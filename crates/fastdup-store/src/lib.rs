@@ -2,6 +2,7 @@
 
 //! Durable container lifecycle behind an injectable storage boundary.
 
+mod exact_index_repository;
 mod generation;
 mod manifest_reader;
 mod reduction;
@@ -10,7 +11,14 @@ mod reduction_dictionary;
 mod reduction_filter;
 mod reduction_similarity;
 
-pub use generation::{GenerationError, GenerationRepository, RecoveredGeneration, WalTail};
+pub use exact_index_repository::{
+    ActivatedExactIndex, ExactIndexLookup, ExactIndexRunReader, ExactIndexRunRepository,
+    ExactIndexStoreError, MAX_ACTIVE_EXACT_INDEX_RUNS, MAX_EXACT_LOOKUP_CANDIDATES,
+};
+pub use generation::{
+    CommittedDataGeneration, GenerationError, GenerationRepository, RecoveredDataGeneration,
+    RecoveredGeneration, VerifiedCommittedFile, WalTail,
+};
 pub use manifest_reader::{MAX_MANIFEST_READ_BYTES, ManifestReadError, VerifiedManifestFile};
 pub use reduction::{
     ReducedObject, ReductionAuditReport, ReductionEngine, ReductionError, ReductionFeatures,
@@ -30,9 +38,12 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use fastdup_format::{
-    BuildingContainerHeader, ContainerId, FormatError, HEADER_BYTES, MAX_CONTAINER_BYTES,
-    SealedContainer,
+    BuildingContainerHeader, ContainerId, ExactIndexEntry, ExactLocationTransition, FormatError,
+    HEADER_BYTES, MAX_CONTAINER_BYTES, SealedContainer,
 };
+
+/// Hard allocation bound for one exact random read through [`StorageIo`].
+pub const MAX_STORAGE_RANGE_BYTES: usize = 1_024 * 1_024;
 
 #[derive(Clone, Debug)]
 pub struct ContainerStore {
@@ -169,6 +180,20 @@ pub trait StorageIo {
     ///
     /// Returns the backend's lookup or read error.
     fn read(&self, name: &str) -> io::Result<Vec<u8>>;
+    /// Returns the current exact object length without reading its contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's lookup or metadata error.
+    fn object_len(&self, name: &str) -> io::Result<u64>;
+    /// Reads exactly one bounded range without materializing the whole object.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` above [`MAX_STORAGE_RANGE_BYTES`],
+    /// `UnexpectedEof` for a range outside the current object, or the backend's
+    /// exact-read error. Partial bytes are never returned as verified evidence.
+    fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>>;
     /// Lists the current names in the container publication directory.
     ///
     /// # Errors
@@ -334,6 +359,59 @@ impl<I: StorageIo> ContainerRepository<I> {
             chunk_id,
             logical_length,
         })
+    }
+
+    /// Resolves one Exact Index candidate by its canonical Container name and
+    /// returns bytes only after pairing every physical coordinate with opaque
+    /// evidence from a complete production Container verification.
+    ///
+    /// This avoids the directory scan used by [`Self::read_verified_chunk`],
+    /// but the index entry remains acceleration state: it cannot construct the
+    /// verification proof and a mismatch never returns bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns Container I/O/integrity failures or
+    /// [`StoreError::ExactLocationMismatch`] for a non-ACTIVE, stale, forged,
+    /// or otherwise unpaired index candidate.
+    pub fn read_verified_location(
+        &self,
+        candidate: ExactIndexEntry,
+    ) -> Result<Vec<u8>, StoreError> {
+        if candidate.transition() != ExactLocationTransition::Active {
+            return Err(StoreError::ExactLocationMismatch);
+        }
+        let location = candidate.location();
+        let container = self.read(location.container_id())?;
+        let Some(record_ordinal) = container.raw_locations().iter().position(|verified| {
+            verified.chunk_id() == candidate.chunk_id()
+                && verified.logical_length() == candidate.logical_length()
+                && verified.container_id() == location.container_id()
+                && verified.container_generation() == location.container_generation()
+                && verified.record_offset() == location.record_offset()
+                && verified.record_length() == location.record_length()
+                && verified.record_crc32c() == location.record_crc32c()
+        }) else {
+            return Err(StoreError::ExactLocationMismatch);
+        };
+        if location.chunk_ordinal() != 0
+            || location.decoded_offset() != 0
+            || location.record_decoded_length() != candidate.logical_length()
+            || location.record_payload_length() != candidate.logical_length()
+            || location.dependency_id() != [0; 32]
+        {
+            return Err(StoreError::ExactLocationMismatch);
+        }
+        let record = container
+            .records()
+            .get(record_ordinal)
+            .ok_or(StoreError::ExactLocationMismatch)?;
+        if record.chunk_id() != candidate.chunk_id()
+            || usize::try_from(candidate.logical_length()) != Ok(record.payload().len())
+        {
+            return Err(StoreError::ExactLocationMismatch);
+        }
+        Ok(record.payload().to_vec())
     }
 
     /// Discovers published names and verifies every complete container.
@@ -526,6 +604,38 @@ impl StorageIo for FsStorageIo {
         Ok(bytes)
     }
 
+    fn object_len(&self, name: &str) -> io::Result<u64> {
+        Ok(File::open(self.path(name)?)?.metadata()?.len())
+    }
+
+    fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        if length > MAX_STORAGE_RANGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded storage read exceeds the hard allocation limit",
+            ));
+        }
+        let length_u64 = u64::try_from(length)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "read length is too large"))?;
+        let end = offset
+            .checked_add(length_u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read range overflows"))?;
+        let file = File::open(self.path(name)?)?;
+        if end > file.metadata()?.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "bounded storage read exceeds the current object length",
+            ));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        bytes.resize(length, 0);
+        file.read_exact_at(&mut bytes, offset)?;
+        Ok(bytes)
+    }
+
     fn list_names(&self) -> io::Result<Vec<String>> {
         std::fs::read_dir(&self.root)?
             .map(|entry| {
@@ -619,6 +729,7 @@ pub enum StoreError {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u64,
     },
+    ExactLocationMismatch,
 }
 
 impl fmt::Display for StoreError {
@@ -643,6 +754,9 @@ impl fmt::Display for StoreError {
                 formatter,
                 "no verified container location for Chunk ID {chunk_id:?} with length {logical_length}"
             ),
+            Self::ExactLocationMismatch => formatter.write_str(
+                "Exact Index candidate does not pair with its fully verified Container location",
+            ),
         }
     }
 }
@@ -655,7 +769,8 @@ impl std::error::Error for StoreError {
             Self::PublishVerificationMismatch
             | Self::InvalidPublishedName(_)
             | Self::PublishedIdentityMismatch { .. }
-            | Self::MissingVerifiedChunk { .. } => None,
+            | Self::MissingVerifiedChunk { .. }
+            | Self::ExactLocationMismatch => None,
         }
     }
 }

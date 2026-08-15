@@ -606,6 +606,7 @@ fn errno(error: PosixError) -> Errno {
         PosixError::Unsupported => libc::EOPNOTSUPP.into(),
         PosixError::Io => libc::EIO.into(),
         PosixError::ReadOnly => libc::EROFS.into(),
+        PosixError::Again => libc::EAGAIN.into(),
     }
 }
 

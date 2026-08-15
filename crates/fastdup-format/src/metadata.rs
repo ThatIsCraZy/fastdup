@@ -12,6 +12,7 @@ const OBJECT_ID_DOMAIN: &[u8] = b"fastdup-metadata-object-v1\0";
 
 pub(crate) const MANIFEST_LEAF_KIND: u16 = 1;
 pub(crate) const NAMESPACE_ROOT_KIND: u16 = 2;
+pub(crate) const EXACT_INDEX_RUN_SET_KIND: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MetadataObjectId([u8; 32]);

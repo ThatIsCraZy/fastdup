@@ -53,6 +53,21 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         })
     }
 
+    pub(crate) fn from_verified_graph(
+        manifest: ManifestLeaf,
+        containers: ContainerRepository<I>,
+    ) -> Self {
+        Self {
+            manifest,
+            containers,
+        }
+    }
+
+    #[must_use]
+    pub const fn manifest(&self) -> &ManifestLeaf {
+        &self.manifest
+    }
+
     #[must_use]
     pub const fn logical_size(&self) -> u64 {
         self.manifest.file_length()

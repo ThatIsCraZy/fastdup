@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::ops::Bound::Excluded;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 mod fuse_adapter;
 mod versioned_file;
@@ -44,6 +44,24 @@ pub struct HandleId(NonZeroU64);
 impl HandleId {
     #[must_use]
     pub const fn new(raw: u64) -> Option<Self> {
+        match NonZeroU64::new(raw) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Opaque identity of one in-flight atomic generation cut.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CommitToken(NonZeroU64);
+
+impl CommitToken {
+    const fn new(raw: u64) -> Option<Self> {
         match NonZeroU64::new(raw) {
             Some(value) => Some(Self(value)),
             None => None,
@@ -211,6 +229,7 @@ pub enum PosixError {
     Unsupported,
     Io,
     ReadOnly,
+    Again,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,6 +311,207 @@ impl CommittedEntry {
             target: InodeId::new(target).ok_or(PosixError::InvalidArgument)?,
             name,
         })
+    }
+}
+
+/// One coalesced changed range captured by an atomic namespace cut.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitRange {
+    offset: u64,
+    length: u64,
+}
+
+impl CommitRange {
+    const fn new(offset: u64, length: u64) -> Self {
+        Self { offset, length }
+    }
+
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+}
+
+/// One immutable regular-file view captured by an atomic namespace cut.
+#[derive(Clone, Debug)]
+pub struct CommitInode {
+    inode: InodeId,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    link_count: u32,
+    mutation_sequence: u64,
+    file: Arc<dyn CommittedFile>,
+    frozen_epoch: Option<Arc<versioned_file::FrozenEpoch>>,
+}
+
+impl CommitInode {
+    #[must_use]
+    pub const fn inode(&self) -> InodeId {
+        self.inode
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> u16 {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    #[must_use]
+    pub const fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    #[must_use]
+    pub const fn link_count(&self) -> u32 {
+        self.link_count
+    }
+
+    #[must_use]
+    pub const fn mutation_sequence(&self) -> u64 {
+        self.mutation_sequence
+    }
+
+    #[must_use]
+    pub fn logical_size(&self) -> u64 {
+        self.file.logical_size()
+    }
+
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        self.file.allocated_bytes()
+    }
+
+    /// Returns the coalesced DATA/HOLE ranges changed since the immediately
+    /// preceding installed version.
+    ///
+    /// File-size changes are represented by [`Self::logical_size`] and the
+    /// preceding durable Manifest length; truncation may therefore return an
+    /// empty range list. The ranges are a planning hint from the frozen epoch,
+    /// never an authorization to skip byte or Manifest verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded allocation or integrity error while materializing the
+    /// immutable range summary.
+    pub fn changed_ranges(&self) -> Result<Vec<CommitRange>, PosixError> {
+        self.frozen_epoch
+            .as_ref()
+            .map_or_else(|| Ok(Vec::new()), |epoch| epoch.changed_ranges())
+    }
+
+    /// Counts allocated bytes in the frozen version without reading content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity or bounded-range error from the frozen view.
+    pub fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, PosixError> {
+        self.file.allocated_bytes_in_range(offset, length)
+    }
+
+    /// Reads exact bytes from the frozen version, excluding later mutations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a committed dependency, integrity, or bounded-resource error.
+    pub fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+        self.file.read_at(offset, length)
+    }
+}
+
+/// One byte-exact directory entry captured by an atomic namespace cut.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitEntry {
+    parent: InodeId,
+    target: InodeId,
+    name: Vec<u8>,
+}
+
+impl CommitEntry {
+    #[must_use]
+    pub const fn parent(&self) -> InodeId {
+        self.parent
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> InodeId {
+        self.target
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+}
+
+/// Retryable immutable view of one complete generation candidate.
+#[derive(Clone, Debug)]
+pub struct NamespaceCommit {
+    token: CommitToken,
+    inode_reservation_end: u64,
+    inode_allocation_cursor: u64,
+    namespace_mutation_sequence: u64,
+    inodes: Vec<CommitInode>,
+    entries: Vec<CommitEntry>,
+}
+
+impl NamespaceCommit {
+    #[must_use]
+    pub const fn token(&self) -> CommitToken {
+        self.token
+    }
+
+    #[must_use]
+    pub const fn inode_reservation_end(&self) -> u64 {
+        self.inode_reservation_end
+    }
+
+    #[must_use]
+    pub const fn inode_allocation_cursor(&self) -> u64 {
+        self.inode_allocation_cursor
+    }
+
+    #[must_use]
+    pub const fn namespace_mutation_sequence(&self) -> u64 {
+        self.namespace_mutation_sequence
+    }
+
+    #[must_use]
+    pub fn inodes(&self) -> &[CommitInode] {
+        &self.inodes
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[CommitEntry] {
+        &self.entries
+    }
+}
+
+/// Verified immutable content to install after a generation becomes durable.
+#[derive(Debug)]
+pub struct CommittedFileInstall {
+    inode: InodeId,
+    mutation_sequence: u64,
+    file: Arc<dyn CommittedFile>,
+}
+
+impl CommittedFileInstall {
+    #[must_use]
+    pub fn new(inode: InodeId, mutation_sequence: u64, file: Arc<dyn CommittedFile>) -> Self {
+        Self {
+            inode,
+            mutation_sequence,
+            file,
+        }
     }
 }
 
@@ -748,6 +968,9 @@ struct Catalog {
     next_inode: u64,
     inode_reservation_end: u64,
     next_handle: u64,
+    next_commit_token: u64,
+    committed_namespace_mutation_sequence: u64,
+    inflight_commit: Option<NamespaceCommit>,
     inodes: BTreeMap<InodeId, Arc<Inode>>,
     entries: BTreeMap<(InodeId, Vec<u8>), InodeId>,
     handles: BTreeMap<HandleId, OpenHandle>,
@@ -757,7 +980,8 @@ struct Catalog {
 #[derive(Debug)]
 pub struct Namespace {
     config: NamespaceConfig,
-    mutations_enabled: bool,
+    mutations_supported: bool,
+    mutations_admitted: RwLock<bool>,
     catalog: RwLock<Catalog>,
 }
 
@@ -791,11 +1015,15 @@ impl Namespace {
 
         Self {
             config,
-            mutations_enabled: true,
+            mutations_supported: true,
+            mutations_admitted: RwLock::new(true),
             catalog: RwLock::new(Catalog {
                 next_inode: ROOT_INODE.get() + 1,
                 inode_reservation_end: u64::MAX,
                 next_handle: 1,
+                next_commit_token: 1,
+                committed_namespace_mutation_sequence: 0,
+                inflight_commit: None,
                 inodes,
                 entries: BTreeMap::new(),
                 handles: BTreeMap::new(),
@@ -822,6 +1050,36 @@ impl Namespace {
     pub fn from_committed(
         config: NamespaceConfig,
         snapshot: CommittedNamespaceSnapshot,
+    ) -> Result<Self, PosixError> {
+        Self::from_committed_mode(config, snapshot, false)
+    }
+
+    /// Mounts a verified snapshot with mutation admission enabled.
+    ///
+    /// The caller must have durably reserved `[next_inode,
+    /// inode_reservation_end)` before constructing the snapshot. This
+    /// constructor performs no I/O and never guesses a reservation from live
+    /// inode records.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the same malformed or inconsistent snapshot state as
+    /// [`Self::from_committed`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the internal configuration permits no valid component name.
+    pub fn from_committed_writable(
+        config: NamespaceConfig,
+        snapshot: CommittedNamespaceSnapshot,
+    ) -> Result<Self, PosixError> {
+        Self::from_committed_mode(config, snapshot, true)
+    }
+
+    fn from_committed_mode(
+        config: NamespaceConfig,
+        snapshot: CommittedNamespaceSnapshot,
+        mutations_enabled: bool,
     ) -> Result<Self, PosixError> {
         assert!(
             config.maximum_name_bytes > 0,
@@ -900,17 +1158,257 @@ impl Namespace {
 
         Ok(Self {
             config,
-            mutations_enabled: false,
+            mutations_supported: mutations_enabled,
+            mutations_admitted: RwLock::new(mutations_enabled),
             catalog: RwLock::new(Catalog {
                 next_inode: snapshot.next_inode,
                 inode_reservation_end: snapshot.inode_reservation_end,
                 next_handle: 1,
+                next_commit_token: 1,
+                committed_namespace_mutation_sequence: snapshot.namespace_mutation_sequence,
+                inflight_commit: None,
                 inodes,
                 entries,
                 handles: BTreeMap::new(),
                 lookup_counts: BTreeMap::new(),
             }),
         })
+    }
+
+    /// Stops acknowledging new mutations while preserving reads and already
+    /// admitted dirty epochs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a prior impossible invariant poisoned the admission lock.
+    pub fn pause_mutation_admission(&self) {
+        *self
+            .mutations_admitted
+            .write()
+            .expect("ASSERT: mutation admission lock poisoned") = false;
+    }
+
+    /// Reopens mutation admission after durable progress catches up.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called for a namespace constructed as permanently read-only.
+    pub fn resume_mutation_admission(&self) {
+        assert!(
+            self.mutations_supported,
+            "ASSERT: a read-only namespace cannot resume mutation admission"
+        );
+        *self
+            .mutations_admitted
+            .write()
+            .expect("ASSERT: mutation admission lock poisoned") = true;
+    }
+
+    #[must_use]
+    /// Reports whether this namespace currently accepts new mutations.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a prior impossible invariant poisoned the admission lock.
+    pub fn mutation_admission_open(&self) -> bool {
+        self.mutations_supported
+            && *self
+                .mutations_admitted
+                .read()
+                .expect("ASSERT: mutation admission lock poisoned")
+    }
+
+    /// Freezes one retryable atomic generation candidate.
+    ///
+    /// Later mutations remain admitted and immediately readable through
+    /// [`Self::dispatch`], but are excluded from the returned view. Repeating
+    /// this call before [`Self::complete_commit`] returns the same token and
+    /// bytes, so a failed durable publication can retry without opening a
+    /// second in-flight epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded allocation or counter-exhaustion error. `Ok(None)`
+    /// means the live namespace already equals its installed generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when internal namespace reachability, link counts, or lock order
+    /// disagree while the catalog is exclusively locked.
+    pub fn begin_commit(&self) -> Result<Option<NamespaceCommit>, PosixError> {
+        let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        if let Some(inflight) = &catalog.inflight_commit {
+            return Ok(Some(inflight.clone()));
+        }
+
+        let namespace_mutation_sequence = root_mutation_sequence(&catalog);
+        let namespace_dirty =
+            namespace_mutation_sequence != catalog.committed_namespace_mutation_sequence;
+        let mut content_dirty = false;
+        for (&inode, object) in &catalog.inodes {
+            if inode == ROOT_INODE {
+                continue;
+            }
+            let state = object.state.read().expect("ASSERT: inode lock poisoned");
+            if state.link_count > 0 && state.data.has_active_mutations() {
+                content_dirty = true;
+                break;
+            }
+        }
+        if !namespace_dirty && !content_dirty {
+            return Ok(None);
+        }
+
+        let token = CommitToken::new(catalog.next_commit_token).ok_or(PosixError::NoSpace)?;
+        let next_commit_token = catalog
+            .next_commit_token
+            .checked_add(1)
+            .ok_or(PosixError::NoSpace)?;
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(catalog.entries.len())
+            .map_err(|_| PosixError::OutOfMemory)?;
+        for ((parent, name), target) in &catalog.entries {
+            let mut copied_name = Vec::new();
+            copied_name
+                .try_reserve_exact(name.len())
+                .map_err(|_| PosixError::OutOfMemory)?;
+            copied_name.extend_from_slice(name);
+            entries.push(CommitEntry {
+                parent: *parent,
+                target: *target,
+                name: copied_name,
+            });
+        }
+
+        let mut inodes = Vec::new();
+        inodes
+            .try_reserve_exact(catalog.inodes.len().saturating_sub(1))
+            .map_err(|_| PosixError::OutOfMemory)?;
+        for (&inode, object) in &catalog.inodes {
+            if inode == ROOT_INODE {
+                continue;
+            }
+            let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
+            if state.link_count == 0 {
+                continue;
+            }
+            assert_eq!(
+                state.kind,
+                FileKind::Regular,
+                "ASSERT: v1 committed child must be a regular file"
+            );
+            let (file, frozen_epoch) = state.data.freeze_for_commit(token);
+            inodes.push(CommitInode {
+                inode,
+                mode: state.mode,
+                uid: state.uid,
+                gid: state.gid,
+                link_count: state.link_count,
+                mutation_sequence: state.mutation_sequence,
+                file,
+                frozen_epoch,
+            });
+        }
+        assert_commit_reachability(&inodes, &entries);
+
+        let commit = NamespaceCommit {
+            token,
+            inode_reservation_end: catalog.inode_reservation_end,
+            inode_allocation_cursor: catalog.next_inode,
+            namespace_mutation_sequence,
+            inodes,
+            entries,
+        };
+        catalog.next_commit_token = next_commit_token;
+        assert!(
+            catalog.inflight_commit.replace(commit.clone()).is_none(),
+            "ASSERT: begin commit replaced an in-flight generation"
+        );
+        Ok(Some(commit))
+    }
+
+    /// Installs fully verified immutable readers after the cut's Commit Record
+    /// is durable.
+    ///
+    /// Active mutations accepted after the cut remain layered over these new
+    /// bases. A file unlinked and reclaimed after the cut is intentionally not
+    /// resurrected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PosixError::Io`] when the installed inode set, sequence, size,
+    /// or allocation metadata disagrees with the frozen cut.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the coordinator supplies a stale token or an internal
+    /// frozen epoch does not match the accepted commit cut.
+    pub fn complete_commit(
+        &self,
+        commit: &NamespaceCommit,
+        installed: Vec<CommittedFileInstall>,
+    ) -> Result<(), PosixError> {
+        let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        let inflight = catalog
+            .inflight_commit
+            .as_ref()
+            .expect("ASSERT: complete requires one in-flight commit");
+        assert_eq!(
+            inflight.token, commit.token,
+            "ASSERT: complete commit token must match the in-flight cut"
+        );
+        if installed.len() != commit.inodes.len() {
+            return Err(PosixError::Io);
+        }
+        let mut by_inode = BTreeMap::new();
+        for install in installed {
+            if by_inode.insert(install.inode, install).is_some() {
+                return Err(PosixError::Io);
+            }
+        }
+        for frozen in &commit.inodes {
+            let install = by_inode.get(&frozen.inode).ok_or(PosixError::Io)?;
+            if install.mutation_sequence != frozen.mutation_sequence
+                || install.file.logical_size() != frozen.logical_size()
+                || install.file.allocated_bytes() != frozen.allocated_bytes()
+            {
+                return Err(PosixError::Io);
+            }
+        }
+
+        for frozen in &commit.inodes {
+            let install = by_inode
+                .remove(&frozen.inode)
+                .expect("ASSERT: preflighted install disappeared");
+            let Some(object) = catalog.inodes.get(&frozen.inode).cloned() else {
+                continue;
+            };
+            let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
+            assert!(
+                state.mutation_sequence >= frozen.mutation_sequence,
+                "ASSERT: live inode sequence cannot precede a frozen prefix"
+            );
+            state.data.install_commit_view(
+                commit.token,
+                install.file,
+                install.mutation_sequence,
+                frozen.frozen_epoch.is_some(),
+            );
+        }
+        assert!(
+            by_inode.is_empty(),
+            "ASSERT: exact install preflight left an unexpected inode"
+        );
+        assert!(
+            root_mutation_sequence(&catalog) >= commit.namespace_mutation_sequence,
+            "ASSERT: live namespace cannot precede a frozen prefix"
+        );
+        catalog.committed_namespace_mutation_sequence = commit.namespace_mutation_sequence;
+        let removed = catalog.inflight_commit.take();
+        assert!(removed.is_some(), "ASSERT: completed commit disappeared");
+        Ok(())
     }
 
     /// Executes one byte-exact POSIX semantic operation.
@@ -1015,6 +1513,7 @@ impl Namespace {
 
     fn create(&self, request: CreateRequest<'_>) -> Result<Reply, PosixError> {
         self.validate_name(request.name)?;
+        let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, request.parent)?;
         let key = (request.parent, request.name.to_vec());
@@ -1022,13 +1521,7 @@ impl Namespace {
             if request.exclusive {
                 return Err(PosixError::Exists);
             }
-            if !self.mutations_enabled && request.options.access != AccessMode::ReadOnly {
-                return Err(PosixError::ReadOnly);
-            }
             return open_existing_for_create(&mut catalog, inode, request);
-        }
-        if !self.mutations_enabled {
-            return Err(PosixError::ReadOnly);
         }
         create_new_file(&mut catalog, key, request)
     }
@@ -1039,6 +1532,9 @@ impl Namespace {
         options: OpenOptions,
         truncate: bool,
     ) -> Result<Reply, PosixError> {
+        let _admission = (options.access != AccessMode::ReadOnly || truncate)
+            .then(|| self.require_mutation_admission())
+            .transpose()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         let object = catalog
             .inodes
@@ -1048,9 +1544,6 @@ impl Namespace {
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
         if state.kind == FileKind::Directory {
             return Err(PosixError::IsDirectory);
-        }
-        if !self.mutations_enabled && options.access != AccessMode::ReadOnly {
-            return Err(PosixError::ReadOnly);
         }
         if truncate && options.access == AccessMode::ReadOnly {
             return Err(PosixError::BadHandle);
@@ -1111,9 +1604,7 @@ impl Namespace {
         requested_offset: u64,
         data: &[u8],
     ) -> Result<Reply, PosixError> {
-        if !self.mutations_enabled {
-            return Err(PosixError::ReadOnly);
-        }
+        let _admission = self.require_mutation_admission()?;
         let written = u32::try_from(data.len()).map_err(|_| PosixError::FileTooLarge)?;
         let (object, open) = self.resolve_open_file(inode, handle)?;
         if open.options.access == AccessMode::ReadOnly {
@@ -1166,6 +1657,7 @@ impl Namespace {
         if length > self.config.maximum_file_bytes {
             return Err(PosixError::FileTooLarge);
         }
+        let _admission = self.require_mutation_admission()?;
         let object = match handle {
             Some(handle) => {
                 let (object, open) = self.resolve_open_file(inode, handle)?;
@@ -1182,9 +1674,6 @@ impl Namespace {
         }
         if length == state.data.logical_size() {
             return Ok(Reply::Attr(state.attributes(inode)));
-        }
-        if !self.mutations_enabled {
-            return Err(PosixError::ReadOnly);
         }
         let next_sequence = state
             .mutation_sequence
@@ -1233,11 +1722,10 @@ impl Namespace {
 
     fn unlink(&self, parent: InodeId, name: &[u8]) -> Result<Reply, PosixError> {
         self.validate_name(name)?;
-        if !self.mutations_enabled {
-            return Err(PosixError::ReadOnly);
-        }
+        let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, parent)?;
+        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
         let key = (parent, name.to_vec());
         let inode = *catalog.entries.get(&key).ok_or(PosixError::NoEntry)?;
         let object = catalog
@@ -1262,6 +1750,7 @@ impl Namespace {
         drop(state);
         let removed = catalog.entries.remove(&key);
         assert_eq!(removed, Some(inode), "ASSERT: validated name disappeared");
+        install_root_mutation_sequence(&catalog, next_namespace_sequence);
 
         let has_lookup = catalog.lookup_counts.get(&inode).copied().unwrap_or(0) != 0;
         if !has_lookup
@@ -1432,6 +1921,20 @@ impl Namespace {
     fn validate_name(&self, name: &[u8]) -> Result<(), PosixError> {
         validate_component(&self.config, name)
     }
+
+    fn require_mutation_admission(&self) -> Result<RwLockReadGuard<'_, bool>, PosixError> {
+        if !self.mutations_supported {
+            return Err(PosixError::ReadOnly);
+        }
+        let admitted = self
+            .mutations_admitted
+            .read()
+            .expect("ASSERT: mutation admission lock poisoned");
+        if !*admitted {
+            return Err(PosixError::Again);
+        }
+        Ok(admitted)
+    }
 }
 
 fn validate_component(config: &NamespaceConfig, name: &[u8]) -> Result<(), PosixError> {
@@ -1443,6 +1946,69 @@ fn validate_component(config: &NamespaceConfig, name: &[u8]) -> Result<(), Posix
         return Err(PosixError::InvalidName);
     }
     Ok(())
+}
+
+fn root_mutation_sequence(catalog: &Catalog) -> u64 {
+    catalog
+        .inodes
+        .get(&ROOT_INODE)
+        .expect("ASSERT: namespace root inode must remain live")
+        .state
+        .read()
+        .expect("ASSERT: root inode lock poisoned")
+        .mutation_sequence
+}
+
+fn next_root_mutation_sequence(catalog: &Catalog) -> Result<u64, PosixError> {
+    root_mutation_sequence(catalog)
+        .checked_add(1)
+        .ok_or(PosixError::NoSpace)
+}
+
+fn install_root_mutation_sequence(catalog: &Catalog, sequence: u64) {
+    let root = catalog
+        .inodes
+        .get(&ROOT_INODE)
+        .expect("ASSERT: namespace root inode must remain live");
+    let mut state = root
+        .state
+        .write()
+        .expect("ASSERT: root inode lock poisoned");
+    assert_eq!(
+        state
+            .mutation_sequence
+            .checked_add(1)
+            .expect("ASSERT: preflighted namespace sequence cannot overflow"),
+        sequence,
+        "ASSERT: namespace mutations must remain contiguous"
+    );
+    state.mutation_sequence = sequence;
+}
+
+fn assert_commit_reachability(inodes: &[CommitInode], entries: &[CommitEntry]) {
+    let mut observed_links = BTreeMap::<InodeId, u32>::new();
+    for entry in entries {
+        assert_eq!(
+            entry.parent, ROOT_INODE,
+            "ASSERT: v1 commit entry must belong to the root"
+        );
+        let count = observed_links.entry(entry.target).or_default();
+        *count = count
+            .checked_add(1)
+            .expect("ASSERT: bounded link count cannot overflow");
+    }
+    assert_eq!(
+        observed_links.len(),
+        inodes.len(),
+        "ASSERT: commit inode and reachable target counts must agree"
+    );
+    for inode in inodes {
+        assert_eq!(
+            observed_links.get(&inode.inode).copied(),
+            Some(inode.link_count),
+            "ASSERT: commit link count must equal exact namespace reachability"
+        );
+    }
 }
 
 fn open_existing_for_create(
@@ -1511,6 +2077,7 @@ fn create_new_file(
     key: (InodeId, Vec<u8>),
     request: CreateRequest<'_>,
 ) -> Result<Reply, PosixError> {
+    let next_namespace_sequence = next_root_mutation_sequence(catalog)?;
     let inode = allocate_inode(catalog)?;
     let handle = allocate_handle(catalog)?;
     let object = Arc::new(Inode {
@@ -1555,6 +2122,7 @@ fn create_new_file(
             .is_none(),
         "ASSERT: monotonic handle allocator returned a live ID"
     );
+    install_root_mutation_sequence(catalog, next_namespace_sequence);
 
     Ok(Reply::Created {
         entry: Entry { attr },

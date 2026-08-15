@@ -8,6 +8,11 @@ license.workspace = true
 fastdup-format.workspace = true
 fastdup-posix.workspace = true
 fastdup-store.workspace = true
+fuse3.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+fastdup-testkit = { path = "../fastdup-testkit" }
 
 [lints]
 workspace = true
