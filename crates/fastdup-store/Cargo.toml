@@ -1,0 +1,14 @@
+[package]
+name = "fastdup-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fastcdc.workspace = true
+fastdup-format.workspace = true
+rustix.workspace = true
+zstd.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "fastdup-appliance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fastdup-format.workspace = true
+fastdup-posix.workspace = true
+fastdup-store.workspace = true
+
+[lints]
+workspace = true

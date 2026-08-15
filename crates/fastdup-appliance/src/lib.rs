@@ -1,0 +1,252 @@
+#![forbid(unsafe_code)]
+
+//! Durable repository-to-POSIX mount orchestration.
+
+use std::fmt;
+use std::sync::Arc;
+
+use fastdup_format::{ManifestExtent, ManifestLeaf};
+use fastdup_posix::{
+    CommittedEntry, CommittedFile, CommittedInode, CommittedNamespaceSnapshot, Namespace,
+    NamespaceConfig, PosixError,
+};
+use fastdup_store::{
+    ContainerRepository, GenerationError, GenerationRepository, ManifestReadError, StorageIo,
+    VerifiedManifestFile,
+};
+
+/// Recovers and mounts the newest wholly verified namespace generation.
+///
+/// This Adapter is the single Seam between durable format/store types and the
+/// POSIX namespace. It retains immutable Manifest recipes and verified
+/// container access behind [`CommittedFile`] without materializing complete
+/// file bytes. All mutation admission deliberately remains read-only until a
+/// later module wires the commit scheduler and durable Inode reservation.
+///
+/// # Errors
+///
+/// Returns generation recovery, Manifest dependency, or POSIX snapshot
+/// validation failures. A missing Commit WAL or empty repository returns
+/// `Ok(None)`.
+pub fn recover_mount<M, C>(
+    config: NamespaceConfig,
+    generations: &GenerationRepository<M>,
+    containers: &ContainerRepository<C>,
+) -> Result<Option<Namespace>, MountError>
+where
+    M: StorageIo,
+    C: Clone + Send + Sync + StorageIo + 'static,
+{
+    let Some(recovered) = generations.recover_latest_with_data(containers)? else {
+        return Ok(None);
+    };
+    let root = recovered.namespace_root();
+
+    let mut inodes = Vec::new();
+    inodes
+        .try_reserve_exact(root.inodes().len())
+        .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
+    for inode in root.inodes() {
+        let manifest = generations.read_manifest(inode.manifest_root())?;
+        if manifest.file_length() != inode.logical_size() {
+            return Err(MountError::Posix(PosixError::Io));
+        }
+        let file = Arc::new(ManifestCommittedFile::new(manifest, containers.clone())?)
+            as Arc<dyn CommittedFile>;
+        inodes.push(CommittedInode::new(
+            inode.inode(),
+            inode.mode(),
+            inode.uid(),
+            inode.gid(),
+            inode.link_count(),
+            inode.mutation_sequence(),
+            file,
+        )?);
+    }
+
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(root.entries().len())
+        .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
+    for entry in root.entries() {
+        entries.push(CommittedEntry::new(
+            entry.parent_inode(),
+            entry.target_inode(),
+            entry.name().to_vec(),
+        )?);
+    }
+
+    let reservation_end = recovered.inode_reservation_end_high_water();
+    let snapshot = CommittedNamespaceSnapshot::new(
+        reservation_end,
+        reservation_end,
+        root.namespace_mutation_sequence(),
+        inodes,
+        entries,
+    )?;
+    Namespace::from_committed(config, snapshot)
+        .map(Some)
+        .map_err(Into::into)
+}
+
+#[derive(Clone, Copy)]
+struct AllocatedRange {
+    start: u64,
+    end: u64,
+}
+
+struct ManifestCommittedFile<I> {
+    file: VerifiedManifestFile<I>,
+    logical_size: u64,
+    allocated_bytes: u64,
+    allocated_ranges: Vec<AllocatedRange>,
+}
+
+impl<I: StorageIo> ManifestCommittedFile<I> {
+    fn new(
+        manifest: ManifestLeaf,
+        containers: ContainerRepository<I>,
+    ) -> Result<Self, ManifestReadError> {
+        let logical_size = manifest.file_length();
+        let mut allocated_ranges = Vec::<AllocatedRange>::new();
+        let mut extent_start = 0_u64;
+        for extent in manifest.extents() {
+            let length = extent_length(extent);
+            let extent_end = extent_start
+                .checked_add(length)
+                .expect("ASSERT: verified Manifest extent end must not overflow");
+            if !matches!(extent, ManifestExtent::Hole { .. }) {
+                if let Some(previous) = allocated_ranges.last_mut()
+                    && previous.end == extent_start
+                {
+                    previous.end = extent_end;
+                } else {
+                    allocated_ranges.push(AllocatedRange {
+                        start: extent_start,
+                        end: extent_end,
+                    });
+                }
+            }
+            extent_start = extent_end;
+        }
+        assert_eq!(
+            extent_start, logical_size,
+            "ASSERT: verified Manifest extents must partition the file"
+        );
+        let allocated_bytes = allocated_ranges.iter().fold(0_u64, |total, range| {
+            total
+                .checked_add(range.end - range.start)
+                .expect("ASSERT: allocated Manifest subset cannot exceed file length")
+        });
+        let file = VerifiedManifestFile::new(manifest, containers)?;
+        Ok(Self {
+            file,
+            logical_size,
+            allocated_bytes,
+            allocated_ranges,
+        })
+    }
+}
+
+impl<I> fmt::Debug for ManifestCommittedFile<I> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManifestCommittedFile")
+            .field("logical_size", &self.logical_size)
+            .field("allocated_bytes", &self.allocated_bytes)
+            .field("allocated_range_count", &self.allocated_ranges.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I> CommittedFile for ManifestCommittedFile<I>
+where
+    I: Send + Sync + StorageIo,
+{
+    fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, PosixError> {
+        let end = offset.checked_add(length).ok_or(PosixError::Io)?;
+        let end = end.min(self.logical_size);
+        if offset >= end {
+            return Ok(0);
+        }
+        let first = self
+            .allocated_ranges
+            .partition_point(|range| range.end <= offset);
+        let mut allocated = 0_u64;
+        for range in &self.allocated_ranges[first..] {
+            if range.start >= end {
+                break;
+            }
+            let intersection_start = range.start.max(offset);
+            let intersection_end = range.end.min(end);
+            allocated = allocated
+                .checked_add(intersection_end - intersection_start)
+                .ok_or(PosixError::Io)?;
+        }
+        Ok(allocated)
+    }
+
+    fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+        self.file
+            .read_at(offset, length)
+            .map_err(|_| PosixError::Io)
+    }
+}
+
+const fn extent_length(extent: &ManifestExtent) -> u64 {
+    match *extent {
+        ManifestExtent::Data { logical_length, .. }
+        | ManifestExtent::Hole { logical_length }
+        | ManifestExtent::Fill { logical_length, .. } => logical_length,
+    }
+}
+
+/// Failure while translating one recovered durable generation into POSIX state.
+#[derive(Debug)]
+pub enum MountError {
+    Generation(GenerationError),
+    Manifest(ManifestReadError),
+    Posix(PosixError),
+}
+
+impl fmt::Display for MountError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for MountError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Generation(error) => Some(error),
+            Self::Manifest(error) => Some(error),
+            Self::Posix(_) => None,
+        }
+    }
+}
+
+impl From<GenerationError> for MountError {
+    fn from(error: GenerationError) -> Self {
+        Self::Generation(error)
+    }
+}
+
+impl From<ManifestReadError> for MountError {
+    fn from(error: ManifestReadError) -> Self {
+        Self::Manifest(error)
+    }
+}
+
+impl From<PosixError> for MountError {
+    fn from(error: PosixError) -> Self {
+        Self::Posix(error)
+    }
+}

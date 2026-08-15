@@ -1,0 +1,5 @@
+[build]
+target-dir = ".artifacts/target"
+
+[env]
+TMPDIR = { value = ".artifacts/tmp", relative = true, force = true }
