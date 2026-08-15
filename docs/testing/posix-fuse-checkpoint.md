@@ -1,6 +1,8 @@
 # Volatile POSIX/FUSE checkpoint
 
-Status: implemented and measured; deliberately non-durable.
+Status: implemented and measured; deliberately non-durable. The later
+[durable POSIX/FUSE checkpoint](durable-posix-checkpoint.md) reuses this exact
+semantic seam and kernel adapter.
 
 This checkpoint is the first shared namespace seam and real low-level FUSE
 mount. Its purpose is to establish live POSIX behavior before connecting the
@@ -116,7 +118,7 @@ assertions is blocked on the manifest/Commit-WAL slice.
   production `statfs`;
 - Samba and crash/remount conformance.
 
-The next safe slice is not more FUSE callbacks. It is the versioned immutable
-manifest and namespace generation path behind the existing semantic seam,
-including the ten-second scheduler and faultable recovery. Sparse extents and
-atomic rename then have a durable object model to update.
+The versioned immutable manifest and namespace generation path is now connected
+as the bounded RAW slice documented in
+[Durable POSIX/FUSE checkpoint](durable-posix-checkpoint.md). Its explicit
+limitations supersede this checkpoint's former next-step note.

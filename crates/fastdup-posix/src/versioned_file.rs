@@ -1,9 +1,10 @@
-use crate::{PosixError, SparseData, copy_bytes};
+use crate::{CommitRange, PosixError, SparseData, copy_bytes};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::num::NonZeroU64;
 use std::ops::Bound::Excluded;
 use std::sync::Arc;
+
+use crate::CommitToken;
 
 /// Type-erased, independently verified immutable content behind a POSIX inode.
 pub trait CommittedFile: fmt::Debug + Send + Sync {
@@ -47,20 +48,6 @@ impl CommittedFile for EmptyCommittedFile {
 
     fn read_at(&self, _offset: u64, _length: u32) -> Result<Vec<u8>, PosixError> {
         Ok(Vec::new())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code, reason = "wired by the durable Namespace checkpoint slice")]
-struct CommitToken(NonZeroU64);
-
-#[allow(dead_code, reason = "wired by the durable Namespace checkpoint slice")]
-impl CommitToken {
-    const fn new(raw: u64) -> Option<Self> {
-        match NonZeroU64::new(raw) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
     }
 }
 
@@ -292,28 +279,92 @@ impl DirtyEpoch {
 }
 
 #[derive(Debug)]
-struct FrozenEpoch {
+pub(super) struct FrozenEpoch {
     token: CommitToken,
     dirty: DirtyEpoch,
 }
 
-#[derive(Debug)]
-#[allow(dead_code, reason = "wired by the durable Namespace checkpoint slice")]
+impl FrozenEpoch {
+    pub(super) fn changed_ranges(&self) -> Result<Vec<CommitRange>, PosixError> {
+        let dirty = &self.dirty;
+        let capacity = dirty
+            .data
+            .extents
+            .len()
+            .checked_add(dirty.holes.ranges.len())
+            .ok_or(PosixError::OutOfMemory)?;
+        let mut ranges = Vec::<CommitRange>::new();
+        ranges
+            .try_reserve_exact(capacity)
+            .map_err(|_| PosixError::OutOfMemory)?;
+        let mut data = dirty.data.extents.iter().peekable();
+        let mut holes = dirty.holes.ranges.iter().peekable();
+        while data.peek().is_some() || holes.peek().is_some() {
+            let take_data = match (data.peek(), holes.peek()) {
+                (Some((data_start, _)), Some((hole_start, _))) => data_start <= hole_start,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => unreachable!("ASSERT: loop requires one dirty range"),
+            };
+            let (start, end) = if take_data {
+                let (&start, bytes) = data
+                    .next()
+                    .expect("ASSERT: selected dirty DATA range must exist");
+                let length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64");
+                (
+                    start,
+                    start
+                        .checked_add(length)
+                        .expect("ASSERT: validated dirty DATA end must not overflow"),
+                )
+            } else {
+                let (&start, &end) = holes
+                    .next()
+                    .expect("ASSERT: selected dirty HOLE range must exist");
+                (start, end)
+            };
+            if end > dirty.result_size || start >= end {
+                return Err(PosixError::Io);
+            }
+            if let Some(previous) = ranges.last_mut()
+                && previous
+                    .offset()
+                    .checked_add(previous.length())
+                    .ok_or(PosixError::Io)?
+                    >= start
+            {
+                let previous_end = previous
+                    .offset()
+                    .checked_add(previous.length())
+                    .ok_or(PosixError::Io)?;
+                previous.length = previous_end.max(end) - previous.offset();
+            } else {
+                ranges.push(CommitRange::new(start, end - start));
+            }
+        }
+        Ok(ranges)
+    }
+}
+
+#[derive(Clone, Debug)]
 struct FrozenCommit {
     committed: Arc<dyn CommittedFile>,
     epoch: Arc<FrozenEpoch>,
+    allocated_bytes: u64,
 }
 
-#[allow(dead_code, reason = "wired by the durable Namespace checkpoint slice")]
 impl FrozenCommit {
+    #[cfg(test)]
     fn token(&self) -> CommitToken {
         self.epoch.token
     }
 
+    #[cfg(test)]
     fn through_sequence(&self) -> u64 {
         self.epoch.dirty.through_sequence
     }
 
+    #[cfg(test)]
     const fn epoch(&self) -> &Arc<FrozenEpoch> {
         &self.epoch
     }
@@ -326,6 +377,30 @@ impl FrozenCommit {
             offset,
             length,
         )
+    }
+}
+
+impl CommittedFile for FrozenCommit {
+    fn logical_size(&self) -> u64 {
+        self.epoch.dirty.result_size
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, PosixError> {
+        let end = offset.checked_add(length).ok_or(PosixError::Io)?;
+        allocated_bytes_through(
+            &self.committed,
+            &[&self.epoch.dirty],
+            offset,
+            end.min(self.logical_size()),
+        )
+    }
+
+    fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+        self.plan_read(offset, length)?.execute()
     }
 }
 
@@ -436,7 +511,23 @@ impl VersionedFile {
         )
     }
 
-    #[allow(dead_code, reason = "wired by the durable Namespace checkpoint slice")]
+    pub(super) const fn has_active_mutations(&self) -> bool {
+        self.active.first_sequence.is_some()
+    }
+
+    pub(super) fn freeze_for_commit(
+        &mut self,
+        token: CommitToken,
+    ) -> (Arc<dyn CommittedFile>, Option<Arc<FrozenEpoch>>) {
+        match self.freeze_active(token) {
+            Some(frozen) => {
+                let epoch = Arc::clone(&frozen.epoch);
+                (Arc::new(frozen), Some(epoch))
+            }
+            None => (Arc::clone(&self.committed), None),
+        }
+    }
+
     fn freeze_active(&mut self, token: CommitToken) -> Option<FrozenCommit> {
         assert!(
             self.inflight.is_none(),
@@ -454,37 +545,64 @@ impl VersionedFile {
         Some(FrozenCommit {
             committed: Arc::clone(&self.committed),
             epoch,
+            allocated_bytes: self.live_allocated_bytes,
         })
     }
 
-    #[allow(dead_code, reason = "wired by the durable Namespace checkpoint slice")]
+    #[cfg(test)]
     fn install_committed(
         &mut self,
         token: CommitToken,
         committed: Arc<dyn CommittedFile>,
         committed_sequence: u64,
     ) {
-        let inflight = self
-            .inflight
-            .take()
-            .expect("ASSERT: install requires one frozen commit epoch");
-        assert_eq!(inflight.token, token, "ASSERT: commit token must match");
+        self.install_commit_view(token, committed, committed_sequence, true);
+    }
+
+    pub(super) fn install_commit_view(
+        &mut self,
+        token: CommitToken,
+        committed: Arc<dyn CommittedFile>,
+        committed_sequence: u64,
+        had_frozen_epoch: bool,
+    ) {
+        let committed_size = committed.logical_size();
+        if had_frozen_epoch {
+            let inflight = self
+                .inflight
+                .take()
+                .expect("ASSERT: install requires one frozen commit epoch");
+            assert_eq!(inflight.token, token, "ASSERT: commit token must match");
+            assert_eq!(
+                inflight.dirty.result_size, committed_size,
+                "ASSERT: installed committed size must match the frozen result"
+            );
+            assert_eq!(
+                inflight.dirty.through_sequence, committed_sequence,
+                "ASSERT: installed committed sequence must match the frozen prefix"
+            );
+        } else {
+            assert!(
+                self.inflight.is_none(),
+                "ASSERT: unchanged commit inode cannot own a frozen epoch"
+            );
+            assert_eq!(
+                self.committed_sequence, committed_sequence,
+                "ASSERT: unchanged commit inode sequence must match its base"
+            );
+            assert_eq!(
+                self.committed.logical_size(),
+                committed_size,
+                "ASSERT: unchanged commit inode size must match its base"
+            );
+        }
         assert_eq!(
-            inflight.dirty.result_size,
-            committed.logical_size(),
-            "ASSERT: installed committed size must match the frozen result"
-        );
-        assert_eq!(
-            inflight.dirty.through_sequence, committed_sequence,
-            "ASSERT: installed committed sequence must match the frozen prefix"
-        );
-        assert_eq!(
-            self.active.base_size, inflight.dirty.result_size,
-            "ASSERT: later active epoch must inherit the frozen result"
+            self.active.base_size, committed_size,
+            "ASSERT: later active epoch must inherit the committed result"
         );
         assert_eq!(
             self.active.base_sequence, committed_sequence,
-            "ASSERT: later active epoch must begin after the frozen prefix"
+            "ASSERT: later active epoch must begin after the committed prefix"
         );
         if let Some(first_sequence) = self.active.first_sequence {
             assert!(

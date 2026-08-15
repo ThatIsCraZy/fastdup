@@ -132,6 +132,9 @@ dependencies = [
  "fastdup-format",
  "fastdup-posix",
  "fastdup-store",
+ "fastdup-testkit",
+ "fuse3",
+ "tokio",
 ]
 
 [[package]]

@@ -81,6 +81,7 @@ impl BuildingContainerHeader {
 pub struct SealedContainer {
     header: ContainerHeader,
     records: Vec<RawRecord>,
+    raw_locations: Vec<VerifiedRawLocation>,
 }
 
 impl SealedContainer {
@@ -191,6 +192,7 @@ impl SealedContainer {
             .map_err(|_| FormatError::ArithmeticOverflow)?;
         let mut records = Vec::with_capacity(record_capacity);
         let mut expected_entries = Vec::with_capacity(record_capacity);
+        let mut raw_locations = Vec::with_capacity(record_capacity);
         let mut cursor = HEADER_BYTES;
         for _ in 0..header.layout.record_count {
             let fixed_end = cursor
@@ -209,10 +211,20 @@ impl SealedContainer {
             }
             let encoded = &bytes[cursor..end];
             let record = RawRecord::decode(encoded)?;
-            expected_entries.push(IndexEntry::from_encoded_record(
+            let index_entry = IndexEntry::from_encoded_record(
                 encoded,
                 u64::try_from(cursor).map_err(|_| FormatError::ArithmeticOverflow)?,
-            ));
+            );
+            raw_locations.push(VerifiedRawLocation {
+                chunk_id: index_entry.chunk_id,
+                logical_length: index_entry.logical_length,
+                container_id: header.container_id,
+                container_generation: header.container_generation,
+                record_offset: index_entry.record_offset,
+                record_length: index_entry.record_length,
+                record_crc32c: index_entry.record_crc32c,
+            });
+            expected_entries.push(index_entry);
             records.push(record);
             cursor = end;
         }
@@ -237,7 +249,11 @@ impl SealedContainer {
         if computed_hash != footer.container_hash {
             return Err(FormatError::ContainerHashMismatch);
         }
-        Ok(Self { header, records })
+        Ok(Self {
+            header,
+            records,
+            raw_locations,
+        })
     }
 
     #[must_use]
@@ -259,12 +275,72 @@ impl SealedContainer {
         &self.records
     }
 
+    /// Returns physical RAW Locations proven by this Container's complete
+    /// Header, Record, Recovery-Index, Footer, CRC, hash, and Chunk-ID checks.
+    ///
+    /// The proof is suitable as rebuild input. An Exact Index lookup result is
+    /// not equivalent evidence and must never construct this opaque type.
+    #[must_use]
+    pub fn raw_locations(&self) -> &[VerifiedRawLocation] {
+        &self.raw_locations
+    }
+
     #[must_use]
     pub fn chunk(&self, chunk_id: ChunkId) -> Option<&[u8]> {
         self.records
             .iter()
             .find(|record| record.chunk_id == chunk_id)
             .map(RawRecord::payload)
+    }
+}
+
+/// Opaque physical Location evidence emitted only by a fully verified
+/// immutable RAW Container.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedRawLocation {
+    chunk_id: ChunkId,
+    logical_length: u32,
+    container_id: ContainerId,
+    container_generation: u64,
+    record_offset: u64,
+    record_length: u32,
+    record_crc32c: u32,
+}
+
+impl VerifiedRawLocation {
+    #[must_use]
+    pub const fn chunk_id(self) -> ChunkId {
+        self.chunk_id
+    }
+
+    #[must_use]
+    pub const fn logical_length(self) -> u32 {
+        self.logical_length
+    }
+
+    #[must_use]
+    pub const fn container_id(self) -> ContainerId {
+        self.container_id
+    }
+
+    #[must_use]
+    pub const fn container_generation(self) -> u64 {
+        self.container_generation
+    }
+
+    #[must_use]
+    pub const fn record_offset(self) -> u64 {
+        self.record_offset
+    }
+
+    #[must_use]
+    pub const fn record_length(self) -> u32 {
+        self.record_length
+    }
+
+    #[must_use]
+    pub const fn record_crc32c(self) -> u32 {
+        self.record_crc32c
     }
 }
 

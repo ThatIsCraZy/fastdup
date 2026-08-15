@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use fastdup_store::StorageIo;
+use fastdup_store::{MAX_STORAGE_RANGE_BYTES, StorageIo};
 
 /// The operation attempted at one deterministic fault-injection position.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +20,8 @@ pub enum StorageOperation {
     WriteAt,
     SetLen,
     Read,
+    ObjectLen,
+    ReadExactAt,
     ListNames,
     SyncFile,
     PublishNoreplace,
@@ -178,6 +180,59 @@ impl StorageIo for MemoryStorageIo {
                     io::Error::new(io::ErrorKind::NotFound, "file inode does not exist")
                 })?
         };
+        state.finish(position)?;
+        Ok(bytes)
+    }
+
+    fn object_len(&self, name: &str) -> io::Result<u64> {
+        let mut state = self.lock();
+        let position = state.begin(StorageOperation::ObjectLen)?;
+        validate_name(name)?;
+        let file_id = state.file_id(name)?;
+        let length = state
+            .files
+            .get(&file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file inode does not exist"))?
+            .live
+            .len();
+        state.finish(position)?;
+        u64::try_from(length).map_err(|_| io::Error::other("in-memory file length exceeds u64"))
+    }
+
+    fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let mut state = self.lock();
+        let position = state.begin(StorageOperation::ReadExactAt)?;
+        validate_name(name)?;
+        if length > MAX_STORAGE_RANGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded storage read exceeds the hard allocation limit",
+            ));
+        }
+        let offset = usize::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset is too large"))?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read range overflows"))?;
+        let file_id = state.file_id(name)?;
+        let source = if let Some(substitution) = &state.read_substitution {
+            substitution
+        } else {
+            &state
+                .files
+                .get(&file_id)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "file inode does not exist")
+                })?
+                .live
+        };
+        let bytes = source.get(offset..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "bounded storage read exceeds the current object length",
+            )
+        })?;
+        let bytes = bytes.to_vec();
         state.finish(position)?;
         Ok(bytes)
     }

@@ -2,10 +2,14 @@
 
 //! Durable repository-to-POSIX mount orchestration.
 
+mod checkpoint;
+
+pub use checkpoint::{DurableNamespace, DurableNamespaceError};
+
 use std::fmt;
 use std::sync::Arc;
 
-use fastdup_format::{ManifestExtent, ManifestLeaf};
+use fastdup_format::{ManifestExtent, ManifestLeaf, NamespaceRoot};
 use fastdup_posix::{
     CommittedEntry, CommittedFile, CommittedInode, CommittedNamespaceSnapshot, Namespace,
     NamespaceConfig, PosixError,
@@ -28,6 +32,12 @@ use fastdup_store::{
 /// Returns generation recovery, Manifest dependency, or POSIX snapshot
 /// validation failures. A missing Commit WAL or empty repository returns
 /// `Ok(None)`.
+///
+/// # Panics
+///
+/// Panics only if the Store returns an internally inconsistent opaque graph
+/// proof whose inode order or lengths disagree with its verified Namespace
+/// Root.
 pub fn recover_mount<M, C>(
     config: NamespaceConfig,
     generations: &GenerationRepository<M>,
@@ -37,13 +47,52 @@ where
     M: StorageIo,
     C: Clone + Send + Sync + StorageIo + 'static,
 {
-    let Some(recovered) = generations.recover_latest_with_data(containers)? else {
+    let Some(recovered) = generations.recover_latest_with_verified_files(containers)? else {
         return Ok(None);
     };
-    let root = recovered.namespace_root();
+    let (generation, verified_files) = recovered.into_parts();
+    let high_water = generation.inode_reservation_end_high_water();
+    let root = generation.namespace_root();
+    let mut files = Vec::new();
+    files
+        .try_reserve_exact(verified_files.len())
+        .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
+    for (inode, verified) in root.inodes().iter().zip(verified_files) {
+        assert_eq!(
+            verified.inode(),
+            inode.inode(),
+            "ASSERT: recovered DATA proof order must match the Namespace Root"
+        );
+        assert_eq!(
+            verified.manifest().file_length(),
+            inode.logical_size(),
+            "ASSERT: recovered DATA proof length must match the durable inode"
+        );
+        files.push(
+            Arc::new(ManifestCommittedFile::from_verified(verified.into_file()))
+                as Arc<dyn CommittedFile>,
+        );
+    }
 
-    let mut inodes = Vec::new();
-    inodes
+    namespace_from_files(config, root, high_water, high_water, files, false).map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn namespace_from_root<M, C>(
+    config: NamespaceConfig,
+    root: &NamespaceRoot,
+    next_inode: u64,
+    inode_reservation_end: u64,
+    generations: &GenerationRepository<M>,
+    containers: &ContainerRepository<C>,
+    writable: bool,
+) -> Result<Namespace, MountError>
+where
+    M: StorageIo,
+    C: Clone + Send + Sync + StorageIo + 'static,
+{
+    let mut files = Vec::new();
+    files
         .try_reserve_exact(root.inodes().len())
         .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
     for inode in root.inodes() {
@@ -53,6 +102,34 @@ where
         }
         let file = Arc::new(ManifestCommittedFile::new(manifest, containers.clone())?)
             as Arc<dyn CommittedFile>;
+        files.push(file);
+    }
+    namespace_from_files(
+        config,
+        root,
+        next_inode,
+        inode_reservation_end,
+        files,
+        writable,
+    )
+}
+
+fn namespace_from_files(
+    config: NamespaceConfig,
+    root: &NamespaceRoot,
+    next_inode: u64,
+    inode_reservation_end: u64,
+    files: Vec<Arc<dyn CommittedFile>>,
+    writable: bool,
+) -> Result<Namespace, MountError> {
+    if files.len() != root.inodes().len() {
+        return Err(MountError::Posix(PosixError::Io));
+    }
+    let mut inodes = Vec::new();
+    inodes
+        .try_reserve_exact(root.inodes().len())
+        .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
+    for (inode, file) in root.inodes().iter().zip(files) {
         inodes.push(CommittedInode::new(
             inode.inode(),
             inode.mode(),
@@ -76,17 +153,18 @@ where
         )?);
     }
 
-    let reservation_end = recovered.inode_reservation_end_high_water();
     let snapshot = CommittedNamespaceSnapshot::new(
-        reservation_end,
-        reservation_end,
+        next_inode,
+        inode_reservation_end,
         root.namespace_mutation_sequence(),
         inodes,
         entries,
     )?;
-    Namespace::from_committed(config, snapshot)
-        .map(Some)
-        .map_err(Into::into)
+    if writable {
+        Namespace::from_committed_writable(config, snapshot).map_err(Into::into)
+    } else {
+        Namespace::from_committed(config, snapshot).map_err(Into::into)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -95,7 +173,7 @@ struct AllocatedRange {
     end: u64,
 }
 
-struct ManifestCommittedFile<I> {
+pub(crate) struct ManifestCommittedFile<I> {
     file: VerifiedManifestFile<I>,
     logical_size: u64,
     allocated_bytes: u64,
@@ -103,14 +181,19 @@ struct ManifestCommittedFile<I> {
 }
 
 impl<I: StorageIo> ManifestCommittedFile<I> {
-    fn new(
+    pub(crate) fn new(
         manifest: ManifestLeaf,
         containers: ContainerRepository<I>,
     ) -> Result<Self, ManifestReadError> {
-        let logical_size = manifest.file_length();
+        let file = VerifiedManifestFile::new(manifest, containers)?;
+        Ok(Self::from_verified(file))
+    }
+
+    pub(crate) fn from_verified(file: VerifiedManifestFile<I>) -> Self {
+        let logical_size = file.manifest().file_length();
         let mut allocated_ranges = Vec::<AllocatedRange>::new();
         let mut extent_start = 0_u64;
-        for extent in manifest.extents() {
+        for extent in file.manifest().extents() {
             let length = extent_length(extent);
             let extent_end = extent_start
                 .checked_add(length)
@@ -138,13 +221,12 @@ impl<I: StorageIo> ManifestCommittedFile<I> {
                 .checked_add(range.end - range.start)
                 .expect("ASSERT: allocated Manifest subset cannot exceed file length")
         });
-        let file = VerifiedManifestFile::new(manifest, containers)?;
-        Ok(Self {
+        Self {
             file,
             logical_size,
             allocated_bytes,
             allocated_ranges,
-        })
+        }
     }
 }
 

@@ -412,13 +412,15 @@ connected as a verified acceleration structure.
 `VerifiedManifestFile` is the implemented immutable read seam for one decoded
 Manifest and one Container Repository. `fastdup-appliance::recover_mount`
 type-erases it behind the POSIX `CommittedFile` boundary and mounts the recovered
-Namespace through the same dispatch seam as FUSE. That recovered checkpoint is
-read-only until the commit scheduler and fresh Inode-range reservation are
-wired. Construction collects the DATA
-dependencies, rejects conflicting logical lengths for the same Chunk ID, and
-batch-verifies that every dependency has a matching record in a fully verified
-published container. It retains the Manifest and repository, not a materialized
-copy of the logical file.
+Namespace through the same dispatch seam as FUSE. The read-only recovery path
+and the durable commit path consume opaque inode-associated readers emitted by
+the same complete graph verification, avoiding an immediate duplicate
+Container scan. The standalone constructor still collects DATA dependencies,
+rejects conflicting logical lengths for the same Chunk ID, and batch-verifies
+that every dependency has a matching record in a fully verified published
+container. No caller can construct the graph-proof type or attach an unrelated
+Manifest. A reader retains the Manifest and repository, not a materialized copy
+of the logical file.
 
 `read_at(offset, length)` accepts at most 1 MiB per request, clips at EOF, and
 reconstructs only the requested range. HOLE produces zero bytes and FILL
@@ -526,13 +528,13 @@ repository can advance again.
 
 This implemented checkpoint intentionally does **not** provide:
 
-- wiring a recovered Namespace Root to `VerifiedManifestFile`, the POSIX/FUSE
-  namespace, or a committed-data overlay behind that interface;
-- the ten-second durability scheduler, mutation-age
-  admission backpressure, or stronger behavior from `fsync`;
-- an indexed DATA-location lookup: `_with_data` commit/recovery and
-  `VerifiedManifestFile` are implemented, but dependency and demand lookup scan
-  published containers and the plain methods deliberately refuse DATA;
+- a fake-clock proof that the implemented five-second scheduler and admission
+  backpressure always meet the ten-second contract under the supported bounded
+  I/O envelope; `fsync` deliberately remains no stronger than that contract;
+- an indexed DATA-location lookup: proof-carrying `_with_data`
+  commit/recovery and `VerifiedManifestFile` are implemented, but dependency
+  and demand lookup scan published containers and the plain methods deliberately
+  refuse DATA;
 - Manifest inner nodes, bounded path rewriting, or files whose complete recipe
   exceeds one 16-MiB Metadata Object;
 - a scalable Namespace tree: NamespaceRoot v1 rewrites one flat bounded object,

@@ -1,6 +1,6 @@
 # POSIX conformance plan
 
-Status: test plan with a first volatile model/FUSE checkpoint.
+Status: test plan with volatile and bounded durable RAW checkpoints.
 
 This document defines how the POSIX surface will be tested. It is not a claim
 that the listed operations are implemented, and it does not redefine their
@@ -18,17 +18,15 @@ write and recovery rules in ADRs
 
 ## Current boundary
 
-The repository implements the Stage-1 immutable Container Store
-described by [Container Store v1](../specs/container-store-v1.md) and the bytes
-described by [Container v1](../specs/container-v1.md). It now also implements
-the deliberately non-durable namespace and low-level FUSE checkpoint recorded
-in [Volatile POSIX/FUSE checkpoint](posix-fuse-checkpoint.md). It does not yet
-implement:
-
-- manifests, Namespace Roots, Commit Records, or a Commit WAL;
-- a durable dirty-extent live view or the ten-second scheduler;
-- nested directories, rename, links, locks, xattrs/ACLs, durable sparse extents,
-  or allocation operations.
+The repository implements the Stage-1 immutable Container Store, versioned
+Manifest leaves, flat Namespace Roots, Commit Records and WAL, the shared
+namespace/FUSE seam, and the bounded RAW orchestration recorded in
+[Durable POSIX/FUSE checkpoint](durable-posix-checkpoint.md). A five-second
+runtime loop and mutation-admission gate are connected to the real mount. It
+does not yet implement bounded Manifest path rewriting, persistent normal-path
+Exact/Location lookup, fake-clock deadline proof, process-kill coverage, nested
+directories, rename, links, locks, xattrs/ACLs, allocation operations, or the
+remaining scalable durable sparse tree.
 
 `fastdup_store::StorageIo` is an internal adapter for publishing canonical
 container files. Its `create_new`, `write_at`, `set_len`, `read`, sync, and
@@ -147,9 +145,12 @@ the POSIX mount as the source of storage semantics.
 
 ## Current truthful result
 
-The public namespace seam and a real raw FUSE mount now exist, and their narrow
-live-behavior checkpoint is green. No P0 row is complete because durable
-generations, deadline admission, crash/remount, sparse extents, and the remaining
-namespace operations are absent. Container Store, deterministic namespace, and
-real-mount results remain separate evidence. The next integrity checkpoint is a
-faultable durable namespace generation behind the same semantic seam.
+The public namespace seam, real FUSE mount, atomic commit cut, immutable
+generation writer, recovery adapter, Inode reservation, scheduler gate, sparse
+RAW checkpoint, and deterministic storage-operation fault matrix are green.
+This provides direct M/F evidence and durable-operation fault evidence for the
+implemented subset. No P0 row is complete as an MVP claim: fake-clock and
+`SIGKILL` deadline coverage, scalable bounded Manifest updates, Exact Dedup in
+the durable path, atomic rename, allocation operations, links, and corruption
+scrub remain absent. Container Store, deterministic namespace, durable
+orchestration, and real-mount results remain separately reported evidence.

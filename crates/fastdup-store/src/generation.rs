@@ -1,4 +1,4 @@
-use crate::{ContainerRepository, StorageIo, StoreError};
+use crate::{ContainerRepository, StorageIo, StoreError, VerifiedManifestFile};
 use fastdup_format::{
     COMMIT_RECORD_BYTES, CommitFormatError, CommitRecord, CommitRecordHash,
     MAX_METADATA_OBJECT_BYTES, ManifestExtent, ManifestLeaf, MetadataFormatError, MetadataObjectId,
@@ -13,6 +13,18 @@ const COMMIT_WAL_NAME: &str = "commit.wal";
 const METADATA_SUFFIX: &str = ".fdm";
 const MAX_COMMIT_WAL_BYTES: usize = 64 * 1_024 * 1_024;
 const WRITE_BLOCK_BYTES: usize = 4_096;
+type VerifiedManifests = Vec<(u64, ManifestLeaf)>;
+
+struct RecoveredGraph {
+    generation: RecoveredGeneration,
+    manifests: VerifiedManifests,
+}
+
+struct SelectedGraph {
+    record: CommitRecord,
+    root: NamespaceRoot,
+    manifests: VerifiedManifests,
+}
 
 #[derive(Clone, Debug)]
 pub struct GenerationRepository<I> {
@@ -107,6 +119,40 @@ impl<I: StorageIo> GenerationRepository<I> {
         self.commit_verified_namespace(root)
     }
 
+    /// Commits a DATA-bearing Namespace Root and returns the Manifest readers
+    /// proven by the same complete graph verification.
+    ///
+    /// The returned readers do not repeat dependency discovery. Demand reads
+    /// still re-verify the selected immutable Container before returning data.
+    /// Callers cannot construct this proof or attach an unrelated Manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph, container, bounded-allocation, publication, WAL-chain,
+    /// or durability errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a prior internal invariant panic poisoned the single-writer
+    /// commit lock.
+    pub fn commit_namespace_with_verified_files<J>(
+        &self,
+        root: &NamespaceRoot,
+        containers: &ContainerRepository<J>,
+    ) -> Result<CommittedDataGeneration<J>, GenerationError>
+    where
+        J: Clone + StorageIo,
+    {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: generation commit lock poisoned");
+        let manifests = self.verify_manifest_graph(root, Some(containers))?;
+        let files = verified_files(manifests, containers)?;
+        let record = self.commit_verified_namespace(root)?;
+        Ok(CommittedDataGeneration { record, files })
+    }
+
     fn commit_verified_namespace(
         &self,
         root: &NamespaceRoot,
@@ -190,6 +236,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: generation commit lock poisoned");
         self.recover_latest_using::<I>(None)
+            .map(|recovered| recovered.map(|graph| graph.generation))
     }
 
     /// Recovers the newest generation whose metadata graph and reachable DATA
@@ -212,12 +259,46 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: generation commit lock poisoned");
         self.recover_latest_using(Some(containers))
+            .map(|recovered| recovered.map(|graph| graph.generation))
+    }
+
+    /// Recovers the newest complete DATA generation together with Manifest
+    /// readers proven by that same forward graph walk.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O, format, container-integrity, graph-completeness, or
+    /// bounded-allocation errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a prior internal invariant panic poisoned the single-writer
+    /// commit lock.
+    pub fn recover_latest_with_verified_files<J>(
+        &self,
+        containers: &ContainerRepository<J>,
+    ) -> Result<Option<RecoveredDataGeneration<J>>, GenerationError>
+    where
+        J: Clone + StorageIo,
+    {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: generation commit lock poisoned");
+        let Some(graph) = self.recover_latest_using(Some(containers))? else {
+            return Ok(None);
+        };
+        let files = verified_files(graph.manifests, containers)?;
+        Ok(Some(RecoveredDataGeneration {
+            generation: graph.generation,
+            files,
+        }))
     }
 
     fn recover_latest_using<J: StorageIo>(
         &self,
         containers: Option<&ContainerRepository<J>>,
-    ) -> Result<Option<RecoveredGeneration>, GenerationError> {
+    ) -> Result<Option<RecoveredGraph>, GenerationError> {
         let wal = match self.storage.read(COMMIT_WAL_NAME) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -245,7 +326,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .max()
             .ok_or(GenerationError::NoRecoverableGeneration)?;
         let mut previous: Option<(CommitRecord, NamespaceRoot)> = None;
-        let mut selected: Option<(CommitRecord, NamespaceRoot)> = None;
+        let mut selected: Option<SelectedGraph> = None;
         for record in &prefix.records {
             if record.policy_set() != self.supported_policy {
                 return Err(GenerationError::UnsupportedPolicySet {
@@ -264,11 +345,11 @@ impl<I: StorageIo> GenerationRepository<I> {
             {
                 break;
             }
-            match self.verify_manifest_graph(&root, containers) {
-                Ok(()) => {}
+            let manifests = match self.verify_manifest_graph(&root, containers) {
+                Ok(manifests) => manifests,
                 Err(error) if error.allows_generation_fallback() => break,
                 Err(error) => return Err(error),
-            }
+            };
             match &previous {
                 Some((previous_record, previous_root)) => {
                     if verify_generation_transition_pair(*previous_record, previous_root, &root)
@@ -281,17 +362,24 @@ impl<I: StorageIo> GenerationRepository<I> {
                 None => {}
             }
             previous = Some((*record, root.clone()));
-            selected = Some((*record, root));
+            selected = Some(SelectedGraph {
+                record: *record,
+                root,
+                manifests,
+            });
         }
-        let Some((record, namespace_root)) = selected else {
+        let Some(selected) = selected else {
             return Err(GenerationError::NoRecoverableGeneration);
         };
-        Ok(Some(RecoveredGeneration {
-            record,
-            namespace_root,
-            wal_tail: prefix.tail,
-            rejected_newer_generations: latest_generation - record.generation(),
-            inode_reservation_end_high_water,
+        Ok(Some(RecoveredGraph {
+            generation: RecoveredGeneration {
+                record: selected.record,
+                namespace_root: selected.root,
+                wal_tail: prefix.tail,
+                rejected_newer_generations: latest_generation - selected.record.generation(),
+                inode_reservation_end_high_water,
+            },
+            manifests: selected.manifests,
         }))
     }
 
@@ -384,8 +472,12 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         root: &NamespaceRoot,
         containers: Option<&ContainerRepository<J>>,
-    ) -> Result<(), GenerationError> {
+    ) -> Result<Vec<(u64, ManifestLeaf)>, GenerationError> {
         let mut required_chunks = BTreeMap::new();
+        let mut manifests = Vec::new();
+        manifests
+            .try_reserve_exact(root.inodes().len())
+            .map_err(|_| GenerationError::OutOfMemory)?;
         for inode in root.inodes() {
             let bytes = self.read_metadata(inode.manifest_root())?;
             let manifest = ManifestLeaf::decode(&bytes)?;
@@ -414,15 +506,16 @@ impl<I: StorageIo> GenerationRepository<I> {
                     });
                 }
             }
+            manifests.push((inode.inode(), manifest));
         }
         if required_chunks.is_empty() {
-            return Ok(());
+            return Ok(manifests);
         }
         let Some(containers) = containers else {
             return Err(GenerationError::DataLocationsNotConnected);
         };
         containers.verify_required_chunks(&required_chunks)?;
-        Ok(())
+        Ok(manifests)
     }
 
     fn verify_generation_transition(
@@ -524,6 +617,91 @@ pub struct RecoveredGeneration {
     inode_reservation_end_high_water: u64,
 }
 
+/// One committed DATA generation and the Manifest readers proven by its graph
+/// verification.
+#[derive(Debug)]
+pub struct CommittedDataGeneration<I> {
+    record: CommitRecord,
+    files: Vec<VerifiedCommittedFile<I>>,
+}
+
+/// One recovered DATA generation and the Manifest readers proven by the same
+/// forward recovery graph walk.
+#[derive(Debug)]
+pub struct RecoveredDataGeneration<I> {
+    generation: RecoveredGeneration,
+    files: Vec<VerifiedCommittedFile<I>>,
+}
+
+impl<I> RecoveredDataGeneration<I> {
+    #[must_use]
+    pub const fn generation(&self) -> &RecoveredGeneration {
+        &self.generation
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (RecoveredGeneration, Vec<VerifiedCommittedFile<I>>) {
+        (self.generation, self.files)
+    }
+}
+
+impl<I> CommittedDataGeneration<I> {
+    #[must_use]
+    pub const fn record(&self) -> CommitRecord {
+        self.record
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (CommitRecord, Vec<VerifiedCommittedFile<I>>) {
+        (self.record, self.files)
+    }
+}
+
+/// One inode-associated Manifest reader that can only originate from a
+/// complete committed DATA-graph verification.
+#[derive(Debug)]
+pub struct VerifiedCommittedFile<I> {
+    inode: u64,
+    file: VerifiedManifestFile<I>,
+}
+
+impl<I: StorageIo> VerifiedCommittedFile<I> {
+    #[must_use]
+    pub const fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    #[must_use]
+    pub const fn manifest(&self) -> &ManifestLeaf {
+        self.file.manifest()
+    }
+
+    #[must_use]
+    pub fn into_file(self) -> VerifiedManifestFile<I> {
+        self.file
+    }
+}
+
+fn verified_files<I>(
+    manifests: Vec<(u64, ManifestLeaf)>,
+    containers: &ContainerRepository<I>,
+) -> Result<Vec<VerifiedCommittedFile<I>>, GenerationError>
+where
+    I: Clone + StorageIo,
+{
+    let mut files = Vec::new();
+    files
+        .try_reserve_exact(manifests.len())
+        .map_err(|_| GenerationError::OutOfMemory)?;
+    for (inode, manifest) in manifests {
+        files.push(VerifiedCommittedFile {
+            inode,
+            file: VerifiedManifestFile::from_verified_graph(manifest, containers.clone()),
+        });
+    }
+    Ok(files)
+}
+
 impl RecoveredGeneration {
     #[must_use]
     pub const fn record(&self) -> CommitRecord {
@@ -598,6 +776,7 @@ pub enum GenerationError {
     WalNeedsRepair(WalTail),
     NoRecoverableGeneration,
     DataLocationsNotConnected,
+    OutOfMemory,
     ManifestLengthMismatch {
         inode: u64,
         inode_length: u64,
@@ -624,7 +803,8 @@ impl GenerationError {
                 StoreError::Format(_)
                 | StoreError::InvalidPublishedName(_)
                 | StoreError::PublishedIdentityMismatch { .. }
-                | StoreError::MissingVerifiedChunk { .. },
+                | StoreError::MissingVerifiedChunk { .. }
+                | StoreError::ExactLocationMismatch,
             ) => true,
             Self::CommitFormat(_)
             | Self::Store(StoreError::PublishVerificationMismatch)
@@ -643,7 +823,8 @@ impl GenerationError {
             | Self::PublishVerificationMismatch
             | Self::WalNeedsRepair(_)
             | Self::NoRecoverableGeneration
-            | Self::DataLocationsNotConnected => false,
+            | Self::DataLocationsNotConnected
+            | Self::OutOfMemory => false,
         }
     }
 }
