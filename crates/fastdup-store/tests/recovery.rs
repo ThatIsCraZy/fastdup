@@ -77,6 +77,8 @@ fn verification_returns_compact_metadata_without_retaining_container_payloads() 
     assert_eq!(verified[0].container_id(), id(0xa1));
     assert_eq!(verified[0].container_generation(), 21);
     assert_eq!(verified[0].chunk_count(), 1);
+    assert_eq!(verified[0].raw_record_count(), 1);
+    assert_eq!(verified[0].zstd_record_count(), 0);
     assert_eq!(verified[0].file_length(), 12_288);
     assert_eq!(verified[1].container_id(), id(0xb2));
     assert_eq!(verified[1].container_generation(), 22);

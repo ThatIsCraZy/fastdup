@@ -45,14 +45,28 @@ becomes durable. A collision never replaces existing bytes. Failure may leave a
 temporary sealed orphan, but metadata commit has not started and recovery does
 not treat that name as published.
 
-## Startup recovery
+## Allocator startup discovery
+
+Writable startup lists and sorts canonical published names, then obtains each
+object's physical length and reads only its fixed 4-KiB Header and 4-KiB Footer.
+Both blocks must validate and agree on Container ID, generation, layout, and
+length; the ID must also match the filename. The maximum observed generation is
+the allocator high-water. A malformed claimed name or invalid envelope fails
+startup rather than being skipped.
+
+This 8-KiB-per-Container envelope proof is sufficient only to skip monotonically
+past every observed durable generation. It does not verify the Container hash,
+Recovery Index, records, or Chunk IDs and cannot authorize a Location. Complete
+verification remains mandatory for publication, scrub, and Exact-Index rebuild.
+
+## Whole-container recovery and scrub
 
 Recovery lists and sorts directory names, then handles each canonical published
 name in Container-ID order. Before allocating file contents, the production XFS
 reader rejects a declared length above 64 MiB and caps the actual read at 64 MiB
 plus one byte to close a metadata/read race. Every accepted published file then
 passes the complete Container v1 verifier, including all CRCs, the recovery-index
-bijection, every RAW Chunk ID, and whole-container BLAKE3.
+bijection, every decoded RAW/Zstd Chunk ID, and whole-container BLAKE3.
 
 The scalable verification API decodes one container at a time and retains only
 its ID, generation, chunk count, and file length. Its payload memory is therefore
@@ -76,6 +90,7 @@ ignored if their names do not claim the `.fdc` suffix.
 | --- | --- | --- | --- |
 | published bytes are the intended fully sealed image | exact production re-read, ID, and generation before file sync | complete Container v1 decode | substitute another valid image on writer reread; publication fails |
 | filename identity equals durable identity | both names derive from writer ID | compare canonical name with verified header/footer ID | rename a valid file to another canonical ID; recovery fails |
+| allocator never reuses an observed generation | consume one scalar generation under the checkpoint lock | pair object length, Header, Footer, and filename before taking the maximum generation | fail-after publication followed by restart skips the ambiguous durable generation without reading its payload |
 | publication never replaces | `RENAME_NOREPLACE` | at most one canonical name per ID | duplicate publish returns `AlreadyExists`; original remains byte-valid |
 | no unbounded read from corrupt length | writer preflights 64 MiB | metadata check plus capped read | sparse file above 64 MiB fails before format decode |
 | acknowledged namespace entry is durable | file sync, atomic rename, directory sync | enumerate durable directory state | effective directory sync followed by returned error still recovers a valid orphan |
@@ -85,3 +100,22 @@ directory state. It exhaustively injects both failure-before and
 operation-effective-then-failure at every current publication operation. Torn
 writes and real power-loss testing remain additional Stage-0 work; they do not
 weaken the required outcomes above.
+
+## Bounded Exact-Location demand reads
+
+An Exact Index hit does not use startup's whole-object reader. The demand-read
+path derives the canonical Container name from the candidate, obtains the exact
+physical length, then reads only the 4-KiB Footer, 4-KiB Header, and the selected
+at-most-1-MiB Encoding Record. The Header and Footer are independently
+checksummed and must agree on Container ID, generation, layout, and physical
+length before the candidate range is used. The selected independent RAW or Zstd
+Record must then match every candidate coordinate, codec, Chunk-Table entry, and
+stored Record CRC. The complete bounded Compression Region is decoded and the
+selected logical Chunk is rehashed before any byte is returned.
+
+This is record-level demand verification, not a claim that the complete
+Container hash or Recovery Index was reread. Whole-container hashing and the
+Recovery-Index bijection remain mandatory for publication, rebuild, and scrub.
+Consequently the bounded reader does not emit `VerifiedChunkLocation`, which is
+reserved for complete Container verification. Persistent envelope, Record, or
+Chunk failures return a `VERIFY` error without partial data.

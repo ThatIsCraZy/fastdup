@@ -2,7 +2,8 @@
 
 Status: draft, pre-stable format; canonical record writer/reader, Run Set
 publication, activation, bounded lookup, recovery, and fail-before/fail-after
-crash matrices are implemented.
+crash matrices are implemented, including replacement activation after bounded
+Run compaction.
 
 This WAL selects exactly one immutable
 [Exact Index Run Set v1](exact-index-run-set-v1.md). It is acceleration state,
@@ -109,6 +110,30 @@ only for this activated Run Set; a negative Exact Index result is never proof
 that content does not exist. Every returned ACTIVE candidate remains
 unverified until its immutable Container coordinates, record checksum, decoded
 length, and BLAKE3 Chunk ID are paired on the data path.
+
+The implemented indexed Chunk reader merges repeated physical Locations in
+this newest-Run-first order, attempts at most one preferred and one alternate
+ACTIVE Location, and demand-verifies each through the bounded Container reader.
+An index lookup failure, negative result, or unusable bounded candidates falls
+back to the fully verified Container scan. This slow path is intentionally
+expensive: it preserves the rule that losing every index object cannot make a
+valid committed Manifest unreadable. It is not the normal hit path.
+
+Each committed Manifest reader pins one immutable `ActivatedExactIndex`; a later
+activation cannot change a read halfway through its physical-location view.
+The writable checkpoint publisher activates a successor Run Set after new
+Containers are durable and before publishing the Namespace generation, then
+installs that new pin behind subsequently committed readers. An activation that
+outlives a failed Namespace commit may name durable orphan Locations but cannot
+make them live. Activation failure marks acceleration degraded and leaves the
+Namespace commit independent.
+
+The current writer compacts four oldest same-level dependencies before a
+successor would approach the 64-Run reader bound. Compacted Runs and the new Run
+Set are immutable RoW objects. A deterministic fail-before/fail-after matrix
+over source audit, output publication, and replacement activation observes only
+the prior active Run Set or the complete replacement; no mixed dependency graph
+is recoverable.
 
 ## ASSERT, VERIFY, and AUDIT pairing
 

@@ -114,6 +114,19 @@ pub fn volatile_mount_options() -> MountOptions {
     options
 }
 
+async fn dispatch_mutation_with_backpressure<R>(
+    namespace: &Namespace,
+    mut mutation: impl FnMut() -> Result<R, PosixError>,
+) -> Result<R, PosixError> {
+    loop {
+        namespace.wait_for_mutation_admission().await?;
+        match mutation() {
+            Err(PosixError::Again) => {}
+            result => return result,
+        }
+    }
+}
+
 impl Filesystem for FuseFilesystem {
     async fn init(&self, _request: Request) -> fuse3::Result<ReplyInit> {
         Ok(ReplyInit {
@@ -211,17 +224,19 @@ impl Filesystem for FuseFilesystem {
             });
         };
         let handle = handle.map(handle_from_raw).transpose()?;
-        let reply = self
-            .namespace
-            .dispatch(
-                context(request),
+        let request = context(request);
+        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                request,
                 Operation::SetLength {
                     inode,
                     handle,
                     length,
                 },
             )
-            .map_err(errno)?;
+        })
+        .await
+        .map_err(errno)?;
         Ok(ReplyAttr {
             ttl: ZERO_TTL,
             attr: fuse_attr(expect_attr(&reply)),
@@ -229,36 +244,45 @@ impl Filesystem for FuseFilesystem {
     }
 
     async fn unlink(&self, request: Request, parent: u64, name: &OsStr) -> fuse3::Result<()> {
-        let reply = self
-            .namespace
-            .dispatch(
-                context(request),
+        let parent = inode_from_raw(parent)?;
+        let request = context(request);
+        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                request,
                 Operation::Unlink {
-                    parent: inode_from_raw(parent)?,
+                    parent,
                     name: name.as_bytes(),
                 },
             )
-            .map_err(errno)?;
+        })
+        .await
+        .map_err(errno)?;
         expect_empty(&reply);
         Ok(())
     }
 
     async fn open(&self, request: Request, inode: u64, flags: u32) -> fuse3::Result<ReplyOpen> {
         let inode = inode_from_raw(inode)?;
-        let reply = self
-            .namespace
-            .dispatch(
-                context(request),
+        let options = open_options(flags)?;
+        let truncate =
+            flags & u32::try_from(libc::O_TRUNC).expect("ASSERT: O_TRUNC must be nonnegative") != 0;
+        let request = context(request);
+        let operation = || {
+            self.namespace.dispatch(
+                request,
                 Operation::Open {
                     inode,
-                    options: open_options(flags)?,
-                    truncate: flags
-                        & u32::try_from(libc::O_TRUNC)
-                            .expect("ASSERT: O_TRUNC must be nonnegative")
-                        != 0,
+                    options,
+                    truncate,
                 },
             )
-            .map_err(errno)?;
+        };
+        let reply = if options.access == AccessMode::ReadOnly && !truncate {
+            operation()
+        } else {
+            dispatch_mutation_with_backpressure(&self.namespace, operation).await
+        }
+        .map_err(errno)?;
         let handle = expect_opened(&reply);
         Ok(ReplyOpen {
             fh: handle.get(),
@@ -304,18 +328,22 @@ impl Filesystem for FuseFilesystem {
         if write_flags & fuse3::raw::flags::FUSE_WRITE_CACHE != 0 {
             return Err(libc::EIO.into());
         }
-        let reply = self
-            .namespace
-            .dispatch(
-                context(request),
+        let inode = inode_from_raw(inode)?;
+        let handle = handle_from_raw(handle)?;
+        let request = context(request);
+        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                request,
                 Operation::Write {
-                    inode: inode_from_raw(inode)?,
-                    handle: handle_from_raw(handle)?,
+                    inode,
+                    handle,
                     offset,
                     data,
                 },
             )
-            .map_err(errno)?;
+        })
+        .await
+        .map_err(errno)?;
         let (bytes, _) = expect_written(&reply);
         Ok(ReplyWrite { written: bytes })
     }
@@ -492,26 +520,27 @@ impl Filesystem for FuseFilesystem {
     ) -> fuse3::Result<ReplyCreated> {
         let parent = inode_from_raw(parent)?;
         let options = open_options(flags)?;
-        let reply = self
-            .namespace
-            .dispatch(
-                context(request),
+        let mode = u16::try_from(mode & 0o7777).expect("ASSERT: masked mode must fit in u16");
+        let exclusive =
+            flags & u32::try_from(libc::O_EXCL).expect("ASSERT: O_EXCL is nonnegative") != 0;
+        let truncate =
+            flags & u32::try_from(libc::O_TRUNC).expect("ASSERT: O_TRUNC must be nonnegative") != 0;
+        let request = context(request);
+        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                request,
                 Operation::Create {
                     parent,
                     name: name.as_bytes(),
-                    mode: u16::try_from(mode & 0o7777)
-                        .expect("ASSERT: masked mode must fit in u16"),
+                    mode,
                     options,
-                    exclusive: flags
-                        & u32::try_from(libc::O_EXCL).expect("ASSERT: O_EXCL is nonnegative")
-                        != 0,
-                    truncate: flags
-                        & u32::try_from(libc::O_TRUNC)
-                            .expect("ASSERT: O_TRUNC must be nonnegative")
-                        != 0,
+                    exclusive,
+                    truncate,
                 },
             )
-            .map_err(errno)?;
+        })
+        .await
+        .map_err(errno)?;
         let (entry, handle) = expect_created(reply);
 
         Ok(ReplyCreated {
@@ -745,12 +774,13 @@ fn release_lookup_reference(namespace: &Namespace, inode: InodeId) {
 
 #[cfg(test)]
 mod tests {
-    use super::{INTERNAL_CONTEXT, LookupTrackingStream};
+    use super::{INTERNAL_CONTEXT, LookupTrackingStream, dispatch_mutation_with_backpressure};
     use crate::{
         Namespace, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE, Reply,
     };
     use futures_util::StreamExt;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn dropped_readdirplus_item_rolls_back_its_lookup_pin() {
@@ -828,5 +858,32 @@ mod tests {
             ),
             Err(PosixError::NoEntry)
         );
+    }
+
+    #[tokio::test]
+    async fn fuse_mutation_waits_for_transient_backpressure_instead_of_returning_again() {
+        let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
+        namespace.pause_mutation_admission();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task_namespace = Arc::clone(&namespace);
+        let task_attempts = Arc::clone(&attempts);
+        let mutation = tokio::spawn(async move {
+            dispatch_mutation_with_backpressure(&task_namespace, || {
+                task_attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(Reply::Empty)
+            })
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert!(!mutation.is_finished());
+
+        namespace.resume_mutation_admission();
+        assert_eq!(
+            mutation.await.expect("mutation task must not panic"),
+            Ok(Reply::Empty)
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

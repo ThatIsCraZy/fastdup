@@ -4,10 +4,10 @@ Status: draft, pre-`format-v1-stable`
 
 This document specifies the first durable fastdup data container. It makes the
 accepted container, logical-chunk, exact-index, durability, and integrity ADRs
-concrete for Stage 1. Stage 1 writes one RAW logical chunk per Encoding Record.
-Fields needed to evolve the record envelope are present, but this revision does
-not assign codec IDs or decoding semantics for compression, multi-chunk regions,
-dictionaries, prefix encoding, or delta encoding.
+concrete for Stage 1 and the first adaptive-compression checkpoint. Version 1
+assigns independent RAW records and dependency-free Zstd level-3 Compression
+Regions containing one or more complete logical chunks. Dictionaries, prefix
+encoding, and delta encoding remain unassigned.
 
 Canonical filesystem naming and startup discovery are defined separately in
 [`container-store-v1.md`](container-store-v1.md).
@@ -128,7 +128,7 @@ Every record starts with this fixed 128-byte header.
 | 0 | 8 | `magic` | ASCII bytes `FDRECD01` |
 | 8 | 2 | `record_version` | `1` |
 | 10 | 2 | `header_length` | `128` |
-| 12 | 2 | `codec_id` | `1` = RAW |
+| 12 | 2 | `codec_id` | `1` = RAW, `2` = dependency-free Zstd |
 | 14 | 2 | `dependency_kind` | `0` = none |
 | 16 | 8 | `required_flags` | zero |
 | 24 | 8 | `compatible_flags` | zero from v1 writers |
@@ -139,10 +139,10 @@ Every record starts with this fixed 128-byte header.
 | 48 | 4 | `chunk_table_offset` | `128` |
 | 52 | 2 | `chunk_entry_size` | `64` |
 | 54 | 2 | reserved | zero |
-| 56 | 4 | `chunk_count` | `1` for RAW v1 |
+| 56 | 4 | `chunk_count` | `1` for RAW; nonzero for Zstd |
 | 60 | 4 | `record_crc32c` | record checksum described below |
 | 64 | 32 | `dependency_id` | zero for `dependency_kind = none` |
-| 96 | 16 | `codec_parameters` | zero for RAW v1; semantics intentionally unassigned |
+| 96 | 16 | `codec_parameters` | all zero for RAW; signed little-endian `i32` level `3` followed by twelve zero bytes for Zstd |
 | 112 | 16 | reserved | zero |
 
 The Chunk Table begins immediately after the record header. Each fixed 64-byte
@@ -163,8 +163,7 @@ gap-free, non-overlapping partition of `[0, decoded_length)`: the first
 entry, every length is nonzero and at most `MAX_LOGICAL_CHUNK_BYTES`, and the
 final checked end equals `decoded_length`. No logical chunk spans records.
 
-For the only codec defined by this revision, RAW, all of these stronger rules
-also apply:
+For RAW, all of these stronger rules also apply:
 
 ```text
 chunk_count       = 1
@@ -180,16 +179,34 @@ The RAW payload is the logical chunk byte-for-byte. Bytes from the checked end o
 the payload to `record_length` are zero padding. The complete `record_length`,
 including this padding, is at most `MAX_RECORD_BYTES`.
 
+For codec `2`, the Chunk Table partitions a decoded region of at most 512 KiB.
+`payload_offset` is exactly `128 + chunk_count * 64`; the payload is one complete
+dependency-free Zstd frame encoded at level 3. Decompression must finish at
+exactly `decoded_length`, after which every table slice is independently hashed
+and compared with its stored Chunk ID. The writer groups only adjacent complete
+chunks and never permits one chunk to span records. The complete padded record
+remains bounded by `MAX_RECORD_BYTES`.
+
+The adaptive v1 writer compares one Zstd record with the complete set of RAW
+records for the same chunks, including record headers, Chunk Tables, and record
+alignment. Zstd is selected only when it saves at least 4,096 bytes and at least
+3%; otherwise each chunk remains one RAW record. Recovery-Index cost is equal
+per logical chunk in both alternatives.
+
+Independent regions may be encoded by scoped workers. Each worker owns disjoint
+region ordinals and private output buffers; the writer merges completed records
+strictly by original ordinal before computing Container layout, Recovery Index,
+Footer hash, or CRCs. Worker count and completion order therefore do not affect
+the encoded Container bytes.
+
 The Record CRC covers all `record_length` bytes, including the header, Chunk
 Table, stored payload, and zero padding, with bytes `[60, 64)` of the record
 treated as zero. The Chunk ID is a separate end-to-end check over decoded bytes;
 a passing Record CRC never substitutes for the Chunk-ID check.
 
-Fields for multiple Chunk Table entries, a single dependency ID, and codec
-parameters deliberately establish a bounded future envelope. They do not make
-those encodings valid in this revision. A v1 parser rejects any `codec_id` other
-than RAW, any nonzero dependency kind or ID, any `chunk_count` other than one,
-and any nonzero codec-parameter byte.
+The dependency field remains reserved: both codecs require dependency kind zero
+and a zero dependency ID. A v1 parser rejects unknown codec IDs, unknown codec
+parameters, and every nonzero required flag or reserved byte.
 
 ## Recovery Index
 
@@ -302,7 +319,8 @@ The writer performs these steps in order:
    header last. Reassert the already known exact file length; on XFS this also
    releases speculative unwritten allocation beyond EOF.
 6. Re-read and validate the sealed structure using the reader parser, including
-   all Record CRCs, the Recovery Index bijection, and every RAW Chunk ID. This is
+   all Record CRCs, codec completion, the Recovery Index bijection, and every
+   decoded Chunk ID. This is
    the writer-side paired verification.
 7. `fsync` the container file. Only now is it `SEALED`.
 8. Atomically rename it, without replacement, from its temporary name to its
@@ -352,8 +370,9 @@ allocations:
 5. Walk exactly `record_count` consecutive records from offset 4,096. Before
    reading a record body, validate its fixed header and prove that its length is
    aligned, at most `MAX_RECORD_BYTES`, and ends no later than `index_offset`.
-   Validate record structure, zero padding, Record CRC, RAW rules, and Chunk
-   Table partitioning. The walk must end exactly at `index_offset`.
+   Validate record structure, zero padding, Record CRC, codec-specific rules,
+   exact decoded length, and Chunk Table partitioning. The walk must end exactly
+   at `index_offset`.
 6. Validate the Index Header and prove its length equation from `entry_count`.
    Check zero footer padding, Index CRC, sort order, and the complete
    index-to-record bijection without trusting index offsets first.
@@ -377,7 +396,7 @@ The required paired checks are:
 | offsets and lengths do not overflow or escape the file | checked before every write | checked before every allocation/read/seek | mutate each length and boundary bit; expect VERIFY, never panic or OOM |
 | only complete sealed files can be published | final parser pass, file `fsync`, rename, directory `fsync` | reject `BUILDING`, bad/missing footer, and unpublished paths | crash after every write/sync/rename; accept only the outcomes listed above |
 | Record CRC covers exactly stored bytes | compute after all record bytes are final | recompute before decode | flip header, table, payload, and padding bytes independently |
-| Chunk ID identifies exact decoded bytes | compute from input chunk and re-read after encode | recompute before returning bytes | rehash every RAW payload; a mismatch quarantines that Location |
+| Chunk ID identifies exact decoded bytes | compute from input chunk and re-read after encode | recompute after RAW copy or Zstd decode before returning bytes | rehash every decoded slice; a mismatch quarantines that Location |
 | Recovery Index is a complete, sorted bijection | build from final record tables and cross-check | resolve and compare every entry with its record/table | delete, duplicate, reorder, or redirect one entry; expect VERIFY |
 | header/footer describe the same immutable object | emit duplicate values from one construction state | compare every duplicate after both block CRCs pass | corrupt each copy independently; do not choose one copy as canonical |
 | the footer authenticates the complete sealed byte sequence | hash the finalized byte sequence using the zeroing rule | recompute for whole-container verification | flip any byte class, including zero padding and reserved fields |
@@ -395,13 +414,9 @@ and offline scrub.
 This Stage-1 specification intentionally leaves the following decisions open
 rather than assigning accidental durable meanings:
 
-- Numeric codec IDs and exact parameters for Zstd, Zstd-dictionary,
-  Zstd-prefix, and Delta; whether a later compatible specification can reuse
-  this record envelope or needs a new record/container format version.
-- Multi-chunk Compression Region limits beyond the structural partition and
-  `MAX_DECODED_RECORD_BYTES` envelope. Version 1 readers accept only one RAW
-  chunk even though `chunk_count`, table sizing, and decoded slice fields are
-  present.
+- Numeric codec IDs and exact parameters for Zstd-dictionary, Zstd-prefix, and
+  Delta; whether a later compatible specification can reuse this record
+  envelope or needs a new record/container format version.
 - Numeric dependency kinds and the durable representation of Dictionary
   Objects. The single 32-byte dependency field is sufficient for the accepted
   depth-one direction, but its future semantics must be specified with the

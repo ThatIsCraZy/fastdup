@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::ops::Bound::Excluded;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
+use tokio::sync::Notify;
 
 mod fuse_adapter;
 mod versioned_file;
@@ -527,9 +529,10 @@ pub struct CommittedNamespaceSnapshot {
 impl CommittedNamespaceSnapshot {
     /// Bundles one already verified committed namespace for a POSIX mount.
     ///
-    /// The current recover adapter mounts committed snapshots read-only until
-    /// the checkpoint scheduler and reservation publisher are connected. No
-    /// identifier is guessed from visible inode records.
+    /// The recovery-only adapter mounts this form read-only. The durable
+    /// appliance uses [`Namespace::from_committed_writable`] only after it has
+    /// published a fresh Inode reservation. No identifier is guessed from
+    /// visible inode records.
     ///
     /// # Errors
     ///
@@ -978,10 +981,88 @@ struct Catalog {
 }
 
 #[derive(Debug)]
+#[repr(align(64))]
+struct DirtyPayloadTracker {
+    checkpointable_active_bytes: AtomicU64,
+    wake_at_bytes: AtomicU64,
+    changed: Notify,
+}
+
+impl Default for DirtyPayloadTracker {
+    fn default() -> Self {
+        Self {
+            checkpointable_active_bytes: AtomicU64::new(0),
+            wake_at_bytes: AtomicU64::new(u64::MAX),
+            changed: Notify::new(),
+        }
+    }
+}
+
+impl DirtyPayloadTracker {
+    fn replace(&self, before: u64, after: u64) {
+        match after.cmp(&before) {
+            std::cmp::Ordering::Greater => {
+                let added = after - before;
+                let update = self.checkpointable_active_bytes.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |current| current.checked_add(added),
+                );
+                assert!(
+                    update.is_ok(),
+                    "ASSERT: checkpointable dirty payload counter must not overflow"
+                );
+                let current = update
+                    .expect("ASSERT: successful dirty payload update must expose its prior value")
+                    .checked_add(added)
+                    .expect("ASSERT: preflighted dirty payload addition cannot overflow");
+                self.notify_if_watermark_reached(current);
+            }
+            std::cmp::Ordering::Less => {
+                let removed = before - after;
+                let update = self.checkpointable_active_bytes.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |current| current.checked_sub(removed),
+                );
+                assert!(
+                    update.is_ok(),
+                    "ASSERT: checkpointable dirty payload removal must be accounted"
+                );
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+
+    fn load(&self) -> u64 {
+        self.checkpointable_active_bytes.load(Ordering::Acquire)
+    }
+
+    fn notify_if_watermark_reached(&self, current: u64) {
+        loop {
+            let wake_at = self.wake_at_bytes.load(Ordering::Acquire);
+            if current < wake_at {
+                return;
+            }
+            if self
+                .wake_at_bytes
+                .compare_exchange(wake_at, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.changed.notify_waiters();
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Namespace {
     config: NamespaceConfig,
     mutations_supported: bool,
     mutations_admitted: RwLock<bool>,
+    admission_changed: Notify,
+    dirty_payload: DirtyPayloadTracker,
     catalog: RwLock<Catalog>,
 }
 
@@ -1017,6 +1098,8 @@ impl Namespace {
             config,
             mutations_supported: true,
             mutations_admitted: RwLock::new(true),
+            admission_changed: Notify::new(),
+            dirty_payload: DirtyPayloadTracker::default(),
             catalog: RwLock::new(Catalog {
                 next_inode: ROOT_INODE.get() + 1,
                 inode_reservation_end: u64::MAX,
@@ -1160,6 +1243,8 @@ impl Namespace {
             config,
             mutations_supported: mutations_enabled,
             mutations_admitted: RwLock::new(mutations_enabled),
+            admission_changed: Notify::new(),
+            dirty_payload: DirtyPayloadTracker::default(),
             catalog: RwLock::new(Catalog {
                 next_inode: snapshot.next_inode,
                 inode_reservation_end: snapshot.inode_reservation_end,
@@ -1202,6 +1287,29 @@ impl Namespace {
             .mutations_admitted
             .write()
             .expect("ASSERT: mutation admission lock poisoned") = true;
+        self.admission_changed.notify_waiters();
+    }
+
+    /// Waits until transient checkpoint backpressure permits a mutation.
+    ///
+    /// The synchronous model seam deliberately continues to return
+    /// [`PosixError::Again`] while admission is closed. The kernel-FUSE edge
+    /// uses this notification to turn that internal state into transparent
+    /// POSIX backpressure instead of leaking `EAGAIN` to ordinary file-copy
+    /// programs.
+    pub(crate) async fn wait_for_mutation_admission(&self) -> Result<(), PosixError> {
+        if !self.mutations_supported {
+            return Err(PosixError::ReadOnly);
+        }
+        loop {
+            let changed = self.admission_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.mutation_admission_open() {
+                return Ok(());
+            }
+            changed.await;
+        }
     }
 
     #[must_use]
@@ -1216,6 +1324,51 @@ impl Namespace {
                 .mutations_admitted
                 .read()
                 .expect("ASSERT: mutation admission lock poisoned")
+    }
+
+    /// Returns unique DATA bytes retained by active, reachable dirty extents.
+    ///
+    /// Overwrites of an already dirty range are counted once, sparse holes are
+    /// not counted, and freezing a commit cut transfers its bytes out of this
+    /// active-pressure counter. The value deliberately excludes encoder
+    /// buffers and an already frozen epoch.
+    #[must_use]
+    pub fn checkpointable_dirty_payload_bytes(&self) -> u64 {
+        self.dirty_payload.load()
+    }
+
+    /// Waits until active checkpointable dirty DATA reaches `threshold`.
+    ///
+    /// The notification is edge-independent: a caller arriving after the
+    /// threshold was crossed returns immediately. This is the scheduler seam
+    /// used to start an early durability checkpoint without polling.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `threshold` is zero because every namespace would satisfy
+    /// such a policy continuously.
+    pub async fn wait_for_checkpointable_dirty_payload(&self, threshold: u64) -> u64 {
+        assert!(
+            threshold > 0,
+            "ASSERT: dirty checkpoint threshold must be nonzero"
+        );
+        loop {
+            let changed = self.dirty_payload.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let current = self.dirty_payload.load();
+            if current >= threshold {
+                return current;
+            }
+            self.dirty_payload
+                .wake_at_bytes
+                .fetch_min(threshold, Ordering::AcqRel);
+            let current = self.dirty_payload.load();
+            if current >= threshold {
+                return current;
+            }
+            changed.await;
+        }
     }
 
     /// Freezes one retryable atomic generation candidate.
@@ -1299,7 +1452,10 @@ impl Namespace {
                 FileKind::Regular,
                 "ASSERT: v1 committed child must be a regular file"
             );
+            let dirty_before = state.data.active_dirty_payload_bytes();
             let (file, frozen_epoch) = state.data.freeze_for_commit(token);
+            let dirty_after = state.data.active_dirty_payload_bytes();
+            self.dirty_payload.replace(dirty_before, dirty_after);
             inodes.push(CommitInode {
                 inode,
                 mode: state.mode,
@@ -1521,7 +1677,7 @@ impl Namespace {
             if request.exclusive {
                 return Err(PosixError::Exists);
             }
-            return open_existing_for_create(&mut catalog, inode, request);
+            return open_existing_for_create(&mut catalog, inode, request, &self.dirty_payload);
         }
         create_new_file(&mut catalog, key, request)
     }
@@ -1561,7 +1717,12 @@ impl Namespace {
 
         let handle = allocate_handle(&mut catalog)?;
         if let Some(sequence) = next_sequence {
+            let dirty_before = state.data.active_dirty_payload_bytes();
             state.data.truncate(0, sequence)?;
+            let dirty_after = state.data.active_dirty_payload_bytes();
+            if state.link_count > 0 {
+                self.dirty_payload.replace(dirty_before, dirty_after);
+            }
             state.mutation_sequence = sequence;
         }
         drop(state);
@@ -1639,7 +1800,12 @@ impl Namespace {
             .checked_add(u64::from(!data.is_empty()))
             .ok_or(PosixError::NoSpace)?;
 
+        let dirty_before = state.data.active_dirty_payload_bytes();
         state.data.write(offset, data, next_sequence)?;
+        let dirty_after = state.data.active_dirty_payload_bytes();
+        if state.link_count > 0 {
+            self.dirty_payload.replace(dirty_before, dirty_after);
+        }
         state.mutation_sequence = next_sequence;
 
         Ok(Reply::Written {
@@ -1679,7 +1845,12 @@ impl Namespace {
             .mutation_sequence
             .checked_add(1)
             .ok_or(PosixError::NoSpace)?;
+        let dirty_before = state.data.active_dirty_payload_bytes();
         state.data.truncate(length, next_sequence)?;
+        let dirty_after = state.data.active_dirty_payload_bytes();
+        if state.link_count > 0 {
+            self.dirty_payload.replace(dirty_before, dirty_after);
+        }
         state.mutation_sequence = next_sequence;
         Ok(Reply::Attr(state.attributes(inode)))
     }
@@ -1745,8 +1916,11 @@ impl Namespace {
             .mutation_sequence
             .checked_add(1)
             .ok_or(PosixError::NoSpace)?;
+        let dirty_before = state.data.active_dirty_payload_bytes();
+        state.data.advance_mutation_sequence(next_sequence);
         state.link_count = 0;
         state.mutation_sequence = next_sequence;
+        self.dirty_payload.replace(dirty_before, 0);
         drop(state);
         let removed = catalog.entries.remove(&key);
         assert_eq!(removed, Some(inode), "ASSERT: validated name disappeared");
@@ -2015,6 +2189,7 @@ fn open_existing_for_create(
     catalog: &mut Catalog,
     inode: InodeId,
     request: CreateRequest<'_>,
+    dirty_payload: &DirtyPayloadTracker,
 ) -> Result<Reply, PosixError> {
     let object = catalog
         .inodes
@@ -2047,7 +2222,14 @@ fn open_existing_for_create(
         .ok_or(PosixError::NoSpace)?;
     let handle = allocate_handle(catalog)?;
     if let Some(sequence) = next_sequence {
+        let dirty_before = state.data.active_dirty_payload_bytes();
         state.data.truncate(0, sequence)?;
+        let dirty_after = state.data.active_dirty_payload_bytes();
+        assert!(
+            state.link_count > 0,
+            "ASSERT: create-existing target must remain linked"
+        );
+        dirty_payload.replace(dirty_before, dirty_after);
         state.mutation_sequence = sequence;
     }
     let attr = state.attributes(inode);

@@ -1,6 +1,6 @@
 # POSIX conformance plan
 
-Status: test plan with volatile and bounded durable RAW checkpoints.
+Status: test plan with volatile and bounded durable RAW/Zstd checkpoints.
 
 This document defines how the POSIX surface will be tested. It is not a claim
 that the listed operations are implemented, and it does not redefine their
@@ -20,13 +20,18 @@ write and recovery rules in ADRs
 
 The repository implements the Stage-1 immutable Container Store, versioned
 Manifest leaves, flat Namespace Roots, Commit Records and WAL, the shared
-namespace/FUSE seam, and the bounded RAW orchestration recorded in
+namespace/FUSE seam, and the bounded adaptive RAW/Zstd orchestration recorded in
 [Durable POSIX/FUSE checkpoint](durable-posix-checkpoint.md). A five-second
-runtime loop and mutation-admission gate are connected to the real mount. It
-does not yet implement bounded Manifest path rewriting, persistent normal-path
-Exact/Location lookup, fake-clock deadline proof, process-kill coverage, nested
-directories, rename, links, locks, xattrs/ACLs, allocation operations, or the
-remaining scalable durable sparse tree.
+runtime loop, event-driven 512-MiB active-Dirty-DATA pressure trigger, and
+mutation-admission gate are connected to the real mount.
+FastCDC-v1, automatic level-zero Exact-Index publication, cross-checkpoint Exact
+Hits, and bounded parallel RAW/Zstd region encoding are connected. It does not
+yet implement hierarchical Manifest path rewriting, Exact-Index compaction,
+per-region serialized Chunking Profile IDs, fake-clock deadline proof,
+process-kill coverage, nested directories, rename, links, locks, xattrs/ACLs,
+allocation operations, or the remaining scalable durable sparse tree. When a
+valid Run Set already exists, normal POSIX reads use bounded verified Locations
+and transparently fall back to Container scans on index loss or corruption.
 
 `fastdup_store::StorageIo` is an internal adapter for publishing canonical
 container files. Its `create_new`, `write_at`, `set_len`, `read`, sync, and
@@ -86,7 +91,7 @@ results.
 | Acknowledged writes | Every successfully acknowledged write is visible to subsequent reads while the daemon remains alive. | After each write reply, read the affected and neighboring ranges through the same and independent handles; bytes equal the ordered mutation overlay, including overlaps. | M |
 | Mutation ordering | Accepted content and metadata mutations form contiguous per-inode sequence prefixes; a later overlapping write wins. | Record assigned sequence numbers in a test observer, permute worker completion, and compare the live and committed bytes with a serial mutation oracle. | M |
 | Ten-second durability | Every acknowledged mutation becomes part of a recoverable commit within the accepted deadline. | With a fake clock, advance to the deadline and crash at every commit operation; with a real mount, kill after the deadline plus tolerance. Recovery must include the mutation in one wholly valid generation. | M |
-| Admission backpressure | The daemon does not acknowledge new mutations when it cannot preserve the deadline. | Stall durable progress before the configured warning point, advance the fake clock, and prove later calls fail or remain unacknowledged while already admitted mutations retain priority. | M |
+| Admission backpressure | The daemon does not acknowledge new mutations when it cannot preserve the deadline or active Dirty DATA reaches 512 MiB. | Stall durable progress before the configured warning point, advance the fake clock, and prove later calls fail or remain unacknowledged while already admitted mutations retain priority. Separately cross the exact byte-pressure edge, require an immediate checkpoint/gate without timer polling, and prove sparse holes and repeated overwrites do not trigger early. | M |
 | `fsync`, `fdatasync`, `O_SYNC`, `O_DSYNC` | Sync calls do not promise a stronger crash boundary than the system window, while acknowledged bytes remain live-readable. | Sync immediately after a write, then verify exact live reads. A crash inside the permitted window may recover the complete old or new generation; a crash after the deadline must recover the write. Never accept a mixed generation. | M |
 | Interrupted ingest | A long open ingest recovers its newest wholly committed prefix. | Append uniquely numbered records for longer than one commit interval and kill at every commit phase. Recovered bytes end exactly at a committed record boundary and equal a prefix of acknowledged bytes. | K |
 | Atomic user rename | Rename replacement is entirely before or entirely after in both namespace and inode state. | Rename a source over an existing target while both have open handles and hardlinks. After each fault, compare paths, inode IDs, link counts, and contents with exactly the pre- or post-rename oracle. | M |
@@ -147,7 +152,8 @@ the POSIX mount as the source of storage semantics.
 
 The public namespace seam, real FUSE mount, atomic commit cut, immutable
 generation writer, recovery adapter, Inode reservation, scheduler gate, sparse
-RAW checkpoint, and deterministic storage-operation fault matrix are green.
+RAW/Zstd checkpoint, pinned Exact-Index demand reads, and deterministic
+storage-operation fault matrix are green.
 This provides direct M/F evidence and durable-operation fault evidence for the
 implemented subset. No P0 row is complete as an MVP claim: fake-clock and
 `SIGKILL` deadline coverage, scalable bounded Manifest updates, Exact Dedup in

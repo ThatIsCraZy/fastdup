@@ -1,4 +1,6 @@
-use fastdup_format::{ContainerId, FormatError, SealedContainer};
+use fastdup_format::{
+    ContainerId, ExactIndexEntry, FormatError, SealedContainer, SealedContainerDescriptor,
+};
 
 #[test]
 fn sealed_container_round_trips_records_through_its_recovery_index() {
@@ -29,6 +31,37 @@ fn sealed_container_round_trips_records_through_its_recovery_index() {
             .expect("indexed xyz"),
         b"xyz"
     );
+}
+
+#[test]
+fn bounded_descriptor_pairs_the_envelope_and_fully_verifies_one_candidate_record() {
+    let encoded = SealedContainer::encode(
+        ContainerId::new([0x34; 16]).expect("nonzero container id"),
+        19,
+        &[b"first bounded record", b"requested bounded record"],
+    )
+    .expect("valid container");
+    let complete = SealedContainer::decode(&encoded).expect("worked Container is fully valid");
+    let candidate = ExactIndexEntry::from_verified_raw(complete.raw_locations()[1])
+        .expect("build the candidate from full rebuild evidence");
+    let footer_offset = encoded.len() - 4_096;
+
+    let descriptor = SealedContainerDescriptor::decode(
+        &encoded[..4_096],
+        &encoded[footer_offset..],
+        u64::try_from(encoded.len()).expect("worked Container length fits u64"),
+    )
+    .expect("bounded reader pairs Header, Footer, and physical length");
+    let range = descriptor
+        .raw_record_range(candidate)
+        .expect("candidate lies in the sealed record region");
+    let start = usize::try_from(range.offset()).expect("worked record offset fits usize");
+    let end = start + range.length();
+    let record = descriptor
+        .decode_raw_candidate(candidate, &encoded[start..end])
+        .expect("bounded reader checks Record CRC and complete Chunk ID");
+
+    assert_eq!(record.payload(), b"requested bounded record");
 }
 
 #[test]

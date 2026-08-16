@@ -3,7 +3,8 @@
 Status: draft, pre-stable format. The canonical full-run writer/reader, bounded
 Header/Footer/page reader, immutable publication repository, Run Set
 activation, and bounded active lookup are implemented and corruption/fault
-tested; compaction and benchmark gates are not yet complete.
+tested. A bounded tiered compactor is implemented; streaming/partitioned
+compaction and benchmark gates are not yet complete.
 
 This document defines an immutable sorted-run building block for the persistent
 Exact Index. It follows
@@ -147,13 +148,17 @@ newest transition in this run:
 | 84 | 4 | `record_crc32c` | equals Container Record Header |
 | 88 | 4 | `record_decoded_length` | equals Container Record Header |
 | 92 | 4 | `record_payload_length` | equals Container Record Header |
-| 96 | 32 | `dependency_id` | zero for independent RAW; otherwise exact dependency identity |
+| 96 | 32 | `dependency_id` | zero for independent RAW/Zstd; otherwise exact dependency identity |
 
-Version 1 writers initially emit only independent RAW records: `codec_id=1`,
-`chunk_ordinal=0`, `decoded_offset=0`, and zero `dependency_id`. Retaining the
-complete record coordinates avoids redefining Location identity when bounded
-range reads replace current whole-container reads. A reader rejects unsupported
-codec/dependency combinations; it does not reinterpret them as RAW.
+The current writer emits independent RAW (`codec_id=1`) and dependency-free
+Zstd (`codec_id=2`) records. RAW requires `chunk_ordinal=0` and
+`decoded_offset=0`; Zstd retains the exact Chunk-Table ordinal, decoded offset,
+record decoded length, and stored payload length. Both require a zero
+`dependency_id`. A bounded demand read validates the Container envelope, reads
+one complete selected record, pairs every coordinate with its Record Header and
+Chunk Table, decodes the complete Compression Region, and rehashes the selected
+logical Chunk. Unsupported codec/dependency combinations are rejected rather
+than reinterpreted as RAW.
 
 Entries are strictly sorted by unsigned bytewise `chunk_id`, numeric
 `logical_length`, unsigned bytewise `container_id`, `record_offset`, and
@@ -226,6 +231,28 @@ because Containers and Manifests are authoritative. Conversely, an ACTIVE index
 entry for an otherwise unreachable durable orphan is not live until a committed
 Manifest names its Chunk ID.
 
+## Current bounded compaction policy
+
+Compaction changes no v1 bytes. It is a cold-path writer policy pinned by the
+appliance Policy Set:
+
+1. after publishing one new level-zero Run, group active Runs by level;
+2. select the four oldest generations at the lowest level having four Runs;
+3. audit each selected Header, Footer, page, cross-page order, pinned Run
+   Reference, and complete Run hash;
+4. sort all selected entries by the canonical physical-Location key and source
+   generation descending, retaining only the newest transition for a repeated
+   Location;
+5. build, publish, and writer-reread one Run at `level + 1`; and
+6. repeat for cascading levels before activating one successor Run Set.
+
+The current implementation permits at most 262,144 input entries per merge.
+This bounds transient materialization and output encoding to roughly 100 MiB.
+Crossing the bound fails the nonauthoritative index operation closed and leaves
+the Namespace commit independent. It does not silently discard an input Run.
+A future streaming partitioned compactor must retain the same canonical merge
+and old-or-complete-new activation behavior.
+
 ## Reader, rebuild, and scrub pairing
 
 | Invariant | Writer | Random reader / recovery | Rebuild / offline scrub |
@@ -243,21 +270,22 @@ failure, and Location mismatch are `VERIFY` failures. Full run hash, global
 cross-run length checks, and canonical rebuild comparison are exhaustive AUDIT
 work in tests and scrub.
 
-The current writer exposes `VerifiedRawLocation` only after a complete
-Container-v1 decode has paired Header, Records, Recovery Index, Footer, CRCs,
-container hash, and Chunk IDs. `ExactIndexEntry::from_verified_raw` consumes
-that opaque evidence and rechecks shared coordinate invariants. Tests exhaust
-all truncated prefixes and every single-byte mutation of a two-page run; no
-mutation is accepted and no prefix panics.
+The current writer exposes `VerifiedChunkLocation` only after a complete
+Container-v1 decode has paired Header, RAW/Zstd Records, Recovery Index, Footer,
+CRCs, container hash, decoded partitions, and Chunk IDs.
+`ExactIndexEntry::from_verified` consumes that opaque evidence and rechecks
+shared coordinate invariants. The RAW-only compatibility constructor remains
+for existing tests. Tests exhaust all truncated prefixes and every single-byte
+mutation of a two-page run; no mutation is accepted and no prefix panics.
 
 ## Deferred formats and benchmark parameters
 
 Run Sets and activation records are assigned separately by
 [Exact Index Run Set v1](exact-index-run-set-v1.md) and
 [Exact Index Activation WAL v1](exact-index-activation-v1.md). The following
-are policy/benchmark choices and must not be inferred from this file: level
-count, level size ratio, level-zero cap, compaction
-concurrency, Bloom/Binary-Fuse bits per key, page cache size, sharding prefix,
-prefetch, mmap versus explicit range I/O, and GC retention. CPU multiversioning
-and SIMD filters may accelerate lookup but cannot change canonical keys or
-verification rules.
+are policy/benchmark choices and must not be inferred from the durable bytes:
+the current four-way ratio and 262,144-entry merge bound, future level count and
+partitioning, compaction concurrency, Bloom/Binary-Fuse bits per key, page cache
+size, sharding prefix, prefetch, mmap versus explicit range I/O, and GC
+retention. CPU multiversioning and SIMD filters may accelerate lookup but cannot
+change canonical keys or verification rules.

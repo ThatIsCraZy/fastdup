@@ -4,14 +4,17 @@ Status: experimental and implemented; pre-`format-v1-stable`.
 
 This specification records the exact durable bytes and publication behavior of
 the first metadata-generation checkpoint. It makes the current implementation
-of immutable Manifest leaves, the flat Namespace Root, and the Commit WAL
+of immutable Manifest trees, the flat Namespace Root, and the paired Commit Log
 auditable without claiming the complete POSIX Exact-Dedup MVP.
 
 The governing decisions are [ADR 0011](../adr/0011-use-hierarchical-immutable-manifests.md),
 [ADR 0012](../adr/0012-publish-one-namespace-root-per-commit.md),
 [ADR 0019](../adr/0019-commit-only-after-data-and-metadata-are-durable.md),
 [ADR 0029](../adr/0029-version-writer-policy-without-stranding-old-data.md),
-and [ADR 0034](../adr/0034-reserve-inode-ids-before-visibility.md).
+[ADR 0034](../adr/0034-reserve-inode-ids-before-visibility.md), and
+[ADR 0037](../adr/0037-separate-structural-recovery-from-current-data-proof.md),
+plus the bounded-log protocol in
+[ADR 0039](../adr/0039-rotate-namespace-commit-log-through-paired-slots.md).
 Container data bytes and their separate publication protocol remain defined by
 [Container format v1](container-v1.md) and
 [Container Store v1](container-store-v1.md).
@@ -38,16 +41,20 @@ The implemented constants are:
 | Maximum Metadata Object file length | 16,777,216 bytes (16 MiB) |
 | Manifest payload header | 64 bytes |
 | Manifest extent entry | 64 bytes |
+| Manifest inner-node payload header | 64 bytes |
+| Manifest child-range entry | 64 bytes |
 | Namespace Root payload header | 128 bytes |
 | Durable Inode record | 96 bytes |
 | Namespace Entry fixed header | 24 bytes |
 | Namespace Entry alignment | 8 bytes |
 | Commit Record | 4,096 bytes |
-| Maximum Commit WAL length | 67,108,864 bytes (64 MiB) |
+| Ordinary Commit Log slot length | 262,144 bytes (64 records) |
+| Legacy `commit.wal` migration limit | 67,108,864 bytes (64 MiB) |
 
 ## Generic Metadata Object envelope
 
-Manifest leaves and Namespace Roots use the same content-addressed envelope.
+Manifest leaves, Manifest inner nodes, and Namespace Roots use the same
+content-addressed envelope.
 The file layout is:
 
 ```text
@@ -65,7 +72,7 @@ offset 4,096. Every byte after the payload through EOF is zero.
 | 0 | 8 | `magic` | ASCII `FDMDOBJ1` |
 | 8 | 2 | `format_version` | `1` |
 | 10 | 2 | `header_length` | `4,096` |
-| 12 | 2 | `object_kind` | `1` = Manifest Leaf, `2` = Namespace Root |
+| 12 | 2 | `object_kind` | `1` = Manifest Leaf, `2` = Namespace Root, `3` = Exact Index Run Set, `4` = Manifest Inner Node |
 | 14 | 2 | `object_id_algorithm` | `1` = unkeyed BLAKE3-256 |
 | 16 | 8 | required-flags slot | zero |
 | 24 | 8 | compatible-flags slot | zero |
@@ -98,10 +105,9 @@ agree where that filename is used.
 
 ## Manifest Leaf v1 payload
 
-A Manifest Leaf is Metadata Object kind `1`. It is currently the complete
-Manifest Root for one file; Manifest inner nodes do not yet exist. Its payload
-contains one header followed by `extent_count` fixed entries and no trailing
-bytes:
+A Manifest Leaf is Metadata Object kind `1`. It is either the complete root of
+a small file recipe or a child of a Manifest Inner Node. Its payload contains
+one header followed by `extent_count` fixed entries and no trailing bytes:
 
 ```text
 payload_length = 64 + extent_count * 64
@@ -150,9 +156,45 @@ Chunk ID, zero `chunk_length`, and zero `fill_byte`. FILL requires a zero Chunk
 ID and zero `chunk_length`; all 256 fill-byte values, including zero, are valid.
 FILL remains allocated logical data and is not a sparse HOLE.
 
-The 16-MiB envelope bound permits at most 262,079 extent entries in one current
-leaf. A larger or hierarchical file recipe requires future Manifest inner nodes
-rather than an oversized v1 object.
+The 16-MiB envelope bound permits at most 262,079 extent entries in one leaf.
+The implemented tree publisher uses substantially smaller leaves: it closes a
+leaf at a stable 64-MiB logical window boundary or 1,024 extents, whichever
+comes first after a complete extent. A DATA extent is never split.
+
+## Manifest Inner Node v1 payload
+
+A Manifest Inner Node is Metadata Object kind `4`. Its children are immutable
+Metadata Object IDs and form an exact ordered partition of the node-local
+logical range. Level `0` is reserved for leaves; a level-`1` node names leaves,
+and every higher node names only nodes at exactly one lower level.
+
+The payload equation is `64 + child_count * 64`. Its 64-byte header is:
+
+| Offset | Width | Field | Version 1 requirement |
+| ---: | ---: | --- | --- |
+| 0 | 8 | `magic` | ASCII `FDMANI01` |
+| 8 | 2 | `format_version` | `1` |
+| 10 | 2 | `header_length` | `64` |
+| 12 | 2 | `child_record_length` | `64` |
+| 14 | 2 | `level` | nonzero |
+| 16 | 8 | required-flags slot | zero |
+| 24 | 8 | `file_length` | nonzero node-local logical length |
+| 32 | 4 | `child_count` | nonzero number of child records |
+| 36 | 4 | `payload_length` | exact header-plus-record length |
+| 40 | 24 | reserved | zero |
+
+Each 64-byte child record contains `logical_offset` at `0..8`, nonzero
+`logical_length` at `8..16`, the child Metadata Object ID at `16..48`, and 16
+zero reserved bytes. Records start at offset zero, are strictly ordered, and
+cover `[0, file_length)` without gaps or overlap. Count and payload equations
+are proven before allocation.
+
+The publisher uses a maximum fanout of 1,024 and a maximum level of 16. It
+publishes unique children before parents and synchronizes their directory names
+as one batch. Content-identical leaves are published once even when referenced
+at several logical positions. The current compatibility reader traverses and
+verifies the tree before reconstructing the existing flat in-memory recipe;
+fully lazy path reads and mutations are the next scalability slice.
 
 ## Namespace Root v1 payload
 
@@ -289,9 +331,11 @@ record bytes, including the stored Record CRC; it has no additional domain
 prefix. That hash is stored only in the next record.
 
 Generation 1 requires a zero predecessor hash. Every later generation requires
-a nonzero predecessor hash. WAL validation additionally requires record ordinal
-`n` to contain generation `n + 1` and its predecessor hash to equal BLAKE3-256
-of the immediately preceding exact record. Namespace mutation cutoff, inode
+a nonzero predecessor hash. Within one Commit Log slot, every record after the
+first has generation exactly one greater than its predecessor and its predecessor
+hash equals BLAKE3-256 of that immediately preceding exact record. The first
+record may be a bridge copied byte-for-byte from the other slot. Namespace
+mutation cutoff, inode
 reservation end, and inode allocation cursor must each be monotone
 nondecreasing across the structurally valid record chain. A Commit Record
 contains no mutable root pointer and no separately stored self-hash.
@@ -310,7 +354,7 @@ in byte order.
 
 - published Metadata Object: `<object-id>.fdm`
 - temporary Metadata Object: `.<object-id>.building`
-- Commit WAL: `commit.wal`
+- paired Commit Log slots: `commit.wal` and `commit.1.wal`
 
 Metadata publication looks up these exact ASCII names. Recovery follows IDs
 referenced from Commit Records and Namespace Roots; it does not currently scan
@@ -359,15 +403,27 @@ The implemented `commit_namespace` and `commit_namespace_with_data` sequence is:
    DATA Chunk ID with its required logical length. Conflicting lengths for one
    Chunk ID are rejected. The plain method accepts only a graph with no DATA;
    `commit_namespace_with_data` additionally verifies every required Chunk
-   against the supplied durable Container Repository before proceeding.
+   against the supplied durable Container Repository before proceeding. The
+   `_using` variant accepts a complete `RequiredChunkVerifier`; the implemented
+   indexed verifier pairs every positive candidate with bounded immutable
+   Container reads and falls back to one complete verified scan on any miss or
+   unusable candidate.
+   The Appliance's normal in-process successor adapter may satisfy this
+   complete-proof interface compositionally: dependencies in byte-identical
+   prefix/suffix Manifest extents retain the immediately preceding installed
+   generation's complete proof, while every dependency in the changed middle
+   is passed to the ordinary verifier. The adapter asserts that this delta is a
+   subset of the independently reread proposed graph. It is not used by
+   recovery or offline verification.
 2. Encode and publish the complete Namespace Root using the immutable-object
    protocol above.
-3. Ensure `commit.wal` exists. Initial creation sets its length to zero,
-   synchronizes the file, and synchronizes the containing directory. If the WAL
-   name already exists, the implementation checks its bounded size and
-   synchronizes the containing directory again before relying on the name.
-4. Read the complete WAL, reject a length above 64 MiB, and require a wholly
-   clean decoded chain with no torn, invalid, or broken tail.
+3. Ensure both fixed Commit Log names exist. Initial creation sets each length
+   to zero and synchronizes each file, then synchronizes the containing
+   directory. Retry synchronizes the directory again before relying on either
+   live name.
+4. Read both slots, validate their bounded prefixes, and select one unambiguous
+   current chain by the exact bridge-overlap rule in ADR 0039. Require the
+   selected tail to be clean.
 5. For generation 1, require an empty namespace and
    `inode_allocation_cursor == 2`. The root may advance
    `inode_reservation_end`; that reservation-only generation must become
@@ -379,12 +435,12 @@ The implemented `commit_namespace` and `commit_namespace_with_data` sequence is:
 7. Construct a Commit Record using the repository's supported Policy Set and
    the Namespace Root's exact namespace mutation sequence, reservation end, and
    allocation cursor.
-8. Write the record at the prior EOF, set the exact new length, and reject a new
-   length above 64 MiB.
-9. Re-read the complete WAL and require the old prefix unchanged, the appended
-   record byte-exact, and the entire chain clean.
-10. Synchronize `commit.wal`. Only this final successful WAL sync publishes the
-   generation for normal crash recovery.
+8. Below 64 records, append to the selected slot. At 64 records, rewrite only
+   the inactive slot with the exact selected final record as bridge followed by
+   the new record. Set the exact intended length.
+9. Re-read the target slot and require the complete intended bytes and chain.
+10. Synchronize only the target slot. This final file sync is the sole commit
+    point for both ordinary append and rotation.
 
 For every noninitial transition, namespace mutation sequence, reservation end,
 allocation cursor, and every retained inode's mutation sequence are monotone
@@ -394,18 +450,21 @@ generation is forbidden. A newly appearing inode below the previous allocation
 cursor is rejected as ID reuse. Deleting an inode is permitted, but these rules
 prevent it from later reappearing under the consumed ID.
 
-The 64-MiB cap admits exactly 16,384 Commit Records. There is no implemented WAL
-segmentation, rotation, compaction, or automatic tail repair. A dirty tail
-blocks further commits with `WalNeedsRepair`.
+Each ordinary slot is capped at 64 Commit Records. `commit.wal` may exceed this
+only while importing a clean legacy v1 chain and remains bounded by 64 MiB.
+Rotation retains one bridge plus at most 63 newer records. A dirty selected tail
+still blocks further commits with `WalNeedsRepair`.
 
 The normal ordering required by ADR 0019 is data containers, immutable metadata
 objects, then the Commit Record. `commit_namespace_with_data` implements that
 proof boundary by accepting a DATA graph only after all referenced Chunk IDs
 and lengths are found in fully verified, already published containers. The
 plain `commit_namespace` intentionally fails closed on such a graph rather than
-assuming a location source. The current proof is correct but expensive: it
-scans published containers because the future persistent Exact Index is not yet
-connected as a verified acceleration structure.
+assuming a location source. With a healthy activated Exact Index, the appliance
+uses bounded Run pages, Container envelopes, complete selected Records, decoded
+lengths, and BLAKE3 Chunk IDs instead of listing or whole-reading every
+Container. A missing, corrupt, stale, or unsupported candidate triggers one
+complete verified Container scan; an index negative never proves DATA absence.
 
 ### Verified Manifest demand reads
 
@@ -428,9 +487,18 @@ produces the stored byte. For every touched DATA extent, the implementation
 locates the Chunk again and fully verifies its immutable container and exact
 logical length before copying any requested bytes. A post-construction
 container corruption therefore fails the demand read instead of returning
-previously trusted bytes. Both dependency verification and demand location are
-currently full directory/container scans; there is not yet a persistent
-verified Chunk-to-Location index on this path.
+previously trusted bytes. An activated persistent Exact Index can be pinned
+behind the ordinary `read_at` interface. It reads only the paired 4-KiB
+Container Footer, 4-KiB Header, and selected at-most-1-MiB Record before
+rehashing its complete Chunk. Both read-only recovery and the writable FUSE
+appliance pin the newest valid Run Set for the lifetime of installed Manifest
+readers. Missing activation, recovery failure, a negative lookup, or unusable
+candidates fall back to the verified scan without rolling the Namespace back.
+Read-only recovery, writable recovery/reservation, and every later checkpoint
+use the same indexed graph verifier. The only remaining ordinary writable-mount
+directory scan is bounded Container-envelope discovery for the generation
+high-water; healthy indexed checkpoints perform no Container directory listing
+or whole-Container read for graph proof.
 
 ## Crash outcomes
 
@@ -442,10 +510,10 @@ verified Chunk-to-Location index on this path.
   Commit Record still has not been synchronized.
 - A crash after directory synchronization but before WAL publication leaves a
   verified published metadata orphan.
-- A crash during the 4-KiB WAL append may leave the prior clean WAL, a short
-  tail, an invalid complete record, or a complete valid record. Recovery uses
-  only the contiguous valid prefix and independently validates its referenced
-  graph.
+- A crash during an ordinary 4-KiB append or inactive-slot rotation may leave
+  the prior selected slot, a short replacement, an invalid record, or a complete
+  successor. Recovery accepts a successor only after exact bridge continuity
+  and independently validates its referenced graph.
 - A complete record whose synchronization reports failure has an uncertain
   durability outcome. Recovery may select it only if its exact bytes and full
   graph validate after restart; the writer must not infer success from the
@@ -464,63 +532,75 @@ verified Chunk-to-Location index on this path.
 
 Normal recovery performs these steps:
 
-1. Read `commit.wal`. A missing WAL means no generation; an empty WAL also means
-   no generation. Reject a WAL above 64 MiB.
-2. Divide the WAL into complete 4,096-byte records and a possible short tail.
-   Decode records from offset zero. Stop at the first invalid record, unexpected
-   generation, or wrong predecessor hash. Classify remaining bytes as `Clean`,
-   `Torn`, `InvalidRecord`, or `BrokenChain`. A nonempty WAL with no valid first
-   record has no recoverable generation.
+1. Read both canonical Commit Log slots. Two missing or empty slots mean no
+   generation. Reject `commit.1.wal` above 256 KiB and `commit.wal` above the
+   64-MiB legacy migration bound.
+2. Divide each slot into complete 4,096-byte records and a possible short tail.
+   Decode from offset zero, requiring internal generation/hash continuity and
+   monotone fields. Classify remaining bytes as `Clean`, `Torn`,
+   `InvalidRecord`, or `BrokenChain`. A nonempty slot with no valid first record
+   fails closed. Select the higher head only when its first exact record equals
+   the other slot's final exact record; conflicting heads are corruption.
 3. Compute the maximum `inode_reservation_end` over the structurally valid WAL
    prefix. This remains the allocator high-water mark even if graph verification
    later selects an older generation.
-4. Traverse the structurally valid prefix **forward**, oldest to newest. Refuse
-   recovery immediately if any reached record has a Policy Set ID other than
-   the repository's supported Policy Set; do not hide an unknown writer policy
-   by rolling back.
-5. Read `<namespace_root>.fdm`; enforce the 16-MiB bound, generic envelope
-   identity, kind `2`, complete Namespace Root payload invariants, link counts,
-   reservation bound, and allocation cursor bound.
+4. Check the Policy Set ID of every record in the valid WAL record prefix.
+   Refuse recovery immediately if any ID differs from the repository's
+   supported Policy Set; do not hide an unknown writer policy by rolling back.
+5. Build the Recovery Transition Prefix **forward**, oldest to newest. For each
+   record, read `<namespace_root>.fdm`; enforce the 16-MiB bound, generic
+   envelope identity, kind `2`, complete Namespace Root payload invariants,
+   link counts, reservation bound, and allocation cursor bound.
 6. Require the root's namespace mutation sequence, reservation end, and
    allocation cursor to equal all three values copied into the Commit Record.
-7. For every Durable Inode, read `<manifest_root>.fdm`; validate the filename
-   identity, generic envelope, kind `1`, Manifest partition, and equality of
-   Manifest `file_length` with inode `logical_size`. Collect every DATA Chunk ID
-   and exact length. `recover_latest_with_data` verifies them against the
-   supplied Container Repository; plain `recover_latest` fails closed with
-   `DataLocationsNotConnected` if any are present.
-8. Verify the same monotone namespace, reservation, allocation, inode-mutation,
+   Verify the same monotone namespace, reservation, allocation, inode-mutation,
    and never-reuse transition rules as the writer. Generation 1 must have
-   allocation cursor `2` and no visible inode.
-9. After each wholly verified record, advance the selected complete generation.
-   At the first missing or corrupt graph or invalid transition for which
-   fallback is safe, stop the forward walk and retain the immediately preceding
-   complete generation. Do not skip the failed generation and attempt a later
-   root, and never merge a Namespace Root, inode, Manifest, or DATA dependency
-   from different generations.
-10. Report the observed WAL tail, the number of structurally valid generations
-   newer than the selected record, and the prefix reservation high-water mark.
-   If no record has a complete accepted graph, return `NoRecoverableGeneration`
-   rather than exposing a partial namespace.
+   allocation cursor `2` and no visible inode. A missing or corrupt root or an
+   invalid transition ends this prefix because no later transition can be
+   proven.
+7. From that transition prefix, consider only the latest WAL generation and its
+   immediate predecessor, the two generations pinned for atomic recovery.
+   Traverse the available candidates **backward**, newest first. Older WAL
+   history is diagnostic and must not become an implicit snapshot.
+8. For the current candidate, traverse every `<manifest_root>.fdm`; validate
+   filename identity, generic envelope, leaf/inner kind, levels, child ranges,
+   Manifest partitions, and equality of root `file_length` with inode
+   `logical_size`. Collect every DATA Chunk ID and exact length.
+   `recover_latest_with_data` verifies them
+   against the supplied Container Repository. The `_using` recovery path may
+   instead use a complete indexed verifier with verified scan fallback; plain
+   `recover_latest` fails closed with `DataLocationsNotConnected` if any DATA
+   dependency is present.
+9. Select the first candidate whose complete Manifest and DATA graph verifies.
+   An explicitly classified missing or corrupt graph may fall back atomically
+   to the immediately previous candidate. Transient I/O and unsupported
+   capabilities abort recovery. Never merge a Namespace Root, inode, Manifest,
+   or DATA dependency from different generations.
+10. Report the observed WAL tail, the number of valid WAL generations newer
+    than the selected record, and the prefix reservation high-water mark. If
+    neither live candidate has a complete accepted graph, return
+    `NoRecoverableGeneration` rather than exposing a partial namespace or older
+    unpinned history.
 
-Missing objects, format/identity damage, length disagreement, missing verified
-Chunks, or an invalid generation transition permit atomic fallback to the last
-complete earlier graph. Unknown Policy Sets, transient I/O, and using the plain
-recovery method for a DATA-bearing graph are refused rather than classified as
-corruption. Recovery does not truncate or repair the WAL; because commits
-require a clean tail, a separate future repair protocol is required before that
-repository can advance again.
+Missing objects, format/identity damage, length disagreement, or missing
+verified Chunks permit atomic fallback from the current graph to its immediate
+predecessor. Structural root or transition damage truncates the Recovery
+Transition Prefix instead. Unknown Policy Sets, transient I/O, and using the
+plain recovery method for a DATA-bearing graph are refused rather than
+classified as corruption. Recovery does not truncate or repair a dirty selected
+slot; because commits require a clean tail, a separate future repair protocol
+is required before that repository can advance again.
 
 ## Paired invariants and implemented evidence
 
 | Invariant | Writer boundary | Reader/recovery boundary | Fault evidence |
 | --- | --- | --- | --- |
 | Object ID identifies exact kind and payload | derive after canonical payload encoding; re-read exact bytes before sync | recompute domain-separated ID and pair it with every referenced filename | substituted or mutated valid-looking bytes fail identity/equality checks |
-| Manifest is one complete byte-exact recipe | validate extent kinds and full partition before envelope encoding | repeat envelope, entry, offset, length, and partition validation | every truncated prefix and every single-byte mutation is rejected without panic |
+| Manifest is one complete byte-exact recipe | validate leaf extents, inner levels, and full child partitions before child-first publication | repeat envelope, level, child range, extent, length, and partition validation | every inner-node prefix and single-byte mutation is rejected without panic; one changed leaf creates only that leaf and its new root path |
 | Namespace has no dangling or reused inode state | canonicalize, validate target existence, cross-check every link count, and bound every ID below the allocation cursor | reject reordered/duplicate IDs and names, dangling targets, orphans, bad names, decreasing cursors, or IDs reused below a prior cursor | reauthenticated order/count corruption, invalid transitions, and exhaustive truncation/byte corruption are rejected |
 | Inode reservation precedes visibility | generation 1 is reservation-only; later allocation cannot cross the preceding record's durable reservation end | validate forward transitions and retain the structurally valid WAL reservation high-water across graph fallback | premature use of a newly extended range and reuse of a removed inode both fail |
-| Commit Record is atomic visibility | publish and sync dependencies before append; re-read exact append; sync WAL last | accept only a contiguous CRC/hash chain and then verify complete graphs in forward order | fail-before/fail-after publication and WAL operations recover only an older or wholly valid generation |
-| DATA is durable before visibility and verified before reads | `_with_data` commit verifies every referenced ID and length in published containers before WAL append | `_with_data` recovery repeats dependency verification; demand reads re-verify the containing container | missing DATA prevents commit, corrupt newest DATA falls back atomically, and corruption after file construction fails demand reads |
+| Commit Record is atomic visibility | publish and sync dependencies before append or rotation; re-read exact target; sync its slot last | accept only internally valid slots with exact cross-slot bridge continuity, validate transitions forward, then prove live graph candidates backward | exhaustive fail-before/fail-after rotation recovers only the previous or complete next generation; a 16,400-Commit lifetime gate crosses the old cap |
+| DATA is durable before visibility and verified before reads | initial/recovered graphs verify every referenced ID and length; a serialized successor composes unchanged predecessor proof with complete changed-dependency verification before WAL append | recovery completely verifies the selected current/previous candidate; demand reads re-verify the containing container; any unusable index candidate invokes the complete scan | healthy recovery proves only the newest graph, missing newest DATA falls back atomically once, unpinned history is never exposed, index-page corruption takes the scan path, suffix-proof work is independent of preserved-prefix size, and corruption after file construction fails demand reads |
 | Counts cannot select unbounded allocations | preflight payload lengths and record equations | prove counts against the bounded payload before vector allocation | `entry_count = u32::MAX` fails as invalid payload under a constrained address space |
 | Policy selection is explicit | store the configured nonzero Policy Set ID in every record | refuse any reached record whose ID is not exactly supported | an unknown newer policy refuses recovery instead of silently rolling back |
 
@@ -531,17 +611,21 @@ This implemented checkpoint intentionally does **not** provide:
 - a fake-clock proof that the implemented five-second scheduler and admission
   backpressure always meet the ten-second contract under the supported bounded
   I/O envelope; `fsync` deliberately remains no stronger than that contract;
-- an indexed DATA-location lookup: proof-carrying `_with_data`
-  commit/recovery and `VerifiedManifestFile` are implemented, but dependency
-  and demand lookup scan published containers and the plain methods deliberately
-  refuse DATA;
-- Manifest inner nodes, bounded path rewriting, or files whose complete recipe
-  exceeds one 16-MiB Metadata Object;
+- a persistent Container-generation allocator: writable mount still performs
+  one directory and paired Header/Footer envelope scan to recover its generation
+  high-water; when the active Exact Index is healthy, indexed commit/recovery
+  graph proof and demand lookup do not read whole Container payloads for that
+  purpose, while the plain methods deliberately retain the verified
+  scan/refusal behavior;
+- lazy tree-native planning/reads and recipes whose current compatibility
+  flattening exceeds one 16-MiB leaf limit; durable publication already reuses
+  unchanged content-addressed leaves and rewrites only their ancestor path;
 - a scalable Namespace tree: NamespaceRoot v1 rewrites one flat bounded object,
   contains only regular inodes below the implicit root directory, and has no
   nested directories, symlinks, ACLs, xattrs, timestamps, or directory metadata
   record beyond its reservation end and allocation cursor;
-- WAL repair, segmentation, rotation, checkpointing, or growth beyond 64 MiB;
+- automatic dirty-tail repair, an offline paired-slot scrub, or a stable
+  downgrade/format-epoch fence;
 - serialization or transitive verification of the Policy Set itself;
 - durable Appliance Lease enforcement, concurrent-writer coordination,
   metadata GC, data-tier Recovery Checkpoints, or metadata-tier-loss rebuild.

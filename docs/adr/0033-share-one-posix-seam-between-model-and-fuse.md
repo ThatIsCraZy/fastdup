@@ -24,6 +24,14 @@ namespace snapshot and the bounded kernel reply: accepted entries retain their
 FUSE lookup pins, while a pending or unpolled entry is released when the stream
 is dropped.
 
+The model seam reports a temporarily closed mutation gate as `Again`, which
+keeps deterministic admission tests synchronous. The FUSE adapter does not
+leak that state to ordinary POSIX writers: it waits for the admission
+notification and retries the still-unapplied mutation. Read-only opens, reads,
+flush, and sync do not wait behind mutation pressure. The retry is safe because
+`Again` is returned while holding the admission gate, before any mutation is
+applied.
+
 The first mounted checkpoint is explicitly volatile. It disables FUSE
 writeback, sets `DIRECT_IO` and zero attribute/entry TTLs, and implements only
 the operations listed in the POSIX checkpoint report. This safe cache policy is

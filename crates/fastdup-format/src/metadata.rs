@@ -13,6 +13,34 @@ const OBJECT_ID_DOMAIN: &[u8] = b"fastdup-metadata-object-v1\0";
 pub(crate) const MANIFEST_LEAF_KIND: u16 = 1;
 pub(crate) const NAMESPACE_ROOT_KIND: u16 = 2;
 pub(crate) const EXACT_INDEX_RUN_SET_KIND: u16 = 3;
+pub(crate) const MANIFEST_INNER_KIND: u16 = 4;
+
+/// The durable payload kind selected by one verified Metadata Object envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetadataObjectKind {
+    ManifestLeaf,
+    NamespaceRoot,
+    ExactIndexRunSet,
+    ManifestInnerNode,
+    Unknown(u16),
+}
+
+/// Fully verifies a generic Metadata Object and returns its durable payload
+/// kind without decoding that payload's kind-specific fields.
+///
+/// # Errors
+///
+/// Returns any envelope integrity, length, padding, or identity failure.
+pub fn metadata_object_kind(bytes: &[u8]) -> Result<MetadataObjectKind, MetadataFormatError> {
+    let object = decode_metadata_object(None, bytes)?;
+    Ok(match object.kind {
+        MANIFEST_LEAF_KIND => MetadataObjectKind::ManifestLeaf,
+        NAMESPACE_ROOT_KIND => MetadataObjectKind::NamespaceRoot,
+        EXACT_INDEX_RUN_SET_KIND => MetadataObjectKind::ExactIndexRunSet,
+        MANIFEST_INNER_KIND => MetadataObjectKind::ManifestInnerNode,
+        unknown => MetadataObjectKind::Unknown(unknown),
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MetadataObjectId([u8; 32]);
@@ -44,6 +72,7 @@ impl MetadataObjectId {
 
 pub(crate) struct DecodedMetadataObject<'a> {
     pub id: MetadataObjectId,
+    pub kind: u16,
     pub payload: &'a [u8],
 }
 
@@ -142,6 +171,7 @@ pub(crate) fn decode_metadata_object(
     }
     Ok(DecodedMetadataObject {
         id: stored_id,
+        kind: object_kind,
         payload,
     })
 }

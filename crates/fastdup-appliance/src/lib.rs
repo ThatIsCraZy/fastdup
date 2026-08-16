@@ -4,19 +4,23 @@
 
 mod checkpoint;
 
-pub use checkpoint::{DurableNamespace, DurableNamespaceError};
+pub use checkpoint::{
+    CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, DurableNamespace,
+    DurableNamespaceError, ProfiledCheckpoint, checkpoint_policy_set_v1,
+};
 
 use std::fmt;
 use std::sync::Arc;
 
-use fastdup_format::{ManifestExtent, ManifestLeaf, NamespaceRoot};
+use fastdup_format::{ManifestExtent, NamespaceRoot};
 use fastdup_posix::{
     CommittedEntry, CommittedFile, CommittedInode, CommittedNamespaceSnapshot, Namespace,
     NamespaceConfig, PosixError,
 };
 use fastdup_store::{
-    ContainerRepository, GenerationError, GenerationRepository, ManifestReadError, StorageIo,
-    VerifiedManifestFile,
+    ContainerRepository, ExactIndexRunRepository, GenerationError, GenerationRepository,
+    IndexedRequiredChunkVerifier, ManifestReadError, RecoveredDataGeneration, StorageIo,
+    VerifiedCommittedFile, VerifiedManifestFile,
 };
 
 /// Recovers and mounts the newest wholly verified namespace generation.
@@ -24,8 +28,8 @@ use fastdup_store::{
 /// This Adapter is the single Seam between durable format/store types and the
 /// POSIX namespace. It retains immutable Manifest recipes and verified
 /// container access behind [`CommittedFile`] without materializing complete
-/// file bytes. All mutation admission deliberately remains read-only until a
-/// later module wires the commit scheduler and durable Inode reservation.
+/// file bytes. This recovery-only helper deliberately returns a read-only
+/// namespace; [`DurableNamespace`] owns the separately gated writable mount.
 ///
 /// # Errors
 ///
@@ -50,9 +54,100 @@ where
     let Some(recovered) = generations.recover_latest_with_verified_files(containers)? else {
         return Ok(None);
     };
+    mount_recovered(config, recovered, |file| file).map(Some)
+}
+
+/// Recovers a namespace and pins the currently activated Exact Index into its
+/// immutable Manifest readers.
+///
+/// The Exact Index is non-authoritative acceleration state. An absent or
+/// unreadable activation therefore mounts the verified namespace through its
+/// Container-scan fallback instead of rolling metadata back or making content
+/// unavailable. Once recovered, one immutable Run Set is pinned for the
+/// lifetime of every returned committed file reader.
+///
+/// # Errors
+///
+/// Returns only Namespace generation, Manifest dependency, or POSIX snapshot
+/// validation failures. Exact Index recovery failures deliberately disable the
+/// accelerator for this mount.
+///
+/// # Panics
+///
+/// Panics only if the Store returns an internally inconsistent opaque graph
+/// proof whose inode order or lengths disagree with its verified Namespace
+/// Root.
+pub fn recover_mount_with_index<M, C, X>(
+    config: NamespaceConfig,
+    generations: &GenerationRepository<M>,
+    containers: &ContainerRepository<C>,
+    indexes: &ExactIndexRunRepository<X>,
+) -> Result<Option<Namespace>, MountError>
+where
+    M: StorageIo,
+    C: Clone + Send + Sync + StorageIo + 'static,
+    X: Clone + Send + Sync + StorageIo + 'static,
+{
+    let active = indexes.recover_active().ok().flatten().map(Arc::new);
+    let recovered = match &active {
+        Some(index) => {
+            let verifier = IndexedRequiredChunkVerifier::new(containers.clone(), Arc::clone(index));
+            generations.recover_latest_with_verified_files_using(containers, &verifier)?
+        }
+        None => generations.recover_latest_with_verified_files(containers)?,
+    };
+    let Some(recovered) = recovered else {
+        return Ok(None);
+    };
+    mount_recovered(config, recovered, |file| match &active {
+        Some(index) => file.with_active_index(Arc::clone(index)),
+        None => file,
+    })
+    .map(Some)
+}
+
+fn mount_recovered<C, F>(
+    config: NamespaceConfig,
+    recovered: RecoveredDataGeneration<C>,
+    prepare_file: F,
+) -> Result<Namespace, MountError>
+where
+    C: Send + Sync + StorageIo + 'static,
+    F: FnMut(VerifiedManifestFile<C>) -> VerifiedManifestFile<C>,
+{
     let (generation, verified_files) = recovered.into_parts();
     let high_water = generation.inode_reservation_end_high_water();
     let root = generation.namespace_root();
+    namespace_from_verified_files_using(
+        config,
+        root,
+        high_water,
+        high_water,
+        verified_files,
+        false,
+        prepare_file,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn namespace_from_verified_files_using<C, F>(
+    config: NamespaceConfig,
+    root: &NamespaceRoot,
+    next_inode: u64,
+    inode_reservation_end: u64,
+    verified_files: Vec<VerifiedCommittedFile<C>>,
+    writable: bool,
+    mut prepare_file: F,
+) -> Result<Namespace, MountError>
+where
+    C: Send + Sync + StorageIo + 'static,
+    F: FnMut(VerifiedManifestFile<C>) -> VerifiedManifestFile<C>,
+{
+    assert_eq!(
+        verified_files.len(),
+        root.inodes().len(),
+        "ASSERT: opaque DATA graph proof count must match the Namespace Root"
+    );
     let mut files = Vec::new();
     files
         .try_reserve_exact(verified_files.len())
@@ -68,41 +163,9 @@ where
             inode.logical_size(),
             "ASSERT: recovered DATA proof length must match the durable inode"
         );
-        files.push(
-            Arc::new(ManifestCommittedFile::from_verified(verified.into_file()))
-                as Arc<dyn CommittedFile>,
-        );
-    }
-
-    namespace_from_files(config, root, high_water, high_water, files, false).map(Some)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn namespace_from_root<M, C>(
-    config: NamespaceConfig,
-    root: &NamespaceRoot,
-    next_inode: u64,
-    inode_reservation_end: u64,
-    generations: &GenerationRepository<M>,
-    containers: &ContainerRepository<C>,
-    writable: bool,
-) -> Result<Namespace, MountError>
-where
-    M: StorageIo,
-    C: Clone + Send + Sync + StorageIo + 'static,
-{
-    let mut files = Vec::new();
-    files
-        .try_reserve_exact(root.inodes().len())
-        .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
-    for inode in root.inodes() {
-        let manifest = generations.read_manifest(inode.manifest_root())?;
-        if manifest.file_length() != inode.logical_size() {
-            return Err(MountError::Posix(PosixError::Io));
-        }
-        let file = Arc::new(ManifestCommittedFile::new(manifest, containers.clone())?)
-            as Arc<dyn CommittedFile>;
-        files.push(file);
+        files.push(Arc::new(ManifestCommittedFile::from_verified(prepare_file(
+            verified.into_file(),
+        ))) as Arc<dyn CommittedFile>);
     }
     namespace_from_files(
         config,
@@ -181,14 +244,6 @@ pub(crate) struct ManifestCommittedFile<I> {
 }
 
 impl<I: StorageIo> ManifestCommittedFile<I> {
-    pub(crate) fn new(
-        manifest: ManifestLeaf,
-        containers: ContainerRepository<I>,
-    ) -> Result<Self, ManifestReadError> {
-        let file = VerifiedManifestFile::new(manifest, containers)?;
-        Ok(Self::from_verified(file))
-    }
-
     pub(crate) fn from_verified(file: VerifiedManifestFile<I>) -> Self {
         let logical_size = file.manifest().file_length();
         let mut allocated_ranges = Vec::<AllocatedRange>::new();

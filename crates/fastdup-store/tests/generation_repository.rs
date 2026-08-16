@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fastdup_format::{
     DurableInode, ManifestExtent, ManifestLeaf, NamespaceEntry, NamespaceRoot, PolicySetId,
 };
-use fastdup_store::{FsStorageIo, GenerationRepository, WalTail};
+use fastdup_store::{FsStorageIo, GenerationRepository, StorageIo, WalTail};
 
 fn unique_test_root(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -112,4 +112,41 @@ fn filesystem_repository_reopens_the_latest_complete_generation() {
             .expect("mount path loads the verified committed Manifest"),
         second_manifest
     );
+}
+
+#[test]
+fn filesystem_repository_rotates_bounded_slots_and_reopens_the_latest_generation() {
+    let root = unique_test_root("generation-rotation-reopen");
+    let policy = PolicySetId::new([0x62; 32]).expect("policy identity is nonzero");
+    let storage = FsStorageIo::open(&root).expect("create workspace-local repository");
+    let repository = GenerationRepository::new(storage.clone(), policy);
+    let reservation = NamespaceRoot::new(4_096, 2, 0, Vec::new(), Vec::new())
+        .expect("empty reservation root is valid");
+    let mut latest = None;
+    for expected_generation in 1..=130 {
+        let record = repository
+            .commit_namespace(&reservation)
+            .expect("filesystem Commit Log rotates without a lifetime stop");
+        assert_eq!(record.generation(), expected_generation);
+        latest = Some(record);
+    }
+    assert!(storage.object_len("commit.wal").expect("first slot exists") <= 64 * 4_096);
+    assert!(
+        storage
+            .object_len("commit.1.wal")
+            .expect("second slot exists")
+            <= 64 * 4_096
+    );
+
+    drop(repository);
+    let recovered = GenerationRepository::new(
+        FsStorageIo::open(&root).expect("reopen workspace-local repository"),
+        policy,
+    )
+    .recover_latest()
+    .expect("paired filesystem slots verify")
+    .expect("rotated generations exist");
+    assert_eq!(recovered.record(), latest.expect("one Commit was made"));
+    assert_eq!(recovered.namespace_root(), &reservation);
+    assert_eq!(recovered.wal_tail(), &WalTail::Clean);
 }
