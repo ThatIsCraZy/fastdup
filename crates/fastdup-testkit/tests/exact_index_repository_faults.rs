@@ -302,3 +302,88 @@ fn replacement_activation_fault_recovers_only_the_previous_or_complete_new_run_s
         );
     }
 }
+
+#[test]
+fn every_compaction_fault_publishes_only_absence_or_one_complete_canonical_run() {
+    const TARGET_GENERATION: u64 = RUN_GENERATION + 4;
+
+    fn prepare(
+        storage: &MemoryStorageIo,
+    ) -> (
+        ExactIndexRunRepository<MemoryStorageIo>,
+        Vec<ExactIndexRunRef>,
+        usize,
+    ) {
+        let repository = ExactIndexRunRepository::new(storage.clone());
+        let mut inputs = Vec::new();
+        for (generation, first_ordinal) in [(RUN_GENERATION, 0), (12, 40), (13, 80), (14, 120)] {
+            let descriptor = repository
+                .publish(&run_at(generation, first_ordinal))
+                .expect("publish one durable compaction source");
+            inputs.push(
+                ExactIndexRunRef::new(0, descriptor).expect("compaction source reference is valid"),
+            );
+        }
+        let baseline = storage.operation_count();
+        (repository, inputs, baseline)
+    }
+
+    fn assert_absent_or_complete(repository: &ExactIndexRunRepository<MemoryStorageIo>) -> bool {
+        match repository.open(profile(), TARGET_GENERATION) {
+            Ok(reader) => {
+                let lookup = reader
+                    .lookup(ChunkId::from_bytes([97; 32]), 16_481)
+                    .expect("a published compacted Run remains page-valid");
+                assert!(lookup.complete());
+                assert_eq!(lookup.candidates().len(), 1);
+                repository
+                    .audit(profile(), TARGET_GENERATION)
+                    .expect("a published compacted Run remains fully auditable");
+                true
+            }
+            Err(ExactIndexStoreError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                false
+            }
+            Err(error) => panic!("compaction exposed neither absence nor a complete Run: {error}"),
+        }
+    }
+
+    let probe_storage = MemoryStorageIo::new();
+    let (probe, inputs, baseline) = prepare(&probe_storage);
+    probe
+        .compact(&inputs, TARGET_GENERATION)
+        .expect("probe compaction succeeds");
+    let operations = probe_storage.operations()[baseline..].to_vec();
+    assert_eq!(
+        operations.last(),
+        Some(&StorageOperation::SyncRoot),
+        "the compacted Run directory sync must be the final publication operation"
+    );
+
+    for (relative_position, operation) in operations.iter().copied().enumerate() {
+        let absolute_position = baseline + relative_position;
+        let storage = MemoryStorageIo::with_fail_before(absolute_position);
+        let (repository, inputs, observed_baseline) = prepare(&storage);
+        assert_eq!(observed_baseline, baseline);
+        assert!(repository.compact(&inputs, TARGET_GENERATION).is_err());
+        storage.crash();
+        assert!(
+            !assert_absent_or_complete(&repository),
+            "fail-before {relative_position} ({operation:?}) made compaction durable"
+        );
+
+        let storage = MemoryStorageIo::with_fail_after(absolute_position);
+        let (repository, inputs, observed_baseline) = prepare(&storage);
+        assert_eq!(observed_baseline, baseline);
+        assert!(repository.compact(&inputs, TARGET_GENERATION).is_err());
+        storage.crash();
+        let recovered = assert_absent_or_complete(&repository);
+        assert_eq!(
+            recovered,
+            relative_position + 1 == operations.len(),
+            "only an effective final SyncRoot may publish compacted Run bytes after an error"
+        );
+    }
+}

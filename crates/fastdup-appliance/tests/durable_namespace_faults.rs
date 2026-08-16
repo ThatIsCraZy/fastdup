@@ -83,7 +83,7 @@ fn every_checkpoint_fault_recovers_only_the_previous_or_complete_generation() {
 }
 
 #[test]
-fn namespace_only_checkpoint_does_not_rescan_containers_for_generation_allocation() {
+fn namespace_only_checkpoint_reuses_the_installed_data_proof_without_a_scan() {
     let metadata = MemoryStorageIo::new();
     let containers = MemoryStorageIo::new();
     let appliance = open(metadata, containers.clone());
@@ -119,8 +119,8 @@ fn namespace_only_checkpoint_does_not_rescan_containers_for_generation_allocatio
         .filter(|operation| **operation == StorageOperation::ListNames)
         .count();
     assert_eq!(
-        list_operations, 1,
-        "one graph proof must feed reader installation without a duplicate DATA scan"
+        list_operations, 0,
+        "an unchanged installed DATA graph must not scan Containers again"
     );
 }
 

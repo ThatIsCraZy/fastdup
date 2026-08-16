@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::container::{MAX_RECORD_BYTES, VerifiedRawLocation};
+use crate::container::{
+    MAX_DECODED_RECORD_BYTES, MAX_RECORD_BYTES, RAW_CODEC, VerifiedChunkLocation,
+    VerifiedRawLocation, ZSTD_CODEC,
+};
 use crate::{ChunkId, ContainerId, MAX_CONTAINER_BYTES, MAX_LOGICAL_CHUNK_BYTES};
 
 pub const EXACT_INDEX_HEADER_BYTES: usize = 4_096;
@@ -20,7 +23,6 @@ const HEADER_MAGIC: [u8; 8] = *b"FDXIRN01";
 const PAGE_MAGIC: [u8; 8] = *b"FDXPG001";
 const FOOTER_MAGIC: [u8; 8] = *b"FDXFTR01";
 const FORMAT_VERSION: u16 = 1;
-const RAW_CODEC: u16 = 1;
 const RAW_PAYLOAD_OFFSET_U32: u32 = 192;
 const RECORD_ALIGNMENT_U32: u32 = 64;
 const MIN_RAW_RECORD_BYTES_U32: u32 = 256;
@@ -88,6 +90,7 @@ pub struct ExactIndexLocation {
     record_crc32c: u32,
     record_decoded_length: u32,
     record_payload_length: u32,
+    codec_id: u16,
     dependency_id: [u8; 32],
 }
 
@@ -118,6 +121,7 @@ impl ExactIndexLocation {
             record_crc32c,
             record_decoded_length: 0,
             record_payload_length: 0,
+            codec_id: RAW_CODEC,
             dependency_id: [0; 32],
         })
     }
@@ -168,6 +172,11 @@ impl ExactIndexLocation {
     }
 
     #[must_use]
+    pub const fn codec_id(&self) -> u16 {
+        self.codec_id
+    }
+
+    #[must_use]
     pub const fn dependency_id(&self) -> [u8; 32] {
         self.dependency_id
     }
@@ -182,6 +191,38 @@ pub struct ExactIndexEntry {
 }
 
 impl ExactIndexEntry {
+    /// Converts proof emitted by a fully verified immutable independent
+    /// Container record into one ACTIVE acceleration entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity error if Container and Exact-Index v1 coordinate
+    /// invariants disagree.
+    pub fn from_verified(verified: VerifiedChunkLocation) -> Result<Self, ExactIndexFormatError> {
+        let location = ExactIndexLocation {
+            container_id: verified.container_id(),
+            container_generation: verified.container_generation(),
+            record_offset: verified.record_offset(),
+            record_length: verified.record_length(),
+            chunk_ordinal: verified.chunk_ordinal(),
+            decoded_offset: verified.decoded_offset(),
+            record_crc32c: verified.record_crc32c(),
+            record_decoded_length: verified.record_decoded_length(),
+            record_payload_length: verified.record_payload_length(),
+            codec_id: verified.codec_id(),
+            dependency_id: [0; 32],
+        };
+        if !valid_independent_location(verified.logical_length(), location) {
+            return Err(ExactIndexFormatError::InvalidEntry);
+        }
+        Ok(Self {
+            chunk_id: verified.chunk_id(),
+            logical_length: verified.logical_length(),
+            transition: ExactLocationTransition::Active,
+            location,
+        })
+    }
+
     /// Converts proof emitted by a fully verified immutable RAW Container into
     /// one ACTIVE acceleration entry without reconstructing physical fields
     /// from caller-supplied scalars.
@@ -211,7 +252,9 @@ impl ExactIndexEntry {
         logical_length: u32,
         mut location: ExactIndexLocation,
     ) -> Result<Self, ExactIndexFormatError> {
-        if expected_raw_record_length(logical_length) != Some(location.record_length) {
+        if location.codec_id != RAW_CODEC
+            || expected_raw_record_length(logical_length) != Some(location.record_length)
+        {
             return Err(ExactIndexFormatError::InvalidEntry);
         }
         location.record_decoded_length = logical_length;
@@ -258,7 +301,7 @@ impl ExactIndexEntry {
         output[0..32].copy_from_slice(&self.chunk_id.bytes());
         put_u32(output, 32, self.logical_length);
         put_u16(output, 36, self.transition.encode());
-        put_u16(output, 38, RAW_CODEC);
+        put_u16(output, 38, self.location.codec_id);
         output[40..56].copy_from_slice(&self.location.container_id.bytes());
         put_u64(output, 56, self.location.container_generation);
         put_u64(output, 64, self.location.record_offset);
@@ -272,25 +315,14 @@ impl ExactIndexEntry {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, ExactIndexFormatError> {
-        if bytes.len() != EXACT_INDEX_ENTRY_BYTES
-            || get_u32(bytes, 32) == 0
-            || get_u16(bytes, 38) != RAW_CODEC
-            || get_u64(bytes, 56) == 0
-            || !valid_raw_location(get_u64(bytes, 64), get_u32(bytes, 72))
-            || get_u32(bytes, 76) != 0
-            || get_u32(bytes, 80) != 0
-            || get_u32(bytes, 88) != get_u32(bytes, 32)
-            || get_u32(bytes, 92) != get_u32(bytes, 32)
-            || expected_raw_record_length(get_u32(bytes, 32)) != Some(get_u32(bytes, 72))
-            || bytes[96..128].iter().any(|byte| *byte != 0)
-        {
+        if bytes.len() != EXACT_INDEX_ENTRY_BYTES || get_u32(bytes, 32) == 0 {
             return Err(ExactIndexFormatError::InvalidEntry);
         }
         let mut chunk_id = [0_u8; 32];
         chunk_id.copy_from_slice(&bytes[0..32]);
         let mut container_id = [0_u8; 16];
         container_id.copy_from_slice(&bytes[40..56]);
-        Ok(Self {
+        let entry = Self {
             chunk_id: ChunkId::from_bytes(chunk_id),
             logical_length: get_u32(bytes, 32),
             transition: ExactLocationTransition::decode(get_u16(bytes, 36))
@@ -301,14 +333,21 @@ impl ExactIndexEntry {
                 container_generation: get_u64(bytes, 56),
                 record_offset: get_u64(bytes, 64),
                 record_length: get_u32(bytes, 72),
-                chunk_ordinal: 0,
-                decoded_offset: 0,
+                chunk_ordinal: get_u32(bytes, 76),
+                decoded_offset: get_u32(bytes, 80),
                 record_crc32c: get_u32(bytes, 84),
                 record_decoded_length: get_u32(bytes, 88),
                 record_payload_length: get_u32(bytes, 92),
-                dependency_id: [0; 32],
+                codec_id: get_u16(bytes, 38),
+                dependency_id: bytes[96..128]
+                    .try_into()
+                    .expect("ASSERT: a fixed Exact Index dependency field has 32 bytes"),
             },
-        })
+        };
+        if !valid_independent_location(entry.logical_length, entry.location) {
+            return Err(ExactIndexFormatError::InvalidEntry);
+        }
+        Ok(entry)
     }
 }
 
@@ -1032,6 +1071,38 @@ fn valid_raw_location(record_offset: u64, record_length: u32) -> bool {
         && record_offset
             .checked_add(u64::from(record_length))
             .is_some_and(|end| end <= MAX_CONTAINER_BYTES)
+}
+
+fn valid_independent_location(logical_length: u32, location: ExactIndexLocation) -> bool {
+    if logical_length == 0
+        || usize::try_from(logical_length).map_or(true, |length| length > MAX_LOGICAL_CHUNK_BYTES)
+        || !valid_raw_location(location.record_offset, location.record_length)
+        || location.container_generation == 0
+        || location.dependency_id != [0; 32]
+    {
+        return false;
+    }
+    match location.codec_id {
+        RAW_CODEC => {
+            location.chunk_ordinal == 0
+                && location.decoded_offset == 0
+                && location.record_decoded_length == logical_length
+                && location.record_payload_length == logical_length
+                && expected_raw_record_length(logical_length) == Some(location.record_length)
+        }
+        ZSTD_CODEC => {
+            location.record_decoded_length > 0
+                && usize::try_from(location.record_decoded_length)
+                    .is_ok_and(|length| length <= MAX_DECODED_RECORD_BYTES)
+                && location.record_payload_length > 0
+                && location.record_payload_length < location.record_length
+                && location
+                    .decoded_offset
+                    .checked_add(logical_length)
+                    .is_some_and(|end| end <= location.record_decoded_length)
+        }
+        _ => false,
+    }
 }
 
 fn expected_raw_record_length(logical_length: u32) -> Option<u32> {

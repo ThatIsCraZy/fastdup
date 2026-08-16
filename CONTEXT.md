@@ -91,6 +91,12 @@ A monotonic appliance-local creation order for containers. It is recoverable
 from durable containers and is not a logical content identity.
 _Avoid_: Container ID, commit generation
 
+**Container envelope proof**:
+The paired, checksummed Container Header and Footer plus physical length and
+canonical filename. It proves structural identity, layout, and generation for
+allocator recovery, but neither the payload hash nor any logical Chunk bytes.
+_Avoid_: Verified Container, verified Location
+
 **Manifest**:
 An immutable recipe for reconstructing one file version from logical chunk IDs
 and file-layout metadata.
@@ -140,8 +146,10 @@ visible versions.
 _Avoid_: Commit group, journal entry
 
 **Commit WAL**:
-The append-only, hash-chained sequence of commit records from which normal crash
-recovery selects the newest wholly valid namespace generation.
+The hash-chained sequence of commit records stored in bounded paired slots from
+which normal crash recovery selects the newest wholly valid namespace
+generation. Rotation rewrites only an inactive slot and preserves an exact
+bridge record.
 _Avoid_: Recovery checkpoint, online index
 
 **Visible version**:
@@ -252,6 +260,12 @@ The bounded set of modified file ranges awaiting conversion into a new immutable
 manifest, without rechunking the entire file.
 _Avoid_: Dirty file, write buffer
 
+**Checkpoint pressure**:
+The unique DATA bytes in reachable active Dirty Extent Maps that can be moved
+into the next Commit Group. It excludes holes, duplicate overwrites, a frozen
+Commit Group, encoder work buffers, and process RSS.
+_Avoid_: Logical bytes, resident memory, bytes written
+
 **Mutation sequence**:
 The monotonic per-inode order in which accepted content and metadata changes are
 applied to the live view and partitioned into commit generations. Later accepted
@@ -324,6 +338,22 @@ _Avoid_: Online metadata index, commit group
 The newest wholly valid commit generation selected after a crash. Recovery does
 not combine independently newer fragments from different commit generations.
 _Avoid_: Best-effort merge, live view
+
+**Recovery transition prefix**:
+The contiguous selected Commit-Log prefix whose Namespace Root bindings and pairwise
+namespace, inode, allocation, and reservation transitions all validate. It
+proves structural ordering but not Manifest or DATA completeness; the current
+and immediately previous generations inside it are separate graph-proof
+candidates.
+_Avoid_: Recovered generation, complete DATA graph
+
+**Successor graph proof**:
+The complete DATA-dependency proof for one new Commit Group formed by retaining
+unchanged dependencies from the immediately preceding verified generation and
+fully verifying every newly introduced dependency. It is valid only while that
+predecessor remains the installed generation and immutable storage stays under
+the same appliance process; recovery and scrub construct fresh complete proofs.
+_Avoid_: Exact-Index authority, cache hit, partial verification
 
 **Generation pin**:
 A temporary liveness root retained for readers, normal rollback, or data-tier

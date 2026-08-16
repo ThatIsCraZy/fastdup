@@ -15,6 +15,12 @@ use crate::StorageIo;
 
 pub const MAX_EXACT_LOOKUP_CANDIDATES: usize = 64;
 pub const MAX_ACTIVE_EXACT_INDEX_RUNS: usize = 64;
+/// Hard bound for one in-memory compaction input and output.
+///
+/// This is policy rather than format geometry. It keeps the current pre-MVP
+/// merge below roughly 100 MiB of transient entry/output storage while a later
+/// streaming partitioned compactor is benchmarked.
+pub const MAX_EXACT_COMPACTION_ENTRIES: usize = 262_144;
 const ACTIVATION_WAL_NAME: &str = "exact-index.activation.wal";
 const MAX_ACTIVATION_WAL_BYTES: u64 = 64 * 1_024 * 1_024;
 
@@ -146,6 +152,111 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         let descriptor = self.audit_named(&published_name(profile, generation))?;
         verify_requested_identity(profile, generation, descriptor)?;
         Ok(descriptor)
+    }
+
+    /// Merges a bounded set of fully audited immutable Runs into one new Run.
+    ///
+    /// For a repeated physical Location the transition from the newest source
+    /// Run generation wins. Every other Location is retained, including
+    /// tombstones needed to shadow still-active older Runs. The output is
+    /// canonical and independent of source discovery order.
+    ///
+    /// This publishes the resulting Run but does not activate it. The caller
+    /// must activate one complete replacement Run Set only after every retained
+    /// dependency is durable.
+    ///
+    /// # Errors
+    ///
+    /// Rejects fewer than two inputs, duplicate/mismatched source identities,
+    /// a nonmonotonic target generation, an input above the explicit memory
+    /// bound, source corruption, Chunk-ID length conflicts, or publication I/O.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a completely audited Run disagrees with the entry count
+    /// pinned by its verified reference, or if the bounded count cannot fit
+    /// `usize`. Both are impossible production `ASSERT` failures.
+    pub fn compact(
+        &self,
+        inputs: &[ExactIndexRunRef],
+        target_generation: u64,
+    ) -> Result<ExactIndexRunDescriptor, ExactIndexStoreError> {
+        if inputs.len() < 2 || inputs.len() > MAX_ACTIVE_EXACT_INDEX_RUNS {
+            return Err(ExactIndexStoreError::InvalidCompactionInput);
+        }
+        let profile = inputs[0].profile();
+        let mut ordered_inputs = Vec::new();
+        ordered_inputs
+            .try_reserve_exact(inputs.len())
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        ordered_inputs.extend_from_slice(inputs);
+        ordered_inputs.sort_unstable_by_key(|run| run.generation());
+        if ordered_inputs.iter().any(|run| run.profile() != profile)
+            || ordered_inputs
+                .windows(2)
+                .any(|pair| pair[0].generation() == pair[1].generation())
+            || ordered_inputs
+                .last()
+                .is_none_or(|run| target_generation <= run.generation())
+        {
+            return Err(ExactIndexStoreError::InvalidCompactionInput);
+        }
+
+        let total_entries = ordered_inputs.iter().try_fold(0_usize, |total, run| {
+            let count = usize::try_from(run.entry_count())
+                .map_err(|_| ExactIndexStoreError::CompactionTooLarge)?;
+            total
+                .checked_add(count)
+                .ok_or(ExactIndexStoreError::CompactionTooLarge)
+        })?;
+        if total_entries > MAX_EXACT_COMPACTION_ENTRIES {
+            return Err(ExactIndexStoreError::CompactionTooLarge);
+        }
+
+        let mut merged = Vec::new();
+        merged
+            .try_reserve_exact(total_entries)
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        for run_ref in ordered_inputs {
+            let entries = self.read_verified_entries(run_ref)?;
+            assert_eq!(
+                entries.len(),
+                usize::try_from(run_ref.entry_count())
+                    .expect("ASSERT: bounded compaction entry count fits usize"),
+                "ASSERT: audited Run entry count disagrees with its pinned reference"
+            );
+            merged.extend(entries.into_iter().map(|entry| CompactionEntry {
+                entry,
+                source_generation: run_ref.generation(),
+            }));
+        }
+        assert_eq!(
+            merged.len(),
+            total_entries,
+            "ASSERT: bounded compaction lost a source entry"
+        );
+        merged.sort_unstable_by_key(|item| {
+            (
+                compaction_location_key(item.entry),
+                Reverse(item.source_generation),
+            )
+        });
+
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(merged.len())
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        let mut previous_key = None;
+        for item in merged {
+            let key = compaction_location_key(item.entry);
+            if previous_key == Some(key) {
+                continue;
+            }
+            previous_key = Some(key);
+            output.push(item.entry);
+        }
+        let compacted = ExactIndexRun::new(profile, target_generation, output)?;
+        self.publish(&compacted)
     }
 
     /// Publishes and activates one Run Set after fully auditing every named
@@ -312,6 +423,44 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         audit.update(envelope.footer_offset, &envelope.footer)?;
         audit.finish()?;
         Ok(descriptor)
+    }
+
+    fn read_verified_entries(
+        &self,
+        run_ref: ExactIndexRunRef,
+    ) -> Result<Vec<ExactIndexEntry>, ExactIndexStoreError> {
+        let name = published_name(run_ref.profile(), run_ref.generation());
+        let envelope = self.read_envelope(&name)?;
+        let descriptor = envelope.descriptor;
+        verify_requested_identity(run_ref.profile(), run_ref.generation(), descriptor)?;
+        verify_run_reference(run_ref, descriptor)?;
+        if descriptor.entry_count() > MAX_EXACT_COMPACTION_ENTRIES {
+            return Err(ExactIndexStoreError::CompactionTooLarge);
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(descriptor.entry_count())
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        let mut audit = descriptor.begin_hash_audit();
+        audit.update(0, &envelope.header)?;
+        for page_ordinal in 0..descriptor.page_count() {
+            let offset = descriptor
+                .page_offset(page_ordinal)
+                .expect("ASSERT: descriptor page ordinal was prevalidated");
+            let bytes = self
+                .storage
+                .read_exact_at(&name, offset, EXACT_INDEX_PAGE_BYTES)?;
+            let page = descriptor.decode_page(page_ordinal, &bytes)?;
+            audit.verify_page(&page)?;
+            entries.extend_from_slice(page.entries());
+            audit.update(offset, &bytes)?;
+        }
+        audit.update(envelope.footer_offset, &envelope.footer)?;
+        audit.finish()?;
+        if entries.len() != descriptor.entry_count() {
+            return Err(ExactIndexStoreError::DependencyMismatch);
+        }
+        Ok(entries)
     }
 
     fn verify_run_set_dependencies(
@@ -705,6 +854,8 @@ pub enum ExactIndexStoreError {
     DependencyMismatch,
     NonMonotonicRunSetGeneration,
     TooManyActiveRuns,
+    InvalidCompactionInput,
+    CompactionTooLarge,
 }
 
 impl fmt::Display for ExactIndexStoreError {
@@ -797,6 +948,23 @@ fn verify_run_reference(
         return Err(ExactIndexStoreError::DependencyMismatch);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompactionEntry {
+    entry: ExactIndexEntry,
+    source_generation: u64,
+}
+
+fn compaction_location_key(entry: ExactIndexEntry) -> (ChunkId, u32, [u8; 16], u64, u32) {
+    let location = entry.location();
+    (
+        entry.chunk_id(),
+        entry.logical_length(),
+        location.container_id().bytes(),
+        location.record_offset(),
+        location.chunk_ordinal(),
+    )
 }
 
 fn temporary_name(profile: ExactIndexProfileId, generation: u64) -> String {

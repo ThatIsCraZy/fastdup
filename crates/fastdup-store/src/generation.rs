@@ -1,18 +1,20 @@
-use crate::{ContainerRepository, StorageIo, StoreError, VerifiedManifestFile};
+use crate::generation_log::{GenerationLog, GenerationLogError};
+use crate::manifest_tree::{ManifestTreeError, encode_manifest_tree, flatten_manifest_tree};
+use crate::{
+    ActivatedExactIndex, ContainerRepository, StorageIo, StoreError, VerifiedManifestFile,
+};
 use fastdup_format::{
-    COMMIT_RECORD_BYTES, CommitFormatError, CommitRecord, CommitRecordHash,
-    MAX_METADATA_OBJECT_BYTES, ManifestExtent, ManifestLeaf, MetadataFormatError, MetadataObjectId,
-    NamespaceRoot, PolicySetId,
+    CommitFormatError, CommitRecord, CommitRecordHash, MAX_METADATA_OBJECT_BYTES, ManifestExtent,
+    ManifestLeaf, MetadataFormatError, MetadataObjectId, NamespaceRoot, PolicySetId,
 };
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-const COMMIT_WAL_NAME: &str = "commit.wal";
 const METADATA_SUFFIX: &str = ".fdm";
-const MAX_COMMIT_WAL_BYTES: usize = 64 * 1_024 * 1_024;
 const WRITE_BLOCK_BYTES: usize = 4_096;
+const MAX_METADATA_OBJECT_BYTES_U64: u64 = 16 * 1_024 * 1_024;
 type VerifiedManifests = Vec<(u64, ManifestLeaf)>;
 
 struct RecoveredGraph {
@@ -33,6 +35,70 @@ pub struct GenerationRepository<I> {
     commit_lock: Arc<Mutex<()>>,
 }
 
+/// Verifies that every logical Chunk required by one metadata graph has at
+/// least one durable, byte-exact physical Location.
+///
+/// Implementations may use rebuild scans or nonauthoritative acceleration, but
+/// success is a complete graph proof. A negative index hint alone can never
+/// satisfy this interface.
+pub trait RequiredChunkVerifier {
+    /// Verifies every unique `(Chunk ID, logical length)` dependency.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first missing, conflicting, corrupt, unsupported, or I/O
+    /// failure without exposing a partial proof.
+    fn verify_required_chunks(
+        &self,
+        required: &BTreeMap<fastdup_format::ChunkId, u64>,
+    ) -> Result<(), StoreError>;
+}
+
+impl<I: StorageIo> RequiredChunkVerifier for ContainerRepository<I> {
+    fn verify_required_chunks(
+        &self,
+        required: &BTreeMap<fastdup_format::ChunkId, u64>,
+    ) -> Result<(), StoreError> {
+        ContainerRepository::verify_required_chunks(self, required)
+    }
+}
+
+/// Complete graph verifier using one pinned Exact-Index generation with the
+/// authoritative verified Container scan as a single fallback.
+#[derive(Clone, Debug)]
+pub struct IndexedRequiredChunkVerifier<C, X> {
+    containers: ContainerRepository<C>,
+    index: Arc<ActivatedExactIndex<X>>,
+}
+
+impl<C, X> IndexedRequiredChunkVerifier<C, X> {
+    #[must_use]
+    pub const fn new(
+        containers: ContainerRepository<C>,
+        index: Arc<ActivatedExactIndex<X>>,
+    ) -> Self {
+        Self { containers, index }
+    }
+}
+
+impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkVerifier<C, X> {
+    fn verify_required_chunks(
+        &self,
+        required: &BTreeMap<fastdup_format::ChunkId, u64>,
+    ) -> Result<(), StoreError> {
+        for (chunk_id, logical_length) in required {
+            if self
+                .containers
+                .find_verified_chunk_with_index(&self.index, *chunk_id, *logical_length)?
+                .is_none()
+            {
+                return self.containers.verify_required_chunks(required);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<I: StorageIo> GenerationRepository<I> {
     #[must_use]
     pub fn new(storage: I, supported_policy: PolicySetId) -> Self {
@@ -51,12 +117,25 @@ impl<I: StorageIo> GenerationRepository<I> {
     /// # Errors
     ///
     /// Returns format, bounded-size, identity, or durable-publication errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a previously content-identified tree plan disagrees with
+    /// the generic Metadata Object writer, an impossible internal invariant.
     pub fn publish_manifest(
         &self,
         manifest: &ManifestLeaf,
     ) -> Result<MetadataObjectId, GenerationError> {
-        let encoded = manifest.encode()?;
-        self.publish_metadata(&encoded)
+        let tree = encode_manifest_tree(manifest)?;
+        for (expected_id, encoded) in tree.objects() {
+            let published_id = self.stage_metadata(encoded)?;
+            assert_eq!(
+                published_id, *expected_id,
+                "ASSERT: Manifest tree plan identity must equal published object identity"
+            );
+        }
+        self.storage.sync_root()?;
+        Ok(tree.root())
     }
 
     /// Loads and fully verifies one immutable Manifest by Metadata Object ID.
@@ -68,8 +147,21 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         object_id: MetadataObjectId,
     ) -> Result<ManifestLeaf, GenerationError> {
-        let bytes = self.read_metadata(object_id)?;
-        ManifestLeaf::decode(&bytes).map_err(Into::into)
+        flatten_manifest_tree(object_id, |node_id| {
+            let name = metadata_name(node_id);
+            let length = self.storage.object_len(&name)?;
+            if length > MAX_METADATA_OBJECT_BYTES_U64 {
+                return Err(ManifestTreeError::IdentityMismatch(node_id));
+            }
+            let bytes = self.storage.read(&name)?;
+            if u64::try_from(bytes.len()) != Ok(length)
+                || MetadataObjectId::from_encoded(&bytes)? != node_id
+            {
+                return Err(ManifestTreeError::IdentityMismatch(node_id));
+            }
+            Ok(bytes)
+        })
+        .map_err(Into::into)
     }
 
     /// Publishes a complete Namespace Root and appends its Commit Record last.
@@ -91,7 +183,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .commit_lock
             .lock()
             .expect("ASSERT: generation commit lock poisoned");
-        self.verify_manifest_graph::<I>(root, None)?;
+        self.verify_manifest_graph(root, None)?;
         self.commit_verified_namespace(root)
     }
 
@@ -153,30 +245,67 @@ impl<I: StorageIo> GenerationRepository<I> {
         Ok(CommittedDataGeneration { record, files })
     }
 
+    /// Commits a DATA-bearing Namespace Root using an independently supplied
+    /// complete dependency verifier and returns readers backed by `containers`.
+    ///
+    /// This is the indexed counterpart of
+    /// [`Self::commit_namespace_with_verified_files`]. The verifier may use
+    /// bounded acceleration, but success must cover every required Chunk and a
+    /// miss must fall back or fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph, dependency-integrity, bounded-allocation, publication,
+    /// WAL-chain, or durability errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a prior internal invariant panic poisoned the single-writer
+    /// commit lock.
+    pub fn commit_namespace_with_verified_files_using<J>(
+        &self,
+        root: &NamespaceRoot,
+        containers: &ContainerRepository<J>,
+        verifier: &dyn RequiredChunkVerifier,
+    ) -> Result<CommittedDataGeneration<J>, GenerationError>
+    where
+        J: Clone + StorageIo,
+    {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: generation commit lock poisoned");
+        let manifests = self.verify_manifest_graph(root, Some(verifier))?;
+        let files = verified_files(manifests, containers)?;
+        let record = self.commit_verified_namespace(root)?;
+        Ok(CommittedDataGeneration { record, files })
+    }
+
     fn commit_verified_namespace(
         &self,
         root: &NamespaceRoot,
     ) -> Result<CommitRecord, GenerationError> {
         let encoded_root = root.encode()?;
         let root_id = self.publish_metadata(&encoded_root)?;
-        self.ensure_wal_exists()?;
-        let wal = self.read_wal()?;
-        let prefix = decode_wal_prefix(&wal);
-        if prefix.tail != WalTail::Clean {
-            return Err(GenerationError::WalNeedsRepair(prefix.tail));
+        let log = GenerationLog::new(&self.storage);
+        let snapshot = log.load_for_append().map_err(map_log_error)?;
+        if snapshot.tail() != &WalTail::Clean {
+            return Err(GenerationError::WalNeedsRepair(snapshot.tail().clone()));
         }
-        if let Some(previous) = prefix.records.last() {
-            self.verify_generation_transition(*previous, root)?;
+        if let Some(previous) = snapshot.last_record() {
+            self.verify_generation_transition(previous, root)?;
         } else if root.inode_allocation_cursor() != 2 || !root.inodes().is_empty() {
             return Err(GenerationError::InitialInodeReservationRequired);
         }
-        let (generation, previous_hash) = match prefix.records.last() {
+        let (generation, previous_hash) = match snapshot.last_record() {
             Some(previous) => (
                 previous
                     .generation()
                     .checked_add(1)
                     .ok_or(GenerationError::GenerationExhausted)?,
-                CommitRecordHash::of(&wal[wal.len() - COMMIT_RECORD_BYTES..wal.len()]),
+                snapshot
+                    .last_hash()
+                    .expect("ASSERT: a last Commit Record has encoded bytes"),
             ),
             None => (1, CommitRecordHash::ZERO),
         };
@@ -189,30 +318,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             root.inode_reservation_end(),
             root.inode_allocation_cursor(),
         )?;
-        let encoded_record = record.encode();
-        let offset = u64::try_from(wal.len()).map_err(|_| GenerationError::WalTooLarge)?;
-        let new_length = wal
-            .len()
-            .checked_add(COMMIT_RECORD_BYTES)
-            .ok_or(GenerationError::WalTooLarge)?;
-        if new_length > MAX_COMMIT_WAL_BYTES {
-            return Err(GenerationError::WalTooLarge);
-        }
-        self.storage
-            .write_at(COMMIT_WAL_NAME, offset, &encoded_record)?;
-        self.storage.set_len(
-            COMMIT_WAL_NAME,
-            u64::try_from(new_length).map_err(|_| GenerationError::WalTooLarge)?,
-        )?;
-        let reread = self.read_wal()?;
-        if reread.len() != new_length
-            || reread[..wal.len()] != wal
-            || reread[wal.len()..] != encoded_record
-            || decode_wal_prefix(&reread).tail != WalTail::Clean
-        {
-            return Err(GenerationError::PublishVerificationMismatch);
-        }
-        self.storage.sync_file(COMMIT_WAL_NAME)?;
+        log.append(&snapshot, record).map_err(map_log_error)?;
         Ok(record)
     }
 
@@ -235,7 +341,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .commit_lock
             .lock()
             .expect("ASSERT: generation commit lock poisoned");
-        self.recover_latest_using::<I>(None)
+        self.recover_latest_using(None)
             .map(|recovered| recovered.map(|graph| graph.generation))
     }
 
@@ -263,7 +369,7 @@ impl<I: StorageIo> GenerationRepository<I> {
     }
 
     /// Recovers the newest complete DATA generation together with Manifest
-    /// readers proven by that same forward graph walk.
+    /// readers proven for that selected recovery candidate.
     ///
     /// # Errors
     ///
@@ -295,61 +401,113 @@ impl<I: StorageIo> GenerationRepository<I> {
         }))
     }
 
-    fn recover_latest_using<J: StorageIo>(
+    /// Recovers the newest complete DATA generation using an independently
+    /// supplied complete dependency verifier.
+    ///
+    /// The verifier may use a pinned Exact Index, but it must fall back or fail
+    /// closed when acceleration cannot prove one required Location. Returned
+    /// Manifest readers retain the supplied Container Repository for demand
+    /// verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O, format, dependency-integrity, graph-completeness, or
+    /// bounded-allocation errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a prior internal invariant panic poisoned the single-writer
+    /// commit lock.
+    pub fn recover_latest_with_verified_files_using<J>(
         &self,
-        containers: Option<&ContainerRepository<J>>,
-    ) -> Result<Option<RecoveredGraph>, GenerationError> {
-        let wal = match self.storage.read(COMMIT_WAL_NAME) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        containers: &ContainerRepository<J>,
+        verifier: &dyn RequiredChunkVerifier,
+    ) -> Result<Option<RecoveredDataGeneration<J>>, GenerationError>
+    where
+        J: Clone + StorageIo,
+    {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: generation commit lock poisoned");
+        let Some(graph) = self.recover_latest_using(Some(verifier))? else {
+            return Ok(None);
         };
-        if wal.len() > MAX_COMMIT_WAL_BYTES {
-            return Err(GenerationError::WalTooLarge);
-        }
-        let prefix = decode_wal_prefix(&wal);
-        if prefix.records.is_empty() {
-            return if wal.is_empty() {
-                Ok(None)
-            } else {
-                Err(GenerationError::NoRecoverableGeneration)
-            };
-        }
-        let latest_generation = match prefix.records.last() {
+        let files = verified_files(graph.manifests, containers)?;
+        Ok(Some(RecoveredDataGeneration {
+            generation: graph.generation,
+            files,
+        }))
+    }
+
+    fn recover_latest_using(
+        &self,
+        verifier: Option<&dyn RequiredChunkVerifier>,
+    ) -> Result<Option<RecoveredGraph>, GenerationError> {
+        let Some(snapshot) = GenerationLog::new(&self.storage)
+            .load_for_recovery()
+            .map_err(map_log_error)?
+        else {
+            return Ok(None);
+        };
+        let latest_generation = match snapshot.records().last() {
             Some(record) => record.generation(),
             None => return Err(GenerationError::NoRecoverableGeneration),
         };
-        let inode_reservation_end_high_water = prefix
-            .records
+        let inode_reservation_end_high_water = snapshot
+            .records()
             .iter()
             .map(|record| record.inode_reservation_end())
             .max()
             .ok_or(GenerationError::NoRecoverableGeneration)?;
-        let mut previous: Option<(CommitRecord, NamespaceRoot)> = None;
-        let mut selected: Option<SelectedGraph> = None;
-        for record in &prefix.records {
+        let structurally_valid_records =
+            self.validate_recovery_transition_prefix(snapshot.records())?;
+        let oldest_online_generation = latest_generation.saturating_sub(1);
+        let selected = self
+            .select_live_recovery_graph(
+                &structurally_valid_records,
+                oldest_online_generation,
+                verifier,
+            )?
+            .ok_or(GenerationError::NoRecoverableGeneration)?;
+        Ok(Some(RecoveredGraph {
+            generation: RecoveredGeneration {
+                record: selected.record,
+                namespace_root: selected.root,
+                wal_tail: snapshot.tail().clone(),
+                rejected_newer_generations: latest_generation - selected.record.generation(),
+                inode_reservation_end_high_water,
+            },
+            manifests: selected.manifests,
+        }))
+    }
+
+    fn validate_recovery_transition_prefix(
+        &self,
+        records: &[CommitRecord],
+    ) -> Result<Vec<CommitRecord>, GenerationError> {
+        for record in records {
             if record.policy_set() != self.supported_policy {
                 return Err(GenerationError::UnsupportedPolicySet {
                     generation: record.generation(),
                     policy_set: record.policy_set(),
                 });
             }
+        }
+        let mut structurally_valid_records = Vec::new();
+        structurally_valid_records
+            .try_reserve_exact(records.len())
+            .map_err(|_| GenerationError::OutOfMemory)?;
+        let mut previous: Option<(CommitRecord, NamespaceRoot)> = None;
+        for record in records {
             let root = match self.read_namespace_root(record.namespace_root()) {
                 Ok(root) => root,
                 Err(error) if error.allows_generation_fallback() => break,
                 Err(error) => return Err(error),
             };
-            if root.namespace_mutation_sequence() != record.namespace_mutation_cutoff()
-                || root.inode_reservation_end() != record.inode_reservation_end()
-                || root.inode_allocation_cursor() != record.inode_allocation_cursor()
-            {
+            if !record_matches_namespace_root(*record, &root) {
                 break;
             }
-            let manifests = match self.verify_manifest_graph(&root, containers) {
-                Ok(manifests) => manifests,
-                Err(error) if error.allows_generation_fallback() => break,
-                Err(error) => return Err(error),
-            };
             match &previous {
                 Some((previous_record, previous_root)) => {
                     if verify_generation_transition_pair(*previous_record, previous_root, &root)
@@ -358,32 +516,59 @@ impl<I: StorageIo> GenerationRepository<I> {
                         break;
                     }
                 }
-                None if root.inode_allocation_cursor() != 2 || !root.inodes().is_empty() => break,
+                None if record.generation() == 1
+                    && (root.inode_allocation_cursor() != 2 || !root.inodes().is_empty()) =>
+                {
+                    break;
+                }
                 None => {}
             }
-            previous = Some((*record, root.clone()));
-            selected = Some(SelectedGraph {
+            structurally_valid_records.push(*record);
+            previous = Some((*record, root));
+        }
+        Ok(structurally_valid_records)
+    }
+
+    fn select_live_recovery_graph(
+        &self,
+        structurally_valid_records: &[CommitRecord],
+        oldest_online_generation: u64,
+        verifier: Option<&dyn RequiredChunkVerifier>,
+    ) -> Result<Option<SelectedGraph>, GenerationError> {
+        for record in structurally_valid_records
+            .iter()
+            .rev()
+            .take_while(|record| record.generation() >= oldest_online_generation)
+        {
+            let root = match self.read_namespace_root(record.namespace_root()) {
+                Ok(root) => root,
+                Err(error) if error.allows_generation_fallback() => continue,
+                Err(error) => return Err(error),
+            };
+            if !record_matches_namespace_root(*record, &root) {
+                continue;
+            }
+            let manifests = match self.verify_manifest_graph(&root, verifier) {
+                Ok(manifests) => manifests,
+                Err(error) if error.allows_generation_fallback() => continue,
+                Err(error) => return Err(error),
+            };
+            return Ok(Some(SelectedGraph {
                 record: *record,
                 root,
                 manifests,
-            });
+            }));
         }
-        let Some(selected) = selected else {
-            return Err(GenerationError::NoRecoverableGeneration);
-        };
-        Ok(Some(RecoveredGraph {
-            generation: RecoveredGeneration {
-                record: selected.record,
-                namespace_root: selected.root,
-                wal_tail: prefix.tail,
-                rejected_newer_generations: latest_generation - selected.record.generation(),
-                inode_reservation_end_high_water,
-            },
-            manifests: selected.manifests,
-        }))
+        Ok(None)
     }
 
     fn publish_metadata(&self, encoded: &[u8]) -> Result<MetadataObjectId, GenerationError> {
+        let object_id = self.stage_metadata(encoded)?;
+        self.storage.sync_root()?;
+        Ok(object_id)
+    }
+
+    fn stage_metadata(&self, encoded: &[u8]) -> Result<MetadataObjectId, GenerationError> {
         if encoded.len() > MAX_METADATA_OBJECT_BYTES {
             return Err(GenerationError::MetadataTooLarge);
         }
@@ -395,7 +580,6 @@ impl<I: StorageIo> GenerationRepository<I> {
             if existing_id != object_id || existing != encoded {
                 return Err(GenerationError::MetadataIdentityCollision(object_id));
             }
-            self.storage.sync_root()?;
             return Ok(object_id);
         }
 
@@ -422,32 +606,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         self.storage.sync_file(&temporary_name)?;
         self.storage
             .publish_noreplace(&temporary_name, &published_name)?;
-        self.storage.sync_root()?;
         Ok(object_id)
-    }
-
-    fn ensure_wal_exists(&self) -> Result<(), GenerationError> {
-        if self.storage.exists(COMMIT_WAL_NAME)? {
-            let bytes = self.storage.read(COMMIT_WAL_NAME)?;
-            if bytes.len() > MAX_COMMIT_WAL_BYTES {
-                return Err(GenerationError::WalTooLarge);
-            }
-            self.storage.sync_root()?;
-            return Ok(());
-        }
-        self.storage.create_new(COMMIT_WAL_NAME)?;
-        self.storage.set_len(COMMIT_WAL_NAME, 0)?;
-        self.storage.sync_file(COMMIT_WAL_NAME)?;
-        self.storage.sync_root()?;
-        Ok(())
-    }
-
-    fn read_wal(&self) -> Result<Vec<u8>, GenerationError> {
-        let bytes = self.storage.read(COMMIT_WAL_NAME)?;
-        if bytes.len() > MAX_COMMIT_WAL_BYTES {
-            return Err(GenerationError::WalTooLarge);
-        }
-        Ok(bytes)
     }
 
     fn read_namespace_root(
@@ -459,8 +618,13 @@ impl<I: StorageIo> GenerationRepository<I> {
     }
 
     fn read_metadata(&self, object_id: MetadataObjectId) -> Result<Vec<u8>, GenerationError> {
-        let bytes = self.storage.read(&metadata_name(object_id))?;
-        if bytes.len() > MAX_METADATA_OBJECT_BYTES
+        let name = metadata_name(object_id);
+        let length = self.storage.object_len(&name)?;
+        if length > MAX_METADATA_OBJECT_BYTES_U64 {
+            return Err(GenerationError::MetadataIdentityCollision(object_id));
+        }
+        let bytes = self.storage.read(&name)?;
+        if u64::try_from(bytes.len()) != Ok(length)
             || MetadataObjectId::from_encoded(&bytes)? != object_id
         {
             return Err(GenerationError::MetadataIdentityCollision(object_id));
@@ -468,10 +632,10 @@ impl<I: StorageIo> GenerationRepository<I> {
         Ok(bytes)
     }
 
-    fn verify_manifest_graph<J: StorageIo>(
+    fn verify_manifest_graph(
         &self,
         root: &NamespaceRoot,
-        containers: Option<&ContainerRepository<J>>,
+        verifier: Option<&dyn RequiredChunkVerifier>,
     ) -> Result<Vec<(u64, ManifestLeaf)>, GenerationError> {
         let mut required_chunks = BTreeMap::new();
         let mut manifests = Vec::new();
@@ -479,8 +643,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .try_reserve_exact(root.inodes().len())
             .map_err(|_| GenerationError::OutOfMemory)?;
         for inode in root.inodes() {
-            let bytes = self.read_metadata(inode.manifest_root())?;
-            let manifest = ManifestLeaf::decode(&bytes)?;
+            let manifest = self.read_manifest(inode.manifest_root())?;
             if manifest.file_length() != inode.logical_size() {
                 return Err(GenerationError::ManifestLengthMismatch {
                     inode: inode.inode(),
@@ -511,10 +674,10 @@ impl<I: StorageIo> GenerationRepository<I> {
         if required_chunks.is_empty() {
             return Ok(manifests);
         }
-        let Some(containers) = containers else {
+        let Some(verifier) = verifier else {
             return Err(GenerationError::DataLocationsNotConnected);
         };
-        containers.verify_required_chunks(&required_chunks)?;
+        verifier.verify_required_chunks(&required_chunks)?;
         Ok(manifests)
     }
 
@@ -533,6 +696,12 @@ impl<I: StorageIo> GenerationRepository<I> {
         }
         verify_generation_transition_pair(previous_record, &previous_root, proposed_root)
     }
+}
+
+fn record_matches_namespace_root(record: CommitRecord, root: &NamespaceRoot) -> bool {
+    root.namespace_mutation_sequence() == record.namespace_mutation_cutoff()
+        && root.inode_reservation_end() == record.inode_reservation_end()
+        && root.inode_allocation_cursor() == record.inode_allocation_cursor()
 }
 
 fn verify_generation_transition_pair(
@@ -593,20 +762,7 @@ fn verify_generation_transition_pair(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WalTail {
-    Clean,
-    Torn {
-        valid_bytes: usize,
-        tail_bytes: usize,
-    },
-    InvalidRecord {
-        offset: usize,
-    },
-    BrokenChain {
-        offset: usize,
-    },
-}
+pub use crate::generation_log::LogTail as WalTail;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredGeneration {
@@ -625,8 +781,8 @@ pub struct CommittedDataGeneration<I> {
     files: Vec<VerifiedCommittedFile<I>>,
 }
 
-/// One recovered DATA generation and the Manifest readers proven by the same
-/// forward recovery graph walk.
+/// One recovered DATA generation and the Manifest readers proven for that same
+/// selected recovery candidate.
 #[derive(Debug)]
 pub struct RecoveredDataGeneration<I> {
     generation: RecoveredGeneration,
@@ -735,6 +891,7 @@ impl RecoveredGeneration {
 pub enum GenerationError {
     Io(io::Error),
     MetadataFormat(MetadataFormatError),
+    ManifestTree(ManifestTreeError),
     CommitFormat(CommitFormatError),
     Store(StoreError),
     MetadataTooLarge,
@@ -792,10 +949,26 @@ pub enum GenerationError {
 impl GenerationError {
     fn allows_generation_fallback(&self) -> bool {
         match self {
-            Self::Io(error) | Self::Store(StoreError::Io(error)) => {
+            Self::Io(error)
+            | Self::Store(StoreError::Io(error))
+            | Self::ManifestTree(ManifestTreeError::Io(error)) => {
                 error.kind() == io::ErrorKind::NotFound
             }
             Self::MetadataFormat(_)
+            | Self::ManifestTree(
+                ManifestTreeError::Metadata(_)
+                | ManifestTreeError::Inner(
+                    fastdup_format::ManifestInnerNodeError::Metadata(_)
+                    | fastdup_format::ManifestInnerNodeError::InvalidLevel
+                    | fastdup_format::ManifestInnerNodeError::InvalidChildRange
+                    | fastdup_format::ManifestInnerNodeError::InvalidPartition
+                    | fastdup_format::ManifestInnerNodeError::InvalidPayload
+                    | fastdup_format::ManifestInnerNodeError::ArithmeticOverflow,
+                )
+                | ManifestTreeError::IdentityMismatch(_)
+                | ManifestTreeError::InvalidTree
+                | ManifestTreeError::ArithmeticOverflow,
+            )
             | Self::MetadataIdentityCollision(_)
             | Self::ManifestLengthMismatch { .. }
             | Self::ManifestChunkLengthConflict { .. }
@@ -824,6 +997,12 @@ impl GenerationError {
             | Self::WalNeedsRepair(_)
             | Self::NoRecoverableGeneration
             | Self::DataLocationsNotConnected
+            | Self::ManifestTree(
+                ManifestTreeError::TreeTooDeep
+                | ManifestTreeError::TreeTooLarge
+                | ManifestTreeError::OutOfMemory
+                | ManifestTreeError::Inner(fastdup_format::ManifestInnerNodeError::OutOfMemory),
+            )
             | Self::OutOfMemory => false,
         }
     }
@@ -840,6 +1019,7 @@ impl std::error::Error for GenerationError {
         match self {
             Self::Io(error) => Some(error),
             Self::MetadataFormat(error) => Some(error),
+            Self::ManifestTree(error) => Some(error),
             Self::CommitFormat(error) => Some(error),
             Self::Store(error) => Some(error),
             _ => None,
@@ -859,6 +1039,12 @@ impl From<MetadataFormatError> for GenerationError {
     }
 }
 
+impl From<ManifestTreeError> for GenerationError {
+    fn from(error: ManifestTreeError) -> Self {
+        Self::ManifestTree(error)
+    }
+}
+
 impl From<CommitFormatError> for GenerationError {
     fn from(error: CommitFormatError) -> Self {
         Self::CommitFormat(error)
@@ -871,54 +1057,19 @@ impl From<StoreError> for GenerationError {
     }
 }
 
-struct WalPrefix {
-    records: Vec<CommitRecord>,
-    tail: WalTail,
-}
-
-fn decode_wal_prefix(bytes: &[u8]) -> WalPrefix {
-    let complete_bytes = bytes.len() / COMMIT_RECORD_BYTES * COMMIT_RECORD_BYTES;
-    let mut records = Vec::new();
-    let mut previous_encoded: Option<&[u8]> = None;
-    let mut previous_record: Option<CommitRecord> = None;
-    for offset in (0..complete_bytes).step_by(COMMIT_RECORD_BYTES) {
-        let encoded = &bytes[offset..offset + COMMIT_RECORD_BYTES];
-        let Ok(record) = CommitRecord::decode(encoded) else {
-            return WalPrefix {
-                records,
-                tail: WalTail::InvalidRecord { offset },
-            };
-        };
-        let expected_generation =
-            u64::try_from(records.len()).expect("ASSERT: bounded WAL record count fits u64") + 1;
-        let expected_hash = previous_encoded.map_or(CommitRecordHash::ZERO, CommitRecordHash::of);
-        if record.generation() != expected_generation
-            || record.previous_record_hash() != expected_hash
-            || previous_record.is_some_and(|previous| {
-                record.namespace_mutation_cutoff() < previous.namespace_mutation_cutoff()
-                    || record.inode_reservation_end() < previous.inode_reservation_end()
-                    || record.inode_allocation_cursor() < previous.inode_allocation_cursor()
-            })
-        {
-            return WalPrefix {
-                records,
-                tail: WalTail::BrokenChain { offset },
-            };
+fn map_log_error(error: GenerationLogError) -> GenerationError {
+    match error {
+        GenerationLogError::Io(error) => GenerationError::Io(error),
+        GenerationLogError::SegmentTooLarge => GenerationError::WalTooLarge,
+        GenerationLogError::NeedsRepair(tail) => GenerationError::WalNeedsRepair(tail),
+        GenerationLogError::PublishVerificationMismatch => {
+            GenerationError::PublishVerificationMismatch
         }
-        records.push(record);
-        previous_encoded = Some(encoded);
-        previous_record = Some(record);
+        GenerationLogError::OutOfMemory => GenerationError::OutOfMemory,
+        GenerationLogError::BrokenGenerationChain
+        | GenerationLogError::DivergentSlots
+        | GenerationLogError::EmptyAfterInitialization => GenerationError::NoRecoverableGeneration,
     }
-    let tail_bytes = bytes.len() - complete_bytes;
-    let tail = if tail_bytes == 0 {
-        WalTail::Clean
-    } else {
-        WalTail::Torn {
-            valid_bytes: complete_bytes,
-            tail_bytes,
-        }
-    };
-    WalPrefix { records, tail }
 }
 
 fn metadata_name(object_id: MetadataObjectId) -> String {

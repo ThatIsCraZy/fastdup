@@ -92,3 +92,65 @@ fn publishing_an_existing_id_never_replaces_the_first_container() {
     );
     assert_eq!(reopened.chunk(ChunkId::of(b"replacement")), None);
 }
+
+#[test]
+fn adaptive_region_publication_uses_zstd_only_when_the_complete_record_wins() {
+    let root = test_root("publish-adaptive-region");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let store = ContainerStore::open(&root).expect("create workspace-local store");
+    let compressible_a = vec![b'A'; 256 * 1_024];
+    let compressible_b = vec![b'B'; 256 * 1_024];
+    let region = [compressible_a.as_slice(), compressible_b.as_slice()];
+    let id = ContainerId::new([0xD1; 16]).expect("container identity is nonzero");
+
+    store
+        .publish_adaptive_regions(id, 1, &[&region])
+        .expect("publish one adaptive Compression Region durably");
+    let reopened = store
+        .read(id)
+        .expect("reopen through the production Container verifier");
+
+    assert_eq!(reopened.zstd_record_count(), 1);
+    assert_eq!(reopened.raw_record_count(), 0);
+    assert_eq!(reopened.chunk_count(), 2);
+    assert_eq!(
+        reopened.chunk(ChunkId::of(&compressible_a)),
+        Some(compressible_a.as_slice())
+    );
+    assert_eq!(
+        reopened.chunk(ChunkId::of(&compressible_b)),
+        Some(compressible_b.as_slice())
+    );
+}
+
+#[test]
+fn adaptive_region_publication_retains_raw_for_incompressible_bytes() {
+    let root = test_root("publish-adaptive-incompressible");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let store = ContainerStore::open(&root).expect("create workspace-local store");
+    let mut state = 0xD1B5_4A32_D192_ED03_u64;
+    let mut bytes = vec![0_u8; 512 * 1_024];
+    for byte in &mut bytes {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state.to_le_bytes()[0];
+    }
+    let region = [&bytes[..256 * 1_024], &bytes[256 * 1_024..]];
+    let id = ContainerId::new([0xD2; 16]).expect("container identity is nonzero");
+
+    store
+        .publish_adaptive_regions(id, 1, &[&region])
+        .expect("publish the incompressible region through the adaptive writer");
+    let reopened = store
+        .read(id)
+        .expect("reopen through the production Container verifier");
+
+    assert_eq!(reopened.zstd_record_count(), 0);
+    assert_eq!(reopened.raw_record_count(), 2);
+    assert_eq!(reopened.chunk_count(), 2);
+}

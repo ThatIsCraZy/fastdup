@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fastdup_format::{
     ContainerId, ExactIndexEntry, ExactIndexLocation, ExactIndexProfileId, ExactIndexRun,
@@ -6,19 +7,23 @@ use fastdup_format::{
 };
 use fastdup_store::{ContainerRepository, ExactIndexRunRepository, FsStorageIo, StoreError};
 
-fn test_root() -> PathBuf {
+fn test_root(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test clock is after the Unix epoch")
+        .as_nanos();
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(".artifacts/tests")
-        .join(format!("exact-index-location-{}", std::process::id()))
+        .join(format!(
+            "exact-index-location-{name}-{}-{nonce}",
+            std::process::id()
+        ))
 }
 
 #[test]
 fn exact_candidate_is_usable_only_after_pairing_with_its_verified_container() {
-    let root = test_root();
-    if root.exists() {
-        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
-    }
+    let root = test_root("raw");
     let storage = FsStorageIo::open(&root).expect("open shared repository root");
     let repository = ContainerRepository::new(storage.clone());
     let container_id = ContainerId::new([0x91; 16]).expect("container ID is nonzero");
@@ -89,4 +94,62 @@ fn exact_candidate_is_usable_only_after_pairing_with_its_verified_container() {
         .read_verified_location(forged)
         .expect_err("an unpaired physical coordinate must never return bytes");
     assert!(matches!(error, StoreError::ExactLocationMismatch));
+}
+
+#[test]
+fn zstd_candidates_are_bounded_verified_locations_for_every_logical_chunk() {
+    let root = test_root("zstd");
+    let storage = FsStorageIo::open(&root).expect("open shared repository root");
+    let repository = ContainerRepository::new(storage.clone());
+    let container_id = ContainerId::new([0xA1; 16]).expect("container ID is nonzero");
+    let first = (0..192 * 1_024)
+        .map(|index| b'a' + u8::try_from(index % 19).expect("fixture remainder fits u8"))
+        .collect::<Vec<_>>();
+    let second = (0..192 * 1_024)
+        .map(|index| b'A' + u8::try_from(index % 17).expect("fixture remainder fits u8"))
+        .collect::<Vec<_>>();
+    repository
+        .publish_adaptive_regions(container_id, 9, &[&[first.as_slice(), second.as_slice()]])
+        .expect("publish one durable multi-Chunk Zstd record");
+    let container = repository
+        .read(container_id)
+        .expect("reread the complete verified Zstd Container");
+    assert_eq!(container.zstd_record_count(), 1);
+    let entries = container
+        .locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("construct acceleration entries only from verified evidence");
+    assert_eq!(entries.len(), 2);
+
+    let profile = ExactIndexProfileId::new([0xA2; 32]).expect("profile identity is nonzero");
+    let index_repository = ExactIndexRunRepository::new(storage);
+    let descriptor = index_repository
+        .publish(&ExactIndexRun::new(profile, 1, entries.clone()).expect("build the immutable Run"))
+        .expect("publish the immutable Run");
+    let active = index_repository
+        .activate(
+            &ExactIndexRunSet::new(
+                profile,
+                1,
+                vec![ExactIndexRunRef::new(0, descriptor).expect("pin the verified Run")],
+            )
+            .expect("build the Run Set"),
+        )
+        .expect("activate the complete Run Set");
+
+    for (entry, expected) in entries.iter().zip([first, second]) {
+        let lookup = active
+            .lookup_transitions(entry.chunk_id(), entry.logical_length())
+            .expect("perform the bounded persistent lookup");
+        assert_eq!(lookup.candidates(), &[*entry]);
+        assert_eq!(
+            repository
+                .read_verified_location(lookup.candidates()[0])
+                .expect("decode and verify the complete selected Zstd record"),
+            expected
+        );
+    }
 }

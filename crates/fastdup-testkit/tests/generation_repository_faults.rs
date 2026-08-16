@@ -1,11 +1,65 @@
 use fastdup_format::{
-    COMMIT_RECORD_BYTES, ChunkId, ContainerId, DurableInode, ManifestExtent, ManifestLeaf,
-    MetadataObjectId, NamespaceEntry, NamespaceRoot, PolicySetId,
+    COMMIT_RECORD_BYTES, ChunkId, ContainerId, DurableInode, ManifestExtent, ManifestInnerNode,
+    ManifestLeaf, MetadataObjectId, MetadataObjectKind, NamespaceEntry, NamespaceRoot, PolicySetId,
+    metadata_object_kind,
 };
 use fastdup_store::{
-    ContainerRepository, GenerationError, GenerationRepository, StorageIo, WalTail,
+    ContainerRepository, GenerationError, GenerationRepository, RequiredChunkVerifier, StorageIo,
+    StoreError, WalTail,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+#[derive(Debug)]
+struct AcceptAllRequiredChunks;
+
+impl RequiredChunkVerifier for AcceptAllRequiredChunks {
+    fn verify_required_chunks(&self, _required: &BTreeMap<ChunkId, u64>) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordingRequiredChunks {
+    calls: Mutex<Vec<Vec<ChunkId>>>,
+    rejected: Vec<ChunkId>,
+}
+
+impl RecordingRequiredChunks {
+    fn rejecting(rejected: Vec<ChunkId>) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            rejected,
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<ChunkId>> {
+        self.calls
+            .lock()
+            .expect("ASSERT: recording verifier lock poisoned")
+            .clone()
+    }
+}
+
+impl RequiredChunkVerifier for RecordingRequiredChunks {
+    fn verify_required_chunks(&self, required: &BTreeMap<ChunkId, u64>) -> Result<(), StoreError> {
+        self.calls
+            .lock()
+            .expect("ASSERT: recording verifier lock poisoned")
+            .push(required.keys().copied().collect());
+        if let Some(chunk_id) = required
+            .keys()
+            .find(|chunk_id| self.rejected.contains(chunk_id))
+        {
+            return Err(StoreError::MissingVerifiedChunk {
+                chunk_id: *chunk_id,
+                logical_length: required[chunk_id],
+            });
+        }
+        Ok(())
+    }
+}
 
 fn metadata_name(object_id: MetadataObjectId) -> String {
     let mut name = String::with_capacity(68);
@@ -15,6 +69,10 @@ fn metadata_name(object_id: MetadataObjectId) -> String {
     }
     name.push_str(".fdm");
     name
+}
+
+fn is_metadata_name(name: &str) -> bool {
+    name.len() == 68 && name.as_bytes().get(64..) == Some(b".fdm")
 }
 
 fn empty_file_root(manifest_root: fastdup_format::MetadataObjectId) -> NamespaceRoot {
@@ -383,6 +441,131 @@ fn data_manifest_commits_and_recovers_only_through_a_verified_container_source()
 }
 
 #[test]
+fn healthy_recovery_verifies_only_the_newest_structurally_valid_data_graph() {
+    let policy = PolicySetId::new([0x75; 32]).expect("policy identity is nonzero");
+    let metadata = MemoryStorageIo::new();
+    let container_storage = MemoryStorageIo::new();
+    let containers = ContainerRepository::new(container_storage.clone());
+    let repository = GenerationRepository::new(metadata.clone(), policy);
+    let accepting_verifier = AcceptAllRequiredChunks;
+    bootstrap_inode_reservation(&repository);
+
+    let mut historical_manifest_id = None;
+    let mut latest_root = None;
+    let mut latest_chunk_id = None;
+    for (mutation_sequence, payload) in [
+        (1, b"generation-two".as_slice()),
+        (2, b"generation-three".as_slice()),
+        (3, b"generation-four".as_slice()),
+    ] {
+        let chunk_id = ChunkId::of(payload);
+        let manifest = ManifestLeaf::new(
+            payload.len() as u64,
+            vec![ManifestExtent::Data {
+                logical_length: payload.len() as u64,
+                chunk_id,
+            }],
+        )
+        .expect("DATA manifest is valid");
+        let manifest_id = repository
+            .publish_manifest(&manifest)
+            .expect("publish DATA manifest");
+        historical_manifest_id.get_or_insert(manifest_id);
+        let root = hole_file_root(manifest_id, payload.len() as u64, mutation_sequence);
+        repository
+            .commit_namespace_with_verified_files_using(&root, &containers, &accepting_verifier)
+            .expect("complete dependency proof authorizes the generation");
+        latest_root = Some(root);
+        latest_chunk_id = Some(chunk_id);
+    }
+    let historical_manifest_name =
+        metadata_name(historical_manifest_id.expect("historical Manifest ID was recorded"));
+    let mut historical_manifest = metadata
+        .read(&historical_manifest_name)
+        .expect("historical Manifest exists");
+    historical_manifest[100] ^= 1;
+    metadata
+        .write_at(
+            &historical_manifest_name,
+            100,
+            &historical_manifest[100..101],
+        )
+        .expect("inject historical Manifest corruption");
+    metadata
+        .sync_file(&historical_manifest_name)
+        .expect("make historical Manifest corruption durable");
+    metadata.crash();
+    container_storage.crash();
+
+    let recording_verifier = RecordingRequiredChunks::default();
+    let recovered = GenerationRepository::new(metadata, policy)
+        .recover_latest_with_verified_files_using(&containers, &recording_verifier)
+        .expect("healthy latest generation recovers")
+        .expect("one committed generation exists");
+
+    assert_eq!(recovered.generation().record().generation(), 4);
+    assert_eq!(
+        recovered.generation().namespace_root(),
+        latest_root.as_ref().expect("latest root was recorded")
+    );
+    assert_eq!(
+        recording_verifier.calls(),
+        vec![vec![latest_chunk_id.expect("latest Chunk ID was recorded")]],
+        "even a corrupt historical DATA graph must not block or be re-proven before a healthy current graph"
+    );
+}
+
+#[test]
+fn recovery_never_exposes_an_unpinned_historical_generation() {
+    let policy = PolicySetId::new([0x76; 32]).expect("policy identity is nonzero");
+    let metadata = MemoryStorageIo::new();
+    let container_storage = MemoryStorageIo::new();
+    let containers = ContainerRepository::new(container_storage.clone());
+    let repository = GenerationRepository::new(metadata.clone(), policy);
+    let accepting_verifier = AcceptAllRequiredChunks;
+    bootstrap_inode_reservation(&repository);
+
+    let mut chunk_ids = Vec::new();
+    for (mutation_sequence, payload) in [
+        (1, b"unpinned-old".as_slice()),
+        (2, b"pinned-previous".as_slice()),
+        (3, b"pinned-current".as_slice()),
+    ] {
+        let chunk_id = ChunkId::of(payload);
+        let manifest = ManifestLeaf::new(
+            payload.len() as u64,
+            vec![ManifestExtent::Data {
+                logical_length: payload.len() as u64,
+                chunk_id,
+            }],
+        )
+        .expect("DATA manifest is valid");
+        let manifest_id = repository
+            .publish_manifest(&manifest)
+            .expect("publish DATA manifest");
+        let root = hole_file_root(manifest_id, payload.len() as u64, mutation_sequence);
+        repository
+            .commit_namespace_with_verified_files_using(&root, &containers, &accepting_verifier)
+            .expect("complete dependency proof authorizes the generation");
+        chunk_ids.push(chunk_id);
+    }
+    metadata.crash();
+    container_storage.crash();
+
+    let recording_verifier = RecordingRequiredChunks::rejecting(vec![chunk_ids[1], chunk_ids[2]]);
+    let error = GenerationRepository::new(metadata, policy)
+        .recover_latest_with_verified_files_using(&containers, &recording_verifier)
+        .expect_err("current and previous failure must not expose older history");
+
+    assert!(matches!(error, GenerationError::NoRecoverableGeneration));
+    assert_eq!(
+        recording_verifier.calls(),
+        vec![vec![chunk_ids[2]], vec![chunk_ids[1]]],
+        "only the current and immediately previous pinned graphs are candidates"
+    );
+}
+
+#[test]
 fn missing_data_location_prevents_commit_and_corrupt_newest_data_falls_back() {
     let policy = PolicySetId::new([0x56; 32]).expect("policy identity is nonzero");
     let missing_storage = MemoryStorageIo::new();
@@ -627,6 +810,485 @@ fn canonical_metadata_and_wal_lookups_do_not_scan_the_publication_directory() {
         !storage.operations().contains(&StorageOperation::ListNames),
         "canonical metadata publication must not grow linearly with directory size"
     );
+}
+
+#[test]
+fn commit_log_rotates_with_bounded_segments_and_recovers_the_latest_generation() {
+    const COMMIT_COUNT: u64 = 130;
+    const MAX_SEGMENT_BYTES: u64 = 64 * COMMIT_RECORD_BYTES as u64;
+
+    let policy = PolicySetId::new([0x61; 32]).expect("policy identity is nonzero");
+    let storage = MemoryStorageIo::new();
+    let repository = GenerationRepository::new(storage.clone(), policy);
+    let root = reservation_root(1_024);
+
+    let mut latest = None;
+    for expected_generation in 1..=COMMIT_COUNT {
+        let committed = repository
+            .commit_namespace(&root)
+            .expect("bounded Generation Log must not stop at a segment boundary");
+        assert_eq!(committed.generation(), expected_generation);
+        latest = Some(committed);
+    }
+
+    for name in storage
+        .list_names()
+        .expect("durable object names are enumerable in the test adapter")
+        .into_iter()
+        .filter(|name| name == "commit.wal" || name == "commit.1.wal")
+    {
+        assert!(
+            storage
+                .object_len(&name)
+                .expect("Generation Log object has a length")
+                <= MAX_SEGMENT_BYTES,
+            "Generation Log segment {name} exceeded its bounded on-disk size"
+        );
+    }
+
+    storage.crash();
+    let recovered = GenerationRepository::new(storage, policy)
+        .recover_latest()
+        .expect("bounded Generation Log recovers after repeated rotation")
+        .expect("at least one committed generation exists");
+    assert_eq!(recovered.record(), latest.expect("one commit was recorded"));
+    assert_eq!(recovered.namespace_root(), &root);
+}
+
+fn seed_generation_log_rotation_boundary(
+    storage: &MemoryStorageIo,
+    policy: PolicySetId,
+) -> (
+    GenerationRepository<MemoryStorageIo>,
+    fastdup_format::CommitRecord,
+) {
+    let repository = GenerationRepository::new(storage.clone(), policy);
+    let root = reservation_root(1_024);
+    let mut latest = None;
+    for _ in 0..64 {
+        latest = Some(
+            repository
+                .commit_namespace(&root)
+                .expect("seed Commit must remain below the rotation boundary"),
+        );
+    }
+    (
+        repository,
+        latest.expect("the boundary contains Commit Records"),
+    )
+}
+
+#[test]
+fn every_rotation_failpoint_recovers_only_the_previous_or_complete_next_generation() {
+    let policy = PolicySetId::new([0x62; 32]).expect("policy identity is nonzero");
+    let previous_root = reservation_root(1_024);
+    let next_root = reservation_root(2_048);
+
+    let probe_storage = MemoryStorageIo::new();
+    let (probe_repository, previous_record) =
+        seed_generation_log_rotation_boundary(&probe_storage, policy);
+    assert_eq!(previous_record.generation(), 64);
+    let baseline = probe_storage.operation_count();
+    let next_record = probe_repository
+        .commit_namespace(&next_root)
+        .expect("probe rotation Commit succeeds");
+    assert_eq!(next_record.generation(), 65);
+    let operations = probe_storage.operations()[baseline..].to_vec();
+    assert_eq!(
+        operations.last(),
+        Some(&StorageOperation::SyncFile),
+        "the rotated-slot sync remains the sole Commit point"
+    );
+
+    for relative_position in 0..operations.len() {
+        let storage = MemoryStorageIo::with_fail_before(baseline + relative_position);
+        let (repository, seeded_record) = seed_generation_log_rotation_boundary(&storage, policy);
+        assert_eq!(seeded_record, previous_record);
+        assert!(repository.commit_namespace(&next_root).is_err());
+        storage.crash();
+        let recovered = GenerationRepository::new(storage, policy)
+            .recover_latest()
+            .expect("the previous rotation slot remains recoverable")
+            .expect("the previous generation remains committed");
+        assert_eq!(
+            recovered.record(),
+            previous_record,
+            "fail-before position {relative_position} exposed the rotating slot"
+        );
+        assert_eq!(recovered.namespace_root(), &previous_root);
+    }
+
+    let commit_point = operations.len() - 1;
+    for relative_position in 0..operations.len() {
+        let storage = MemoryStorageIo::with_fail_after(baseline + relative_position);
+        let (repository, seeded_record) = seed_generation_log_rotation_boundary(&storage, policy);
+        assert_eq!(seeded_record, previous_record);
+        assert!(repository.commit_namespace(&next_root).is_err());
+        storage.crash();
+        let recovered = GenerationRepository::new(storage, policy)
+            .recover_latest()
+            .expect("one complete rotation slot remains recoverable")
+            .expect("at least the previous generation remains committed");
+        let expected = if relative_position == commit_point {
+            next_record
+        } else {
+            previous_record
+        };
+        assert_eq!(
+            recovered.record(),
+            expected,
+            "fail-after position {relative_position} exposed a mixed rotation"
+        );
+        assert_eq!(
+            recovered.namespace_root(),
+            if relative_position == commit_point {
+                &next_root
+            } else {
+                &previous_root
+            }
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual lifetime gate crosses the complete legacy 64-MiB Commit-WAL capacity"]
+fn commit_log_crosses_the_legacy_sixteen_thousand_commit_limit() {
+    const COMMIT_COUNT: u64 = 16_400;
+
+    let policy = PolicySetId::new([0x63; 32]).expect("policy identity is nonzero");
+    let storage = MemoryStorageIo::new();
+    let repository = GenerationRepository::new(storage.clone(), policy);
+    let root = reservation_root(1_024);
+    let mut latest = None;
+    for expected_generation in 1..=COMMIT_COUNT {
+        let record = repository
+            .commit_namespace(&root)
+            .expect("slot rotation must outlive the legacy WAL capacity");
+        assert_eq!(record.generation(), expected_generation);
+        latest = Some(record);
+    }
+
+    storage.crash();
+    let recovered = GenerationRepository::new(storage, policy)
+        .recover_latest()
+        .expect("the long-running Generation Log recovers")
+        .expect("the lifetime gate committed at least one generation");
+    assert_eq!(recovered.record(), latest.expect("one commit was recorded"));
+    assert_eq!(recovered.namespace_root(), &root);
+}
+
+#[test]
+fn manifest_tree_reuses_unchanged_leaves_and_recovers_through_its_root() {
+    const EXTENT_COUNT: usize = 2_500;
+    const EXTENT_BYTES: u64 = 64 * 1_024;
+
+    let policy = PolicySetId::new([0x64; 32]).expect("policy identity is nonzero");
+    let storage = MemoryStorageIo::new();
+    let repository = GenerationRepository::new(storage.clone(), policy);
+    let build_manifest = |changed_fill: u8| {
+        let extents = (0..EXTENT_COUNT)
+            .map(|ordinal| {
+                if ordinal % 2 == 0 {
+                    ManifestExtent::Hole {
+                        logical_length: EXTENT_BYTES,
+                    }
+                } else {
+                    ManifestExtent::Fill {
+                        logical_length: EXTENT_BYTES,
+                        value: if ordinal == 1_201 { changed_fill } else { 0x5A },
+                    }
+                }
+            })
+            .collect();
+        ManifestLeaf::new(
+            u64::try_from(EXTENT_COUNT).expect("fixture count fits u64") * EXTENT_BYTES,
+            extents,
+        )
+        .expect("worked large Manifest is valid")
+    };
+
+    let first = build_manifest(0x5A);
+    let first_root = repository
+        .publish_manifest(&first)
+        .expect("large Manifest tree publishes child-first");
+    let first_root_bytes = storage
+        .read(&metadata_name(first_root))
+        .expect("published Manifest root exists");
+    assert_eq!(
+        metadata_object_kind(&first_root_bytes).expect("root envelope verifies"),
+        MetadataObjectKind::ManifestInnerNode
+    );
+    let first_inner = ManifestInnerNode::decode(&first_root_bytes).expect("root node verifies");
+    assert_eq!(first_inner.level(), 1);
+    assert_eq!(first_inner.children().len(), 3);
+    assert_eq!(
+        repository
+            .read_manifest(first_root)
+            .expect("tree flattens through its public read seam"),
+        first
+    );
+    let objects_after_first = storage
+        .list_names()
+        .expect("test storage names are enumerable")
+        .into_iter()
+        .filter(|name| is_metadata_name(name))
+        .count();
+    assert_eq!(
+        objects_after_first, 3,
+        "two byte-identical full leaves share one object; the tail leaf and root are distinct"
+    );
+
+    let second = build_manifest(0xA5);
+    let second_root = repository
+        .publish_manifest(&second)
+        .expect("one changed range publishes a successor tree");
+    assert_ne!(second_root, first_root);
+    let objects_after_second = storage
+        .list_names()
+        .expect("test storage names are enumerable")
+        .into_iter()
+        .filter(|name| is_metadata_name(name))
+        .count();
+    assert_eq!(
+        objects_after_second - objects_after_first,
+        2,
+        "only one changed leaf and its root path are new"
+    );
+
+    bootstrap_inode_reservation(&repository);
+    let root = hole_file_root(
+        second_root,
+        u64::try_from(EXTENT_COUNT).expect("fixture count fits u64") * EXTENT_BYTES,
+        1,
+    );
+    let committed = repository
+        .commit_namespace(&root)
+        .expect("generation verification traverses the Manifest tree");
+    storage.crash();
+    let reopened = GenerationRepository::new(storage, policy);
+    let recovered = reopened
+        .recover_latest()
+        .expect("recovery traverses the complete Manifest tree")
+        .expect("tree-bearing generation is committed");
+    assert_eq!(recovered.record(), committed);
+    assert_eq!(recovered.namespace_root(), &root);
+    assert_eq!(
+        reopened
+            .read_manifest(second_root)
+            .expect("reopened tree remains byte-exact"),
+        second
+    );
+}
+
+#[test]
+fn manifest_tree_adds_levels_without_materializing_logical_file_bytes() {
+    const LEAF_COUNT: usize = 1_025;
+    const LEAF_BYTES: u64 = 64 * 1_024 * 1_024;
+
+    let policy = PolicySetId::new([0x65; 32]).expect("policy identity is nonzero");
+    let storage = MemoryStorageIo::new();
+    let repository = GenerationRepository::new(storage.clone(), policy);
+    let manifest = ManifestLeaf::new(
+        u64::try_from(LEAF_COUNT).expect("fixture count fits u64") * LEAF_BYTES,
+        vec![
+            ManifestExtent::Fill {
+                logical_length: LEAF_BYTES,
+                value: 0xC3,
+            };
+            LEAF_COUNT
+        ],
+    )
+    .expect("large logical Manifest is structurally valid");
+
+    let root = repository
+        .publish_manifest(&manifest)
+        .expect("multi-level Manifest publishes");
+    let root_bytes = storage
+        .read(&metadata_name(root))
+        .expect("multi-level root exists");
+    let root_node = ManifestInnerNode::decode(&root_bytes).expect("multi-level root verifies");
+    assert_eq!(root_node.level(), 2);
+    assert_eq!(root_node.children().len(), 2);
+    assert_eq!(root_node.file_length(), manifest.file_length());
+    assert_eq!(
+        repository
+            .read_manifest(root)
+            .expect("bounded traversal reconstructs the logical recipe"),
+        manifest
+    );
+}
+
+#[test]
+fn corrupt_nonempty_rotation_slot_never_rolls_back_beyond_the_live_pair() {
+    let policy = PolicySetId::new([0x66; 32]).expect("policy identity is nonzero");
+    let storage = MemoryStorageIo::new();
+    let repository = GenerationRepository::new(storage.clone(), policy);
+    let root = reservation_root(1_024);
+    for expected_generation in 1..=67 {
+        assert_eq!(
+            repository
+                .commit_namespace(&root)
+                .expect("rotation seed commits")
+                .generation(),
+            expected_generation
+        );
+    }
+    storage
+        .write_at("commit.1.wal", 0, b"X")
+        .expect("inject corruption into the active nonempty slot");
+    storage
+        .sync_file("commit.1.wal")
+        .expect("make active-slot corruption durable");
+    storage.crash();
+
+    assert!(matches!(
+        GenerationRepository::new(storage, policy).recover_latest(),
+        Err(GenerationError::NoRecoverableGeneration)
+    ));
+}
+
+#[test]
+fn rotation_fallback_keeps_the_new_high_water_and_never_exposes_older_history() {
+    let policy = PolicySetId::new([0x67; 32]).expect("policy identity is nonzero");
+    let storage = MemoryStorageIo::new();
+    let repository = GenerationRepository::new(storage.clone(), policy);
+    let old_root = reservation_root(1_024);
+    let mut record_64 = None;
+    for _ in 0..64 {
+        record_64 = Some(
+            repository
+                .commit_namespace(&old_root)
+                .expect("seed reaches the rotation boundary"),
+        );
+    }
+    let root_65 = reservation_root(2_048);
+    let record_65 = repository
+        .commit_namespace(&root_65)
+        .expect("rotation advances the durable reservation high-water");
+    let root_66 = reservation_root(4_096);
+    let record_66 = repository
+        .commit_namespace(&root_66)
+        .expect("successor advances the durable reservation high-water again");
+    assert_eq!(record_65.generation(), 65);
+    assert_eq!(record_66.generation(), 66);
+
+    let corrupt_root = |record: fastdup_format::CommitRecord| {
+        let name = metadata_name(record.namespace_root());
+        let mut bytes = storage.read(&name).expect("Namespace Root exists");
+        bytes[100] ^= 1;
+        storage
+            .write_at(&name, 100, &bytes[100..101])
+            .expect("inject Namespace Root corruption");
+        storage
+            .sync_file(&name)
+            .expect("make Namespace Root corruption durable");
+    };
+    corrupt_root(record_66);
+    storage.crash();
+    let recovered = GenerationRepository::new(storage.clone(), policy)
+        .recover_latest()
+        .expect("the immediate predecessor remains a recovery candidate")
+        .expect("generation 65 remains live");
+    assert_eq!(recovered.record(), record_65);
+    assert_eq!(recovered.namespace_root(), &root_65);
+    assert_eq!(recovered.inode_reservation_end_high_water(), 4_096);
+    assert_eq!(recovered.rejected_newer_generations(), 1);
+
+    corrupt_root(record_65);
+    storage.crash();
+    assert!(matches!(
+        GenerationRepository::new(storage, policy).recover_latest(),
+        Err(GenerationError::NoRecoverableGeneration)
+    ));
+    assert_eq!(record_64.expect("boundary seed exists").generation(), 64);
+}
+
+#[test]
+fn corrupt_changed_manifest_leaf_falls_back_as_one_complete_tree_generation() {
+    const EXTENT_COUNT: usize = 1_100;
+    const EXTENT_BYTES: u64 = 64 * 1_024;
+
+    let policy = PolicySetId::new([0x68; 32]).expect("policy identity is nonzero");
+    let storage = MemoryStorageIo::new();
+    let repository = GenerationRepository::new(storage.clone(), policy);
+    let manifest = |changed_value: u8| {
+        ManifestLeaf::new(
+            u64::try_from(EXTENT_COUNT).expect("fixture count fits u64") * EXTENT_BYTES,
+            (0..EXTENT_COUNT)
+                .map(|ordinal| ManifestExtent::Fill {
+                    logical_length: EXTENT_BYTES,
+                    value: if ordinal == 1_050 {
+                        changed_value
+                    } else {
+                        0x31
+                    },
+                })
+                .collect(),
+        )
+        .expect("tree fallback fixture is valid")
+    };
+    bootstrap_inode_reservation(&repository);
+
+    let first_manifest = manifest(0x31);
+    let first_root_id = repository
+        .publish_manifest(&first_manifest)
+        .expect("publish first tree");
+    let logical_size = first_manifest.file_length();
+    let first_root = hole_file_root(first_root_id, logical_size, 1);
+    let first_record = repository
+        .commit_namespace(&first_root)
+        .expect("commit first complete tree");
+
+    let second_manifest = manifest(0x32);
+    let second_root_id = repository
+        .publish_manifest(&second_manifest)
+        .expect("publish changed tree");
+    let second_root = hole_file_root(second_root_id, logical_size, 2);
+    repository
+        .commit_namespace(&second_root)
+        .expect("commit second complete tree");
+
+    let first_node = ManifestInnerNode::decode(
+        &storage
+            .read(&metadata_name(first_root_id))
+            .expect("first root exists"),
+    )
+    .expect("first root verifies");
+    let second_node = ManifestInnerNode::decode(
+        &storage
+            .read(&metadata_name(second_root_id))
+            .expect("second root exists"),
+    )
+    .expect("second root verifies");
+    let changed_child = second_node
+        .children()
+        .iter()
+        .map(|child| child.child())
+        .find(|child| {
+            !first_node
+                .children()
+                .iter()
+                .any(|prior| prior.child() == *child)
+        })
+        .expect("one changed leaf has a new identity");
+    let changed_name = metadata_name(changed_child);
+    let mut bytes = storage.read(&changed_name).expect("changed leaf exists");
+    bytes[100] ^= 1;
+    storage
+        .write_at(&changed_name, 100, &bytes[100..101])
+        .expect("inject changed-leaf corruption");
+    storage
+        .sync_file(&changed_name)
+        .expect("make changed-leaf corruption durable");
+    storage.crash();
+
+    let recovered = GenerationRepository::new(storage, policy)
+        .recover_latest()
+        .expect("tree corruption permits exactly one atomic fallback")
+        .expect("the prior complete tree remains live");
+    assert_eq!(recovered.record(), first_record);
+    assert_eq!(recovered.namespace_root(), &first_root);
+    assert_eq!(recovered.rejected_newer_generations(), 1);
 }
 
 #[test]

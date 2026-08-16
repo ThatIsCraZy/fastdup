@@ -441,6 +441,10 @@ impl VersionedFile {
         self.live_allocated_bytes
     }
 
+    pub(super) const fn active_dirty_payload_bytes(&self) -> u64 {
+        self.active.data.allocated_bytes
+    }
+
     pub(super) fn write(
         &mut self,
         offset: u64,
@@ -484,6 +488,12 @@ impl VersionedFile {
             "ASSERT: allocated bytes must not exceed logical size"
         );
         Ok(())
+    }
+
+    pub(super) fn advance_mutation_sequence(&mut self, sequence: u64) {
+        self.active.assert_next_sequence(sequence);
+        self.active.record_sequence(sequence);
+        self.active.assert_valid();
     }
 
     fn allocated_bytes_in_range(&self, start: u64, end: u64) -> Result<u64, PosixError> {

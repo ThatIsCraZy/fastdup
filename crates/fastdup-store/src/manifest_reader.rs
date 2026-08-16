@@ -1,19 +1,61 @@
-use crate::{ContainerRepository, StorageIo, StoreError};
+use crate::{ActivatedExactIndex, ContainerRepository, StorageIo, StoreError};
 use fastdup_format::{ChunkId, ManifestExtent, ManifestLeaf};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 pub const MAX_MANIFEST_READ_BYTES: u32 = 1_024 * 1_024;
 
-/// A verified immutable file recipe backed by durable RAW containers.
+/// A verified immutable file recipe backed by durable RAW/Zstd containers.
 ///
 /// Construction verifies every DATA dependency as one batch. Demand reads
-/// re-verify the selected immutable container before copying any DATA bytes;
-/// HOLE and FILL extents require no physical data location.
+/// verify either the complete Container slow path or a paired sealed envelope
+/// plus the complete selected Record and Chunk; HOLE and FILL extents require
+/// no physical data location.
 #[derive(Clone, Debug)]
 pub struct VerifiedManifestFile<I> {
     manifest: ManifestLeaf,
     containers: ContainerRepository<I>,
+    indexed_reader: Option<Arc<dyn VerifiedChunkReader>>,
+}
+
+trait VerifiedChunkReader: fmt::Debug + Send + Sync {
+    fn read_verified_chunk(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u64,
+    ) -> Result<Vec<u8>, StoreError>;
+}
+
+struct ActiveIndexChunkReader<I, J> {
+    containers: ContainerRepository<I>,
+    index: Arc<ActivatedExactIndex<J>>,
+}
+
+impl<I, J> fmt::Debug for ActiveIndexChunkReader<I, J> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveIndexChunkReader")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I, J> VerifiedChunkReader for ActiveIndexChunkReader<I, J>
+where
+    I: Send + Sync + StorageIo,
+    J: Send + Sync + StorageIo,
+{
+    fn read_verified_chunk(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u64,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.containers.read_verified_chunk_with_index(
+            self.index.as_ref(),
+            chunk_id,
+            logical_length,
+        )
+    }
 }
 
 impl<I: StorageIo> VerifiedManifestFile<I> {
@@ -50,6 +92,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         Ok(Self {
             manifest,
             containers,
+            indexed_reader: None,
         })
     }
 
@@ -60,7 +103,28 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         Self {
             manifest,
             containers,
+            indexed_reader: None,
         }
+    }
+
+    /// Pins one already recovered Exact Index generation behind this Manifest
+    /// reader. Subsequent ordinary demand reads use its bounded candidates and
+    /// retain the verified Container scan as their correctness fallback.
+    ///
+    /// Pinning by [`Arc`] prevents a concurrent activation from changing the
+    /// physical-location view halfway through a file read. The index remains
+    /// acceleration state and does not extend the lifetime of DATA objects.
+    #[must_use]
+    pub fn with_active_index<J>(mut self, index: Arc<ActivatedExactIndex<J>>) -> Self
+    where
+        I: Clone + Send + Sync + 'static,
+        J: Send + Sync + StorageIo + 'static,
+    {
+        self.indexed_reader = Some(Arc::new(ActiveIndexChunkReader {
+            containers: self.containers.clone(),
+            index,
+        }));
+        self
     }
 
     #[must_use]
@@ -85,6 +149,52 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
     /// Panics only when a previously validated Manifest partition fails to
     /// cover the requested range, which is an impossible internal state.
     pub fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, ManifestReadError> {
+        if let Some(reader) = &self.indexed_reader {
+            self.read_at_using(offset, length, |chunk_id, logical_length| {
+                reader.read_verified_chunk(chunk_id, logical_length)
+            })
+        } else {
+            self.read_at_using(offset, length, |chunk_id, logical_length| {
+                self.containers
+                    .read_verified_chunk(chunk_id, logical_length)
+            })
+        }
+    }
+
+    /// Reads one bounded byte range using the activated persistent Exact Index
+    /// for DATA extents and the verified Container scan only as a correctness
+    /// fallback. HOLE and FILL extents remain metadata-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a range, allocation, index-backed Container verification, or
+    /// fallback scan failure. On error no partial byte sequence is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when a previously validated Manifest partition fails to
+    /// cover the requested range, which is an impossible internal state.
+    pub fn read_at_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>, ManifestReadError> {
+        self.read_at_using(offset, length, |chunk_id, logical_length| {
+            self.containers
+                .read_verified_chunk_with_index(index, chunk_id, logical_length)
+        })
+    }
+
+    fn read_at_using<F>(
+        &self,
+        offset: u64,
+        length: u32,
+        mut read_chunk: F,
+    ) -> Result<Vec<u8>, ManifestReadError>
+    where
+        F: FnMut(ChunkId, u64) -> Result<Vec<u8>, StoreError>,
+    {
         if length > MAX_MANIFEST_READ_BYTES {
             return Err(ManifestReadError::RequestTooLarge(length));
         }
@@ -135,9 +245,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
                     logical_length,
                     chunk_id,
                 } => {
-                    let payload = self
-                        .containers
-                        .read_verified_chunk(chunk_id, logical_length)?;
+                    let payload = read_chunk(chunk_id, logical_length)?;
                     let source_start = usize::try_from(copy_start - extent_start)
                         .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
                     let source_end = usize::try_from(copy_end - extent_start)

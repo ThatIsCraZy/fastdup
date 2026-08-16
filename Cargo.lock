@@ -129,11 +129,13 @@ checksum = "77af40d8a8dadb92dc178569a5f5edb5f3056e98255c2de48ab5d59a52892e0c"
 name = "fastdup-appliance"
 version = "0.1.0"
 dependencies = [
+ "fastcdc",
  "fastdup-format",
  "fastdup-posix",
  "fastdup-store",
  "fastdup-testkit",
  "fuse3",
+ "rustix",
  "tokio",
 ]
 
@@ -143,6 +145,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "crc32c",
+ "zstd",
 ]
 
 [[package]]
@@ -170,6 +173,7 @@ dependencies = [
 name = "fastdup-testkit"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fastdup-format",
  "fastdup-store",
 ]

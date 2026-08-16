@@ -2,16 +2,25 @@
 
 fastdup is an integrity-first prototype for a POSIX deduplicating storage
 appliance. The repository is deliberately early: the implemented slice is the
-versioned Stage-1 RAW container format, its durable XFS publication path, and a
-deterministic crash model. A separate in-memory reference pipeline now exercises
+versioned RAW/Zstd container format, durable metadata generations, immutable
+Exact-Index runs, their XFS publication paths, and a deterministic crash model.
+A separate in-memory reference pipeline exercises
 FastCDC, Exact Dedup, Zstd/Dictionary, bounded Similarity/Depth-1 Delta, FILL,
-and bounded Reorder, but those records do not yet have a durable on-disk format.
-A low-level FUSE checkpoint is mountable and exercises volatile live POSIX
-semantics. Versioned Manifest/Namespace/Commit-WAL formats now recover through a
-type-erased appliance adapter into the same POSIX seam, including lazy verified
-DATA/FILL/HOLE reads. That recovered seam is deliberately read-only until the
-ten-second checkpoint scheduler and durable Inode reservation publisher are
-connected, so this is not yet a usable backup target.
+and bounded Reorder. Dependency-free Zstd Compression Regions now have a durable
+on-disk format; Dictionary, Similarity, Delta, and Reorder records do not yet.
+A low-level FUSE checkpoint is mountable with writable live POSIX semantics,
+five-second durable checkpoints, a ten-second mutation-admission gate, and an
+additional 512-MiB active-Dirty-DATA pressure checkpoint.
+Versioned Manifest/Namespace/Commit-WAL formats recover through a type-erased
+adapter into the same seam, including lazy verified DATA/FILL/HOLE reads. A
+valid activated Exact-Index Run Set is pinned at mount and bounds normal DATA
+reads. New checkpoints stream FastCDC-v1 boundaries, publish verified RAW/Zstd
+Locations as level-zero Runs, and reuse Exact Hits across later checkpoints;
+four same-level Runs are merged RoW before the 64-Run reader bound is reached.
+Missing or corrupt index state falls back to verified Container scans. Adaptive
+Compression Regions are encoded by a bounded cache-local worker pool and merged
+in deterministic input order.
+This remains an experimental checkpoint rather than a production backup target.
 
 Start with [CONTEXT.md](CONTEXT.md), the accepted decisions in
 [`docs/adr/`](docs/adr/), and the byte-exact
@@ -27,6 +36,10 @@ Its durable namespace and recovery rules are specified in
 The current reduction policy, real 10-ISO results, worker scaling, integrity
 gates, and explicit limitations are recorded in
 [`data-reduction-reference-v1`](docs/benchmarks/data-reduction-reference-v1.md).
+The first sustained kernel-FUSE write/checkpoint/read/delete run, including
+per-stage CPU, memory, Exact/Compression efficiency, and device-I/O evidence,
+is recorded in
+[`io-intensive-fuse-600s`](docs/benchmarks/io-intensive-fuse-600s.md).
 
 ## Workspace
 
@@ -67,12 +80,15 @@ cargo run --release -p fastdup-store --example reduction_matrix -- \
   /source/fastdup/.artifacts/corpus/structured-v1/*
 ```
 
-The next correctness work is the single-writer checkpoint scheduler: reserve a
-fresh Inode range, cut immutable per-Inode dirty epochs, publish data and
-metadata outside Inode locks, commit the Namespace Root, then retire exactly the
-installed prefix while preserving later writes. WAL segmentation and an indexed
-verified Chunk-location path remain production blockers; the current 64-MiB WAL
-and full-container DATA verification are intentionally bounded checkpoint
-implementations. The reference reduction implementation remains benchmark
-evidence and a format-design oracle, not permission to bypass POSIX conformance
-gates.
+Verified Locations now provide commit-time and recovery DATA proof without a
+Container-directory scan while the active index is healthy. Namespace commits
+rotate through two bounded, overlapping Commit-Log slots, and large recipes are
+published as content-addressed Manifest trees whose unchanged leaves are reused.
+The next scalability work is tree-native lazy reads/path updates, metadata GC,
+a durable Container-generation high-water, and per-DATA-region Chunking Profile
+identities. The current compactor is explicitly bounded to 262,144 input
+entries; streaming partitioned compaction remains necessary above that scale.
+External index rebuild/scrub, a format-epoch fence, and process-kill deadline
+evidence remain production blockers.
+The reference reduction implementation remains benchmark evidence and a
+format-design oracle, not permission to bypass POSIX conformance gates.

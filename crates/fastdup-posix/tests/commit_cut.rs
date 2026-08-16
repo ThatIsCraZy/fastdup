@@ -417,6 +417,146 @@ fn closing_admission_waits_until_an_already_admitted_write_is_applied() {
     );
 }
 
+#[tokio::test]
+async fn checkpoint_pressure_counts_unique_checkpointable_dirty_payload() {
+    let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
+    let Reply::Created { entry, handle } = create(&namespace, b"pressure") else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+    let inode = entry.attr.inode;
+
+    let waiting_namespace = Arc::clone(&namespace);
+    let waiter = tokio::spawn(async move {
+        waiting_namespace
+            .wait_for_checkpointable_dirty_payload(11)
+            .await
+    });
+    tokio::task::yield_now().await;
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 0,
+                data: b"abcdefgh",
+            },
+        )
+        .expect("write initial dirty payload");
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 2,
+                data: b"XY",
+            },
+        )
+        .expect("overwrite dirty payload without double counting it");
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 16,
+                data: b"ij",
+            },
+        )
+        .expect("write beyond a sparse hole");
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 10);
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            namespace.wait_for_checkpointable_dirty_payload(11),
+        )
+        .await
+        .is_err(),
+        "ten unique dirty bytes must not trip an eleven-byte threshold"
+    );
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 18,
+                data: b"k",
+            },
+        )
+        .expect("cross checkpoint pressure threshold");
+    assert_eq!(
+        waiter
+            .await
+            .expect("checkpoint-pressure waiter did not panic"),
+        11
+    );
+
+    namespace
+        .begin_commit()
+        .expect("freeze pressure fixture")
+        .expect("dirty fixture requires a commit");
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 0);
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 0,
+                data: b"next",
+            },
+        )
+        .expect("write into the next active epoch");
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 4);
+}
+
+#[test]
+fn open_orphan_dirty_payload_is_not_checkpointable() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let Reply::Created { entry, handle } = create(&namespace, b"orphan-pressure") else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+    let inode = entry.attr.inode;
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 0,
+                data: b"next",
+            },
+        )
+        .expect("write linked fixture");
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 4);
+
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Unlink {
+                parent: ROOT_INODE,
+                name: b"orphan-pressure",
+            },
+        )
+        .expect("unlink active fixture");
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 0);
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 4,
+                data: b"orphan",
+            },
+        )
+        .expect("open orphan remains writable but is not checkpointable");
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 0);
+}
+
 fn create(namespace: &Namespace, name: &[u8]) -> Reply {
     namespace
         .dispatch(

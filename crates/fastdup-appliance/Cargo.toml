@@ -8,7 +8,9 @@ license.workspace = true
 fastdup-format.workspace = true
 fastdup-posix.workspace = true
 fastdup-store.workspace = true
+fastcdc.workspace = true
 fuse3.workspace = true
+rustix.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

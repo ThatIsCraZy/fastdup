@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
 fastdup-format.workspace = true
 fastdup-store.workspace = true
 

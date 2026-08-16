@@ -23,11 +23,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .checked_add(summary.file_length())
             .ok_or_else(|| io::Error::other("file-byte counter overflow"))
     })?;
+    let raw_records = summaries.iter().try_fold(0_usize, |total, summary| {
+        total
+            .checked_add(summary.raw_record_count())
+            .ok_or_else(|| io::Error::other("RAW record counter overflow"))
+    })?;
+    let zstd_records = summaries.iter().try_fold(0_usize, |total, summary| {
+        total
+            .checked_add(summary.zstd_record_count())
+            .ok_or_else(|| io::Error::other("Zstd record counter overflow"))
+    })?;
 
     println!("result=PASS");
     println!("verification=FULL_CONTAINER_AUDIT");
     println!("containers={}", summaries.len());
     println!("chunks={chunks}");
+    println!("raw_records={raw_records}");
+    println!("zstd_records={zstd_records}");
     println!("file_bytes={file_bytes}");
     println!("retained_payload_bytes=0");
     println!("store={}", root.display());
