@@ -19,10 +19,13 @@ valid prefix and stops at the first torn or invalid record. The append-only WAL
 is authoritative; redundant superblock slots may accelerate segment discovery
 but an in-place root pointer is never required for correctness. Size and memory
 pressure may commit early, while the oldest admitted mutation controls the hard
-deadline. The v1 daemon starts an immediate pressure checkpoint at 512 MiB of
-active checkpointable Dirty DATA, exactly eight format-v1 maximum Container
+deadline. ADR 0040 additionally permits complete immutable Containers to become
+durable before their generation cut and uses their bounded backlog to start an
+early coalesced commit. The v1 daemon retains an immediate fallback checkpoint
+at 512 MiB of resident active checkpointable Dirty DATA, exactly eight format-v1 maximum Container
 sizes. It closes mutation admission while that pressure checkpoint catches up,
 and also closes admission if the next active epoch reaches the same threshold
 while a time-triggered checkpoint is still running. Sparse holes, overwrites of
-already dirty ranges, frozen epochs, and encoder buffers do not inflate this
-trigger; it is a bounded commit-batch rule rather than an RSS measurement.
+already dirty ranges, frozen epochs, encoder buffers, and byte-exact ranges
+externalized to verified immutable Containers do not inflate this trigger; it
+is a bounded resident-fallback rule rather than an RSS measurement.

@@ -1,5 +1,9 @@
 use crate::generation_log::{GenerationLog, GenerationLogError};
-use crate::manifest_tree::{ManifestTreeError, encode_manifest_tree, flatten_manifest_tree};
+use crate::manifest_tree::{
+    ManifestRangeExtent, ManifestTreeError, ManifestTreeSummary, encode_manifest_tree,
+    flatten_manifest_tree, read_manifest_tree_range, rewrite_manifest_tree_range,
+    scan_manifest_tree,
+};
 use crate::{
     ActivatedExactIndex, ContainerRepository, StorageIo, StoreError, VerifiedManifestFile,
 };
@@ -10,12 +14,13 @@ use fastdup_format::{
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 const METADATA_SUFFIX: &str = ".fdm";
 const WRITE_BLOCK_BYTES: usize = 4_096;
 const MAX_METADATA_OBJECT_BYTES_U64: u64 = 16 * 1_024 * 1_024;
-type VerifiedManifests = Vec<(u64, ManifestLeaf)>;
+type VerifiedManifests = Vec<(u64, ManifestTreeSummary)>;
 
 struct RecoveredGraph {
     generation: RecoveredGeneration,
@@ -138,6 +143,45 @@ impl<I: StorageIo> GenerationRepository<I> {
         Ok(tree.root())
     }
 
+    /// Publishes an equal-length immutable successor by replacing one logical
+    /// range and rewriting only the intersecting leaves and their ancestors.
+    /// Unchanged subtree object IDs are retained exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns format, predecessor-tree, replacement-boundary, identity, or
+    /// durable-publication errors. A replacement boundary inside DATA is
+    /// rejected because one DATA extent is the indivisible Chunk identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the path-local tree plan disagrees with the generic
+    /// content-addressed Metadata Object writer.
+    pub fn publish_manifest_replacement(
+        &self,
+        previous_root: MetadataObjectId,
+        expected_logical_size: u64,
+        replaced: Range<u64>,
+        replacement: &[ManifestExtent],
+    ) -> Result<MetadataObjectId, GenerationError> {
+        let tree = rewrite_manifest_tree_range(
+            previous_root,
+            expected_logical_size,
+            replaced,
+            replacement,
+            |node_id| self.read_manifest_node(node_id),
+        )?;
+        for (expected_id, encoded) in tree.objects() {
+            let published_id = self.stage_metadata(encoded)?;
+            assert_eq!(
+                published_id, *expected_id,
+                "ASSERT: path-local Manifest plan identity must equal published object identity"
+            );
+        }
+        self.storage.sync_root()?;
+        Ok(tree.root())
+    }
+
     /// Loads and fully verifies one immutable Manifest by Metadata Object ID.
     ///
     /// # Errors
@@ -161,6 +205,32 @@ impl<I: StorageIo> GenerationRepository<I> {
             }
             Ok(bytes)
         })
+        .map_err(Into::into)
+    }
+
+    /// Reads and verifies only Manifest tree paths intersecting one range.
+    /// Returned extents retain their absolute logical offsets.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded I/O, identity, tree-partition, or arithmetic errors.
+    pub fn read_manifest_range(
+        &self,
+        object_id: MetadataObjectId,
+        expected_logical_size: u64,
+        range: Range<u64>,
+    ) -> Result<Vec<ManifestRangeExtent>, GenerationError> {
+        let length = range
+            .end
+            .checked_sub(range.start)
+            .ok_or(ManifestTreeError::InvalidReplacement)?;
+        read_manifest_tree_range(
+            object_id,
+            expected_logical_size,
+            range.start,
+            length,
+            |node_id| self.read_manifest_node(node_id),
+        )
         .map_err(Into::into)
     }
 
@@ -233,6 +303,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         containers: &ContainerRepository<J>,
     ) -> Result<CommittedDataGeneration<J>, GenerationError>
     where
+        I: Clone + Send + Sync + 'static,
         J: Clone + StorageIo,
     {
         let _guard = self
@@ -240,7 +311,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: generation commit lock poisoned");
         let manifests = self.verify_manifest_graph(root, Some(containers))?;
-        let files = verified_files(manifests, containers)?;
+        let files = verified_files(manifests, &self.storage, containers)?;
         let record = self.commit_verified_namespace(root)?;
         Ok(CommittedDataGeneration { record, files })
     }
@@ -269,6 +340,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<CommittedDataGeneration<J>, GenerationError>
     where
+        I: Clone + Send + Sync + 'static,
         J: Clone + StorageIo,
     {
         let _guard = self
@@ -276,7 +348,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: generation commit lock poisoned");
         let manifests = self.verify_manifest_graph(root, Some(verifier))?;
-        let files = verified_files(manifests, containers)?;
+        let files = verified_files(manifests, &self.storage, containers)?;
         let record = self.commit_verified_namespace(root)?;
         Ok(CommittedDataGeneration { record, files })
     }
@@ -385,6 +457,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         containers: &ContainerRepository<J>,
     ) -> Result<Option<RecoveredDataGeneration<J>>, GenerationError>
     where
+        I: Clone + Send + Sync + 'static,
         J: Clone + StorageIo,
     {
         let _guard = self
@@ -394,7 +467,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         let Some(graph) = self.recover_latest_using(Some(containers))? else {
             return Ok(None);
         };
-        let files = verified_files(graph.manifests, containers)?;
+        let files = verified_files(graph.manifests, &self.storage, containers)?;
         Ok(Some(RecoveredDataGeneration {
             generation: graph.generation,
             files,
@@ -424,6 +497,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<Option<RecoveredDataGeneration<J>>, GenerationError>
     where
+        I: Clone + Send + Sync + 'static,
         J: Clone + StorageIo,
     {
         let _guard = self
@@ -433,7 +507,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         let Some(graph) = self.recover_latest_using(Some(verifier))? else {
             return Ok(None);
         };
-        let files = verified_files(graph.manifests, containers)?;
+        let files = verified_files(graph.manifests, &self.storage, containers)?;
         Ok(Some(RecoveredDataGeneration {
             generation: graph.generation,
             files,
@@ -636,40 +710,51 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         root: &NamespaceRoot,
         verifier: Option<&dyn RequiredChunkVerifier>,
-    ) -> Result<Vec<(u64, ManifestLeaf)>, GenerationError> {
+    ) -> Result<VerifiedManifests, GenerationError> {
         let mut required_chunks = BTreeMap::new();
+        let mut chunk_length_conflict = None;
         let mut manifests = Vec::new();
         manifests
             .try_reserve_exact(root.inodes().len())
             .map_err(|_| GenerationError::OutOfMemory)?;
         for inode in root.inodes() {
-            let manifest = self.read_manifest(inode.manifest_root())?;
-            if manifest.file_length() != inode.logical_size() {
+            let summary = scan_manifest_tree(
+                inode.manifest_root(),
+                |node_id| self.read_manifest_node(node_id),
+                |_logical_offset, extent| {
+                    let ManifestExtent::Data {
+                        logical_length,
+                        chunk_id,
+                    } = *extent
+                    else {
+                        return Ok(());
+                    };
+                    if let Some(previous_length) = required_chunks.get(&chunk_id).copied() {
+                        if previous_length != logical_length {
+                            chunk_length_conflict =
+                                Some((chunk_id, previous_length, logical_length));
+                        }
+                    } else {
+                        required_chunks.insert(chunk_id, logical_length);
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Some((chunk_id, first_length, second_length)) = chunk_length_conflict.take() {
+                return Err(GenerationError::ManifestChunkLengthConflict {
+                    chunk_id,
+                    first_length,
+                    second_length,
+                });
+            }
+            if summary.logical_size() != inode.logical_size() {
                 return Err(GenerationError::ManifestLengthMismatch {
                     inode: inode.inode(),
                     inode_length: inode.logical_size(),
-                    manifest_length: manifest.file_length(),
+                    manifest_length: summary.logical_size(),
                 });
             }
-            for extent in manifest.extents() {
-                let ManifestExtent::Data {
-                    logical_length,
-                    chunk_id,
-                } = *extent
-                else {
-                    continue;
-                };
-                if let Some(previous_length) = required_chunks.insert(chunk_id, logical_length)
-                    && previous_length != logical_length
-                {
-                    return Err(GenerationError::ManifestChunkLengthConflict {
-                        chunk_id,
-                        first_length: previous_length,
-                        second_length: logical_length,
-                    });
-                }
-            }
-            manifests.push((inode.inode(), manifest));
+            manifests.push((inode.inode(), summary));
         }
         if required_chunks.is_empty() {
             return Ok(manifests);
@@ -679,6 +764,24 @@ impl<I: StorageIo> GenerationRepository<I> {
         };
         verifier.verify_required_chunks(&required_chunks)?;
         Ok(manifests)
+    }
+
+    fn read_manifest_node(
+        &self,
+        object_id: MetadataObjectId,
+    ) -> Result<Vec<u8>, ManifestTreeError> {
+        let name = metadata_name(object_id);
+        let length = self.storage.object_len(&name)?;
+        if length > MAX_METADATA_OBJECT_BYTES_U64 {
+            return Err(ManifestTreeError::IdentityMismatch(object_id));
+        }
+        let bytes = self.storage.read(&name)?;
+        if u64::try_from(bytes.len()) != Ok(length)
+            || MetadataObjectId::from_encoded(&bytes)? != object_id
+        {
+            return Err(ManifestTreeError::IdentityMismatch(object_id));
+        }
+        Ok(bytes)
     }
 
     fn verify_generation_transition(
@@ -828,8 +931,18 @@ impl<I: StorageIo> VerifiedCommittedFile<I> {
     }
 
     #[must_use]
-    pub const fn manifest(&self) -> &ManifestLeaf {
-        self.file.manifest()
+    pub fn manifest_root(&self) -> Option<MetadataObjectId> {
+        self.file.manifest_root()
+    }
+
+    #[must_use]
+    pub fn logical_size(&self) -> u64 {
+        self.file.logical_size()
+    }
+
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        self.file.allocated_bytes()
     }
 
     #[must_use]
@@ -838,21 +951,27 @@ impl<I: StorageIo> VerifiedCommittedFile<I> {
     }
 }
 
-fn verified_files<I>(
-    manifests: Vec<(u64, ManifestLeaf)>,
+fn verified_files<M, I>(
+    manifests: Vec<(u64, ManifestTreeSummary)>,
+    metadata: &M,
     containers: &ContainerRepository<I>,
 ) -> Result<Vec<VerifiedCommittedFile<I>>, GenerationError>
 where
+    M: Clone + Send + Sync + StorageIo + 'static,
     I: Clone + StorageIo,
 {
     let mut files = Vec::new();
     files
         .try_reserve_exact(manifests.len())
         .map_err(|_| GenerationError::OutOfMemory)?;
-    for (inode, manifest) in manifests {
+    for (inode, summary) in manifests {
         files.push(VerifiedCommittedFile {
             inode,
-            file: VerifiedManifestFile::from_verified_graph(manifest, containers.clone()),
+            file: VerifiedManifestFile::from_verified_tree(
+                summary,
+                metadata.clone(),
+                containers.clone(),
+            ),
         });
     }
     Ok(files)
@@ -1000,6 +1119,8 @@ impl GenerationError {
             | Self::ManifestTree(
                 ManifestTreeError::TreeTooDeep
                 | ManifestTreeError::TreeTooLarge
+                | ManifestTreeError::InvalidReplacement
+                | ManifestTreeError::BoundaryInsideData
                 | ManifestTreeError::OutOfMemory
                 | ManifestTreeError::Inner(fastdup_format::ManifestInnerNodeError::OutOfMemory),
             )

@@ -727,7 +727,7 @@ fn create_and_write<M, C>(
     payload: &[u8],
 ) -> fastdup_posix::InodeId
 where
-    M: fastdup_store::StorageIo,
+    M: Clone + Send + Sync + fastdup_store::StorageIo + 'static,
     C: Clone + Send + Sync + fastdup_store::StorageIo + 'static,
 {
     let Reply::Created { entry, handle } = appliance

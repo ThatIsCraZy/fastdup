@@ -277,6 +277,24 @@ A content or namespace change that passed permission and lock checks, reached
 fastdup, received a mutation sequence, and may therefore be acknowledged.
 _Avoid_: Kernel-dirty page, attempted write
 
+**Active dirty epoch**:
+The current ordered mutations accepted after the most recent commit cut. They
+remain immediately readable and may advance while an earlier cut is persisted,
+but are not included in that earlier recoverable generation.
+_Avoid_: Frozen commit cut, write transaction
+
+**Frozen commit cut**:
+The single immutable prefix of accepted Namespace and inode mutations currently
+being persisted or retained for retry. Later mutations never change its token,
+bytes, names, or ordering.
+_Avoid_: Active dirty epoch, filesystem freeze
+
+**Ingest lane**:
+A bounded process-local FastCDC and Container-staging stream for one hot inode.
+It controls local queueing and reduction continuity but has no durable identity
+and does not define commit visibility.
+_Avoid_: Commit group, worker thread
+
 **Commit group**:
 A batch of ordered content and namespace mutations whose durability and recovery
 visibility advance atomically. It does not determine compression boundaries.

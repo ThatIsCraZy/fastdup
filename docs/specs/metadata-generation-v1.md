@@ -123,7 +123,7 @@ payload_length = 64 + extent_count * 64
 | 12 | 2 | `extent_entry_length` | `64` |
 | 14 | 2 | reserved | zero |
 | 16 | 8 | required-flags slot | zero |
-| 24 | 8 | `file_length` | complete logical file length |
+| 24 | 8 | `file_length` | complete node-local logical length; equal to the whole file only when this leaf is the root |
 | 32 | 4 | `extent_count` | number of entries |
 | 36 | 4 | `payload_length` | exact header-plus-entries length |
 | 40 | 24 | reserved | zero |
@@ -134,7 +134,7 @@ The field widths sum to 64 bytes.
 
 | Relative offset | Width | Field | Version 1 requirement |
 | ---: | ---: | --- | --- |
-| 0 | 8 | `logical_offset` | exact start in the file |
+| 0 | 8 | `logical_offset` | exact start inside this leaf's node-local range |
 | 8 | 8 | `logical_length` | nonzero extent length |
 | 16 | 2 | `extent_kind` | `1` = DATA, `2` = HOLE, `3` = FILL |
 | 18 | 2 | reserved | zero |
@@ -144,7 +144,10 @@ The field widths sum to 64 bytes.
 | 57 | 7 | reserved | zero |
 
 The field widths sum to 64 bytes. Entries are ordered by logical offset and
-must form an exact, gap-free, non-overlapping partition of `[0, file_length)`.
+must form an exact, gap-free, non-overlapping partition of the leaf-local
+`[0, file_length)` range. A parent supplies the leaf's position in its own
+range; moving or reusing an immutable subtree therefore does not change IDs
+inside that subtree.
 The first offset is zero, each later offset is the checked end of its
 predecessor, and the final checked end equals `file_length`. An empty file has
 zero extents; a nonempty file has at least one extent. Zero-length extents are

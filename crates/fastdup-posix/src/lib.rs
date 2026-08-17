@@ -234,6 +234,58 @@ pub enum PosixError {
     Again,
 }
 
+/// Optional appliance-owned sink for successfully admitted content mutations.
+///
+/// Notifications happen after the live view was updated but before the POSIX
+/// write reply is returned. The sink is acceleration only: it must retain its
+/// own failure state and must never make an accepted mutation disappear from
+/// the Namespace dirty overlay.
+#[derive(Clone, Debug)]
+pub struct ExternalizedExtent {
+    inode: InodeId,
+    offset: u64,
+    through_sequence: u64,
+    data: Arc<dyn CommittedFile>,
+}
+
+impl ExternalizedExtent {
+    /// Constructs one verified DATA range that may replace matching resident
+    /// dirty bytes. The source uses range-local coordinates starting at zero.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty, sparse, or arithmetically overflowing source.
+    pub fn new(
+        inode: InodeId,
+        offset: u64,
+        through_sequence: u64,
+        data: Arc<dyn CommittedFile>,
+    ) -> Result<Self, PosixError> {
+        let length = data.logical_size();
+        if length == 0 || data.allocated_bytes() != length || offset.checked_add(length).is_none() {
+            return Err(PosixError::InvalidArgument);
+        }
+        Ok(Self {
+            inode,
+            offset,
+            through_sequence,
+            data,
+        })
+    }
+}
+
+pub trait MutationObserver: std::fmt::Debug + Send + Sync {
+    fn accepted_write(
+        &self,
+        inode: InodeId,
+        offset: u64,
+        mutation_sequence: u64,
+        bytes: &[u8],
+    ) -> Vec<ExternalizedExtent>;
+
+    fn accepted_truncate(&self, inode: InodeId, mutation_sequence: u64, length: u64);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamespaceConfig {
     pub maximum_name_bytes: usize,
@@ -584,15 +636,23 @@ impl InodeState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ExternalDirtyData {
+    source: Arc<dyn CommittedFile>,
+    source_offset: u64,
+    length: u64,
+    through_sequence: u64,
+}
+
 #[derive(Debug, Default)]
 struct SparseData {
     logical_size: u64,
     allocated_bytes: u64,
     extents: BTreeMap<u64, Vec<u8>>,
+    external_extents: BTreeMap<u64, ExternalDirtyData>,
 }
 
 impl SparseData {
-    #[cfg(test)]
     fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
         if length == 0 || offset >= self.logical_size {
             return Ok(Vec::new());
@@ -613,6 +673,16 @@ impl SparseData {
         for (&extent_start, bytes) in self.extents.range((Excluded(offset), Excluded(end))) {
             overlay_extent(&mut output, offset, end, extent_start, bytes);
         }
+        if let Some((&extent_start, external)) = self.external_extents.range(..=offset).next_back()
+        {
+            overlay_external(&mut output, offset, end, extent_start, external)?;
+        }
+        for (&extent_start, external) in self
+            .external_extents
+            .range((Excluded(offset), Excluded(end)))
+        {
+            overlay_external(&mut output, offset, end, extent_start, external)?;
+        }
         Ok(output)
     }
 
@@ -625,6 +695,7 @@ impl SparseData {
         let end = offset
             .checked_add(data_length)
             .ok_or(PosixError::FileTooLarge)?;
+        self.remove_external_overlaps(offset, end)?;
         if self.try_append_to_previous(offset, end, data)? {
             return Ok(());
         }
@@ -738,6 +809,8 @@ impl SparseData {
             return Ok(());
         }
 
+        self.truncate_external(length)?;
+
         let crossing = self
             .extents
             .range(..length)
@@ -801,6 +874,176 @@ impl SparseData {
         self.allocated_bytes
     }
 
+    fn resident_bytes(&self) -> u64 {
+        self.extents.values().fold(0_u64, |total, bytes| {
+            total
+                .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize fits u64"))
+                .expect("ASSERT: resident Dirty DATA cannot overflow")
+        })
+    }
+
+    fn externalize_many(
+        &mut self,
+        mut candidates: Vec<(u64, u64, Arc<dyn CommittedFile>)>,
+    ) -> Result<(), PosixError> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        candidates.sort_unstable_by_key(|(offset, _, _)| *offset);
+        let mut runs = Vec::<(u64, u64)>::new();
+        runs.try_reserve(candidates.len())
+            .map_err(|_| PosixError::OutOfMemory)?;
+        let mut previous_end = None;
+        for (offset, _, source) in &candidates {
+            let length = source.logical_size();
+            let end = offset.checked_add(length).ok_or(PosixError::Io)?;
+            if length == 0
+                || end > self.logical_size
+                || source.allocated_bytes() != length
+                || previous_end.is_some_and(|previous| *offset < previous)
+            {
+                return Err(PosixError::Io);
+            }
+            let requested = u32::try_from(length).map_err(|_| PosixError::FileTooLarge)?;
+            let current = self.read(*offset, requested)?;
+            if !source.matches_complete_bytes(&current)? {
+                return Err(PosixError::Io);
+            }
+            match runs.last_mut() {
+                Some((_, run_end)) if *run_end == *offset => *run_end = end,
+                _ => runs.push((*offset, end)),
+            }
+            previous_end = Some(end);
+        }
+        for &(start, end) in &runs {
+            self.remove_resident_overlaps(start, end)?;
+            self.remove_external_overlaps(start, end)?;
+        }
+        for (offset, through_sequence, source) in candidates {
+            let length = source.logical_size();
+            assert!(
+                self.external_extents
+                    .insert(
+                        offset,
+                        ExternalDirtyData {
+                            source,
+                            source_offset: 0,
+                            length,
+                            through_sequence,
+                        },
+                    )
+                    .is_none(),
+                "ASSERT: externalized range must replace every overlap"
+            );
+            self.allocated_bytes = self
+                .allocated_bytes
+                .checked_add(length)
+                .expect("ASSERT: external allocation cannot overflow");
+        }
+        #[cfg(test)]
+        self.audit_valid();
+        Ok(())
+    }
+
+    fn remove_resident_overlaps(&mut self, start: u64, end: u64) -> Result<(), PosixError> {
+        let mut overlapping = Vec::new();
+        let mut fragments = Vec::new();
+        if let Some((&extent_start, bytes)) = self.extents.range(..=start).next_back() {
+            plan_overlap(
+                &mut overlapping,
+                &mut fragments,
+                extent_start,
+                bytes,
+                start,
+                end,
+            )?;
+        }
+        for (&extent_start, bytes) in self.extents.range((Excluded(start), Excluded(end))) {
+            plan_overlap(
+                &mut overlapping,
+                &mut fragments,
+                extent_start,
+                bytes,
+                start,
+                end,
+            )?;
+        }
+        for extent_start in overlapping {
+            let removed = self
+                .extents
+                .remove(&extent_start)
+                .expect("ASSERT: resident overlap vanished");
+            self.allocated_bytes -= u64::try_from(removed.len()).expect("ASSERT: usize fits u64");
+        }
+        for (fragment_start, fragment) in fragments {
+            self.allocated_bytes = self
+                .allocated_bytes
+                .checked_add(u64::try_from(fragment.len()).expect("ASSERT: usize fits u64"))
+                .expect("ASSERT: fragment allocation cannot overflow");
+            assert!(self.extents.insert(fragment_start, fragment).is_none());
+        }
+        Ok(())
+    }
+
+    fn remove_external_overlaps(&mut self, start: u64, end: u64) -> Result<(), PosixError> {
+        let starts = external_overlapping_starts(&self.external_extents, start, end);
+        let mut fragments = Vec::new();
+        for extent_start in &starts {
+            let external = &self.external_extents[extent_start];
+            let extent_end = extent_start
+                .checked_add(external.length)
+                .ok_or(PosixError::Io)?;
+            if *extent_start < start {
+                fragments.push((
+                    *extent_start,
+                    ExternalDirtyData {
+                        source: Arc::clone(&external.source),
+                        source_offset: external.source_offset,
+                        length: start - extent_start,
+                        through_sequence: external.through_sequence,
+                    },
+                ));
+            }
+            if extent_end > end {
+                fragments.push((
+                    end,
+                    ExternalDirtyData {
+                        source: Arc::clone(&external.source),
+                        source_offset: external
+                            .source_offset
+                            .checked_add(end - extent_start)
+                            .ok_or(PosixError::Io)?,
+                        length: extent_end - end,
+                        through_sequence: external.through_sequence,
+                    },
+                ));
+            }
+        }
+        for extent_start in starts {
+            let removed = self
+                .external_extents
+                .remove(&extent_start)
+                .expect("ASSERT: external overlap vanished");
+            self.allocated_bytes -= removed.length;
+        }
+        for (fragment_start, fragment) in fragments {
+            self.allocated_bytes = self
+                .allocated_bytes
+                .checked_add(fragment.length)
+                .expect("ASSERT: external fragment allocation cannot overflow");
+            assert!(
+                self.external_extents
+                    .insert(fragment_start, fragment)
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
+    fn truncate_external(&mut self, length: u64) -> Result<(), PosixError> {
+        self.remove_external_overlaps(length, self.logical_size)
+    }
+
     fn assert_valid_around(&self, position: u64) {
         if let Some((&start, bytes)) = self.extents.range(..=position).next_back() {
             self.assert_extent_valid(start, bytes);
@@ -848,28 +1091,56 @@ impl SparseData {
 
     #[cfg(test)]
     fn audit_valid(&self) {
-        let mut previous_end = 0_u64;
+        let mut ranges = Vec::with_capacity(self.extents.len() + self.external_extents.len());
         let mut allocated_bytes = 0_u64;
         for (&start, bytes) in &self.extents {
             assert!(
                 !bytes.is_empty(),
                 "ASSERT: sparse DATA extent must be nonempty"
             );
-            assert!(
-                start >= previous_end,
-                "ASSERT: sparse DATA extents must not overlap"
-            );
             let length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit in u64");
-            previous_end = start
+            let end = start
                 .checked_add(length)
                 .expect("ASSERT: sparse extent end must not overflow");
             assert!(
-                previous_end <= self.logical_size,
+                end <= self.logical_size,
                 "ASSERT: sparse extent must stay inside logical size"
             );
+            ranges.push((start, end));
             allocated_bytes = allocated_bytes
                 .checked_add(length)
                 .expect("ASSERT: allocated extent bytes must not overflow");
+        }
+        for (&start, external) in &self.external_extents {
+            assert!(
+                external.length != 0,
+                "ASSERT: external dirty DATA extent must be nonempty"
+            );
+            let end = start
+                .checked_add(external.length)
+                .expect("ASSERT: external dirty extent end must not overflow");
+            assert!(
+                end <= self.logical_size,
+                "ASSERT: external dirty extent must stay inside logical size"
+            );
+            assert!(
+                external
+                    .source_offset
+                    .checked_add(external.length)
+                    .is_some_and(|source_end| source_end <= external.source.logical_size()),
+                "ASSERT: external dirty extent must stay inside its verified source"
+            );
+            ranges.push((start, end));
+            allocated_bytes = allocated_bytes
+                .checked_add(external.length)
+                .expect("ASSERT: allocated extent bytes must not overflow");
+        }
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 <= pair[1].0,
+                "ASSERT: resident and external dirty DATA extents must not overlap"
+            );
         }
         assert_eq!(
             allocated_bytes, self.allocated_bytes,
@@ -878,7 +1149,6 @@ impl SparseData {
     }
 }
 
-#[cfg(test)]
 fn overlay_extent(
     output: &mut [u8],
     read_start: u64,
@@ -904,6 +1174,55 @@ fn overlay_extent(
     let target_end =
         usize::try_from(copy_end - read_start).expect("ASSERT: target end must fit in usize");
     output[target_start..target_end].copy_from_slice(&bytes[source_start..source_end]);
+}
+
+fn overlay_external(
+    output: &mut [u8],
+    read_start: u64,
+    read_end: u64,
+    extent_start: u64,
+    external: &ExternalDirtyData,
+) -> Result<(), PosixError> {
+    let extent_end = extent_start
+        .checked_add(external.length)
+        .ok_or(PosixError::Io)?;
+    let copy_start = extent_start.max(read_start);
+    let copy_end = extent_end.min(read_end);
+    if copy_start >= copy_end {
+        return Ok(());
+    }
+    let source_offset = external
+        .source_offset
+        .checked_add(copy_start - extent_start)
+        .ok_or(PosixError::Io)?;
+    let length = u32::try_from(copy_end - copy_start).map_err(|_| PosixError::FileTooLarge)?;
+    let bytes = external.source.read_at(source_offset, length)?;
+    if bytes.len() != usize::try_from(length).expect("ASSERT: u32 fits usize") {
+        return Err(PosixError::Io);
+    }
+    let target_start =
+        usize::try_from(copy_start - read_start).expect("ASSERT: target offset fits usize");
+    output[target_start..target_start + bytes.len()].copy_from_slice(&bytes);
+    Ok(())
+}
+
+fn external_overlapping_starts(
+    extents: &BTreeMap<u64, ExternalDirtyData>,
+    start: u64,
+    end: u64,
+) -> Vec<u64> {
+    let mut starts = Vec::new();
+    if let Some((&candidate, extent)) = extents.range(..=start).next_back()
+        && candidate.saturating_add(extent.length) > start
+    {
+        starts.push(candidate);
+    }
+    starts.extend(
+        extents
+            .range((Excluded(start), Excluded(end)))
+            .map(|(&candidate, _)| candidate),
+    );
+    starts
 }
 
 fn plan_overlap(
@@ -1063,6 +1382,7 @@ pub struct Namespace {
     mutations_admitted: RwLock<bool>,
     admission_changed: Notify,
     dirty_payload: DirtyPayloadTracker,
+    mutation_observer: RwLock<Option<Arc<dyn MutationObserver>>>,
     catalog: RwLock<Catalog>,
 }
 
@@ -1100,6 +1420,7 @@ impl Namespace {
             mutations_admitted: RwLock::new(true),
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
+            mutation_observer: RwLock::new(None),
             catalog: RwLock::new(Catalog {
                 next_inode: ROOT_INODE.get() + 1,
                 inode_reservation_end: u64::MAX,
@@ -1245,6 +1566,7 @@ impl Namespace {
             mutations_admitted: RwLock::new(mutations_enabled),
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
+            mutation_observer: RwLock::new(None),
             catalog: RwLock::new(Catalog {
                 next_inode: snapshot.next_inode,
                 inode_reservation_end: snapshot.inode_reservation_end,
@@ -1326,15 +1648,37 @@ impl Namespace {
                 .expect("ASSERT: mutation admission lock poisoned")
     }
 
-    /// Returns unique DATA bytes retained by active, reachable dirty extents.
+    /// Returns unique resident DATA bytes retained by active dirty extents.
     ///
     /// Overwrites of an already dirty range are counted once, sparse holes are
     /// not counted, and freezing a commit cut transfers its bytes out of this
-    /// active-pressure counter. The value deliberately excludes encoder
-    /// buffers and an already frozen epoch.
+    /// active-pressure counter. A byte-exact dirty range externalized to a
+    /// verified immutable Container is also excluded because the live view can
+    /// reread it without retaining the original payload. The value deliberately
+    /// excludes range recipes, encoder buffers, and an already frozen epoch.
     #[must_use]
     pub fn checkpointable_dirty_payload_bytes(&self) -> u64 {
         self.dirty_payload.load()
+    }
+
+    /// Installs the one appliance-owned write-through observer before serving
+    /// requests. Replacing an installed observer would split one mutation
+    /// stream across two reduction states and is therefore an impossible use.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the observer lock was poisoned or an observer was already
+    /// installed for this Namespace.
+    pub fn install_mutation_observer(&self, observer: Arc<dyn MutationObserver>) {
+        let mut installed = self
+            .mutation_observer
+            .write()
+            .expect("ASSERT: mutation observer lock poisoned");
+        assert!(
+            installed.is_none(),
+            "ASSERT: a Namespace may install only one mutation observer"
+        );
+        *installed = Some(observer);
     }
 
     /// Waits until active checkpointable dirty DATA reaches `threshold`.
@@ -1452,9 +1796,9 @@ impl Namespace {
                 FileKind::Regular,
                 "ASSERT: v1 committed child must be a regular file"
             );
-            let dirty_before = state.data.active_dirty_payload_bytes();
+            let dirty_before = state.data.active_resident_payload_bytes();
             let (file, frozen_epoch) = state.data.freeze_for_commit(token);
-            let dirty_after = state.data.active_dirty_payload_bytes();
+            let dirty_after = state.data.active_resident_payload_bytes();
             self.dirty_payload.replace(dirty_before, dirty_after);
             inodes.push(CommitInode {
                 inode,
@@ -1677,7 +2021,18 @@ impl Namespace {
             if request.exclusive {
                 return Err(PosixError::Exists);
             }
-            return open_existing_for_create(&mut catalog, inode, request, &self.dirty_payload);
+            let observer = self
+                .mutation_observer
+                .read()
+                .expect("ASSERT: mutation observer lock poisoned")
+                .clone();
+            return open_existing_for_create(
+                &mut catalog,
+                inode,
+                request,
+                &self.dirty_payload,
+                observer.as_deref(),
+            );
         }
         create_new_file(&mut catalog, key, request)
     }
@@ -1717,9 +2072,9 @@ impl Namespace {
 
         let handle = allocate_handle(&mut catalog)?;
         if let Some(sequence) = next_sequence {
-            let dirty_before = state.data.active_dirty_payload_bytes();
+            let dirty_before = state.data.active_resident_payload_bytes();
             state.data.truncate(0, sequence)?;
-            let dirty_after = state.data.active_dirty_payload_bytes();
+            let dirty_after = state.data.active_resident_payload_bytes();
             if state.link_count > 0 {
                 self.dirty_payload.replace(dirty_before, dirty_after);
             }
@@ -1733,6 +2088,17 @@ impl Namespace {
                 .is_none(),
             "ASSERT: monotonic handle allocator returned a live ID"
         );
+        drop(catalog);
+        if let Some(sequence) = next_sequence
+            && let Some(observer) = self
+                .mutation_observer
+                .read()
+                .expect("ASSERT: mutation observer lock poisoned")
+                .as_ref()
+                .cloned()
+        {
+            observer.accepted_truncate(inode, sequence, 0);
+        }
         Ok(Reply::Opened(handle))
     }
 
@@ -1800,18 +2166,55 @@ impl Namespace {
             .checked_add(u64::from(!data.is_empty()))
             .ok_or(PosixError::NoSpace)?;
 
-        let dirty_before = state.data.active_dirty_payload_bytes();
+        let dirty_before = state.data.active_resident_payload_bytes();
         state.data.write(offset, data, next_sequence)?;
-        let dirty_after = state.data.active_dirty_payload_bytes();
+        let dirty_after = state.data.active_resident_payload_bytes();
         if state.link_count > 0 {
             self.dirty_payload.replace(dirty_before, dirty_after);
         }
         state.mutation_sequence = next_sequence;
 
+        drop(state);
+        if let Some(observer) = self
+            .mutation_observer
+            .read()
+            .expect("ASSERT: mutation observer lock poisoned")
+            .as_ref()
+            .cloned()
+        {
+            let externalized = observer.accepted_write(inode, offset, next_sequence, data);
+            self.externalize_dirty_extents(externalized);
+        }
+
         Ok(Reply::Written {
             bytes: written,
-            mutation_sequence: state.mutation_sequence,
+            mutation_sequence: next_sequence,
         })
+    }
+
+    fn externalize_dirty_extents(&self, extents: Vec<ExternalizedExtent>) {
+        let mut by_inode = BTreeMap::<InodeId, Vec<(u64, u64, Arc<dyn CommittedFile>)>>::new();
+        for extent in extents {
+            by_inode.entry(extent.inode).or_default().push((
+                extent.offset,
+                extent.through_sequence,
+                extent.data,
+            ));
+        }
+        for (inode, candidates) in by_inode {
+            let Ok(object) = self.resolve_inode(inode) else {
+                continue;
+            };
+            let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
+            let resident_before = state.data.active_resident_payload_bytes();
+            if state.data.externalize_many(candidates).is_err() {
+                continue;
+            }
+            let resident_after = state.data.active_resident_payload_bytes();
+            if state.link_count > 0 {
+                self.dirty_payload.replace(resident_before, resident_after);
+            }
+        }
     }
 
     fn set_length(
@@ -1845,14 +2248,25 @@ impl Namespace {
             .mutation_sequence
             .checked_add(1)
             .ok_or(PosixError::NoSpace)?;
-        let dirty_before = state.data.active_dirty_payload_bytes();
+        let dirty_before = state.data.active_resident_payload_bytes();
         state.data.truncate(length, next_sequence)?;
-        let dirty_after = state.data.active_dirty_payload_bytes();
+        let dirty_after = state.data.active_resident_payload_bytes();
         if state.link_count > 0 {
             self.dirty_payload.replace(dirty_before, dirty_after);
         }
         state.mutation_sequence = next_sequence;
-        Ok(Reply::Attr(state.attributes(inode)))
+        let attr = state.attributes(inode);
+        drop(state);
+        if let Some(observer) = self
+            .mutation_observer
+            .read()
+            .expect("ASSERT: mutation observer lock poisoned")
+            .as_ref()
+            .cloned()
+        {
+            observer.accepted_truncate(inode, next_sequence, length);
+        }
+        Ok(Reply::Attr(attr))
     }
 
     fn sync(&self, inode: InodeId, handle: HandleId) -> Result<Reply, PosixError> {
@@ -1916,7 +2330,7 @@ impl Namespace {
             .mutation_sequence
             .checked_add(1)
             .ok_or(PosixError::NoSpace)?;
-        let dirty_before = state.data.active_dirty_payload_bytes();
+        let dirty_before = state.data.active_resident_payload_bytes();
         state.data.advance_mutation_sequence(next_sequence);
         state.link_count = 0;
         state.mutation_sequence = next_sequence;
@@ -2190,6 +2604,7 @@ fn open_existing_for_create(
     inode: InodeId,
     request: CreateRequest<'_>,
     dirty_payload: &DirtyPayloadTracker,
+    observer: Option<&dyn MutationObserver>,
 ) -> Result<Reply, PosixError> {
     let object = catalog
         .inodes
@@ -2222,9 +2637,9 @@ fn open_existing_for_create(
         .ok_or(PosixError::NoSpace)?;
     let handle = allocate_handle(catalog)?;
     if let Some(sequence) = next_sequence {
-        let dirty_before = state.data.active_dirty_payload_bytes();
+        let dirty_before = state.data.active_resident_payload_bytes();
         state.data.truncate(0, sequence)?;
-        let dirty_after = state.data.active_dirty_payload_bytes();
+        let dirty_after = state.data.active_resident_payload_bytes();
         assert!(
             state.link_count > 0,
             "ASSERT: create-existing target must remain linked"
@@ -2234,6 +2649,11 @@ fn open_existing_for_create(
     }
     let attr = state.attributes(inode);
     drop(state);
+    if let Some(sequence) = next_sequence
+        && let Some(observer) = observer
+    {
+        observer.accepted_truncate(inode, sequence, 0);
+    }
     assert!(
         catalog
             .handles

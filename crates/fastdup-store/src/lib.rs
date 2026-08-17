@@ -7,6 +7,7 @@ mod generation;
 mod generation_log;
 mod manifest_reader;
 mod manifest_tree;
+pub use manifest_tree::ManifestRangeExtent;
 mod reduction;
 mod reduction_codec;
 mod reduction_dictionary;
@@ -681,11 +682,49 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u64,
     ) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .find_verified_candidate_with_index(index, chunk_id, logical_length)
+            .map(|(_, bytes)| bytes))
+    }
+
+    /// Resolves one Exact Index candidate and returns its physical descriptor
+    /// only after pairing it with and decoding the immutable Container record.
+    ///
+    /// The returned entry is still not authoritative metadata. A later read
+    /// must pass it back through [`Self::read_verified_location`], which repeats
+    /// all physical-coordinate, checksum, and Chunk-ID verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns only impossible requested-length conversion failures. Candidate
+    /// and index I/O/integrity failures deliberately degrade to `Ok(None)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the activated reader violates its hard candidate bound or
+    /// returns a different key after successful page validation.
+    pub fn find_verified_location_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+    ) -> Result<Option<ExactIndexEntry>, StoreError> {
+        Ok(self
+            .find_verified_candidate_with_index(index, chunk_id, logical_length)
+            .map(|(entry, _)| entry))
+    }
+
+    fn find_verified_candidate_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+    ) -> Option<(ExactIndexEntry, Vec<u8>)> {
         let Ok(index_length) = u32::try_from(logical_length) else {
-            return Ok(None);
+            return None;
         };
         let Ok(lookup) = index.lookup_transitions(chunk_id, index_length) else {
-            return Ok(None);
+            return None;
         };
         let mut seen_locations: [Option<ExactIndexLocation>; MAX_EXACT_LOOKUP_CANDIDATES] =
             [None; MAX_EXACT_LOOKUP_CANDIDATES];
@@ -720,10 +759,10 @@ impl<I: StorageIo> ContainerRepository<I> {
             }
             attempted += 1;
             if let Ok(bytes) = self.read_verified_location(candidate) {
-                return Ok(Some(bytes));
+                return Some((candidate, bytes));
             }
         }
-        Ok(None)
+        None
     }
 
     /// Resolves one Chunk through an activated persistent Exact Index and
