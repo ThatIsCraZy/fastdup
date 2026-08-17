@@ -3,11 +3,11 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fastdup_appliance::{
-    CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, DurableNamespace, ProfiledCheckpoint,
-    checkpoint_policy_set_v1,
+    CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction, CheckpointPressure, DurableNamespace,
+    MUTATION_COMMIT_TARGET, ProfiledCheckpoint, checkpoint_action, checkpoint_policy_set_v1,
 };
 use fastdup_posix::{FuseFilesystem, NamespaceConfig, volatile_mount_options};
 use fastdup_store::{
@@ -17,7 +17,7 @@ use fuse3::raw::Session;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
-const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+const SCHEDULER_RESOLUTION: Duration = Duration::from_millis(50);
 const CHECKPOINT_WARNING: Duration = Duration::from_secs(5);
 const INODE_RESERVATION_SPAN: u64 = 4_096;
 
@@ -69,13 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1,
         appliance.exact_index_degraded(),
     );
-    if io_telemetry_enabled {
-        eprintln!("data-tier StorageIo telemetry is enabled for this mount");
-    }
+    emit_io_telemetry_state(io_telemetry_enabled);
 
-    let mut ticks = interval(CHECKPOINT_INTERVAL);
+    let mut ticks = interval(SCHEDULER_RESOLUTION);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticks.tick().await;
+    let mut oldest_dirty = None::<Instant>;
+    let mut last_checkpoint_attempt = Instant::now();
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
@@ -83,25 +83,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             _ = ticks.tick() => {
-                if let Err(error) = checkpoint_cycle(Arc::clone(&appliance)).await {
-                    appliance.namespace().pause_mutation_admission();
-                    eprintln!(
-                        "CRITICAL: durable progress failed; mutation admission remains closed: {error}"
-                    );
+                let action = heartbeat_action(
+                    observe_checkpoint_action(&appliance, &mut oldest_dirty),
+                    last_checkpoint_attempt,
+                );
+                if !matches!(action, CheckpointAction::Wait(_)) {
+                    if matches!(action, CheckpointAction::PauseAndCommit(_)) {
+                        appliance.namespace().pause_mutation_admission();
+                    }
+                    let checkpoint_started = Instant::now();
+                    if let Err(error) = checkpoint_cycle(Arc::clone(&appliance)).await {
+                        appliance.namespace().pause_mutation_admission();
+                        eprintln!(
+                            "CRITICAL: durable progress failed; mutation admission remains closed: {error}"
+                        );
+                    }
+                    oldest_dirty = (appliance.namespace().checkpointable_dirty_payload_bytes() != 0)
+                        .then_some(checkpoint_started);
+                    last_checkpoint_attempt = Instant::now();
                 }
             }
             dirty_bytes = appliance
                 .namespace()
                 .wait_for_checkpointable_dirty_payload(CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1) => {
                 appliance.namespace().pause_mutation_admission();
-                eprintln!(
-                    "checkpoint pressure reached {dirty_bytes} active dirty bytes; mutation admission is closed until durable progress catches up"
-                );
+                emit_checkpoint_pressure(&appliance, dirty_bytes, false);
                 if let Err(error) = checkpoint_cycle(Arc::clone(&appliance)).await {
                     eprintln!(
                         "CRITICAL: pressure checkpoint failed; mutation admission remains closed: {error}"
                     );
                 }
+                last_checkpoint_attempt = Instant::now();
             }
         }
     }
@@ -113,6 +125,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     mount.unmount().await?;
     data_storage.emit();
     Ok(())
+}
+
+fn emit_io_telemetry_state(enabled: bool) {
+    if enabled {
+        eprintln!("data-tier StorageIo telemetry is enabled for this mount");
+    }
+}
+
+fn emit_checkpoint_pressure(appliance: &FsAppliance, dirty_bytes: u64, running: bool) {
+    let staged = appliance.write_through_status();
+    let context = if running {
+        " while a checkpoint was running"
+    } else {
+        ""
+    };
+    eprintln!(
+        "checkpoint pressure reached {dirty_bytes} active dirty bytes{context}; mutation admission is closed; active_lanes={} buffered_bytes={} sealed={} degraded={}",
+        staged.active_lanes(),
+        staged.buffered_bytes(),
+        staged.sealed_uncommitted_containers(),
+        staged.degraded(),
+    );
+}
+
+fn heartbeat_action(action: CheckpointAction, last_attempt: Instant) -> CheckpointAction {
+    if matches!(action, CheckpointAction::Wait(_))
+        && last_attempt.elapsed() >= MUTATION_COMMIT_TARGET
+    {
+        CheckpointAction::Commit(fastdup_appliance::CheckpointTrigger::MutationAge)
+    } else {
+        action
+    }
+}
+
+fn observe_checkpoint_action(
+    appliance: &FsAppliance,
+    oldest_dirty: &mut Option<Instant>,
+) -> CheckpointAction {
+    let now = Instant::now();
+    if appliance.namespace().checkpointable_dirty_payload_bytes() == 0 {
+        *oldest_dirty = None;
+    } else {
+        oldest_dirty.get_or_insert(now);
+    }
+    let staged = appliance.write_through_status();
+    checkpoint_action(CheckpointPressure {
+        oldest_mutation_age: oldest_dirty.map(|started| now.duration_since(started)),
+        oldest_sealed_container_age: staged.oldest_sealed_age(),
+        sealed_uncommitted_containers: staged.sealed_uncommitted_containers(),
+    })
 }
 
 async fn checkpoint_cycle(appliance: Arc<FsAppliance>) -> Result<(), String> {
@@ -135,9 +197,7 @@ async fn checkpoint_cycle(appliance: Arc<FsAppliance>) -> Result<(), String> {
                 .namespace()
                 .wait_for_checkpointable_dirty_payload(CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1) => {
                 appliance.namespace().pause_mutation_admission();
-                eprintln!(
-                    "checkpoint pressure reached {dirty_bytes} active dirty bytes while a checkpoint was running; mutation admission is closed"
-                );
+                emit_checkpoint_pressure(&appliance, dirty_bytes, true);
                 await_worker(worker).await?
             }
         }

@@ -3,16 +3,22 @@
 //! Durable repository-to-POSIX mount orchestration.
 
 mod checkpoint;
+mod checkpoint_trigger;
 
 pub use checkpoint::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, DurableNamespace,
-    DurableNamespaceError, ProfiledCheckpoint, checkpoint_policy_set_v1,
+    DurableNamespaceError, ProfiledCheckpoint, WriteThroughStatus, checkpoint_policy_set_v1,
+};
+pub use checkpoint_trigger::{
+    CONTAINER_COMMIT_COALESCE, CheckpointAction, CheckpointPressure, CheckpointTrigger,
+    MUTATION_ADMISSION_GUARD, MUTATION_COMMIT_TARGET, SEALED_CONTAINER_COMMIT_LIMIT,
+    checkpoint_action,
 };
 
 use std::fmt;
 use std::sync::Arc;
 
-use fastdup_format::{ManifestExtent, NamespaceRoot};
+use fastdup_format::NamespaceRoot;
 use fastdup_posix::{
     CommittedEntry, CommittedFile, CommittedInode, CommittedNamespaceSnapshot, Namespace,
     NamespaceConfig, PosixError,
@@ -48,7 +54,7 @@ pub fn recover_mount<M, C>(
     containers: &ContainerRepository<C>,
 ) -> Result<Option<Namespace>, MountError>
 where
-    M: StorageIo,
+    M: Clone + Send + Sync + StorageIo + 'static,
     C: Clone + Send + Sync + StorageIo + 'static,
 {
     let Some(recovered) = generations.recover_latest_with_verified_files(containers)? else {
@@ -84,7 +90,7 @@ pub fn recover_mount_with_index<M, C, X>(
     indexes: &ExactIndexRunRepository<X>,
 ) -> Result<Option<Namespace>, MountError>
 where
-    M: StorageIo,
+    M: Clone + Send + Sync + StorageIo + 'static,
     C: Clone + Send + Sync + StorageIo + 'static,
     X: Clone + Send + Sync + StorageIo + 'static,
 {
@@ -159,7 +165,7 @@ where
             "ASSERT: recovered DATA proof order must match the Namespace Root"
         );
         assert_eq!(
-            verified.manifest().file_length(),
+            verified.logical_size(),
             inode.logical_size(),
             "ASSERT: recovered DATA proof length must match the durable inode"
         );
@@ -230,57 +236,20 @@ fn namespace_from_files(
     }
 }
 
-#[derive(Clone, Copy)]
-struct AllocatedRange {
-    start: u64,
-    end: u64,
-}
-
 pub(crate) struct ManifestCommittedFile<I> {
     file: VerifiedManifestFile<I>,
     logical_size: u64,
     allocated_bytes: u64,
-    allocated_ranges: Vec<AllocatedRange>,
 }
 
 impl<I: StorageIo> ManifestCommittedFile<I> {
     pub(crate) fn from_verified(file: VerifiedManifestFile<I>) -> Self {
-        let logical_size = file.manifest().file_length();
-        let mut allocated_ranges = Vec::<AllocatedRange>::new();
-        let mut extent_start = 0_u64;
-        for extent in file.manifest().extents() {
-            let length = extent_length(extent);
-            let extent_end = extent_start
-                .checked_add(length)
-                .expect("ASSERT: verified Manifest extent end must not overflow");
-            if !matches!(extent, ManifestExtent::Hole { .. }) {
-                if let Some(previous) = allocated_ranges.last_mut()
-                    && previous.end == extent_start
-                {
-                    previous.end = extent_end;
-                } else {
-                    allocated_ranges.push(AllocatedRange {
-                        start: extent_start,
-                        end: extent_end,
-                    });
-                }
-            }
-            extent_start = extent_end;
-        }
-        assert_eq!(
-            extent_start, logical_size,
-            "ASSERT: verified Manifest extents must partition the file"
-        );
-        let allocated_bytes = allocated_ranges.iter().fold(0_u64, |total, range| {
-            total
-                .checked_add(range.end - range.start)
-                .expect("ASSERT: allocated Manifest subset cannot exceed file length")
-        });
+        let logical_size = file.logical_size();
+        let allocated_bytes = file.allocated_bytes();
         Self {
             file,
             logical_size,
             allocated_bytes,
-            allocated_ranges,
         }
     }
 }
@@ -291,7 +260,6 @@ impl<I> fmt::Debug for ManifestCommittedFile<I> {
             .debug_struct("ManifestCommittedFile")
             .field("logical_size", &self.logical_size)
             .field("allocated_bytes", &self.allocated_bytes)
-            .field("allocated_range_count", &self.allocated_ranges.len())
             .finish_non_exhaustive()
     }
 }
@@ -309,40 +277,18 @@ where
     }
 
     fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, PosixError> {
-        let end = offset.checked_add(length).ok_or(PosixError::Io)?;
-        let end = end.min(self.logical_size);
-        if offset >= end {
-            return Ok(0);
+        if offset == 0 && length >= self.logical_size {
+            return Ok(self.allocated_bytes);
         }
-        let first = self
-            .allocated_ranges
-            .partition_point(|range| range.end <= offset);
-        let mut allocated = 0_u64;
-        for range in &self.allocated_ranges[first..] {
-            if range.start >= end {
-                break;
-            }
-            let intersection_start = range.start.max(offset);
-            let intersection_end = range.end.min(end);
-            allocated = allocated
-                .checked_add(intersection_end - intersection_start)
-                .ok_or(PosixError::Io)?;
-        }
-        Ok(allocated)
+        self.file
+            .allocated_bytes_in_range(offset, length)
+            .map_err(|_| PosixError::Io)
     }
 
     fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
         self.file
             .read_at(offset, length)
             .map_err(|_| PosixError::Io)
-    }
-}
-
-const fn extent_length(extent: &ManifestExtent) -> u64 {
-    match *extent {
-        ManifestExtent::Data { logical_length, .. }
-        | ManifestExtent::Hole { logical_length }
-        | ManifestExtent::Fill { logical_length, .. } => logical_length,
     }
 }
 

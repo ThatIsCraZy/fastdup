@@ -25,3 +25,20 @@ an unusable Exact candidate performs a fresh complete proof or fails closed.
 Immutable Container corruption discovered later still fails demand reads and
 is handled by scrub/quarantine; repeatedly rereading every historical Chunk at
 five-second commit cadence is not a substitute for scrub.
+
+## Implementation boundary
+
+The installed online state is an opaque Manifest Root, logical length, and
+verified allocated-byte scalar; it is not a flattened file recipe. Equal-size
+dirty updates read only intersecting tree paths, expand boundaries across whole
+DATA extents, publish replacement leaves child-first, and retain every remote
+subtree ID exactly. New files and length-changing updates may still use a
+complete-tree planning fallback.
+
+The current commit reader streams the complete immutable Manifest structure to
+pair the writer with a structural reader/recovery check. Its Chunk-location
+verification is successor-bounded as required above, but its metadata I/O is
+not yet path-bounded. Replacing that streaming pass requires an opaque
+subtree-origin proof consumed by the serialized generation commit; accepting
+raw Root IDs or caller-asserted summaries would weaken this ADR and is not an
+acceptable shortcut. Recovery and offline scrub remain complete traversals.

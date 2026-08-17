@@ -1,5 +1,10 @@
+use crate::manifest_tree::{
+    ManifestRangeExtent, ManifestTreeError, ManifestTreeSummary, read_manifest_tree_range,
+};
 use crate::{ActivatedExactIndex, ContainerRepository, StorageIo, StoreError};
-use fastdup_format::{ChunkId, ManifestExtent, ManifestLeaf};
+use fastdup_format::{
+    ChunkId, MAX_METADATA_OBJECT_BYTES, ManifestExtent, ManifestLeaf, MetadataObjectId,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -14,9 +19,111 @@ pub const MAX_MANIFEST_READ_BYTES: u32 = 1_024 * 1_024;
 /// no physical data location.
 #[derive(Clone, Debug)]
 pub struct VerifiedManifestFile<I> {
-    manifest: ManifestLeaf,
+    recipe: Arc<dyn ManifestRecipe>,
     containers: ContainerRepository<I>,
     indexed_reader: Option<Arc<dyn VerifiedChunkReader>>,
+}
+
+trait ManifestRecipe: fmt::Debug + Send + Sync {
+    fn root(&self) -> Option<MetadataObjectId>;
+    fn logical_size(&self) -> u64;
+    fn allocated_bytes(&self) -> u64;
+    fn read_range(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<ManifestRangeExtent>, ManifestReadError>;
+}
+
+#[derive(Debug)]
+struct FlatManifestRecipe {
+    manifest: ManifestLeaf,
+    allocated_bytes: u64,
+}
+
+impl ManifestRecipe for FlatManifestRecipe {
+    fn root(&self) -> Option<MetadataObjectId> {
+        None
+    }
+
+    fn logical_size(&self) -> u64 {
+        self.manifest.file_length()
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    fn read_range(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<ManifestRangeExtent>, ManifestReadError> {
+        let end = offset.saturating_add(length).min(self.logical_size());
+        let mut located = Vec::new();
+        let mut extent_offset = 0_u64;
+        for extent in self.manifest.extents() {
+            let extent_end = extent_offset
+                .checked_add(extent_logical_length(extent))
+                .ok_or(ManifestReadError::ArithmeticOverflow)?;
+            if extent_end > offset && extent_offset < end {
+                located
+                    .try_reserve(1)
+                    .map_err(|_| ManifestReadError::OutOfMemory)?;
+                located.push(ManifestRangeExtent::new(extent_offset, extent.clone()));
+            }
+            extent_offset = extent_end;
+        }
+        Ok(located)
+    }
+}
+
+struct TreeManifestRecipe<M> {
+    summary: ManifestTreeSummary,
+    metadata: M,
+}
+
+impl<M> fmt::Debug for TreeManifestRecipe<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TreeManifestRecipe")
+            .field("root", &self.summary.root())
+            .field("logical_size", &self.summary.logical_size())
+            .field("allocated_bytes", &self.summary.allocated_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> ManifestRecipe for TreeManifestRecipe<M>
+where
+    M: Send + Sync + StorageIo,
+{
+    fn root(&self) -> Option<MetadataObjectId> {
+        Some(self.summary.root())
+    }
+
+    fn logical_size(&self) -> u64 {
+        self.summary.logical_size()
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.summary.allocated_bytes()
+    }
+
+    fn read_range(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<ManifestRangeExtent>, ManifestReadError> {
+        read_manifest_tree_range(
+            self.summary.root(),
+            self.summary.logical_size(),
+            offset,
+            length,
+            |object_id| read_tree_metadata(&self.metadata, object_id),
+        )
+        .map_err(Into::into)
+    }
 }
 
 trait VerifiedChunkReader: fmt::Debug + Send + Sync {
@@ -89,19 +196,35 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             }
         }
         containers.verify_required_chunks(&required)?;
+        let allocated_bytes = manifest.extents().iter().try_fold(0_u64, |total, extent| {
+            let length = if matches!(extent, ManifestExtent::Hole { .. }) {
+                0
+            } else {
+                extent_logical_length(extent)
+            };
+            total.checked_add(length)
+        });
+        let allocated_bytes = allocated_bytes.ok_or(ManifestReadError::ArithmeticOverflow)?;
         Ok(Self {
-            manifest,
+            recipe: Arc::new(FlatManifestRecipe {
+                manifest,
+                allocated_bytes,
+            }),
             containers,
             indexed_reader: None,
         })
     }
 
-    pub(crate) fn from_verified_graph(
-        manifest: ManifestLeaf,
+    pub(crate) fn from_verified_tree<M>(
+        summary: ManifestTreeSummary,
+        metadata: M,
         containers: ContainerRepository<I>,
-    ) -> Self {
+    ) -> Self
+    where
+        M: Send + Sync + StorageIo + 'static,
+    {
         Self {
-            manifest,
+            recipe: Arc::new(TreeManifestRecipe { summary, metadata }),
             containers,
             indexed_reader: None,
         }
@@ -128,13 +251,51 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
     }
 
     #[must_use]
-    pub const fn manifest(&self) -> &ManifestLeaf {
-        &self.manifest
+    pub fn manifest_root(&self) -> Option<MetadataObjectId> {
+        self.recipe.root()
     }
 
     #[must_use]
-    pub const fn logical_size(&self) -> u64 {
-        self.manifest.file_length()
+    pub fn logical_size(&self) -> u64 {
+        self.recipe.logical_size()
+    }
+
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        self.recipe.allocated_bytes()
+    }
+
+    /// Counts allocated DATA/FILL bytes intersecting one logical range using
+    /// only the touched Manifest-tree paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded metadata I/O, identity, tree-partition, or arithmetic
+    /// error without returning a partial count.
+    pub fn allocated_bytes_in_range(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<u64, ManifestReadError> {
+        if length == 0 || offset >= self.logical_size() {
+            return Ok(0);
+        }
+        let end = offset.saturating_add(length).min(self.logical_size());
+        let extents = self.recipe.read_range(offset, end - offset)?;
+        extents.iter().try_fold(0_u64, |total, located| {
+            if matches!(located.extent(), ManifestExtent::Hole { .. }) {
+                return Ok(total);
+            }
+            let extent_end = located
+                .logical_offset()
+                .checked_add(extent_logical_length(located.extent()))
+                .ok_or(ManifestReadError::ArithmeticOverflow)?;
+            let overlap_start = located.logical_offset().max(offset);
+            let overlap_end = extent_end.min(end);
+            total
+                .checked_add(overlap_end - overlap_start)
+                .ok_or(ManifestReadError::ArithmeticOverflow)
+        })
     }
 
     /// Reads one bounded byte range without materializing the complete file.
@@ -212,20 +373,15 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             .map_err(|_| ManifestReadError::OutOfMemory)?;
         output.resize(output_length, 0);
 
-        let mut extent_start = 0_u64;
+        let extents = self.recipe.read_range(offset, read_end - offset)?;
         let mut covered_until = offset;
-        for extent in self.manifest.extents() {
+        for located in &extents {
+            let extent = located.extent();
+            let extent_start = located.logical_offset();
             let extent_length = extent_logical_length(extent);
             let extent_end = extent_start
                 .checked_add(extent_length)
                 .ok_or(ManifestReadError::ArithmeticOverflow)?;
-            if extent_end <= offset {
-                extent_start = extent_end;
-                continue;
-            }
-            if extent_start >= read_end {
-                break;
-            }
             let copy_start = extent_start.max(offset);
             let copy_end = extent_end.min(read_end);
             assert_eq!(
@@ -255,7 +411,6 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
                 }
             }
             covered_until = copy_end;
-            extent_start = extent_end;
         }
         assert_eq!(
             covered_until, read_end,
@@ -268,6 +423,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
 #[derive(Debug)]
 pub enum ManifestReadError {
     Store(StoreError),
+    Tree(ManifestTreeError),
     RequestTooLarge(u32),
     OutOfMemory,
     ArithmeticOverflow,
@@ -288,6 +444,7 @@ impl std::error::Error for ManifestReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Store(error) => Some(error),
+            Self::Tree(error) => Some(error),
             Self::RequestTooLarge(_)
             | Self::OutOfMemory
             | Self::ArithmeticOverflow
@@ -300,6 +457,42 @@ impl From<StoreError> for ManifestReadError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
     }
+}
+
+impl From<ManifestTreeError> for ManifestReadError {
+    fn from(error: ManifestTreeError) -> Self {
+        Self::Tree(error)
+    }
+}
+
+fn read_tree_metadata<I: StorageIo>(
+    storage: &I,
+    object_id: MetadataObjectId,
+) -> Result<Vec<u8>, ManifestTreeError> {
+    let name = metadata_name(object_id);
+    let length = storage.object_len(&name)?;
+    if length
+        > u64::try_from(MAX_METADATA_OBJECT_BYTES).expect("ASSERT: metadata object bound fits u64")
+    {
+        return Err(ManifestTreeError::IdentityMismatch(object_id));
+    }
+    let bytes = storage.read(&name)?;
+    if u64::try_from(bytes.len()) != Ok(length)
+        || MetadataObjectId::from_encoded(&bytes)? != object_id
+    {
+        return Err(ManifestTreeError::IdentityMismatch(object_id));
+    }
+    Ok(bytes)
+}
+
+fn metadata_name(object_id: MetadataObjectId) -> String {
+    let mut name = String::with_capacity(68);
+    for byte in object_id.bytes() {
+        use std::fmt::Write;
+        write!(&mut name, "{byte:02x}").expect("ASSERT: writing to String cannot fail");
+    }
+    name.push_str(".fdm");
+    name
 }
 
 const fn extent_logical_length(extent: &ManifestExtent) -> u64 {

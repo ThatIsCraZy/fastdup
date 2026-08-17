@@ -41,7 +41,7 @@ pub struct ManifestLeaf {
 }
 
 impl ManifestLeaf {
-    /// Constructs one leaf that partitions the complete file range.
+    /// Constructs one leaf that partitions its complete node-local range.
     ///
     /// # Errors
     ///

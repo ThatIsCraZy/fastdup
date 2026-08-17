@@ -1,4 +1,4 @@
-use crate::{CommitRange, PosixError, SparseData, copy_bytes};
+use crate::{CommitRange, ExternalDirtyData, PosixError, SparseData, copy_bytes};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound::Excluded;
@@ -28,6 +28,27 @@ pub trait CommittedFile: fmt::Debug + Send + Sync {
     /// Returns [`PosixError::Io`] for I/O or integrity failures and a bounded
     /// resource error when the requested output cannot be represented.
     fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError>;
+
+    /// Verifies that one complete candidate payload is exactly this source.
+    ///
+    /// The default is intentionally conservative and performs a verified read.
+    /// Content-addressed implementations may override it with an equivalent
+    /// identity check to avoid a second physical read immediately after the
+    /// source was verified. Returning `true` authorizes the Namespace to drop
+    /// its resident fallback, so this is an integrity boundary rather than a
+    /// probabilistic membership hint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a read, integrity, or bounded-resource error. The caller must
+    /// retain the resident bytes on every error.
+    fn matches_complete_bytes(&self, candidate: &[u8]) -> Result<bool, PosixError> {
+        if u64::try_from(candidate.len()).expect("ASSERT: usize fits u64") != self.logical_size() {
+            return Ok(false);
+        }
+        let length = u32::try_from(candidate.len()).map_err(|_| PosixError::FileTooLarge)?;
+        Ok(self.read_at(0, length)? == candidate)
+    }
 }
 
 #[derive(Debug)]
@@ -264,9 +285,11 @@ impl DirtyEpoch {
             self.through_sequence != self.base_sequence,
             "ASSERT: dirty epoch sequence bounds must agree"
         );
+        let mut accounted_data = 0_u64;
         for (&data_start, bytes) in &self.data.extents {
+            let data_length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64");
             let data_end = data_start
-                .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64"))
+                .checked_add(data_length)
                 .expect("ASSERT: validated DATA extent must not overflow");
             assert!(
                 self.holes
@@ -274,7 +297,55 @@ impl DirtyEpoch {
                     .is_empty(),
                 "ASSERT: dirty DATA and HOLE extents must not overlap"
             );
+            accounted_data = accounted_data
+                .checked_add(data_length)
+                .expect("ASSERT: dirty DATA accounting cannot overflow");
         }
+        let mut previous_external_end = 0_u64;
+        for (&data_start, external) in &self.data.external_extents {
+            let data_end = data_start
+                .checked_add(external.length)
+                .expect("ASSERT: external dirty extent must not overflow");
+            assert!(
+                self.holes
+                    .overlapping_starts(data_start, data_end)
+                    .is_empty(),
+                "ASSERT: external dirty DATA and HOLE extents must not overlap"
+            );
+            assert!(
+                data_start >= previous_external_end,
+                "ASSERT: external dirty DATA extents must not overlap"
+            );
+            assert!(
+                external.through_sequence > self.base_sequence
+                    && external.through_sequence <= self.through_sequence,
+                "ASSERT: external dirty DATA must belong to this mutation epoch"
+            );
+            assert!(
+                external
+                    .source_offset
+                    .checked_add(external.length)
+                    .is_some_and(|end| end <= external.source.logical_size()),
+                "ASSERT: external dirty DATA must stay inside its verified source"
+            );
+            assert!(
+                self.data.extents.iter().all(|(&resident_start, bytes)| {
+                    let resident_end = resident_start
+                        .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize fits u64"))
+                        .expect("ASSERT: resident dirty DATA must not overflow");
+                    resident_end <= data_start || resident_start >= data_end
+                }),
+                "ASSERT: resident and external dirty DATA must not overlap"
+            );
+            previous_external_end = data_end;
+            accounted_data = accounted_data
+                .checked_add(external.length)
+                .expect("ASSERT: dirty DATA accounting cannot overflow");
+        }
+        assert_eq!(
+            accounted_data, self.data.allocated_bytes,
+            "ASSERT: resident plus external dirty DATA must match cached allocation"
+        );
     }
 }
 
@@ -291,42 +362,38 @@ impl FrozenEpoch {
             .data
             .extents
             .len()
+            .checked_add(dirty.data.external_extents.len())
+            .ok_or(PosixError::OutOfMemory)?
             .checked_add(dirty.holes.ranges.len())
             .ok_or(PosixError::OutOfMemory)?;
         let mut ranges = Vec::<CommitRange>::new();
         ranges
             .try_reserve_exact(capacity)
             .map_err(|_| PosixError::OutOfMemory)?;
-        let mut data = dirty.data.extents.iter().peekable();
-        let mut holes = dirty.holes.ranges.iter().peekable();
-        while data.peek().is_some() || holes.peek().is_some() {
-            let take_data = match (data.peek(), holes.peek()) {
-                (Some((data_start, _)), Some((hole_start, _))) => data_start <= hole_start,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (None, None) => unreachable!("ASSERT: loop requires one dirty range"),
-            };
-            let (start, end) = if take_data {
-                let (&start, bytes) = data
-                    .next()
-                    .expect("ASSERT: selected dirty DATA range must exist");
-                let length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64");
-                (
-                    start,
-                    start
-                        .checked_add(length)
-                        .expect("ASSERT: validated dirty DATA end must not overflow"),
-                )
-            } else {
-                let (&start, &end) = holes
-                    .next()
-                    .expect("ASSERT: selected dirty HOLE range must exist");
-                (start, end)
-            };
+        for (&start, bytes) in &dirty.data.extents {
+            ranges.push(CommitRange::new(
+                start,
+                u64::try_from(bytes.len()).expect("ASSERT: usize fits u64"),
+            ));
+        }
+        for (&start, external) in &dirty.data.external_extents {
+            ranges.push(CommitRange::new(start, external.length));
+        }
+        for (&start, &end) in &dirty.holes.ranges {
+            ranges.push(CommitRange::new(start, end - start));
+        }
+        ranges.sort_unstable_by_key(|range| range.offset());
+        let mut output = Vec::<CommitRange>::new();
+        output
+            .try_reserve_exact(ranges.len())
+            .map_err(|_| PosixError::OutOfMemory)?;
+        for range in ranges {
+            let start = range.offset();
+            let end = start.checked_add(range.length()).ok_or(PosixError::Io)?;
             if end > dirty.result_size || start >= end {
                 return Err(PosixError::Io);
             }
-            if let Some(previous) = ranges.last_mut()
+            if let Some(previous) = output.last_mut()
                 && previous
                     .offset()
                     .checked_add(previous.length())
@@ -339,10 +406,10 @@ impl FrozenEpoch {
                     .ok_or(PosixError::Io)?;
                 previous.length = previous_end.max(end) - previous.offset();
             } else {
-                ranges.push(CommitRange::new(start, end - start));
+                output.push(CommitRange::new(start, end - start));
             }
         }
-        Ok(ranges)
+        Ok(output)
     }
 }
 
@@ -441,8 +508,49 @@ impl VersionedFile {
         self.live_allocated_bytes
     }
 
-    pub(super) const fn active_dirty_payload_bytes(&self) -> u64 {
-        self.active.data.allocated_bytes
+    pub(super) fn active_resident_payload_bytes(&self) -> u64 {
+        self.active.data.resident_bytes()
+    }
+
+    pub(super) fn externalize_many(
+        &mut self,
+        candidates: Vec<(u64, u64, Arc<dyn CommittedFile>)>,
+    ) -> Result<(), PosixError> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut accepted = false;
+        let mut first_error = None;
+        for (offset, through_sequence, source) in candidates {
+            let candidate = (|| {
+                if through_sequence <= self.active.base_sequence
+                    || through_sequence > self.active.through_sequence
+                {
+                    return Err(PosixError::Again);
+                }
+                let end = offset
+                    .checked_add(source.logical_size())
+                    .ok_or(PosixError::Io)?;
+                if !self.active.holes.overlapping_starts(offset, end).is_empty() {
+                    return Err(PosixError::Again);
+                }
+                self.active
+                    .data
+                    .externalize_many(vec![(offset, through_sequence, source)])
+            })();
+            match candidate {
+                Ok(()) => accepted = true,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        self.active.assert_valid();
+        if accepted {
+            Ok(())
+        } else {
+            Err(first_error.expect("ASSERT: a nonempty candidate batch produced one result"))
+        }
     }
 
     pub(super) fn write(
@@ -671,9 +779,9 @@ fn allocated_bytes_through(
             )?)
             .ok_or(PosixError::Io)?;
     }
-    let mut apply_data = |extent_start: u64, bytes: &[u8]| -> Result<(), PosixError> {
+    let mut apply_data = |extent_start: u64, extent_length: u64| -> Result<(), PosixError> {
         let extent_end = extent_start
-            .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64"))
+            .checked_add(extent_length)
             .expect("ASSERT: validated DATA extent must not overflow");
         let overlap_start = extent_start.max(start);
         let overlap_end = extent_end.min(effective_end);
@@ -689,14 +797,31 @@ fn allocated_bytes_through(
         Ok(())
     };
     if let Some((&extent_start, bytes)) = epoch.data.extents.range(..=start).next_back() {
-        apply_data(extent_start, bytes)?;
+        apply_data(
+            extent_start,
+            u64::try_from(bytes.len()).expect("ASSERT: usize fits u64"),
+        )?;
     }
     for (&extent_start, bytes) in epoch
         .data
         .extents
         .range((Excluded(start), Excluded(effective_end)))
     {
-        apply_data(extent_start, bytes)?;
+        apply_data(
+            extent_start,
+            u64::try_from(bytes.len()).expect("ASSERT: usize fits u64"),
+        )?;
+    }
+    if let Some((&extent_start, external)) = epoch.data.external_extents.range(..=start).next_back()
+    {
+        apply_data(extent_start, external.length)?;
+    }
+    for (&extent_start, external) in epoch
+        .data
+        .external_extents
+        .range((Excluded(start), Excluded(effective_end)))
+    {
+        apply_data(extent_start, external.length)?;
     }
     if allocated <= effective_end - start {
         Ok(allocated)
@@ -737,6 +862,18 @@ impl PlannedEpoch {
             .range((Excluded(read_start), Excluded(read_end)))
         {
             plan_data(&mut data, read_start, read_end, extent_start, bytes)?;
+        }
+        if let Some((&extent_start, external)) =
+            epoch.data.external_extents.range(..=read_start).next_back()
+        {
+            plan_external(&mut data, read_start, read_end, extent_start, external)?;
+        }
+        for (&extent_start, external) in epoch
+            .data
+            .external_extents
+            .range((Excluded(read_start), Excluded(read_end)))
+        {
+            plan_external(&mut data, read_start, read_end, extent_start, external)?;
         }
         let holes = epoch
             .holes
@@ -858,6 +995,37 @@ fn plan_data(
     planned.push(PlannedData {
         start: copy_start,
         bytes: copy_bytes(&bytes[source_start..source_end])?,
+    });
+    Ok(())
+}
+
+fn plan_external(
+    planned: &mut Vec<PlannedData>,
+    read_start: u64,
+    read_end: u64,
+    extent_start: u64,
+    external: &ExternalDirtyData,
+) -> Result<(), PosixError> {
+    let extent_end = extent_start
+        .checked_add(external.length)
+        .ok_or(PosixError::Io)?;
+    let copy_start = extent_start.max(read_start);
+    let copy_end = extent_end.min(read_end);
+    if copy_start >= copy_end {
+        return Ok(());
+    }
+    let source_offset = external
+        .source_offset
+        .checked_add(copy_start - extent_start)
+        .ok_or(PosixError::Io)?;
+    let length = u32::try_from(copy_end - copy_start).map_err(|_| PosixError::FileTooLarge)?;
+    let bytes = external.source.read_at(source_offset, length)?;
+    if bytes.len() != usize::try_from(length).expect("ASSERT: u32 fits usize") {
+        return Err(PosixError::Io);
+    }
+    planned.push(PlannedData {
+        start: copy_start,
+        bytes,
     });
     Ok(())
 }
@@ -1009,6 +1177,87 @@ mod tests {
             "ASSERT: test content and allocation maps must agree"
         );
         Arc::new(BytesReader { bytes, allocated })
+    }
+
+    #[test]
+    fn verified_external_dirty_extent_releases_resident_bytes_and_survives_updates() {
+        let mut file = VersionedFile::new_empty();
+        file.write(0, b"abcdefgh", 1).expect("initial write");
+        assert_eq!(file.active_resident_payload_bytes(), 8);
+
+        file.externalize_many(vec![(2, 1, bytes_reader(b"cdef".to_vec()))])
+            .expect("matching verified source must externalize");
+        assert_eq!(file.active_resident_payload_bytes(), 4);
+        assert_eq!(
+            file.plan_read(0, 8)
+                .expect("externalized read plan")
+                .execute()
+                .expect("externalized read"),
+            b"abcdefgh"
+        );
+
+        file.write(3, b"XY", 2)
+            .expect("later write splits external source");
+        assert_eq!(
+            file.plan_read(0, 8)
+                .expect("updated read plan")
+                .execute()
+                .expect("updated read"),
+            b"abcXYfgh"
+        );
+        file.truncate(6, 3)
+            .expect("truncate clips an external fragment");
+        assert_eq!(
+            file.plan_read(0, 8)
+                .expect("truncated read plan")
+                .execute()
+                .expect("truncated read"),
+            b"abcXYf"
+        );
+    }
+
+    #[test]
+    fn mismatched_external_source_preserves_the_resident_fallback() {
+        let mut file = VersionedFile::new_empty();
+        file.write(0, b"abcdefgh", 1).expect("initial write");
+
+        assert_eq!(
+            file.externalize_many(vec![(2, 1, bytes_reader(b"WRNG".to_vec()))]),
+            Err(PosixError::Io)
+        );
+        assert_eq!(file.active_resident_payload_bytes(), 8);
+        assert_eq!(
+            file.plan_read(0, 8)
+                .expect("fallback read plan")
+                .execute()
+                .expect("fallback read"),
+            b"abcdefgh"
+        );
+    }
+
+    #[test]
+    fn stale_cross_cut_candidate_does_not_reject_a_valid_active_candidate() {
+        let mut file = VersionedFile::new_empty();
+        file.write(0, b"abcd", 1).expect("write frozen prefix");
+        let cut = file
+            .freeze_active(CommitToken::new(1).expect("token is nonzero"))
+            .expect("prefix creates a frozen cut");
+        file.write(4, b"efgh", 2).expect("write active suffix");
+
+        file.externalize_many(vec![
+            (0, 2, bytes_reader(b"abcd".to_vec())),
+            (4, 2, bytes_reader(b"efgh".to_vec())),
+        ])
+        .expect("one stale candidate must not reject its valid sibling");
+        assert_eq!(file.active_resident_payload_bytes(), 0);
+        assert_eq!(
+            file.plan_read(0, 8)
+                .expect("cross-cut read plan")
+                .execute()
+                .expect("cross-cut read"),
+            b"abcdefgh"
+        );
+        drop(cut);
     }
 
     #[test]
