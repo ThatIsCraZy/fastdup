@@ -17,8 +17,8 @@ repository first skips the complete old reservation and durably publishes a
 fresh range; no ID acknowledged inside a lost durability window is reused.
 The daemon derives its nonzero Policy Set ID from canonical
 `checkpoint-policy-v1` bytes that pin FastCDC, Compression Region, Zstd
-selection, level-zero publication, and four-way compaction decisions; these rules cannot change
-silently under the earlier experimental constant ID.
+selection, level-zero publication, and four-way compaction decisions; these
+rules cannot change silently under the earlier experimental constant ID.
 
 A checkpoint performs this order:
 
@@ -128,10 +128,54 @@ holds a shared admission guard through application of the mutation, so the
 close operation cannot race past a write that passed admission but has not yet
 updated the live view.
 
+Write-through reduction is independently asynchronous. A write first updates
+the authoritative POSIX Dirty Extent Map with one owned immutable Mutation
+Payload, then admits zero-copy shared views of at most one MiB to a global
+16-MiB Ingest Queue, and returns without waiting for FastCDC, compression, or
+Container durability. One permanent bounded worker pool executes at most one
+job per inode while allowing different inodes to advance concurrently. Live
+reads therefore observe accepted bytes even while the data tier is blocked. A
+full Ingest Queue blocks only the admitting request after the inode-data lock
+has been released; it does not close global mutation admission.
+
+The lane Tail is segmented rather than one shifting `Vec`: appending a Queue
+view is zero-copy, FastCDC compacts at most its 256-KiB maximum lookahead, and a
+Pending Chunk remains a slice of that compacted buffer. The deterministic
+differential test compares hostile input segmentation with the pinned
+contiguous FastCDC-v1 boundary sequence. Container publication performs three
+ordered writes (Building Header, complete Body/Footer, Sealed Header) rather
+than one syscall per 4-KiB format page; the same fail-before/fail-after matrix
+still requires absent-or-fully-verified recovery.
+
+On the 2026-08-21 test host, `strace` observes exactly three `pwrite64`, two
+`fsync`, and one `renameat2` calls for one complete Container publication. The
+kernel was built with `CONFIG_IO_URING=y`, but the runtime policy reports
+`kernel.io_uring_disabled=2`; Linux defines this value as disabling
+`io_uring_setup()` for every process with `EPERM` ([kernel sysctl
+documentation](https://www.kernel.org/doc/html/v6.15/admin-guide/sysctl/kernel.html#io-uring-disabled)).
+An io_uring Storage adapter is therefore not enabled on this host. Even on an
+enabled host, v1 first requires evidence that batching multiple independent
+Container writes or syncs beats the existing bounded publisher threads;
+wrapping one large write and its strictly ordered verify/sync/rename chain is
+not a sufficient gate. FUSE-over-io_uring is separately still described as an
+in-development interface with incomplete request coverage ([kernel FUSE
+io_uring documentation](https://cdn.kernel.org/doc/html/latest/filesystems/fuse/fuse-io-uring.html#limitations)).
+
+`Sync`, `Release`, and checkpoint planning fence the relevant per-inode
+mutation sequence. The fence waits for reduction processing, but `Sync` does
+not create a private durable generation or strengthen the accepted system-wide
+commit window. Zero-payload barriers represent truncate, unlink, metadata
+clone, and rename-overwrite in the same sequence space. Compression permits
+cover only CPU preparation and are returned before immutable Container I/O, so
+one stalled data-file sync cannot retain the complete encode budget.
+
 This is a bounded-progress mechanism, not a claim that arbitrarily stalled
 hardware can meet a wall-clock deadline. Arbitrarily stalled total I/O remains
-outside the supported failure envelope in ADR 0007. A fake-clock deadline test,
-process `SIGKILL` matrix, and persisted appliance-health state remain open.
+outside the supported failure envelope in ADR 0007. The public
+[`SIGKILL`, remount, and deadline harness](sigkill-remount-deadline.md) now
+proves complete-prefix recovery inside the window and full recovery after ten
+seconds on the real mount. A fake-clock stalled-I/O deadline test and persisted
+appliance-health state remain open.
 
 ## Validation on 2026-08-16
 
@@ -154,6 +198,14 @@ The public POSIX commit-cut tests prove:
 - unlink removes an open orphan from checkpoint pressure while preserving
   byte-exact writes through its existing handle and contiguous Inode mutation
   sequencing.
+
+The asynchronous write-through integration tests pause Container file sync and
+prove through the public Namespace seam that writes still return and remain
+live-readable, `Release` waits for its final queued sequence, two files reach
+data-tier durability concurrently, and admission blocks only after the explicit
+16-MiB queue fills. A separate unlink-during-reduction tracer proves that its
+zero-payload barrier cannot be skipped and cannot leave `Release` waiting on an
+unobserved sequence.
 
 A real release-build kernel-FUSE run then wrote exactly 536,870,912 zero bytes
 in 0.31 seconds. The daemon reported the pressure edge at exactly 536,870,912
@@ -186,6 +238,16 @@ read and output-publication operation; after crash the compacted Run is either
 absent or completely published, and only an effective final directory sync may
 make an error-returning publication durable. Existing replacement-activation
 fault tests then select only the old or complete new Run Set.
+
+The Exact Index Activation Log no longer stops at the former 16,384-record
+limit. A filesystem-backed migration tracer fills the complete legacy 64-MiB
+file, activates generation 16,385 through the second slot, reopens it, and
+recovers that exact Run Set. A separate 130-activation tracer crosses two
+ordinary rotation boundaries while keeping both slot files at or below 256 KiB.
+The deterministic backend fails before and after every first-rotation operation;
+only an effective final target-slot sync may expose generation 65. Writer,
+recovery, and offline audit all reject an authenticated-chain failure in the
+inactive peer.
 
 The durable appliance integration test checkpoints a byte-exact raw name and a
 sparse seek-write, reopens through production recovery, verifies size,
@@ -285,6 +347,52 @@ was durable as generation 10. Workspace-local artifacts remain under
 `/source/fastdup/.artifacts/tier-meta/manifest-tree-iso.meta.FbR465`, and
 `/source/fastdup/.artifacts/tier-data/manifest-tree-iso.data.2wZnXu`.
 
+After prepared extent recipes were connected to the Frozen Commit Cut, another
+fresh release mount copied the same complete ISO in 22.84 seconds through FUSE
+(90.74 MB/s logical). Stable full-Container cuts commonly adopted about
+66.5 MB directly and passed only 0.35--0.61 MB through checkpoint FastCDC. A
+34-MiB public integration test additionally overwrites one byte inside an
+externalized Chunk, bounds all checkpoint rechunking below 4 MiB, crashes both
+stores, and verifies the complete recovered file byte-for-byte.
+
+The complete ISO SHA-256 before restart and after a new daemon recovered the
+mount was the official
+`aac6ac3ce781b91a91ce78463405f66c611a5dca4b3840c79e5e01d97302f6c8`.
+The initial verified read took 32.00 seconds and the recovered read 33.49
+seconds. That run exposed two distinct races: a Container completed after its
+mutation had entered the Frozen Cut, and a checkpoint cut a stable but
+not-yet-full Ingest Lane. The first was fixed by byte-verified late recipe
+attachment; the second by fencing already admitted observers at cut formation
+and draining complete FastCDC chunks immediately after the cut.
+
+The complete pinned ISO was then copied again through a fresh release mount.
+The copy completed in 47.88 seconds and produced 49 generation checkpoints.
+Across them, 2,054,849,812 bytes were adopted directly as prepared recipes and
+20,209,047 bytes passed through checkpoint FastCDC. The maximum per-generation
+rechunk was 582,760 bytes, down from the observed 28--34 MiB spikes and bounded
+near the incomplete CDC suffix plus a boundary chunk. Live and post-restart
+SHA-256 both matched the official
+`aac6ac3ce781b91a91ce78463405f66c611a5dca4b3840c79e5e01d97302f6c8`.
+Artifacts are retained under `recipe-cut-fenced.meta.YUq65F` on the metadata
+tier, `recipe-cut-fenced.data.sRajqp` on the DATA tier, and
+`/source/fastdup/.artifacts/recipe-cut-fenced.log`.
+
+The next append-native Manifest successor slice retained the accepted 500-ms
+full-Container coalescing policy and removed the growing complete-tree commit
+scan from sequential appends. A fresh release copy of the same pinned ISO
+completed in 35.02 seconds with 43 checkpoints. Total checkpoint wall/CPU time
+was 18.79/27.46 seconds and Metadata wall/CPU time was 8.76/17.81 seconds,
+compared with 28.36/41.08 and 10.98/24.05 seconds in the preceding 47.88-second
+run. The checkpoints reused 2,056,954,238 recipe bytes, rechunked 15,490,690
+bytes, and never buffered more than 570,039 reduction bytes. Live and
+post-restart SHA-256 both matched the official source. Artifacts are retained
+under `append-proof-500ms.meta.LpYKYs`, `append-proof-500ms.data.fyiszJ`, and
+`/source/fastdup/.artifacts/append-proof-500ms.log`.
+
+A separate 2-second coalescing experiment reduced commit count but regressed
+the complete copy to 51.84 seconds as larger generations increased Metadata
+work. That policy change was rejected; 500 ms remains the accepted value.
+
 ```bash
 export RUSTUP_HOME=/source/fastdup/.artifacts/rustup
 export CARGO_HOME=/source/fastdup/.artifacts/cargo
@@ -306,38 +414,57 @@ in [memory and swap containment](../operations/memory-and-swap.md).
 
 - The writer has FastCDC-v1, automatic level-zero Exact-Index publication, and
   deterministic four-way tiered compaction before the 64-active-Run reader
-  bound. The current cold-path merge materializes at most 262,144 verified
-  entries and fails the nonauthoritative index closed above that bound;
-  streaming partitioned compaction remains required for the full capacity
-  target. Per-DATA-region Chunking Profile IDs are not yet serialized in the
-  Manifest tree, and Bloom/hot negative-lookup acceleration is not connected.
-- Durable recipes now use content-addressed Manifest leaves and bounded inner
-  nodes; unchanged leaves are reused and a change publishes only its new leaf
-  and ancestor path. Planning and installed readers still flatten the complete
-  extent recipe in memory, so CPU/RAM work remains O(number of file extents).
-  Tree-native lazy reads and path-local mutation are required for 100-TB files.
-- Sparse planning, FastCDC, and BLAKE3 identity construction are currently
-  serial. Independent adaptive Compression Regions use bounded private worker
-  outputs and a deterministic ordinal merge; pipeline-overlapped planning and
-  per-worker reusable codec contexts remain to be measured and connected.
+  bound. The cold-path merge now makes two complete source-audit passes and
+  retains only one verified 4-KiB page per source, one heap entry per source,
+  and one output page. The public 262,145-entry tracer completes in 1.95 s with
+  37,468 KiB maximum RSS and zero swap on the development host. Partitioned Run
+  families remain required above the Run-v1 one-GiB output-object bound.
+  Per-DATA-region Chunking Profile IDs are not yet serialized in the Manifest
+  tree. Active Runs now build the existing cache-line-aligned blocked Bloom
+  hint during their mandatory full audit. A definite absence bypasses that
+  Run's Exact pages; a positive remains untrusted and follows the complete
+  verified lookup. Filter memory and absent/maybe probes are reported
+  independently from the pressure-bounded Exact Index page cache.
+- Durable recipes use content-addressed Manifest leaves and bounded inner
+  nodes. Installed reads are tree-native; equal-length changes publish only
+  replacement leaves and ancestor paths, and sequential appends additionally
+  commit from an opaque right-spine successor proof. Equal-length replacements
+  now extend that proof from their touched paths. Truncate and arbitrary
+  length-changing middle splice/concat are also tree-native and preserve
+  complete shifted suffix-subtree identities.
+- FastCDC for one stream and its Manifest edit planning remain ordered. The
+  write-through path overlaps the next Container's CDC with durability of the
+  prior detached Container. BLAKE3 shards, independent Compression Regions,
+  Similarity fingerprints, Delta trials, Reorder keys, and maintenance
+  verification share one permanent quota-sized work-stealing pool. Results
+  merge by deterministic ordinal, and each pool worker retains its private
+  Zstd codec context. Commit-time planning of independent inode tails remains
+  serial because the common Exact set and 32-MiB Container packing cross inode
+  boundaries; most long-stream bytes have already left that path through
+  write-through reduction.
 - Reachable-DATA graph verification uses verified persistent Locations during
   healthy indexed read-only recovery, writable recovery/reservation, and every
   checkpoint. Any missing, corrupt, stale, or unusable candidate invokes one
   complete verified scan because the index remains nonauthoritative. The
-  verifier still walks every unique Chunk in the flattened graph, so hierarchical
-  incremental proof reuse is required for 100-TB files. Container-generation
-  discovery separately retains one O(number of Containers) mount-time envelope
-  scan until it receives its own durable high-water record.
+  legacy fallback verifier still walks every unique Chunk in the graph. New
+  files, sequential appends, and equal-length replacement successors verify
+  only introduced DATA. Every such proof is fenced to the exact installed
+  Commit Record and stale proofs are rejected before dependency verification.
+  Container-generation discovery separately retains one O(number of Containers)
+  mount-time envelope scan until it receives its own durable high-water record.
 - The flat v1 Namespace Root and compatibility Manifest planner retain their
   documented metadata size limits.
-- Atomic rename, links, nested directories, xattrs/ACLs, locks, allocation
-  operations, normal read caching, automatic GC, scrub, and Samba conformance
-  remain open.
-- Commit-Log rotation is implemented through paired bounded slots. A durable
-  Appliance Lease/format-epoch fence, offline slot scrub, fake-clock deadline
-  proofs, `SIGKILL`/remount sweeps, and multi-process writer exclusion remain
+- Links, nested directories, xattrs/ACLs, locks, allocation operations,
+  automatic GC, and Samba/Veeam conformance remain open. Atomic replacement
+  rename, bounded verified read caching, offline end-to-end scrub, and RoW
+  Exact-Index rebuild are implemented; the maintenance path is documented in
+  [scrub and Exact-Index rebuild](../operations/scrub-and-exact-index-rebuild.md).
+- Commit-Log rotation is implemented through paired bounded slots. A bounded
+  real-process `SIGKILL`/remount/deadline matrix is green. A durable Appliance
+  Lease/format-epoch fence, fake-clock stalled-I/O proofs, broad randomized
+  process-kill/power-cut campaigns, and multi-process writer exclusion remain
   open.
 
-The next recovery-safe scaling slice is tree-native lazy Manifest traversal and
-path-local updates, followed by Metadata GC and a durable Container-generation
-high-water.
+The next recovery-safe scaling slice is Metadata/DATA GC and a durable
+Container-generation high-water, followed by the Appliance Lease and broader
+process-kill/power-cut campaigns.

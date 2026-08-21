@@ -10,7 +10,41 @@ libraries, and future regressions.
 
 The durable FUSE daemon currently closes mutation admission at 512 MiB of
 unique, reachable active Dirty DATA (eight nominal 64-MiB Containers). Keep that
-limit enabled. Run the daemon with the following service properties:
+limit enabled. The verified read cache is a separate discardable tier: it is
+hard-capped at one eighth of effective RAM (and at most 8 GiB), while reserving
+at least one quarter of effective RAM or 4 GiB for ingest, XFS, and I/O queues.
+It purges and stops admitting payloads whenever the reserve is unavailable or
+Swap use is observed. The persistent Exact Index retains only verified hot
+4-KiB pages in a separate direct-mapped cache. Its hard geometry is one 128th
+of effective RAM, clamped to 1-256 MiB, while its resident target uses the same
+live reserve and drops to zero on Swap. It is never a complete in-memory Chunk
+map. Rebuildable per-Run blocked Bloom hints use a separate active-set budget of
+one 32nd of effective RAM, clamped to 1 MiB-8 GiB and limited by headroom above
+the shared reserve. Every Run-Set activation resamples headroom, and observed
+Swap disables filters in the replacement; absence always falls back to the
+verified Exact pages. The data-tier `io_uring`
+adapter has an independent
+256-MiB publication-buffer budget. Its normal owned path transfers a prepared
+Container image once and charges exactly one image for the whole publication.
+After the final Header write, the original allocation is released before the
+equal-sized writer-reread buffer is allocated; the same lease covers both
+phases. Legacy borrowed `write_at` calls still require a completion-lifetime
+copy and report those bytes separately. Neither tier counts as read-cache
+capacity. This budget begins at publication admission, so the Reduction
+pipeline must independently bound prepared-but-not-yet-submitted images. The
+Ring path is currently opt-in with `FASTDUP_IO_URING=try` or `required`; absent
+or `off` retains the faster measured synchronous path.
+
+Rereads of at least 1 MiB are decoded by a permanent CPU verifier pool using all
+effective CPUs by default; smaller Containers stay inline. Every pooled job
+continues holding the same publication-buffer lease, so queued verifier input
+cannot escape the 256-MiB bound. The decoded `SealedContainer` result can
+temporarily coexist with its reread input during verification and is not part
+of `inflight_bytes`; process RSS/cgroup limits remain the authoritative guard
+for that decoded representation. With nominal 64-MiB images, the input budget
+admits at most four such jobs concurrently.
+
+Run the daemon with the following service properties:
 
 ```ini
 [Service]
@@ -43,11 +77,38 @@ For every sustained ingest test record all of the following:
 - daemon `Swap` and anonymous memory from `/proc/PID/smaps_rollup`;
 - system `MemAvailable` and `SwapFree`;
 - deltas of `pswpin` and `pswpout` from `/proc/vmstat`;
-- cgroup `memory.current`, `memory.events`, and `memory.swap.current`.
+- cgroup `memory.current`, `memory.events`, and `memory.swap.current`; and
+- `verified_read_cache` telemetry, especially payload `resident_bytes`,
+  `target_bytes`, `pressure_rejections`, and fixed `metadata_bytes`; and
+- `exact_index_page_cache` hits, misses, resident/target/capacity pages,
+  evictions, pressure rejections, reserve, and Swap sample; and
+- Container-descriptor cache hits, misses, admissions, evictions,
+  pressure/allocation rejections, hard/target/resident entries,
+  hard/target coverage, resident/fixed bytes, and its memory-pressure sample;
+  this cache contains no Header/Footer pages or DATA payload; and
+- `exact_run_membership` filters, allocated bytes, probes, definite absences,
+  and lookups requiring Exact pages; and
+- `data_io_uring` mode, `inflight_bytes`, `peak_inflight_bytes`, submitted and
+  completed operation counts, root-sync caller/submission counts, owned
+  publications started/completed, `borrowed_write_copy_bytes`, configured
+  verifier workers, jobs started/completed/failed, and active/peak-active
+  verifications.
 
 Pass requires daemon and cgroup swap to remain zero, `pswpout` not to increase,
 and no `oom`, `oom_kill`, or `max` event. Historical host SwapUsed is not by
 itself a fastdup failure; attribute it using the process and cgroup counters.
+Ring `inflight_bytes` must return to zero after quiescence, its peak must not
+exceed `max_inflight_bytes`, and completed operations must equal submitted
+operations after a clean shutdown.
+In active Ring mode, every successful normal Container publication must
+increment both owned counters exactly once, and `borrowed_write_copy_bytes`
+must remain zero. A nominal 64-MiB image must charge approximately one image,
+never two; the hard peak remains at or below 256 MiB. Synchronous and fallback
+modes report zero Ring-publication counters by construction.
+After quiescence, active verifications must be zero, completed jobs must equal
+started jobs, failures must be zero for a healthy workload, and peak active
+must not exceed configured workers. Small-Container-only runs should report no
+pooled jobs.
 
 The 2026-08-16 bounded-dirty 50-ISO run met these memory checks with a 2.40-GiB
 peak and more than 19 GiB of available-RAM margin. It did not meet throughput or

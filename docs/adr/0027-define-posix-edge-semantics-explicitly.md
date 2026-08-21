@@ -18,3 +18,9 @@ KEEP_SIZE reservations, while collapse/insert range initially return
 `EOPNOTSUPP`. `O_SYNC` and `O_DSYNC` share the deliberate ten-second durability
 semantics of `fsync`. Version 1 uses relatime; mtime, ctime, and explicitly set
 times remain ordinary atomic metadata mutations.
+
+Range clone is the exception to byte-copy write admission defined by
+[ADR 0043](0043-expose-metadata-range-clones-for-veeam-fast-clone.md): an
+accepted fully allocated immutable source range becomes one target metadata
+mutation and allocates no frontend DATA pages. Same-file overlap and sparse
+source cloning fail explicitly.

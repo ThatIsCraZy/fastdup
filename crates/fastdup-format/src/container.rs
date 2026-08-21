@@ -1,6 +1,8 @@
 use core::fmt;
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use std::thread;
+
+use rayon::prelude::*;
 
 use crate::exact_index::{ExactIndexEntry, ExactLocationTransition};
 
@@ -43,6 +45,11 @@ const INDEX_CRC_OFFSET: usize = 36;
 const FOOTER_MAGIC: &[u8; 8] = b"FDFOOT01";
 const FOOTER_BYTES_USIZE: usize = 4_096;
 const FOOTER_HASH_OFFSET: usize = 96;
+
+thread_local! {
+    static ZSTD_ENCODER_V1: RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { RefCell::new(None) };
+}
 const FOOTER_CRC_OFFSET: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -445,29 +452,23 @@ impl SealedContainer {
             return Err(FormatError::InvalidContainerLayout);
         }
         let worker_count = workers.get().min(regions.len());
-        let encoded_by_region = thread::scope(|scope| {
-            let mut handles = Vec::new();
-            handles
-                .try_reserve_exact(worker_count)
-                .map_err(|_| FormatError::ArithmeticOverflow)?;
-            for worker in 0..worker_count {
-                handles.push(scope.spawn(move || {
-                    let mut completed = Vec::new();
-                    for ordinal in (worker..regions.len()).step_by(worker_count) {
-                        completed.push((ordinal, encode_adaptive_region(regions[ordinal])?));
-                    }
-                    Ok::<_, FormatError>(completed)
-                }));
-            }
+        let encoded_by_region = (0..worker_count)
+            .into_par_iter()
+            .map(|worker| {
+                let mut completed = Vec::new();
+                for ordinal in (worker..regions.len()).step_by(worker_count) {
+                    completed.push((ordinal, encode_adaptive_region(regions[ordinal])?));
+                }
+                Ok::<_, FormatError>(completed)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let encoded_by_region = {
             let mut ordered = Vec::new();
             ordered
                 .try_reserve_exact(regions.len())
                 .map_err(|_| FormatError::ArithmeticOverflow)?;
             ordered.resize_with(regions.len(), || None);
-            for handle in handles {
-                let completed = handle
-                    .join()
-                    .expect("ASSERT: adaptive Container encoding worker panicked")?;
+            for completed in encoded_by_region {
                 for (ordinal, encoded) in completed {
                     assert!(
                         ordered[ordinal].replace(encoded).is_none(),
@@ -476,7 +477,7 @@ impl SealedContainer {
                 }
             }
             Ok::<_, FormatError>(ordered)
-        })?;
+        }?;
         let mut encoded_records = Vec::new();
         for region in encoded_by_region {
             encoded_records.extend(
@@ -994,7 +995,7 @@ fn encode_zstd_record(chunks: &[&[u8]], level: i32) -> Result<Vec<u8>, FormatErr
     for chunk in chunks {
         decoded.extend_from_slice(chunk);
     }
-    let payload = zstd::bulk::compress(&decoded, level).map_err(|_| FormatError::ZstdFailure)?;
+    let payload = compress_zstd_v1(&decoded, level)?;
     let table_bytes = chunks
         .len()
         .checked_mul(CHUNK_TABLE_ENTRY_BYTES)
@@ -1083,6 +1084,25 @@ fn encode_zstd_record(chunks: &[&[u8]], level: i32) -> Result<Vec<u8>, FormatErr
         return Err(FormatError::InvalidZstdRecord);
     }
     Ok(bytes)
+}
+
+fn compress_zstd_v1(decoded: &[u8], level: i32) -> Result<Vec<u8>, FormatError> {
+    if level != ZSTD_LEVEL_V1 {
+        return Err(FormatError::InvalidZstdRecord);
+    }
+    ZSTD_ENCODER_V1.with(|encoder| {
+        let mut encoder = encoder.borrow_mut();
+        if encoder.is_none() {
+            *encoder = Some(
+                zstd::bulk::Compressor::new(ZSTD_LEVEL_V1).map_err(|_| FormatError::ZstdFailure)?,
+            );
+        }
+        encoder
+            .as_mut()
+            .expect("ASSERT: worker-local Zstd encoder was initialized")
+            .compress(decoded)
+            .map_err(|_| FormatError::ZstdFailure)
+    })
 }
 
 fn zstd_record_wins(raw_bytes: usize, zstd_bytes: usize) -> Result<bool, FormatError> {

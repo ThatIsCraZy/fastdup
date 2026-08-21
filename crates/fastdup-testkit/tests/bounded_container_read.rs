@@ -2,7 +2,9 @@ use fastdup_format::{
     ContainerId, ExactIndexEntry, ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef,
     ExactIndexRunSet,
 };
-use fastdup_store::{ContainerRepository, ExactIndexRunRepository, StorageIo, StoreError};
+use fastdup_store::{
+    ContainerRepository, ExactIndexRunRepository, MemoryPressureSnapshot, StorageIo, StoreError,
+};
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
 #[test]
@@ -105,6 +107,119 @@ fn exact_location_read_uses_only_bounded_ranges_and_returns_verified_bytes() {
 }
 
 #[test]
+fn repeated_location_reads_reuse_the_verified_container_envelope() {
+    let storage = MemoryStorageIo::new();
+    let repository = ContainerRepository::new(storage.clone());
+    let container_id = ContainerId::new([0xB4; 16]).expect("container identity is nonzero");
+    let first = b"first record in one immutable container";
+    let second = b"second record reuses the verified envelope";
+    repository
+        .publish_raw(container_id, 19, &[first, second])
+        .expect("publish one worked Container");
+    let container = repository
+        .read(container_id)
+        .expect("obtain rebuild evidence before measuring bounded reads");
+    let first_entry = ExactIndexEntry::from_verified_raw(container.raw_locations()[0])
+        .expect("construct first exact location");
+    let second_entry = ExactIndexEntry::from_verified_raw(container.raw_locations()[1])
+        .expect("construct second exact location");
+    let baseline = storage.operation_count();
+
+    assert_eq!(
+        repository
+            .read_verified_location(first_entry)
+            .expect("first record verifies"),
+        first
+    );
+    assert_eq!(
+        repository
+            .read_verified_location(second_entry)
+            .expect("second record verifies"),
+        second
+    );
+
+    let operations = &storage.operations()[baseline..];
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ObjectLen)
+            .count(),
+        1,
+        "one immutable Container envelope must be measured only once"
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ReadExactAt)
+            .count(),
+        4,
+        "the cold read needs Header+Footer+Record; the hot read only its Record"
+    );
+    let cache = repository.descriptor_cache_status();
+    assert_eq!(cache.misses(), 1);
+    assert_eq!(cache.hits(), 1);
+    assert_eq!(cache.evictions(), 0);
+    assert!(
+        cache.capacity() >= 16_777_216,
+        "the descriptor cache must address at least 512 TiB of 32-MiB Containers"
+    );
+    assert!(cache.metadata_bytes() < 1_024 * 1_024);
+}
+
+#[test]
+fn swap_pressure_disables_envelope_admission_without_changing_verified_reads() {
+    let storage = MemoryStorageIo::new();
+    let gib = 1_024_u64.pow(3);
+    let repository = ContainerRepository::new_with_descriptor_cache_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 * gib, 96 * gib, 1),
+    );
+    let container_id = ContainerId::new([0xB5; 16]).expect("container identity is nonzero");
+    let payload = b"cache pressure may cost IO but cannot change verified bytes";
+    repository
+        .publish_raw(container_id, 20, &[payload])
+        .expect("publish fixture Container");
+    let container = repository
+        .read(container_id)
+        .expect("obtain rebuild evidence");
+    let entry = ExactIndexEntry::from_verified_raw(container.raw_locations()[0])
+        .expect("construct exact location");
+    let baseline = storage.operation_count();
+
+    for _ in 0..2 {
+        assert_eq!(
+            repository
+                .read_verified_location(entry)
+                .expect("pressure fallback still verifies the record"),
+            payload
+        );
+    }
+
+    let operations = &storage.operations()[baseline..];
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ObjectLen)
+            .count(),
+        2
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ReadExactAt)
+            .count(),
+        6
+    );
+    let status = repository.descriptor_cache_status();
+    assert_eq!(status.target_entries(), 0);
+    assert_eq!(status.entry_count(), 0);
+    assert_eq!(status.hits(), 0);
+    assert_eq!(status.misses(), 2);
+    assert_eq!(status.pressure_rejections(), 2);
+    assert_eq!(status.swap_used_bytes(), 1);
+}
+
+#[test]
 fn bounded_location_read_rejects_record_corruption_without_returning_bytes() {
     let storage = MemoryStorageIo::new();
     let repository = ContainerRepository::new(storage.clone());
@@ -120,6 +235,12 @@ fn bounded_location_read_rejects_record_corruption_without_returning_bytes() {
         .expect("construct one index candidate from verified rebuild evidence");
     let location = candidate.location();
     let published_name = format!("{}.fdc", "a5".repeat(16));
+    assert_eq!(
+        repository
+            .read_verified_location(candidate)
+            .expect("warm only the immutable envelope proof"),
+        payload
+    );
     storage
         .write_at(&published_name, location.record_offset() + 192, &[0xFF])
         .expect("inject one live payload corruption through the storage seam");
@@ -178,6 +299,81 @@ fn active_exact_index_resolves_a_chunk_without_a_container_directory_scan() {
     let operations = &storage.operations()[baseline..];
     assert!(!operations.contains(&StorageOperation::Read));
     assert!(!operations.contains(&StorageOperation::ListNames));
+}
+
+#[test]
+fn repeated_exact_lookup_reuses_one_verified_hot_index_page() {
+    let data = MemoryStorageIo::new();
+    let containers = ContainerRepository::new(data);
+    let container_id = ContainerId::new([0xBA; 16]).expect("container identity is nonzero");
+    let payload = b"one hot Exact Index page should remain bounded in RAM";
+    containers
+        .publish_raw(container_id, 17, &[payload])
+        .expect("publish one worked Container");
+    let container = containers
+        .read(container_id)
+        .expect("obtain verified rebuild evidence");
+    let entry = ExactIndexEntry::from_verified_raw(container.raw_locations()[0])
+        .expect("construct one exact entry");
+
+    let metadata = MemoryStorageIo::new();
+    let profile = ExactIndexProfileId::new([0xBB; 32]).expect("profile identity is nonzero");
+    let indexes = ExactIndexRunRepository::new_with_memory_snapshot(
+        metadata.clone(),
+        MemoryPressureSnapshot::new(128 * 1_024 * 1_024 * 1_024, 96 * 1_024 * 1_024 * 1_024, 0),
+    );
+    let descriptor = indexes
+        .publish(&ExactIndexRun::new(profile, 1, vec![entry]).expect("construct one Run"))
+        .expect("publish one Run");
+    indexes
+        .activate(
+            &ExactIndexRunSet::new(
+                profile,
+                1,
+                vec![ExactIndexRunRef::new(0, descriptor).expect("pin one Run")],
+            )
+            .expect("construct one Run Set"),
+        )
+        .expect("activate one Run Set");
+    let active = indexes
+        .recover_active()
+        .expect("recover active Exact Index")
+        .expect("one Exact Index is active");
+    let baseline = metadata.operation_count();
+
+    let first = active
+        .lookup_transitions(entry.chunk_id(), entry.logical_length())
+        .expect("first hot lookup succeeds");
+    let after_first = metadata.operation_count();
+    let second = active
+        .lookup_transitions(entry.chunk_id(), entry.logical_length())
+        .expect("second hot lookup succeeds");
+    let after_second = metadata.operation_count();
+
+    assert_eq!(first, second);
+    assert_eq!(first.candidates(), &[entry]);
+    assert_eq!(
+        metadata.operations()[baseline..after_first]
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ReadExactAt)
+            .count(),
+        1,
+        "binary search and candidate collection must share one verified page"
+    );
+    assert_eq!(
+        metadata.operations()[after_first..after_second]
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ReadExactAt)
+            .count(),
+        0,
+        "a repeated hot-key lookup must not issue another Metadata page read"
+    );
+    let cache = indexes.page_cache_status();
+    assert_eq!(cache.misses(), 1);
+    assert_eq!(cache.hits(), 3);
+    assert_eq!(cache.resident_pages(), 1);
+    assert!(cache.target_pages() >= cache.resident_pages());
+    assert!(cache.capacity_pages() >= cache.target_pages());
 }
 
 #[test]

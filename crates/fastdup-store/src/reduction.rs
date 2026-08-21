@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::BitOr;
-use std::thread;
 
 use fastcdc::v2020::{FastCDC, Normalization};
 use fastdup_format::ChunkId;
+use rayon::prelude::*;
 
 use crate::ReductionDictionary;
 use crate::reduction_codec::{
@@ -34,6 +34,31 @@ const EXACT_BLOOM_MAXIMUM_BYTES: usize = 4 * 1_024 * 1_024;
 const DELTA_MINIMUM_SAVINGS_BYTES: u64 = 4_096;
 const DELTA_MINIMUM_SAVINGS_PERCENT: u128 = 5;
 const PERCENT_DENOMINATOR: u128 = 100;
+
+thread_local! {
+    /// One mutable Zstd encode/decode context per permanent Rayon worker.
+    ///
+    /// Reduction tasks never share the context and therefore need no codec
+    /// lock. Keeping it in TLS avoids rebuilding Zstd state at every
+    /// Container, Similarity, or Delta phase boundary.
+    static REDUCTION_CODEC_V1: RefCell<Option<WorkerCodec>> = const { RefCell::new(None) };
+}
+
+fn with_worker_codec<T>(
+    operation: impl FnOnce(&mut WorkerCodec) -> Result<T, ReductionError>,
+) -> Result<T, ReductionError> {
+    REDUCTION_CODEC_V1.with(|codec| {
+        let mut codec = codec.borrow_mut();
+        if codec.is_none() {
+            *codec = Some(WorkerCodec::new().map_err(|error| codec_error(&error))?);
+        }
+        operation(
+            codec
+                .as_mut()
+                .expect("ASSERT: worker-local Reduction Codec was initialized"),
+        )
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReductionFeatures(u16);
@@ -1120,39 +1145,25 @@ impl ReductionEngine {
             .contains(ReductionFeatures::COMPRESSION);
         let dictionary = self.dictionary.as_ref();
 
-        let worker_results = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for worker_ordinal in 0..worker_count {
-                handles.push(scope.spawn(move || {
-                    let mut codec = WorkerCodec::new().map_err(|error| codec_error(&error))?;
+        let worker_results = (0..worker_count)
+            .into_par_iter()
+            .map(|worker_ordinal| {
+                with_worker_codec(|codec| {
                     let mut stats = WorkerStats::default();
                     let mut encoded = Vec::new();
                     for region_index in (worker_ordinal..regions.len()).step_by(worker_count) {
                         let region = regions
                             .get(region_index)
                             .expect("ASSERT: a scheduled region ordinal is in bounds");
-                        let encoded_region = encode_region(
-                            &mut codec,
-                            input,
-                            region,
-                            compression_enabled,
-                            dictionary,
-                        )?;
+                        let encoded_region =
+                            encode_region(codec, input, region, compression_enabled, dictionary)?;
                         stats.observe(&encoded_region.record)?;
                         encoded.push(encoded_region);
                     }
-                    Ok::<_, ReductionError>(WorkerResult { encoded, stats })
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .expect("ASSERT: a scoped reduction worker must not panic")
+                    Ok(WorkerResult { encoded, stats })
                 })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut ordered = (0..regions.len()).map(|_| None).collect::<Vec<_>>();
         let mut aggregate = AggregateStats::default();
@@ -1338,12 +1349,10 @@ impl ReductionEngine {
             .min(jobs.len());
         let records = &self.records;
         let dictionary = self.dictionary.as_ref();
-        let worker_results = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for worker_ordinal in 0..worker_count {
-                let jobs = &jobs;
-                handles.push(scope.spawn(move || {
-                    let mut codec = WorkerCodec::new().map_err(|error| codec_error(&error))?;
+        let worker_results = (0..worker_count)
+            .into_par_iter()
+            .map(|worker_ordinal| {
+                with_worker_codec(|codec| {
                     let mut worker_stats = DeltaWorkerStats::default();
                     let mut decisions = Vec::new();
                     for job_index in (worker_ordinal..jobs.len()).step_by(worker_count) {
@@ -1364,7 +1373,7 @@ impl ReductionEngine {
                                 .checked_add(1)
                                 .expect("ASSERT: Delta Trials cannot overflow for one input");
                             let decoded_base = decode_independent_location(
-                                &mut codec,
+                                codec,
                                 records,
                                 base.candidate.chunk_id(),
                                 usize::try_from(base.candidate.logical_length()).map_err(|_| {
@@ -1427,21 +1436,13 @@ impl ReductionEngine {
                             accepted,
                         });
                     }
-                    Ok::<_, ReductionError>(DeltaWorkerResult {
+                    Ok(DeltaWorkerResult {
                         decisions,
                         stats: worker_stats,
                     })
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .expect("ASSERT: a scoped Delta worker must not panic")
                 })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut ordered = (0..regions.len()).map(|_| None).collect::<Vec<_>>();
         for worker in worker_results {
@@ -1778,21 +1779,13 @@ fn parallel_chunk_ids(
             .collect();
     }
 
-    let worker_results = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for worker_ordinal in 0..worker_count {
+    let worker_results = (0..worker_count)
+        .into_par_iter()
+        .map(|worker_ordinal| {
             let (start, end) = contiguous_shard(ranges.len(), worker_count, worker_ordinal);
-            handles.push(scope.spawn(move || hash_chunk_shard(input, ranges, start, end)));
-        }
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .expect("ASSERT: a scoped Chunk hash worker must not panic")
-            })
-            .collect::<Vec<_>>()
-    });
+            hash_chunk_shard(input, ranges, start, end)
+        })
+        .collect::<Vec<_>>();
 
     let mut ordered = vec![None; ranges.len()];
     for worker in worker_results {
@@ -1874,42 +1867,31 @@ fn parallel_region_fingerprints(
         .iter()
         .flat_map(|region| region.logical_ordinals.iter().copied())
         .collect::<Vec<_>>();
-    let worker_results = thread::scope(|scope| {
-        let jobs = &jobs;
-        let mut handles = Vec::with_capacity(worker_count);
-        for worker_ordinal in 0..worker_count {
-            handles.push(scope.spawn(move || {
-                let mut fingerprints = Vec::new();
-                for job_index in (worker_ordinal..jobs.len()).step_by(worker_count) {
-                    let logical_ordinal = *jobs
-                        .get(job_index)
-                        .expect("ASSERT: a scheduled fingerprint job is in bounds");
-                    let chunk = chunks
-                        .get(logical_ordinal)
-                        .expect("ASSERT: a fingerprint Chunk ordinal is in bounds");
-                    let end = chunk
-                        .input_offset
-                        .checked_add(chunk.length)
-                        .expect("ASSERT: a bounded fingerprint range cannot overflow");
-                    let bytes = input
-                        .get(chunk.input_offset..end)
-                        .expect("ASSERT: a fingerprint Chunk lies within the input");
-                    let fingerprint =
-                        SimilarityFingerprint::v1(bytes).map_err(similarity_writer_error)?;
-                    fingerprints.push((logical_ordinal, fingerprint));
-                }
-                Ok::<_, ReductionError>(fingerprints)
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .expect("ASSERT: a scoped fingerprint worker must not panic")
-            })
-            .collect::<Result<Vec<_>, _>>()
-    })?;
+    let worker_results = (0..worker_count)
+        .into_par_iter()
+        .map(|worker_ordinal| {
+            let mut fingerprints = Vec::new();
+            for job_index in (worker_ordinal..jobs.len()).step_by(worker_count) {
+                let logical_ordinal = *jobs
+                    .get(job_index)
+                    .expect("ASSERT: a scheduled fingerprint job is in bounds");
+                let chunk = chunks
+                    .get(logical_ordinal)
+                    .expect("ASSERT: a fingerprint Chunk ordinal is in bounds");
+                let end = chunk
+                    .input_offset
+                    .checked_add(chunk.length)
+                    .expect("ASSERT: a bounded fingerprint range cannot overflow");
+                let bytes = input
+                    .get(chunk.input_offset..end)
+                    .expect("ASSERT: a fingerprint Chunk lies within the input");
+                let fingerprint =
+                    SimilarityFingerprint::v1(bytes).map_err(similarity_writer_error)?;
+                fingerprints.push((logical_ordinal, fingerprint));
+            }
+            Ok::<_, ReductionError>(fingerprints)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut fingerprints = vec![None; chunks.len()];
     for worker in worker_results {
@@ -1966,29 +1948,19 @@ fn parallel_reorder_keys(
     worker_count: usize,
 ) -> Vec<Option<ReorderKey>> {
     assert!(worker_count > 0, "ASSERT: Reorder has at least one worker");
-    let worker_keys = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for worker_ordinal in 0..worker_count {
-            handles.push(scope.spawn(move || {
-                let mut keys = Vec::new();
-                for region_index in (worker_ordinal..regions.len()).step_by(worker_count) {
-                    let region = regions
-                        .get(region_index)
-                        .expect("ASSERT: a scheduled Reorder region is in bounds");
-                    keys.push((region.ordinal, reorder_key(chunks, fingerprints, region)));
-                }
-                keys
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .expect("ASSERT: a scoped Reorder worker must not panic")
-            })
-            .collect::<Vec<_>>()
-    });
+    let worker_keys = (0..worker_count)
+        .into_par_iter()
+        .map(|worker_ordinal| {
+            let mut keys = Vec::new();
+            for region_index in (worker_ordinal..regions.len()).step_by(worker_count) {
+                let region = regions
+                    .get(region_index)
+                    .expect("ASSERT: a scheduled Reorder region is in bounds");
+                keys.push((region.ordinal, reorder_key(chunks, fingerprints, region)));
+            }
+            keys
+        })
+        .collect::<Vec<_>>();
 
     let mut keys = vec![None; regions.len()];
     for worker in worker_keys {

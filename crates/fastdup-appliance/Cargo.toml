@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 fastdup-format.workspace = true
+fastdup-io-uring = { path = "../fastdup-io-uring" }
 fastdup-posix.workspace = true
 fastdup-store.workspace = true
 fastcdc.workspace = true

@@ -1,8 +1,11 @@
-use crate::{CommitRange, ExternalDirtyData, PosixError, SparseData, copy_bytes};
+use crate::{
+    CommitRange, ExternalDirtyData, MutationPayload, PosixError, PreparedCommitExtent,
+    PreparedDataRecipe, SparseData, copy_bytes,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound::Excluded;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::CommitToken;
 
@@ -48,6 +51,76 @@ pub trait CommittedFile: fmt::Debug + Send + Sync {
         }
         let length = u32::try_from(candidate.len()).map_err(|_| PosixError::FileTooLarge)?;
         Ok(self.read_at(0, length)? == candidate)
+    }
+
+    /// Returns an immutable reduction recipe carried by this verified source.
+    ///
+    /// The default deliberately exposes no recipe. Implementations may return
+    /// one only when the recipe is a complete, deterministic description of
+    /// the source bytes and can be re-verified by the durable commit path.
+    fn prepared_data_recipe(&self) -> Option<PreparedDataRecipe> {
+        None
+    }
+
+    /// Exports a range-local immutable recipe without reading payload bytes.
+    ///
+    /// Offsets in the returned extents remain coordinates in this source.
+    /// The default supports complete Chunk/FILL sources and turns a partial
+    /// Chunk selection into a bounded Chunk slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounds, allocation-metadata, or resource error. `Ok(None)`
+    /// means the source cannot describe the complete range without DATA I/O.
+    fn prepared_clone_extents(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<Vec<PreparedCommitExtent>>, PosixError> {
+        let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
+        if length == 0 || end > self.logical_size() {
+            return Err(PosixError::InvalidArgument);
+        }
+        if self.allocated_bytes_in_range(offset, length)? != length {
+            return Ok(None);
+        }
+        let Some(recipe) = self.prepared_data_recipe() else {
+            return Ok(None);
+        };
+        let recipe = match recipe {
+            PreparedDataRecipe::Chunk { chunk_id } => {
+                let chunk_length =
+                    u32::try_from(self.logical_size()).map_err(|_| PosixError::FileTooLarge)?;
+                if offset == 0 && length == self.logical_size() {
+                    PreparedDataRecipe::Chunk { chunk_id }
+                } else {
+                    PreparedDataRecipe::ChunkSlice {
+                        chunk_id,
+                        chunk_length,
+                        chunk_offset: u32::try_from(offset)
+                            .map_err(|_| PosixError::FileTooLarge)?,
+                    }
+                }
+            }
+            PreparedDataRecipe::ChunkSlice {
+                chunk_id,
+                chunk_length,
+                chunk_offset,
+            } => PreparedDataRecipe::ChunkSlice {
+                chunk_id,
+                chunk_length,
+                chunk_offset: chunk_offset
+                    .checked_add(u32::try_from(offset).map_err(|_| PosixError::FileTooLarge)?)
+                    .ok_or(PosixError::FileTooLarge)?,
+            },
+            PreparedDataRecipe::Fill { value } => PreparedDataRecipe::Fill { value },
+        };
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(1)
+            .map_err(|_| PosixError::OutOfMemory)?;
+        prepared.push(PreparedCommitExtent::new(offset, length, recipe));
+        Ok(Some(prepared))
     }
 }
 
@@ -224,13 +297,42 @@ impl DirtyEpoch {
         }
     }
 
-    fn write(&mut self, offset: u64, bytes: &[u8], sequence: u64) -> Result<(), PosixError> {
+    fn write(
+        &mut self,
+        offset: u64,
+        bytes: MutationPayload,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
         assert!(!bytes.is_empty(), "ASSERT: empty write reached dirty epoch");
         self.assert_next_sequence(sequence);
         let previous_size = self.result_size;
         let length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64");
         let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
         self.data.write(offset, bytes)?;
+        if offset > previous_size {
+            self.holes.insert(previous_size, offset);
+        }
+        self.holes.remove(offset, end);
+        self.result_size = previous_size.max(end);
+        self.record_sequence(sequence);
+        self.assert_valid();
+        Ok(())
+    }
+
+    fn clone_range(
+        &mut self,
+        offset: u64,
+        source: Arc<dyn CommittedFile>,
+        source_offset: u64,
+        length: u64,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
+        assert!(length > 0, "ASSERT: clone mutation is nonempty");
+        self.assert_next_sequence(sequence);
+        let previous_size = self.result_size;
+        let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
+        self.data
+            .write_external(offset, source, source_offset, length, sequence)?;
         if offset > previous_size {
             self.holes.insert(previous_size, offset);
         }
@@ -353,6 +455,7 @@ impl DirtyEpoch {
 pub(super) struct FrozenEpoch {
     token: CommitToken,
     dirty: DirtyEpoch,
+    late_prepared: RwLock<BTreeMap<u64, PreparedCommitExtent>>,
 }
 
 impl FrozenEpoch {
@@ -411,6 +514,218 @@ impl FrozenEpoch {
         }
         Ok(output)
     }
+
+    pub(super) fn prepared_extents_in_range(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<PreparedCommitExtent>, PosixError> {
+        let end = offset.checked_add(length).ok_or(PosixError::Io)?;
+        if end > self.dirty.result_size {
+            return Err(PosixError::Io);
+        }
+        let mut prepared = Vec::<PreparedCommitExtent>::new();
+        if let Some((&extent_start, external)) = self
+            .dirty
+            .data
+            .external_extents
+            .range(..=offset)
+            .next_back()
+        {
+            append_prepared_external(&mut prepared, offset, end, extent_start, external)?;
+        }
+        for (&extent_start, external) in self
+            .dirty
+            .data
+            .external_extents
+            .range((Excluded(offset), Excluded(end)))
+        {
+            append_prepared_external(&mut prepared, offset, end, extent_start, external)?;
+        }
+        let late = self
+            .late_prepared
+            .read()
+            .expect("ASSERT: frozen prepared-recipe lock poisoned");
+        if let Some((_, extent)) = late.range(..=offset).next_back() {
+            append_prepared_extent(&mut prepared, offset, end, *extent)?;
+        }
+        for (_, extent) in late.range((Excluded(offset), Excluded(end))) {
+            append_prepared_extent(&mut prepared, offset, end, *extent)?;
+        }
+        prepared.sort_unstable_by_key(|extent| extent.offset());
+        for pair in prepared.windows(2) {
+            let previous_end = pair[0]
+                .offset()
+                .checked_add(pair[0].length())
+                .ok_or(PosixError::Io)?;
+            if previous_end > pair[1].offset() {
+                return Err(PosixError::Io);
+            }
+        }
+        Ok(prepared)
+    }
+
+    fn attach_late_prepared(
+        &self,
+        offset: u64,
+        length: u64,
+        recipe: PreparedDataRecipe,
+    ) -> Result<(), PosixError> {
+        let end = offset.checked_add(length).ok_or(PosixError::Io)?;
+        if length == 0 || end > self.dirty.result_size {
+            return Err(PosixError::Again);
+        }
+        if dirty_external_overlaps(&self.dirty.data.external_extents, offset, end) {
+            return Err(PosixError::Again);
+        }
+        let candidate = PreparedCommitExtent::new(offset, length, recipe);
+        let mut late = self
+            .late_prepared
+            .write()
+            .expect("ASSERT: frozen prepared-recipe lock poisoned");
+        if let Some((&previous_start, previous)) = late.range(..=offset).next_back() {
+            let previous_end = previous_start
+                .checked_add(previous.length())
+                .expect("ASSERT: stored prepared extent cannot overflow");
+            if previous_end > offset {
+                return if *previous == candidate {
+                    Ok(())
+                } else {
+                    Err(PosixError::Again)
+                };
+            }
+        }
+        if late
+            .range(offset..end)
+            .next()
+            .is_some_and(|(&next_start, _)| next_start < end)
+        {
+            return Err(PosixError::Again);
+        }
+        assert!(
+            late.insert(offset, candidate).is_none(),
+            "ASSERT: validated prepared extent must not replace a survivor"
+        );
+        Ok(())
+    }
+}
+
+fn dirty_external_overlaps(
+    extents: &BTreeMap<u64, ExternalDirtyData>,
+    start: u64,
+    end: u64,
+) -> bool {
+    if let Some((&previous_start, previous)) = extents.range(..=start).next_back() {
+        let previous_end = previous_start
+            .checked_add(previous.length)
+            .expect("ASSERT: validated external dirty extent cannot overflow");
+        if previous_end > start {
+            return true;
+        }
+    }
+    extents
+        .range(start..end)
+        .next()
+        .is_some_and(|(&next_start, _)| next_start < end)
+}
+
+fn append_prepared_extent(
+    prepared: &mut Vec<PreparedCommitExtent>,
+    range_start: u64,
+    range_end: u64,
+    extent: PreparedCommitExtent,
+) -> Result<(), PosixError> {
+    let extent_end = extent
+        .offset()
+        .checked_add(extent.length())
+        .ok_or(PosixError::Io)?;
+    if extent_end <= range_start || extent.offset() >= range_end {
+        return Ok(());
+    }
+    let clipped = match extent.recipe() {
+        PreparedDataRecipe::Chunk { .. } | PreparedDataRecipe::ChunkSlice { .. } => {
+            if extent.offset() < range_start || extent_end > range_end {
+                return Ok(());
+            }
+            extent
+        }
+        PreparedDataRecipe::Fill { .. } => PreparedCommitExtent::new(
+            extent.offset().max(range_start),
+            extent_end.min(range_end) - extent.offset().max(range_start),
+            extent.recipe(),
+        ),
+    };
+    prepared
+        .try_reserve(1)
+        .map_err(|_| PosixError::OutOfMemory)?;
+    prepared.push(clipped);
+    Ok(())
+}
+
+fn append_prepared_external(
+    prepared: &mut Vec<PreparedCommitExtent>,
+    range_start: u64,
+    range_end: u64,
+    extent_start: u64,
+    external: &ExternalDirtyData,
+) -> Result<(), PosixError> {
+    let extent_end = extent_start
+        .checked_add(external.length)
+        .ok_or(PosixError::Io)?;
+    if extent_end <= range_start || extent_start >= range_end {
+        return Ok(());
+    }
+    let selected_start = extent_start.max(range_start);
+    let selected_end = extent_end.min(range_end);
+    let source_start = external
+        .source_offset
+        .checked_add(selected_start - extent_start)
+        .ok_or(PosixError::Io)?;
+    let source_length = selected_end - selected_start;
+    let Some(source_extents) = external
+        .source
+        .prepared_clone_extents(source_start, source_length)?
+    else {
+        return Ok(());
+    };
+    for source_extent in source_extents {
+        let relative = source_extent
+            .offset()
+            .checked_sub(source_start)
+            .ok_or(PosixError::Io)?;
+        let prepared_start = selected_start.checked_add(relative).ok_or(PosixError::Io)?;
+        if let Some(previous) = prepared.last()
+            && previous
+                .offset()
+                .checked_add(previous.length())
+                .is_none_or(|previous_end| previous_end > prepared_start)
+        {
+            return Err(PosixError::Io);
+        }
+        prepared
+            .try_reserve(1)
+            .map_err(|_| PosixError::OutOfMemory)?;
+        let translated = match (
+            source_extent.retained_manifest_root(),
+            source_extent.retained_source_offset(),
+        ) {
+            (Some(root), Some(source_offset)) => PreparedCommitExtent::try_new_retained(
+                prepared_start,
+                source_extent.length(),
+                source_extent.recipe(),
+                root,
+                source_offset,
+            )?,
+            (None, None) => PreparedCommitExtent::new(
+                prepared_start,
+                source_extent.length(),
+                source_extent.recipe(),
+            ),
+            _ => return Err(PosixError::Io),
+        };
+        prepared.push(translated);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -522,7 +837,7 @@ impl VersionedFile {
         let mut accepted = false;
         let mut first_error = None;
         for (offset, through_sequence, source) in candidates {
-            let candidate = (|| {
+            let active_result = (|| {
                 if through_sequence <= self.active.base_sequence
                     || through_sequence > self.active.through_sequence
                 {
@@ -534,14 +849,22 @@ impl VersionedFile {
                 if !self.active.holes.overlapping_starts(offset, end).is_empty() {
                     return Err(PosixError::Again);
                 }
-                self.active
-                    .data
-                    .externalize_many(vec![(offset, through_sequence, source)])
+                self.active.data.externalize_many(vec![(
+                    offset,
+                    through_sequence,
+                    Arc::clone(&source),
+                )])
             })();
-            match candidate {
-                Ok(()) => accepted = true,
-                Err(error) => {
-                    first_error.get_or_insert(error);
+            let frozen_result = self.prepare_inflight(offset, &source);
+            if active_result.is_ok() || frozen_result.is_ok() {
+                accepted = true;
+            } else {
+                first_error.get_or_insert_with(|| {
+                    active_result
+                        .expect_err("ASSERT: rejected active externalization has one error")
+                });
+                if !matches!(frozen_result, Err(PosixError::Again)) {
+                    first_error = frozen_result.err();
                 }
             }
         }
@@ -553,10 +876,41 @@ impl VersionedFile {
         }
     }
 
-    pub(super) fn write(
+    fn prepare_inflight(
+        &self,
+        offset: u64,
+        source: &Arc<dyn CommittedFile>,
+    ) -> Result<(), PosixError> {
+        let frozen = self.inflight.as_ref().ok_or(PosixError::Again)?;
+        let recipe = source.prepared_data_recipe().ok_or(PosixError::Again)?;
+        let length = source.logical_size();
+        let end = offset.checked_add(length).ok_or(PosixError::Io)?;
+        if length == 0 || end > frozen.dirty.result_size {
+            return Err(PosixError::Again);
+        }
+        let allocated = allocated_bytes_through(&self.committed, &[&frozen.dirty], offset, end)?;
+        if allocated != length {
+            return Err(PosixError::Again);
+        }
+        let requested = u32::try_from(length).map_err(|_| PosixError::FileTooLarge)?;
+        let current = ReadPlan::new(
+            Arc::clone(&self.committed),
+            &[&frozen.dirty],
+            frozen.dirty.result_size,
+            offset,
+            requested,
+        )?
+        .execute()?;
+        if !source.matches_complete_bytes(&current)? {
+            return Err(PosixError::Again);
+        }
+        frozen.attach_late_prepared(offset, length, recipe)
+    }
+
+    pub(super) fn write_payload(
         &mut self,
         offset: u64,
-        bytes: &[u8],
+        bytes: MutationPayload,
         sequence: u64,
     ) -> Result<(), PosixError> {
         let length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64");
@@ -573,6 +927,58 @@ impl VersionedFile {
             .checked_sub(overwritten)
             .and_then(|remaining| remaining.checked_add(length))
             .expect("ASSERT: allocated-byte replacement must remain bounded by logical size");
+        assert!(
+            self.live_allocated_bytes <= self.logical_size(),
+            "ASSERT: allocated bytes must not exceed logical size"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn write(&mut self, offset: u64, bytes: &[u8], sequence: u64) -> Result<(), PosixError> {
+        self.write_payload(
+            offset,
+            MutationPayload::try_copy_from_slice(bytes)?,
+            sequence,
+        )
+    }
+
+    pub(super) fn stable_clone_source(&self) -> Result<Arc<dyn CommittedFile>, PosixError> {
+        if self.has_active_mutations() {
+            return Err(PosixError::Unsupported);
+        }
+        match &self.inflight {
+            Some(epoch) => Ok(Arc::new(FrozenCommit {
+                committed: Arc::clone(&self.committed),
+                epoch: Arc::clone(epoch),
+                allocated_bytes: self.live_allocated_bytes,
+            })),
+            None => Ok(Arc::clone(&self.committed)),
+        }
+    }
+
+    pub(super) fn clone_range(
+        &mut self,
+        offset: u64,
+        source: Arc<dyn CommittedFile>,
+        source_offset: u64,
+        length: u64,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
+        let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
+        let overwritten_end = end.min(self.logical_size());
+        let overwritten = if offset < overwritten_end {
+            self.allocated_bytes_in_range(offset, overwritten_end)?
+        } else {
+            0
+        };
+        self.active
+            .clone_range(offset, source, source_offset, length, sequence)?;
+        self.live_allocated_bytes = self
+            .live_allocated_bytes
+            .checked_sub(overwritten)
+            .and_then(|remaining| remaining.checked_add(length))
+            .expect("ASSERT: cloned allocation must remain bounded by logical size");
         assert!(
             self.live_allocated_bytes <= self.logical_size(),
             "ASSERT: allocated bytes must not exceed logical size"
@@ -658,7 +1064,11 @@ impl VersionedFile {
             &mut self.active,
             DirtyEpoch::new(result_size, through_sequence),
         );
-        let epoch = Arc::new(FrozenEpoch { token, dirty });
+        let epoch = Arc::new(FrozenEpoch {
+            token,
+            dirty,
+            late_prepared: RwLock::new(BTreeMap::new()),
+        });
         self.inflight = Some(Arc::clone(&epoch));
         Some(FrozenCommit {
             committed: Arc::clone(&self.committed),
@@ -854,14 +1264,26 @@ impl PlannedEpoch {
         }
         let mut data = Vec::new();
         if let Some((&extent_start, bytes)) = epoch.data.extents.range(..=read_start).next_back() {
-            plan_data(&mut data, read_start, read_end, extent_start, bytes)?;
+            plan_data(
+                &mut data,
+                read_start,
+                read_end,
+                extent_start,
+                bytes.as_bytes(),
+            )?;
         }
         for (&extent_start, bytes) in epoch
             .data
             .extents
             .range((Excluded(read_start), Excluded(read_end)))
         {
-            plan_data(&mut data, read_start, read_end, extent_start, bytes)?;
+            plan_data(
+                &mut data,
+                read_start,
+                read_end,
+                extent_start,
+                bytes.as_bytes(),
+            )?;
         }
         if let Some((&extent_start, external)) =
             epoch.data.external_extents.range(..=read_start).next_back()
@@ -1125,6 +1547,7 @@ mod tests {
     struct BytesReader {
         bytes: Vec<u8>,
         allocated: Vec<bool>,
+        recipe: Option<PreparedDataRecipe>,
     }
 
     impl CommittedFile for BytesReader {
@@ -1163,6 +1586,10 @@ mod tests {
                 .min(self.bytes.len());
             Ok(self.bytes[start.min(end)..end].to_vec())
         }
+
+        fn prepared_data_recipe(&self) -> Option<PreparedDataRecipe> {
+            self.recipe
+        }
     }
 
     fn bytes_reader(bytes: Vec<u8>) -> Arc<dyn CommittedFile> {
@@ -1176,7 +1603,20 @@ mod tests {
             allocated.len(),
             "ASSERT: test content and allocation maps must agree"
         );
-        Arc::new(BytesReader { bytes, allocated })
+        Arc::new(BytesReader {
+            bytes,
+            allocated,
+            recipe: None,
+        })
+    }
+
+    fn prepared_bytes_reader(bytes: Vec<u8>, recipe: PreparedDataRecipe) -> Arc<dyn CommittedFile> {
+        let allocated = vec![true; bytes.len()];
+        Arc::new(BytesReader {
+            bytes,
+            allocated,
+            recipe: Some(recipe),
+        })
     }
 
     #[test]
@@ -1213,6 +1653,73 @@ mod tests {
                 .execute()
                 .expect("truncated read"),
             b"abcXYf"
+        );
+    }
+
+    #[test]
+    fn frozen_recipe_evidence_reuses_verified_chunk_slices_and_clips_fill() {
+        let mut file = VersionedFile::new_empty();
+        file.write(0, b"abcdzzzz", 1).expect("initial write");
+        file.externalize_many(vec![
+            (
+                0,
+                1,
+                prepared_bytes_reader(
+                    b"abcd".to_vec(),
+                    PreparedDataRecipe::Chunk { chunk_id: [7; 32] },
+                ),
+            ),
+            (
+                4,
+                1,
+                prepared_bytes_reader(b"zzzz".to_vec(), PreparedDataRecipe::Fill { value: b'z' }),
+            ),
+        ])
+        .expect("verified recipes externalize");
+        file.write(1, b"X", 2)
+            .expect("later write splits the prepared Chunk");
+        let frozen = file
+            .freeze_active(CommitToken::new(1).expect("token is nonzero"))
+            .expect("dirty file freezes");
+
+        assert_eq!(
+            frozen
+                .epoch()
+                .prepared_extents_in_range(0, 8)
+                .expect("collect prepared recipes"),
+            vec![
+                PreparedCommitExtent::new(
+                    0,
+                    1,
+                    PreparedDataRecipe::ChunkSlice {
+                        chunk_id: [7; 32],
+                        chunk_length: 4,
+                        chunk_offset: 0,
+                    },
+                ),
+                PreparedCommitExtent::new(
+                    2,
+                    2,
+                    PreparedDataRecipe::ChunkSlice {
+                        chunk_id: [7; 32],
+                        chunk_length: 4,
+                        chunk_offset: 2,
+                    },
+                ),
+                PreparedCommitExtent::new(4, 4, PreparedDataRecipe::Fill { value: b'z' }),
+            ],
+            "verified immutable Chunk fragments remain metadata-only slices around the dirty byte"
+        );
+        assert_eq!(
+            frozen
+                .epoch()
+                .prepared_extents_in_range(5, 2)
+                .expect("clip prepared FILL"),
+            vec![PreparedCommitExtent::new(
+                5,
+                2,
+                PreparedDataRecipe::Fill { value: b'z' },
+            )]
         );
     }
 

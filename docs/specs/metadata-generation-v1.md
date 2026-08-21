@@ -103,7 +103,7 @@ all-zero 32-byte value is invalid. Reader verification requires the stored ID,
 the recomputed ID, and the ID encoded by an internal published filename to
 agree where that filename is used.
 
-## Manifest Leaf v1 payload
+## Manifest Leaf v1 and v2 payload
 
 A Manifest Leaf is Metadata Object kind `1`. It is either the complete root of
 a small file recipe or a child of a Manifest Inner Node. Its payload contains
@@ -115,10 +115,10 @@ payload_length = 64 + extent_count * 64
 
 ### Manifest header
 
-| Offset | Width | Field | Version 1 requirement |
+| Offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
 | 0 | 8 | `magic` | ASCII `FDMANL01` |
-| 8 | 2 | `format_version` | `1` |
+| 8 | 2 | `format_version` | `1` or `2` |
 | 10 | 2 | `header_length` | `64` |
 | 12 | 2 | `extent_entry_length` | `64` |
 | 14 | 2 | reserved | zero |
@@ -132,16 +132,16 @@ The field widths sum to 64 bytes.
 
 ### Manifest extent entry
 
-| Relative offset | Width | Field | Version 1 requirement |
+| Relative offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
 | 0 | 8 | `logical_offset` | exact start inside this leaf's node-local range |
 | 8 | 8 | `logical_length` | nonzero extent length |
-| 16 | 2 | `extent_kind` | `1` = DATA, `2` = HOLE, `3` = FILL |
+| 16 | 2 | `extent_kind` | `1` = DATA, `2` = HOLE, `3` = FILL, v2 also permits `4` = DATA_SLICE |
 | 18 | 2 | reserved | zero |
-| 20 | 4 | `chunk_length` | DATA length; otherwise zero |
-| 24 | 32 | `chunk_id` | DATA Chunk ID; otherwise zero |
-| 56 | 1 | `fill_byte` | FILL value; otherwise zero |
-| 57 | 7 | reserved | zero |
+| 20 | 4 | `chunk_length` | full DATA/DATA_SLICE Chunk length; otherwise zero |
+| 24 | 32 | `chunk_id` | DATA/DATA_SLICE Chunk ID; otherwise zero |
+| 56 | 4 | `chunk_offset` / `fill_byte` | v2 DATA_SLICE offset; FILL uses byte 56 only; otherwise zero |
+| 60 | 4 | reserved | zero |
 
 The field widths sum to 64 bytes. Entries are ordered by logical offset and
 must form an exact, gap-free, non-overlapping partition of the leaf-local
@@ -159,12 +159,23 @@ Chunk ID, zero `chunk_length`, and zero `fill_byte`. FILL requires a zero Chunk
 ID and zero `chunk_length`; all 256 fill-byte values, including zero, are valid.
 FILL remains allocated logical data and is not a sparse HOLE.
 
+DATA_SLICE is valid only in version 2. It stores the full immutable Chunk's
+`chunk_id` and `chunk_length`, a `chunk_offset` at bytes `56..60`, and a
+node-local `logical_length`. Writer, recovery, demand reader, and scrub require
+checked `chunk_offset + logical_length <= chunk_length <= 262,144`; bytes
+`60..64` remain zero. Dependency verification and physical lookup use the full
+`chunk_length`, while allocation and file partitioning use `logical_length`.
+The complete Chunk is authenticated before a reader returns its selected
+slice. A leaf without DATA_SLICE is encoded as v1; a leaf containing any
+DATA_SLICE is encoded as v2.
+
 The 16-MiB envelope bound permits at most 262,079 extent entries in one leaf.
 The implemented tree publisher uses substantially smaller leaves: it closes a
 leaf at a stable 64-MiB logical window boundary or 1,024 extents, whichever
-comes first after a complete extent. A DATA extent is never split.
+comes first after a complete extent. Tree edits may split DATA into DATA_SLICE
+metadata records without splitting or rewriting the immutable Chunk itself.
 
-## Manifest Inner Node v1 payload
+## Manifest Inner Node v1 and v2 payload
 
 A Manifest Inner Node is Metadata Object kind `4`. Its children are immutable
 Metadata Object IDs and form an exact ordered partition of the node-local
@@ -173,10 +184,10 @@ and every higher node names only nodes at exactly one lower level.
 
 The payload equation is `64 + child_count * 64`. Its 64-byte header is:
 
-| Offset | Width | Field | Version 1 requirement |
+| Offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
 | 0 | 8 | `magic` | ASCII `FDMANI01` |
-| 8 | 2 | `format_version` | `1` |
+| 8 | 2 | `format_version` | `1` or `2` |
 | 10 | 2 | `header_length` | `64` |
 | 12 | 2 | `child_record_length` | `64` |
 | 14 | 2 | `level` | nonzero |
@@ -187,17 +198,36 @@ The payload equation is `64 + child_count * 64`. Its 64-byte header is:
 | 40 | 24 | reserved | zero |
 
 Each 64-byte child record contains `logical_offset` at `0..8`, nonzero
-`logical_length` at `8..16`, the child Metadata Object ID at `16..48`, and 16
-zero reserved bytes. Records start at offset zero, are strictly ordered, and
-cover `[0, file_length)` without gaps or overlap. Count and payload equations
-are proven before allocation.
+`logical_length` at `8..16`, and the child Metadata Object ID at `16..48`.
+Version 1 requires `48..64` to be zero. Version 2 stores the child's
+`allocated_bytes` at `48..56` and keeps `56..64` zero. The allocation total is
+no greater than `logical_length`; it counts DATA and FILL and excludes HOLE.
+Records start at offset zero, are strictly ordered, and cover
+`[0, file_length)` without gaps or overlap. Count and payload equations are
+proven before allocation.
+
+New trees and every rewritten ancestor use version 2. Version 1 remains
+readable, but its absent allocation summaries cannot authorize the optimized
+truncate/splice path. A v2 parent may name only a child whose exact allocation
+total was established by the writer. Recovery and metadata scrub completely
+traverse the selected graph and require each authenticated v2 child total to
+equal the verified child subtree; a mismatch is corruption.
 
 The publisher uses a maximum fanout of 1,024 and a maximum level of 16. It
 publishes unique children before parents and synchronizes their directory names
 as one batch. Content-identical leaves are published once even when referenced
-at several logical positions. The current compatibility reader traverses and
-verifies the tree before reconstructing the existing flat in-memory recipe;
-fully lazy path reads and mutations are the next scalability slice.
+at several logical positions. Installed demand reads and allocation queries
+descend only intersecting paths and may consume a fully covered v2 child's
+summary without decoding its descendants. Complete recovery and scrub do not
+take that shortcut. Append, equal-length replacement, and truncate retain
+untouched subtree identities and rewrite only their affected frontier.
+Length-changing middle splice replaces one predecessor-coordinate range with a
+canonical extent sequence of arbitrary length. Empty-old means insertion;
+empty-new means deletion. The writer checks
+`new_file_length = old_file_length - old_range_length + new_extent_length`,
+derives allocation from v2 summaries plus the replacement, and retains complete
+prefix and shifted-suffix child IDs. HOLE/FILL may split at either boundary;
+DATA may not.
 
 ## Namespace Root v1 payload
 
@@ -604,6 +634,7 @@ is required before that repository can advance again.
 | Inode reservation precedes visibility | generation 1 is reservation-only; later allocation cannot cross the preceding record's durable reservation end | validate forward transitions and retain the structurally valid WAL reservation high-water across graph fallback | premature use of a newly extended range and reuse of a removed inode both fail |
 | Commit Record is atomic visibility | publish and sync dependencies before append or rotation; re-read exact target; sync its slot last | accept only internally valid slots with exact cross-slot bridge continuity, validate transitions forward, then prove live graph candidates backward | exhaustive fail-before/fail-after rotation recovers only the previous or complete next generation; a 16,400-Commit lifetime gate crosses the old cap |
 | DATA is durable before visibility and verified before reads | initial/recovered graphs verify every referenced ID and length; a serialized successor composes unchanged predecessor proof with complete changed-dependency verification before WAL append | recovery completely verifies the selected current/previous candidate; demand reads re-verify the containing container; any unusable index candidate invokes the complete scan | healthy recovery proves only the newest graph, missing newest DATA falls back atomically once, unpinned history is never exposed, index-page corruption takes the scan path, suffix-proof work is independent of preserved-prefix size, and corruption after file construction fails demand reads |
+| Length-changing splice is one immutable successor | check predecessor range/result-length/allocation equations; encode partial DATA as bounded v2 DATA_SLICE extents; publish replacement leaves and rewritten parents child-first; append WAL last | completely traverse the selected root, recompute every partition and v2 allocation total, verify full-Chunk identity/length/offset for every slice, and verify every replacement DATA dependency | insertion, cross-child deletion, shifted-suffix identity, DATA-slice boundaries, and exhaustive fail-before/fail-after recover only the predecessor or complete successor |
 | Counts cannot select unbounded allocations | preflight payload lengths and record equations | prove counts against the bounded payload before vector allocation | `entry_count = u32::MAX` fails as invalid payload under a constrained address space |
 | Policy selection is explicit | store the configured nonzero Policy Set ID in every record | refuse any reached record whose ID is not exactly supported | an unknown newer policy refuses recovery instead of silently rolling back |
 
@@ -620,9 +651,10 @@ This implemented checkpoint intentionally does **not** provide:
   graph proof and demand lookup do not read whole Container payloads for that
   purpose, while the plain methods deliberately retain the verified
   scan/refusal behavior;
-- lazy tree-native planning/reads and recipes whose current compatibility
-  flattening exceeds one 16-MiB leaf limit; durable publication already reuses
-  unchanged content-addressed leaves and rewrites only their ancestor path;
+- a metadata garbage collector; installed reads, allocation queries, append,
+  equal-length replacement, truncate, and arbitrary middle splice/concat are
+  tree-native, while compatibility inspection may still flatten only bounded
+  recipes;
 - a scalable Namespace tree: NamespaceRoot v1 rewrites one flat bounded object,
   contains only regular inodes below the implicit root directory, and has no
   nested directories, symlinks, ACLs, xattrs, timestamps, or directory metadata

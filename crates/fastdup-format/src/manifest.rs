@@ -7,13 +7,24 @@ use crate::{
 pub const MANIFEST_HEADER_BYTES: usize = 64;
 const MANIFEST_ENTRY_BYTES: usize = 64;
 const MANIFEST_MAGIC: &[u8; 8] = b"FDMANL01";
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION_V1: u16 = 1;
+const FORMAT_VERSION_V2: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestExtent {
     Data {
         logical_length: u64,
         chunk_id: ChunkId,
+    },
+    /// One byte range inside a complete independently verified Chunk.
+    ///
+    /// This v2 extent permits aligned POSIX range clones to remain metadata
+    /// operations even when their boundaries do not match `FastCDC` cuts.
+    DataSlice {
+        logical_length: u64,
+        chunk_id: ChunkId,
+        chunk_length: u32,
+        chunk_offset: u32,
     },
     Hole {
         logical_length: u64,
@@ -28,6 +39,7 @@ impl ManifestExtent {
     const fn logical_length(&self) -> u64 {
         match *self {
             Self::Data { logical_length, .. }
+            | Self::DataSlice { logical_length, .. }
             | Self::Hole { logical_length }
             | Self::Fill { logical_length, .. } => logical_length,
         }
@@ -79,7 +91,16 @@ impl ManifestLeaf {
         let payload_length = payload_length(self.extents.len())?;
         let mut payload = vec![0_u8; payload_length];
         payload[0..8].copy_from_slice(MANIFEST_MAGIC);
-        put_u16(&mut payload, 8, FORMAT_VERSION);
+        let format_version = if self
+            .extents
+            .iter()
+            .any(|extent| matches!(extent, ManifestExtent::DataSlice { .. }))
+        {
+            FORMAT_VERSION_V2
+        } else {
+            FORMAT_VERSION_V1
+        };
+        put_u16(&mut payload, 8, format_version);
         put_u16(&mut payload, 10, 64);
         put_u16(&mut payload, 12, 64);
         put_u64(&mut payload, 16, 0);
@@ -116,6 +137,17 @@ impl ManifestLeaf {
                     );
                     entry[24..56].copy_from_slice(&chunk_id.bytes());
                 }
+                ManifestExtent::DataSlice {
+                    chunk_id,
+                    chunk_length,
+                    chunk_offset,
+                    ..
+                } => {
+                    put_u16(entry, 16, 4);
+                    put_u32(entry, 20, *chunk_length);
+                    entry[24..56].copy_from_slice(&chunk_id.bytes());
+                    put_u32(entry, 56, *chunk_offset);
+                }
                 ManifestExtent::Hole { .. } => put_u16(entry, 16, 2),
                 ManifestExtent::Fill { value, .. } => {
                     put_u16(entry, 16, 3);
@@ -140,7 +172,8 @@ impl ManifestLeaf {
         if payload.len() < MANIFEST_HEADER_BYTES || &payload[0..8] != MANIFEST_MAGIC {
             return Err(MetadataFormatError::InvalidPayload);
         }
-        if get_u16(payload, 8) != FORMAT_VERSION
+        let format_version = get_u16(payload, 8);
+        if !matches!(format_version, FORMAT_VERSION_V1 | FORMAT_VERSION_V2)
             || usize::from(get_u16(payload, 10)) != MANIFEST_HEADER_BYTES
             || usize::from(get_u16(payload, 12)) != MANIFEST_ENTRY_BYTES
             || get_u16(payload, 14) != 0
@@ -168,26 +201,43 @@ impl ManifestLeaf {
             let chunk_length = get_u32(entry, 20);
             let mut chunk_id = [0_u8; 32];
             chunk_id.copy_from_slice(&entry[24..56]);
-            if logical_offset != expected_offset
-                || get_u16(entry, 18) != 0
-                || entry[57..64].iter().any(|byte| *byte != 0)
-            {
+            if logical_offset != expected_offset || get_u16(entry, 18) != 0 {
                 return Err(MetadataFormatError::InvalidExtent);
             }
             let extent = match get_u16(entry, 16) {
-                1 if u64::from(chunk_length) == logical_length && entry[56] == 0 => {
+                1 if u64::from(chunk_length) == logical_length
+                    && entry[56..64].iter().all(|byte| *byte == 0) =>
+                {
                     ManifestExtent::Data {
                         logical_length,
                         chunk_id: ChunkId::from_bytes(chunk_id),
                     }
                 }
-                2 if chunk_length == 0 && chunk_id == [0; 32] && entry[56] == 0 => {
+                2 if chunk_length == 0
+                    && chunk_id == [0; 32]
+                    && entry[56..64].iter().all(|byte| *byte == 0) =>
+                {
                     ManifestExtent::Hole { logical_length }
                 }
-                3 if chunk_length == 0 && chunk_id == [0; 32] => ManifestExtent::Fill {
-                    logical_length,
-                    value: entry[56],
-                },
+                3 if chunk_length == 0
+                    && chunk_id == [0; 32]
+                    && entry[57..64].iter().all(|byte| *byte == 0) =>
+                {
+                    ManifestExtent::Fill {
+                        logical_length,
+                        value: entry[56],
+                    }
+                }
+                4 if format_version == FORMAT_VERSION_V2
+                    && entry[60..64].iter().all(|byte| *byte == 0) =>
+                {
+                    ManifestExtent::DataSlice {
+                        logical_length,
+                        chunk_id: ChunkId::from_bytes(chunk_id),
+                        chunk_length,
+                        chunk_offset: get_u32(entry, 56),
+                    }
+                }
                 _ => return Err(MetadataFormatError::InvalidExtent),
             };
             expected_offset = expected_offset
@@ -209,12 +259,29 @@ fn validate_partition(
         if length == 0 {
             return Err(MetadataFormatError::InvalidExtent);
         }
-        if matches!(extent, ManifestExtent::Data { .. })
-            && length
-                > u64::try_from(MAX_LOGICAL_CHUNK_BYTES)
-                    .map_err(|_| MetadataFormatError::ArithmeticOverflow)?
-        {
-            return Err(MetadataFormatError::InvalidExtent);
+        let maximum_chunk_bytes = u64::try_from(MAX_LOGICAL_CHUNK_BYTES)
+            .map_err(|_| MetadataFormatError::ArithmeticOverflow)?;
+        match *extent {
+            ManifestExtent::Data { .. } if length > maximum_chunk_bytes => {
+                return Err(MetadataFormatError::InvalidExtent);
+            }
+            ManifestExtent::DataSlice {
+                chunk_length,
+                chunk_offset,
+                ..
+            } => {
+                let chunk_length = u64::from(chunk_length);
+                let slice_end = u64::from(chunk_offset)
+                    .checked_add(length)
+                    .ok_or(MetadataFormatError::ArithmeticOverflow)?;
+                if chunk_length == 0
+                    || chunk_length > maximum_chunk_bytes
+                    || slice_end > chunk_length
+                {
+                    return Err(MetadataFormatError::InvalidExtent);
+                }
+            }
+            _ => {}
         }
         end = end
             .checked_add(length)

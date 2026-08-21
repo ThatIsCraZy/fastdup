@@ -6,9 +6,9 @@ use bytes::Bytes;
 use fuse3::raw::Filesystem;
 use fuse3::raw::Request;
 use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, FileAttr as FuseFileAttr, ReplyAttr, ReplyCreated,
-    ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs,
-    ReplyWrite,
+    DirectoryEntry, DirectoryEntryPlus, FileAttr as FuseFileAttr, ReplyAttr, ReplyCopyFileRange,
+    ReplyCreated, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen,
+    ReplyStatFs, ReplyWrite,
 };
 use fuse3::{Errno, FileType, MountOptions, SetAttr, Timestamp};
 use futures_util::stream::{self, Stream};
@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 const MAXIMUM_WRITE_BYTES: u32 = 1_024 * 1_024;
 const FOPEN_DIRECT_IO: u32 = 1;
@@ -92,12 +93,34 @@ impl Drop for LookupTrackingStream {
 #[derive(Clone, Debug)]
 pub struct FuseFilesystem {
     namespace: Arc<Namespace>,
+    blocking_permits: Arc<Semaphore>,
 }
 
 impl FuseFilesystem {
     #[must_use]
-    pub const fn new(namespace: Arc<Namespace>) -> Self {
-        Self { namespace }
+    pub fn new(namespace: Arc<Namespace>) -> Self {
+        let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        Self {
+            namespace,
+            blocking_permits: Arc::new(Semaphore::new(workers)),
+        }
+    }
+
+    async fn run_blocking<R, F>(&self, work: F) -> R
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        let permit = Arc::clone(&self.blocking_permits)
+            .acquire_owned()
+            .await
+            .expect("ASSERT: the FUSE blocking executor is never closed while mounted");
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+        .expect("ASSERT: bounded FUSE blocking work must not panic")
     }
 }
 
@@ -261,6 +284,18 @@ impl Filesystem for FuseFilesystem {
         Ok(())
     }
 
+    async fn rename(
+        &self,
+        request: Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+    ) -> fuse3::Result<()> {
+        self.rename_with_flags(request, parent, name, new_parent, new_name, 0)
+            .await
+    }
+
     async fn open(&self, request: Request, inode: u64, flags: u32) -> fuse3::Result<ReplyOpen> {
         let inode = inode_from_raw(inode)?;
         let options = open_options(flags)?;
@@ -298,17 +333,23 @@ impl Filesystem for FuseFilesystem {
         offset: u64,
         size: u32,
     ) -> fuse3::Result<ReplyData> {
+        let namespace = Arc::clone(&self.namespace);
+        let request = context(request);
+        let inode = inode_from_raw(inode)?;
+        let handle = handle_from_raw(handle)?;
         let reply = self
-            .namespace
-            .dispatch(
-                context(request),
-                Operation::Read {
-                    inode: inode_from_raw(inode)?,
-                    handle: handle_from_raw(handle)?,
-                    offset,
-                    length: size,
-                },
-            )
+            .run_blocking(move || {
+                namespace.dispatch(
+                    request,
+                    Operation::Read {
+                        inode,
+                        handle,
+                        offset,
+                        length: size,
+                    },
+                )
+            })
+            .await
             .map_err(errno)?;
         Ok(ReplyData {
             data: Bytes::from(expect_data(reply)),
@@ -331,19 +372,24 @@ impl Filesystem for FuseFilesystem {
         let inode = inode_from_raw(inode)?;
         let handle = handle_from_raw(handle)?;
         let request = context(request);
-        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
-            self.namespace.dispatch(
-                request,
-                Operation::Write {
-                    inode,
-                    handle,
-                    offset,
-                    data,
-                },
-            )
-        })
-        .await
-        .map_err(errno)?;
+        let payload = crate::MutationPayload::try_copy_from_slice(data).map_err(errno)?;
+        let reply = loop {
+            self.namespace
+                .wait_for_mutation_admission()
+                .await
+                .map_err(errno)?;
+            let namespace = Arc::clone(&self.namespace);
+            let payload = payload.clone();
+            match self
+                .run_blocking(move || {
+                    namespace.dispatch_owned_write(request, inode, handle, offset, payload)
+                })
+                .await
+            {
+                Err(PosixError::Again) => {}
+                result => break result.map_err(errno)?,
+            }
+        };
         let (bytes, _) = expect_written(&reply);
         Ok(ReplyWrite { written: bytes })
     }
@@ -361,15 +407,13 @@ impl Filesystem for FuseFilesystem {
         _lock_owner: u64,
         _flush: bool,
     ) -> fuse3::Result<()> {
+        let namespace = Arc::clone(&self.namespace);
+        let request = context(request);
+        let inode = inode_from_raw(inode)?;
+        let handle = handle_from_raw(handle)?;
         let reply = self
-            .namespace
-            .dispatch(
-                context(request),
-                Operation::Release {
-                    inode: inode_from_raw(inode)?,
-                    handle: handle_from_raw(handle)?,
-                },
-            )
+            .run_blocking(move || namespace.dispatch(request, Operation::Release { inode, handle }))
+            .await
             .map_err(errno)?;
         expect_empty(&reply);
         Ok(())
@@ -382,7 +426,7 @@ impl Filesystem for FuseFilesystem {
         handle: u64,
         data_only: bool,
     ) -> fuse3::Result<()> {
-        self.sync(request, inode, handle, data_only)
+        self.sync(request, inode, handle, data_only).await
     }
 
     async fn flush(
@@ -392,7 +436,7 @@ impl Filesystem for FuseFilesystem {
         handle: u64,
         _lock_owner: u64,
     ) -> fuse3::Result<()> {
-        self.sync(request, inode, handle, false)
+        self.sync(request, inode, handle, false).await
     }
 
     async fn opendir(&self, request: Request, inode: u64, _flags: u32) -> fuse3::Result<ReplyOpen> {
@@ -464,6 +508,19 @@ impl Filesystem for FuseFilesystem {
         Ok(ReplyDirectoryPlus {
             entries: LookupTrackingStream::new(self.namespace.clone(), expect_directory(reply)),
         })
+    }
+
+    async fn rename2(
+        &self,
+        request: Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> fuse3::Result<()> {
+        self.rename_with_flags(request, parent, name, new_parent, new_name, flags)
+            .await
     }
 
     async fn releasedir(
@@ -551,26 +608,119 @@ impl Filesystem for FuseFilesystem {
             flags: FOPEN_DIRECT_IO,
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_file_range(
+        &self,
+        request: Request,
+        inode: u64,
+        source_handle: u64,
+        source_offset: u64,
+        target_inode: u64,
+        target_handle: u64,
+        target_offset: u64,
+        length: u64,
+        flags: u64,
+    ) -> fuse3::Result<ReplyCopyFileRange> {
+        if flags != 0 {
+            return Err(libc::EINVAL.into());
+        }
+        let source_inode = inode_from_raw(inode)?;
+        let source_handle = handle_from_raw(source_handle)?;
+        let target_inode = inode_from_raw(target_inode)?;
+        let target_handle = handle_from_raw(target_handle)?;
+        let request = context(request);
+        let reply = loop {
+            self.namespace
+                .wait_for_mutation_admission()
+                .await
+                .map_err(errno)?;
+            let namespace = Arc::clone(&self.namespace);
+            match self
+                .run_blocking(move || {
+                    namespace.dispatch(
+                        request,
+                        Operation::CloneRange {
+                            source_inode,
+                            source_handle,
+                            source_offset,
+                            target_inode,
+                            target_handle,
+                            target_offset,
+                            length,
+                        },
+                    )
+                })
+                .await
+            {
+                Err(PosixError::Again) => {}
+                result => break result.map_err(errno)?,
+            }
+        };
+        let Reply::Cloned { bytes, .. } = reply else {
+            panic!("ASSERT: namespace clone returned a non-cloned reply");
+        };
+        Ok(ReplyCopyFileRange { copied: bytes })
+    }
 }
 
 impl FuseFilesystem {
-    fn sync(
+    async fn rename_with_flags(
+        &self,
+        request: Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> fuse3::Result<()> {
+        let no_replace = flags == libc::RENAME_NOREPLACE;
+        if flags != 0 && !no_replace {
+            return Err(libc::EOPNOTSUPP.into());
+        }
+        let request = context(request);
+        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                request,
+                Operation::Rename {
+                    parent: inode_from_raw(parent).map_err(|_| PosixError::InvalidArgument)?,
+                    name: name.as_bytes(),
+                    new_parent: inode_from_raw(new_parent)
+                        .map_err(|_| PosixError::InvalidArgument)?,
+                    new_name: new_name.as_bytes(),
+                    no_replace,
+                },
+            )
+        })
+        .await
+        .map_err(errno)?;
+        expect_empty(&reply);
+        Ok(())
+    }
+
+    async fn sync(
         &self,
         request: Request,
         inode: u64,
         handle: u64,
         data_only: bool,
     ) -> fuse3::Result<()> {
+        let namespace = Arc::clone(&self.namespace);
+        let request = context(request);
+        let inode = inode_from_raw(inode)?;
+        let handle = handle_from_raw(handle)?;
         let reply = self
-            .namespace
-            .dispatch(
-                context(request),
-                Operation::Sync {
-                    inode: inode_from_raw(inode)?,
-                    handle: handle_from_raw(handle)?,
-                    data_only,
-                },
-            )
+            .run_blocking(move || {
+                namespace.dispatch(
+                    request,
+                    Operation::Sync {
+                        inode,
+                        handle,
+                        data_only,
+                    },
+                )
+            })
+            .await
             .map_err(errno)?;
         expect_empty(&reply);
         Ok(())

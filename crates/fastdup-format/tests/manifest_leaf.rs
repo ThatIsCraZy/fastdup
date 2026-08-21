@@ -114,3 +114,37 @@ fn writer_rejects_incomplete_zero_length_and_oversized_data_partitions() {
         Err(MetadataFormatError::InvalidExtent)
     );
 }
+
+#[test]
+fn manifest_v2_chunk_slice_round_trips_and_rejects_out_of_bounds_ranges() {
+    let chunk_id = ChunkId::of(&vec![0x5a; 64 * 1_024]);
+    let leaf = ManifestLeaf::new(
+        4 * 1_024,
+        vec![ManifestExtent::DataSlice {
+            logical_length: 4 * 1_024,
+            chunk_id,
+            chunk_length: 64 * 1_024,
+            chunk_offset: 12 * 1_024,
+        }],
+    )
+    .expect("a bounded slice of one verified Chunk is valid");
+    let encoded = leaf.encode().expect("v2 slice manifest encodes");
+    assert_eq!(
+        &encoded[METADATA_HEADER_BYTES + 8..METADATA_HEADER_BYTES + 10],
+        &2_u16.to_le_bytes()
+    );
+    assert_eq!(ManifestLeaf::decode(&encoded), Ok(leaf));
+
+    assert_eq!(
+        ManifestLeaf::new(
+            8,
+            vec![ManifestExtent::DataSlice {
+                logical_length: 8,
+                chunk_id,
+                chunk_length: 16,
+                chunk_offset: 12,
+            }],
+        ),
+        Err(MetadataFormatError::InvalidExtent)
+    );
+}

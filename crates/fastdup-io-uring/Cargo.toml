@@ -1,0 +1,18 @@
+[package]
+name = "fastdup-io-uring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fastdup-format.workspace = true
+fastdup-store.workspace = true
+io-uring.workspace = true
+libc.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

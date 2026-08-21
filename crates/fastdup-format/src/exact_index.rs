@@ -358,6 +358,185 @@ pub struct ExactIndexRun {
     entries: Vec<ExactIndexEntry>,
 }
 
+/// Allocation-bounded canonical encoder for one immutable Exact Index Run.
+///
+/// The caller supplies the exact output count and key bounds established by a
+/// preceding verified merge pass, then feeds canonical entries in complete
+/// format-v1 pages. The encoder retains only fixed geometry and one hash state;
+/// it never materializes the complete Run.
+pub struct ExactIndexRunStreamEncoder {
+    profile: ExactIndexProfileId,
+    generation: u64,
+    entry_count: usize,
+    page_count: usize,
+    footer_offset: usize,
+    file_length: usize,
+    key_bounds: [u8; 64],
+    header: [u8; EXACT_INDEX_HEADER_BYTES],
+    hasher: blake3::Hasher,
+    emitted_entries: usize,
+    emitted_pages: usize,
+    previous_entry: Option<ExactIndexEntry>,
+}
+
+impl ExactIndexRunStreamEncoder {
+    /// Starts one streaming Run with exact geometry from a verified merge pass.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty Run, zero generation, reversed key bounds, arithmetic
+    /// overflow, or output exceeding the format-v1 one-GiB object bound.
+    pub fn new(
+        profile: ExactIndexProfileId,
+        generation: u64,
+        entry_count: usize,
+        minimum_chunk_id: ChunkId,
+        maximum_chunk_id: ChunkId,
+    ) -> Result<Self, ExactIndexFormatError> {
+        if generation == 0 {
+            return Err(ExactIndexFormatError::InvalidGeneration);
+        }
+        if entry_count == 0 || minimum_chunk_id > maximum_chunk_id {
+            return Err(ExactIndexFormatError::InvalidEntry);
+        }
+        let file_length = encoded_length(entry_count)?;
+        let page_count = page_count(entry_count);
+        let footer_offset = EXACT_INDEX_HEADER_BYTES
+            .checked_add(
+                page_count
+                    .checked_mul(EXACT_INDEX_PAGE_BYTES)
+                    .ok_or(ExactIndexFormatError::ArithmeticOverflow)?,
+            )
+            .ok_or(ExactIndexFormatError::ArithmeticOverflow)?;
+        let mut key_bounds = [0_u8; 64];
+        key_bounds[..32].copy_from_slice(&minimum_chunk_id.bytes());
+        key_bounds[32..].copy_from_slice(&maximum_chunk_id.bytes());
+        let mut header = [0_u8; EXACT_INDEX_HEADER_BYTES];
+        encode_identity_fields(
+            &mut header,
+            HEADER_MAGIC,
+            profile,
+            generation,
+            entry_count,
+            page_count,
+            key_bounds,
+            footer_offset,
+            file_length,
+        )?;
+        let header_crc = checksum_with_zero(&header, HEADER_CRC_OFFSET);
+        put_u32(&mut header, HEADER_CRC_OFFSET, header_crc);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&header);
+        Ok(Self {
+            profile,
+            generation,
+            entry_count,
+            page_count,
+            footer_offset,
+            file_length,
+            key_bounds,
+            header,
+            hasher,
+            emitted_entries: 0,
+            emitted_pages: 0,
+            previous_entry: None,
+        })
+    }
+
+    /// Returns the complete checksummed Header to write at offset zero.
+    #[must_use]
+    pub const fn header(&self) -> &[u8; EXACT_INDEX_HEADER_BYTES] {
+        &self.header
+    }
+
+    /// Encodes the next complete canonical entry page and advances the Run hash.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a wrong page size, too many pages/entries, duplicate/reordered
+    /// Locations, or a Chunk ID paired with conflicting logical lengths.
+    pub fn encode_next_page(
+        &mut self,
+        entries: &[ExactIndexEntry],
+    ) -> Result<[u8; EXACT_INDEX_PAGE_BYTES], ExactIndexFormatError> {
+        let remaining = self
+            .entry_count
+            .checked_sub(self.emitted_entries)
+            .ok_or(ExactIndexFormatError::ArithmeticOverflow)?;
+        let expected = remaining.min(ENTRIES_PER_PAGE);
+        if self.emitted_pages >= self.page_count || entries.len() != expected || expected == 0 {
+            return Err(ExactIndexFormatError::InvalidPage);
+        }
+        if let Some(previous) = self.previous_entry {
+            validate_entry_pair(previous, entries[0])?;
+        }
+        validate_entries(entries)?;
+        let mut minimum = [0_u8; 32];
+        minimum.copy_from_slice(&self.key_bounds[..32]);
+        let mut maximum = [0_u8; 32];
+        maximum.copy_from_slice(&self.key_bounds[32..]);
+        if (self.emitted_pages == 0 && entries[0].chunk_id != ChunkId::from_bytes(minimum))
+            || (self.emitted_pages + 1 == self.page_count
+                && entries
+                    .last()
+                    .is_none_or(|entry| entry.chunk_id != ChunkId::from_bytes(maximum)))
+        {
+            return Err(ExactIndexFormatError::InvalidPage);
+        }
+        let mut page = [0_u8; EXACT_INDEX_PAGE_BYTES];
+        encode_page(&mut page, self.emitted_pages, entries)?;
+        self.hasher.update(&page);
+        self.previous_entry = entries.last().copied();
+        self.emitted_entries = self
+            .emitted_entries
+            .checked_add(entries.len())
+            .ok_or(ExactIndexFormatError::ArithmeticOverflow)?;
+        self.emitted_pages = self
+            .emitted_pages
+            .checked_add(1)
+            .ok_or(ExactIndexFormatError::ArithmeticOverflow)?;
+        Ok(page)
+    }
+
+    /// Finishes the exact Footer and returns its verified descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete output or any writer-side Header/Footer disagreement.
+    pub fn finish(
+        mut self,
+    ) -> Result<([u8; EXACT_INDEX_PAGE_BYTES], ExactIndexRunDescriptor), ExactIndexFormatError>
+    {
+        if self.emitted_entries != self.entry_count || self.emitted_pages != self.page_count {
+            return Err(ExactIndexFormatError::NonSequentialAudit);
+        }
+        let mut footer = [0_u8; EXACT_INDEX_PAGE_BYTES];
+        encode_identity_fields(
+            &mut footer,
+            FOOTER_MAGIC,
+            self.profile,
+            self.generation,
+            self.entry_count,
+            self.page_count,
+            self.key_bounds,
+            self.footer_offset,
+            self.file_length,
+        )?;
+        put_u16(&mut footer, 10, PAGE_BYTES_U16);
+        self.hasher.update(&footer);
+        let run_hash = *self.hasher.finalize().as_bytes();
+        footer[RUN_HASH_OFFSET..RUN_HASH_OFFSET + 32].copy_from_slice(&run_hash);
+        let footer_crc = checksum_with_zero(&footer, FOOTER_CRC_OFFSET);
+        put_u32(&mut footer, FOOTER_CRC_OFFSET, footer_crc);
+        let descriptor = ExactIndexRunDescriptor::decode(
+            &self.header,
+            &footer,
+            u64_from_usize(self.file_length)?,
+        )?;
+        Ok((footer, descriptor))
+    }
+}
+
 /// Header/Footer proof for bounded page reads from one immutable run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExactIndexRunDescriptor {
@@ -886,16 +1065,41 @@ fn encode_identity_block(
     footer_offset: usize,
     file_length: usize,
 ) -> Result<(), ExactIndexFormatError> {
+    encode_identity_fields(
+        block,
+        magic,
+        run.profile,
+        run.generation,
+        run.entries.len(),
+        page_count,
+        key_bounds(&run.entries),
+        footer_offset,
+        file_length,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_identity_fields(
+    block: &mut [u8],
+    magic: [u8; 8],
+    profile: ExactIndexProfileId,
+    generation: u64,
+    entry_count: usize,
+    page_count: usize,
+    key_bounds: [u8; 64],
+    footer_offset: usize,
+    file_length: usize,
+) -> Result<(), ExactIndexFormatError> {
     block[0..8].copy_from_slice(&magic);
     put_u16(block, 8, FORMAT_VERSION);
     put_u16(block, 10, HEADER_BYTES_U16);
     put_u16(block, 12, PAGE_BYTES_U16);
     put_u16(block, 14, ENTRY_BYTES_U16);
-    put_u64(block, 32, run.generation);
+    put_u64(block, 32, generation);
     put_u64(
         block,
         40,
-        u64::try_from(run.entries.len()).map_err(|_| ExactIndexFormatError::ArithmeticOverflow)?,
+        u64::try_from(entry_count).map_err(|_| ExactIndexFormatError::ArithmeticOverflow)?,
     );
     put_u64(
         block,
@@ -904,8 +1108,8 @@ fn encode_identity_block(
     );
     put_u32(block, 56, ENTRIES_PER_PAGE_U32);
     put_u32(block, 60, 1);
-    block[64..96].copy_from_slice(&run.profile.bytes());
-    block[96..160].copy_from_slice(&key_bounds(&run.entries));
+    block[64..96].copy_from_slice(&profile.bytes());
+    block[96..160].copy_from_slice(&key_bounds);
     put_u64(block, 160, HEADER_BYTES_U64);
     put_u64(
         block,
@@ -1146,9 +1350,9 @@ fn key_bounds(entries: &[ExactIndexEntry]) -> [u8; 64] {
 }
 
 fn checksum_with_zero(bytes: &[u8], offset: usize) -> u32 {
-    let mut copy = bytes.to_vec();
-    copy[offset..offset + 4].fill(0);
-    crc32c::crc32c(&copy)
+    let checksum = crc32c::crc32c_append(0, &bytes[..offset]);
+    let checksum = crc32c::crc32c_append(checksum, &[0_u8; 4]);
+    crc32c::crc32c_append(checksum, &bytes[offset + 4..])
 }
 
 fn calculate_run_hash(bytes: &[u8], footer_offset: usize) -> [u8; 32] {

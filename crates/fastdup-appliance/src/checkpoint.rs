@@ -5,7 +5,7 @@ use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use fastcdc::v2020::{FastCDC, Normalization, StreamCDC};
@@ -17,13 +17,16 @@ use fastdup_format::{
 };
 use fastdup_posix::{
     CommitInode, CommitRange, CommittedFile, CommittedFileInstall, ExternalizedExtent, InodeId,
-    MutationObserver, Namespace, NamespaceCommit, NamespaceConfig, PosixError,
+    MutationObserver, MutationPayload, Namespace, NamespaceCommit, NamespaceConfig, PosixError,
+    PreparedCommitExtent, PreparedDataRecipe,
 };
 use fastdup_store::{
-    ActivatedExactIndex, AdaptiveContainerPublishMetrics, ContainerRepository,
-    ExactIndexRunRepository, GenerationError, GenerationRepository, IndexedRequiredChunkVerifier,
-    ManifestReadError, RequiredChunkVerifier, StorageIo, StoreError, VerifiedCommittedFile,
-    VerifiedManifestFile,
+    ActivatedExactIndex, AdaptiveContainerPublishMetrics, ContainerDescriptorCacheStatus,
+    ContainerRepository, ExactIndexPageCacheStatus, ExactIndexRunRepository,
+    ExactRunMembershipStatus, GenerationError, GenerationRepository, IndexedRequiredChunkVerifier,
+    ManifestReadError, ManifestSuccessorProof, ManifestTreeSummary, RequiredChunkVerifier,
+    StorageIo, StoreError, SuccessorPredecessor, VerifiedCommittedFile, VerifiedManifestFile,
+    VerifiedReadCache, VerifiedReadCacheError, VerifiedReadCacheStatus,
 };
 
 use crate::{ManifestCommittedFile, MountError, namespace_from_verified_files_using};
@@ -35,16 +38,30 @@ const COMPRESSION_REGION_TARGET_BYTES: usize = 512 * 1_024;
 const CDC_MINIMUM_BYTES: usize = 16 * 1_024;
 const CDC_TARGET_BYTES: usize = 64 * 1_024;
 const CDC_MAXIMUM_BYTES: usize = 256 * 1_024;
+type RetainedManifestRanges = BTreeMap<u64, BTreeMap<MetadataObjectId, Vec<Range<u64>>>>;
+type AdaptiveCommitFinish = (
+    Vec<ExactIndexEntry>,
+    CheckpointReductionMetrics,
+    RetainedManifestRanges,
+);
 const CDC_SEED_V1: u64 = 0;
 const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
-const MAX_CHECKPOINT_WORKERS: usize =
-    CONTAINER_PAYLOAD_TARGET_BYTES / COMPRESSION_REGION_TARGET_BYTES;
+const EXACT_PUBLICATION_QUEUE_BATCHES: usize = 8;
+const MAX_RECENT_EXACT_LOCATIONS: usize = 8_192;
 const WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1: usize = 384 * 1_024 * 1_024;
-const MAX_ACTIVE_INGEST_LANES_V1: usize =
-    WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1 / (CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES) - 1;
+const WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1: usize = 16 * 1_024 * 1_024;
+const DETACHED_CONTAINER_BUDGET_BYTES_V1: usize = 2 * CONTAINER_PAYLOAD_TARGET_BYTES;
+const WRITE_THROUGH_JOB_MAX_BYTES_V1: usize = 1_024 * 1_024;
+const MAX_ACTIVE_INGEST_LANES_V1: usize = (WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1
+    - WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1
+    - DETACHED_CONTAINER_BUDGET_BYTES_V1)
+    / (CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES)
+    - 1;
 const _: () = assert!(
     WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1
-        >= 2 * (CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES)
+        >= WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1
+            + DETACHED_CONTAINER_BUDGET_BYTES_V1
+            + 2 * (CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES)
 );
 
 /// V1 scheduler high-water for active checkpointable DATA.
@@ -59,6 +76,7 @@ pub const CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1: u64 = 8 * fastdup_format::MAX_CONTA
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteThroughStatus {
     buffered_bytes: u64,
+    queued_bytes: u64,
     active_lanes: u64,
     sealed_uncommitted_containers: u64,
     oldest_sealed_age: Option<Duration>,
@@ -69,6 +87,11 @@ impl WriteThroughStatus {
     #[must_use]
     pub const fn buffered_bytes(self) -> u64 {
         self.buffered_bytes
+    }
+
+    #[must_use]
+    pub const fn queued_bytes(self) -> u64 {
+        self.queued_bytes
     }
 
     #[must_use]
@@ -153,6 +176,9 @@ pub struct CheckpointMetrics {
     containers: u64,
     peak_buffered_chunk_bytes: u64,
     peak_buffered_chunks: u64,
+    recipe_reuse_chunks: u64,
+    recipe_reuse_bytes: u64,
+    checkpoint_rechunk_bytes: u64,
 }
 
 macro_rules! phase_getter {
@@ -246,6 +272,21 @@ impl CheckpointMetrics {
         self.peak_buffered_chunks
     }
 
+    #[must_use]
+    pub const fn recipe_reuse_chunks(self) -> u64 {
+        self.recipe_reuse_chunks
+    }
+
+    #[must_use]
+    pub const fn recipe_reuse_bytes(self) -> u64 {
+        self.recipe_reuse_bytes
+    }
+
+    #[must_use]
+    pub const fn checkpoint_rechunk_bytes(self) -> u64 {
+        self.checkpoint_rechunk_bytes
+    }
+
     fn merge_reduction(&mut self, reduction: &CheckpointReductionMetrics) {
         self.fastcdc = reduction.fastcdc;
         self.hash_and_fill = reduction.hash_and_fill;
@@ -266,6 +307,9 @@ impl CheckpointMetrics {
         self.containers = reduction.containers;
         self.peak_buffered_chunk_bytes = reduction.peak_buffered_chunk_bytes;
         self.peak_buffered_chunks = reduction.peak_buffered_chunks;
+        self.recipe_reuse_chunks = reduction.recipe_reuse_chunks;
+        self.recipe_reuse_bytes = reduction.recipe_reuse_bytes;
+        self.checkpoint_rechunk_bytes = reduction.checkpoint_rechunk_bytes;
     }
 }
 
@@ -308,6 +352,9 @@ struct CheckpointReductionMetrics {
     containers: u64,
     peak_buffered_chunk_bytes: u64,
     peak_buffered_chunks: u64,
+    recipe_reuse_chunks: u64,
+    recipe_reuse_bytes: u64,
+    checkpoint_rechunk_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -347,7 +394,7 @@ impl PhaseStarted {
 pub fn checkpoint_policy_set_v1() -> PolicySetId {
     PolicySetId::new(
         ChunkId::of(
-            b"fastdup/checkpoint-policy-v1/FastCDC=16384:65536:262144:norm1:seed0:append-tail-anchor-v1/region=524288/Zstd=level3:min4096:min3pct/exact=l0-runs-v1:fanin4/proof=installed-successor-delta-v1",
+            b"fastdup/checkpoint-policy-v1/FastCDC=16384:65536:262144:norm1:seed0:append-tail-anchor-v1/region=524288/Zstd=level3:min4096:min3pct/exact=l0-runs-v2:fanin4:partition262144/proof=installed-successor-delta-v1",
         )
         .bytes(),
     )
@@ -365,6 +412,7 @@ pub struct DurableNamespace<M, C> {
     generations: GenerationRepository<M>,
     containers: ContainerRepository<C>,
     checkpoint_lock: Mutex<()>,
+    installed_predecessor: Mutex<SuccessorPredecessor>,
     manifests: Mutex<Vec<InstalledManifest>>,
     next_container_generation: Arc<Mutex<u64>>,
     manifest_readers: Arc<dyn ManifestReaderPolicy<C>>,
@@ -378,6 +426,7 @@ struct InstalledManifest {
     root: MetadataObjectId,
     logical_size: u64,
     allocated_bytes: u64,
+    summary: ManifestTreeSummary,
 }
 
 struct VerifiedLocationFile<C> {
@@ -447,6 +496,12 @@ where
                 .expect("ASSERT: Exact Index length fits usize")
             && ChunkId::of(candidate) == self.entry.chunk_id())
     }
+
+    fn prepared_data_recipe(&self) -> Option<PreparedDataRecipe> {
+        Some(PreparedDataRecipe::Chunk {
+            chunk_id: self.entry.chunk_id().bytes(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -488,21 +543,209 @@ impl CommittedFile for FillCommittedFile {
                 && candidate.iter().all(|byte| *byte == self.value),
         )
     }
+
+    fn prepared_data_recipe(&self) -> Option<PreparedDataRecipe> {
+        Some(PreparedDataRecipe::Fill { value: self.value })
+    }
 }
 
 #[derive(Debug)]
 struct PendingWriteThroughChunk {
     offset: u64,
-    bytes: Vec<u8>,
+    chunk_id: ChunkId,
+    bytes: MutationPayload,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StableExtraction {
+    FillContainer,
+    DrainForCommitCut,
 }
 
 #[derive(Debug, Default)]
+struct SegmentedIngestTail {
+    segments: VecDeque<MutationPayload>,
+    length: usize,
+}
+
+impl SegmentedIngestTail {
+    fn len(&self) -> usize {
+        self.length
+    }
+
+    fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    fn clear(&mut self) {
+        self.segments.clear();
+        self.length = 0;
+    }
+
+    fn push(&mut self, payload: MutationPayload) {
+        assert!(
+            !payload.is_empty(),
+            "ASSERT: an Ingest Tail segment is nonempty"
+        );
+        self.length = self
+            .length
+            .checked_add(payload.len())
+            .expect("ASSERT: bounded Ingest Tail length cannot overflow");
+        self.segments.push_back(payload);
+    }
+
+    fn front_bytes(&self) -> &[u8] {
+        self.segments.front().map_or(&[], MutationPayload::as_bytes)
+    }
+
+    fn make_prefix_contiguous(&mut self, maximum: usize) -> Result<(), DurableNamespaceError> {
+        assert!(maximum != 0, "ASSERT: contiguous prefix bound is nonzero");
+        let desired = maximum.min(self.length);
+        if desired == 0 || self.front_bytes().len() >= desired {
+            return Ok(());
+        }
+        let mut contiguous = Vec::new();
+        contiguous
+            .try_reserve_exact(desired)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for segment in &self.segments {
+            let remaining = desired - contiguous.len();
+            if remaining == 0 {
+                break;
+            }
+            let copy = remaining.min(segment.len());
+            contiguous.extend_from_slice(&segment.as_bytes()[..copy]);
+        }
+        assert_eq!(
+            contiguous.len(),
+            desired,
+            "ASSERT: cached Ingest Tail length must match its segments"
+        );
+        self.discard_prefix(desired);
+        self.length = self
+            .length
+            .checked_add(desired)
+            .expect("ASSERT: replacing a compacted prefix cannot overflow");
+        self.segments
+            .push_front(MutationPayload::from_owned_bytes(contiguous));
+        self.assert_valid();
+        Ok(())
+    }
+
+    fn take_prefix(&mut self, length: usize) -> Result<MutationPayload, DurableNamespaceError> {
+        assert!(length != 0, "ASSERT: consumed Ingest prefix is nonempty");
+        if length > self.length {
+            return Err(DurableNamespaceError::FrozenViewMismatch);
+        }
+        self.make_prefix_contiguous(length)?;
+        let front = self
+            .segments
+            .pop_front()
+            .expect("ASSERT: nonempty Ingest Tail owns a front segment");
+        assert!(
+            front.len() >= length,
+            "ASSERT: compacted front must cover requested prefix"
+        );
+        let consumed = front
+            .checked_slice(0, length)
+            .expect("ASSERT: consumed prefix lies inside front segment");
+        if front.len() > length {
+            self.segments.push_front(
+                front
+                    .checked_slice(length, front.len())
+                    .expect("ASSERT: retained suffix lies inside front segment"),
+            );
+        }
+        self.length = self
+            .length
+            .checked_sub(length)
+            .expect("ASSERT: consumed prefix was accounted");
+        self.assert_valid();
+        Ok(consumed)
+    }
+
+    fn discard_prefix(&mut self, mut length: usize) {
+        assert!(
+            length <= self.length,
+            "ASSERT: discarded prefix stays inside Ingest Tail"
+        );
+        while length != 0 {
+            let front = self
+                .segments
+                .pop_front()
+                .expect("ASSERT: accounted Ingest Tail owns a front segment");
+            if front.len() > length {
+                self.segments.push_front(
+                    front
+                        .checked_slice(length, front.len())
+                        .expect("ASSERT: retained tail suffix lies inside front segment"),
+                );
+                self.length -= length;
+                return;
+            }
+            length -= front.len();
+            self.length -= front.len();
+        }
+    }
+
+    fn assert_valid(&self) {
+        let actual = self.segments.iter().fold(0_usize, |total, segment| {
+            assert!(
+                !segment.is_empty(),
+                "ASSERT: Ingest Tail cannot retain empty segments"
+            );
+            total
+                .checked_add(segment.len())
+                .expect("ASSERT: bounded Ingest Tail segment sum cannot overflow")
+        });
+        assert_eq!(
+            actual, self.length,
+            "ASSERT: cached Ingest Tail length must match its segments"
+        );
+        assert_eq!(
+            self.segments.is_empty(),
+            self.is_empty(),
+            "ASSERT: Ingest Tail emptiness must match its byte count"
+        );
+    }
+}
+
+fn take_next_stable_fastcdc_chunk(
+    tail: &mut SegmentedIngestTail,
+) -> Result<Option<MutationPayload>, DurableNamespaceError> {
+    if tail.len() <= CDC_MAXIMUM_BYTES {
+        return Ok(None);
+    }
+    tail.make_prefix_contiguous(CDC_MAXIMUM_BYTES)?;
+    let stable_before = tail.len() - CDC_MAXIMUM_BYTES;
+    let first = FastCDC::with_level_and_seed(
+        tail.front_bytes(),
+        CDC_MINIMUM_BYTES,
+        CDC_TARGET_BYTES,
+        CDC_MAXIMUM_BYTES,
+        Normalization::Level1,
+        CDC_SEED_V1,
+    )
+    .next()
+    .expect("ASSERT: a nonempty maximum-sized CDC prefix yields one Chunk");
+    assert_eq!(
+        first.offset, 0,
+        "ASSERT: front-prefix FastCDC must begin at zero"
+    );
+    if first.length > stable_before {
+        return Ok(None);
+    }
+    tail.take_prefix(first.length).map(Some)
+}
+
+#[derive(Debug, Default)]
+#[repr(align(64))]
 struct WriteThroughStream {
     inode: Option<InodeId>,
     last_mutation_sequence: Option<u64>,
     next_offset: u64,
     tail_offset: u64,
-    tail: Vec<u8>,
+    tail: SegmentedIngestTail,
     pending_chunks: Vec<PendingWriteThroughChunk>,
     pending_bytes: usize,
 }
@@ -516,6 +759,14 @@ struct WriteThroughRegistry {
     next_touch: u64,
 }
 
+struct WriteThroughStatusSnapshot {
+    lanes: Vec<Arc<Mutex<WriteThroughStream>>>,
+    overflow: Arc<Mutex<WriteThroughStream>>,
+    sealed_uncommitted_containers: usize,
+    oldest_sealed_age: Option<Duration>,
+    degraded: bool,
+}
+
 #[derive(Debug)]
 struct WriteThroughLane {
     stream: Arc<Mutex<WriteThroughStream>>,
@@ -523,6 +774,21 @@ struct WriteThroughLane {
 }
 
 impl WriteThroughRegistry {
+    fn status_snapshot(&self) -> WriteThroughStatusSnapshot {
+        let mut lanes = Vec::new();
+        lanes
+            .try_reserve_exact(self.lanes.len())
+            .expect("ASSERT: bounded status Lane snapshot allocation succeeds");
+        lanes.extend(self.lanes.values().map(|lane| Arc::clone(&lane.stream)));
+        WriteThroughStatusSnapshot {
+            lanes,
+            overflow: Arc::clone(&self.overflow),
+            sealed_uncommitted_containers: self.sealed.len(),
+            oldest_sealed_age: self.sealed.front().map(Instant::elapsed),
+            degraded: self.degraded,
+        }
+    }
+
     fn acquire_lane(&mut self, inode: InodeId) -> Arc<Mutex<WriteThroughStream>> {
         let touch = self.next_touch;
         self.next_touch = self
@@ -588,6 +854,440 @@ struct WriteThroughIngest<C> {
     worker_permits: WorkerPermits,
     active_writers: AtomicUsize,
     registry: Mutex<WriteThroughRegistry>,
+    queue: Arc<IngestQueue>,
+    publication_queue: Arc<PublicationQueue>,
+    namespace: OnceLock<Weak<Namespace>>,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+#[derive(Debug)]
+enum IngestJobKind {
+    Write {
+        offset: u64,
+        bytes: MutationPayload,
+        final_for_sequence: bool,
+    },
+    Truncate,
+}
+
+#[derive(Debug)]
+struct IngestJob {
+    inode: InodeId,
+    mutation_sequence: u64,
+    kind: IngestJobKind,
+}
+
+impl IngestJob {
+    fn buffered_bytes(&self) -> usize {
+        match &self.kind {
+            IngestJobKind::Write { bytes, .. } => bytes.len(),
+            IngestJobKind::Truncate => 0,
+        }
+    }
+
+    fn final_for_sequence(&self) -> bool {
+        match self.kind {
+            IngestJobKind::Write {
+                final_for_sequence, ..
+            } => final_for_sequence,
+            IngestJobKind::Truncate => true,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct InodeJobQueue {
+    pending: VecDeque<IngestJob>,
+    in_flight: bool,
+    last_enqueued_sequence: u64,
+    completed_sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct IngestQueueState {
+    inodes: BTreeMap<InodeId, InodeJobQueue>,
+    ready: VecDeque<InodeId>,
+    buffered_bytes: usize,
+    shutdown: bool,
+}
+
+#[derive(Debug)]
+struct IngestQueue {
+    state: Mutex<IngestQueueState>,
+    work_available: Condvar,
+    space_available: Condvar,
+    completed: Condvar,
+}
+
+#[derive(Debug)]
+struct DetachedContainerWork {
+    inode: InodeId,
+    through_sequence: u64,
+    chunks: Vec<PendingWriteThroughChunk>,
+    payload_bytes: usize,
+}
+
+impl DetachedContainerWork {
+    fn new(
+        inode: InodeId,
+        through_sequence: u64,
+        chunks: Vec<PendingWriteThroughChunk>,
+        payload_bytes: usize,
+    ) -> Self {
+        let actual = chunks.iter().fold(0_usize, |total, chunk| {
+            total
+                .checked_add(chunk.bytes.len())
+                .expect("ASSERT: detached Container byte sum cannot overflow")
+        });
+        assert_eq!(
+            actual, payload_bytes,
+            "ASSERT: detached Container byte accounting must be exact"
+        );
+        assert!(
+            !chunks.is_empty() && payload_bytes != 0,
+            "ASSERT: detached Container work must contain payload"
+        );
+        assert!(
+            payload_bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
+            "ASSERT: detached Container exceeds its pre-format payload bound"
+        );
+        Self {
+            inode,
+            through_sequence,
+            chunks,
+            payload_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct InodePublicationQueue {
+    pending: VecDeque<DetachedContainerWork>,
+    in_flight_sequence: Option<u64>,
+    last_enqueued_sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct PublicationQueueState {
+    inodes: BTreeMap<InodeId, InodePublicationQueue>,
+    ready: VecDeque<InodeId>,
+    buffered_bytes: usize,
+    shutdown: bool,
+}
+
+#[derive(Debug)]
+struct PublicationQueue {
+    state: Mutex<PublicationQueueState>,
+    work_available: Condvar,
+    space_available: Condvar,
+    completed: Condvar,
+}
+
+impl PublicationQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PublicationQueueState::default()),
+            work_available: Condvar::new(),
+            space_available: Condvar::new(),
+            completed: Condvar::new(),
+        }
+    }
+
+    fn enqueue(&self, work: DetachedContainerWork) {
+        let inode = work.inode;
+        let work_bytes = work.payload_bytes;
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: detached publication queue lock poisoned");
+        while state
+            .buffered_bytes
+            .checked_add(work_bytes)
+            .is_none_or(|total| total > DETACHED_CONTAINER_BUDGET_BYTES_V1)
+        {
+            state = self.space_available.wait(state).expect(
+                "ASSERT: detached publication queue lock poisoned while applying backpressure",
+            );
+        }
+        assert!(
+            !state.shutdown,
+            "ASSERT: cannot enqueue detached Container work after scheduler shutdown"
+        );
+        state.buffered_bytes = state
+            .buffered_bytes
+            .checked_add(work_bytes)
+            .expect("ASSERT: detached publication bytes cannot overflow");
+        let inode_queue = state.inodes.entry(inode).or_default();
+        assert!(
+            work.through_sequence >= inode_queue.last_enqueued_sequence,
+            "ASSERT: detached per-inode publication sequence cannot move backwards"
+        );
+        inode_queue.last_enqueued_sequence = work.through_sequence;
+        let schedule = inode_queue.in_flight_sequence.is_none() && inode_queue.pending.is_empty();
+        inode_queue.pending.push_back(work);
+        if schedule {
+            state.ready.push_back(inode);
+            self.work_available.notify_one();
+        }
+    }
+
+    fn next_work(&self) -> Option<DetachedContainerWork> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: detached publication queue lock poisoned");
+        loop {
+            if let Some(inode) = state.ready.pop_front() {
+                let inode_queue = state
+                    .inodes
+                    .get_mut(&inode)
+                    .expect("ASSERT: ready publication inode must own a queue");
+                assert!(
+                    inode_queue.in_flight_sequence.is_none(),
+                    "ASSERT: one inode cannot publish two Containers concurrently"
+                );
+                let work = inode_queue
+                    .pending
+                    .pop_front()
+                    .expect("ASSERT: ready publication inode must own pending work");
+                inode_queue.in_flight_sequence = Some(work.through_sequence);
+                return Some(work);
+            }
+            if state.shutdown {
+                return None;
+            }
+            state = self
+                .work_available
+                .wait(state)
+                .expect("ASSERT: detached publication queue lock poisoned while waiting for work");
+        }
+    }
+
+    fn finish(&self, work: &DetachedContainerWork) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: detached publication queue lock poisoned");
+        state.buffered_bytes = state
+            .buffered_bytes
+            .checked_sub(work.payload_bytes)
+            .expect("ASSERT: completed detached bytes must have been admitted");
+        let inode_queue = state
+            .inodes
+            .get_mut(&work.inode)
+            .expect("ASSERT: completed publication inode must retain queue state");
+        assert_eq!(
+            inode_queue.in_flight_sequence,
+            Some(work.through_sequence),
+            "ASSERT: completed publication must match the active inode sequence"
+        );
+        inode_queue.in_flight_sequence = None;
+        if !inode_queue.pending.is_empty() {
+            state.ready.push_back(work.inode);
+            self.work_available.notify_one();
+        }
+        self.space_available.notify_all();
+        self.completed.notify_all();
+    }
+
+    fn wait_through(&self, inode: InodeId, through_sequence: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: detached publication queue lock poisoned");
+        loop {
+            let complete = state.inodes.get(&inode).is_none_or(|queue| {
+                queue
+                    .in_flight_sequence
+                    .is_none_or(|sequence| sequence > through_sequence)
+                    && queue
+                        .pending
+                        .front()
+                        .is_none_or(|work| work.through_sequence > through_sequence)
+            });
+            if complete {
+                return;
+            }
+            state = self.completed.wait(state).expect(
+                "ASSERT: detached publication queue lock poisoned while waiting for sequence fence",
+            );
+        }
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("ASSERT: detached publication queue lock poisoned")
+            .buffered_bytes
+    }
+
+    fn shutdown(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: detached publication queue lock poisoned during shutdown");
+        state.shutdown = true;
+        self.work_available.notify_all();
+        self.space_available.notify_all();
+        self.completed.notify_all();
+    }
+}
+
+impl IngestQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(IngestQueueState::default()),
+            work_available: Condvar::new(),
+            space_available: Condvar::new(),
+            completed: Condvar::new(),
+        }
+    }
+
+    fn enqueue(&self, job: IngestJob) {
+        let job_bytes = job.buffered_bytes();
+        assert!(
+            job_bytes <= WRITE_THROUGH_JOB_MAX_BYTES_V1,
+            "ASSERT: one queued ingest job exceeds its byte bound"
+        );
+        let inode = job.inode;
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned");
+        while state
+            .buffered_bytes
+            .checked_add(job_bytes)
+            .is_none_or(|total| total > WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1)
+        {
+            state = self
+                .space_available
+                .wait(state)
+                .expect("ASSERT: ingest queue lock poisoned while applying backpressure");
+        }
+        assert!(
+            !state.shutdown,
+            "ASSERT: cannot enqueue after scheduler shutdown"
+        );
+        state.buffered_bytes = state
+            .buffered_bytes
+            .checked_add(job_bytes)
+            .expect("ASSERT: bounded ingest queue bytes cannot overflow");
+        let inode_queue = state.inodes.entry(inode).or_default();
+        assert!(
+            job.mutation_sequence >= inode_queue.last_enqueued_sequence,
+            "ASSERT: per-inode ingest admission sequence cannot move backwards"
+        );
+        inode_queue.last_enqueued_sequence = job.mutation_sequence;
+        let schedule = !inode_queue.in_flight && inode_queue.pending.is_empty();
+        inode_queue.pending.push_back(job);
+        if schedule {
+            state.ready.push_back(inode);
+            self.work_available.notify_one();
+        }
+    }
+
+    fn next_job(&self) -> Option<IngestJob> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned");
+        loop {
+            if let Some(inode) = state.ready.pop_front() {
+                let inode_queue = state
+                    .inodes
+                    .get_mut(&inode)
+                    .expect("ASSERT: ready inode must own a queue");
+                assert!(
+                    !inode_queue.in_flight,
+                    "ASSERT: one inode cannot have two active ingest jobs"
+                );
+                let job = inode_queue
+                    .pending
+                    .pop_front()
+                    .expect("ASSERT: ready inode must own pending work");
+                inode_queue.in_flight = true;
+                return Some(job);
+            }
+            if state.shutdown {
+                return None;
+            }
+            state = self
+                .work_available
+                .wait(state)
+                .expect("ASSERT: ingest queue lock poisoned while waiting for work");
+        }
+    }
+
+    fn finish(&self, job: &IngestJob) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned");
+        state.buffered_bytes = state
+            .buffered_bytes
+            .checked_sub(job.buffered_bytes())
+            .expect("ASSERT: completed ingest bytes must have been admitted");
+        let inode_queue = state
+            .inodes
+            .get_mut(&job.inode)
+            .expect("ASSERT: completed inode must retain queue state");
+        assert!(
+            inode_queue.in_flight,
+            "ASSERT: completed ingest job must have been active"
+        );
+        inode_queue.in_flight = false;
+        if job.final_for_sequence() {
+            assert!(
+                job.mutation_sequence >= inode_queue.completed_sequence,
+                "ASSERT: completed inode sequence cannot move backwards"
+            );
+            inode_queue.completed_sequence = job.mutation_sequence;
+        }
+        if !inode_queue.pending.is_empty() {
+            state.ready.push_back(job.inode);
+            self.work_available.notify_one();
+        }
+        self.space_available.notify_all();
+        self.completed.notify_all();
+    }
+
+    fn wait_through(&self, inode: InodeId, mutation_sequence: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned");
+        loop {
+            let complete = state
+                .inodes
+                .get(&inode)
+                .is_none_or(|queue| queue.completed_sequence >= mutation_sequence);
+            if complete {
+                return;
+            }
+            state = self
+                .completed
+                .wait(state)
+                .expect("ASSERT: ingest queue lock poisoned while waiting for sequence fence");
+        }
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned")
+            .buffered_bytes
+    }
+
+    fn shutdown(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned during shutdown");
+        state.shutdown = true;
+        self.work_available.notify_all();
+        self.space_available.notify_all();
+        self.completed.notify_all();
+    }
 }
 
 struct WorkerPermits {
@@ -756,13 +1456,13 @@ fn assert_bounded_write_through_lane(state: &WriteThroughStream) {
 
 impl<C> fmt::Debug for WriteThroughIngest<C> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let registry = self
+        let snapshot = self
             .registry
             .lock()
-            .expect("ASSERT: write-through registry lock poisoned");
-        let buffered_bytes = registry.lanes.values().fold(0_usize, |total, lane| {
+            .expect("ASSERT: write-through registry lock poisoned")
+            .status_snapshot();
+        let buffered_bytes = snapshot.lanes.iter().fold(0_usize, |total, lane| {
             let lane = lane
-                .stream
                 .lock()
                 .expect("ASSERT: write-through lane lock poisoned");
             total
@@ -770,13 +1470,15 @@ impl<C> fmt::Debug for WriteThroughIngest<C> {
                 .and_then(|sum| sum.checked_add(lane.pending_bytes))
                 .expect("ASSERT: bounded write-through lane bytes cannot overflow")
         });
-        let overflow = registry
+        let overflow = snapshot
             .overflow
             .lock()
             .expect("ASSERT: write-through overflow lane lock poisoned");
         let buffered_bytes = buffered_bytes
             .checked_add(overflow.tail.len())
             .and_then(|sum| sum.checked_add(overflow.pending_bytes))
+            .and_then(|sum| sum.checked_add(self.queue.buffered_bytes()))
+            .and_then(|sum| sum.checked_add(self.publication_queue.buffered_bytes()))
             .expect("ASSERT: bounded write-through bytes cannot overflow");
         assert!(
             buffered_bytes <= WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1,
@@ -784,14 +1486,17 @@ impl<C> fmt::Debug for WriteThroughIngest<C> {
         );
         formatter
             .debug_struct("WriteThroughIngest")
-            .field("active_lanes", &registry.lanes.len())
+            .field("active_lanes", &snapshot.lanes.len())
             .field("buffered_bytes", &buffered_bytes)
-            .field("sealed_uncommitted", &registry.sealed.len())
+            .field(
+                "sealed_uncommitted",
+                &snapshot.sealed_uncommitted_containers,
+            )
             .field(
                 "active_writers",
                 &self.active_writers.load(Ordering::Relaxed),
             )
-            .field("degraded", &registry.degraded)
+            .field("degraded", &snapshot.degraded)
             .finish_non_exhaustive()
     }
 }
@@ -800,14 +1505,195 @@ impl<C> WriteThroughIngest<C>
 where
     C: Clone + Send + Sync + StorageIo + 'static,
 {
-    fn status(&self) -> WriteThroughStatus {
-        let registry = self
+    fn start_workers(self: &Arc<Self>, namespace: &Arc<Namespace>) {
+        self.namespace
+            .set(Arc::downgrade(namespace))
+            .expect("ASSERT: write-through Namespace is attached exactly once");
+        let worker_count = self
+            .worker_budget
+            .get()
+            .min(MAX_ACTIVE_INGEST_LANES_V1.saturating_add(1));
+        let mut workers = self
+            .workers
+            .lock()
+            .expect("ASSERT: ingest worker handle lock poisoned");
+        assert!(
+            workers.is_empty(),
+            "ASSERT: ingest workers start exactly once"
+        );
+        let publication_worker_count = worker_count.min(2);
+        workers
+            .try_reserve_exact(worker_count.saturating_add(publication_worker_count))
+            .expect("ASSERT: bounded ingest worker handle allocation succeeds");
+        for ordinal in 0..worker_count {
+            let owner = Arc::downgrade(self);
+            let queue = Arc::clone(&self.queue);
+            let worker = std::thread::Builder::new()
+                .name(format!("fastdup-ingest-{ordinal}"))
+                .spawn(move || {
+                    while let Some(job) = queue.next_job() {
+                        if let Some(owner) = owner.upgrade() {
+                            owner.process_job(&job);
+                        }
+                        queue.finish(&job);
+                    }
+                })
+                .expect("ASSERT: bounded permanent ingest worker creation succeeds");
+            workers.push(worker);
+        }
+        for ordinal in 0..publication_worker_count {
+            let owner = Arc::downgrade(self);
+            let queue = Arc::clone(&self.publication_queue);
+            let worker = std::thread::Builder::new()
+                .name(format!("fastdup-publish-{ordinal}"))
+                .spawn(move || {
+                    while let Some(work) = queue.next_work() {
+                        if let Some(owner) = owner.upgrade() {
+                            owner.process_detached_container(&work);
+                        }
+                        queue.finish(&work);
+                    }
+                })
+                .expect("ASSERT: bounded permanent publication worker creation succeeds");
+            workers.push(worker);
+        }
+    }
+
+    fn enqueue_write(
+        &self,
+        inode: InodeId,
+        offset: u64,
+        mutation_sequence: u64,
+        bytes: &MutationPayload,
+    ) {
+        let mut consumed = 0_usize;
+        while consumed < bytes.len() {
+            let chunk_end = consumed
+                .saturating_add(WRITE_THROUGH_JOB_MAX_BYTES_V1)
+                .min(bytes.len());
+            let job_offset = offset
+                .checked_add(u64::try_from(consumed).expect("ASSERT: queued offset fits u64"))
+                .expect("ASSERT: accepted write range was already checked");
+            let chunk = bytes
+                .checked_slice(consumed, chunk_end)
+                .expect("ASSERT: queued write slice lies inside accepted payload");
+            consumed = chunk_end;
+            self.queue.enqueue(IngestJob {
+                inode,
+                mutation_sequence,
+                kind: IngestJobKind::Write {
+                    offset: job_offset,
+                    bytes: chunk,
+                    final_for_sequence: consumed == bytes.len(),
+                },
+            });
+        }
+    }
+
+    fn process_job(&self, job: &IngestJob) {
+        let result = match &job.kind {
+            IngestJobKind::Write { offset, bytes, .. } => {
+                self.stage_write(job.inode, *offset, job.mutation_sequence, bytes.clone())
+            }
+            IngestJobKind::Truncate => {
+                self.reset_lane(job.inode);
+                Ok(Vec::new())
+            }
+        };
+        match result {
+            Ok(externalized) => {
+                if !externalized.is_empty()
+                    && let Some(namespace) = self.namespace.get().and_then(Weak::upgrade)
+                {
+                    namespace.externalize_verified_extents(externalized);
+                }
+            }
+            Err(error) => self.degrade_job(job, &error),
+        }
+    }
+
+    fn process_detached_container(&self, work: &DetachedContainerWork) {
+        let _active_writer = ActiveWriteThrough::enter(&self.active_writers);
+        match self.publish_chunks(&work.chunks, work.inode, work.through_sequence) {
+            Ok((externalized, sealed)) => {
+                if let Some(namespace) = self.namespace.get().and_then(Weak::upgrade) {
+                    namespace.externalize_verified_extents(externalized);
+                }
+                if sealed {
+                    let mut registry = self
+                        .registry
+                        .lock()
+                        .expect("ASSERT: write-through registry lock poisoned");
+                    registry.sealed.push_back(Instant::now());
+                }
+            }
+            Err(error) => self.degrade_inode(work.inode, work.through_sequence, &error),
+        }
+    }
+
+    fn degrade_job(&self, job: &IngestJob, error: &DurableNamespaceError) {
+        let (offset, length) = match &job.kind {
+            IngestJobKind::Write { offset, bytes, .. } => (*offset, bytes.len()),
+            IngestJobKind::Truncate => (0, 0),
+        };
+        eprintln!(
+            "write-through staging degraded; resident fallback retained: inode={} offset={offset} length={length} sequence={} error={error:?}",
+            job.inode.get(),
+            job.mutation_sequence,
+        );
+        self.mark_degraded(job.inode);
+    }
+
+    fn degrade_inode(&self, inode: InodeId, mutation_sequence: u64, error: &DurableNamespaceError) {
+        eprintln!(
+            "detached Container publication degraded; resident fallback retained: inode={} sequence={mutation_sequence} error={error:?}",
+            inode.get(),
+        );
+        self.mark_degraded(inode);
+    }
+
+    fn mark_degraded(&self, inode: InodeId) {
+        let mut registry = self
             .registry
             .lock()
             .expect("ASSERT: write-through registry lock poisoned");
-        let buffered = registry.lanes.values().fold(0_usize, |total, lane| {
+        registry.degraded = true;
+        registry.lanes.remove(&inode);
+        let mut overflow = registry
+            .overflow
+            .lock()
+            .expect("ASSERT: write-through overflow lane lock poisoned");
+        if overflow.inode == Some(inode) {
+            *overflow = WriteThroughStream::default();
+        }
+    }
+
+    fn reset_lane(&self, inode: InodeId) {
+        let mut registry = self
+            .registry
+            .lock()
+            .expect("ASSERT: write-through registry lock poisoned");
+        registry.lanes.remove(&inode);
+        let mut overflow = registry
+            .overflow
+            .lock()
+            .expect("ASSERT: write-through overflow lane lock poisoned");
+        if overflow.inode == Some(inode) {
+            *overflow = WriteThroughStream::default();
+        }
+    }
+
+    fn status(&self) -> WriteThroughStatus {
+        // Never wait for a Lane while holding the Registry. A Lane may apply
+        // publication-queue backpressure while the completing publisher needs
+        // the Registry to retire its work and release that queue space.
+        let snapshot = self
+            .registry
+            .lock()
+            .expect("ASSERT: write-through registry lock poisoned")
+            .status_snapshot();
+        let buffered = snapshot.lanes.iter().fold(0_usize, |total, lane| {
             let lane = lane
-                .stream
                 .lock()
                 .expect("ASSERT: write-through lane lock poisoned");
             total
@@ -815,7 +1701,7 @@ where
                 .and_then(|sum| sum.checked_add(lane.pending_bytes))
                 .expect("ASSERT: bounded write-through lane bytes cannot overflow")
         });
-        let overflow = registry
+        let overflow = snapshot
             .overflow
             .lock()
             .expect("ASSERT: write-through overflow lane lock poisoned");
@@ -823,18 +1709,28 @@ where
             .checked_add(overflow.tail.len())
             .and_then(|sum| sum.checked_add(overflow.pending_bytes))
             .expect("ASSERT: bounded write-through bytes cannot overflow");
+        let queued_bytes = self
+            .queue
+            .buffered_bytes()
+            .checked_add(self.publication_queue.buffered_bytes())
+            .expect("ASSERT: bounded scheduler queue bytes cannot overflow");
+        let buffered = buffered
+            .checked_add(queued_bytes)
+            .expect("ASSERT: bounded write-through plus queue bytes cannot overflow");
         assert!(
             buffered <= WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1,
             "ASSERT: write-through registry exceeded its process memory budget"
         );
         WriteThroughStatus {
             buffered_bytes: u64::try_from(buffered).expect("ASSERT: process buffers fit in u64"),
-            active_lanes: u64::try_from(registry.lanes.len())
+            queued_bytes: u64::try_from(queued_bytes)
+                .expect("ASSERT: bounded queued bytes fit u64"),
+            active_lanes: u64::try_from(snapshot.lanes.len())
                 .expect("ASSERT: bounded Ingest Lane count fits u64"),
-            sealed_uncommitted_containers: u64::try_from(registry.sealed.len())
+            sealed_uncommitted_containers: u64::try_from(snapshot.sealed_uncommitted_containers)
                 .expect("ASSERT: process Container count fits in u64"),
-            oldest_sealed_age: registry.sealed.front().map(Instant::elapsed),
-            degraded: registry.degraded,
+            oldest_sealed_age: snapshot.oldest_sealed_age,
+            degraded: snapshot.degraded,
         }
     }
 
@@ -844,6 +1740,15 @@ where
             .expect("ASSERT: write-through registry lock poisoned")
             .sealed
             .len()
+    }
+
+    fn wait_for_commit_cut(&self, commit: &NamespaceCommit) {
+        for inode in commit.inodes() {
+            self.queue
+                .wait_through(inode.inode(), inode.mutation_sequence());
+            self.publication_queue
+                .wait_through(inode.inode(), inode.mutation_sequence());
+        }
     }
 
     fn complete_cut(&self, sealed_at_cut: usize) {
@@ -868,7 +1773,7 @@ where
         inode: InodeId,
         offset: u64,
         through_sequence: u64,
-        bytes: &[u8],
+        bytes: MutationPayload,
     ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
         let _active_writer = ActiveWriteThrough::enter(&self.active_writers);
         let lane = self.lane_for(inode);
@@ -892,14 +1797,15 @@ where
         lane.next_offset = offset
             .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize fits u64"))
             .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
-        lane.tail
-            .try_reserve(bytes.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        lane.tail.extend_from_slice(bytes);
+        lane.tail.push(bytes);
         let mut externalized = Vec::new();
-        let mut sealed = 0_usize;
         loop {
-            externalized.extend(self.extract_stable_chunks(&mut lane, inode, through_sequence)?);
+            externalized.extend(self.extract_stable_chunks(
+                &mut lane,
+                inode,
+                through_sequence,
+                StableExtraction::FillContainer,
+            )?);
             if lane.pending_bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
                 break;
             }
@@ -907,13 +1813,88 @@ where
                 lane.pending_bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
                 "ASSERT: write-through payload exceeded its pre-format Container bound"
             );
-            externalized.extend(self.publish_pending(&mut lane, inode, through_sequence)?);
-            sealed = sealed
-                .checked_add(1)
-                .expect("ASSERT: one bounded write cannot seal usize::MAX Containers");
+            let work = DetachedContainerWork::new(
+                inode,
+                through_sequence,
+                std::mem::take(&mut lane.pending_chunks),
+                std::mem::take(&mut lane.pending_bytes),
+            );
+            assert_pending_write_through_state(&lane);
+            self.publication_queue.enqueue(work);
         }
         assert_bounded_write_through_lane(&lane);
         drop(lane);
+        Ok(externalized)
+    }
+
+    fn flush_stable_for_commit_cut(
+        &self,
+    ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
+        let _active_writer = ActiveWriteThrough::enter(&self.active_writers);
+        let lanes = {
+            let registry = self
+                .registry
+                .lock()
+                .expect("ASSERT: write-through registry lock poisoned");
+            let mut lanes = Vec::new();
+            lanes
+                .try_reserve_exact(registry.lanes.len().saturating_add(1))
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+            lanes.extend(registry.lanes.values().map(|lane| Arc::clone(&lane.stream)));
+            lanes.push(Arc::clone(&registry.overflow));
+            lanes
+        };
+        let mut externalized = Vec::new();
+        let mut sealed = 0_usize;
+        for lane in lanes {
+            let mut lane = lane
+                .lock()
+                .expect("ASSERT: write-through lane lock poisoned");
+            let (Some(inode), Some(through_sequence)) = (lane.inode, lane.last_mutation_sequence)
+            else {
+                assert_pending_write_through_state(&lane);
+                continue;
+            };
+            loop {
+                let previous_tail = lane.tail.len();
+                let extracted = self.extract_stable_chunks(
+                    &mut lane,
+                    inode,
+                    through_sequence,
+                    StableExtraction::DrainForCommitCut,
+                )?;
+                externalized
+                    .try_reserve(extracted.len())
+                    .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+                externalized.extend(extracted);
+                let had_pending = !lane.pending_chunks.is_empty();
+                if had_pending {
+                    let (published, did_seal) =
+                        self.publish_pending(&mut lane, inode, through_sequence)?;
+                    externalized
+                        .try_reserve(published.len())
+                        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+                    externalized.extend(published);
+                    if did_seal {
+                        sealed = sealed
+                            .checked_add(1)
+                            .expect("ASSERT: bounded lane flush count cannot overflow usize");
+                    }
+                }
+                if lane.tail.len() == previous_tail || !had_pending {
+                    break;
+                }
+            }
+            assert!(
+                lane.pending_chunks.is_empty() && lane.pending_bytes == 0,
+                "ASSERT: commit-cut drain must publish every complete staged Chunk"
+            );
+            assert!(
+                lane.tail.len() <= CDC_MAXIMUM_BYTES * 2,
+                "ASSERT: commit-cut drain may retain only one boundary Chunk plus the incomplete CDC suffix"
+            );
+            assert_bounded_write_through_lane(&lane);
+        }
         if sealed != 0 {
             let mut registry = self
                 .registry
@@ -943,66 +1924,43 @@ where
         state: &mut WriteThroughStream,
         inode: InodeId,
         through_sequence: u64,
+        extraction: StableExtraction,
     ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
         assert_pending_write_through_state(state);
         let stable_before = state.tail.len().saturating_sub(CDC_MAXIMUM_BYTES);
         let stable_required = CONTAINER_PAYLOAD_FLUSH_BYTES
             .checked_sub(state.pending_bytes)
             .expect("ASSERT: pending bytes remain below the flush threshold");
-        if stable_before < stable_required {
+        if extraction == StableExtraction::FillContainer && stable_before < stable_required {
             return Ok(Vec::new());
         }
-        let ranges = FastCDC::with_level_and_seed(
-            &state.tail,
-            CDC_MINIMUM_BYTES,
-            CDC_TARGET_BYTES,
-            CDC_MAXIMUM_BYTES,
-            Normalization::Level1,
-            CDC_SEED_V1,
-        )
-        .take_while(|chunk| chunk.offset + chunk.length <= stable_before)
-        .map(|chunk| (chunk.offset, chunk.length))
-        .collect::<Vec<_>>();
-        let Some(_) = ranges.last() else {
-            return Ok(Vec::new());
-        };
-        state
-            .pending_chunks
-            .try_reserve(ranges.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         let mut externalized = Vec::new();
-        externalized
-            .try_reserve(ranges.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        let mut consumed = 0_usize;
-        for (chunk_offset, chunk_length) in ranges {
-            let chunk_end = chunk_offset
-                .checked_add(chunk_length)
-                .ok_or(DurableNamespaceError::OutOfMemory)?;
-            let chunk = &state.tail[chunk_offset..chunk_end];
-            let logical_offset = state
+        while let Some(chunk) = take_next_stable_fastcdc_chunk(&mut state.tail)? {
+            let logical_offset = state.tail_offset;
+            state.tail_offset = state
                 .tail_offset
                 .checked_add(
-                    u64::try_from(chunk_offset).expect("ASSERT: bounded Chunk offset fits u64"),
+                    u64::try_from(chunk.len())
+                        .expect("ASSERT: bounded FastCDC Chunk length fits u64"),
                 )
                 .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
-            if chunk.iter().all(|byte| *byte == chunk[0]) {
+            let chunk_bytes = chunk.as_bytes();
+            if chunk_bytes.iter().all(|byte| *byte == chunk_bytes[0]) {
                 externalized.push(ExternalizedExtent::new(
                     inode,
                     logical_offset,
                     through_sequence,
                     Arc::new(FillCommittedFile {
-                        value: chunk[0],
-                        length: u64::try_from(chunk.len())
+                        value: chunk_bytes[0],
+                        length: u64::try_from(chunk_bytes.len())
                             .expect("ASSERT: bounded FastCDC Chunk length fits u64"),
                     }),
                 )?);
-                consumed = chunk_end;
                 continue;
             }
-            let chunk_id = ChunkId::of(chunk);
-            let logical_length =
-                u64::try_from(chunk.len()).expect("ASSERT: bounded FastCDC Chunk length fits u64");
+            let chunk_id = ChunkId::of(chunk_bytes);
+            let logical_length = u64::try_from(chunk_bytes.len())
+                .expect("ASSERT: bounded FastCDC Chunk length fits u64");
             if let Some(entry) =
                 self.index
                     .verified_location(&self.containers, chunk_id, logical_length)
@@ -1013,31 +1971,21 @@ where
                     through_sequence,
                     entry,
                 )?);
-                consumed = chunk_end;
                 continue;
             }
             state.pending_bytes = state
                 .pending_bytes
-                .checked_add(chunk.len())
+                .checked_add(chunk_bytes.len())
                 .ok_or(DurableNamespaceError::OutOfMemory)?;
             state.pending_chunks.push(PendingWriteThroughChunk {
                 offset: logical_offset,
-                bytes: chunk.to_vec(),
+                chunk_id,
+                bytes: chunk,
             });
-            consumed = chunk_end;
             if state.pending_bytes >= CONTAINER_PAYLOAD_FLUSH_BYTES {
                 break;
             }
         }
-        assert!(
-            consumed != 0,
-            "ASSERT: one stable FastCDC Chunk was consumed"
-        );
-        state.tail.drain(..consumed);
-        state.tail_offset = state
-            .tail_offset
-            .checked_add(u64::try_from(consumed).expect("ASSERT: bounded drain fits u64"))
-            .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
         assert_pending_write_through_state(state);
         Ok(externalized)
     }
@@ -1047,15 +1995,100 @@ where
         state: &mut WriteThroughStream,
         inode: InodeId,
         through_sequence: u64,
-    ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
+    ) -> Result<(Vec<ExternalizedExtent>, bool), DurableNamespaceError> {
         assert_pending_write_through_state(state);
         if state.pending_chunks.is_empty() {
             state.pending_bytes = 0;
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
+        let externalized = self.publish_chunks(&state.pending_chunks, inode, through_sequence)?;
+        state.pending_chunks.clear();
+        state.pending_bytes = 0;
+        assert_pending_write_through_state(state);
+        Ok(externalized)
+    }
+
+    fn publish_chunks(
+        &self,
+        chunks: &[PendingWriteThroughChunk],
+        inode: InodeId,
+        through_sequence: u64,
+    ) -> Result<(Vec<ExternalizedExtent>, bool), DurableNamespaceError> {
+        assert!(
+            !chunks.is_empty(),
+            "ASSERT: Container publication requires at least one pending Chunk"
+        );
+        let mut locations = BTreeMap::<ChunkId, ExactIndexEntry>::new();
+        let mut candidates = BTreeMap::<ChunkId, (u32, &PendingWriteThroughChunk)>::new();
+        let mut new_chunks = Vec::new();
+        new_chunks
+            .try_reserve(chunks.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for chunk in chunks {
+            let chunk_id = chunk.chunk_id;
+            let logical_length = u32::try_from(chunk.bytes.len())
+                .map_err(|_| DurableNamespaceError::FrozenViewMismatch)?;
+            if let Some((previous_length, _)) = candidates.get(&chunk_id).copied() {
+                if previous_length != logical_length {
+                    return Err(DurableNamespaceError::ChunkLengthConflict {
+                        chunk_id,
+                        first_length: u64::from(previous_length),
+                        second_length: u64::from(logical_length),
+                    });
+                }
+                continue;
+            }
+            candidates.insert(chunk_id, (logical_length, chunk));
+        }
+        let requests = candidates
+            .iter()
+            .map(|(chunk_id, (logical_length, _))| (*chunk_id, u64::from(*logical_length)))
+            .collect::<Vec<_>>();
+        let resolved = self.index.verified_locations(&self.containers, &requests);
+        assert_eq!(
+            resolved.len(),
+            candidates.len(),
+            "ASSERT: batched Exact lookup returns one result per sorted unique request"
+        );
+        for ((chunk_id, (_logical_length, chunk)), location) in candidates.into_iter().zip(resolved)
+        {
+            if let Some(entry) = location {
+                locations.insert(chunk_id, entry);
+            } else {
+                new_chunks.push(chunk);
+            }
+        }
+        if new_chunks.is_empty() {
+            return self
+                .externalize_chunks(chunks, inode, through_sequence, &locations)
+                .map(|externalized| (externalized, false));
+        }
+        let entries = self.publish_new_chunks(&new_chunks)?;
+        for entry in &entries {
+            if let Some(previous) = locations.insert(entry.chunk_id(), *entry) {
+                assert_eq!(
+                    previous.logical_length(),
+                    entry.logical_length(),
+                    "ASSERT: one Chunk ID cannot identify two logical lengths"
+                );
+            }
+        }
+        let externalized = self.externalize_chunks(chunks, inode, through_sequence, &locations)?;
+        self.index.publish_level_zero(entries);
+        Ok((externalized, true))
+    }
+
+    fn publish_new_chunks(
+        &self,
+        new_chunks: &[&PendingWriteThroughChunk],
+    ) -> Result<Vec<ExactIndexEntry>, DurableNamespaceError> {
+        assert!(
+            !new_chunks.is_empty(),
+            "ASSERT: a new-Chunk Container must contain at least one Chunk"
+        );
         let mut regions = Vec::<Vec<&[u8]>>::new();
         let mut region_bytes = 0_usize;
-        for chunk in &state.pending_chunks {
+        for chunk in new_chunks {
             if region_bytes != 0
                 && region_bytes
                     .checked_add(chunk.bytes.len())
@@ -1070,7 +2103,7 @@ where
             regions
                 .last_mut()
                 .expect("ASSERT: active region exists")
-                .push(chunk.bytes.as_slice());
+                .push(chunk.bytes.as_bytes());
             region_bytes = region_bytes
                 .checked_add(chunk.bytes.len())
                 .ok_or(DurableNamespaceError::OutOfMemory)?;
@@ -1085,14 +2118,17 @@ where
             workers.get() <= self.worker_budget.get(),
             "ASSERT: one encode job cannot exceed the write-through worker budget"
         );
-        let (verified, _) = self.containers.publish_adaptive_regions_parallel_profiled(
+        let prepared = ContainerRepository::<C>::prepare_adaptive_regions_parallel(
             random_container_id()?,
             generation,
             &region_refs,
             workers,
         )?;
         drop(worker_lease);
-        let entries: Vec<ExactIndexEntry> = verified
+        let (verified, _) = self
+            .containers
+            .publish_prepared_adaptive_profiled(prepared)?;
+        let entries = verified
             .locations()
             .iter()
             .copied()
@@ -1101,22 +2137,22 @@ where
                     .expect("ASSERT: verified write-through Location forms an Exact Index entry")
             })
             .collect();
-        let mut locations = BTreeMap::new();
-        for entry in &entries {
-            if let Some(previous) = locations.insert(entry.chunk_id(), *entry) {
-                assert_eq!(
-                    previous.logical_length(),
-                    entry.logical_length(),
-                    "ASSERT: one Chunk ID cannot identify two logical lengths"
-                );
-            }
-        }
+        Ok(entries)
+    }
+
+    fn externalize_chunks(
+        &self,
+        chunks: &[PendingWriteThroughChunk],
+        inode: InodeId,
+        through_sequence: u64,
+        locations: &BTreeMap<ChunkId, ExactIndexEntry>,
+    ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
         let mut externalized = Vec::new();
         externalized
-            .try_reserve(state.pending_chunks.len())
+            .try_reserve(chunks.len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for pending in &state.pending_chunks {
-            let chunk_id = ChunkId::of(&pending.bytes);
+        for pending in chunks {
+            let chunk_id = pending.chunk_id;
             let entry = locations
                 .get(&chunk_id)
                 .copied()
@@ -1137,10 +2173,6 @@ where
                 entry,
             )?);
         }
-        self.index.publish_level_zero(entries);
-        state.pending_chunks.clear();
-        state.pending_bytes = 0;
-        assert_pending_write_through_state(state);
         Ok(externalized)
     }
 
@@ -1173,47 +2205,73 @@ where
         inode: InodeId,
         offset: u64,
         mutation_sequence: u64,
-        bytes: &[u8],
+        bytes: MutationPayload,
     ) -> Vec<ExternalizedExtent> {
-        let error = match self.stage_write(inode, offset, mutation_sequence, bytes) {
-            Ok(externalized) => return externalized,
-            Err(error) => error,
-        };
-        eprintln!(
-            "write-through staging degraded; resident fallback retained: inode={} offset={offset} length={} sequence={mutation_sequence} error={error:?}",
-            inode.get(),
-            bytes.len(),
-        );
-        let mut registry = self
-            .registry
-            .lock()
-            .expect("ASSERT: write-through registry lock poisoned");
-        registry.degraded = true;
-        registry.lanes.remove(&inode);
-        let mut overflow = registry
-            .overflow
-            .lock()
-            .expect("ASSERT: write-through overflow lane lock poisoned");
-        if overflow.inode == Some(inode) {
-            *overflow = WriteThroughStream::default();
-        }
+        self.enqueue_write(inode, offset, mutation_sequence, &bytes);
         Vec::new()
     }
 
-    fn accepted_truncate(&self, inode: InodeId, _mutation_sequence: u64, _length: u64) {
-        let mut registry = self
-            .registry
-            .lock()
-            .expect("ASSERT: write-through registry lock poisoned");
-        registry.lanes.remove(&inode);
-        let mut overflow = registry
-            .overflow
-            .lock()
-            .expect("ASSERT: write-through overflow lane lock poisoned");
-        if overflow.inode == Some(inode) {
-            *overflow = WriteThroughStream::default();
+    fn accepted_truncate(&self, inode: InodeId, mutation_sequence: u64, _length: u64) {
+        self.queue.enqueue(IngestJob {
+            inode,
+            mutation_sequence,
+            kind: IngestJobKind::Truncate,
+        });
+    }
+
+    fn wait_through(&self, inode: InodeId, mutation_sequence: u64) {
+        self.queue.wait_through(inode, mutation_sequence);
+        self.publication_queue
+            .wait_through(inode, mutation_sequence);
+        self.index.flush_level_zero();
+    }
+}
+
+impl<C> Drop for WriteThroughIngest<C> {
+    fn drop(&mut self) {
+        self.queue.shutdown();
+        self.publication_queue.shutdown();
+        let current = std::thread::current().id();
+        let workers = self
+            .workers
+            .get_mut()
+            .expect("ASSERT: ingest worker handle lock poisoned during shutdown");
+        for worker in workers.drain(..) {
+            if worker.thread().id() != current {
+                worker
+                    .join()
+                    .expect("ASSERT: permanent ingest worker must not panic");
+            }
         }
     }
+}
+
+fn install_write_through<C>(
+    namespace: &Arc<Namespace>,
+    containers: ContainerRepository<C>,
+    next_generation: Arc<Mutex<u64>>,
+    index: Arc<dyn ManifestReaderPolicy<C>>,
+    worker_budget: NonZeroUsize,
+) -> Arc<WriteThroughIngest<C>>
+where
+    C: Clone + Send + Sync + StorageIo + 'static,
+{
+    let write_through = Arc::new(WriteThroughIngest {
+        containers,
+        next_generation,
+        index,
+        worker_budget,
+        worker_permits: WorkerPermits::new(worker_budget),
+        active_writers: AtomicUsize::new(0),
+        registry: Mutex::new(WriteThroughRegistry::default()),
+        queue: Arc::new(IngestQueue::new()),
+        publication_queue: Arc::new(PublicationQueue::new()),
+        namespace: OnceLock::new(),
+        workers: Mutex::new(Vec::new()),
+    });
+    write_through.start_workers(namespace);
+    namespace.install_mutation_observer(write_through.clone());
+    write_through
 }
 
 trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
@@ -1226,37 +2284,27 @@ trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
         chunk_id: ChunkId,
         logical_length: u64,
     ) -> Option<ExactIndexEntry>;
+    fn verified_locations(
+        &self,
+        containers: &ContainerRepository<C>,
+        requests: &[(ChunkId, u64)],
+    ) -> Vec<Option<ExactIndexEntry>>;
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>);
+    fn flush_level_zero(&self);
     fn exact_index_degraded(&self) -> bool;
-}
-
-/// Composes one successor proof from the installed predecessor and a fully
-/// verified changed-dependency set. Construction stays private because only
-/// `DurableNamespace` owns the serialized installed-generation transition.
-struct IncrementalGraphVerifier<'a> {
-    complete: &'a dyn RequiredChunkVerifier,
-    changed: &'a BTreeMap<ChunkId, u64>,
-}
-
-impl RequiredChunkVerifier for IncrementalGraphVerifier<'_> {
-    fn verify_required_chunks(&self, required: &BTreeMap<ChunkId, u64>) -> Result<(), StoreError> {
-        for (chunk_id, logical_length) in self.changed {
-            assert_eq!(
-                required.get(chunk_id),
-                Some(logical_length),
-                "ASSERT: incremental DATA proof must be a subset of the reread Manifest graph"
-            );
-        }
-        self.complete.verify_required_chunks(self.changed)
-    }
+    fn exact_index_page_cache_status(&self) -> ExactIndexPageCacheStatus;
+    fn exact_run_membership_status(&self) -> ExactRunMembershipStatus;
+    fn read_cache_status(&self) -> VerifiedReadCacheStatus;
 }
 
 #[derive(Debug)]
-struct ScanManifestReaders;
+struct ScanManifestReaders {
+    read_cache: Arc<VerifiedReadCache>,
+}
 
 impl<C: StorageIo + 'static> ManifestReaderPolicy<C> for ScanManifestReaders {
     fn prepare(&self, file: VerifiedManifestFile<C>) -> VerifiedManifestFile<C> {
-        file
+        file.with_verified_read_cache(Arc::clone(&self.read_cache))
     }
 
     fn graph_verifier(&self, containers: ContainerRepository<C>) -> Box<dyn RequiredChunkVerifier> {
@@ -1276,19 +2324,59 @@ impl<C: StorageIo + 'static> ManifestReaderPolicy<C> for ScanManifestReaders {
         None
     }
 
+    fn verified_locations(
+        &self,
+        _containers: &ContainerRepository<C>,
+        requests: &[(ChunkId, u64)],
+    ) -> Vec<Option<ExactIndexEntry>> {
+        vec![None; requests.len()]
+    }
+
     fn publish_level_zero(&self, _entries: Vec<ExactIndexEntry>) {}
+
+    fn flush_level_zero(&self) {}
 
     fn exact_index_degraded(&self) -> bool {
         false
     }
+
+    fn exact_index_page_cache_status(&self) -> ExactIndexPageCacheStatus {
+        ExactIndexPageCacheStatus::default()
+    }
+
+    fn exact_run_membership_status(&self) -> ExactRunMembershipStatus {
+        ExactRunMembershipStatus::default()
+    }
+
+    fn read_cache_status(&self) -> VerifiedReadCacheStatus {
+        self.read_cache.status()
+    }
 }
 
 struct IndexedManifestReaders<X> {
+    core: Arc<ExactPublisherCore<X>>,
+    publisher: ExactPublicationQueue,
+    read_cache: Arc<VerifiedReadCache>,
+}
+
+struct ExactPublisherCore<X> {
     repository: ExactIndexRunRepository<X>,
     profile: ExactIndexProfileId,
     active: RwLock<Option<Arc<ActivatedExactIndex<X>>>>,
     publish_lock: Mutex<()>,
     degraded: AtomicBool,
+    recent: RwLock<BTreeMap<(ChunkId, u32), ExactIndexEntry>>,
+}
+
+enum ExactPublicationCommand {
+    Publish(Vec<ExactIndexEntry>),
+    Flush(mpsc::SyncSender<()>),
+    Shutdown,
+}
+
+struct ExactPublicationQueue {
+    sender: mpsc::SyncSender<ExactPublicationCommand>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl<X> fmt::Debug for IndexedManifestReaders<X> {
@@ -1296,18 +2384,127 @@ impl<X> fmt::Debug for IndexedManifestReaders<X> {
         formatter
             .debug_struct("IndexedManifestReaders")
             .field("run_count", &self.run_count())
-            .field("degraded", &self.degraded.load(Ordering::Relaxed))
+            .field("degraded", &self.core.degraded.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
 impl<X> IndexedManifestReaders<X> {
     fn run_count(&self) -> usize {
-        self.active
+        self.core
+            .active
             .read()
             .expect("ASSERT: active Exact Index reader lock poisoned")
             .as_ref()
             .map_or(0, |active| active.run_count())
+    }
+}
+
+impl ExactPublicationQueue {
+    fn start<X>(core: Arc<ExactPublisherCore<X>>) -> io::Result<Self>
+    where
+        X: Clone + Send + Sync + StorageIo + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel(EXACT_PUBLICATION_QUEUE_BATCHES);
+        let worker = std::thread::Builder::new()
+            .name("fastdup-exact-publisher".to_owned())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        ExactPublicationCommand::Publish(entries) => {
+                            if core.try_publish_level_zero(entries.clone()).is_ok() {
+                                let mut recent = core
+                                    .recent
+                                    .write()
+                                    .expect("ASSERT: recent Exact Location lock poisoned");
+                                for entry in entries {
+                                    let key = (entry.chunk_id(), entry.logical_length());
+                                    if recent.get(&key) == Some(&entry) {
+                                        recent.remove(&key);
+                                    }
+                                }
+                            } else {
+                                core.degraded.store(true, Ordering::Release);
+                            }
+                        }
+                        ExactPublicationCommand::Flush(reply) => {
+                            let _ = reply.send(());
+                        }
+                        ExactPublicationCommand::Shutdown => break,
+                    }
+                }
+            })?;
+        Ok(Self {
+            sender,
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+
+    fn publish(&self, entries: Vec<ExactIndexEntry>) {
+        self.sender
+            .send(ExactPublicationCommand::Publish(entries))
+            .expect("ASSERT: permanent Exact publisher remains alive while mounted");
+    }
+
+    fn flush(&self) {
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.sender
+            .send(ExactPublicationCommand::Flush(reply))
+            .expect("ASSERT: permanent Exact publisher remains alive while mounted");
+        receive
+            .recv()
+            .expect("ASSERT: permanent Exact publisher acknowledges every fence");
+    }
+}
+
+impl Drop for ExactPublicationQueue {
+    fn drop(&mut self) {
+        let _ = self.sender.send(ExactPublicationCommand::Shutdown);
+        if let Some(worker) = self
+            .worker
+            .get_mut()
+            .expect("ASSERT: Exact publisher handle lock poisoned during shutdown")
+            .take()
+        {
+            worker
+                .join()
+                .expect("ASSERT: permanent Exact publisher must not panic");
+        }
+    }
+}
+
+impl<X> ExactPublisherCore<X>
+where
+    X: Clone + Send + Sync + StorageIo + 'static,
+{
+    fn remember_recent(&self, entries: &[ExactIndexEntry]) {
+        let mut recent = self
+            .recent
+            .write()
+            .expect("ASSERT: recent Exact Location lock poisoned");
+        for entry in entries {
+            recent.insert((entry.chunk_id(), entry.logical_length()), *entry);
+        }
+        while recent.len() > MAX_RECENT_EXACT_LOCATIONS {
+            let oldest_key = *recent
+                .keys()
+                .next()
+                .expect("ASSERT: an oversized recent Exact map is nonempty");
+            recent.remove(&oldest_key);
+        }
+        assert!(
+            recent.len() <= MAX_RECENT_EXACT_LOCATIONS,
+            "ASSERT: recent Exact Location overlay exceeds its entry bound"
+        );
+    }
+
+    fn recent_location(&self, chunk_id: ChunkId, logical_length: u64) -> Option<ExactIndexEntry> {
+        let length = u32::try_from(logical_length).ok()?;
+        self.recent
+            .read()
+            .expect("ASSERT: recent Exact Location lock poisoned")
+            .get(&(chunk_id, length))
+            .copied()
     }
 }
 
@@ -1317,7 +2514,8 @@ where
     X: Clone + Send + Sync + StorageIo + 'static,
 {
     fn prepare(&self, file: VerifiedManifestFile<C>) -> VerifiedManifestFile<C> {
-        match self
+        let file = match self
+            .core
             .active
             .read()
             .expect("ASSERT: active Exact Index reader lock poisoned")
@@ -1325,11 +2523,13 @@ where
         {
             Some(active) => file.with_active_index(Arc::clone(active)),
             None => file,
-        }
+        };
+        file.with_verified_read_cache(Arc::clone(&self.read_cache))
     }
 
     fn graph_verifier(&self, containers: ContainerRepository<C>) -> Box<dyn RequiredChunkVerifier> {
         let active = self
+            .core
             .active
             .read()
             .expect("ASSERT: active Exact Index reader lock poisoned")
@@ -1350,7 +2550,13 @@ where
         chunk_id: ChunkId,
         logical_length: u64,
     ) -> Option<ExactIndexEntry> {
+        if let Some(recent) = self.core.recent_location(chunk_id, logical_length)
+            && containers.read_verified_location(recent).is_ok()
+        {
+            return Some(recent);
+        }
         let active = self
+            .core
             .active
             .read()
             .expect("ASSERT: active Exact Index reader lock poisoned")
@@ -1361,26 +2567,80 @@ where
         {
             location
         } else {
-            self.degraded.store(true, Ordering::Release);
+            self.core.degraded.store(true, Ordering::Release);
             None
         }
+    }
+
+    fn verified_locations(
+        &self,
+        containers: &ContainerRepository<C>,
+        requests: &[(ChunkId, u64)],
+    ) -> Vec<Option<ExactIndexEntry>> {
+        let active = self
+            .core
+            .active
+            .read()
+            .expect("ASSERT: active Exact Index reader lock poisoned")
+            .clone();
+        requests
+            .iter()
+            .map(|(chunk_id, logical_length)| {
+                if let Some(recent) = self.core.recent_location(*chunk_id, *logical_length)
+                    && containers.read_verified_location(recent).is_ok()
+                {
+                    return Some(recent);
+                }
+                let active = active.as_ref()?;
+                if let Ok(location) =
+                    containers.find_verified_location_with_index(active, *chunk_id, *logical_length)
+                {
+                    location
+                } else {
+                    self.core.degraded.store(true, Ordering::Release);
+                    None
+                }
+            })
+            .collect()
     }
 
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>) {
         if entries.is_empty() {
             return;
         }
-        if self.try_publish_level_zero(entries).is_err() {
-            self.degraded.store(true, Ordering::Release);
-        }
+        self.core.remember_recent(&entries);
+        self.publisher.publish(entries);
+    }
+
+    fn flush_level_zero(&self) {
+        self.publisher.flush();
     }
 
     fn exact_index_degraded(&self) -> bool {
-        self.degraded.load(Ordering::Acquire)
+        self.core.degraded.load(Ordering::Acquire)
+    }
+
+    fn exact_index_page_cache_status(&self) -> ExactIndexPageCacheStatus {
+        self.core.repository.page_cache_status()
+    }
+
+    fn exact_run_membership_status(&self) -> ExactRunMembershipStatus {
+        self.core
+            .active
+            .read()
+            .expect("ASSERT: active Exact Index reader lock poisoned")
+            .as_ref()
+            .map_or_else(ExactRunMembershipStatus::default, |active| {
+                active.membership_status()
+            })
+    }
+
+    fn read_cache_status(&self) -> VerifiedReadCacheStatus {
+        self.read_cache.status()
     }
 }
 
-impl<X> IndexedManifestReaders<X>
+impl<X> ExactPublisherCore<X>
 where
     X: Clone + Send + Sync + StorageIo + 'static,
 {
@@ -1421,19 +2681,22 @@ where
         run_refs.push(ExactIndexRunRef::new(0, descriptor)?);
         let mut newest_run_generation = run_generation;
         while let Some((source_level, inputs)) = select_compaction_inputs(&run_refs) {
-            newest_run_generation = newest_run_generation
+            let first_output_generation = newest_run_generation
                 .checked_add(1)
                 .ok_or(fastdup_store::ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
             let target_level = source_level
                 .checked_add(1)
                 .ok_or(fastdup_store::ExactIndexStoreError::InvalidCompactionInput)?;
-            let compacted = self.repository.compact(&inputs, newest_run_generation)?;
+            let compacted =
+                self.repository
+                    .compact_family(&inputs, target_level, first_output_generation)?;
+            newest_run_generation = compacted.last_generation();
             run_refs.retain(|run| {
                 !inputs
                     .iter()
                     .any(|input| input.generation() == run.generation())
             });
-            run_refs.push(ExactIndexRunRef::new(target_level, compacted)?);
+            run_refs.extend_from_slice(compacted.runs());
         }
         let run_set_generation = previous.as_ref().map_or(Ok(1), |active| {
             active
@@ -1454,16 +2717,24 @@ where
 }
 
 fn select_compaction_inputs(runs: &[ExactIndexRunRef]) -> Option<(u16, Vec<ExactIndexRunRef>)> {
-    let mut by_level = BTreeMap::<u16, Vec<ExactIndexRunRef>>::new();
+    let mut by_level = BTreeMap::<u16, BTreeMap<u64, Vec<ExactIndexRunRef>>>::new();
     for run in runs.iter().copied() {
-        by_level.entry(run.level()).or_default().push(run);
+        by_level
+            .entry(run.level())
+            .or_default()
+            .entry(run.family_generation())
+            .or_default()
+            .push(run);
     }
-    for (level, mut candidates) in by_level {
-        if candidates.len() < EXACT_INDEX_COMPACTION_FANIN {
+    for (level, families) in by_level {
+        if families.len() < EXACT_INDEX_COMPACTION_FANIN {
             continue;
         }
-        candidates.sort_unstable_by_key(|run| run.generation());
-        candidates.truncate(EXACT_INDEX_COMPACTION_FANIN);
+        let mut candidates = Vec::new();
+        for (_, mut family) in families.into_iter().take(EXACT_INDEX_COMPACTION_FANIN) {
+            family.sort_unstable_by_key(|run| run.partition_ordinal());
+            candidates.extend(family);
+        }
         return Some((level, candidates));
     }
     None
@@ -1492,12 +2763,13 @@ where
         containers: ContainerRepository<C>,
         inode_reservation_span: u64,
     ) -> Result<Self, DurableNamespaceError> {
+        let read_cache = Arc::new(VerifiedReadCache::new_system()?);
         Self::open_using(
             config,
             generations,
             containers,
             inode_reservation_span,
-            Arc::new(ScanManifestReaders),
+            Arc::new(ScanManifestReaders { read_cache }),
         )
     }
 
@@ -1525,20 +2797,28 @@ where
     where
         X: Clone + Send + Sync + StorageIo + 'static,
     {
+        let read_cache = Arc::new(VerifiedReadCache::new_system()?);
         let recovered = indexes.recover_active();
         let initially_degraded = recovered.is_err();
         let active = recovered.ok().flatten().map(Arc::new);
         let profile = active
             .as_ref()
-            .map_or_else(checkpoint_index_profile_v1, |index| {
+            .map_or_else(checkpoint_exact_index_profile_v1, |index| {
                 index.run_set().profile()
             });
-        let manifest_readers: Arc<dyn ManifestReaderPolicy<C>> = Arc::new(IndexedManifestReaders {
+        let core = Arc::new(ExactPublisherCore {
             repository: indexes.clone(),
             profile,
             active: RwLock::new(active),
             publish_lock: Mutex::new(()),
             degraded: AtomicBool::new(initially_degraded),
+            recent: RwLock::new(BTreeMap::new()),
+        });
+        let publisher = ExactPublicationQueue::start(Arc::clone(&core))?;
+        let manifest_readers: Arc<dyn ManifestReaderPolicy<C>> = Arc::new(IndexedManifestReaders {
+            core,
+            publisher,
+            read_cache,
         });
         Self::open_using(
             config,
@@ -1564,7 +2844,8 @@ where
             .recover_latest_with_verified_files_using(&containers, graph_verifier.as_ref())?;
         let next_container_generation =
             Arc::new(Mutex::new(discover_next_container_generation(&containers)?));
-        let (root, next_inode, reservation_end, verified_files) = match recovered {
+        let (root, next_inode, reservation_end, installed_record, verified_files) = match recovered
+        {
             None => {
                 let reservation_end = FIRST_REGULAR_INODE
                     .checked_add(inode_reservation_span)
@@ -1576,8 +2857,14 @@ where
                     Vec::new(),
                     Vec::new(),
                 )?;
-                generations.commit_namespace(&root)?;
-                (root, FIRST_REGULAR_INODE, reservation_end, Vec::new())
+                let installed_record = generations.commit_namespace(&root)?;
+                (
+                    root,
+                    FIRST_REGULAR_INODE,
+                    reservation_end,
+                    installed_record,
+                    Vec::new(),
+                )
             }
             Some(recovered) => {
                 let (recovered, _prior_files) = recovered.into_parts();
@@ -1598,8 +2885,14 @@ where
                     &containers,
                     graph_verifier.as_ref(),
                 )?;
-                let (_record, verified_files) = committed.into_parts();
-                (root, next_inode, reservation_end, verified_files)
+                let (installed_record, verified_files) = committed.into_parts();
+                (
+                    root,
+                    next_inode,
+                    reservation_end,
+                    installed_record,
+                    verified_files,
+                )
             }
         };
         let manifests = load_manifest_cache(&root, &verified_files)?;
@@ -1613,25 +2906,23 @@ where
             |file| manifest_readers.prepare(file),
         )?;
         let available_workers = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
-        let checkpoint_workers =
-            NonZeroUsize::new(available_workers.get().min(MAX_CHECKPOINT_WORKERS))
-                .expect("ASSERT: the checkpoint worker cap is nonzero");
-        let write_through = Arc::new(WriteThroughIngest {
-            containers: containers.clone(),
-            next_generation: Arc::clone(&next_container_generation),
-            index: Arc::clone(&manifest_readers),
-            worker_budget: checkpoint_workers,
-            worker_permits: WorkerPermits::new(checkpoint_workers),
-            active_writers: AtomicUsize::new(0),
-            registry: Mutex::new(WriteThroughRegistry::default()),
-        });
+        let checkpoint_workers = available_workers;
         let namespace = Arc::new(namespace);
-        namespace.install_mutation_observer(write_through.clone());
+        let write_through = install_write_through(
+            &namespace,
+            containers.clone(),
+            Arc::clone(&next_container_generation),
+            Arc::clone(&manifest_readers),
+            checkpoint_workers,
+        );
         Ok(Self {
             namespace,
             generations,
             containers,
             checkpoint_lock: Mutex::new(()),
+            installed_predecessor: Mutex::new(SuccessorPredecessor::from_committed_record(
+                installed_record,
+            )),
             manifests: Mutex::new(manifests),
             next_container_generation,
             manifest_readers,
@@ -1663,6 +2954,34 @@ where
     #[must_use]
     pub fn exact_index_degraded(&self) -> bool {
         self.manifest_readers.exact_index_degraded()
+    }
+
+    /// Returns bounded, pressure-aware Exact-Index hot-page cache evidence.
+    #[must_use]
+    pub fn exact_index_page_cache_status(&self) -> ExactIndexPageCacheStatus {
+        self.manifest_readers.exact_index_page_cache_status()
+    }
+
+    /// Returns active immutable-Run membership-filter memory and probe evidence.
+    #[must_use]
+    pub fn exact_run_membership_status(&self) -> ExactRunMembershipStatus {
+        self.manifest_readers.exact_run_membership_status()
+    }
+
+    /// Returns bounded shared read-cache memory and hit/miss evidence.
+    ///
+    /// A zero target means memory or Swap pressure disabled admission and
+    /// purged all cached payloads. Fixed set metadata is reported separately
+    /// from resident payload bytes.
+    #[must_use]
+    pub fn verified_read_cache_status(&self) -> VerifiedReadCacheStatus {
+        self.manifest_readers.read_cache_status()
+    }
+
+    /// Returns process-local verified Container-envelope cache telemetry.
+    #[must_use]
+    pub fn container_descriptor_cache_status(&self) -> ContainerDescriptorCacheStatus {
+        self.containers.descriptor_cache_status()
     }
 
     /// Returns the runtime worker cap for independent Compression Regions.
@@ -1721,10 +3040,16 @@ where
         let sealed_at_cut = self.write_through.capture_cut();
         let freeze_started = PhaseStarted::now();
         let Some(commit) = self.namespace.begin_commit()? else {
+            // With no dirty generation, every Container trigger captured above
+            // is stale acceleration evidence rather than uncommitted data.
+            self.write_through.complete_cut(sealed_at_cut);
             return Ok(None);
         };
         let mut metrics = CheckpointMetrics::default();
         freeze_started.finish_into(&mut metrics.freeze);
+        self.write_through.wait_for_commit_cut(&commit);
+        let stable = self.write_through.flush_stable_for_commit_cut()?;
+        self.namespace.externalize_verified_extents(stable);
         let mut writer = AdaptiveCommitWriter::new(
             &self.containers,
             &self.next_container_generation,
@@ -1741,6 +3066,7 @@ where
             .lock()
             .expect("ASSERT: installed Manifest cache lock poisoned");
         for inode in commit.inodes() {
+            writer.begin_inode(inode.inode());
             let previous = installed_manifests
                 .binary_search_by_key(&inode.inode().get(), |manifest| manifest.inode)
                 .ok()
@@ -1752,16 +3078,21 @@ where
                 &mut writer,
             )?);
         }
-        let changed_dependencies = collect_planned_dependencies(&manifests)?;
         drop(installed_manifests);
-        let (level_zero_entries, reduction_metrics) = writer.finish()?;
+        let (level_zero_entries, reduction_metrics, retained_ranges) = writer.finish()?;
         manifest_plan_started.finish_into(&mut metrics.manifest_plan);
         metrics.merge_reduction(&reduction_metrics);
         let exact_index_started = PhaseStarted::now();
         self.manifest_readers.publish_level_zero(level_zero_entries);
+        // A checkpoint may have produced DATA outside the write-through
+        // observer (for example, a partial lane drained at the commit cut).
+        // Its Exact locations must be part of the durable activation history
+        // before the Namespace generation can become visible. Ordinary ingest
+        // keeps publication asynchronous until this commit/Sync fence.
+        self.manifest_readers.flush_level_zero();
         exact_index_started.finish_into(&mut metrics.exact_index_publish);
         let metadata_started = PhaseStarted::now();
-        let record = self.publish_generation(&commit, manifests, &changed_dependencies)?;
+        let record = self.publish_generation(&commit, manifests, &retained_ranges)?;
         self.write_through.complete_cut(sealed_at_cut);
         metadata_started.finish_into(&mut metrics.metadata_commit);
         total_started.finish_into(&mut metrics.total);
@@ -1772,42 +3103,95 @@ where
         &self,
         commit: &NamespaceCommit,
         manifests: Vec<ManifestPublication>,
-    ) -> Result<(Vec<DurableInode>, Vec<InstalledManifest>), DurableNamespaceError> {
+        predecessor: SuccessorPredecessor,
+        retained_ranges: &RetainedManifestRanges,
+    ) -> Result<(Vec<DurableInode>, Vec<ManifestSuccessorProof>), DurableNamespaceError> {
         if manifests.len() != commit.inodes().len() {
             return Err(DurableNamespaceError::FrozenViewMismatch);
         }
         let mut durable_inodes = Vec::new();
-        let mut next_manifests = Vec::new();
+        let mut successor_proofs = Vec::new();
         durable_inodes
             .try_reserve_exact(commit.inodes().len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        next_manifests
+        successor_proofs
             .try_reserve_exact(commit.inodes().len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         for (inode, publication) in commit.inodes().iter().zip(manifests) {
-            let manifest_root = match &publication {
-                ManifestPublication::Reuse { root, .. } => *root,
+            let (manifest_root, mut proof) = match &publication {
+                ManifestPublication::Reuse { summary } => {
+                    let proof = self
+                        .generations
+                        .reuse_manifest_successor(predecessor, *summary);
+                    (summary.root(), proof)
+                }
+                ManifestPublication::Append { previous, extents } => {
+                    let proof =
+                        self.generations
+                            .stage_manifest_append(predecessor, *previous, extents)?;
+                    (proof.summary().root(), proof)
+                }
                 ManifestPublication::Replace {
-                    previous_root,
-                    logical_size,
+                    previous,
                     replacements,
-                    ..
                 } => {
-                    let mut root = *previous_root;
+                    let mut proof = self
+                        .generations
+                        .reuse_manifest_successor(predecessor, *previous);
                     for replacement in replacements {
-                        root = self.generations.publish_manifest_replacement(
-                            root,
-                            *logical_size,
+                        proof = self.generations.stage_manifest_replacement_successor(
+                            proof,
                             replacement.replaced.clone(),
                             &replacement.extents,
                         )?;
                     }
-                    root
+                    (proof.summary().root(), proof)
                 }
-                ManifestPublication::Complete { manifest, .. } => {
-                    self.generations.publish_manifest(manifest)?
+                ManifestPublication::Truncate {
+                    previous,
+                    replacements,
+                    logical_size,
+                    allocated_bytes,
+                } => {
+                    let mut proof = self
+                        .generations
+                        .reuse_manifest_successor(predecessor, *previous);
+                    for replacement in replacements {
+                        proof = self.generations.stage_manifest_replacement_successor(
+                            proof,
+                            replacement.replaced.clone(),
+                            &replacement.extents,
+                        )?;
+                    }
+                    proof = self
+                        .generations
+                        .stage_manifest_truncate_successor(proof, *logical_size)?;
+                    if proof.summary().allocated_bytes() != *allocated_bytes {
+                        return Err(DurableNamespaceError::FrozenViewMismatch);
+                    }
+                    (proof.summary().root(), proof)
+                }
+                ManifestPublication::Complete { manifest } => {
+                    let proof = self
+                        .generations
+                        .stage_manifest_successor(predecessor, manifest)?;
+                    (proof.summary().root(), proof)
                 }
             };
+            if let Some(by_root) = retained_ranges.get(&inode.inode().get()) {
+                for (source_root, ranges) in by_root {
+                    for source_range in coalesced_ranges(ranges)? {
+                        proof = self
+                            .generations
+                            .retain_predecessor_manifest_range_successor(
+                                proof,
+                                *source_root,
+                                source_range,
+                            )?;
+                    }
+                }
+            }
+            successor_proofs.push(proof);
             durable_inodes.push(DurableInode::new(
                 inode.inode().get(),
                 inode.mode(),
@@ -1818,58 +3202,38 @@ where
                 inode.logical_size(),
                 manifest_root,
             )?);
-            next_manifests.push(InstalledManifest {
-                inode: inode.inode().get(),
-                root: manifest_root,
-                logical_size: inode.logical_size(),
-                allocated_bytes: inode.allocated_bytes(),
-            });
         }
-        Ok((durable_inodes, next_manifests))
+        Ok((durable_inodes, successor_proofs))
     }
 
     fn publish_generation(
         &self,
         commit: &NamespaceCommit,
         manifests: Vec<ManifestPublication>,
-        changed_dependencies: &BTreeMap<ChunkId, u64>,
+        retained_ranges: &RetainedManifestRanges,
     ) -> Result<CommitRecord, DurableNamespaceError> {
-        let (durable_inodes, next_manifests) = self.publish_manifest_plans(commit, manifests)?;
+        let predecessor = *self
+            .installed_predecessor
+            .lock()
+            .expect("ASSERT: installed predecessor lock poisoned");
+        let (durable_inodes, successor_proofs) =
+            self.publish_manifest_plans(commit, manifests, predecessor, retained_ranges)?;
         let mut installs = Vec::new();
         installs
             .try_reserve_exact(commit.inodes().len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(commit.entries().len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for entry in commit.entries() {
-            entries.push(NamespaceEntry::new(
-                entry.parent().get(),
-                entry.target().get(),
-                entry.name().to_vec(),
-            )?);
-        }
-        let root = NamespaceRoot::new(
-            commit.inode_reservation_end(),
-            commit.inode_allocation_cursor(),
-            commit.namespace_mutation_sequence(),
-            durable_inodes,
-            entries,
-        )?;
+        let root = namespace_root_for_commit(commit, durable_inodes)?;
         let graph_verifier = self
             .manifest_readers
             .graph_verifier(self.containers.clone());
-        let incremental_verifier = IncrementalGraphVerifier {
-            complete: graph_verifier.as_ref(),
-            changed: changed_dependencies,
-        };
         let committed = self
             .generations
-            .commit_namespace_with_verified_files_using(
+            .commit_namespace_with_successor_proofs_using(
                 &root,
                 &self.containers,
-                &incremental_verifier,
+                predecessor,
+                &successor_proofs,
+                graph_verifier.as_ref(),
             )?;
         let (record, verified_files) = committed.into_parts();
         assert_eq!(
@@ -1877,13 +3241,11 @@ where
             commit.inodes().len(),
             "ASSERT: committed DATA proof must cover every frozen inode"
         );
-        for (ordinal, ((inode, verified), planned_manifest)) in commit
-            .inodes()
-            .iter()
-            .zip(verified_files)
-            .zip(&next_manifests)
-            .enumerate()
-        {
+        let mut next_manifests = Vec::new();
+        next_manifests
+            .try_reserve_exact(verified_files.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for (ordinal, (inode, verified)) in commit.inodes().iter().zip(verified_files).enumerate() {
             assert_eq!(
                 verified.inode(),
                 inode.inode().get(),
@@ -1891,7 +3253,7 @@ where
             );
             assert_eq!(
                 verified.logical_size(),
-                planned_manifest.logical_size,
+                inode.logical_size(),
                 "ASSERT: published Manifest reread length must equal the planned Manifest"
             );
             assert_eq!(
@@ -1899,6 +3261,21 @@ where
                 Some(root.inodes()[ordinal].manifest_root()),
                 "ASSERT: committed DATA proof must retain the published Manifest Root"
             );
+            assert_eq!(
+                verified.allocated_bytes(),
+                inode.allocated_bytes(),
+                "ASSERT: committed Manifest allocation must match the Frozen inode"
+            );
+            let summary = verified
+                .manifest_summary()
+                .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
+            next_manifests.push(InstalledManifest {
+                inode: inode.inode().get(),
+                root: summary.root(),
+                logical_size: summary.logical_size(),
+                allocated_bytes: summary.allocated_bytes(),
+                summary,
+            });
             let installed = Arc::new(ManifestCommittedFile::from_verified(
                 self.manifest_readers.prepare(verified.into_file()),
             )) as Arc<dyn CommittedFile>;
@@ -1913,107 +3290,66 @@ where
             .manifests
             .lock()
             .expect("ASSERT: installed Manifest cache lock poisoned") = next_manifests;
+        *self
+            .installed_predecessor
+            .lock()
+            .expect("ASSERT: installed predecessor lock poisoned") =
+            SuccessorPredecessor::from_committed_record(record);
         Ok(record)
     }
 }
 
+fn namespace_root_for_commit(
+    commit: &NamespaceCommit,
+    durable_inodes: Vec<DurableInode>,
+) -> Result<NamespaceRoot, DurableNamespaceError> {
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(commit.entries().len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    for entry in commit.entries() {
+        entries.push(NamespaceEntry::new(
+            entry.parent().get(),
+            entry.target().get(),
+            entry.name().to_vec(),
+        )?);
+    }
+    NamespaceRoot::new(
+        commit.inode_reservation_end(),
+        commit.inode_allocation_cursor(),
+        commit.namespace_mutation_sequence(),
+        durable_inodes,
+        entries,
+    )
+    .map_err(Into::into)
+}
+
 enum ManifestPublication {
     Reuse {
-        root: MetadataObjectId,
+        summary: ManifestTreeSummary,
+    },
+    Append {
+        previous: ManifestTreeSummary,
+        extents: Vec<ManifestExtent>,
     },
     Replace {
-        previous_root: MetadataObjectId,
-        logical_size: u64,
+        previous: ManifestTreeSummary,
         replacements: Vec<ManifestReplacement>,
-        dependencies: BTreeMap<ChunkId, u64>,
+    },
+    Truncate {
+        previous: ManifestTreeSummary,
+        replacements: Vec<ManifestReplacement>,
+        logical_size: u64,
+        allocated_bytes: u64,
     },
     Complete {
         manifest: ManifestLeaf,
-        dependencies: BTreeMap<ChunkId, u64>,
     },
 }
 
 struct ManifestReplacement {
     replaced: Range<u64>,
     extents: Vec<ManifestExtent>,
-}
-
-fn collect_planned_dependencies(
-    plans: &[ManifestPublication],
-) -> Result<BTreeMap<ChunkId, u64>, DurableNamespaceError> {
-    let mut all = BTreeMap::new();
-    for dependencies in plans.iter().filter_map(|plan| match plan {
-        ManifestPublication::Reuse { .. } => None,
-        ManifestPublication::Replace { dependencies, .. }
-        | ManifestPublication::Complete { dependencies, .. } => Some(dependencies),
-    }) {
-        for (chunk_id, logical_length) in dependencies {
-            insert_chunk_dependency(&mut all, *chunk_id, *logical_length)?;
-        }
-    }
-    Ok(all)
-}
-
-fn insert_chunk_dependency(
-    dependencies: &mut BTreeMap<ChunkId, u64>,
-    chunk_id: ChunkId,
-    logical_length: u64,
-) -> Result<(), DurableNamespaceError> {
-    if let Some(previous_length) = dependencies.insert(chunk_id, logical_length)
-        && previous_length != logical_length
-    {
-        return Err(DurableNamespaceError::ChunkLengthConflict {
-            chunk_id,
-            first_length: previous_length,
-            second_length: logical_length,
-        });
-    }
-    Ok(())
-}
-
-fn collect_changed_manifest_dependencies(
-    previous: Option<&ManifestLeaf>,
-    proposed: &ManifestLeaf,
-    changed: &mut BTreeMap<ChunkId, u64>,
-) -> Result<(), DurableNamespaceError> {
-    let proposed_extents = proposed.extents();
-    let (prefix, suffix) = previous.map_or((0, 0), |previous| {
-        let previous_extents = previous.extents();
-        let prefix = previous_extents
-            .iter()
-            .zip(proposed_extents)
-            .take_while(|(left, right)| left == right)
-            .count();
-        let remaining_previous = previous_extents.len().saturating_sub(prefix);
-        let remaining_proposed = proposed_extents.len().saturating_sub(prefix);
-        let suffix = previous_extents
-            .iter()
-            .rev()
-            .take(remaining_previous)
-            .zip(proposed_extents.iter().rev().take(remaining_proposed))
-            .take_while(|(left, right)| left == right)
-            .count();
-        (prefix, suffix)
-    });
-    let changed_end = proposed_extents
-        .len()
-        .checked_sub(suffix)
-        .expect("ASSERT: common Manifest suffix cannot exceed proposed extents");
-    assert!(
-        prefix <= changed_end,
-        "ASSERT: common Manifest prefix and suffix cannot overlap"
-    );
-    for extent in &proposed_extents[prefix..changed_end] {
-        let ManifestExtent::Data {
-            logical_length,
-            chunk_id,
-        } = *extent
-        else {
-            continue;
-        };
-        insert_chunk_dependency(changed, chunk_id, logical_length)?;
-    }
-    Ok(())
 }
 
 fn plan_checkpoint_manifest<M: StorageIo, C: StorageIo>(
@@ -2032,10 +3368,26 @@ fn plan_checkpoint_manifest<M: StorageIo, C: StorageIo>(
                 return Err(DurableNamespaceError::FrozenViewMismatch);
             }
             return Ok(ManifestPublication::Reuse {
-                root: previous.root,
+                summary: previous.summary,
             });
         }
         return plan_path_local_manifest(inode, previous, &changed, generations, writer);
+    }
+
+    if let Some(previous) = previous
+        && previous.logical_size < logical_size
+        && changed
+            .iter()
+            .all(|range| range.offset() >= previous.logical_size)
+    {
+        return plan_append_manifest(inode, previous, writer);
+    }
+
+    if let Some(previous) = previous
+        && previous.logical_size > logical_size
+        && changed.is_empty()
+    {
+        return plan_truncate_manifest(inode, previous, generations, writer);
     }
 
     let previous_manifest = match previous {
@@ -2045,15 +3397,115 @@ fn plan_checkpoint_manifest<M: StorageIo, C: StorageIo>(
         Some(_) | None => None,
     };
     let manifest = plan_manifest(inode, previous_manifest.as_ref(), writer)?;
-    let mut dependencies = BTreeMap::new();
-    collect_changed_manifest_dependencies(
-        previous_manifest.as_ref(),
-        &manifest,
-        &mut dependencies,
+    Ok(ManifestPublication::Complete { manifest })
+}
+
+fn plan_truncate_manifest<M: StorageIo, C: StorageIo>(
+    inode: &CommitInode,
+    previous: InstalledManifest,
+    generations: &GenerationRepository<M>,
+    writer: &mut AdaptiveCommitWriter<'_, C>,
+) -> Result<ManifestPublication, DurableNamespaceError> {
+    let logical_size = inode.logical_size();
+    assert!(
+        logical_size < previous.logical_size,
+        "ASSERT: truncate plan must shrink the file"
+    );
+    let mut replacements = Vec::new();
+    if logical_size > 0 {
+        let boundary = generations.read_manifest_range(
+            previous.root,
+            previous.logical_size,
+            logical_size - 1..logical_size,
+        )?;
+        let extent = boundary
+            .first()
+            .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
+        let extent_end = extent
+            .logical_offset()
+            .checked_add(extent_length(extent.extent()))
+            .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+        if matches!(extent.extent(), ManifestExtent::Data { .. }) && extent_end > logical_size {
+            let prefix_length = logical_size
+                .checked_sub(extent.logical_offset())
+                .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+            let mut stack = Vec::new();
+            stack
+                .try_reserve_exact(128)
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+            let mut extents = Vec::new();
+            plan_manifest_range_with_prepared(
+                inode,
+                extent.logical_offset(),
+                prefix_length,
+                writer,
+                &mut stack,
+                &mut extents,
+            )?;
+            assert!(
+                stack.is_empty(),
+                "ASSERT: truncate boundary planner must consume its complete work stack"
+            );
+            extents.push(ManifestExtent::Hole {
+                logical_length: extent_end - logical_size,
+            });
+            replacements.push(ManifestReplacement {
+                replaced: extent.logical_offset()..extent_end,
+                extents,
+            });
+        }
+    }
+    Ok(ManifestPublication::Truncate {
+        previous: previous.summary,
+        replacements,
+        logical_size,
+        allocated_bytes: inode.allocated_bytes(),
+    })
+}
+
+fn plan_append_manifest<C: StorageIo>(
+    inode: &CommitInode,
+    previous: InstalledManifest,
+    writer: &mut AdaptiveCommitWriter<'_, C>,
+) -> Result<ManifestPublication, DurableNamespaceError> {
+    let append_length = inode
+        .logical_size()
+        .checked_sub(previous.logical_size)
+        .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+    assert!(append_length > 0, "ASSERT: append plan must grow the file");
+    let mut stack = Vec::new();
+    stack
+        .try_reserve_exact(128)
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    let mut extents = Vec::new();
+    plan_manifest_range_with_prepared(
+        inode,
+        previous.logical_size,
+        append_length,
+        writer,
+        &mut stack,
+        &mut extents,
     )?;
-    Ok(ManifestPublication::Complete {
-        manifest,
-        dependencies,
+    let appended_allocated = extents.iter().try_fold(0_u64, |total, extent| {
+        if matches!(extent, ManifestExtent::Hole { .. }) {
+            Ok(total)
+        } else {
+            total
+                .checked_add(extent_length(extent))
+                .ok_or(DurableNamespaceError::ArithmeticOverflow)
+        }
+    })?;
+    if previous
+        .allocated_bytes
+        .checked_add(appended_allocated)
+        .ok_or(DurableNamespaceError::ArithmeticOverflow)?
+        != inode.allocated_bytes()
+    {
+        return Err(DurableNamespaceError::FrozenViewMismatch);
+    }
+    Ok(ManifestPublication::Append {
+        previous: previous.summary,
+        extents,
     })
 }
 
@@ -2094,7 +3546,6 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
     replacements
         .try_reserve_exact(rewrites.len())
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-    let mut dependencies = BTreeMap::new();
     let mut allocated_bytes = previous.allocated_bytes;
     let mut stack = Vec::new();
     stack
@@ -2108,8 +3559,14 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
         )?;
         let removed = allocated_bytes_in_range(&previous_extents, rewrite.start..rewrite.end)?;
         let mut extents = Vec::new();
-        stack.push((rewrite.start, rewrite.end - rewrite.start));
-        plan_manifest_ranges(inode, writer, &mut stack, &mut extents)?;
+        plan_manifest_range_with_prepared(
+            inode,
+            rewrite.start,
+            rewrite.end - rewrite.start,
+            writer,
+            &mut stack,
+            &mut extents,
+        )?;
         assert!(
             stack.is_empty(),
             "ASSERT: path-local range planner must consume its complete work stack"
@@ -2133,7 +3590,6 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
             .checked_sub(removed)
             .and_then(|remaining| remaining.checked_add(added))
             .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
-        collect_extent_dependencies(&extents, &mut dependencies)?;
         replacements.push(ManifestReplacement {
             replaced: rewrite.start..rewrite.end,
             extents,
@@ -2143,10 +3599,8 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
         return Err(DurableNamespaceError::FrozenViewMismatch);
     }
     Ok(ManifestPublication::Replace {
-        previous_root: previous.root,
-        logical_size: previous.logical_size,
+        previous: previous.summary,
         replacements,
-        dependencies,
     })
 }
 
@@ -2174,23 +3628,15 @@ fn allocated_bytes_in_range(
     Ok(allocated)
 }
 
-fn collect_extent_dependencies(
-    extents: &[ManifestExtent],
-    dependencies: &mut BTreeMap<ChunkId, u64>,
-) -> Result<(), DurableNamespaceError> {
-    for extent in extents {
-        if let ManifestExtent::Data {
-            logical_length,
-            chunk_id,
-        } = *extent
-        {
-            insert_chunk_dependency(dependencies, chunk_id, logical_length)?;
-        }
-    }
-    Ok(())
-}
-
-fn checkpoint_index_profile_v1() -> ExactIndexProfileId {
+/// Exact-Index profile paired with the durable checkpoint's FastCDC-v1 rules.
+///
+/// # Panics
+///
+/// Panics only if BLAKE3 maps the fixed canonical profile bytes to the
+/// reserved all-zero identity, an impossible production `ASSERT` for this
+/// pinned input.
+#[must_use]
+pub fn checkpoint_exact_index_profile_v1() -> ExactIndexProfileId {
     ExactIndexProfileId::new(
         ChunkId::of(b"fastdup/FastCDC-v1/min=16384,target=65536,max=262144,norm=1,seed=0").bytes(),
     )
@@ -2230,11 +3676,15 @@ fn load_manifest_cache<I: StorageIo>(
         {
             return Err(DurableNamespaceError::FrozenViewMismatch);
         }
+        let summary = file
+            .manifest_summary()
+            .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
         manifests.push(InstalledManifest {
             inode: inode.inode(),
-            root: inode.manifest_root(),
-            logical_size: inode.logical_size(),
-            allocated_bytes: file.allocated_bytes(),
+            root: summary.root(),
+            logical_size: summary.logical_size(),
+            allocated_bytes: summary.allocated_bytes(),
+            summary,
         });
     }
     Ok(manifests)
@@ -2274,9 +3724,8 @@ fn plan_full_manifest<C: StorageIo>(
     stack
         .try_reserve_exact(128)
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-    stack.push((0_u64, logical_size));
     let mut extents = Vec::new();
-    plan_manifest_ranges(inode, writer, &mut stack, &mut extents)?;
+    plan_manifest_range_with_prepared(inode, 0, logical_size, writer, &mut stack, &mut extents)?;
     let manifest = ManifestLeaf::new(logical_size, extents)?;
     verify_manifest_allocation(&manifest, inode)?;
     Ok(manifest)
@@ -2359,8 +3808,14 @@ fn plan_incremental_manifest<C: StorageIo>(
             return Err(DurableNamespaceError::FrozenViewMismatch);
         }
         preserve_range(&located, cursor, rewrite.start, &mut extents)?;
-        stack.push((rewrite.start, rewrite.end - rewrite.start));
-        plan_manifest_ranges(inode, writer, &mut stack, &mut extents)?;
+        plan_manifest_range_with_prepared(
+            inode,
+            rewrite.start,
+            rewrite.end - rewrite.start,
+            writer,
+            &mut stack,
+            &mut extents,
+        )?;
         assert!(
             stack.is_empty(),
             "ASSERT: range planner must consume its complete work stack"
@@ -2484,6 +3939,31 @@ fn coalesce_rewrites(rewrites: &mut Vec<RewriteRange>) {
     rewrites.truncate(output);
 }
 
+fn coalesced_ranges(ranges: &[Range<u64>]) -> Result<Vec<Range<u64>>, DurableNamespaceError> {
+    let mut sorted = Vec::new();
+    sorted
+        .try_reserve_exact(ranges.len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    sorted.extend_from_slice(ranges);
+    sorted.sort_unstable_by_key(|range| range.start);
+    let mut output = Vec::<Range<u64>>::new();
+    output
+        .try_reserve_exact(sorted.len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    for range in sorted {
+        if range.start >= range.end {
+            return Err(DurableNamespaceError::FrozenViewMismatch);
+        }
+        match output.last_mut() {
+            Some(previous) if range.start <= previous.end => {
+                previous.end = previous.end.max(range.end);
+            }
+            _ => output.push(range),
+        }
+    }
+    Ok(output)
+}
+
 fn preserve_range(
     located: &[LocatedExtent<'_>],
     start: u64,
@@ -2513,17 +3993,41 @@ fn preserve_range(
                 logical_length: original_length,
                 chunk_id,
             } => {
-                if overlap_start != located_extent.start
-                    || overlap_end != located_extent.end
-                    || logical_length != *original_length
+                if overlap_start == located_extent.start
+                    && overlap_end == located_extent.end
+                    && logical_length == *original_length
                 {
-                    return Err(DurableNamespaceError::FrozenViewMismatch);
-                }
-                ManifestExtent::Data {
-                    logical_length,
-                    chunk_id: *chunk_id,
+                    ManifestExtent::Data {
+                        logical_length,
+                        chunk_id: *chunk_id,
+                    }
+                } else {
+                    ManifestExtent::DataSlice {
+                        logical_length,
+                        chunk_id: *chunk_id,
+                        chunk_length: u32::try_from(*original_length)
+                            .map_err(|_| DurableNamespaceError::ArithmeticOverflow)?,
+                        chunk_offset: u32::try_from(overlap_start - located_extent.start)
+                            .map_err(|_| DurableNamespaceError::ArithmeticOverflow)?,
+                    }
                 }
             }
+            ManifestExtent::DataSlice {
+                chunk_id,
+                chunk_length,
+                chunk_offset,
+                ..
+            } => ManifestExtent::DataSlice {
+                logical_length,
+                chunk_id: *chunk_id,
+                chunk_length: *chunk_length,
+                chunk_offset: chunk_offset
+                    .checked_add(
+                        u32::try_from(overlap_start - located_extent.start)
+                            .map_err(|_| DurableNamespaceError::ArithmeticOverflow)?,
+                    )
+                    .ok_or(DurableNamespaceError::ArithmeticOverflow)?,
+            },
             ManifestExtent::Hole { .. } => ManifestExtent::Hole { logical_length },
             ManifestExtent::Fill { value, .. } => ManifestExtent::Fill {
                 logical_length,
@@ -2542,9 +4046,106 @@ fn preserve_range(
 const fn extent_length(extent: &ManifestExtent) -> u64 {
     match *extent {
         ManifestExtent::Data { logical_length, .. }
+        | ManifestExtent::DataSlice { logical_length, .. }
         | ManifestExtent::Hole { logical_length }
         | ManifestExtent::Fill { logical_length, .. } => logical_length,
     }
+}
+
+fn plan_manifest_range_with_prepared<C: StorageIo>(
+    inode: &CommitInode,
+    offset: u64,
+    length: u64,
+    writer: &mut AdaptiveCommitWriter<'_, C>,
+    stack: &mut Vec<(u64, u64)>,
+    extents: &mut Vec<ManifestExtent>,
+) -> Result<(), DurableNamespaceError> {
+    assert!(length > 0, "ASSERT: manifest range must be nonempty");
+    assert!(
+        stack.is_empty(),
+        "ASSERT: prepared range planning requires an empty work stack"
+    );
+    let end = offset
+        .checked_add(length)
+        .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+    let prepared = inode.prepared_extents_in_range(offset, length)?;
+    let mut cursor = offset;
+    for extent in prepared {
+        let prepared_end = extent
+            .offset()
+            .checked_add(extent.length())
+            .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+        if extent.offset() < cursor || prepared_end > end {
+            return Err(DurableNamespaceError::FrozenViewMismatch);
+        }
+        if cursor < extent.offset() {
+            stack.push((cursor, extent.offset() - cursor));
+            plan_manifest_ranges(inode, writer, stack, extents)?;
+            assert!(
+                stack.is_empty(),
+                "ASSERT: range planner must consume a prepared-recipe gap"
+            );
+        }
+        let manifest_extent = match extent.recipe() {
+            PreparedDataRecipe::Chunk { chunk_id } => {
+                if extent.length()
+                    > u64::try_from(MAX_LOGICAL_CHUNK_BYTES)
+                        .expect("ASSERT: maximum logical Chunk bytes fit u64")
+                {
+                    return Err(DurableNamespaceError::FrozenViewMismatch);
+                }
+                let chunk_id = ChunkId::from_bytes(chunk_id);
+                writer.record_prepared_chunk(chunk_id, extent.length(), extent)?;
+                ManifestExtent::Data {
+                    logical_length: extent.length(),
+                    chunk_id,
+                }
+            }
+            PreparedDataRecipe::ChunkSlice {
+                chunk_id,
+                chunk_length,
+                chunk_offset,
+            } => {
+                let slice_end = u64::from(chunk_offset)
+                    .checked_add(extent.length())
+                    .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+                if chunk_length == 0
+                    || usize::try_from(chunk_length).is_err()
+                    || usize::try_from(chunk_length)
+                        .is_ok_and(|length| length > MAX_LOGICAL_CHUNK_BYTES)
+                    || slice_end > u64::from(chunk_length)
+                {
+                    return Err(DurableNamespaceError::FrozenViewMismatch);
+                }
+                let chunk_id = ChunkId::from_bytes(chunk_id);
+                writer.record_prepared_chunk(chunk_id, u64::from(chunk_length), extent)?;
+                ManifestExtent::DataSlice {
+                    logical_length: extent.length(),
+                    chunk_id,
+                    chunk_length,
+                    chunk_offset,
+                }
+            }
+            PreparedDataRecipe::Fill { value } => {
+                writer.record_prepared_fill(extent.length());
+                ManifestExtent::Fill {
+                    logical_length: extent.length(),
+                    value,
+                }
+            }
+        };
+        push_extent(extents, manifest_extent)?;
+        cursor = prepared_end;
+    }
+    if cursor < end {
+        stack.push((cursor, end - cursor));
+        plan_manifest_ranges(inode, writer, stack, extents)?;
+    }
+    assert!(
+        stack.is_empty(),
+        "ASSERT: prepared range planner must consume its complete work stack"
+    );
+    Ok(())
 }
 
 fn plan_manifest_ranges<C: StorageIo>(
@@ -2605,6 +4206,11 @@ fn plan_allocated_range<C: StorageIo>(
         CDC_MAXIMUM_BYTES, MAX_LOGICAL_CHUNK_BYTES,
         "ASSERT: FastCDC-v1 maximum must equal the durable format bound"
     );
+    writer.metrics.checkpoint_rechunk_bytes = writer
+        .metrics
+        .checkpoint_rechunk_bytes
+        .checked_add(length)
+        .expect("ASSERT: checkpoint rechunk bytes cannot overflow u64");
     let reader = CommitRangeReader {
         inode,
         start: offset,
@@ -2750,6 +4356,7 @@ fn verify_manifest_allocation(
     let planned_allocated = manifest.extents().iter().try_fold(0_u64, |total, extent| {
         let length = match extent {
             ManifestExtent::Data { logical_length, .. }
+            | ManifestExtent::DataSlice { logical_length, .. }
             | ManifestExtent::Fill { logical_length, .. } => *logical_length,
             ManifestExtent::Hole { .. } => 0,
         };
@@ -2811,6 +4418,8 @@ struct AdaptiveCommitWriter<'a, C> {
     payload_bytes: usize,
     workers: NonZeroUsize,
     metrics: CheckpointReductionMetrics,
+    current_inode: Option<u64>,
+    retained_ranges: RetainedManifestRanges,
 }
 
 impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
@@ -2830,7 +4439,94 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             payload_bytes: 0,
             workers,
             metrics: CheckpointReductionMetrics::default(),
+            current_inode: None,
+            retained_ranges: BTreeMap::new(),
         }
+    }
+
+    fn begin_inode(&mut self, inode: InodeId) {
+        self.current_inode = Some(inode.get());
+    }
+
+    fn record_prepared_chunk(
+        &mut self,
+        chunk_id: ChunkId,
+        length: u64,
+        prepared: PreparedCommitExtent,
+    ) -> Result<(), DurableNamespaceError> {
+        assert!(length > 0, "ASSERT: a prepared Chunk is nonempty");
+        if let Some(previous) = self.seen.insert(chunk_id, length)
+            && previous != length
+        {
+            return Err(DurableNamespaceError::ChunkLengthConflict {
+                chunk_id,
+                first_length: previous,
+                second_length: length,
+            });
+        }
+        match (
+            prepared.retained_manifest_root(),
+            prepared.retained_source_offset(),
+        ) {
+            (Some(root), Some(source_offset)) => {
+                let root =
+                    MetadataObjectId::new(root).ok_or(DurableNamespaceError::FrozenViewMismatch)?;
+                let end = source_offset
+                    .checked_add(prepared.length())
+                    .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+                let inode = self
+                    .current_inode
+                    .expect("ASSERT: prepared Chunk planning requires an active inode");
+                self.retained_ranges
+                    .entry(inode)
+                    .or_default()
+                    .entry(root)
+                    .or_default()
+                    .push(source_offset..end);
+            }
+            (None, None) => {}
+            _ => return Err(DurableNamespaceError::FrozenViewMismatch),
+        }
+        self.record_prepared_recipe(length);
+        Ok(())
+    }
+
+    fn record_prepared_fill(&mut self, length: u64) {
+        assert!(length > 0, "ASSERT: a prepared FILL is nonempty");
+        self.metrics.fill_chunks = self
+            .metrics
+            .fill_chunks
+            .checked_add(1)
+            .expect("ASSERT: checkpoint FILL Chunk count cannot overflow u64");
+        self.metrics.fill_bytes = self
+            .metrics
+            .fill_bytes
+            .checked_add(length)
+            .expect("ASSERT: checkpoint FILL bytes cannot overflow u64");
+        self.record_prepared_recipe(length);
+    }
+
+    fn record_prepared_recipe(&mut self, length: u64) {
+        self.metrics.logical_chunks = self
+            .metrics
+            .logical_chunks
+            .checked_add(1)
+            .expect("ASSERT: checkpoint logical Chunk count cannot overflow u64");
+        self.metrics.logical_chunk_bytes = self
+            .metrics
+            .logical_chunk_bytes
+            .checked_add(length)
+            .expect("ASSERT: checkpoint logical Chunk bytes cannot overflow u64");
+        self.metrics.recipe_reuse_chunks = self
+            .metrics
+            .recipe_reuse_chunks
+            .checked_add(1)
+            .expect("ASSERT: checkpoint recipe-reuse count cannot overflow u64");
+        self.metrics.recipe_reuse_bytes = self
+            .metrics
+            .recipe_reuse_bytes
+            .checked_add(length)
+            .expect("ASSERT: checkpoint recipe-reuse bytes cannot overflow u64");
     }
 
     fn push(&mut self, chunk_id: ChunkId, bytes: Vec<u8>) -> Result<(), DurableNamespaceError> {
@@ -2908,11 +4604,9 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             .expect("ASSERT: checkpoint Exact Hit bytes cannot overflow u64");
     }
 
-    fn finish(
-        mut self,
-    ) -> Result<(Vec<ExactIndexEntry>, CheckpointReductionMetrics), DurableNamespaceError> {
+    fn finish(mut self) -> Result<AdaptiveCommitFinish, DurableNamespaceError> {
         self.flush()?;
-        Ok((self.level_zero_entries, self.metrics))
+        Ok((self.level_zero_entries, self.metrics, self.retained_ranges))
     }
 
     fn flush(&mut self) -> Result<(), DurableNamespaceError> {
@@ -3053,6 +4747,7 @@ pub enum DurableNamespaceError {
     Store(StoreError),
     Generation(GenerationError),
     Manifest(ManifestReadError),
+    ReadCache(VerifiedReadCacheError),
     Mount(MountError),
     InvalidReservationSpan,
     InodeReservationExhausted,
@@ -3081,6 +4776,7 @@ impl std::error::Error for DurableNamespaceError {
             Self::Store(error) => Some(error),
             Self::Generation(error) => Some(error),
             Self::Manifest(error) => Some(error),
+            Self::ReadCache(error) => Some(error),
             Self::Mount(error) => Some(error),
             Self::Posix(_)
             | Self::InvalidReservationSpan
@@ -3130,6 +4826,12 @@ impl From<ManifestReadError> for DurableNamespaceError {
     }
 }
 
+impl From<VerifiedReadCacheError> for DurableNamespaceError {
+    fn from(error: VerifiedReadCacheError) -> Self {
+        Self::ReadCache(error)
+    }
+}
+
 impl From<MountError> for DurableNamespaceError {
     fn from(error: MountError) -> Self {
         Self::Mount(error)
@@ -3139,6 +4841,117 @@ impl From<MountError> for DurableNamespaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastdup_testkit::MemoryStorageIo;
+
+    #[test]
+    fn exact_externalization_consumes_existing_verification_without_second_container_read() {
+        let storage = MemoryStorageIo::new();
+        let containers = ContainerRepository::new(storage.clone());
+        let container_id = ContainerId::new([0xD4; 16]).expect("fixture ID is nonzero");
+        let payload = b"one verified exact Chunk must not be physically verified twice";
+        containers
+            .publish_raw(container_id, 23, &[payload])
+            .expect("publish fixture Container");
+        let sealed = containers
+            .read(container_id)
+            .expect("read rebuild evidence for fixture entry");
+        let entry = ExactIndexEntry::from_verified_raw(sealed.raw_locations()[0])
+            .expect("construct fixture Exact entry");
+        let verified = containers
+            .read_verified_location(entry)
+            .expect("perform the one physical candidate verification");
+        let after_verification = storage.operation_count();
+        let external = VerifiedLocationFile { containers, entry };
+
+        assert!(
+            external
+                .matches_complete_bytes(&verified)
+                .expect("match already verified bytes"),
+            "the externalization proof must match the physically verified Chunk"
+        );
+        assert_eq!(
+            storage.operation_count(),
+            after_verification,
+            "frontend externalization must not repeat Container envelope or Record I/O"
+        );
+    }
+
+    #[test]
+    fn segmented_ingest_tail_compacts_once_and_consumes_without_memmove() {
+        let mut tail = SegmentedIngestTail::default();
+        for bytes in [b"abc".as_slice(), b"defg".as_slice(), b"hijkl".as_slice()] {
+            tail.push(
+                MutationPayload::try_copy_from_slice(bytes).expect("allocate fixture segment"),
+            );
+        }
+
+        tail.make_prefix_contiguous(8)
+            .expect("compact bounded fixture prefix");
+        assert_eq!(tail.front_bytes(), b"abcdefgh");
+        let consumed = tail.take_prefix(5).expect("consume compact prefix");
+        assert_eq!(consumed.as_bytes(), b"abcde");
+        assert_eq!(tail.len(), 7);
+        tail.make_prefix_contiguous(7)
+            .expect("compact remaining fixture bytes");
+        assert_eq!(tail.front_bytes(), b"fghijkl");
+    }
+
+    #[test]
+    fn independent_ingest_lane_state_starts_on_cache_lines() {
+        assert_eq!(std::mem::align_of::<WriteThroughStream>(), 64);
+    }
+
+    #[test]
+    fn segmented_fastcdc_matches_contiguous_v1_boundaries() {
+        let mut state = 0x5eed_cafe_1234_5678_u64;
+        let mut source = vec![0_u8; 4 * 1_024 * 1_024 + 91_337];
+        for byte in &mut source {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state.to_le_bytes()[0];
+        }
+        let stable_end = source.len() - CDC_MAXIMUM_BYTES;
+        let expected = FastCDC::with_level_and_seed(
+            &source,
+            CDC_MINIMUM_BYTES,
+            CDC_TARGET_BYTES,
+            CDC_MAXIMUM_BYTES,
+            Normalization::Level1,
+            CDC_SEED_V1,
+        )
+        .take_while(|chunk| chunk.offset + chunk.length <= stable_end)
+        .map(|chunk| source[chunk.offset..chunk.offset + chunk.length].to_vec())
+        .collect::<Vec<_>>();
+
+        let mut tail = SegmentedIngestTail::default();
+        let segment_sizes = [1, 4_095, 131_071, 17, 1_048_576, 65_537];
+        let mut cursor = 0_usize;
+        let mut ordinal = 0_usize;
+        while cursor < source.len() {
+            let end = cursor
+                .saturating_add(segment_sizes[ordinal % segment_sizes.len()])
+                .min(source.len());
+            tail.push(
+                MutationPayload::try_copy_from_slice(&source[cursor..end])
+                    .expect("allocate segmented fixture"),
+            );
+            cursor = end;
+            ordinal += 1;
+        }
+        let mut observed = Vec::new();
+        while let Some(chunk) =
+            take_next_stable_fastcdc_chunk(&mut tail).expect("chunk segmented fixture")
+        {
+            observed.push(chunk.as_bytes().to_vec());
+        }
+
+        assert_eq!(observed, expected);
+        assert_eq!(
+            tail.len(),
+            source.len() - expected.iter().map(Vec::len).sum::<usize>()
+        );
+    }
 
     #[test]
     fn full_registry_never_evicts_an_in_flight_ingest_lane() {
@@ -3199,6 +5012,49 @@ mod tests {
     }
 
     #[test]
+    fn ingest_queue_preserves_per_inode_sequence_order() {
+        let queue = IngestQueue::new();
+        let inode = InodeId::new(2).expect("fixture inode is nonzero");
+        queue.enqueue(IngestJob {
+            inode,
+            mutation_sequence: 7,
+            kind: IngestJobKind::Write {
+                offset: 0,
+                bytes: MutationPayload::try_copy_from_slice(&[1])
+                    .expect("allocate fixture payload"),
+                final_for_sequence: true,
+            },
+        });
+        queue.enqueue(IngestJob {
+            inode,
+            mutation_sequence: 8,
+            kind: IngestJobKind::Truncate,
+        });
+
+        let first = queue.next_job().expect("first queued job exists");
+        assert_eq!(first.mutation_sequence, 7);
+        queue.finish(&first);
+        let second = queue.next_job().expect("second queued job exists");
+        assert_eq!(second.mutation_sequence, 8);
+        queue.finish(&second);
+        queue.wait_through(inode, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "per-inode ingest admission sequence cannot move backwards")]
+    fn ingest_queue_asserts_on_decreasing_inode_sequence() {
+        let queue = IngestQueue::new();
+        let inode = InodeId::new(2).expect("fixture inode is nonzero");
+        for mutation_sequence in [8, 7] {
+            queue.enqueue(IngestJob {
+                inode,
+                mutation_sequence,
+                kind: IngestJobKind::Truncate,
+            });
+        }
+    }
+
+    #[test]
     fn encode_worker_permits_cannot_overbook_the_write_through_budget() {
         let budget = NonZeroUsize::new(10).expect("fixture budget is nonzero");
         let permits = WorkerPermits::new(budget);
@@ -3237,7 +5093,9 @@ mod tests {
         let state = WriteThroughStream {
             pending_chunks: vec![PendingWriteThroughChunk {
                 offset: 0,
-                bytes: vec![1, 2, 3],
+                chunk_id: ChunkId::of(&[1, 2, 3]),
+                bytes: MutationPayload::try_copy_from_slice(&[1, 2, 3])
+                    .expect("allocate fixture payload"),
             }],
             pending_bytes: 2,
             ..WriteThroughStream::default()
@@ -3248,8 +5106,18 @@ mod tests {
     #[test]
     #[should_panic(expected = "one Ingest Lane exceeded one Container plus CDC suffix")]
     fn stable_lane_asserts_on_an_impossible_buffer_overshoot() {
+        let mut tail = SegmentedIngestTail::default();
+        tail.push(
+            MutationPayload::try_copy_from_slice(&vec![
+                0_u8;
+                CONTAINER_PAYLOAD_TARGET_BYTES
+                    + CDC_MAXIMUM_BYTES
+                    + 1
+            ])
+            .expect("allocate oversized fixture payload"),
+        );
         let state = WriteThroughStream {
-            tail: vec![0_u8; CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES + 1],
+            tail,
             ..WriteThroughStream::default()
         };
         assert_bounded_write_through_lane(&state);

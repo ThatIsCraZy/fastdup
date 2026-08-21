@@ -193,7 +193,7 @@ alignment. Zstd is selected only when it saves at least 4,096 bytes and at least
 3%; otherwise each chunk remains one RAW record. Recovery-Index cost is equal
 per logical chunk in both alternatives.
 
-Independent regions may be encoded by scoped workers. Each worker owns disjoint
+Independent regions may be encoded by permanent-pool workers. Each worker owns disjoint
 region ordinals and private output buffers; the writer merges completed records
 strictly by original ordinal before computing Container layout, Recovery Index,
 Footer hash, or CRCs. Worker count and completion order therefore do not affect

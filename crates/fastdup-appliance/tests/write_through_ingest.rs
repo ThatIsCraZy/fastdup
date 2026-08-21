@@ -3,15 +3,19 @@ use fastdup_posix::{
     HandleId, InodeId, Namespace, NamespaceConfig, OpenOptions, Operation, ROOT_INODE, Reply,
     RequestContext,
 };
-use fastdup_store::{ContainerRepository, ExactIndexRunRepository, GenerationRepository};
-use fastdup_testkit::MemoryStorageIo;
-use std::sync::Barrier;
+use fastdup_store::{
+    ContainerRepository, ExactIndexRunRepository, GenerationRepository, StorageIo,
+};
+use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
+use std::sync::{Arc, Barrier, mpsc};
+use std::time::Duration;
 
 const CALLER: RequestContext = RequestContext {
     uid: 1_000,
     gid: 1_000,
     pid: 7,
 };
+const STORAGE_REACH_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Appliance = DurableNamespace<MemoryStorageIo, MemoryStorageIo>;
 
@@ -38,7 +42,319 @@ fn open_appliance_on(
     .expect("open write-through appliance")
 }
 
-fn create_file(appliance: &Appliance, name: &[u8]) -> (InodeId, HandleId) {
+fn open_appliance_with_paused_containers(
+    containers: PausedStorageIo,
+) -> DurableNamespace<MemoryStorageIo, PausedStorageIo> {
+    DurableNamespace::open_with_index(
+        NamespaceConfig::default(),
+        GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set_v1()),
+        ContainerRepository::new(containers),
+        &ExactIndexRunRepository::new(MemoryStorageIo::new()),
+        32,
+    )
+    .expect("open write-through appliance with paused data tier")
+}
+
+#[test]
+fn write_returns_and_is_live_while_container_durability_is_blocked() {
+    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode, handle) = create_file(&appliance, b"async-write");
+    let block = fixture_block();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let writer_appliance = Arc::clone(&appliance);
+    let writer = std::thread::spawn(move || {
+        for ordinal in 0_u64..34 {
+            write_one_mebibyte(&writer_appliance, inode, handle, ordinal, &block);
+        }
+        finished_tx
+            .send(())
+            .expect("test receiver remains available");
+    });
+
+    assert!(
+        paused.wait_until_reached(STORAGE_REACH_TIMEOUT),
+        "worked stream must reach Container file durability"
+    );
+    let completed_while_paused = finished_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    let live = read_fixture(&appliance, inode, handle);
+    paused.resume();
+    writer.join().expect("writer thread completes");
+
+    assert!(
+        completed_while_paused,
+        "FUSE-visible writes must not wait for background Container durability"
+    );
+    assert_eq!(live.len(), 4_096);
+}
+
+#[test]
+fn one_stream_chunks_a_second_container_while_the_first_waits_for_durability() {
+    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode, handle) = create_file(&appliance, b"same-inode-overlap");
+    let block = fixture_block();
+    let writer_appliance = Arc::clone(&appliance);
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        for ordinal in 0_u64..70 {
+            write_one_mebibyte(&writer_appliance, inode, handle, ordinal, &block);
+        }
+        finished_tx
+            .send(())
+            .expect("test receiver remains available");
+    });
+
+    assert!(
+        paused.wait_until_reached(STORAGE_REACH_TIMEOUT),
+        "the first detached Container reaches its durability barrier"
+    );
+    let completed_while_paused = finished_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+    paused.resume();
+    writer.join().expect("writer thread completes");
+    fence_ingest(&appliance, inode, handle);
+    let status = appliance.write_through_status();
+    let Reply::Data(live_tail) = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Read {
+                inode,
+                handle,
+                offset: 69 * 1_048_576,
+                length: 4_096,
+            },
+        )
+        .expect("the newest admitted bytes stay live")
+    else {
+        panic!("read returned the wrong reply");
+    };
+
+    assert!(
+        completed_while_paused,
+        "same-inode FastCDC must advance beyond one blocked Container publication: {status:?}"
+    );
+    assert_eq!(live_tail.len(), 4_096);
+    assert_eq!(
+        status.sealed_uncommitted_containers(),
+        1,
+        "queued Containers must recheck newly published Exact locations before writing duplicate DATA"
+    );
+    assert!(
+        status.buffered_bytes() <= 384 * 1_024 * 1_024,
+        "detached publication work remains inside the process ingest budget: {status:?}"
+    );
+}
+
+#[test]
+fn release_waits_for_its_last_queued_write_without_blocking_write_admission() {
+    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode, handle) = create_file(&appliance, b"close-fence");
+    let block = fixture_block();
+    for ordinal in 0_u64..34 {
+        write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
+    }
+    assert!(
+        paused.wait_until_reached(STORAGE_REACH_TIMEOUT),
+        "background reduction must reach blocked durability"
+    );
+
+    let release_appliance = Arc::clone(&appliance);
+    let (released_tx, released_rx) = mpsc::channel();
+    let release = std::thread::spawn(move || {
+        release_appliance
+            .namespace()
+            .dispatch(CALLER, Operation::Release { inode, handle })
+            .expect("release succeeds after its sequence fence");
+        released_tx
+            .send(())
+            .expect("test receiver remains available");
+    });
+    let released_while_paused = released_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    paused.resume();
+    release.join().expect("release thread completes");
+
+    assert!(
+        !released_while_paused,
+        "close must fence its accepted writes before retiring the handle"
+    );
+}
+
+#[test]
+fn different_files_reach_container_durability_in_parallel() {
+    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode_a, handle_a) = create_file(&appliance, b"parallel-sync-a");
+    let (inode_b, handle_b) = create_file(&appliance, b"parallel-sync-b");
+    let block_a = fixture_block();
+    let mut block_b = fixture_block();
+    for byte in &mut block_b {
+        *byte = byte.wrapping_add(37);
+    }
+
+    let first_stream = Arc::clone(&appliance);
+    let writer_a = std::thread::spawn(move || {
+        for ordinal in 0_u64..34 {
+            write_one_mebibyte(&first_stream, inode_a, handle_a, ordinal, &block_a);
+        }
+    });
+    assert!(
+        paused.wait_until_reached_count(1, STORAGE_REACH_TIMEOUT),
+        "first file reaches blocked durability"
+    );
+    let second_stream = Arc::clone(&appliance);
+    let writer_b = std::thread::spawn(move || {
+        for ordinal in 0_u64..34 {
+            write_one_mebibyte(&second_stream, inode_b, handle_b, ordinal, &block_b);
+        }
+    });
+
+    let both_reached_durability = paused.wait_until_reached_count(2, STORAGE_REACH_TIMEOUT);
+    paused.resume();
+    writer_a.join().expect("first writer completes");
+    writer_b.join().expect("second writer completes");
+    assert!(
+        both_reached_durability,
+        "one blocked file must not retain the complete global encode budget during data-tier I/O"
+    );
+}
+
+#[test]
+fn admission_blocks_only_after_the_bounded_ingest_queue_fills() {
+    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode, handle) = create_file(&appliance, b"queue-pressure");
+    let block = fixture_block();
+    let writer_appliance = Arc::clone(&appliance);
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        for ordinal in 0_u64..128 {
+            write_one_mebibyte(&writer_appliance, inode, handle, ordinal, &block);
+        }
+        finished_tx
+            .send(())
+            .expect("test receiver remains available");
+    });
+    assert!(
+        paused.wait_until_reached(STORAGE_REACH_TIMEOUT),
+        "stream reaches blocked Container durability"
+    );
+    let finished_before_space = finished_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    paused.resume();
+    writer
+        .join()
+        .expect("writer completes after queue space returns");
+
+    assert!(
+        !finished_before_space,
+        "writes beyond two detached Containers and the bounded queue must apply admission backpressure"
+    );
+}
+
+#[test]
+fn status_does_not_deadlock_a_full_single_stream_publication_queue() {
+    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode, handle) = create_file(&appliance, b"status-under-queue-pressure");
+    let block = fixture_block();
+    let writer_appliance = Arc::clone(&appliance);
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        for ordinal in 0_u64..128 {
+            write_one_mebibyte(&writer_appliance, inode, handle, ordinal, &block);
+        }
+        finished_tx
+            .send(())
+            .expect("writer completion receiver remains available");
+    });
+    assert!(
+        paused.wait_until_reached(STORAGE_REACH_TIMEOUT),
+        "single-stream publication reaches blocked Container durability"
+    );
+    assert!(
+        finished_rx.recv_timeout(Duration::from_secs(1)).is_err(),
+        "fixture must fill the bounded same-inode publication queue"
+    );
+
+    let status_appliance = Arc::clone(&appliance);
+    let (status_tx, status_rx) = mpsc::channel();
+    let status_reader = std::thread::spawn(move || {
+        let status = status_appliance.write_through_status();
+        status_tx
+            .send(status)
+            .expect("status receiver remains available");
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    paused.resume();
+    let status = status_rx
+        .recv_timeout(STORAGE_REACH_TIMEOUT)
+        .expect("status must release the Registry so a publisher can retire queue pressure");
+    assert!(
+        status.queued_bytes() != 0,
+        "fixture must observe real publication-queue pressure"
+    );
+
+    writer
+        .join()
+        .expect("writer completes after durability resumes");
+    status_reader.join().expect("status reader completes");
+}
+
+#[test]
+fn unlink_sequence_barrier_allows_release_to_finish_after_queued_writes() {
+    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode, handle) = create_file(&appliance, b"unlinked-while-reducing");
+    let block = fixture_block();
+    for ordinal in 0_u64..34 {
+        write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
+    }
+    assert!(
+        paused.wait_until_reached(STORAGE_REACH_TIMEOUT),
+        "background reduction must reach blocked durability"
+    );
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Unlink {
+                parent: ROOT_INODE,
+                name: b"unlinked-while-reducing",
+            },
+        )
+        .expect("unlink installs an ordered ingest barrier");
+
+    let release_appliance = Arc::clone(&appliance);
+    let (released_tx, released_rx) = mpsc::channel();
+    let release = std::thread::spawn(move || {
+        release_appliance
+            .namespace()
+            .dispatch(CALLER, Operation::Release { inode, handle })
+            .expect("release crosses the unlink sequence barrier");
+        released_tx
+            .send(())
+            .expect("test receiver remains available");
+    });
+    assert!(
+        released_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_err(),
+        "release must not skip the queued write or unlink barrier"
+    );
+    paused.resume();
+    assert!(
+        released_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "release must not wait forever on an unobserved unlink sequence"
+    );
+    release.join().expect("release thread completes");
+}
+
+fn create_file<M, C>(appliance: &DurableNamespace<M, C>, name: &[u8]) -> (InodeId, HandleId)
+where
+    M: Clone + Send + Sync + StorageIo + 'static,
+    C: Clone + Send + Sync + StorageIo + 'static,
+{
     let Reply::Created { entry, handle } = appliance
         .namespace()
         .dispatch(
@@ -101,7 +417,15 @@ fn write_salted_fixture(
     block[..4_096].to_vec()
 }
 
-fn read_fixture(appliance: &Appliance, inode: InodeId, handle: HandleId) -> Vec<u8> {
+fn read_fixture<M, C>(
+    appliance: &DurableNamespace<M, C>,
+    inode: InodeId,
+    handle: HandleId,
+) -> Vec<u8>
+where
+    M: Clone + Send + Sync + StorageIo + 'static,
+    C: Clone + Send + Sync + StorageIo + 'static,
+{
     let Reply::Data(bytes) = appliance
         .namespace()
         .dispatch(
@@ -120,13 +444,16 @@ fn read_fixture(appliance: &Appliance, inode: InodeId, handle: HandleId) -> Vec<
     bytes
 }
 
-fn write_one_mebibyte(
-    appliance: &Appliance,
+fn write_one_mebibyte<M, C>(
+    appliance: &DurableNamespace<M, C>,
     inode: InodeId,
     handle: HandleId,
     ordinal: u64,
     block: &[u8],
-) {
+) where
+    M: Clone + Send + Sync + StorageIo + 'static,
+    C: Clone + Send + Sync + StorageIo + 'static,
+{
     appliance
         .namespace()
         .dispatch(
@@ -141,11 +468,30 @@ fn write_one_mebibyte(
         .expect("append one interleaved block");
 }
 
+fn fence_ingest<M, C>(appliance: &DurableNamespace<M, C>, inode: InodeId, handle: HandleId)
+where
+    M: Clone + Send + Sync + StorageIo + 'static,
+    C: Clone + Send + Sync + StorageIo + 'static,
+{
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Sync {
+                inode,
+                handle,
+                data_only: true,
+            },
+        )
+        .expect("sync fences accepted asynchronous ingest jobs");
+}
+
 #[test]
 fn sequential_writes_publish_reduced_data_before_the_namespace_commit() {
     let appliance = open_appliance();
     let (inode, handle) = create_file(&appliance, b"long-stream");
     let expected = write_fixture(&appliance, inode, handle);
+    fence_ingest(&appliance, inode, handle);
 
     let staged = appliance.write_through_status();
     assert_eq!(staged.sealed_uncommitted_containers(), 1);
@@ -165,8 +511,25 @@ fn sequential_writes_publish_reduced_data_before_the_namespace_commit() {
         .expect("commit the pre-published stream")
         .expect("stream has one dirty generation");
     assert!(
-        committed.metrics().exact_hit_bytes() >= 32 * 1_024 * 1_024,
-        "checkpoint must adopt pre-published exact locations instead of rewriting their bytes"
+        committed.metrics().recipe_reuse_bytes() >= 30 * 1_024 * 1_024,
+        "checkpoint must adopt the verified write-through recipe without rereading its bytes"
+    );
+    assert!(
+        committed.metrics().checkpoint_rechunk_bytes() <= 4 * 1_024 * 1_024,
+        "only the incomplete FastCDC tail may be re-read and rechunked"
+    );
+    assert_eq!(
+        appliance
+            .write_through_status()
+            .sealed_uncommitted_containers(),
+        1,
+        "the post-cut partial Container remains trigger evidence until an empty cut proves it stale"
+    );
+    assert!(
+        appliance
+            .checkpoint_profiled()
+            .expect("clear stale post-cut Container evidence")
+            .is_none()
     );
     assert_eq!(
         appliance
@@ -181,6 +544,7 @@ fn sequential_writes_publish_reduced_data_before_the_namespace_commit() {
         write_fixture(&appliance, duplicate_inode, duplicate_handle),
         expected
     );
+    fence_ingest(&appliance, duplicate_inode, duplicate_handle);
     assert!(
         appliance.namespace().checkpointable_dirty_payload_bytes() < 4 * 1_024 * 1_024,
         "checkpoint-spanning Exact hits must also release resident POSIX dirty copies"
@@ -196,6 +560,65 @@ fn sequential_writes_publish_reduced_data_before_the_namespace_commit() {
         read_fixture(&appliance, duplicate_inode, duplicate_handle),
         expected
     );
+}
+
+#[test]
+fn partial_update_rechunks_only_the_affected_recipe_and_recovers_byte_exact() {
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let appliance = open_appliance_on(metadata.clone(), containers.clone(), MemoryStorageIo::new());
+    let (inode, handle) = create_file(&appliance, b"recipe-boundary");
+    let mut block = fixture_block();
+    let mut expected = Vec::new();
+    expected
+        .try_reserve_exact(34 * 1_048_576)
+        .expect("fixture allocation is bounded");
+    for ordinal in 0_u64..34 {
+        block[0] = u8::try_from(ordinal).expect("fixture ordinal is bounded");
+        write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
+        expected.extend_from_slice(&block);
+    }
+    fence_ingest(&appliance, inode, handle);
+    assert!(
+        appliance.namespace().checkpointable_dirty_payload_bytes() < 4 * 1_024 * 1_024,
+        "the stable write-through prefix must already be externalized"
+    );
+
+    let changed_offset = 4 * 1_048_576 + 12_345;
+    write_at(
+        &appliance,
+        inode,
+        handle,
+        u64::try_from(changed_offset).expect("fixture offset fits u64"),
+        b"X",
+    );
+    expected[changed_offset] = b'X';
+
+    let committed = appliance
+        .checkpoint_profiled()
+        .expect("commit the partially overwritten recipe")
+        .expect("updated stream has one dirty generation");
+    assert!(
+        committed.metrics().recipe_reuse_bytes() >= 29 * 1_024 * 1_024,
+        "unaffected complete recipes must remain directly reusable"
+    );
+    assert!(
+        committed.metrics().checkpoint_rechunk_bytes() <= 4 * 1_024 * 1_024,
+        "the incomplete tail plus the one split Chunk bound checkpoint rereads: {:?}",
+        committed.metrics()
+    );
+    drop(appliance);
+    metadata.crash();
+    containers.crash();
+
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        &ContainerRepository::new(containers),
+    )
+    .expect("recover recipe-backed generation")
+    .expect("committed generation exists");
+    assert_eq!(read_named_all(&recovered, b"recipe-boundary"), expected);
 }
 
 #[test]
@@ -215,6 +638,8 @@ fn interleaved_files_keep_independent_bounded_ingest_lanes() {
         write_one_mebibyte(&appliance, inode_a, handle_a, ordinal, &block_a);
         write_one_mebibyte(&appliance, inode_b, handle_b, ordinal, &block_b);
     }
+    fence_ingest(&appliance, inode_a, handle_a);
+    fence_ingest(&appliance, inode_b, handle_b);
 
     let staged = appliance.write_through_status();
     assert_eq!(staged.active_lanes(), 2);
@@ -262,6 +687,8 @@ fn parallel_lanes_publish_one_complete_exact_index_history() {
             writer_b.join().expect("parallel writer B must not panic"),
         )
     });
+    fence_ingest(&appliance, inode_a, handle_a);
+    fence_ingest(&appliance, inode_b, handle_b);
 
     assert_eq!(
         appliance.exact_index_run_count(),
@@ -362,6 +789,9 @@ fn ninth_interleaved_stream_does_not_fall_back_to_the_resident_dirty_guard() {
             write_one_mebibyte(&appliance, inode, handle, write_ordinal, block);
         }
     }
+    for (inode, handle) in streams.iter().copied() {
+        fence_ingest(&appliance, inode, handle);
+    }
 
     let dirty = appliance.namespace().checkpointable_dirty_payload_bytes();
     assert!(
@@ -371,7 +801,7 @@ fn ninth_interleaved_stream_does_not_fall_back_to_the_resident_dirty_guard() {
 }
 
 #[test]
-fn container_crossing_a_frozen_cut_releases_the_valid_active_suffix() {
+fn container_crossing_a_frozen_cut_releases_active_and_reuses_the_frozen_prefix() {
     let appliance = open_appliance();
     let (inode, handle) = create_file(&appliance, b"cross-cut");
     let mut block = fixture_block();
@@ -389,11 +819,60 @@ fn container_crossing_a_frozen_cut_releases_the_valid_active_suffix() {
         block[0] = u8::try_from(ordinal).expect("fixture ordinal is bounded");
         write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
     }
+    fence_ingest(&appliance, inode, handle);
 
     let dirty = appliance.namespace().checkpointable_dirty_payload_bytes();
     assert!(
         dirty < 20 * 1_024 * 1_024,
         "valid post-cut chunks must externalize even when the same Container batch begins in the frozen epoch: {dirty} resident bytes"
+    );
+    let committed = appliance
+        .checkpoint_profiled()
+        .expect("commit the cross-cut frozen prefix")
+        .expect("the frozen prefix needs one generation");
+    assert!(
+        committed.metrics().recipe_reuse_bytes() >= 15 * 1_024 * 1_024,
+        "durable Chunks completed after the cut must still become frozen-prefix recipes: {:?}",
+        committed.metrics()
+    );
+    assert!(
+        committed.metrics().checkpoint_rechunk_bytes() <= 1_024 * 1_024,
+        "only the Chunk intersecting the cut may require bounded replay: {:?}",
+        committed.metrics()
+    );
+}
+
+#[test]
+fn checkpoint_flushes_stable_partial_lane_before_forming_the_frozen_cut() {
+    let appliance = open_appliance();
+    let (inode, handle) = create_file(&appliance, b"partial-lane-cut");
+    let mut block = fixture_block();
+    for ordinal in 0_u64..16 {
+        block[0] = u8::try_from(ordinal).expect("fixture ordinal is bounded");
+        write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
+    }
+    fence_ingest(&appliance, inode, handle);
+    assert_eq!(
+        appliance
+            .write_through_status()
+            .sealed_uncommitted_containers(),
+        0,
+        "the lane must still be below its normal Container flush threshold"
+    );
+
+    let committed = appliance
+        .checkpoint_profiled()
+        .expect("checkpoint the partial Ingest Lane")
+        .expect("the partial lane has one dirty generation");
+    assert!(
+        committed.metrics().recipe_reuse_bytes() >= 15 * 1_024 * 1_024,
+        "stable partial-lane Chunks must become recipes before the cut: {:?}",
+        committed.metrics()
+    );
+    assert!(
+        committed.metrics().checkpoint_rechunk_bytes() <= 1_024 * 1_024,
+        "only the bounded incomplete CDC suffix may be rechunked: {:?}",
+        committed.metrics()
     );
 }
 
@@ -453,6 +932,66 @@ fn read_named(namespace: &Namespace, name: &[u8]) -> Vec<u8> {
         panic!("read returned the wrong reply");
     };
     bytes
+}
+
+fn read_named_all(namespace: &Namespace, name: &[u8]) -> Vec<u8> {
+    let Reply::Entry(entry) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: ROOT_INODE,
+                name,
+            },
+        )
+        .expect("lookup complete fixture")
+    else {
+        panic!("lookup returned the wrong reply");
+    };
+    let Reply::Opened(handle) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: entry.attr.inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open complete fixture")
+    else {
+        panic!("open returned the wrong reply");
+    };
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(usize::try_from(entry.attr.size).expect("fixture size fits usize"))
+        .expect("fixture output allocation is bounded");
+    let mut offset = 0_u64;
+    while offset < entry.attr.size {
+        let length = (entry.attr.size - offset).min(1_048_576);
+        let Reply::Data(bytes) = namespace
+            .dispatch(
+                CALLER,
+                Operation::Read {
+                    inode: entry.attr.inode,
+                    handle,
+                    offset,
+                    length: u32::try_from(length).expect("bounded fixture read fits u32"),
+                },
+            )
+            .expect("read complete fixture")
+        else {
+            panic!("read returned the wrong reply");
+        };
+        assert_eq!(
+            u64::try_from(bytes.len()).expect("fixture read length fits u64"),
+            length,
+            "recovered reads must not return an early EOF"
+        );
+        output.extend_from_slice(&bytes);
+        offset = offset
+            .checked_add(length)
+            .expect("fixture read cursor cannot overflow");
+    }
+    output
 }
 
 fn write_salted_fixture_in_lockstep(

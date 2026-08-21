@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 blake3.workspace = true
 crc32c.workspace = true
+rayon.workspace = true
 zstd.workspace = true
 
 [lints]

@@ -19,6 +19,10 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn entry(ordinal: u8) -> ExactIndexEntry {
+    entry_with_crc(ordinal, 0xAB00_0000 + u32::from(ordinal))
+}
+
+fn entry_with_crc(ordinal: u8, record_crc32c: u32) -> ExactIndexEntry {
     let logical_length = 16_384 + u32::from(ordinal);
     let record_length = (logical_length + 255) / 64 * 64;
     let location = ExactIndexLocation::raw(
@@ -26,11 +30,150 @@ fn entry(ordinal: u8) -> ExactIndexEntry {
         u64::from(ordinal) + 1,
         4_096 + u64::from(ordinal) * 64,
         record_length,
-        0xAB00_0000 + u32::from(ordinal),
+        record_crc32c,
     )
     .expect("worked RAW location is valid");
     ExactIndexEntry::active(ChunkId::from_bytes([ordinal; 32]), logical_length, location)
         .expect("worked active entry is valid")
+}
+
+#[test]
+fn family_compaction_uses_family_precedence_and_opens_one_partition_at_a_time() {
+    let root = test_root("compact-partitioned-input-family");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xE5; 32]).expect("profile identity is nonzero");
+    let repository = ExactIndexRunRepository::new(
+        FsStorageIo::open(&root).expect("open workspace-local compaction repository"),
+    );
+    let old_first = repository
+        .publish(
+            &ExactIndexRun::new(profile, 1, vec![entry_with_crc(7, 0x1111_1111)])
+                .expect("old first partition is valid"),
+        )
+        .expect("publish old first partition");
+    let old_second = repository
+        .publish(
+            &ExactIndexRun::new(profile, 2, vec![entry(8)]).expect("old second partition is valid"),
+        )
+        .expect("publish old second partition");
+    let newer = repository
+        .publish(
+            &ExactIndexRun::new(profile, 3, vec![entry_with_crc(7, 0x2222_2222)])
+                .expect("newer singleton family is valid"),
+        )
+        .expect("publish newer family");
+    let inputs = vec![
+        ExactIndexRunRef::family_partition(0, 1, 0, 2, old_first)
+            .expect("old first reference is valid"),
+        ExactIndexRunRef::family_partition(0, 1, 1, 2, old_second)
+            .expect("old second reference is valid"),
+        ExactIndexRunRef::new(0, newer).expect("newer singleton reference is valid"),
+    ];
+
+    let output = repository
+        .compact_family(&inputs, 1, 4)
+        .expect("complete source families compact");
+    assert_eq!(output.runs().len(), 1);
+    let lookup = repository
+        .open(profile, 4)
+        .expect("open compacted output")
+        .lookup(ChunkId::from_bytes([7; 32]), 16_391)
+        .expect("lookup repeated Location");
+    assert_eq!(lookup.candidates().len(), 1);
+    assert_eq!(
+        lookup.candidates()[0].location().record_crc32c(),
+        0x2222_2222
+    );
+}
+
+#[test]
+fn compaction_fanin_is_bounded_by_families_not_physical_partitions() {
+    const FAMILY_GENERATION: u64 = 100;
+    const PARTITION_COUNT: u16 = 65;
+
+    let root = test_root("compact-many-source-partitions");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xE6; 32]).expect("profile identity is nonzero");
+    let repository = ExactIndexRunRepository::new(
+        FsStorageIo::open(&root).expect("open workspace-local compaction repository"),
+    );
+    let mut inputs = Vec::new();
+    for ordinal in 0..PARTITION_COUNT {
+        let entry_ordinal = u8::try_from(ordinal).expect("worked ordinal fits u8");
+        let generation = FAMILY_GENERATION + u64::from(ordinal);
+        let descriptor = repository
+            .publish(
+                &ExactIndexRun::new(profile, generation, vec![entry(entry_ordinal)])
+                    .expect("one source partition is valid"),
+            )
+            .expect("publish one old-family partition");
+        inputs.push(
+            ExactIndexRunRef::family_partition(
+                0,
+                FAMILY_GENERATION,
+                ordinal,
+                PARTITION_COUNT,
+                descriptor,
+            )
+            .expect("old-family partition reference is valid"),
+        );
+    }
+    let newer_generation = 200;
+    let newer = repository
+        .publish(
+            &ExactIndexRun::new(
+                profile,
+                newer_generation,
+                vec![entry_with_crc(42, 0x4242_4242)],
+            )
+            .expect("newer singleton source is valid"),
+        )
+        .expect("publish newer singleton family");
+    inputs.push(ExactIndexRunRef::new(0, newer).expect("newer reference is valid"));
+
+    let output = repository
+        .compact_family(&inputs, 1, 201)
+        .expect("66 physical Runs in two logical families remain valid bounded fan-in");
+    assert_eq!(output.runs().len(), 1);
+    assert_eq!(output.runs()[0].entry_count(), 65);
+    let lookup = repository
+        .open(profile, 201)
+        .expect("open compacted family")
+        .lookup(ChunkId::from_bytes([42; 32]), 16_426)
+        .expect("lookup newer transition");
+    assert_eq!(lookup.candidates().len(), 1);
+    assert_eq!(
+        lookup.candidates()[0].location().record_crc32c(),
+        0x4242_4242
+    );
+}
+
+fn large_entry(ordinal: u32) -> ExactIndexEntry {
+    let mut chunk_id = [0_u8; 32];
+    chunk_id[28..].copy_from_slice(&ordinal.to_be_bytes());
+    let mut container_id = [0_u8; 16];
+    container_id[..4].copy_from_slice(
+        &ordinal
+            .checked_add(1)
+            .expect("fixture ordinal stays below u32::MAX")
+            .to_be_bytes(),
+    );
+    let logical_length = 16_384;
+    let record_length = (logical_length + 255) / 64 * 64;
+    let location = ExactIndexLocation::raw(
+        ContainerId::new(container_id).expect("fixture Container identity is nonzero"),
+        u64::from(ordinal) + 1,
+        4_096,
+        record_length,
+        ordinal,
+    )
+    .expect("worked RAW location is valid");
+    ExactIndexEntry::active(ChunkId::from_bytes(chunk_id), logical_length, location)
+        .expect("worked large active entry is valid")
 }
 
 #[test]
@@ -192,4 +335,65 @@ fn compaction_rejects_a_corrupt_source_without_publishing_output() {
         repository.open(profile, 3),
         Err(ExactIndexStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
     ));
+}
+
+#[test]
+fn compaction_streams_more_than_the_legacy_262_144_entry_limit() {
+    const FIRST_COUNT: u32 = 131_073;
+    const TOTAL_COUNT: u32 = 262_145;
+
+    let root = test_root("compact-above-legacy-entry-limit");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xE4; 32]).expect("profile identity is nonzero");
+    let repository = ExactIndexRunRepository::new(
+        FsStorageIo::open(&root).expect("open workspace-local compaction repository"),
+    );
+    let mut references = Vec::new();
+    for (generation, range) in [(1_u64, 0..FIRST_COUNT), (2_u64, FIRST_COUNT..TOTAL_COUNT)] {
+        let run = ExactIndexRun::new(profile, generation, range.map(large_entry).collect())
+            .expect("large source Run is canonicalizable");
+        let descriptor = repository
+            .publish(&run)
+            .expect("publish one large source Run");
+        references
+            .push(ExactIndexRunRef::new(0, descriptor).expect("large source reference is valid"));
+    }
+
+    let family = repository
+        .compact_family(&references, 1, 3)
+        .expect("compaction must partition beyond the per-Run target");
+    assert_eq!(family.family_generation(), 3);
+    assert_eq!(family.last_generation(), 4);
+    assert_eq!(family.runs().len(), 2);
+    assert_eq!(family.runs()[0].entry_count(), 262_144);
+    assert_eq!(family.runs()[1].entry_count(), 1);
+    assert_eq!(family.runs()[0].partition_ordinal(), 0);
+    assert_eq!(family.runs()[1].partition_ordinal(), 1);
+    assert_eq!(family.runs()[0].partition_count(), 2);
+    assert!(family.runs()[0].maximum_chunk_id() < family.runs()[1].minimum_chunk_id());
+    for run_ref in family.runs() {
+        repository
+            .audit(profile, run_ref.generation())
+            .expect("every family partition remains fully auditable");
+    }
+    for ordinal in [0, TOTAL_COUNT - 1] {
+        let expected = large_entry(ordinal);
+        let partition = family
+            .runs()
+            .iter()
+            .find(|run| {
+                run.minimum_chunk_id() <= expected.chunk_id()
+                    && expected.chunk_id() <= run.maximum_chunk_id()
+            })
+            .expect("exactly one partition covers the key");
+        let lookup = repository
+            .open(profile, partition.generation())
+            .expect("open streamed compacted partition")
+            .lookup(expected.chunk_id(), expected.logical_length())
+            .expect("bounded lookup in streamed compacted Run");
+        assert!(lookup.complete());
+        assert_eq!(lookup.candidates(), &[expected]);
+    }
 }

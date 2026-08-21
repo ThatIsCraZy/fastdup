@@ -1,7 +1,8 @@
 use crate::manifest_tree::{
-    ManifestRangeExtent, ManifestTreeError, ManifestTreeSummary, read_manifest_tree_range,
+    ManifestRangeExtent, ManifestTreeError, ManifestTreeSummary,
+    allocated_bytes_in_manifest_tree_range, read_manifest_tree_range,
 };
-use crate::{ActivatedExactIndex, ContainerRepository, StorageIo, StoreError};
+use crate::{ActivatedExactIndex, ContainerRepository, StorageIo, StoreError, VerifiedReadCache};
 use fastdup_format::{
     ChunkId, MAX_METADATA_OBJECT_BYTES, ManifestExtent, ManifestLeaf, MetadataObjectId,
 };
@@ -22,12 +23,14 @@ pub struct VerifiedManifestFile<I> {
     recipe: Arc<dyn ManifestRecipe>,
     containers: ContainerRepository<I>,
     indexed_reader: Option<Arc<dyn VerifiedChunkReader>>,
+    read_cache: Option<Arc<VerifiedReadCache>>,
 }
 
 trait ManifestRecipe: fmt::Debug + Send + Sync {
     fn root(&self) -> Option<MetadataObjectId>;
     fn logical_size(&self) -> u64;
     fn allocated_bytes(&self) -> u64;
+    fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, ManifestReadError>;
     fn read_range(
         &self,
         offset: u64,
@@ -52,6 +55,30 @@ impl ManifestRecipe for FlatManifestRecipe {
 
     fn allocated_bytes(&self) -> u64 {
         self.allocated_bytes
+    }
+
+    fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, ManifestReadError> {
+        let end = offset.saturating_add(length).min(self.logical_size());
+        let mut extent_offset = 0_u64;
+        self.manifest
+            .extents()
+            .iter()
+            .try_fold(0_u64, |total, extent| {
+                let extent_end = extent_offset
+                    .checked_add(extent_logical_length(extent))
+                    .ok_or(ManifestReadError::ArithmeticOverflow)?;
+                let overlap = extent_end
+                    .min(end)
+                    .saturating_sub(extent_offset.max(offset));
+                extent_offset = extent_end;
+                if matches!(extent, ManifestExtent::Hole { .. }) {
+                    Ok(total)
+                } else {
+                    total
+                        .checked_add(overlap)
+                        .ok_or(ManifestReadError::ArithmeticOverflow)
+                }
+            })
     }
 
     fn read_range(
@@ -108,6 +135,17 @@ where
 
     fn allocated_bytes(&self) -> u64 {
         self.summary.allocated_bytes()
+    }
+
+    fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, ManifestReadError> {
+        allocated_bytes_in_manifest_tree_range(
+            self.summary.root(),
+            self.summary.logical_size(),
+            offset,
+            length,
+            |object_id| read_tree_metadata(&self.metadata, object_id),
+        )
+        .map_err(Into::into)
     }
 
     fn read_range(
@@ -178,12 +216,17 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
     ) -> Result<Self, ManifestReadError> {
         let mut required = BTreeMap::<ChunkId, u64>::new();
         for extent in manifest.extents() {
-            let ManifestExtent::Data {
-                logical_length,
-                chunk_id,
-            } = *extent
-            else {
-                continue;
+            let (chunk_id, logical_length) = match *extent {
+                ManifestExtent::Data {
+                    logical_length,
+                    chunk_id,
+                } => (chunk_id, logical_length),
+                ManifestExtent::DataSlice {
+                    chunk_id,
+                    chunk_length,
+                    ..
+                } => (chunk_id, u64::from(chunk_length)),
+                ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => continue,
             };
             if let Some(previous) = required.insert(chunk_id, logical_length)
                 && previous != logical_length
@@ -212,6 +255,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             }),
             containers,
             indexed_reader: None,
+            read_cache: None,
         })
     }
 
@@ -227,6 +271,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             recipe: Arc::new(TreeManifestRecipe { summary, metadata }),
             containers,
             indexed_reader: None,
+            read_cache: None,
         }
     }
 
@@ -247,6 +292,15 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             containers: self.containers.clone(),
             index,
         }));
+        self
+    }
+
+    /// Installs one shared, bounded cache behind this immutable Manifest
+    /// reader. Only complete bytes returned by the verified Container path are
+    /// admitted; recovery and scrub remain independent of cache state.
+    #[must_use]
+    pub fn with_verified_read_cache(mut self, cache: Arc<VerifiedReadCache>) -> Self {
+        self.read_cache = Some(cache);
         self
     }
 
@@ -280,22 +334,28 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         if length == 0 || offset >= self.logical_size() {
             return Ok(0);
         }
-        let end = offset.saturating_add(length).min(self.logical_size());
-        let extents = self.recipe.read_range(offset, end - offset)?;
-        extents.iter().try_fold(0_u64, |total, located| {
-            if matches!(located.extent(), ManifestExtent::Hole { .. }) {
-                return Ok(total);
-            }
-            let extent_end = located
-                .logical_offset()
-                .checked_add(extent_logical_length(located.extent()))
-                .ok_or(ManifestReadError::ArithmeticOverflow)?;
-            let overlap_start = located.logical_offset().max(offset);
-            let overlap_end = extent_end.min(end);
-            total
-                .checked_add(overlap_end - overlap_start)
-                .ok_or(ManifestReadError::ArithmeticOverflow)
-        })
+        self.recipe.allocated_bytes_in_range(offset, length)
+    }
+
+    /// Returns only Manifest extents intersecting one range.
+    ///
+    /// This is a metadata-only export used by range-clone admission. Returned
+    /// extents retain file coordinates and may extend across the requested
+    /// boundaries; callers must clip them while preserving Chunk identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded metadata I/O, identity, partition, or arithmetic
+    /// failures. No partial recipe is returned.
+    pub fn manifest_extents_in_range(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<ManifestRangeExtent>, ManifestReadError> {
+        if length == 0 || offset >= self.logical_size() {
+            return Ok(Vec::new());
+        }
+        self.recipe.read_range(offset, length)
     }
 
     /// Reads one bounded byte range without materializing the complete file.
@@ -312,12 +372,16 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
     pub fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, ManifestReadError> {
         if let Some(reader) = &self.indexed_reader {
             self.read_at_using(offset, length, |chunk_id, logical_length| {
-                reader.read_verified_chunk(chunk_id, logical_length)
+                self.read_cached(chunk_id, logical_length, || {
+                    reader.read_verified_chunk(chunk_id, logical_length)
+                })
             })
         } else {
             self.read_at_using(offset, length, |chunk_id, logical_length| {
-                self.containers
-                    .read_verified_chunk(chunk_id, logical_length)
+                self.read_cached(chunk_id, logical_length, || {
+                    self.containers
+                        .read_verified_chunk(chunk_id, logical_length)
+                })
             })
         }
     }
@@ -342,9 +406,31 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         length: u32,
     ) -> Result<Vec<u8>, ManifestReadError> {
         self.read_at_using(offset, length, |chunk_id, logical_length| {
-            self.containers
-                .read_verified_chunk_with_index(index, chunk_id, logical_length)
+            self.read_cached(chunk_id, logical_length, || {
+                self.containers
+                    .read_verified_chunk_with_index(index, chunk_id, logical_length)
+            })
         })
+    }
+
+    fn read_cached<F>(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u64,
+        read_verified: F,
+    ) -> Result<Vec<u8>, StoreError>
+    where
+        F: FnOnce() -> Result<Vec<u8>, StoreError>,
+    {
+        let Some(cache) = &self.read_cache else {
+            return read_verified();
+        };
+        if let Some(bytes) = cache.get(chunk_id, logical_length) {
+            return Ok(bytes);
+        }
+        let bytes = read_verified()?;
+        cache.admit_verified(chunk_id, logical_length, &bytes);
+        Ok(bytes)
     }
 
     fn read_at_using<F>(
@@ -406,6 +492,25 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
                         .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
                     let source_end = usize::try_from(copy_end - extent_start)
                         .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
+                    output[target_start..target_end]
+                        .copy_from_slice(&payload[source_start..source_end]);
+                }
+                ManifestExtent::DataSlice {
+                    chunk_id,
+                    chunk_length,
+                    chunk_offset,
+                    ..
+                } => {
+                    let payload = read_chunk(chunk_id, u64::from(chunk_length))?;
+                    let source_start =
+                        usize::try_from(u64::from(chunk_offset) + (copy_start - extent_start))
+                            .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
+                    let source_end = source_start
+                        .checked_add(target_end - target_start)
+                        .ok_or(ManifestReadError::ArithmeticOverflow)?;
+                    if source_end > payload.len() {
+                        return Err(ManifestReadError::ArithmeticOverflow);
+                    }
                     output[target_start..target_end]
                         .copy_from_slice(&payload[source_start..source_end]);
                 }
@@ -498,6 +603,7 @@ fn metadata_name(object_id: MetadataObjectId) -> String {
 const fn extent_logical_length(extent: &ManifestExtent) -> u64 {
     match *extent {
         ManifestExtent::Data { logical_length, .. }
+        | ManifestExtent::DataSlice { logical_length, .. }
         | ManifestExtent::Hole { logical_length }
         | ManifestExtent::Fill { logical_length, .. } => logical_length,
     }

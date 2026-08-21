@@ -5,7 +5,7 @@ use fastdup_format::{
 };
 use fastdup_store::{
     ContainerRepository, GenerationError, GenerationRepository, RequiredChunkVerifier, StorageIo,
-    StoreError, WalTail,
+    StoreError, SuccessorPredecessor, WalTail,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 use std::collections::BTreeMap;
@@ -198,6 +198,72 @@ fn committed_namespace_root_recovers_only_after_the_wal_is_durable() {
         .expect("one committed generation must exist");
     assert_eq!(recovered.record(), committed);
     assert_eq!(recovered.namespace_root(), &root);
+}
+
+#[test]
+fn stale_successor_proof_cannot_advance_a_newer_installed_generation() {
+    let metadata = MemoryStorageIo::new();
+    let containers = ContainerRepository::new(MemoryStorageIo::new());
+    let policy = PolicySetId::new([0x79; 32]).expect("policy identity is nonzero");
+    let repository = GenerationRepository::new(metadata.clone(), policy);
+    let verifier = RecordingRequiredChunks::default();
+    let reservation = repository
+        .commit_namespace(&reservation_root(1_024))
+        .expect("publish predecessor reservation");
+    let predecessor = SuccessorPredecessor::from_committed_record(reservation);
+
+    let first_manifest = ManifestLeaf::new(8, vec![ManifestExtent::Hole { logical_length: 8 }])
+        .expect("first successor Manifest is valid");
+    let first_proof = repository
+        .publish_manifest_successor(predecessor, &first_manifest)
+        .expect("publish first successor Manifest");
+    let first_root = hole_file_root(first_proof.summary().root(), 8, 1);
+    let first_commit = repository
+        .commit_namespace_with_successor_proofs_using(
+            &first_root,
+            &containers,
+            predecessor,
+            &[first_proof],
+            &verifier,
+        )
+        .expect("the proof matches its installed predecessor");
+    assert_eq!(first_commit.record().generation(), 2);
+
+    let stale_manifest = ManifestLeaf::new(5, vec![ManifestExtent::Hole { logical_length: 5 }])
+        .expect("stale successor Manifest is locally valid");
+    let stale_proof = repository
+        .publish_manifest_successor(predecessor, &stale_manifest)
+        .expect("immutable Metadata publication may precede stale-proof rejection");
+    let stale_root = hole_file_root(stale_proof.summary().root(), 5, 2);
+    let error = repository
+        .commit_namespace_with_successor_proofs_using(
+            &stale_root,
+            &containers,
+            predecessor,
+            &[stale_proof],
+            &verifier,
+        )
+        .expect_err("a proof bound to generation one must not advance generation two");
+    assert!(matches!(
+        error,
+        GenerationError::StaleSuccessorPredecessor {
+            proof_generation: 1,
+            installed_generation: Some(2),
+        }
+    ));
+    assert_eq!(
+        verifier.calls(),
+        vec![Vec::<ChunkId>::new()],
+        "a stale predecessor must be rejected before any dependency verifier work"
+    );
+
+    metadata.crash();
+    let recovered = GenerationRepository::new(metadata, policy)
+        .recover_latest()
+        .expect("stale rejection leaves the installed generation recoverable")
+        .expect("generation two remains installed");
+    assert_eq!(recovered.record(), first_commit.record());
+    assert_eq!(recovered.namespace_root(), &first_root);
 }
 
 #[test]

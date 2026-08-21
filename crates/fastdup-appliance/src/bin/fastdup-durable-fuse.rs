@@ -9,6 +9,7 @@ use fastdup_appliance::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction, CheckpointPressure, DurableNamespace,
     MUTATION_COMMIT_TARGET, ProfiledCheckpoint, checkpoint_action, checkpoint_policy_set_v1,
 };
+use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo};
 use fastdup_posix::{FuseFilesystem, NamespaceConfig, volatile_mount_options};
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, FsStorageIo, GenerationRepository, StorageIo,
@@ -47,8 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let policy = checkpoint_policy_set_v1();
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
-    let data_storage =
-        TelemetryStorageIo::new(FsStorageIo::open(&container_root)?, io_telemetry_enabled);
+    let data_storage = open_data_storage(&container_root, io_telemetry_enabled)?;
     let appliance = Arc::new(DurableNamespace::open_with_index(
         NamespaceConfig::default(),
         GenerationRepository::new(FsStorageIo::open(&metadata_root)?, policy),
@@ -70,6 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         appliance.exact_index_degraded(),
     );
     emit_io_telemetry_state(io_telemetry_enabled);
+    emit_io_uring_state(&data_storage);
+    emit_verified_read_cache(&appliance);
 
     let mut ticks = interval(SCHEDULER_RESOLUTION);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -123,14 +125,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("CRITICAL: final checkpoint failed during shutdown: {error}");
     }
     mount.unmount().await?;
+    emit_verified_read_cache(&appliance);
     data_storage.emit();
+    emit_io_uring_state(&data_storage);
     Ok(())
+}
+
+fn open_data_storage(root: &std::path::Path, telemetry: bool) -> io::Result<TelemetryStorageIo> {
+    let config = IoUringStorageConfig::default();
+    let storage = match std::env::var("FASTDUP_IO_URING").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("off") => {
+            IoUringStorageIo::open_synchronous(root, config)?
+        }
+        Ok("try") => IoUringStorageIo::open_or_fallback(root, config)?,
+        Ok("required") => IoUringStorageIo::open_required(root, config)?,
+        Ok(_) | Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FASTDUP_IO_URING must be off, try, or required",
+            ));
+        }
+    };
+    Ok(TelemetryStorageIo::new(storage, telemetry))
 }
 
 fn emit_io_telemetry_state(enabled: bool) {
     if enabled {
         eprintln!("data-tier StorageIo telemetry is enabled for this mount");
     }
+}
+
+fn emit_io_uring_state(storage: &TelemetryStorageIo) {
+    let status = storage.inner.status();
+    eprintln!(
+        concat!(
+            "data_io_uring mode={:?} ring_entries={} max_inflight_bytes={} ",
+            "inflight_bytes={} peak_inflight_bytes={} submitted_operations={} ",
+            "completed_operations={} root_sync_callers={} root_sync_submissions={} ",
+            "owned_publications_started={} owned_publications_completed={} ",
+            "borrowed_write_copy_bytes={} ",
+            "verifier_workers={} verification_jobs_started={} ",
+            "verification_jobs_completed={} verification_jobs_failed={} ",
+            "active_verifications={} peak_active_verifications={} ",
+            "fallback_reason={:?}"
+        ),
+        status.mode(),
+        status.ring_entries(),
+        status.max_inflight_bytes(),
+        status.inflight_bytes(),
+        status.peak_inflight_bytes(),
+        status.submitted_operations(),
+        status.completed_operations(),
+        status.root_sync_callers(),
+        status.root_sync_submissions(),
+        status.owned_publications_started(),
+        status.owned_publications_completed(),
+        status.borrowed_write_copy_bytes(),
+        status.verifier_workers(),
+        status.verification_jobs_started(),
+        status.verification_jobs_completed(),
+        status.verification_jobs_failed(),
+        status.active_verifications(),
+        status.peak_active_verifications(),
+        status.fallback_reason(),
+    );
 }
 
 fn emit_checkpoint_pressure(appliance: &FsAppliance, dirty_bytes: u64, running: bool) {
@@ -205,6 +263,7 @@ async fn checkpoint_cycle(appliance: Arc<FsAppliance>) -> Result<(), String> {
     if let Some(profiled) = result {
         emit_checkpoint_metrics(&profiled);
     }
+    emit_verified_read_cache(&appliance);
     if !appliance.namespace().mutation_admission_open() {
         catch_up(Arc::clone(&appliance)).await?;
         appliance.namespace().resume_mutation_admission();
@@ -218,10 +277,100 @@ async fn catch_up(appliance: Arc<FsAppliance>) -> Result<(), String> {
         let worker_appliance = Arc::clone(&appliance);
         let worker = tokio::task::spawn_blocking(move || worker_appliance.checkpoint_profiled());
         match await_worker(worker).await? {
-            Some(profiled) => emit_checkpoint_metrics(&profiled),
+            Some(profiled) => {
+                emit_checkpoint_metrics(&profiled);
+                emit_verified_read_cache(&appliance);
+            }
             None => return Ok(()),
         }
     }
+}
+
+fn emit_verified_read_cache(appliance: &FsAppliance) {
+    let membership = appliance.exact_run_membership_status();
+    eprintln!(
+        concat!(
+            "exact_run_membership filters={} allocated_bytes={} probes={} ",
+            "definitely_absent={} requires_exact_lookup={}"
+        ),
+        membership.filter_count(),
+        membership.allocated_bytes(),
+        membership.probes(),
+        membership.definitely_absent(),
+        membership.requires_exact_lookup(),
+    );
+    let exact = appliance.exact_index_page_cache_status();
+    eprintln!(
+        concat!(
+            "exact_index_page_cache hits={} misses={} hit_rate_basis_points={} ",
+            "resident_pages={} target_pages={} capacity_pages={} evictions={} ",
+            "pressure_rejections={} reserve_bytes={} effective_limit_bytes={} ",
+            "available_bytes={} swap_used_bytes={}"
+        ),
+        exact.hits(),
+        exact.misses(),
+        exact.hit_rate_basis_points(),
+        exact.resident_pages(),
+        exact.target_pages(),
+        exact.capacity_pages(),
+        exact.evictions(),
+        exact.pressure_rejections(),
+        exact.reserve_bytes(),
+        exact.effective_limit_bytes(),
+        exact.available_bytes(),
+        exact.swap_used_bytes(),
+    );
+    let descriptors = appliance.container_descriptor_cache_status();
+    eprintln!(
+        concat!(
+            "container_descriptor_cache hits={} misses={} hit_rate_basis_points={} ",
+            "admissions={} evictions={} pressure_rejections={} allocation_rejections={} ",
+            "capacity={} target_entries={} entries={} resident_bytes={} metadata_bytes={} ",
+            "hard_coverage_bytes={} target_coverage_bytes={} effective_limit_bytes={} ",
+            "available_bytes={} swap_used_bytes={}"
+        ),
+        descriptors.hits(),
+        descriptors.misses(),
+        descriptors.hit_rate_basis_points(),
+        descriptors.admissions(),
+        descriptors.evictions(),
+        descriptors.pressure_rejections(),
+        descriptors.allocation_rejections(),
+        descriptors.capacity(),
+        descriptors.target_entries(),
+        descriptors.entry_count(),
+        descriptors.resident_bytes(),
+        descriptors.metadata_bytes(),
+        descriptors.hard_coverage_bytes(),
+        descriptors.target_coverage_bytes(),
+        descriptors.effective_limit_bytes(),
+        descriptors.available_bytes(),
+        descriptors.swap_used_bytes(),
+    );
+    let cache = appliance.verified_read_cache_status();
+    eprintln!(
+        concat!(
+            "verified_read_cache hits={} misses={} admissions={} evictions={} ",
+            "pressure_rejections={} oversized_rejections={} entries={} resident_bytes={} ",
+            "target_bytes={} metadata_bytes={} hard_limit_bytes={} reserve_bytes={} ",
+            "effective_limit_bytes={} available_bytes={} swap_used_bytes={}"
+        ),
+        cache.hits(),
+        cache.misses(),
+        cache.admissions(),
+        cache.evictions(),
+        cache.pressure_rejections(),
+        cache.oversized_rejections(),
+        cache.entry_count(),
+        cache.resident_bytes(),
+        cache.target_bytes(),
+        cache.metadata_bytes(),
+        cache.hard_limit_bytes(),
+        cache.reserve_bytes(),
+        cache.effective_limit_bytes(),
+        cache.available_bytes(),
+        cache.swap_used_bytes(),
+    );
 }
 
 async fn await_worker(
@@ -256,7 +405,8 @@ fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
             "metadata_wall_ns={} metadata_cpu_ns={} logical_chunks={} logical_bytes={} ",
             "fill_chunks={} fill_bytes={} exact_hit_chunks={} exact_hit_bytes={} ",
             "new_chunks={} new_bytes={} container_file_bytes={} raw_records={} ",
-            "zstd_records={} containers={} peak_buffered_bytes={} peak_buffered_chunks={}"
+            "zstd_records={} containers={} peak_buffered_bytes={} peak_buffered_chunks={} ",
+            "recipe_reuse_chunks={} recipe_reuse_bytes={} checkpoint_rechunk_bytes={}"
         ),
         profiled.record().generation(),
         metrics.total().wall().as_nanos(),
@@ -293,18 +443,21 @@ fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
         metrics.containers(),
         metrics.peak_buffered_chunk_bytes(),
         metrics.peak_buffered_chunks(),
+        metrics.recipe_reuse_chunks(),
+        metrics.recipe_reuse_bytes(),
+        metrics.checkpoint_rechunk_bytes(),
     );
 }
 
 #[derive(Clone, Debug)]
 struct TelemetryStorageIo {
-    inner: FsStorageIo,
+    inner: IoUringStorageIo,
     enabled: bool,
     telemetry: Arc<DataIoTelemetry>,
 }
 
 impl TelemetryStorageIo {
-    fn new(inner: FsStorageIo, enabled: bool) -> Self {
+    fn new(inner: IoUringStorageIo, enabled: bool) -> Self {
         Self {
             inner,
             enabled,
@@ -454,6 +607,10 @@ impl StorageIo for TelemetryStorageIo {
 
     fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
         self.inner.publish_noreplace(temporary_name, published_name)
+    }
+
+    fn remove_file(&self, name: &str) -> io::Result<()> {
+        self.inner.remove_file(name)
     }
 
     fn sync_root(&self) -> io::Result<()> {

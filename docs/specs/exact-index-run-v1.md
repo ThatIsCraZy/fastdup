@@ -3,8 +3,8 @@
 Status: draft, pre-stable format. The canonical full-run writer/reader, bounded
 Header/Footer/page reader, immutable publication repository, Run Set
 activation, and bounded active lookup are implemented and corruption/fault
-tested. A bounded tiered compactor is implemented; streaming/partitioned
-compaction and benchmark gates are not yet complete.
+tested. A bounded-fanin streaming tiered compactor emits key-disjoint Run
+families; benchmark gates are not yet complete.
 
 This document defines an immutable sorted-run building block for the persistent
 Exact Index. It follows
@@ -211,7 +211,7 @@ publishing a rebuilt/compacted run as active and during offline scrub.
 This run format is immutable and self-validating but deliberately does not
 define authority or activation by filename. The
 [Run Set](exact-index-run-set-v1.md) and
-[Activation WAL](exact-index-activation-v1.md) formats use this order:
+[Activation Log](exact-index-activation-v1.md) formats use this order:
 
 1. write a temporary run with explicit maximum length and checked offsets;
 2. reread and run the complete writer-side parser, including all page CRCs and
@@ -240,24 +240,32 @@ appliance Policy Set:
 2. select the four oldest generations at the lowest level having four Runs;
 3. audit each selected Header, Footer, page, cross-page order, pinned Run
    Reference, and complete Run hash;
-4. sort all selected entries by the canonical physical-Location key and source
-   generation descending, retaining only the newest transition for a repeated
-   Location;
-5. build, publish, and writer-reread one Run at `level + 1`; and
+4. perform a first K-way pass over one independently verified 4-KiB page per
+   source, ordering by canonical physical-Location key and source generation
+   descending, retaining only the newest transition for a repeated Location;
+5. use that pass's exact output count and key bounds to perform a second full
+   source audit while writing canonical pages directly into one unpublished
+   Run, then writer-reread and publish it at `level + 1`; and
 6. repeat for cascading levels before activating one successor Run Set.
 
-The current implementation permits at most 262,144 input entries per merge.
-This bounds transient materialization and output encoding to roughly 100 MiB.
-Crossing the bound fails the nonauthoritative index operation closed and leaves
-the Namespace commit independent. It does not silently discard an input Run.
-A future streaming partitioned compactor must retain the same canonical merge
-and old-or-complete-new activation behavior.
+There is no entry-count memory-policy cap. At the maximum 64-input fanin the
+merge retains at most 64 verified source pages, 64 heap entries, Header/Footer
+evidence, and one 31-entry output page. It never materializes an input or output
+Run. Both passes validate every source page, cross-page order, pinned Run
+Reference, and complete Run hash. A source failure during the second pass leaves
+only an unpublished temporary object.
+
+One output must still satisfy the Run-v1 one-GiB format bound. Crossing that
+durable object limit fails the nonauthoritative index operation closed and
+leaves Namespace durability independent; it never discards an input Run.
+Partitioned Run families and range-aware lookup are a separate format/policy
+step required before a compaction can emit more than one Run.
 
 ## Reader, rebuild, and scrub pairing
 
 | Invariant | Writer | Random reader / recovery | Rebuild / offline scrub |
 | --- | --- | --- | --- |
-| geometry is bounded and exact | derive counts and offsets with checked arithmetic before allocation | validate Header/Footer equations before page allocation or I/O | reject every truncated, oversized, overlapping, or out-of-range object |
+| geometry is bounded and exact | first verified merge pass derives exact counts/bounds; streaming encoder checks every page cursor and offset before I/O | validate Header/Footer equations before page allocation or I/O | reject every truncated, oversized, overlapping, or out-of-range object |
 | each page is canonical and independently protected | sort entries, emit exact key bounds, zero unused slots, compute page CRC | validate page ordinal/count/bounds/CRC before binary search | walk every page and compare adjacent last/first keys |
 | Location matches immutable Container evidence | copy fields from the verified Container Recovery Index | treat lookup as candidate; cross-check Container ID/generation/record/table and rehash decoded Chunk before return | reconstruct entries only from fully verified sealed Containers |
 | one Chunk ID has one logical length | reject before sorting and across run-builder batches | reject within a run and across every probed active run | global external sort reports cross-Container conflicts as Corruption |
@@ -282,10 +290,10 @@ mutation of a two-page run; no mutation is accepted and no prefix panics.
 
 Run Sets and activation records are assigned separately by
 [Exact Index Run Set v1](exact-index-run-set-v1.md) and
-[Exact Index Activation WAL v1](exact-index-activation-v1.md). The following
-are policy/benchmark choices and must not be inferred from the durable bytes:
-the current four-way ratio and 262,144-entry merge bound, future level count and
-partitioning, compaction concurrency, Bloom/Binary-Fuse bits per key, page cache
+[Exact Index Activation Log v1](exact-index-activation-v1.md). The following
+are policy/benchmark choices and must not be inferred from the Run-v1 bytes:
+the current four-way ratio, future level count, partition target, compaction
+concurrency, Bloom/Binary-Fuse bits per key, page cache
 size, sharding prefix, prefetch, mmap versus explicit range I/O, and GC
 retention. CPU multiversioning and SIMD filters may accelerate lookup but cannot
 change canonical keys or verification rules.

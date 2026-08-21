@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use fastdup_posix::{
     CommittedEntry, CommittedFile, CommittedFileInstall, CommittedInode,
-    CommittedNamespaceSnapshot, Namespace, NamespaceConfig, OpenOptions, Operation, PosixError,
-    ROOT_INODE, Reply, RequestContext,
+    CommittedNamespaceSnapshot, ExternalizedExtent, InodeId, MutationObserver, MutationPayload,
+    Namespace, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE, Reply,
+    RequestContext,
 };
 
 const CALLER: RequestContext = RequestContext {
@@ -48,6 +49,91 @@ struct BlockingAllocatedFile {
     release: Mutex<mpsc::Receiver<()>>,
 }
 
+#[derive(Debug)]
+struct BlockingMutationObserver {
+    entered: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl MutationObserver for BlockingMutationObserver {
+    fn accepted_write(
+        &self,
+        _inode: InodeId,
+        _offset: u64,
+        _mutation_sequence: u64,
+        _bytes: MutationPayload,
+    ) -> Vec<ExternalizedExtent> {
+        if let Some(entered) = self
+            .entered
+            .lock()
+            .expect("ASSERT: fixture entered lock poisoned")
+            .take()
+        {
+            entered.send(()).expect("writer announces observer entry");
+            self.release
+                .lock()
+                .expect("ASSERT: fixture release lock poisoned")
+                .recv()
+                .expect("test releases mutation observer");
+        }
+        Vec::new()
+    }
+
+    fn accepted_truncate(&self, _inode: InodeId, _mutation_sequence: u64, _length: u64) {}
+}
+
+#[derive(Debug, Default)]
+struct RetainingMutationObserver {
+    payloads: Mutex<Vec<MutationPayload>>,
+}
+
+impl MutationObserver for RetainingMutationObserver {
+    fn accepted_write(
+        &self,
+        _inode: InodeId,
+        _offset: u64,
+        _mutation_sequence: u64,
+        bytes: MutationPayload,
+    ) -> Vec<ExternalizedExtent> {
+        self.payloads
+            .lock()
+            .expect("ASSERT: fixture payload lock poisoned")
+            .push(bytes);
+        Vec::new()
+    }
+
+    fn accepted_truncate(&self, _inode: InodeId, _mutation_sequence: u64, _length: u64) {}
+}
+
+#[test]
+fn mutation_observer_owns_accepted_bytes_after_write_returns() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let observer = Arc::new(RetainingMutationObserver::default());
+    namespace.install_mutation_observer(observer.clone());
+    let Reply::Created { entry, handle } = create(&namespace, b"owned-observer-payload") else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: 0,
+                data: b"observer-retains-these-bytes",
+            },
+        )
+        .expect("write fixture bytes");
+
+    let payloads = observer
+        .payloads
+        .lock()
+        .expect("ASSERT: fixture payload lock poisoned");
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].as_bytes(), b"observer-retains-these-bytes");
+}
+
 impl CommittedFile for BlockingAllocatedFile {
     fn logical_size(&self) -> u64 {
         1
@@ -81,6 +167,78 @@ impl CommittedFile for BlockingAllocatedFile {
             Ok(Vec::new())
         }
     }
+}
+
+#[test]
+fn commit_cut_waits_for_the_admitted_writes_mutation_observer() {
+    let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
+    let Reply::Created { entry, handle } = namespace
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"observer-fence",
+                mode: 0o640,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create fixture")
+    else {
+        panic!("ASSERT: create must return Created");
+    };
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    namespace.install_mutation_observer(Arc::new(BlockingMutationObserver {
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
+    }));
+
+    let writer_namespace = Arc::clone(&namespace);
+    let writer = std::thread::spawn(move || {
+        writer_namespace.dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: 0,
+                data: b"fenced bytes",
+            },
+        )
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("write reaches its mutation observer");
+
+    let cut_namespace = Arc::clone(&namespace);
+    let (cut_tx, cut_rx) = mpsc::channel();
+    let cut = std::thread::spawn(move || {
+        cut_tx
+            .send(cut_namespace.begin_commit())
+            .expect("return commit result");
+    });
+    assert!(
+        matches!(
+            cut_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "a Frozen Commit Cut must not overtake an admitted write's observer"
+    );
+
+    release_tx.send(()).expect("release mutation observer");
+    writer
+        .join()
+        .expect("writer thread must not panic")
+        .expect("write completes");
+    let commit = cut_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("cut completes after observer")
+        .expect("cut succeeds")
+        .expect("the observed write is dirty");
+    assert_eq!(commit.inodes().len(), 1);
+    assert_eq!(commit.inodes()[0].logical_size(), 12);
+    cut.join().expect("cut thread must not panic");
 }
 
 #[test]

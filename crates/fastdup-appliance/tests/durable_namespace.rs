@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fastdup_appliance::{DurableNamespace, recover_mount, recover_mount_with_index};
+use fastdup_appliance::{
+    DurableNamespace, checkpoint_policy_set_v1, recover_mount, recover_mount_with_index,
+};
 use fastdup_format::PolicySetId;
 use fastdup_posix::{NamespaceConfig, OpenOptions, Operation, ROOT_INODE, Reply, RequestContext};
 use fastdup_store::{
@@ -243,7 +245,14 @@ fn compressible_checkpoint_publishes_zstd_regions_and_recovers_byte_exactly() {
     let payload_bytes = u64::try_from(payload.len()).expect("fixture length fits u64");
     assert_eq!(metrics.logical_chunk_bytes(), payload_bytes);
     assert_eq!(metrics.exact_hit_chunks(), 0);
-    assert_eq!(metrics.new_chunk_bytes(), payload_bytes);
+    assert_eq!(
+        metrics
+            .new_chunk_bytes()
+            .checked_add(metrics.recipe_reuse_bytes())
+            .expect("fixture accounting is bounded"),
+        payload_bytes,
+        "pre-cut publication plus checkpoint fallback must cover the complete payload"
+    );
     assert!(metrics.logical_chunks() > 1);
     assert!(metrics.zstd_records() > 0);
     assert_eq!(metrics.raw_records(), 0);
@@ -404,7 +413,10 @@ fn checkpoint_uses_bounded_content_defined_chunks() {
         .extents()
         .iter()
         .filter_map(|extent| match extent {
-            fastdup_format::ManifestExtent::Data { logical_length, .. } => Some(*logical_length),
+            fastdup_format::ManifestExtent::Data { logical_length, .. }
+            | fastdup_format::ManifestExtent::DataSlice { logical_length, .. } => {
+                Some(*logical_length)
+            }
             fastdup_format::ManifestExtent::Hole { .. }
             | fastdup_format::ManifestExtent::Fill { .. } => None,
         })
@@ -451,6 +463,219 @@ fn checkpoint_uses_bounded_content_defined_chunks() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn partial_fastcdc_range_clone_publishes_only_metadata_and_recovers_byte_exact() {
+    let metadata = MemoryStorageIo::new();
+    let containers_storage = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0x8c; 32]).expect("policy identity is nonzero");
+    let generations = GenerationRepository::new(metadata.clone(), policy);
+    let containers = ContainerRepository::new(containers_storage.clone());
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        generations.clone(),
+        containers.clone(),
+        16,
+    )
+    .expect("open durable namespace");
+    let payload = (0..3 * CHUNK_BYTES)
+        .map(|index| u8::try_from((index * 131 + index / 97) % 251).expect("fixture byte"))
+        .collect::<Vec<_>>();
+    let Reply::Created {
+        entry: source,
+        handle: source_handle,
+    } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"source-full",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create source")
+    else {
+        panic!("ASSERT: source create reply");
+    };
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: source.attr.inode,
+                handle: source_handle,
+                offset: 0,
+                data: &payload,
+            },
+        )
+        .expect("write source");
+    appliance.checkpoint().expect("checkpoint source");
+    let data_objects_before = containers
+        .recover_published()
+        .expect("recover source containers")
+        .len();
+
+    let Reply::Created {
+        entry: target,
+        handle: target_handle,
+    } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"synthetic-full.tmp",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create target")
+    else {
+        panic!("ASSERT: target create reply");
+    };
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::SetLength {
+                inode: target.attr.inode,
+                handle: Some(target_handle),
+                length: u64::try_from(payload.len()).expect("fixture length"),
+            },
+        )
+        .expect("pre-size sparse target");
+    let source_offset = 4_096_u64;
+    let target_offset = 64 * 1_024_u64;
+    let clone_length = 96 * 1_024_u64;
+    assert_eq!(
+        appliance.namespace().dispatch(
+            CALLER,
+            Operation::CloneRange {
+                source_inode: source.attr.inode,
+                source_handle,
+                source_offset,
+                target_inode: target.attr.inode,
+                target_handle,
+                target_offset,
+                length: clone_length,
+            },
+        ),
+        Ok(Reply::Cloned {
+            bytes: clone_length,
+            mutation_sequence: 2,
+        })
+    );
+    assert_eq!(
+        appliance.namespace().checkpointable_dirty_payload_bytes(),
+        0,
+        "range clone must not create frontend payload pages"
+    );
+    assert_eq!(
+        appliance.namespace().dispatch(
+            CALLER,
+            Operation::Rename {
+                parent: ROOT_INODE,
+                name: b"synthetic-full.tmp",
+                new_parent: ROOT_INODE,
+                new_name: b"synthetic-full.vbk",
+                no_replace: false,
+            },
+        ),
+        Ok(Reply::Empty)
+    );
+    appliance.checkpoint().expect("checkpoint metadata clone");
+    assert_eq!(
+        containers
+            .recover_published()
+            .expect("recover clone containers")
+            .len(),
+        data_objects_before,
+        "synthetic clone must publish no DATA container"
+    );
+    let selected = generations
+        .recover_latest_with_data(&containers)
+        .expect("verify cloned generation")
+        .expect("cloned generation is present");
+    let durable_target = selected
+        .namespace_root()
+        .inodes()
+        .iter()
+        .find(|inode| inode.inode() == target.attr.inode.get())
+        .expect("target inode is durable");
+    let scrubbed = generations
+        .scrub_manifest_tree_metadata(durable_target.manifest_root())
+        .expect("offline scrub accepts the cloned Manifest");
+    assert_eq!(
+        scrubbed.logical_size(),
+        u64::try_from(payload.len()).expect("fixture length fits u64")
+    );
+    let cloned_manifest = generations
+        .read_manifest(durable_target.manifest_root())
+        .expect("read cloned Manifest recipe");
+    assert!(
+        cloned_manifest
+            .extents()
+            .iter()
+            .any(|extent| matches!(extent, fastdup_format::ManifestExtent::DataSlice { .. })),
+        "misaligned clone boundaries must be represented by v2 Chunk slices"
+    );
+
+    metadata.crash();
+    containers_storage.crash();
+    let recovered_generations = GenerationRepository::new(metadata, policy);
+    let recovered_containers = ContainerRepository::new(containers_storage);
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &recovered_generations,
+        &recovered_containers,
+    )
+    .expect("recover cloned generation")
+    .expect("cloned generation exists");
+    let Reply::Entry(recovered_entry) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: ROOT_INODE,
+                name: b"synthetic-full.vbk",
+            },
+        )
+        .expect("final synthetic-full name is durable")
+    else {
+        panic!("ASSERT: recovered synthetic-full lookup reply");
+    };
+    assert_eq!(recovered_entry.attr.inode, target.attr.inode);
+    let Reply::Opened(recovered_handle) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: target.attr.inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open recovered target")
+    else {
+        panic!("ASSERT: recovered target open reply");
+    };
+    assert_eq!(
+        read(
+            &recovered,
+            target.attr.inode,
+            recovered_handle,
+            target_offset,
+            u32::try_from(clone_length).expect("clone length fits u32"),
+        ),
+        payload[usize::try_from(source_offset).expect("source offset fits")
+            ..usize::try_from(source_offset + clone_length).expect("source end fits")]
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn later_checkpoint_reuses_zstd_chunks_through_the_persistent_exact_index() {
     let metadata_storage = MemoryStorageIo::new();
     let container_storage = MemoryStorageIo::new();
@@ -476,13 +701,19 @@ fn later_checkpoint_reuses_zstd_chunks_through_the_persistent_exact_index() {
         .checkpoint()
         .expect("checkpoint the first copy")
         .expect("the first copy needs a generation");
-    assert_eq!(appliance.exact_index_run_count(), 1);
+    let first_run_count = appliance.exact_index_run_count();
+    assert!(first_run_count >= 1);
     assert!(!appliance.exact_index_degraded());
     let first_containers = containers
         .verify_published()
         .expect("verify the first published Container set");
-    assert_eq!(first_containers.len(), 1);
-    assert!(first_containers[0].zstd_record_count() > 0);
+    let first_container_count = first_containers.len();
+    assert!(first_container_count >= 1);
+    assert!(
+        first_containers
+            .iter()
+            .any(|container| container.zstd_record_count() > 0)
+    );
 
     let second = create_and_write(&appliance, b"second-copy", &payload);
     appliance
@@ -494,12 +725,12 @@ fn later_checkpoint_reuses_zstd_chunks_through_the_persistent_exact_index() {
             .verify_published()
             .expect("verify the post-dedup Container set")
             .len(),
-        1,
+        first_container_count,
         "a verified Exact Hit must not publish another physical Container"
     );
     assert_eq!(
         appliance.exact_index_run_count(),
-        1,
+        first_run_count,
         "a duplicate-only checkpoint must not publish an empty L0 Run"
     );
     assert!(!appliance.exact_index_degraded());
@@ -760,6 +991,120 @@ where
         )
         .expect("write one duplicate fixture");
     entry.attr.inode
+}
+
+#[test]
+fn one_checkpoint_shares_one_barrier_across_all_new_metadata_objects() {
+    let metadata = MemoryStorageIo::new();
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1()),
+        ContainerRepository::new(MemoryStorageIo::new()),
+        16,
+    )
+    .expect("open metadata batching fixture");
+    create_and_write(&appliance, b"metadata-a", b"first manifest payload");
+    create_and_write(&appliance, b"metadata-b", b"second manifest payload");
+    let baseline = metadata.operations().len();
+
+    appliance
+        .checkpoint()
+        .expect("checkpoint both manifests")
+        .expect("fixture has one dirty generation");
+
+    let root_syncs = metadata.operations()[baseline..]
+        .iter()
+        .filter(|operation| **operation == StorageOperation::SyncRoot)
+        .count();
+    assert_eq!(
+        root_syncs, 2,
+        "all immutable Manifest and Namespace objects share one barrier; the second sync preserves the independently retryable WAL-slot topology"
+    );
+}
+
+#[test]
+fn writable_appliance_installs_one_shared_pressure_bounded_verified_read_cache() {
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0x9C; 32]).expect("policy identity is nonzero");
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, policy),
+        ContainerRepository::new(containers.clone()),
+        16,
+    )
+    .expect("open cached appliance");
+    let payload: Vec<u8> = (0..96 * 1_024)
+        .map(|offset| {
+            u8::try_from(offset % 251)
+                .expect("fixture modulus fits u8")
+                .wrapping_mul(31)
+        })
+        .collect();
+    let inode = create_and_write(&appliance, b"cache-fixture", &payload);
+    appliance
+        .checkpoint()
+        .expect("commit cache fixture")
+        .expect("cache fixture is dirty");
+    let Reply::Opened(handle) = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open committed cache fixture")
+    else {
+        panic!("ASSERT: open returned the wrong reply variant");
+    };
+
+    let baseline = containers.operation_count();
+    assert_eq!(
+        read(
+            appliance.namespace(),
+            inode,
+            handle,
+            0,
+            u32::try_from(payload.len()).expect("fixture length fits u32"),
+        ),
+        payload
+    );
+    let after_first = containers.operation_count();
+    assert!(after_first > baseline);
+    assert_eq!(
+        read(
+            appliance.namespace(),
+            inode,
+            handle,
+            0,
+            u32::try_from(payload.len()).expect("fixture length fits u32"),
+        ),
+        payload
+    );
+    let after_second = containers.operation_count();
+    let cache = appliance.verified_read_cache_status();
+    assert!(cache.misses() > 0);
+    if after_second == after_first {
+        assert!(cache.hits() > 0);
+        assert!(cache.target_bytes() > 0);
+    } else {
+        assert_eq!(cache.target_bytes(), 0);
+        assert_eq!(cache.resident_bytes(), 0);
+        assert!(
+            cache.swap_used_bytes() > 0 || cache.available_bytes() <= cache.reserve_bytes(),
+            "verified DATA cache may repeat I/O only after its live headroom disappears"
+        );
+    }
+    assert!(cache.resident_bytes() <= cache.target_bytes());
+    assert!(
+        cache
+            .resident_bytes()
+            .checked_add(cache.metadata_bytes())
+            .is_some_and(|bytes| bytes <= cache.hard_limit_bytes())
+    );
 }
 
 fn pseudorandom_payload(length: usize, seed: u64) -> Vec<u8> {
@@ -1057,6 +1402,482 @@ fn append_graph_proof_reads_are_bounded_by_changed_suffix_not_prior_file_size() 
     assert!(
         large_prefix_reads <= small_prefix_reads + 32,
         "verified DATA reads must remain suffix-bounded: small={small_prefix_reads}, large={large_prefix_reads}"
+    );
+}
+
+#[test]
+fn sparse_tree_append_reads_only_the_right_manifest_path() {
+    const PREFIX_BYTES: u64 = 68 * 1_024 * 1_024 * 1_024;
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0x75; 32]).expect("policy identity is nonzero");
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), policy),
+        ContainerRepository::new(containers.clone()),
+        16,
+    )
+    .expect("bootstrap sparse-tree fixture");
+    let Reply::Created { entry, handle } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"huge-sparse-append",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create sparse-tree fixture")
+    else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::SetLength {
+                inode: entry.attr.inode,
+                handle: Some(handle),
+                length: PREFIX_BYTES,
+            },
+        )
+        .expect("create the large sparse prefix");
+    for ordinal in 0..1_088_u64 {
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode: entry.attr.inode,
+                    handle,
+                    offset: ordinal * 64 * 1_024 * 1_024,
+                    data: &[u8::try_from(ordinal % 251).expect("fixture byte fits u8")],
+                },
+            )
+            .expect("materialize one sparse Manifest boundary");
+    }
+    appliance
+        .checkpoint()
+        .expect("checkpoint sparse prefix")
+        .expect("sparse prefix needs one generation");
+
+    let baseline = metadata.operation_count();
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: PREFIX_BYTES,
+                data: b"path-local append",
+            },
+        )
+        .expect("append one small DATA extent");
+    appliance
+        .checkpoint()
+        .expect("checkpoint sparse append")
+        .expect("sparse append needs one generation");
+    let metadata_reads = metadata.operations()[baseline..]
+        .iter()
+        .filter(|operation| **operation == StorageOperation::Read)
+        .count();
+    assert!(
+        metadata_reads <= 64,
+        "an append must read only the right Manifest path and bounded commit metadata, observed {metadata_reads} reads"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one public-seam fixture keeps construction, bounded-I/O oracle, crash, and recovery together"
+)]
+fn sparse_tree_replacement_reads_only_the_touched_manifest_path() {
+    const PREFIX_BYTES: u64 = 68 * 1_024 * 1_024 * 1_024;
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0x76; 32]).expect("policy identity is nonzero");
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), policy),
+        ContainerRepository::new(containers.clone()),
+        16,
+    )
+    .expect("bootstrap sparse-tree fixture");
+    let Reply::Created { entry, handle } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"huge-sparse-replacement",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create sparse-tree fixture")
+    else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::SetLength {
+                inode: entry.attr.inode,
+                handle: Some(handle),
+                length: PREFIX_BYTES,
+            },
+        )
+        .expect("create the large sparse prefix");
+    for ordinal in 0..1_088_u64 {
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode: entry.attr.inode,
+                    handle,
+                    offset: ordinal * 64 * 1_024 * 1_024,
+                    data: &[u8::try_from(ordinal % 251).expect("fixture byte fits u8")],
+                },
+            )
+            .expect("materialize one sparse Manifest boundary");
+    }
+    appliance
+        .checkpoint()
+        .expect("checkpoint sparse prefix")
+        .expect("sparse prefix needs one generation");
+
+    let baseline = metadata.operation_count();
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: PREFIX_BYTES - 1,
+                data: b"R",
+            },
+        )
+        .expect("replace one byte near the sparse-tree tail");
+    appliance
+        .checkpoint()
+        .expect("checkpoint sparse replacement")
+        .expect("sparse replacement needs one generation");
+    let metadata_reads = metadata.operations()[baseline..]
+        .iter()
+        .filter(|operation| **operation == StorageOperation::Read)
+        .count();
+    assert!(
+        metadata_reads <= 256,
+        "a replacement must read only touched Manifest paths and bounded commit metadata, observed {metadata_reads} reads"
+    );
+    drop(appliance);
+    metadata.crash();
+    containers.crash();
+
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, policy),
+        &ContainerRepository::new(containers),
+    )
+    .expect("recover sparse replacement generation")
+    .expect("sparse replacement generation exists");
+    let Reply::Opened(recovered_handle) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: entry.attr.inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open recovered sparse replacement")
+    else {
+        panic!("ASSERT: open returned the wrong reply variant");
+    };
+    assert_eq!(
+        read(
+            &recovered,
+            entry.attr.inode,
+            recovered_handle,
+            PREFIX_BYTES - 1,
+            1,
+        ),
+        b"R"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one public-seam tracer keeps the large-tree cut, bounded-I/O oracle, crash, and recovery together"
+)]
+fn sparse_tree_truncate_reuses_left_subtrees_and_recovers_the_exact_cut() {
+    const ORIGINAL_BYTES: u64 = 68 * 1_024 * 1_024 * 1_024;
+    const TRUNCATED_BYTES: u64 = 32 * 1_024 * 1_024 * 1_024 + 17;
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0x79; 32]).expect("policy identity is nonzero");
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), policy),
+        ContainerRepository::new(containers.clone()),
+        16,
+    )
+    .expect("bootstrap sparse-tree truncate fixture");
+    let Reply::Created { entry, handle } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"huge-sparse-truncate",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create sparse-tree truncate fixture")
+    else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::SetLength {
+                inode: entry.attr.inode,
+                handle: Some(handle),
+                length: ORIGINAL_BYTES,
+            },
+        )
+        .expect("create the large sparse predecessor");
+    for ordinal in 0..1_088_u64 {
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode: entry.attr.inode,
+                    handle,
+                    offset: ordinal * 64 * 1_024 * 1_024,
+                    data: &[u8::try_from(ordinal % 251).expect("fixture byte fits u8")],
+                },
+            )
+            .expect("materialize one sparse Manifest boundary");
+    }
+    appliance
+        .checkpoint()
+        .expect("checkpoint sparse predecessor")
+        .expect("sparse predecessor needs one generation");
+
+    let baseline = metadata.operation_count();
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::SetLength {
+                inode: entry.attr.inode,
+                handle: Some(handle),
+                length: TRUNCATED_BYTES,
+            },
+        )
+        .expect("truncate the large sparse file");
+    appliance
+        .checkpoint()
+        .expect("checkpoint path-local truncate")
+        .expect("truncate needs one generation");
+    let metadata_reads = metadata.operations()[baseline..]
+        .iter()
+        .filter(|operation| **operation == StorageOperation::Read)
+        .count();
+    assert!(
+        metadata_reads <= 256,
+        "truncate must read only the cutoff Manifest path and bounded commit metadata, observed {metadata_reads} reads"
+    );
+    drop(appliance);
+    metadata.crash();
+    containers.crash();
+
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, policy),
+        &ContainerRepository::new(containers),
+    )
+    .expect("recover sparse truncate generation")
+    .expect("sparse truncate generation exists");
+    let Reply::Attr(recovered_attr) = recovered
+        .dispatch(
+            CALLER,
+            Operation::GetAttr {
+                inode: entry.attr.inode,
+            },
+        )
+        .expect("stat recovered sparse truncate")
+    else {
+        panic!("ASSERT: getattr returned the wrong reply variant");
+    };
+    assert_eq!(recovered_attr.size, TRUNCATED_BYTES);
+    let Reply::Opened(recovered_handle) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: entry.attr.inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open recovered sparse truncate")
+    else {
+        panic!("ASSERT: open returned the wrong reply variant");
+    };
+    assert_eq!(
+        read(
+            &recovered,
+            entry.attr.inode,
+            recovered_handle,
+            32 * 1_024 * 1_024 * 1_024,
+            18,
+        ),
+        [u8::try_from(512 % 251).expect("fixture byte fits u8")]
+            .into_iter()
+            .chain([0; 16])
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        read(
+            &recovered,
+            entry.attr.inode,
+            recovered_handle,
+            TRUNCATED_BYTES,
+            1,
+        )
+        .is_empty(),
+        "the exact truncate cut must be EOF after recovery"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one public-seam tracer keeps DATA-boundary reduction, crash, and byte-exact recovery together"
+)]
+fn truncate_inside_data_reencodes_only_the_boundary_prefix_and_recovers_byte_exactly() {
+    const ORIGINAL_BYTES: usize = 1_048_576;
+    const TRUNCATED_BYTES: usize = 333_333;
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0x7a; 32]).expect("policy identity is nonzero");
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), policy),
+        ContainerRepository::new(containers.clone()),
+        16,
+    )
+    .expect("bootstrap DATA-boundary truncate fixture");
+    let Reply::Created { entry, handle } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"truncate-inside-data",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create DATA-boundary fixture")
+    else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+    let payload = pseudorandom_payload(ORIGINAL_BYTES, 0x713d_6b2f_98a0_4ce1);
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: 0,
+                data: &payload,
+            },
+        )
+        .expect("write DATA-boundary fixture");
+    appliance
+        .checkpoint()
+        .expect("checkpoint complete DATA predecessor")
+        .expect("DATA predecessor needs one generation");
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::SetLength {
+                inode: entry.attr.inode,
+                handle: Some(handle),
+                length: u64::try_from(TRUNCATED_BYTES).expect("fixture length fits u64"),
+            },
+        )
+        .expect("truncate inside one DATA Chunk");
+    appliance
+        .checkpoint()
+        .expect("checkpoint DATA-boundary truncate")
+        .expect("DATA-boundary truncate needs one generation");
+    drop(appliance);
+    metadata.crash();
+    containers.crash();
+
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, policy),
+        &ContainerRepository::new(containers),
+    )
+    .expect("recover DATA-boundary truncate")
+    .expect("DATA-boundary generation exists");
+    let Reply::Opened(recovered_handle) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: entry.attr.inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open recovered DATA-boundary file")
+    else {
+        panic!("ASSERT: open returned the wrong reply variant");
+    };
+    assert_eq!(
+        read(
+            &recovered,
+            entry.attr.inode,
+            recovered_handle,
+            0,
+            u32::try_from(TRUNCATED_BYTES).expect("fixture length fits u32"),
+        ),
+        payload[..TRUNCATED_BYTES]
+    );
+    assert!(
+        read(
+            &recovered,
+            entry.attr.inode,
+            recovered_handle,
+            u64::try_from(TRUNCATED_BYTES).expect("fixture length fits u64"),
+            1,
+        )
+        .is_empty()
     );
 }
 

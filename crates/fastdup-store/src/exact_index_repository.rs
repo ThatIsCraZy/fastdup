@@ -1,43 +1,286 @@
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::fmt;
 use std::io;
+use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use fastdup_format::{
-    ChunkId, EXACT_INDEX_ACTIVATION_RECORD_BYTES, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES,
-    ExactIndexActivationError, ExactIndexActivationHash, ExactIndexActivationRecord,
-    ExactIndexEntry, ExactIndexFormatError, ExactIndexPage, ExactIndexPagePosition,
-    ExactIndexProfileId, ExactIndexRun, ExactIndexRunDescriptor, ExactIndexRunRef,
-    ExactIndexRunSet, ExactIndexRunSetError, ExactIndexRunSetId, MAX_METADATA_OBJECT_BYTES,
+    ChunkId, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES, ExactIndexActivationError,
+    ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError, ExactIndexPage,
+    ExactIndexPagePosition, ExactIndexProfileId, ExactIndexRun, ExactIndexRunDescriptor,
+    ExactIndexRunHashAudit, ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError,
+    ExactIndexRunSetId, ExactIndexRunStreamEncoder, MAX_METADATA_OBJECT_BYTES,
 };
 
-use crate::StorageIo;
+use crate::exact_activation_log::{ExactActivationLog, ExactActivationLogError};
+use crate::read_cache::{
+    MemoryPressureSnapshot, SYSTEM_REFRESH_INTERVAL, shared_cache_reserve_bytes,
+};
+use crate::reduction_filter::{BlockedBloomHint, BloomLookupHint};
+use crate::{ContainerRepository, StorageIo, StoreError};
 
 pub const MAX_EXACT_LOOKUP_CANDIDATES: usize = 64;
-pub const MAX_ACTIVE_EXACT_INDEX_RUNS: usize = 64;
-/// Hard bound for one in-memory compaction input and output.
+pub const MAX_ACTIVE_EXACT_INDEX_FAMILIES: usize = 64;
+const EXACT_INDEX_PAGE_CACHE_FALLBACK_SLOTS: usize = 256;
+const EXACT_INDEX_PAGE_CACHE_MINIMUM_BYTES: u64 = 1_024 * 1_024;
+const EXACT_INDEX_PAGE_CACHE_MAXIMUM_BYTES: u64 = 256 * 1_024 * 1_024;
+const EXACT_INDEX_PAGE_CACHE_RAM_DIVISOR: u64 = 128;
+const EXACT_RUN_MEMBERSHIP_RAM_DIVISOR: u64 = 32;
+const EXACT_RUN_MEMBERSHIP_MINIMUM_BYTES: u64 = 1_024 * 1_024;
+const EXACT_RUN_MEMBERSHIP_MAXIMUM_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
+/// Compatibility name for the former physical-Run bound.
 ///
-/// This is policy rather than format geometry. It keeps the current pre-MVP
-/// merge below roughly 100 MiB of transient entry/output storage while a later
-/// streaming partitioned compactor is benchmarked.
-pub const MAX_EXACT_COMPACTION_ENTRIES: usize = 262_144;
-const ACTIVATION_WAL_NAME: &str = "exact-index.activation.wal";
-const MAX_ACTIVATION_WAL_BYTES: u64 = 64 * 1_024 * 1_024;
+/// The bound applies to logical Run families since Run-Set v2. Physical
+/// partitions within one family do not consume additional lookup precedence.
+pub const MAX_ACTIVE_EXACT_INDEX_RUNS: usize = MAX_ACTIVE_EXACT_INDEX_FAMILIES;
+pub const EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES: usize = 262_144;
+
+/// One complete, key-disjoint output generation of Exact Index compaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactIndexRunFamily {
+    runs: Vec<ExactIndexRunRef>,
+    family_generation: u64,
+    last_generation: u64,
+}
+
+impl ExactIndexRunFamily {
+    fn new(runs: Vec<ExactIndexRunRef>) -> Result<Self, ExactIndexStoreError> {
+        let profile = runs
+            .first()
+            .copied()
+            .ok_or(ExactIndexStoreError::InvalidCompactionInput)?
+            .profile();
+        let canonical = ExactIndexRunSet::new(profile, 1, runs)?;
+        if canonical.family_count() != 1 {
+            return Err(ExactIndexStoreError::InvalidCompactionInput);
+        }
+        let canonical_runs = canonical.runs();
+        let family_generation = canonical_runs[0].family_generation();
+        let last_generation = canonical_runs[canonical_runs.len() - 1].generation();
+        Ok(Self {
+            runs: canonical_runs.to_vec(),
+            family_generation,
+            last_generation,
+        })
+    }
+
+    #[must_use]
+    pub fn runs(&self) -> &[ExactIndexRunRef] {
+        &self.runs
+    }
+
+    #[must_use]
+    pub const fn family_generation(&self) -> u64 {
+        self.family_generation
+    }
+
+    #[must_use]
+    pub const fn last_generation(&self) -> u64 {
+        self.last_generation
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompactionInputFamily {
+    refs: Vec<ExactIndexRunRef>,
+    family_generation: u64,
+}
 
 /// Durable immutable Exact Index run publication and bounded lookup module.
 #[derive(Clone, Debug)]
 pub struct ExactIndexRunRepository<I> {
     storage: I,
     publish_lock: Arc<Mutex<()>>,
+    page_cache: Arc<ExactIndexPageCache>,
+    fixed_membership_snapshot: Option<MemoryPressureSnapshot>,
+    membership_counters: Arc<ExactRunMembershipCounters>,
+}
+
+/// Fixed-capacity Exact-Index hot-page cache evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExactIndexPageCacheStatus {
+    hits: u64,
+    misses: u64,
+    resident_pages: u64,
+    evictions: u64,
+    pressure_rejections: u64,
+    target_pages: u64,
+    capacity_pages: u64,
+    reserve_bytes: u64,
+    effective_limit_bytes: u64,
+    available_bytes: u64,
+    swap_used_bytes: u64,
+}
+
+impl ExactIndexPageCacheStatus {
+    #[must_use]
+    pub const fn hits(self) -> u64 {
+        self.hits
+    }
+
+    #[must_use]
+    pub const fn misses(self) -> u64 {
+        self.misses
+    }
+
+    #[must_use]
+    pub const fn resident_pages(self) -> u64 {
+        self.resident_pages
+    }
+
+    #[must_use]
+    pub const fn evictions(self) -> u64 {
+        self.evictions
+    }
+
+    #[must_use]
+    pub const fn pressure_rejections(self) -> u64 {
+        self.pressure_rejections
+    }
+
+    #[must_use]
+    pub const fn target_pages(self) -> u64 {
+        self.target_pages
+    }
+
+    #[must_use]
+    pub const fn capacity_pages(self) -> u64 {
+        self.capacity_pages
+    }
+
+    #[must_use]
+    pub const fn reserve_bytes(self) -> u64 {
+        self.reserve_bytes
+    }
+
+    #[must_use]
+    pub const fn effective_limit_bytes(self) -> u64 {
+        self.effective_limit_bytes
+    }
+
+    #[must_use]
+    pub const fn available_bytes(self) -> u64 {
+        self.available_bytes
+    }
+
+    #[must_use]
+    pub const fn swap_used_bytes(self) -> u64 {
+        self.swap_used_bytes
+    }
+
+    /// Returns hit rate in basis points, or zero before the first lookup.
+    #[must_use]
+    pub fn hit_rate_basis_points(self) -> u64 {
+        let total = self.hits.saturating_add(self.misses);
+        self.hits
+            .saturating_mul(10_000)
+            .checked_div(total)
+            .unwrap_or(0)
+    }
+}
+
+/// Process-lifetime evidence for immutable active-Run membership probes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExactRunMembershipStatus {
+    filter_count: u64,
+    allocated_bytes: u64,
+    probes: u64,
+    definitely_absent: u64,
+    requires_exact_lookup: u64,
+}
+
+impl ExactRunMembershipStatus {
+    #[must_use]
+    pub const fn filter_count(self) -> u64 {
+        self.filter_count
+    }
+
+    #[must_use]
+    pub const fn allocated_bytes(self) -> u64 {
+        self.allocated_bytes
+    }
+
+    #[must_use]
+    pub const fn probes(self) -> u64 {
+        self.probes
+    }
+
+    #[must_use]
+    pub const fn definitely_absent(self) -> u64 {
+        self.definitely_absent
+    }
+
+    #[must_use]
+    pub const fn requires_exact_lookup(self) -> u64 {
+        self.requires_exact_lookup
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExactRunMembershipCounters {
+    probes: AtomicU64,
+    definitely_absent: AtomicU64,
+    requires_exact_lookup: AtomicU64,
+}
+
+/// Payload-free evidence from pairing every ACTIVE index entry with its
+/// immutable Container location during an offline scrub.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactIndexLocationAudit {
+    activation: ExactIndexActivationRecord,
+    active_locations: u64,
+}
+
+impl ExactIndexLocationAudit {
+    #[must_use]
+    pub const fn activation(self) -> ExactIndexActivationRecord {
+        self.activation
+    }
+
+    #[must_use]
+    pub const fn active_locations(self) -> u64 {
+        self.active_locations
+    }
 }
 
 impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     #[must_use]
     pub fn new(storage: I) -> Self {
+        let snapshot = MemoryPressureSnapshot::read_system()
+            .unwrap_or_else(|_| MemoryPressureSnapshot::new(0, 0, 1));
         Self {
             storage,
             publish_lock: Arc::new(Mutex::new(())),
+            page_cache: Arc::new(ExactIndexPageCache::build(snapshot, true)),
+            fixed_membership_snapshot: None,
+            membership_counters: Arc::new(ExactRunMembershipCounters::default()),
         }
+    }
+
+    /// Constructs a repository with a deterministic, manually fixed memory
+    /// snapshot for tests and embedded runtimes with an external governor.
+    ///
+    /// The ordinary constructor samples host/cgroup pressure automatically.
+    /// This variant deliberately does not refresh `/proc`; callers must create
+    /// a new repository to apply another snapshot.
+    #[must_use]
+    pub fn new_with_memory_snapshot(storage: I, snapshot: MemoryPressureSnapshot) -> Self {
+        Self {
+            storage,
+            publish_lock: Arc::new(Mutex::new(())),
+            page_cache: Arc::new(ExactIndexPageCache::build(snapshot, false)),
+            fixed_membership_snapshot: Some(snapshot),
+            membership_counters: Arc::new(ExactRunMembershipCounters::default()),
+        }
+    }
+
+    /// Returns repository-wide bounded Exact-Index hot-page cache evidence.
+    #[must_use]
+    pub fn page_cache_status(&self) -> ExactIndexPageCacheStatus {
+        self.page_cache.status()
     }
 
     /// Durably publishes one immutable run without activating it.
@@ -135,6 +378,9 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             storage: self.storage.clone(),
             name,
             descriptor,
+            page_cache: Arc::clone(&self.page_cache),
+            membership: None,
+            membership_counters: Arc::clone(&self.membership_counters),
         })
     }
 
@@ -154,7 +400,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         Ok(descriptor)
     }
 
-    /// Merges a bounded set of fully audited immutable Runs into one new Run.
+    /// Streams a bounded-fanin set of fully audited immutable Runs into one new Run.
     ///
     /// For a repeated physical Location the transition from the newest source
     /// Run generation wins. Every other Location is retained, including
@@ -168,14 +414,13 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     /// # Errors
     ///
     /// Rejects fewer than two inputs, duplicate/mismatched source identities,
-    /// a nonmonotonic target generation, an input above the explicit memory
-    /// bound, source corruption, Chunk-ID length conflicts, or publication I/O.
+    /// a nonmonotonic target generation, source corruption, Chunk-ID length
+    /// conflicts, output above the Run-v1 object bound, or publication I/O.
     ///
     /// # Panics
     ///
-    /// Panics only if a completely audited Run disagrees with the entry count
-    /// pinned by its verified reference, or if the bounded count cannot fit
-    /// `usize`. Both are impossible production `ASSERT` failures.
+    /// Panics only if the verified K-way cursor loses or reorders its own
+    /// current entry. This is an impossible production `ASSERT` failure.
     pub fn compact(
         &self,
         inputs: &[ExactIndexRunRef],
@@ -202,65 +447,73 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             return Err(ExactIndexStoreError::InvalidCompactionInput);
         }
 
-        let total_entries = ordered_inputs.iter().try_fold(0_usize, |total, run| {
-            let count = usize::try_from(run.entry_count())
-                .map_err(|_| ExactIndexStoreError::CompactionTooLarge)?;
-            total
-                .checked_add(count)
-                .ok_or(ExactIndexStoreError::CompactionTooLarge)
-        })?;
-        if total_entries > MAX_EXACT_COMPACTION_ENTRIES {
-            return Err(ExactIndexStoreError::CompactionTooLarge);
-        }
+        let summary = self.merge_compaction_inputs(&ordered_inputs, |_| Ok(()))?;
+        let _guard = self
+            .publish_lock
+            .lock()
+            .expect("ASSERT: Exact Index streaming compaction lock poisoned");
+        self.publish_streamed_compaction(&ordered_inputs, profile, target_generation, summary)
+    }
 
-        let mut merged = Vec::new();
-        merged
-            .try_reserve_exact(total_entries)
-            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
-        for run_ref in ordered_inputs {
-            let entries = self.read_verified_entries(run_ref)?;
-            assert_eq!(
-                entries.len(),
-                usize::try_from(run_ref.entry_count())
-                    .expect("ASSERT: bounded compaction entry count fits usize"),
-                "ASSERT: audited Run entry count disagrees with its pinned reference"
-            );
-            merged.extend(entries.into_iter().map(|entry| CompactionEntry {
-                entry,
-                source_generation: run_ref.generation(),
-            }));
-        }
+    /// Compacts complete source families into one key-partitioned Run family.
+    ///
+    /// Output partitions never split one Chunk ID. Every partition is fully
+    /// audited and synchronized before one final directory sync makes the
+    /// complete unpublished family reusable by a later Run-Set activation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete/mixed input families, invalid level/generation
+    /// transitions, source corruption, an unsplittable Run-v1-sized hot key,
+    /// excessive partition count, or publication I/O.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if verified merge summaries disagree with the second pass
+    /// or the format writer rejects its own previously verified descriptors.
+    pub fn compact_family(
+        &self,
+        inputs: &[ExactIndexRunRef],
+        target_level: u16,
+        first_generation: u64,
+    ) -> Result<ExactIndexRunFamily, ExactIndexStoreError> {
+        let input_families =
+            validate_family_compaction_inputs(inputs, target_level, first_generation)?;
+        let profile = input_families[0].refs[0].profile();
+        let summaries = self.compaction_partition_summaries(&input_families)?;
+        let partition_count = u16::try_from(summaries.len())
+            .map_err(|_| ExactIndexStoreError::TooManyRunPartitions)?;
+        first_generation
+            .checked_add(u64::from(partition_count) - 1)
+            .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
+        let _guard = self
+            .publish_lock
+            .lock()
+            .expect("ASSERT: Exact Index family compaction lock poisoned");
+        let descriptors =
+            self.publish_streamed_family(&input_families, profile, first_generation, &summaries)?;
         assert_eq!(
-            merged.len(),
-            total_entries,
-            "ASSERT: bounded compaction lost a source entry"
+            descriptors.len(),
+            summaries.len(),
+            "ASSERT: streamed family descriptor count must equal its first-pass partition count"
         );
-        merged.sort_unstable_by_key(|item| {
-            (
-                compaction_location_key(item.entry),
-                Reverse(item.source_generation),
-            )
-        });
-
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(merged.len())
+        let mut runs = Vec::new();
+        runs.try_reserve_exact(descriptors.len())
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
-        let mut previous_key = None;
-        for item in merged {
-            let key = compaction_location_key(item.entry);
-            if previous_key == Some(key) {
-                continue;
-            }
-            previous_key = Some(key);
-            output.push(item.entry);
+        for (ordinal, descriptor) in descriptors.into_iter().enumerate() {
+            runs.push(ExactIndexRunRef::family_partition(
+                target_level,
+                first_generation,
+                u16::try_from(ordinal).map_err(|_| ExactIndexStoreError::TooManyRunPartitions)?,
+                partition_count,
+                descriptor,
+            )?);
         }
-        let compacted = ExactIndexRun::new(profile, target_generation, output)?;
-        self.publish(&compacted)
+        ExactIndexRunFamily::new(runs)
     }
 
     /// Publishes and activates one Run Set after fully auditing every named
-    /// immutable Run. The final activation-WAL sync is the only commit point.
+    /// immutable Run. The final selected-slot sync is the only commit point.
     ///
     /// # Errors
     ///
@@ -283,44 +536,32 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         let encoded = run_set.encode()?;
         let run_set_id = ExactIndexRunSetId::from_encoded(&encoded)?;
         self.publish_run_set(run_set_id, &encoded)?;
-        self.ensure_activation_wal()?;
-        let tail = self.read_activation_tail()?;
-        if !tail.clean {
-            return Err(ExactIndexStoreError::ActivationWalCorrupt);
-        }
-        if let Some(last) = tail.last {
+        let log = ExactActivationLog::new(&self.storage);
+        let snapshot = log.load_for_append().map_err(map_activation_log_error)?;
+        if let Some(last) = snapshot.last_record() {
             if last.run_set_id() == run_set_id {
                 if last.profile() != run_set.profile()
                     || last.run_set_generation() != run_set.generation()
                 {
                     return Err(ExactIndexStoreError::DependencyMismatch);
                 }
-                self.storage.sync_file(ACTIVATION_WAL_NAME)?;
+                log.sync_selected(&snapshot)
+                    .map_err(map_activation_log_error)?;
                 return ActivatedExactIndex::new(last, run_set.clone(), readers);
             }
             if run_set.generation() <= last.run_set_generation() {
                 return Err(ExactIndexStoreError::NonMonotonicRunSetGeneration);
             }
         }
-        let generation = tail.last.map_or(Ok(1), |record| {
+        let generation = snapshot.last_record().map_or(Ok(1), |record| {
             record
                 .generation()
                 .checked_add(1)
                 .ok_or(ExactIndexStoreError::ActivationWalCorrupt)
         })?;
-        let previous_hash = tail.last.map_or(ExactIndexActivationHash::ZERO, |record| {
-            ExactIndexActivationHash::of(&record.encode())
-        });
-        let next_length = tail
-            .valid_length
-            .checked_add(
-                u64::try_from(EXACT_INDEX_ACTIVATION_RECORD_BYTES)
-                    .expect("ASSERT: activation record length fits u64"),
-            )
-            .ok_or(ExactIndexStoreError::ActivationWalFull)?;
-        if next_length > MAX_ACTIVATION_WAL_BYTES {
-            return Err(ExactIndexStoreError::ActivationWalFull);
-        }
+        let previous_hash = snapshot
+            .last_hash()
+            .unwrap_or(fastdup_format::ExactIndexActivationHash::ZERO);
         let record = ExactIndexActivationRecord::new(
             generation,
             previous_hash,
@@ -328,18 +569,8 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             run_set.profile(),
             run_set.generation(),
         )?;
-        let encoded_record = record.encode();
-        self.storage
-            .write_at(ACTIVATION_WAL_NAME, tail.valid_length, &encoded_record)?;
-        let reread = self.storage.read_exact_at(
-            ACTIVATION_WAL_NAME,
-            tail.valid_length,
-            EXACT_INDEX_ACTIVATION_RECORD_BYTES,
-        )?;
-        if reread != encoded_record || ExactIndexActivationRecord::decode(&reread)? != record {
-            return Err(ExactIndexStoreError::PublishVerificationMismatch);
-        }
-        self.storage.sync_file(ACTIVATION_WAL_NAME)?;
+        log.append(&snapshot, record)
+            .map_err(map_activation_log_error)?;
         ActivatedExactIndex::new(record, run_set.clone(), readers)
     }
 
@@ -355,13 +586,170 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     /// Returns activation-chain, Run Set, Run, identity, I/O, or integrity
     /// failures.
     pub fn recover_active(&self) -> Result<Option<ActivatedExactIndex<I>>, ExactIndexStoreError> {
-        if !self.storage.exists(ACTIVATION_WAL_NAME)? {
-            return Ok(None);
-        }
-        let tail = self.read_activation_tail()?;
-        let Some(record) = tail.last else {
+        let log = ExactActivationLog::new(&self.storage);
+        let Some(snapshot) = log.load_for_recovery().map_err(map_activation_log_error)? else {
             return Ok(None);
         };
+        let Some(record) = snapshot.last_record() else {
+            return Ok(None);
+        };
+        self.open_activated_record(record).map(Some)
+    }
+
+    /// Audits both bounded Activation-Log slots and the selected immutable
+    /// Run-Set dependency graph without changing activation state.
+    ///
+    /// This is the offline-scrub pairing for the writer and recovery slot
+    /// invariants. A corrupt inactive peer is reported rather than silently
+    /// discarded, because it could otherwise be mistaken for rotation
+    /// evidence after another fault.
+    ///
+    /// # Errors
+    ///
+    /// Returns slot topology, hash-chain, Run Set, Run, identity, I/O, or
+    /// integrity failures.
+    pub fn audit_activation_log(
+        &self,
+    ) -> Result<Option<ExactIndexActivationRecord>, ExactIndexStoreError> {
+        let log = ExactActivationLog::new(&self.storage);
+        let Some(snapshot) = log.load_for_recovery().map_err(map_activation_log_error)? else {
+            return Ok(None);
+        };
+        let Some(record) = snapshot.last_record() else {
+            return Ok(None);
+        };
+        self.open_activated_record(record)?;
+        Ok(Some(record))
+    }
+
+    /// Audits the complete selected index graph and pairs every ACTIVE entry
+    /// with the exact immutable Container record it accelerates.
+    ///
+    /// This deliberately performs random Container reads and is intended for
+    /// offline scrub, not lookup or mount recovery. Non-ACTIVE transitions are
+    /// authenticated by the Run audit but have no live DATA dependency.
+    ///
+    /// # Errors
+    ///
+    /// Returns activation, Run-Set, Run, page, Container, identity, I/O, or
+    /// checked-counter failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a format-verified logical length does not fit the host address
+    /// space. Supported production targets have at least 32-bit `usize`.
+    pub fn audit_active_locations<J: StorageIo>(
+        &self,
+        containers: &ContainerRepository<J>,
+    ) -> Result<Option<ExactIndexLocationAudit>, ExactIndexStoreError> {
+        let log = ExactActivationLog::new(&self.storage);
+        let Some(snapshot) = log.load_for_recovery().map_err(map_activation_log_error)? else {
+            return Ok(None);
+        };
+        let Some(record) = snapshot.last_record() else {
+            return Ok(None);
+        };
+        let active = self.open_activated_record(record)?;
+        self.audit_run_set_global_invariants(active.run_set())?;
+        let mut active_locations = 0_u64;
+        for reader in &active.readers {
+            for page_ordinal in 0..reader.descriptor.page_count() {
+                let page = reader.read_page(page_ordinal)?;
+                for entry in page.entries() {
+                    if reader.membership.as_ref().is_some_and(|membership| {
+                        membership.probe_for_exact_lookup(
+                            entry.chunk_id(),
+                            usize::try_from(entry.logical_length())
+                                .expect("ASSERT: Exact logical length fits usize"),
+                        ) == BloomLookupHint::DefinitelyAbsent
+                    }) {
+                        return Err(ExactIndexStoreError::MembershipFalseNegative);
+                    }
+                    if entry.transition() != fastdup_format::ExactLocationTransition::Active {
+                        continue;
+                    }
+                    containers.read_verified_location(*entry)?;
+                    active_locations = active_locations
+                        .checked_add(1)
+                        .ok_or(ExactIndexStoreError::CounterOverflow)?;
+                }
+            }
+        }
+        Ok(Some(ExactIndexLocationAudit {
+            activation: record,
+            active_locations,
+        }))
+    }
+
+    /// Streams all logical Run families through one bounded K-way merge to
+    /// verify cross-family Chunk-length and physical-transition invariants.
+    ///
+    /// No complete Chunk map or output Run is materialized. Memory is bounded
+    /// by one verified page and one heap entry per active family.
+    ///
+    /// # Errors
+    ///
+    /// Returns Run-Set, Run/page/hash, cross-family identity, I/O, allocation,
+    /// or checked-arithmetic failures.
+    pub(crate) fn audit_run_set_global_invariants(
+        &self,
+        run_set: &ExactIndexRunSet,
+    ) -> Result<(), ExactIndexStoreError> {
+        if run_set.runs().is_empty() {
+            return Ok(());
+        }
+        let mut grouped = std::collections::BTreeMap::<(u16, u64), Vec<ExactIndexRunRef>>::new();
+        for run in run_set.runs().iter().copied() {
+            grouped
+                .entry((run.level(), run.family_generation()))
+                .or_default()
+                .push(run);
+        }
+        let mut families = Vec::new();
+        families
+            .try_reserve_exact(grouped.len())
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        for ((_, family_generation), mut refs) in grouped {
+            refs.sort_unstable_by_key(|run| run.partition_ordinal());
+            families.push(CompactionInputFamily {
+                refs,
+                family_generation,
+            });
+        }
+        self.merge_compaction_families(&families, |_| Ok(()))?;
+        Ok(())
+    }
+
+    /// Returns the greatest generation named by any immutable Run for one
+    /// profile, including unpublished/orphaned rebuild output.
+    ///
+    /// Rebuilders use this allocator high-water so retries never collide with
+    /// a different immutable object left behind before activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns directory I/O or a malformed canonical Run name.
+    pub fn discover_run_generation_high_water(
+        &self,
+        profile: ExactIndexProfileId,
+    ) -> Result<Option<u64>, ExactIndexStoreError> {
+        let mut high_water = None;
+        for name in self.storage.list_names()? {
+            let Some((observed_profile, generation)) = parse_run_name(&name)? else {
+                continue;
+            };
+            if observed_profile == profile {
+                high_water =
+                    Some(high_water.map_or(generation, |value: u64| value.max(generation)));
+            }
+        }
+        Ok(high_water)
+    }
+
+    fn open_activated_record(
+        &self,
+        record: ExactIndexActivationRecord,
+    ) -> Result<ActivatedExactIndex<I>, ExactIndexStoreError> {
         let run_set = self.read_run_set(record.run_set_id())?;
         if run_set.profile() != record.profile()
             || run_set.generation() != record.run_set_generation()
@@ -370,7 +758,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             return Err(ExactIndexStoreError::DependencyMismatch);
         }
         let readers = self.verify_run_set_dependencies(&run_set)?;
-        Ok(Some(ActivatedExactIndex::new(record, run_set, readers)?))
+        ActivatedExactIndex::new(record, run_set, readers)
     }
 
     fn open_named(&self, name: &str) -> Result<ExactIndexRunDescriptor, ExactIndexStoreError> {
@@ -406,6 +794,42 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
 
     fn audit_named(&self, name: &str) -> Result<ExactIndexRunDescriptor, ExactIndexStoreError> {
         let envelope = self.read_envelope(name)?;
+        self.audit_opened_run(name, &envelope, |_| {})?;
+        Ok(envelope.descriptor)
+    }
+
+    fn audit_named_with_membership(
+        &self,
+        name: &str,
+        maximum_bytes: usize,
+    ) -> Result<(ExactIndexRunDescriptor, Option<Arc<BlockedBloomHint>>), ExactIndexStoreError>
+    {
+        let envelope = self.read_envelope(name)?;
+        let descriptor = envelope.descriptor;
+        let mut membership = (maximum_bytes != 0)
+            .then(|| BlockedBloomHint::new(descriptor.entry_count(), maximum_bytes).ok())
+            .flatten();
+        self.audit_opened_run(name, &envelope, |entry| {
+            if let Some(filter) = &mut membership {
+                let logical_length = usize::try_from(entry.logical_length())
+                    .expect("ASSERT: Exact logical length fits usize");
+                filter.insert_hint(entry.chunk_id(), logical_length);
+                assert_eq!(
+                    filter.probe_for_exact_lookup(entry.chunk_id(), logical_length),
+                    BloomLookupHint::RequiresExactLookup,
+                    "ASSERT: inserting an Exact Run key cannot produce a Bloom false negative"
+                );
+            }
+        })?;
+        Ok((descriptor, membership.map(Arc::new)))
+    }
+
+    fn audit_opened_run(
+        &self,
+        name: &str,
+        envelope: &OpenedRunEnvelope,
+        mut visit: impl FnMut(&ExactIndexEntry),
+    ) -> Result<(), ExactIndexStoreError> {
         let descriptor = envelope.descriptor;
         let mut audit = descriptor.begin_hash_audit();
         audit.update(0, &envelope.header)?;
@@ -418,74 +842,396 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 .read_exact_at(name, offset, EXACT_INDEX_PAGE_BYTES)?;
             let page = descriptor.decode_page(page_ordinal, &bytes)?;
             audit.verify_page(&page)?;
+            for entry in page.entries() {
+                visit(entry);
+            }
             audit.update(offset, &bytes)?;
         }
         audit.update(envelope.footer_offset, &envelope.footer)?;
         audit.finish()?;
-        Ok(descriptor)
+        Ok(())
     }
 
-    fn read_verified_entries(
+    fn merge_compaction_inputs<F>(
         &self,
-        run_ref: ExactIndexRunRef,
-    ) -> Result<Vec<ExactIndexEntry>, ExactIndexStoreError> {
-        let name = published_name(run_ref.profile(), run_ref.generation());
-        let envelope = self.read_envelope(&name)?;
-        let descriptor = envelope.descriptor;
-        verify_requested_identity(run_ref.profile(), run_ref.generation(), descriptor)?;
-        verify_run_reference(run_ref, descriptor)?;
-        if descriptor.entry_count() > MAX_EXACT_COMPACTION_ENTRIES {
-            return Err(ExactIndexStoreError::CompactionTooLarge);
-        }
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(descriptor.entry_count())
+        inputs: &[ExactIndexRunRef],
+        mut emit: F,
+    ) -> Result<CompactionSummary, ExactIndexStoreError>
+    where
+        F: FnMut(ExactIndexEntry) -> Result<(), ExactIndexStoreError>,
+    {
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(inputs.len())
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
-        let mut audit = descriptor.begin_hash_audit();
-        audit.update(0, &envelope.header)?;
-        for page_ordinal in 0..descriptor.page_count() {
-            let offset = descriptor
-                .page_offset(page_ordinal)
-                .expect("ASSERT: descriptor page ordinal was prevalidated");
-            let bytes = self
-                .storage
-                .read_exact_at(&name, offset, EXACT_INDEX_PAGE_BYTES)?;
-            let page = descriptor.decode_page(page_ordinal, &bytes)?;
-            audit.verify_page(&page)?;
-            entries.extend_from_slice(page.entries());
-            audit.update(offset, &bytes)?;
+        for run_ref in inputs.iter().copied() {
+            sources.push(CompactionSource::open(self, run_ref)?);
         }
-        audit.update(envelope.footer_offset, &envelope.footer)?;
-        audit.finish()?;
-        if entries.len() != descriptor.entry_count() {
+        let mut heap = BinaryHeap::new();
+        heap.try_reserve(inputs.len())
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        for (source_ordinal, source) in sources.iter().enumerate() {
+            heap.push(CompactionHeapEntry::new(
+                source.current(),
+                source.generation,
+                source_ordinal,
+            ));
+        }
+
+        let mut summary = CompactionSummary::default();
+        let mut previous_location_key = None;
+        let mut previous_output = None;
+        while let Some(candidate) = heap.pop() {
+            let source = &mut sources[candidate.source_ordinal];
+            assert_eq!(
+                source.current(),
+                candidate.entry,
+                "ASSERT: compaction heap entry must equal its source cursor"
+            );
+            let location_key = compaction_location_key(candidate.entry);
+            if previous_location_key != Some(location_key) {
+                if let Some(previous) = previous_output {
+                    verify_compaction_output_pair(previous, candidate.entry)?;
+                }
+                emit(candidate.entry)?;
+                summary.observe(candidate.entry)?;
+                previous_output = Some(candidate.entry);
+                previous_location_key = Some(location_key);
+            }
+            source.advance()?;
+            if let Some(next) = source.current_optional() {
+                heap.push(CompactionHeapEntry::new(
+                    next,
+                    source.generation,
+                    candidate.source_ordinal,
+                ));
+            }
+        }
+        if sources.iter().any(|source| !source.finished) {
             return Err(ExactIndexStoreError::DependencyMismatch);
         }
-        Ok(entries)
+        summary.finish()
+    }
+
+    fn merge_compaction_families<F>(
+        &self,
+        inputs: &[CompactionInputFamily],
+        mut emit: F,
+    ) -> Result<CompactionSummary, ExactIndexStoreError>
+    where
+        F: FnMut(ExactIndexEntry) -> Result<(), ExactIndexStoreError>,
+    {
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(inputs.len())
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        for family in inputs {
+            sources.push(CompactionFamilySource::open(self, family)?);
+        }
+        let mut heap = BinaryHeap::new();
+        heap.try_reserve(inputs.len())
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        for (source_ordinal, source) in sources.iter().enumerate() {
+            heap.push(CompactionHeapEntry::new(
+                source.current(),
+                source.family_generation,
+                source_ordinal,
+            ));
+        }
+
+        let mut summary = CompactionSummary::default();
+        let mut previous_location_key = None;
+        let mut previous_output = None;
+        while let Some(candidate) = heap.pop() {
+            let source = &mut sources[candidate.source_ordinal];
+            assert_eq!(
+                source.current(),
+                candidate.entry,
+                "ASSERT: family compaction heap entry must equal its source cursor"
+            );
+            let location_key = compaction_location_key(candidate.entry);
+            if previous_location_key != Some(location_key) {
+                if let Some(previous) = previous_output {
+                    verify_compaction_output_pair(previous, candidate.entry)?;
+                }
+                emit(candidate.entry)?;
+                summary.observe(candidate.entry)?;
+                previous_output = Some(candidate.entry);
+                previous_location_key = Some(location_key);
+            }
+            source.advance(self)?;
+            if let Some(next) = source.current_optional() {
+                heap.push(CompactionHeapEntry::new(
+                    next,
+                    source.family_generation,
+                    candidate.source_ordinal,
+                ));
+            }
+        }
+        if sources.iter().any(|source| !source.finished()) {
+            return Err(ExactIndexStoreError::DependencyMismatch);
+        }
+        summary.finish()
+    }
+
+    fn compaction_partition_summaries(
+        &self,
+        inputs: &[CompactionInputFamily],
+    ) -> Result<Vec<CompactionSummary>, ExactIndexStoreError> {
+        let mut summaries = Vec::new();
+        let mut current = CompactionSummary::default();
+        let global = self.merge_compaction_families(inputs, |entry| {
+            if current.entry_count >= EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES
+                && current.maximum_chunk_id != Some(entry.chunk_id())
+            {
+                summaries
+                    .try_reserve(1)
+                    .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+                summaries.push(std::mem::take(&mut current).finish()?);
+            }
+            current.observe(entry)
+        })?;
+        summaries
+            .try_reserve(1)
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        summaries.push(current.finish()?);
+        let observed_count = summaries.iter().try_fold(0_usize, |total, summary| {
+            total
+                .checked_add(summary.entry_count)
+                .ok_or(ExactIndexStoreError::OutOfMemory)
+        })?;
+        if observed_count != global.entry_count
+            || summaries
+                .first()
+                .and_then(|summary| summary.minimum_chunk_id)
+                != global.minimum_chunk_id
+            || summaries
+                .last()
+                .and_then(|summary| summary.maximum_chunk_id)
+                != global.maximum_chunk_id
+        {
+            return Err(ExactIndexStoreError::DependencyMismatch);
+        }
+        Ok(summaries)
+    }
+
+    fn publish_streamed_family(
+        &self,
+        inputs: &[CompactionInputFamily],
+        profile: ExactIndexProfileId,
+        first_generation: u64,
+        summaries: &[CompactionSummary],
+    ) -> Result<Vec<ExactIndexRunDescriptor>, ExactIndexStoreError> {
+        let first_summary = summaries
+            .first()
+            .copied()
+            .ok_or(ExactIndexStoreError::InvalidCompactionInput)?;
+        let mut output = Some(StreamedPartitionOutput::new(
+            self,
+            profile,
+            first_generation,
+            first_summary,
+        )?);
+        let mut partition_ordinal = 0_usize;
+        let mut emitted_in_partition = 0_usize;
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(summaries.len())
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        let observed = self.merge_compaction_families(inputs, |entry| {
+            if emitted_in_partition == summaries[partition_ordinal].entry_count {
+                descriptors.push(
+                    output
+                        .take()
+                        .expect("ASSERT: every family partition owns one active writer")
+                        .finish(self)?,
+                );
+                partition_ordinal = partition_ordinal
+                    .checked_add(1)
+                    .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+                let summary = summaries
+                    .get(partition_ordinal)
+                    .copied()
+                    .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+                let generation = first_generation
+                    .checked_add(
+                        u64::try_from(partition_ordinal)
+                            .map_err(|_| ExactIndexStoreError::TooManyRunPartitions)?,
+                    )
+                    .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
+                output = Some(StreamedPartitionOutput::new(
+                    self, profile, generation, summary,
+                )?);
+                emitted_in_partition = 0;
+            }
+            output
+                .as_mut()
+                .expect("ASSERT: active family partition writer exists")
+                .push(&self.storage, entry)?;
+            emitted_in_partition = emitted_in_partition
+                .checked_add(1)
+                .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+            Ok(())
+        })?;
+        let expected_entries = summaries.iter().try_fold(0_usize, |total, summary| {
+            total
+                .checked_add(summary.entry_count)
+                .ok_or(ExactIndexStoreError::OutOfMemory)
+        })?;
+        if observed.entry_count != expected_entries
+            || emitted_in_partition != summaries[partition_ordinal].entry_count
+        {
+            return Err(ExactIndexStoreError::DependencyMismatch);
+        }
+        descriptors.push(
+            output
+                .take()
+                .expect("ASSERT: final family partition writer exists")
+                .finish(self)?,
+        );
+        if descriptors.len() != summaries.len() {
+            return Err(ExactIndexStoreError::DependencyMismatch);
+        }
+        self.storage.sync_root()?;
+        Ok(descriptors)
+    }
+
+    fn publish_streamed_compaction(
+        &self,
+        inputs: &[ExactIndexRunRef],
+        profile: ExactIndexProfileId,
+        generation: u64,
+        expected_summary: CompactionSummary,
+    ) -> Result<ExactIndexRunDescriptor, ExactIndexStoreError> {
+        let mut encoder = ExactIndexRunStreamEncoder::new(
+            profile,
+            generation,
+            expected_summary.entry_count,
+            expected_summary
+                .minimum_chunk_id
+                .ok_or(ExactIndexStoreError::InvalidCompactionInput)?,
+            expected_summary
+                .maximum_chunk_id
+                .ok_or(ExactIndexStoreError::InvalidCompactionInput)?,
+        )?;
+        let temporary_name = temporary_name(profile, generation);
+        let published_name = published_name(profile, generation);
+        match self.storage.create_new(&temporary_name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.storage
+            .write_at(&temporary_name, 0, encoder.header())?;
+
+        let mut page_entries = Vec::new();
+        page_entries
+            .try_reserve_exact(31)
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        let mut page_ordinal = 0_usize;
+        let observed_summary = self.merge_compaction_inputs(inputs, |entry| {
+            page_entries.push(entry);
+            if page_entries.len() == 31 {
+                write_streamed_page(
+                    &self.storage,
+                    &temporary_name,
+                    &mut encoder,
+                    page_ordinal,
+                    &page_entries,
+                )?;
+                page_entries.clear();
+                page_ordinal = page_ordinal
+                    .checked_add(1)
+                    .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+            }
+            Ok(())
+        })?;
+        if !page_entries.is_empty() {
+            write_streamed_page(
+                &self.storage,
+                &temporary_name,
+                &mut encoder,
+                page_ordinal,
+                &page_entries,
+            )?;
+        }
+        if observed_summary != expected_summary {
+            return Err(ExactIndexStoreError::DependencyMismatch);
+        }
+        let (footer, expected) = encoder.finish()?;
+        let footer_offset = u64::try_from(expected.file_length() - EXACT_INDEX_PAGE_BYTES)
+            .map_err(|_| ExactIndexStoreError::DependencyMismatch)?;
+        self.storage
+            .write_at(&temporary_name, footer_offset, &footer)?;
+        self.storage.set_len(
+            &temporary_name,
+            u64::try_from(expected.file_length())
+                .map_err(|_| ExactIndexStoreError::DependencyMismatch)?,
+        )?;
+        let observed = self.audit_named(&temporary_name)?;
+        verify_expected_descriptor(expected, observed)?;
+        self.storage.sync_file(&temporary_name)?;
+        if self.storage.exists(&published_name)? {
+            let raced = self.audit_named(&published_name)?;
+            verify_expected_descriptor(expected, raced)?;
+        } else {
+            match self
+                .storage
+                .publish_noreplace(&temporary_name, &published_name)
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let raced = self.audit_named(&published_name)?;
+                    verify_expected_descriptor(expected, raced)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.storage.sync_root()?;
+        Ok(observed)
     }
 
     fn verify_run_set_dependencies(
         &self,
         run_set: &ExactIndexRunSet,
     ) -> Result<Vec<ExactIndexRunReader<I>>, ExactIndexStoreError> {
-        if run_set.runs().len() > MAX_ACTIVE_EXACT_INDEX_RUNS {
+        if run_set.family_count() > MAX_ACTIVE_EXACT_INDEX_FAMILIES {
             return Err(ExactIndexStoreError::TooManyActiveRuns);
         }
         let mut readers = Vec::new();
         readers
             .try_reserve_exact(run_set.runs().len())
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        let mut membership_bytes_remaining = self.membership_budget_bytes_now();
         for run_ref in run_set.runs().iter().copied() {
             let name = published_name(run_ref.profile(), run_ref.generation());
-            let descriptor = self.audit_named(&name)?;
+            let (descriptor, membership) =
+                self.audit_named_with_membership(&name, membership_bytes_remaining)?;
             verify_requested_identity(run_ref.profile(), run_ref.generation(), descriptor)?;
             verify_run_reference(run_ref, descriptor)?;
+            if let Some(filter) = &membership {
+                membership_bytes_remaining = membership_bytes_remaining
+                    .checked_sub(filter.allocated_bytes())
+                    .expect("ASSERT: admitted Run membership fits its remaining budget");
+            }
             readers.push(ExactIndexRunReader {
                 storage: self.storage.clone(),
                 name,
                 descriptor,
+                page_cache: Arc::clone(&self.page_cache),
+                membership,
+                membership_counters: Arc::clone(&self.membership_counters),
             });
         }
         Ok(readers)
+    }
+
+    fn membership_budget_bytes_now(&self) -> usize {
+        let snapshot = self.fixed_membership_snapshot.unwrap_or_else(|| {
+            MemoryPressureSnapshot::read_system()
+                .unwrap_or_else(|_| MemoryPressureSnapshot::new(0, 0, 1))
+        });
+        exact_run_membership_budget(snapshot)
     }
 
     fn publish_run_set(
@@ -557,65 +1303,6 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         }
         Ok(run_set)
     }
-
-    fn ensure_activation_wal(&self) -> Result<(), ExactIndexStoreError> {
-        if self.storage.exists(ACTIVATION_WAL_NAME)? {
-            self.storage.sync_root()?;
-            return Ok(());
-        }
-        match self.storage.create_new(ACTIVATION_WAL_NAME) {
-            Ok(()) => self.storage.sync_file(ACTIVATION_WAL_NAME)?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        self.storage.sync_root()?;
-        Ok(())
-    }
-
-    fn read_activation_tail(&self) -> Result<ActivationTail, ExactIndexStoreError> {
-        let physical_length = self.storage.object_len(ACTIVATION_WAL_NAME)?;
-        if physical_length > MAX_ACTIVATION_WAL_BYTES {
-            return Err(ExactIndexStoreError::ActivationWalCorrupt);
-        }
-        let record_bytes = u64::try_from(EXACT_INDEX_ACTIVATION_RECORD_BYTES)
-            .expect("ASSERT: activation record length fits u64");
-        let record_count = physical_length / record_bytes;
-        let valid_length = record_count
-            .checked_mul(record_bytes)
-            .ok_or(ExactIndexStoreError::ActivationWalCorrupt)?;
-        let mut last: Option<ExactIndexActivationRecord> = None;
-        for ordinal in 0..record_count {
-            let offset = ordinal
-                .checked_mul(record_bytes)
-                .ok_or(ExactIndexStoreError::ActivationWalCorrupt)?;
-            let encoded = self.storage.read_exact_at(
-                ACTIVATION_WAL_NAME,
-                offset,
-                EXACT_INDEX_ACTIVATION_RECORD_BYTES,
-            )?;
-            let record = ExactIndexActivationRecord::decode(&encoded)?;
-            let expected_generation = ordinal
-                .checked_add(1)
-                .ok_or(ExactIndexStoreError::ActivationWalCorrupt)?;
-            let expected_previous = last.map_or(ExactIndexActivationHash::ZERO, |previous| {
-                ExactIndexActivationHash::of(&previous.encode())
-            });
-            if record.generation() != expected_generation
-                || record.previous_record_hash() != expected_previous
-                || last.is_some_and(|previous| {
-                    record.run_set_generation() <= previous.run_set_generation()
-                })
-            {
-                return Err(ExactIndexStoreError::ActivationWalCorrupt);
-            }
-            last = Some(record);
-        }
-        Ok(ActivationTail {
-            last,
-            valid_length,
-            clean: physical_length == valid_length,
-        })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -623,7 +1310,14 @@ pub struct ActivatedExactIndex<I> {
     record: ExactIndexActivationRecord,
     run_set: ExactIndexRunSet,
     readers: Vec<ExactIndexRunReader<I>>,
-    lookup_order: Vec<usize>,
+    lookup_families: Vec<ExactIndexLookupFamily>,
+}
+
+#[derive(Clone, Debug)]
+struct ExactIndexLookupFamily {
+    level: u16,
+    family_generation: u64,
+    reader_indices: Vec<usize>,
 }
 
 impl<I> ActivatedExactIndex<I> {
@@ -632,20 +1326,50 @@ impl<I> ActivatedExactIndex<I> {
         run_set: ExactIndexRunSet,
         readers: Vec<ExactIndexRunReader<I>>,
     ) -> Result<Self, ExactIndexStoreError> {
-        if readers.len() != run_set.runs().len() || readers.len() > MAX_ACTIVE_EXACT_INDEX_RUNS {
+        if readers.len() != run_set.runs().len()
+            || run_set.family_count() > MAX_ACTIVE_EXACT_INDEX_FAMILIES
+        {
             return Err(ExactIndexStoreError::DependencyMismatch);
         }
-        let mut lookup_order = Vec::new();
-        lookup_order
-            .try_reserve_exact(readers.len())
+        let mut lookup_families: Vec<ExactIndexLookupFamily> = Vec::new();
+        lookup_families
+            .try_reserve_exact(run_set.family_count())
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
-        lookup_order.extend(0..readers.len());
-        lookup_order.sort_unstable_by_key(|index| Reverse(run_set.runs()[*index].generation()));
+        for (reader_index, run_ref) in run_set.runs().iter().copied().enumerate() {
+            if let Some(family) = lookup_families.iter_mut().find(|family| {
+                family.level == run_ref.level()
+                    && family.family_generation == run_ref.family_generation()
+            }) {
+                family.reader_indices.push(reader_index);
+            } else {
+                let mut reader_indices = Vec::new();
+                reader_indices
+                    .try_reserve_exact(usize::from(run_ref.partition_count()))
+                    .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+                reader_indices.push(reader_index);
+                lookup_families.push(ExactIndexLookupFamily {
+                    level: run_ref.level(),
+                    family_generation: run_ref.family_generation(),
+                    reader_indices,
+                });
+            }
+        }
+        for family in &mut lookup_families {
+            family
+                .reader_indices
+                .sort_unstable_by_key(|index| run_set.runs()[*index].partition_ordinal());
+        }
+        lookup_families.sort_unstable_by_key(|family| {
+            (Reverse(family.family_generation), Reverse(family.level))
+        });
+        if lookup_families.len() != run_set.family_count() {
+            return Err(ExactIndexStoreError::DependencyMismatch);
+        }
         Ok(Self {
             record,
             run_set,
             readers,
-            lookup_order,
+            lookup_families,
         })
     }
 
@@ -662,6 +1386,58 @@ impl<I> ActivatedExactIndex<I> {
     #[must_use]
     pub fn run_count(&self) -> usize {
         self.readers.len()
+    }
+
+    #[must_use]
+    pub fn family_count(&self) -> usize {
+        self.lookup_families.len()
+    }
+
+    /// Returns current filter residency and process-lifetime probe evidence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bounded active reader set violates shared-counter or
+    /// memory-accounting invariants.
+    #[must_use]
+    pub fn membership_status(&self) -> ExactRunMembershipStatus {
+        let filter_count = self
+            .readers
+            .iter()
+            .filter(|reader| reader.membership.is_some())
+            .count();
+        let allocated_bytes = self.readers.iter().fold(0_usize, |total, reader| {
+            total
+                .checked_add(
+                    reader
+                        .membership
+                        .as_ref()
+                        .map_or(0, |filter| filter.allocated_bytes()),
+                )
+                .expect("ASSERT: active Run membership byte accounting cannot overflow")
+        });
+        let Some(counters) = self
+            .readers
+            .first()
+            .map(|reader| &reader.membership_counters)
+        else {
+            return ExactRunMembershipStatus::default();
+        };
+        assert!(
+            self.readers
+                .iter()
+                .all(|reader| Arc::ptr_eq(&reader.membership_counters, counters)),
+            "ASSERT: one active Exact Index shares one membership counter set"
+        );
+        ExactRunMembershipStatus {
+            filter_count: u64::try_from(filter_count)
+                .expect("ASSERT: active membership filter count fits u64"),
+            allocated_bytes: u64::try_from(allocated_bytes)
+                .expect("ASSERT: active membership bytes fit u64"),
+            probes: counters.probes.load(AtomicOrdering::Relaxed),
+            definitely_absent: counters.definitely_absent.load(AtomicOrdering::Relaxed),
+            requires_exact_lookup: counters.requires_exact_lookup.load(AtomicOrdering::Relaxed),
+        }
     }
 }
 
@@ -686,9 +1462,15 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
             .try_reserve_exact(MAX_EXACT_LOOKUP_CANDIDATES)
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
         let mut complete = true;
-        for &index in &self.lookup_order {
+        for family in &self.lookup_families {
+            let partition_ordinal = family
+                .reader_indices
+                .partition_point(|index| self.run_set.runs()[*index].maximum_chunk_id() < chunk_id);
+            let Some(&index) = family.reader_indices.get(partition_ordinal) else {
+                continue;
+            };
             let run_ref = self.run_set.runs()[index];
-            if chunk_id < run_ref.minimum_chunk_id() || chunk_id > run_ref.maximum_chunk_id() {
+            if chunk_id < run_ref.minimum_chunk_id() {
                 continue;
             }
             let lookup = self.readers[index].lookup(chunk_id, logical_length)?;
@@ -716,13 +1498,6 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ActivationTail {
-    last: Option<ExactIndexActivationRecord>,
-    valid_length: u64,
-    clean: bool,
-}
-
 #[derive(Clone, Debug)]
 struct OpenedRunEnvelope {
     descriptor: ExactIndexRunDescriptor,
@@ -731,12 +1506,767 @@ struct OpenedRunEnvelope {
     footer_offset: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompactionSummary {
+    entry_count: usize,
+    minimum_chunk_id: Option<ChunkId>,
+    maximum_chunk_id: Option<ChunkId>,
+}
+
+struct StreamedPartitionOutput {
+    encoder: ExactIndexRunStreamEncoder,
+    temporary_name: String,
+    published_name: String,
+    page_entries: Vec<ExactIndexEntry>,
+    page_ordinal: usize,
+}
+
+impl StreamedPartitionOutput {
+    fn new<I: Clone + StorageIo>(
+        repository: &ExactIndexRunRepository<I>,
+        profile: ExactIndexProfileId,
+        generation: u64,
+        summary: CompactionSummary,
+    ) -> Result<Self, ExactIndexStoreError> {
+        let encoder = ExactIndexRunStreamEncoder::new(
+            profile,
+            generation,
+            summary.entry_count,
+            summary
+                .minimum_chunk_id
+                .ok_or(ExactIndexStoreError::InvalidCompactionInput)?,
+            summary
+                .maximum_chunk_id
+                .ok_or(ExactIndexStoreError::InvalidCompactionInput)?,
+        )?;
+        let temporary_name = temporary_name(profile, generation);
+        let published_name = published_name(profile, generation);
+        match repository.storage.create_new(&temporary_name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        repository
+            .storage
+            .write_at(&temporary_name, 0, encoder.header())?;
+        let mut page_entries = Vec::new();
+        page_entries
+            .try_reserve_exact(31)
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        Ok(Self {
+            encoder,
+            temporary_name,
+            published_name,
+            page_entries,
+            page_ordinal: 0,
+        })
+    }
+
+    fn push<I: StorageIo>(
+        &mut self,
+        storage: &I,
+        entry: ExactIndexEntry,
+    ) -> Result<(), ExactIndexStoreError> {
+        self.page_entries.push(entry);
+        if self.page_entries.len() == 31 {
+            write_streamed_page(
+                storage,
+                &self.temporary_name,
+                &mut self.encoder,
+                self.page_ordinal,
+                &self.page_entries,
+            )?;
+            self.page_entries.clear();
+            self.page_ordinal = self
+                .page_ordinal
+                .checked_add(1)
+                .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+        }
+        Ok(())
+    }
+
+    fn finish<I: Clone + StorageIo>(
+        mut self,
+        repository: &ExactIndexRunRepository<I>,
+    ) -> Result<ExactIndexRunDescriptor, ExactIndexStoreError> {
+        if !self.page_entries.is_empty() {
+            write_streamed_page(
+                &repository.storage,
+                &self.temporary_name,
+                &mut self.encoder,
+                self.page_ordinal,
+                &self.page_entries,
+            )?;
+        }
+        let (footer, expected) = self.encoder.finish()?;
+        let footer_offset = u64::try_from(expected.file_length() - EXACT_INDEX_PAGE_BYTES)
+            .map_err(|_| ExactIndexStoreError::DependencyMismatch)?;
+        repository
+            .storage
+            .write_at(&self.temporary_name, footer_offset, &footer)?;
+        repository.storage.set_len(
+            &self.temporary_name,
+            u64::try_from(expected.file_length())
+                .map_err(|_| ExactIndexStoreError::DependencyMismatch)?,
+        )?;
+        let observed = repository.audit_named(&self.temporary_name)?;
+        verify_expected_descriptor(expected, observed)?;
+        repository.storage.sync_file(&self.temporary_name)?;
+        if repository.storage.exists(&self.published_name)? {
+            let raced = repository.audit_named(&self.published_name)?;
+            verify_expected_descriptor(expected, raced)?;
+        } else {
+            match repository
+                .storage
+                .publish_noreplace(&self.temporary_name, &self.published_name)
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let raced = repository.audit_named(&self.published_name)?;
+                    verify_expected_descriptor(expected, raced)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(observed)
+    }
+}
+
+impl CompactionSummary {
+    fn observe(&mut self, entry: ExactIndexEntry) -> Result<(), ExactIndexStoreError> {
+        self.entry_count = self
+            .entry_count
+            .checked_add(1)
+            .ok_or(ExactIndexStoreError::OutOfMemory)?;
+        self.minimum_chunk_id.get_or_insert(entry.chunk_id());
+        self.maximum_chunk_id = Some(entry.chunk_id());
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Self, ExactIndexStoreError> {
+        if self.entry_count == 0
+            || self.minimum_chunk_id.is_none()
+            || self.maximum_chunk_id.is_none()
+        {
+            return Err(ExactIndexStoreError::InvalidCompactionInput);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactionHeapEntry {
+    entry: ExactIndexEntry,
+    location_key: (ChunkId, u32, [u8; 16], u64, u32),
+    source_generation: u64,
+    source_ordinal: usize,
+}
+
+impl CompactionHeapEntry {
+    fn new(entry: ExactIndexEntry, source_generation: u64, source_ordinal: usize) -> Self {
+        Self {
+            entry,
+            location_key: compaction_location_key(entry),
+            source_generation,
+            source_ordinal,
+        }
+    }
+}
+
+impl Ord for CompactionHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .location_key
+            .cmp(&self.location_key)
+            .then_with(|| self.source_generation.cmp(&other.source_generation))
+            .then_with(|| other.source_ordinal.cmp(&self.source_ordinal))
+    }
+}
+
+impl PartialOrd for CompactionHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct CompactionSource<I> {
+    storage: I,
+    name: String,
+    descriptor: ExactIndexRunDescriptor,
+    generation: u64,
+    footer: Vec<u8>,
+    footer_offset: u64,
+    audit: Option<ExactIndexRunHashAudit>,
+    page: Option<ExactIndexPage>,
+    page_entry_ordinal: usize,
+    next_page_ordinal: usize,
+    finished: bool,
+}
+
+struct CompactionFamilySource<I> {
+    partitions: Vec<ExactIndexRunRef>,
+    next_partition_ordinal: usize,
+    current: CompactionSource<I>,
+    family_generation: u64,
+}
+
+impl<I: Clone + StorageIo> CompactionFamilySource<I> {
+    fn open(
+        repository: &ExactIndexRunRepository<I>,
+        family: &CompactionInputFamily,
+    ) -> Result<Self, ExactIndexStoreError> {
+        let first = family
+            .refs
+            .first()
+            .copied()
+            .ok_or(ExactIndexStoreError::InvalidCompactionInput)?;
+        Ok(Self {
+            partitions: family.refs.clone(),
+            next_partition_ordinal: 1,
+            current: CompactionSource::open(repository, first)?,
+            family_generation: family.family_generation,
+        })
+    }
+
+    fn current(&self) -> ExactIndexEntry {
+        self.current.current()
+    }
+
+    fn current_optional(&self) -> Option<ExactIndexEntry> {
+        self.current.current_optional()
+    }
+
+    fn advance(
+        &mut self,
+        repository: &ExactIndexRunRepository<I>,
+    ) -> Result<(), ExactIndexStoreError> {
+        self.current.advance()?;
+        if self.current.finished && self.next_partition_ordinal < self.partitions.len() {
+            let next = self.partitions[self.next_partition_ordinal];
+            self.next_partition_ordinal = self
+                .next_partition_ordinal
+                .checked_add(1)
+                .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+            self.current = CompactionSource::open(repository, next)?;
+        }
+        Ok(())
+    }
+
+    fn finished(&self) -> bool {
+        self.current.finished && self.next_partition_ordinal == self.partitions.len()
+    }
+}
+
+impl<I: Clone + StorageIo> CompactionSource<I> {
+    fn open(
+        repository: &ExactIndexRunRepository<I>,
+        run_ref: ExactIndexRunRef,
+    ) -> Result<Self, ExactIndexStoreError> {
+        let name = published_name(run_ref.profile(), run_ref.generation());
+        let envelope = repository.read_envelope(&name)?;
+        verify_requested_identity(run_ref.profile(), run_ref.generation(), envelope.descriptor)?;
+        verify_run_reference(run_ref, envelope.descriptor)?;
+        let mut audit = envelope.descriptor.begin_hash_audit();
+        audit.update(0, &envelope.header)?;
+        let mut source = Self {
+            storage: repository.storage.clone(),
+            name,
+            descriptor: envelope.descriptor,
+            generation: run_ref.generation(),
+            footer: envelope.footer,
+            footer_offset: envelope.footer_offset,
+            audit: Some(audit),
+            page: None,
+            page_entry_ordinal: 0,
+            next_page_ordinal: 0,
+            finished: false,
+        };
+        source.load_next_page()?;
+        if source.page.is_none() {
+            return Err(ExactIndexStoreError::InvalidCompactionInput);
+        }
+        Ok(source)
+    }
+
+    fn current(&self) -> ExactIndexEntry {
+        self.current_optional()
+            .expect("ASSERT: active compaction source must expose one current entry")
+    }
+
+    fn current_optional(&self) -> Option<ExactIndexEntry> {
+        self.page
+            .as_ref()
+            .and_then(|page| page.entries().get(self.page_entry_ordinal))
+            .copied()
+    }
+
+    fn advance(&mut self) -> Result<(), ExactIndexStoreError> {
+        let page = self
+            .page
+            .as_ref()
+            .expect("ASSERT: only an active compaction source can advance");
+        self.page_entry_ordinal = self
+            .page_entry_ordinal
+            .checked_add(1)
+            .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+        if self.page_entry_ordinal < page.entries().len() {
+            return Ok(());
+        }
+        self.load_next_page()
+    }
+
+    fn load_next_page(&mut self) -> Result<(), ExactIndexStoreError> {
+        if self.next_page_ordinal == self.descriptor.page_count() {
+            let mut audit = self
+                .audit
+                .take()
+                .expect("ASSERT: a compaction source hash audit finishes exactly once");
+            audit.update(self.footer_offset, &self.footer)?;
+            audit.finish()?;
+            self.page = None;
+            self.finished = true;
+            return Ok(());
+        }
+        let page_ordinal = self.next_page_ordinal;
+        let offset = self
+            .descriptor
+            .page_offset(page_ordinal)
+            .expect("ASSERT: verified compaction page ordinal is in range");
+        let bytes = self
+            .storage
+            .read_exact_at(&self.name, offset, EXACT_INDEX_PAGE_BYTES)?;
+        let page = self.descriptor.decode_page(page_ordinal, &bytes)?;
+        let audit = self
+            .audit
+            .as_mut()
+            .expect("ASSERT: active compaction source retains its hash audit");
+        audit.verify_page(&page)?;
+        audit.update(offset, &bytes)?;
+        self.page = Some(page);
+        self.page_entry_ordinal = 0;
+        self.next_page_ordinal = self
+            .next_page_ordinal
+            .checked_add(1)
+            .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+        Ok(())
+    }
+}
+
+fn verify_compaction_output_pair(
+    previous: ExactIndexEntry,
+    next: ExactIndexEntry,
+) -> Result<(), ExactIndexStoreError> {
+    if previous.chunk_id() == next.chunk_id() && previous.logical_length() != next.logical_length()
+    {
+        return Err(ExactIndexFormatError::ChunkLengthConflict.into());
+    }
+    if compaction_location_key(previous) >= compaction_location_key(next) {
+        return Err(ExactIndexFormatError::NonCanonicalOrder.into());
+    }
+    Ok(())
+}
+
+fn validate_family_compaction_inputs(
+    inputs: &[ExactIndexRunRef],
+    target_level: u16,
+    first_generation: u64,
+) -> Result<Vec<CompactionInputFamily>, ExactIndexStoreError> {
+    let first = inputs
+        .first()
+        .copied()
+        .ok_or(ExactIndexStoreError::InvalidCompactionInput)?;
+    let source_level = target_level
+        .checked_sub(1)
+        .ok_or(ExactIndexStoreError::InvalidCompactionInput)?;
+    if first.level() != source_level {
+        return Err(ExactIndexStoreError::InvalidCompactionInput);
+    }
+    let canonical = ExactIndexRunSet::new(first.profile(), 1, inputs.to_vec())?;
+    if canonical.family_count() < 2
+        || canonical.family_count() > MAX_ACTIVE_EXACT_INDEX_FAMILIES
+        || canonical
+            .runs()
+            .iter()
+            .any(|run| run.level() != source_level)
+        || canonical
+            .runs()
+            .iter()
+            .any(|run| first_generation <= run.generation())
+    {
+        return Err(ExactIndexStoreError::InvalidCompactionInput);
+    }
+
+    let mut ordered = canonical.runs().to_vec();
+    ordered.sort_unstable_by_key(|run| {
+        (
+            run.family_generation(),
+            run.partition_ordinal(),
+            run.generation(),
+        )
+    });
+    let mut families: Vec<CompactionInputFamily> = Vec::new();
+    families
+        .try_reserve_exact(canonical.family_count())
+        .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+    for run in ordered {
+        if let Some(family) = families
+            .last_mut()
+            .filter(|family| family.family_generation == run.family_generation())
+        {
+            family.refs.push(run);
+        } else {
+            let mut refs = Vec::new();
+            refs.try_reserve_exact(usize::from(run.partition_count()))
+                .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+            refs.push(run);
+            families.push(CompactionInputFamily {
+                refs,
+                family_generation: run.family_generation(),
+            });
+        }
+    }
+    if families.len() != canonical.family_count() {
+        return Err(ExactIndexStoreError::DependencyMismatch);
+    }
+    Ok(families)
+}
+
+fn write_streamed_page<I: StorageIo>(
+    storage: &I,
+    temporary_name: &str,
+    encoder: &mut ExactIndexRunStreamEncoder,
+    page_ordinal: usize,
+    entries: &[ExactIndexEntry],
+) -> Result<(), ExactIndexStoreError> {
+    let page = encoder.encode_next_page(entries)?;
+    let offset = EXACT_INDEX_HEADER_BYTES
+        .checked_add(
+            page_ordinal
+                .checked_mul(EXACT_INDEX_PAGE_BYTES)
+                .ok_or(ExactIndexStoreError::DependencyMismatch)?,
+        )
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+    storage.write_at(temporary_name, offset, &page)?;
+    Ok(())
+}
+
+const _: () = assert!(std::mem::align_of::<ExactIndexPageCacheSlot>() == 64);
+
+#[derive(Clone, Debug)]
+struct CachedExactIndexPage {
+    run_hash: [u8; 32],
+    page_ordinal: usize,
+    page: Arc<ExactIndexPage>,
+}
+
+#[repr(align(64))]
+#[derive(Debug)]
+struct ExactIndexPageCacheSlot {
+    page: Mutex<Option<CachedExactIndexPage>>,
+}
+
+impl Default for ExactIndexPageCacheSlot {
+    fn default() -> Self {
+        Self {
+            page: Mutex::new(None),
+        }
+    }
+}
+
+/// Repository-wide, pressure-bounded cache of independently verified 4-KiB
+/// Exact-Index pages.
+///
+/// Direct mapping keeps lookup allocation-free and bounds both pointer chasing
+/// and replacement work. A collision merely evicts another acceleration entry;
+/// it cannot affect Exact-Index or DATA correctness.
+struct ExactIndexPageCache {
+    slots: Box<[ExactIndexPageCacheSlot]>,
+    admission: Mutex<()>,
+    target_pages: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    resident_pages: AtomicU64,
+    evictions: AtomicU64,
+    pressure_rejections: AtomicU64,
+    effective_limit_bytes: AtomicU64,
+    available_bytes: AtomicU64,
+    swap_used_bytes: AtomicU64,
+    automatic_pressure: bool,
+    started: Instant,
+    last_refresh_millis: AtomicU64,
+}
+
+impl fmt::Debug for ExactIndexPageCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExactIndexPageCache")
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExactIndexPageCache {
+    fn build(snapshot: MemoryPressureSnapshot, automatic_pressure: bool) -> Self {
+        let slot_count = exact_page_cache_capacity(snapshot);
+        let slots = std::iter::repeat_with(ExactIndexPageCacheSlot::default)
+            .take(slot_count)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        assert_eq!(
+            slots.len(),
+            slot_count,
+            "ASSERT: Exact Index page cache construction is complete"
+        );
+        assert!(
+            slots.len().is_power_of_two(),
+            "ASSERT: Exact Index page-cache geometry is direct-map compatible"
+        );
+        let cache = Self {
+            slots,
+            admission: Mutex::new(()),
+            target_pages: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            resident_pages: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            pressure_rejections: AtomicU64::new(0),
+            effective_limit_bytes: AtomicU64::new(snapshot.effective_limit_bytes()),
+            available_bytes: AtomicU64::new(snapshot.available_bytes()),
+            swap_used_bytes: AtomicU64::new(snapshot.swap_used_bytes()),
+            automatic_pressure,
+            started: Instant::now(),
+            last_refresh_millis: AtomicU64::new(0),
+        };
+        cache.apply_pressure_snapshot(snapshot);
+        cache
+    }
+
+    fn get(&self, run_hash: [u8; 32], page_ordinal: usize) -> Option<Arc<ExactIndexPage>> {
+        self.refresh_pressure_if_due();
+        let slot = &self.slots[exact_page_cache_slot(run_hash, page_ordinal, self.slots.len())];
+        let cached = slot
+            .page
+            .lock()
+            .expect("ASSERT: Exact Index page-cache slot lock poisoned");
+        let found = cached
+            .as_ref()
+            .filter(|cached| cached.run_hash == run_hash && cached.page_ordinal == page_ordinal)
+            .map(|cached| Arc::clone(&cached.page));
+        if found.is_some() {
+            self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        found
+    }
+
+    fn insert(&self, run_hash: [u8; 32], page_ordinal: usize, page: Arc<ExactIndexPage>) {
+        assert_eq!(
+            page.ordinal(),
+            page_ordinal,
+            "ASSERT: an Exact Index page-cache key matches the verified page ordinal"
+        );
+        self.refresh_pressure_if_due();
+        let _admission = self
+            .admission
+            .lock()
+            .expect("ASSERT: Exact Index page-cache admission lock poisoned");
+        let target = self.target_pages.load(AtomicOrdering::Acquire);
+        if target == 0 {
+            self.pressure_rejections
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return;
+        }
+        let slot = &self.slots[exact_page_cache_slot(run_hash, page_ordinal, self.slots.len())];
+        let mut cached = slot
+            .page
+            .lock()
+            .expect("ASSERT: Exact Index page-cache slot lock poisoned");
+        match cached.as_ref() {
+            None => {
+                if self.resident_pages.load(AtomicOrdering::Acquire) >= target {
+                    self.pressure_rejections
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    return;
+                }
+                self.resident_pages.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Some(previous)
+                if previous.run_hash != run_hash || previous.page_ordinal != page_ordinal =>
+            {
+                self.evictions.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Some(_) => {}
+        }
+        *cached = Some(CachedExactIndexPage {
+            run_hash,
+            page_ordinal,
+            page,
+        });
+    }
+
+    fn status(&self) -> ExactIndexPageCacheStatus {
+        self.refresh_pressure_if_due();
+        let effective_limit_bytes = self.effective_limit_bytes.load(AtomicOrdering::Relaxed);
+        ExactIndexPageCacheStatus {
+            hits: self.hits.load(AtomicOrdering::Relaxed),
+            misses: self.misses.load(AtomicOrdering::Relaxed),
+            resident_pages: self.resident_pages.load(AtomicOrdering::Relaxed),
+            evictions: self.evictions.load(AtomicOrdering::Relaxed),
+            pressure_rejections: self.pressure_rejections.load(AtomicOrdering::Relaxed),
+            target_pages: self.target_pages.load(AtomicOrdering::Relaxed),
+            capacity_pages: u64::try_from(self.slots.len())
+                .expect("ASSERT: Exact Index page-cache capacity fits u64"),
+            reserve_bytes: shared_cache_reserve_bytes(effective_limit_bytes),
+            effective_limit_bytes,
+            available_bytes: self.available_bytes.load(AtomicOrdering::Relaxed),
+            swap_used_bytes: self.swap_used_bytes.load(AtomicOrdering::Relaxed),
+        }
+    }
+
+    fn refresh_pressure_if_due(&self) {
+        if !self.automatic_pressure {
+            return;
+        }
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let interval = u64::try_from(SYSTEM_REFRESH_INTERVAL.as_millis())
+            .expect("ASSERT: memory refresh interval fits u64 milliseconds");
+        let previous = self.last_refresh_millis.load(AtomicOrdering::Relaxed);
+        if elapsed.saturating_sub(previous) < interval
+            || self
+                .last_refresh_millis
+                .compare_exchange(
+                    previous,
+                    elapsed,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
+        let snapshot = MemoryPressureSnapshot::read_system()
+            .unwrap_or_else(|_| MemoryPressureSnapshot::new(0, 0, 1));
+        self.apply_pressure_snapshot(snapshot);
+    }
+
+    fn apply_pressure_snapshot(&self, snapshot: MemoryPressureSnapshot) {
+        let reserve = shared_cache_reserve_bytes(snapshot.effective_limit_bytes());
+        let available_for_cache = snapshot.available_bytes().saturating_sub(reserve);
+        let page_bytes = exact_page_cache_accounted_page_bytes();
+        let capacity = u64::try_from(self.slots.len())
+            .expect("ASSERT: Exact Index page-cache capacity fits u64");
+        let target = if snapshot.swap_used_bytes() == 0 {
+            (available_for_cache / page_bytes).min(capacity)
+        } else {
+            0
+        };
+        self.effective_limit_bytes
+            .store(snapshot.effective_limit_bytes(), AtomicOrdering::Relaxed);
+        self.available_bytes
+            .store(snapshot.available_bytes(), AtomicOrdering::Relaxed);
+        self.swap_used_bytes
+            .store(snapshot.swap_used_bytes(), AtomicOrdering::Relaxed);
+        self.target_pages.store(target, AtomicOrdering::Release);
+        if self.resident_pages.load(AtomicOrdering::Acquire) > target {
+            self.purge();
+        }
+    }
+
+    fn purge(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .expect("ASSERT: Exact Index page-cache admission lock poisoned");
+        let mut removed = 0_u64;
+        for slot in &self.slots {
+            if slot
+                .page
+                .lock()
+                .expect("ASSERT: Exact Index page-cache slot lock poisoned")
+                .take()
+                .is_some()
+            {
+                removed = removed
+                    .checked_add(1)
+                    .expect("ASSERT: Exact Index cached-page count cannot overflow");
+            }
+        }
+        let previous = self.resident_pages.swap(0, AtomicOrdering::AcqRel);
+        assert_eq!(
+            removed, previous,
+            "ASSERT: Exact Index page-cache resident accounting matches its slots"
+        );
+        self.evictions.fetch_add(removed, AtomicOrdering::Relaxed);
+    }
+}
+
+fn exact_run_membership_budget(snapshot: MemoryPressureSnapshot) -> usize {
+    if snapshot.swap_used_bytes() != 0 || snapshot.effective_limit_bytes() == 0 {
+        return 0;
+    }
+    let hard_limit = (snapshot.effective_limit_bytes() / EXACT_RUN_MEMBERSHIP_RAM_DIVISOR).clamp(
+        EXACT_RUN_MEMBERSHIP_MINIMUM_BYTES,
+        EXACT_RUN_MEMBERSHIP_MAXIMUM_BYTES,
+    );
+    let available = snapshot
+        .available_bytes()
+        .saturating_sub(shared_cache_reserve_bytes(snapshot.effective_limit_bytes()));
+    usize::try_from(hard_limit.min(available)).unwrap_or(usize::MAX)
+}
+
+fn exact_page_cache_capacity(snapshot: MemoryPressureSnapshot) -> usize {
+    if snapshot.effective_limit_bytes() == 0 {
+        return EXACT_INDEX_PAGE_CACHE_FALLBACK_SLOTS;
+    }
+    let hard_bytes = (snapshot.effective_limit_bytes() / EXACT_INDEX_PAGE_CACHE_RAM_DIVISOR).clamp(
+        EXACT_INDEX_PAGE_CACHE_MINIMUM_BYTES,
+        EXACT_INDEX_PAGE_CACHE_MAXIMUM_BYTES,
+    );
+    let requested = usize::try_from(hard_bytes / exact_page_cache_accounted_page_bytes())
+        .unwrap_or(usize::MAX)
+        .max(1);
+    floor_power_of_two(requested)
+}
+
+fn exact_page_cache_accounted_page_bytes() -> u64 {
+    u64::try_from(EXACT_INDEX_PAGE_BYTES + size_of::<ExactIndexPageCacheSlot>())
+        .expect("ASSERT: Exact Index accounted page bytes fit u64")
+}
+
+fn floor_power_of_two(value: usize) -> usize {
+    let next = value
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX / 2 + 1);
+    if next == value { value } else { next / 2 }
+}
+
+fn exact_page_cache_slot(run_hash: [u8; 32], page_ordinal: usize, slot_count: usize) -> usize {
+    assert!(
+        slot_count.is_power_of_two(),
+        "ASSERT: Exact Index page-cache slot count is a power of two"
+    );
+    let mut lane = [0_u8; 8];
+    lane.copy_from_slice(&run_hash[..8]);
+    let page = u64::try_from(page_ordinal)
+        .expect("ASSERT: an Exact Index page ordinal fits the cache hash domain");
+    let mixed =
+        u64::from_le_bytes(lane) ^ page.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ page.rotate_left(29);
+    let mask =
+        u64::try_from(slot_count - 1).expect("ASSERT: the Exact Index page-cache mask fits u64");
+    usize::try_from(mixed & mask).expect("ASSERT: a masked Exact Index page-cache slot fits usize")
+}
+
 /// Open immutable run handle retaining only its verified envelope.
 #[derive(Clone, Debug)]
 pub struct ExactIndexRunReader<I> {
     storage: I,
     name: String,
     descriptor: ExactIndexRunDescriptor,
+    page_cache: Arc<ExactIndexPageCache>,
+    membership: Option<Arc<BlockedBloomHint>>,
+    membership_counters: Arc<ExactRunMembershipCounters>,
 }
 
 impl<I: StorageIo> ExactIndexRunReader<I> {
@@ -749,11 +2279,41 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
     /// # Errors
     ///
     /// Returns exact-range I/O or touched-page integrity failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a format-v1 logical length does not fit the host address
+    /// space. Supported production targets have at least 32-bit `usize`.
     pub fn lookup(
         &self,
         chunk_id: ChunkId,
         logical_length: u32,
     ) -> Result<ExactIndexLookup, ExactIndexStoreError> {
+        if let Some(membership) = &self.membership {
+            self.membership_counters
+                .probes
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            let hint = membership.probe_for_exact_lookup(
+                chunk_id,
+                usize::try_from(logical_length).expect("ASSERT: Exact logical length fits usize"),
+            );
+            match hint {
+                BloomLookupHint::DefinitelyAbsent => {
+                    self.membership_counters
+                        .definitely_absent
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    return Ok(ExactIndexLookup {
+                        candidates: Vec::new(),
+                        complete: true,
+                    });
+                }
+                BloomLookupHint::RequiresExactLookup => {
+                    self.membership_counters
+                        .requires_exact_lookup
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+        }
         let mut lower = 0;
         let mut upper = self.descriptor.page_count();
         while lower < upper {
@@ -766,9 +2326,6 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         }
 
         let mut candidates = Vec::new();
-        candidates
-            .try_reserve_exact(MAX_EXACT_LOOKUP_CANDIDATES)
-            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
         let mut page_ordinal = lower;
         while page_ordinal < self.descriptor.page_count() {
             let page = self.read_page(page_ordinal)?;
@@ -780,7 +2337,11 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
                 });
             }
             let remaining = MAX_EXACT_LOOKUP_CANDIDATES - candidates.len();
-            candidates.extend_from_slice(&matches[..matches.len().min(remaining)]);
+            let accepted = matches.len().min(remaining);
+            candidates
+                .try_reserve_exact(accepted)
+                .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+            candidates.extend_from_slice(&matches[..accepted]);
             let key_reaches_page_end = page.entries().last().is_some_and(|entry| {
                 entry.chunk_id() == chunk_id && entry.logical_length() == logical_length
             });
@@ -810,7 +2371,11 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         })
     }
 
-    fn read_page(&self, page_ordinal: usize) -> Result<ExactIndexPage, ExactIndexStoreError> {
+    fn read_page(&self, page_ordinal: usize) -> Result<Arc<ExactIndexPage>, ExactIndexStoreError> {
+        let run_hash = self.descriptor.run_hash();
+        if let Some(page) = self.page_cache.get(run_hash, page_ordinal) {
+            return Ok(page);
+        }
         let offset = self
             .descriptor
             .page_offset(page_ordinal)
@@ -818,7 +2383,10 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         let bytes = self
             .storage
             .read_exact_at(&self.name, offset, EXACT_INDEX_PAGE_BYTES)?;
-        Ok(self.descriptor.decode_page(page_ordinal, &bytes)?)
+        let page = Arc::new(self.descriptor.decode_page(page_ordinal, &bytes)?);
+        self.page_cache
+            .insert(run_hash, page_ordinal, Arc::clone(&page));
+        Ok(page)
     }
 }
 
@@ -843,6 +2411,7 @@ impl ExactIndexLookup {
 #[derive(Debug)]
 pub enum ExactIndexStoreError {
     Io(io::Error),
+    Container(StoreError),
     Format(ExactIndexFormatError),
     IdentityMismatch,
     PublishVerificationMismatch,
@@ -850,12 +2419,13 @@ pub enum ExactIndexStoreError {
     Activation(ExactIndexActivationError),
     RunSet(ExactIndexRunSetError),
     ActivationWalCorrupt,
-    ActivationWalFull,
     DependencyMismatch,
     NonMonotonicRunSetGeneration,
     TooManyActiveRuns,
+    TooManyRunPartitions,
     InvalidCompactionInput,
-    CompactionTooLarge,
+    CounterOverflow,
+    MembershipFalseNegative,
 }
 
 impl fmt::Display for ExactIndexStoreError {
@@ -869,6 +2439,12 @@ impl std::error::Error for ExactIndexStoreError {}
 impl From<io::Error> for ExactIndexStoreError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<StoreError> for ExactIndexStoreError {
+    fn from(error: StoreError) -> Self {
+        Self::Container(error)
     }
 }
 
@@ -887,6 +2463,23 @@ impl From<ExactIndexActivationError> for ExactIndexStoreError {
 impl From<ExactIndexRunSetError> for ExactIndexStoreError {
     fn from(error: ExactIndexRunSetError) -> Self {
         Self::RunSet(error)
+    }
+}
+
+fn map_activation_log_error(error: ExactActivationLogError) -> ExactIndexStoreError {
+    match error {
+        ExactActivationLogError::Io(error) => ExactIndexStoreError::Io(error),
+        ExactActivationLogError::OutOfMemory => ExactIndexStoreError::OutOfMemory,
+        ExactActivationLogError::PublishVerificationMismatch => {
+            ExactIndexStoreError::PublishVerificationMismatch
+        }
+        ExactActivationLogError::SlotTooLarge
+        | ExactActivationLogError::BrokenChain
+        | ExactActivationLogError::DivergentSlots
+        | ExactActivationLogError::NeedsRepair
+        | ExactActivationLogError::EmptyAfterInitialization => {
+            ExactIndexStoreError::ActivationWalCorrupt
+        }
     }
 }
 
@@ -950,12 +2543,6 @@ fn verify_run_reference(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
-struct CompactionEntry {
-    entry: ExactIndexEntry,
-    source_generation: u64,
-}
-
 fn compaction_location_key(entry: ExactIndexEntry) -> (ChunkId, u32, [u8; 16], u64, u32) {
     let location = entry.location();
     (
@@ -975,6 +2562,45 @@ fn published_name(profile: ExactIndexProfileId, generation: u64) -> String {
     format!("{}.{generation:016x}.fdx", encode_hex(profile.bytes()))
 }
 
+fn parse_run_name(name: &str) -> Result<Option<(ExactIndexProfileId, u64)>, ExactIndexStoreError> {
+    if name.strip_suffix(".fdx").is_none() {
+        return Ok(None);
+    }
+    if name.len() != 85 || name.as_bytes().get(64) != Some(&b'.') {
+        return Err(ExactIndexStoreError::IdentityMismatch);
+    }
+    let mut profile_bytes = [0_u8; 32];
+    decode_hex_into(&name.as_bytes()[..64], &mut profile_bytes)?;
+    let generation = u64::from_str_radix(&name[65..81], 16)
+        .map_err(|_| ExactIndexStoreError::IdentityMismatch)?;
+    if generation == 0 {
+        return Err(ExactIndexStoreError::IdentityMismatch);
+    }
+    let profile =
+        ExactIndexProfileId::new(profile_bytes).ok_or(ExactIndexStoreError::IdentityMismatch)?;
+    Ok(Some((profile, generation)))
+}
+
+fn decode_hex_into(encoded: &[u8], output: &mut [u8]) -> Result<(), ExactIndexStoreError> {
+    if encoded.len() != output.len() * 2 {
+        return Err(ExactIndexStoreError::IdentityMismatch);
+    }
+    for (pair, byte) in encoded.chunks_exact(2).zip(output) {
+        let high = decode_hex_nibble(pair[0]).ok_or(ExactIndexStoreError::IdentityMismatch)?;
+        let low = decode_hex_nibble(pair[1]).ok_or(ExactIndexStoreError::IdentityMismatch)?;
+        *byte = (high << 4) | low;
+    }
+    Ok(())
+}
+
+const fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
 fn run_set_name(run_set_id: ExactIndexRunSetId) -> String {
     format!("{}.fdxset", encode_hex(run_set_id.bytes()))
 }
@@ -987,4 +2613,51 @@ fn encode_hex<const N: usize>(bytes: [u8; N]) -> String {
             .expect("ASSERT: writing into an owned String cannot fail");
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_page_cache_capacity_and_target_follow_live_headroom() {
+        let gib = 1_024_u64 * 1_024 * 1_024;
+        let healthy = MemoryPressureSnapshot::new(128 * gib, 96 * gib, 0);
+        let cache = ExactIndexPageCache::build(healthy, false);
+        let status = cache.status();
+
+        assert_eq!(std::mem::align_of::<ExactIndexPageCacheSlot>(), 64);
+        assert!(status.capacity_pages().is_power_of_two());
+        assert!(status.capacity_pages() > 256);
+        assert_eq!(status.target_pages(), status.capacity_pages());
+        assert_eq!(status.reserve_bytes(), 32 * gib);
+
+        cache.apply_pressure_snapshot(MemoryPressureSnapshot::new(128 * gib, 32 * gib, 0));
+        assert_eq!(cache.status().target_pages(), 0);
+
+        cache.apply_pressure_snapshot(MemoryPressureSnapshot::new(128 * gib, 96 * gib, 1));
+        let swapped = cache.status();
+        assert_eq!(swapped.target_pages(), 0);
+        assert_eq!(swapped.swap_used_bytes(), 1);
+    }
+
+    #[test]
+    fn exact_run_membership_budget_preserves_headroom_and_closes_on_swap() {
+        let gib = 1_024_u64 * 1_024 * 1_024;
+
+        assert_eq!(
+            exact_run_membership_budget(MemoryPressureSnapshot::new(16 * gib, 12 * gib, 0)),
+            512 * 1_024 * 1_024
+        );
+        assert_eq!(
+            exact_run_membership_budget(MemoryPressureSnapshot::new(16 * gib, 4 * gib, 0)),
+            0,
+            "the shared 4-GiB reserve wins over optional membership hints"
+        );
+        assert_eq!(
+            exact_run_membership_budget(MemoryPressureSnapshot::new(16 * gib, 12 * gib, 1)),
+            0,
+            "any observed Swap disables the next active filter set"
+        );
+    }
 }

@@ -190,6 +190,135 @@ fn acknowledged_writes_are_live_and_open_orphans_remain_usable() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn atomic_rename_replaces_the_visible_name_but_keeps_the_old_open_inode() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let Reply::Created {
+        entry: staging,
+        handle: staging_handle,
+    } = namespace
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"staging.vbk",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create staging full")
+    else {
+        panic!("ASSERT: staging create reply");
+    };
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: staging.attr.inode,
+                handle: staging_handle,
+                offset: 0,
+                data: b"synthetic-full",
+            },
+        )
+        .expect("write staging full");
+    let Reply::Created {
+        entry: old,
+        handle: old_handle,
+    } = namespace
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"active.vbk",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create old full")
+    else {
+        panic!("ASSERT: old create reply");
+    };
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: old.attr.inode,
+                handle: old_handle,
+                offset: 0,
+                data: b"old-full",
+            },
+        )
+        .expect("write old full");
+
+    assert_eq!(
+        namespace.dispatch(
+            CALLER,
+            Operation::Rename {
+                parent: ROOT_INODE,
+                name: b"staging.vbk",
+                new_parent: ROOT_INODE,
+                new_name: b"active.vbk",
+                no_replace: true,
+            },
+        ),
+        Err(PosixError::Exists)
+    );
+    assert_eq!(
+        namespace.dispatch(
+            CALLER,
+            Operation::Rename {
+                parent: ROOT_INODE,
+                name: b"staging.vbk",
+                new_parent: ROOT_INODE,
+                new_name: b"active.vbk",
+                no_replace: false,
+            },
+        ),
+        Ok(Reply::Empty)
+    );
+    assert_eq!(
+        namespace.dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: ROOT_INODE,
+                name: b"staging.vbk",
+            },
+        ),
+        Err(PosixError::NoEntry)
+    );
+    let Reply::Entry(active) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: ROOT_INODE,
+                name: b"active.vbk",
+            },
+        )
+        .expect("renamed full is visible")
+    else {
+        panic!("ASSERT: active lookup reply");
+    };
+    assert_eq!(active.attr.inode, staging.attr.inode);
+    assert_eq!(
+        namespace.dispatch(
+            CALLER,
+            Operation::Read {
+                inode: old.attr.inode,
+                handle: old_handle,
+                offset: 0,
+                length: 32,
+            },
+        ),
+        Ok(Reply::Data(b"old-full".to_vec())),
+        "the replaced inode remains readable through its existing handle"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn seek_write_truncate_and_access_modes_are_checked() {
     let namespace = Namespace::new_volatile(NamespaceConfig {
         maximum_name_bytes: 255,

@@ -2,7 +2,7 @@ use fastdup_format::{
     ChunkId, ContainerId, ExactIndexEntry, ExactIndexLocation, ExactIndexProfileId, ExactIndexRun,
     ExactIndexRunRef, ExactIndexRunSet,
 };
-use fastdup_store::{ExactIndexRunRepository, ExactIndexStoreError};
+use fastdup_store::{ExactIndexRunRepository, ExactIndexStoreError, MemoryPressureSnapshot};
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
 const RUN_GENERATION: u64 = 11;
@@ -55,6 +55,23 @@ fn high_fanout_run() -> ExactIndexRun {
         .collect();
     ExactIndexRun::new(profile(), RUN_GENERATION, entries)
         .expect("high-fanout run is canonicalizable")
+}
+
+fn single_entry_run(run_generation: u64, ordinal: u8) -> ExactIndexRun {
+    let logical_length = 32_768 + u32::from(ordinal);
+    let record_length = (logical_length + 255) / 64 * 64;
+    let location = ExactIndexLocation::raw(
+        ContainerId::new([ordinal + 1; 16]).expect("container identity is nonzero"),
+        run_generation,
+        4_096,
+        record_length,
+        0xEE00_0000 + u32::from(ordinal),
+    )
+    .expect("worked RAW location is valid");
+    let entry =
+        ExactIndexEntry::active(ChunkId::from_bytes([ordinal; 32]), logical_length, location)
+            .expect("worked active entry is valid");
+    ExactIndexRun::new(profile(), run_generation, vec![entry]).expect("one-entry run is canonical")
 }
 
 fn assert_absent_or_complete(repository: &ExactIndexRunRepository<MemoryStorageIo>) -> bool {
@@ -117,7 +134,10 @@ fn every_publish_fault_recovers_only_absence_or_the_complete_run() {
 #[test]
 fn lookup_never_materializes_the_run_or_an_unbounded_location_set() {
     let storage = MemoryStorageIo::new();
-    let repository = ExactIndexRunRepository::new(storage.clone());
+    let repository = ExactIndexRunRepository::new_with_memory_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 0),
+    );
     repository
         .publish(&high_fanout_run())
         .expect("publish high-fanout run");
@@ -146,6 +166,174 @@ fn lookup_never_materializes_the_run_or_an_unbounded_location_set() {
 }
 
 #[test]
+fn one_large_run_family_consumes_one_lookup_slot_and_reads_only_its_key_partition() {
+    const FAMILY_GENERATION: u64 = 100;
+    const PARTITION_COUNT: u16 = 65;
+
+    let storage = MemoryStorageIo::new();
+    let repository = ExactIndexRunRepository::new_with_memory_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 0),
+    );
+    let mut refs = Vec::new();
+    for ordinal in 0..PARTITION_COUNT {
+        let descriptor = repository
+            .publish(&single_entry_run(
+                FAMILY_GENERATION + u64::from(ordinal),
+                u8::try_from(ordinal).expect("worked partition ordinal fits u8"),
+            ))
+            .expect("publish one durable family partition");
+        refs.push(
+            ExactIndexRunRef::family_partition(
+                1,
+                FAMILY_GENERATION,
+                ordinal,
+                PARTITION_COUNT,
+                descriptor,
+            )
+            .expect("partition reference is valid"),
+        );
+    }
+    let run_set = ExactIndexRunSet::new(profile(), 1, refs)
+        .expect("one complete partitioned family is canonical");
+    let active = repository
+        .activate(&run_set)
+        .expect("a family may contain more than 64 physical Runs");
+    assert_eq!(active.family_count(), 1);
+    assert_eq!(active.run_count(), usize::from(PARTITION_COUNT));
+
+    let baseline = storage.operation_count();
+    let lookup = active
+        .lookup_transitions(ChunkId::from_bytes([42; 32]), 32_810)
+        .expect("range-aware family lookup succeeds");
+    assert!(lookup.complete());
+    assert_eq!(lookup.candidates().len(), 1);
+    let operations = &storage.operations()[baseline..];
+    assert!(!operations.contains(&StorageOperation::Read));
+    assert!(!operations.contains(&StorageOperation::ListNames));
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ReadExactAt)
+            .count(),
+        1,
+        "binary search and candidate extraction reuse the one verified hot page"
+    );
+}
+
+#[test]
+fn active_run_membership_skips_every_exact_page_for_an_absent_key() {
+    let storage = MemoryStorageIo::new();
+    let repository = ExactIndexRunRepository::new_with_memory_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 0),
+    );
+    let mut run_refs = Vec::new();
+    for generation in 201..=204 {
+        let descriptor = repository
+            .publish(&run_at(generation, 0))
+            .expect("publish one immutable overlapping Run");
+        run_refs
+            .push(ExactIndexRunRef::new(0, descriptor).expect("pin one verified Run descriptor"));
+    }
+    let active = repository
+        .activate(
+            &ExactIndexRunSet::new(profile(), 1, run_refs)
+                .expect("construct one active overlapping Run Set"),
+        )
+        .expect("activate every complete Run dependency");
+    let baseline = storage.operation_count();
+
+    let lookup = active
+        .lookup_transitions(ChunkId::from_bytes([20; 32]), 99_999)
+        .expect("an absent key remains a complete non-authoritative lookup");
+
+    assert!(lookup.complete());
+    assert!(lookup.candidates().is_empty());
+    let membership = active.membership_status();
+    assert_eq!(membership.filter_count(), 4);
+    assert!(membership.allocated_bytes() >= 4 * 64);
+    assert_eq!(membership.probes(), 4);
+    assert_eq!(membership.definitely_absent(), 4);
+    assert_eq!(membership.requires_exact_lookup(), 0);
+    let operations = &storage.operations()[baseline..];
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ReadExactAt)
+            .count(),
+        0,
+        "complete Run membership should reject the absent key before page lookup: {operations:?}"
+    );
+}
+
+#[test]
+fn active_run_membership_never_authorizes_a_present_key() {
+    let storage = MemoryStorageIo::new();
+    let repository = ExactIndexRunRepository::new_with_memory_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 0),
+    );
+    let descriptor = repository
+        .publish(&run_at(205, 0))
+        .expect("publish one immutable Run");
+    let active = repository
+        .activate(
+            &ExactIndexRunSet::new(
+                profile(),
+                1,
+                vec![ExactIndexRunRef::new(0, descriptor).expect("pin the verified Run")],
+            )
+            .expect("construct one active Run Set"),
+        )
+        .expect("activate the complete Run dependency");
+    let baseline = storage.operation_count();
+
+    let lookup = active
+        .lookup_transitions(ChunkId::from_bytes([20; 32]), 16_404)
+        .expect("the Bloom positive still runs the complete Exact lookup");
+
+    assert_eq!(lookup.candidates().len(), 1);
+    assert!(storage.operations()[baseline..].contains(&StorageOperation::ReadExactAt));
+    let membership = active.membership_status();
+    assert_eq!(membership.probes(), 1);
+    assert_eq!(membership.definitely_absent(), 0);
+    assert_eq!(membership.requires_exact_lookup(), 1);
+}
+
+#[test]
+fn swap_pressure_disables_run_membership_without_changing_lookup_results() {
+    let storage = MemoryStorageIo::new();
+    let repository = ExactIndexRunRepository::new_with_memory_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 1),
+    );
+    let descriptor = repository
+        .publish(&run_at(206, 0))
+        .expect("publish one immutable Run");
+    let active = repository
+        .activate(
+            &ExactIndexRunSet::new(
+                profile(),
+                1,
+                vec![ExactIndexRunRef::new(0, descriptor).expect("pin the verified Run")],
+            )
+            .expect("construct one active Run Set"),
+        )
+        .expect("activate without optional membership acceleration");
+    let baseline = storage.operation_count();
+
+    let lookup = active
+        .lookup_transitions(ChunkId::from_bytes([20; 32]), 99_999)
+        .expect("an unfiltered absent key uses the normal Exact path");
+
+    assert!(lookup.candidates().is_empty());
+    assert!(storage.operations()[baseline..].contains(&StorageOperation::ReadExactAt));
+    assert_eq!(active.membership_status().filter_count(), 0);
+    assert_eq!(active.membership_status().probes(), 0);
+}
+
+#[test]
 fn every_first_activation_fault_recovers_only_absence_or_the_complete_run_set() {
     let probe_storage = MemoryStorageIo::new();
     let probe = ExactIndexRunRepository::new(probe_storage.clone());
@@ -162,7 +350,7 @@ fn every_first_activation_fault_recovers_only_absence_or_the_complete_run_set() 
     assert_eq!(
         activation_operations.last(),
         Some(&StorageOperation::SyncFile),
-        "the activation WAL sync must remain the final fallible commit operation"
+        "the selected activation-slot sync must remain the final fallible commit operation"
     );
 
     for (relative_position, operation) in activation_operations.iter().copied().enumerate() {
@@ -240,14 +428,20 @@ fn replacement_activation_fault_recovers_only_the_previous_or_complete_new_run_s
         repository
             .activate(&first_set)
             .expect("commit first activation");
-        let replacement = repository
+        let replacement_first = repository
             .publish(&run_at(RUN_GENERATION + 1, 80))
-            .expect("publish replacement durable Run");
+            .expect("publish first replacement family partition");
+        let replacement_second = repository
+            .publish(&run_at(RUN_GENERATION + 2, 120))
+            .expect("publish second replacement family partition");
         let replacement_set = ExactIndexRunSet::new(
             profile(),
             2,
             vec![
-                ExactIndexRunRef::new(0, replacement).expect("replacement Run reference is valid"),
+                ExactIndexRunRef::family_partition(0, RUN_GENERATION + 1, 0, 2, replacement_first)
+                    .expect("first replacement partition reference is valid"),
+                ExactIndexRunRef::family_partition(0, RUN_GENERATION + 1, 1, 2, replacement_second)
+                    .expect("second replacement partition reference is valid"),
                 ExactIndexRunRef::new(1, first).expect("retained Run reference is valid"),
             ],
         )
@@ -294,6 +488,92 @@ fn replacement_activation_fault_recovers_only_the_previous_or_complete_new_run_s
             2
         } else {
             1
+        };
+        assert_eq!(
+            recovered.run_set().generation(),
+            expected_generation,
+            "fail-after {relative_position} ({operation:?}) recovered a mixed generation"
+        );
+    }
+}
+
+#[test]
+fn every_activation_rotation_fault_recovers_only_the_previous_or_complete_new_run_set() {
+    const SLOT_RECORDS: u64 = 64;
+
+    fn prepare(
+        storage: &MemoryStorageIo,
+    ) -> (
+        ExactIndexRunRepository<MemoryStorageIo>,
+        ExactIndexRunSet,
+        usize,
+    ) {
+        let repository = ExactIndexRunRepository::new(storage.clone());
+        let descriptor = repository
+            .publish(&run())
+            .expect("publish one durable Run shared by every activation");
+        let run_ref = ExactIndexRunRef::new(0, descriptor).expect("Run reference is valid");
+        for generation in 1..=SLOT_RECORDS {
+            let run_set = ExactIndexRunSet::new(profile(), generation, vec![run_ref])
+                .expect("worked Run Set generation is valid");
+            repository
+                .activate(&run_set)
+                .expect("seed one complete bounded-slot activation");
+        }
+        let successor = ExactIndexRunSet::new(profile(), SLOT_RECORDS + 1, vec![run_ref])
+            .expect("rotation successor Run Set is valid");
+        let baseline = storage.operation_count();
+        (repository, successor, baseline)
+    }
+
+    let probe_storage = MemoryStorageIo::new();
+    let (probe, successor, baseline) = prepare(&probe_storage);
+    probe
+        .activate(&successor)
+        .expect("probe activation rotation succeeds");
+    let operations = probe_storage.operations()[baseline..].to_vec();
+    assert_eq!(
+        operations.last(),
+        Some(&StorageOperation::SyncFile),
+        "the rotated slot sync must remain the final fallible commit operation"
+    );
+
+    for (relative_position, operation) in operations.iter().copied().enumerate() {
+        let absolute_position = baseline + relative_position;
+        let storage = MemoryStorageIo::with_fail_before(absolute_position);
+        let (repository, successor, observed_baseline) = prepare(&storage);
+        assert_eq!(observed_baseline, baseline);
+        assert!(
+            repository.activate(&successor).is_err(),
+            "fail-before {relative_position} ({operation:?}) was not observed"
+        );
+        storage.crash();
+        let recovered = repository
+            .recover_active()
+            .expect("the previous activation remains recoverable")
+            .expect("one complete Run Set remains active");
+        assert_eq!(
+            recovered.run_set().generation(),
+            SLOT_RECORDS,
+            "fail-before {relative_position} ({operation:?}) exposed a mixed/new Run Set"
+        );
+
+        let storage = MemoryStorageIo::with_fail_after(absolute_position);
+        let (repository, successor, observed_baseline) = prepare(&storage);
+        assert_eq!(observed_baseline, baseline);
+        assert!(
+            repository.activate(&successor).is_err(),
+            "fail-after {relative_position} ({operation:?}) was not observed"
+        );
+        storage.crash();
+        let recovered = repository
+            .recover_active()
+            .expect("one whole activation remains recoverable")
+            .expect("at least the previous Run Set remains active");
+        let expected_generation = if relative_position + 1 == operations.len() {
+            SLOT_RECORDS + 1
+        } else {
+            SLOT_RECORDS
         };
         assert_eq!(
             recovered.run_set().generation(),

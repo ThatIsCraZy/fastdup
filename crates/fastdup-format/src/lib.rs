@@ -25,7 +25,7 @@ pub use exact_index::{
     EXACT_INDEX_ENTRY_BYTES, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES, ExactIndexEntry,
     ExactIndexFormatError, ExactIndexLocation, ExactIndexPage, ExactIndexPagePosition,
     ExactIndexProfileId, ExactIndexRun, ExactIndexRunDescriptor, ExactIndexRunHashAudit,
-    ExactLocationTransition,
+    ExactIndexRunStreamEncoder, ExactLocationTransition,
 };
 pub use exact_index_activation::{
     EXACT_INDEX_ACTIVATION_RECORD_BYTES, ExactIndexActivationError, ExactIndexActivationHash,

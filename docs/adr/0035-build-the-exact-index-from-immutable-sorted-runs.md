@@ -24,9 +24,10 @@ Commit WAL.
 The immutable-run direction follows the accepted RoW and rebuild decisions, but
 the production fanout is workload-sensitive. Benchmarks on the pinned Rocky ISO
 variants and structured corpus must select page-cache policy, level count,
-level-zero run cap, compaction ratio, Bloom/Binary-Fuse placement, and whether a
-single sorted run or a partitioned run family gives the best NVMe read and write
-amplification. These values are policy, not durable-format constants.
+level-zero family cap, compaction ratio, and Bloom/Binary-Fuse placement. The
+need for partitioned Run families is accepted by
+[ADR 0045](0045-partition-exact-index-compaction-into-run-families.md); its
+262,144-entry target remains pinned policy rather than a Run-format constant.
 
 The proposal is accepted only after the prototype demonstrates all of:
 
@@ -60,10 +61,45 @@ checkpoint generations remain below the 64-active-Run bound and retain a first-
 generation Exact Hit across remount. Fail-before/fail-after injection across the
 complete compaction publication exposes only absence or a complete canonical
 Run; the activation matrix independently selects only the old or complete new
-Run Set. The current merge deliberately caps its transient input at 262,144
-entries. Canonical external rebuild, streaming/partitioned compaction above that
-bound, and the Rocky/structured-corpus performance gates remain open, so this
-ADR remains proposed.
+Run Set. Activation now rotates through two overlapping 64-record slots and
+migrates the former 16,384-record single-file WAL without an activation-lifetime
+stop; writer, recovery, offline audit, and fault injection enforce the same
+bridge identity. The former 262,144-entry transient cap is now an output
+partition target rather than a failure limit. Compaction performs two complete
+verified K-way merge passes, retains one 4-KiB page per source family plus one
+output page, and streams a complete key-disjoint Run family. Lookup selects at
+most one partition per family. The offline external rebuild now scans one
+verified Container at a time, publishes hidden level-zero/compacted families,
+performs a bounded global cross-family invariant pass, and atomically activates
+the replacement. Deterministic fail-before/fail-after injection proves only the
+old/absent or complete new index is selected; orphan retry uses a monotonic
+name high-water. The exact procedure and limitations are recorded in
+[scrub and Exact-Index rebuild](../operations/scrub-and-exact-index-rebuild.md).
+
+Each active physical Run may now carry a rebuildable RAM membership hint. It
+reuses the existing `BlockedBloomHint` from the reduction pipeline: the key is
+exactly `(Chunk ID, logical length)`, one probe touches one aligned 64-byte
+block, and seven distinct bits target ten bits per key. The hint is constructed
+during the already mandatory complete Run audit, so activation adds no second
+Run read. `DefinitelyAbsent` skips that Run's page lookup; every positive is
+still untrusted and follows the unchanged page-checksummed lookup and Container
+verification path. Allocation failure or disabled admission simply leaves the
+Run unfiltered. Writer insertion is paired with an immediate no-false-negative
+assertion and offline scrub probes every authenticated Run entry again.
+
+All filters in one newly activated Run Set share one budget: one 32nd of the
+effective memory limit, clamped to 1 MiB through 8 GiB and further bounded by
+live available memory above the shared cache/I/O reserve. The ordinary
+repository resamples current host/cgroup headroom at every Run-Set activation;
+any observed Swap sets that new active set's budget to zero. Filters are
+immutable with their Runs, contain no Locations, and are rebuilt after restart;
+they are
+neither serialized nor content authority. Telemetry separates current filter
+count/bytes from process-lifetime absent/maybe probe counters.
+
+Rocky/structured-corpus throughput, discovery/worker-order canonicality at
+scale, and index write-amplification gates remain open, so this ADR remains
+proposed.
 
 ## Consequences
 
@@ -78,5 +114,5 @@ The page geometry and entry encoding are fixed by
 [Exact Index Run v1](../specs/exact-index-run-v1.md). Run Set and activation-log
 layouts are assigned separately by
 [Exact Index Run Set v1](../specs/exact-index-run-set-v1.md) and
-[Exact Index Activation WAL v1](../specs/exact-index-activation-v1.md); their
+[Exact Index Activation Log v1](../specs/exact-index-activation-v1.md); their
 implementation does not give any index object content or liveness authority.

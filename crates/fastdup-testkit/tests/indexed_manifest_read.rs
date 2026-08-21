@@ -4,7 +4,7 @@ use fastdup_format::{
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, IndexedRequiredChunkVerifier,
-    RequiredChunkVerifier, StorageIo, VerifiedManifestFile,
+    MemoryPressureSnapshot, RequiredChunkVerifier, StorageIo, VerifiedManifestFile,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
@@ -24,7 +24,10 @@ fn manifest_data_extent_uses_the_active_index_and_bounded_container_reader() {
         .expect("construct one Exact Index entry");
 
     let profile = ExactIndexProfileId::new([0xB2; 32]).expect("profile identity is nonzero");
-    let indexes = ExactIndexRunRepository::new(storage.clone());
+    let indexes = ExactIndexRunRepository::new_with_memory_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 0),
+    );
     let descriptor = indexes
         .publish(
             &ExactIndexRun::new(profile, 1, vec![entry])
@@ -86,7 +89,10 @@ fn indexed_graph_verification_is_bounded_and_corruption_falls_back_to_one_comple
         .expect("construct one Exact Index entry");
 
     let profile = ExactIndexProfileId::new([0xB4; 32]).expect("profile identity is nonzero");
-    let indexes = ExactIndexRunRepository::new(storage.clone());
+    let indexes = ExactIndexRunRepository::new_with_memory_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 1),
+    );
     let descriptor = indexes
         .publish(
             &ExactIndexRun::new(profile, 1, vec![entry])

@@ -79,6 +79,44 @@ fn manifest_inner_node_has_stable_content_addressed_bytes_and_round_trips() {
 }
 
 #[test]
+fn v2_child_allocation_summaries_are_stable_bounded_and_round_trip() {
+    let node = ManifestInnerNode::new_with_allocated_bytes(
+        12,
+        1,
+        vec![
+            ManifestChildRange::new_with_allocated_bytes(0, 4, 1, object_id(0x22))
+                .expect("sparse child summary is valid"),
+            ManifestChildRange::new_with_allocated_bytes(4, 8, 8, object_id(0x88))
+                .expect("allocated child summary is valid"),
+        ],
+    )
+    .expect("worked v2 child partition is valid");
+
+    let encoded = node.encode().expect("bounded v2 inner node encodes");
+    assert_eq!(
+        &encoded[METADATA_HEADER_BYTES + 8..METADATA_HEADER_BYTES + 10],
+        &2_u16.to_le_bytes()
+    );
+    let first_child = METADATA_HEADER_BYTES + MANIFEST_INNER_HEADER_BYTES;
+    assert_eq!(
+        &encoded[first_child + 48..first_child + 56],
+        &1_u64.to_le_bytes()
+    );
+    assert_eq!(
+        &encoded[first_child + MANIFEST_CHILD_RANGE_BYTES + 48
+            ..first_child + MANIFEST_CHILD_RANGE_BYTES + 56],
+        &8_u64.to_le_bytes()
+    );
+    assert_eq!(node.allocated_bytes(), Ok(Some(9)));
+    assert_eq!(ManifestInnerNode::decode(&encoded), Ok(node));
+
+    assert_eq!(
+        ManifestChildRange::new_with_allocated_bytes(0, 4, 5, object_id(1)),
+        Err(ManifestInnerNodeError::InvalidChildRange)
+    );
+}
+
+#[test]
 fn writer_rejects_leaf_level_empty_gapped_overlapping_and_overflowing_ranges() {
     let child = |offset, length, byte| ManifestChildRange::new(offset, length, object_id(byte));
     let complete = || vec![child(0, 4, 1).expect("worked child range is valid")];

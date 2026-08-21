@@ -19,7 +19,18 @@ Locations as level-zero Runs, and reuse Exact Hits across later checkpoints;
 four same-level Runs are merged RoW before the 64-Run reader bound is reached.
 Missing or corrupt index state falls back to verified Container scans. Adaptive
 Compression Regions are encoded by a bounded cache-local worker pool and merged
-in deterministic input order.
+in deterministic input order. Exact-Index activation now rotates through two
+overlapping 64-record slots and migrates the former 16,384-record WAL without a
+lifetime write stop.
+The POSIX/FUSE seam also supports metadata-only range clones across arbitrary
+FastCDC boundaries through Manifest v2 Chunk slices, plus atomic replacement
+rename. Clone checkpoints allocate no frontend payload, rechunk no bytes, and
+perform no DATA-container I/O. This is the filesystem primitive needed by
+Veeam synthetic full. The experimental GPL `vfs_fastdup` Samba adapter now
+advertises block refcounting only when explicitly enabled, maps Duplicate
+Extents to FUSE `copy_file_range`, and exposes one fixed Integrity Information
+state. It compiles against Samba 4.23.5, but Veeam Fast Clone is not advertised
+as supported until a real SMB/Veeam trace and protocol matrix are green.
 This remains an experimental checkpoint rather than a production backup target.
 
 Start with [CONTEXT.md](CONTEXT.md), the accepted decisions in
@@ -36,10 +47,16 @@ Its durable namespace and recovery rules are specified in
 The current reduction policy, real 10-ISO results, worker scaling, integrity
 gates, and explicit limitations are recorded in
 [`data-reduction-reference-v1`](docs/benchmarks/data-reduction-reference-v1.md).
+The persistent CPU-pool scaling result is recorded in
+[`reduction-worker-pool`](docs/benchmarks/reduction-worker-pool.md).
 The first sustained kernel-FUSE write/checkpoint/read/delete run, including
 per-stage CPU, memory, Exact/Compression efficiency, and device-I/O evidence,
 is recorded in
 [`io-intensive-fuse-600s`](docs/benchmarks/io-intensive-fuse-600s.md).
+The range-clone design, crash matrix, and real FUSE evidence are recorded in
+[`veeam-fast-clone`](docs/testing/veeam-fast-clone.md).
+Offline integrity verification and RoW Exact-Index reconstruction are described
+in [`scrub and Exact-Index rebuild`](docs/operations/scrub-and-exact-index-rebuild.md).
 
 ## Workspace
 
@@ -54,6 +71,9 @@ is recorded in
   injectable storage boundary, plus the non-durable reduction reference engine.
 - `fastdup-testkit`: separate live/durable state, crash simulation, and
   deterministic I/O failures.
+- `samba/vfs_fastdup`: GPL Samba VFS adapter and a dependency-free executable
+  contract test for Duplicate Extents, Integrity Information, and CLOSE
+  ordering.
 
 All generated artifacts stay under `/source/fastdup/.artifacts/`. With the
 workspace-local toolchain installed, run:
@@ -78,17 +98,34 @@ cargo run --release -p fastdup-testkit --example audit_container_store
 cargo run --release -p fastdup-store --example reduction_matrix -- \
   --preset all --workers 8 --inflight-mib 128 \
   /source/fastdup/.artifacts/corpus/structured-v1/*
+cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
+  --offline scrub METADATA_ROOT CONTAINER_ROOT
 ```
 
 Verified Locations now provide commit-time and recovery DATA proof without a
 Container-directory scan while the active index is healthy. Namespace commits
 rotate through two bounded, overlapping Commit-Log slots, and large recipes are
-published as content-addressed Manifest trees whose unchanged leaves are reused.
-The next scalability work is tree-native lazy reads/path updates, metadata GC,
-a durable Container-generation high-water, and per-DATA-region Chunking Profile
-identities. The current compactor is explicitly bounded to 262,144 input
-entries; streaming partitioned compaction remains necessary above that scale.
-External index rebuild/scrub, a format-epoch fence, and process-kill deadline
-evidence remain production blockers.
+published as content-addressed Manifest trees. Lazy reads, equal-length updates,
+append, truncate, and arbitrary length-changing middle splice/concat reuse
+unchanged subtrees without flattening the file recipe. Exact-Run compaction and
+offline rebuild stream inputs with one verified 4-KiB page per source family
+instead of retaining a complete entry set. Offline scrub verifies every retained
+generation, published Container, active index object, and ACTIVE Location; the
+RoW rebuild activates only a fully audited replacement Run Set.
+
+Offline scrub-bound GC removes fully unreachable Containers and compacts
+profitable sets of partially live Containers only after verified replacements
+and a filtered RoW Exact Index are active and the current/previous generation
+proof is revalidated. Online GC still requires RETIRING transitions and pin
+drain. The next recovery work is Metadata GC, a durable
+Container-generation high-water, per-DATA-region Chunking Profile identities,
+and an Appliance Lease/format-epoch fence. A bounded real-process
+[`SIGKILL`/remount/deadline harness](docs/testing/sigkill-remount-deadline.md)
+is green; broad load, randomized kill, and block-device power-cut evidence
+remain open. Partitioned Run
+families remain necessary only when one canonical output exceeds the Run-v1
+one-GiB object bound. Large-store rebuild/scrub performance remains a production
+gate even though the bounded integrity path and deterministic fault matrix are
+implemented.
 The reference reduction implementation remains benchmark evidence and a
 format-design oracle, not permission to bypass POSIX conformance gates.

@@ -7,7 +7,8 @@ mod checkpoint_trigger;
 
 pub use checkpoint::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, DurableNamespace,
-    DurableNamespaceError, ProfiledCheckpoint, WriteThroughStatus, checkpoint_policy_set_v1,
+    DurableNamespaceError, ProfiledCheckpoint, WriteThroughStatus,
+    checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1,
 };
 pub use checkpoint_trigger::{
     CONTAINER_COMMIT_COALESCE, CheckpointAction, CheckpointPressure, CheckpointTrigger,
@@ -18,10 +19,10 @@ pub use checkpoint_trigger::{
 use std::fmt;
 use std::sync::Arc;
 
-use fastdup_format::NamespaceRoot;
+use fastdup_format::{ManifestExtent, NamespaceRoot};
 use fastdup_posix::{
     CommittedEntry, CommittedFile, CommittedInode, CommittedNamespaceSnapshot, Namespace,
-    NamespaceConfig, PosixError,
+    NamespaceConfig, PosixError, PreparedCommitExtent, PreparedDataRecipe,
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, GenerationError, GenerationRepository,
@@ -289,6 +290,105 @@ where
         self.file
             .read_at(offset, length)
             .map_err(|_| PosixError::Io)
+    }
+
+    fn prepared_clone_extents(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<Vec<PreparedCommitExtent>>, PosixError> {
+        let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
+        if length == 0 || end > self.logical_size {
+            return Err(PosixError::InvalidArgument);
+        }
+        if self.allocated_bytes_in_range(offset, length)? != length {
+            return Ok(None);
+        }
+        let located = self
+            .file
+            .manifest_extents_in_range(offset, length)
+            .map_err(|_| PosixError::Io)?;
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(located.len())
+            .map_err(|_| PosixError::OutOfMemory)?;
+        let mut cursor = offset;
+        for located_extent in located {
+            let extent = located_extent.extent();
+            let extent_length = match *extent {
+                ManifestExtent::Data { logical_length, .. }
+                | ManifestExtent::DataSlice { logical_length, .. }
+                | ManifestExtent::Hole { logical_length }
+                | ManifestExtent::Fill { logical_length, .. } => logical_length,
+            };
+            let extent_end = located_extent
+                .logical_offset()
+                .checked_add(extent_length)
+                .ok_or(PosixError::Io)?;
+            let selected_start = located_extent.logical_offset().max(offset);
+            let selected_end = extent_end.min(end);
+            if selected_start != cursor || selected_start >= selected_end {
+                return Err(PosixError::Io);
+            }
+            let selected_length = selected_end - selected_start;
+            let recipe = match *extent {
+                ManifestExtent::Data {
+                    logical_length,
+                    chunk_id,
+                } => {
+                    if selected_start == located_extent.logical_offset()
+                        && selected_length == logical_length
+                    {
+                        PreparedDataRecipe::Chunk {
+                            chunk_id: chunk_id.bytes(),
+                        }
+                    } else {
+                        PreparedDataRecipe::ChunkSlice {
+                            chunk_id: chunk_id.bytes(),
+                            chunk_length: u32::try_from(logical_length)
+                                .map_err(|_| PosixError::Io)?,
+                            chunk_offset: u32::try_from(
+                                selected_start - located_extent.logical_offset(),
+                            )
+                            .map_err(|_| PosixError::Io)?,
+                        }
+                    }
+                }
+                ManifestExtent::DataSlice {
+                    chunk_id,
+                    chunk_length,
+                    chunk_offset,
+                    ..
+                } => PreparedDataRecipe::ChunkSlice {
+                    chunk_id: chunk_id.bytes(),
+                    chunk_length,
+                    chunk_offset: chunk_offset
+                        .checked_add(
+                            u32::try_from(selected_start - located_extent.logical_offset())
+                                .map_err(|_| PosixError::Io)?,
+                        )
+                        .ok_or(PosixError::Io)?,
+                },
+                ManifestExtent::Fill { value, .. } => PreparedDataRecipe::Fill { value },
+                ManifestExtent::Hole { .. } => return Ok(None),
+            };
+            let prepared_extent = match self.file.manifest_root() {
+                Some(root) => PreparedCommitExtent::try_new_retained(
+                    selected_start,
+                    selected_length,
+                    recipe,
+                    root.bytes(),
+                    selected_start,
+                )?,
+                None => PreparedCommitExtent::try_new(selected_start, selected_length, recipe)?,
+            };
+            prepared.push(prepared_extent);
+            cursor = selected_end;
+        }
+        if cursor != end {
+            return Err(PosixError::Io);
+        }
+        Ok(Some(prepared))
     }
 }
 

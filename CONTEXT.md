@@ -40,6 +40,18 @@ Location Set. It is rebuildable acceleration rather than the source of content
 or liveness truth.
 _Avoid_: Bloom filter, recovery index
 
+**Exact Index activation log**:
+The bounded hash-chained selection history that identifies one immutable Exact
+Index Run Set as active. It is acceleration state and never content or liveness
+authority.
+_Avoid_: Commit WAL, Exact Index, Manifest
+
+**Exact Index Run family**:
+One logical, immutable Exact Index generation represented by one or more
+strictly key-disjoint Runs selected together. A family is the unit of
+compaction precedence; an individual partition is only its physical range.
+_Avoid_: Run Set, shard replica, independent Run generation
+
 **Exact hit**:
 A Chunk ID and logical-length match against the Exact Index. It permits location
 reuse without asserting that a physical copy is canonical.
@@ -75,6 +87,18 @@ _Avoid_: Dictionary, previous container
 An immutable content-identified byte sequence required by a dictionary encoding.
 It is a physical decoding dependency, not a mutable workload setting.
 _Avoid_: Base chunk, training profile
+
+**Dictionary family**:
+A policy-selected group of sufficiently similar content whose prior samples may
+train one Dictionary Object. Membership affects compression opportunity only,
+never content identity, integrity, placement authority, or visibility.
+_Avoid_: File type, codec, trust class
+
+**Dictionary catalog**:
+A bounded acceleration mapping Dictionary Families to measured immutable
+Dictionary Objects. It is neither a cross-Container compression history nor a
+source of durable content or liveness truth.
+_Avoid_: Compression catalog, shared Zstd stream, dictionary index
 
 **Container**:
 An immutable collection of physical chunk encodings with enough local metadata
@@ -217,6 +241,18 @@ A decoded chunk or region admitted to a shared read cache only after its complet
 stored encoding and logical content identity were verified.
 _Avoid_: Kernel-dirty page, cache location
 
+**Exact Index hot page**:
+An independently verified immutable Exact Index page retained as bounded RAM
+acceleration. It avoids repeated Metadata-Tier I/O but never authorizes Chunk
+reuse or replaces verification of the selected DATA Location.
+_Avoid_: In-memory Exact Index, hash table
+
+**Cache memory reserve**:
+Host/cgroup headroom that DATA and Exact Index caches are forbidden to consume.
+It protects Dirty DATA, reduction workers, XFS clean/writeback pages, and device
+queues; pressure shrinks or disables cache admission rather than borrowing it.
+_Avoid_: Cache capacity, free RAM, metadata reserve
+
 **Recovery index**:
 Container-local metadata from which stored logical chunk identities and physical
 locations can be rediscovered without the online deduplication index.
@@ -237,6 +273,21 @@ _Avoid_: Deleted container, quarantined location
 An offline or background integrity pass that verifies durable sources of truth
 and reports or repairs invalid physical locations.
 _Avoid_: Garbage collection, rebuild
+
+**GC scrub plan**:
+Opaque, generation-bound evidence from one successful Scrub that names verified
+physical garbage without making an Exact Index or reference count authoritative.
+_Avoid_: Refcount snapshot, deletion list
+
+**Reclaimable container**:
+A verified Container with no Chunk reachable from any currently pinned online
+generation. A partially live Container is not reclaimable until relocation.
+_Avoid_: Empty container, retiring container
+
+**Compaction victim set**:
+Verified partially live Containers whose uncovered live Chunks can be moved to
+fewer replacement Containers before the originals become reclaimable.
+_Avoid_: Garbage list, empty Containers
 
 **Rebuild**:
 The generation-building recovery process that derives new online indexes from
@@ -286,14 +337,22 @@ _Avoid_: Frozen commit cut, write transaction
 **Frozen commit cut**:
 The single immutable prefix of accepted Namespace and inode mutations currently
 being persisted or retained for retry. Later mutations never change its token,
-bytes, names, or ordering.
+bytes, names, or ordering. Forming the cut waits for every already admitted
+mutation to finish its Ingest-Lane observer; it does not hold mutation admission
+closed while the generation is persisted.
 _Avoid_: Active dirty epoch, filesystem freeze
 
 **Ingest lane**:
 A bounded process-local FastCDC and Container-staging stream for one hot inode.
-It controls local queueing and reduction continuity but has no durable identity
-and does not define commit visibility.
+It controls reduction continuity but has no durable identity and does not define
+commit visibility.
 _Avoid_: Commit group, worker thread
+
+**Ingest queue**:
+The bounded process-local payload accepted for asynchronous reduction but not
+yet completed through its Ingest Lane. It defines RAM backpressure, not commit
+visibility or durability.
+_Avoid_: Dirty epoch, durable journal
 
 **Commit group**:
 A batch of ordered content and namespace mutations whose durability and recovery
@@ -331,6 +390,25 @@ _Avoid_: CDC profile change, sparse boundary
 A versioned byte-to-boundary rule used by one DATA region. Different regions of
 the same file may use different profiles without changing logical chunk identity.
 _Avoid_: Compression profile, file type
+
+**Prepared extent recipe**:
+Process-local proof carried from a byte-verified externalized dirty range into
+the Frozen Commit Cut. It may avoid re-reading a complete Chunk or FILL extent,
+but it neither contains a physical Location nor makes a generation visible;
+generation publication must still verify every changed DATA dependency.
+Stable FastCDC Chunks still below the normal Container-fill threshold are
+drained immediately after the cut and may attach this proof to the frozen range;
+only one boundary Chunk plus the incomplete bounded CDC suffix remain resident
+for checkpoint replay.
+_Avoid_: Manifest, Exact-Index hint, commit record
+
+**Range clone**:
+One atomic target mutation that reuses the verified immutable recipe of an
+equal-length source byte range. It is metadata-only: it neither copies source
+bytes through the frontend nor creates new logical Chunk identities. Veeam SMB
+Fast Clone reaches it through the Samba Duplicate Extents adapter and FUSE
+`copy_file_range`.
+_Avoid_: Buffered copy, Exact-Dedup hit, snapshot
 
 **Fill extent**:
 A DATA range consisting of one repeated byte value. It is reconstructed without

@@ -1,7 +1,8 @@
 use fastdup_format::{
     ChunkId, ContainerId, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES, ExactIndexEntry,
     ExactIndexLocation, ExactIndexProfileId, ExactIndexRun, ExactIndexRunDescriptor,
-    ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetId,
+    ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError, ExactIndexRunSetId,
+    METADATA_HEADER_BYTES,
 };
 
 fn descriptor(
@@ -93,4 +94,99 @@ fn every_truncated_or_single_byte_corrupt_run_set_is_rejected_without_panicking(
             "decoder accepted corruption at byte {offset}"
         );
     }
+}
+
+#[test]
+fn partitioned_run_family_has_stable_v2_bytes_and_round_trips_as_one_generation() {
+    let profile = ExactIndexProfileId::new([0xD2; 32]).expect("profile identity is nonzero");
+    let first = ExactIndexRunRef::family_partition(2, 100, 0, 2, descriptor(profile, 100, 10))
+        .expect("first family partition is valid");
+    let second = ExactIndexRunRef::family_partition(2, 100, 1, 2, descriptor(profile, 101, 20))
+        .expect("second family partition is valid");
+    let run_set = ExactIndexRunSet::new(profile, 7, vec![second, first])
+        .expect("complete partitioned family canonicalizes");
+
+    let encoded = run_set.encode().expect("v2 Run Set encodes");
+    assert_eq!(&encoded[4_096 + 8..4_096 + 10], &2_u16.to_le_bytes());
+    assert_eq!(&encoded[4_096 + 12..4_096 + 14], &160_u16.to_le_bytes());
+    let decoded = ExactIndexRunSet::decode(&encoded).expect("v2 Run Set decodes");
+    assert_eq!(decoded, run_set);
+    assert_eq!(decoded.family_count(), 1);
+    assert_eq!(decoded.runs()[0].family_generation(), 100);
+    assert_eq!(decoded.runs()[0].partition_ordinal(), 0);
+    assert_eq!(decoded.runs()[0].partition_count(), 2);
+    assert_eq!(decoded.runs()[1].generation(), 101);
+    assert_eq!(
+        decoded.id().expect("decoded v2 re-encodes"),
+        run_set.id().expect("v2 identity")
+    );
+}
+
+#[test]
+fn writer_rejects_incomplete_and_overlapping_run_families() {
+    let profile = ExactIndexProfileId::new([0xD3; 32]).expect("profile identity is nonzero");
+    let incomplete = ExactIndexRunRef::family_partition(2, 100, 0, 2, descriptor(profile, 100, 10))
+        .expect("one partition reference is locally valid");
+    assert!(matches!(
+        ExactIndexRunSet::new(profile, 1, vec![incomplete]),
+        Err(ExactIndexRunSetError::InvalidRunFamily)
+    ));
+
+    let first = ExactIndexRunRef::family_partition(2, 200, 0, 2, descriptor(profile, 200, 20))
+        .expect("first partition reference is locally valid");
+    let second = ExactIndexRunRef::family_partition(2, 200, 1, 2, descriptor(profile, 201, 10))
+        .expect("second partition reference is locally valid");
+    assert!(matches!(
+        ExactIndexRunSet::new(profile, 1, vec![first, second]),
+        Err(ExactIndexRunSetError::OverlappingRunFamily)
+    ));
+}
+
+#[test]
+fn reader_rejects_reauthenticated_missing_partition_without_panicking() {
+    let profile = ExactIndexProfileId::new([0xD4; 32]).expect("profile identity is nonzero");
+    let first = ExactIndexRunRef::family_partition(2, 300, 0, 2, descriptor(profile, 300, 10))
+        .expect("first family partition is valid");
+    let second = ExactIndexRunRef::family_partition(2, 300, 1, 2, descriptor(profile, 301, 20))
+        .expect("second family partition is valid");
+    let run_set =
+        ExactIndexRunSet::new(profile, 1, vec![first, second]).expect("complete family is valid");
+    let mut encoded = run_set.encode().expect("v2 fixture encodes");
+    let second_entry = METADATA_HEADER_BYTES + 128 + 160;
+    encoded[second_entry + 2..second_entry + 4].copy_from_slice(&0_u16.to_le_bytes());
+    reauthenticate_metadata_object(&mut encoded);
+
+    let result = std::panic::catch_unwind(|| ExactIndexRunSet::decode(&encoded));
+    assert!(
+        result.is_ok(),
+        "reader must not panic on authenticated corruption"
+    );
+    assert!(result.expect("panic checked").is_err());
+}
+
+fn reauthenticate_metadata_object(encoded: &mut [u8]) {
+    let payload_length = usize::try_from(u64::from_le_bytes(
+        encoded[32..40].try_into().expect("fixed payload length"),
+    ))
+    .expect("fixture payload length fits");
+    let kind = u16::from_le_bytes(encoded[12..14].try_into().expect("fixed kind"));
+    let (payload_crc, object_id) = {
+        let payload = &encoded[METADATA_HEADER_BYTES..METADATA_HEADER_BYTES + payload_length];
+        let payload_crc = crc32c::crc32c(payload);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"fastdup-metadata-object-v1\0");
+        hasher.update(&kind.to_le_bytes());
+        hasher.update(
+            &u64::try_from(payload_length)
+                .expect("fixture payload length fits")
+                .to_le_bytes(),
+        );
+        hasher.update(payload);
+        (payload_crc, *hasher.finalize().as_bytes())
+    };
+    encoded[80..84].copy_from_slice(&payload_crc.to_le_bytes());
+    encoded[48..80].copy_from_slice(&object_id);
+    encoded[84..88].fill(0);
+    let header_crc = crc32c::crc32c(&encoded[..METADATA_HEADER_BYTES]);
+    encoded[84..88].copy_from_slice(&header_crc.to_le_bytes());
 }

@@ -3,11 +3,12 @@
 //! The first implementation checkpoint is deliberately volatile. It proves
 //! live POSIX semantics but does not claim crash durability.
 
+use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::ops::Bound::Excluded;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use tokio::sync::Notify;
 
 mod fuse_adapter;
@@ -18,9 +19,197 @@ use versioned_file::VersionedFile;
 pub use fuse_adapter::{FuseFilesystem, volatile_mount_options};
 pub use versioned_file::CommittedFile;
 
+/// Format-independent reduction recipe retained by verified write-through DATA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedDataRecipe {
+    /// One complete immutable content-addressed Chunk.
+    Chunk { chunk_id: [u8; 32] },
+    /// One logical byte range inside a complete immutable Chunk.
+    ChunkSlice {
+        chunk_id: [u8; 32],
+        chunk_length: u32,
+        chunk_offset: u32,
+    },
+    /// One byte repeated for the complete logical extent.
+    Fill { value: u8 },
+}
+
+/// One range-local recipe available to a generation checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedCommitExtent {
+    offset: u64,
+    length: u64,
+    recipe: PreparedDataRecipe,
+    retained_manifest_root: Option<[u8; 32]>,
+    retained_source_offset: u64,
+}
+
+impl PreparedCommitExtent {
+    const fn new(offset: u64, length: u64, recipe: PreparedDataRecipe) -> Self {
+        assert!(length > 0, "ASSERT: a prepared commit extent is nonempty");
+        assert!(
+            offset.checked_add(length).is_some(),
+            "ASSERT: a prepared commit extent cannot overflow"
+        );
+        Self {
+            offset,
+            length,
+            recipe,
+            retained_manifest_root: None,
+            retained_source_offset: 0,
+        }
+    }
+
+    /// Constructs one externally supplied immutable recipe range.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty or overflowing ranges before they cross the checkpoint
+    /// integrity boundary.
+    pub fn try_new(
+        offset: u64,
+        length: u64,
+        recipe: PreparedDataRecipe,
+    ) -> Result<Self, PosixError> {
+        if length == 0 || offset.checked_add(length).is_none() {
+            return Err(PosixError::InvalidArgument);
+        }
+        Ok(Self::new(offset, length, recipe))
+    }
+
+    /// Constructs a recipe proven to originate from one installed immutable
+    /// Manifest range. The durable Store must still validate this claim
+    /// against the exact predecessor Namespace Root before reusing its DATA
+    /// proof.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero Manifest identity and empty, destination-overflowing, or
+    /// source-overflowing ranges.
+    pub fn try_new_retained(
+        offset: u64,
+        length: u64,
+        recipe: PreparedDataRecipe,
+        manifest_root: [u8; 32],
+        source_offset: u64,
+    ) -> Result<Self, PosixError> {
+        let mut extent = Self::try_new(offset, length, recipe)?;
+        if manifest_root == [0; 32] || source_offset.checked_add(length).is_none() {
+            return Err(PosixError::InvalidArgument);
+        }
+        extent.retained_manifest_root = Some(manifest_root);
+        extent.retained_source_offset = source_offset;
+        Ok(extent)
+    }
+
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+
+    #[must_use]
+    pub const fn recipe(self) -> PreparedDataRecipe {
+        self.recipe
+    }
+
+    #[must_use]
+    pub const fn retained_manifest_root(self) -> Option<[u8; 32]> {
+        self.retained_manifest_root
+    }
+
+    #[must_use]
+    pub const fn retained_source_offset(self) -> Option<u64> {
+        if self.retained_manifest_root.is_some() {
+            Some(self.retained_source_offset)
+        } else {
+            None
+        }
+    }
+}
+
 pub const ROOT_INODE: InodeId = InodeId(NonZeroU64::MIN);
-const MAX_COALESCED_EXTENT_BYTES: usize = 16 * 1_024 * 1_024;
 const MAX_DIRECTORY_ENTRIES_PER_REPLY: usize = 256;
+
+/// One immutable, owned write payload shared by the POSIX Dirty Extent Map and
+/// asynchronous mutation observers.
+///
+/// Clones and checked slices retain the same allocation. The Namespace creates
+/// exactly one backing allocation when adapting the borrowed FUSE request;
+/// observers may therefore retain or split this value after the write reply
+/// without copying its bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationPayload {
+    bytes: Bytes,
+}
+
+impl MutationPayload {
+    /// Adopts one already-owned immutable request buffer without copying it.
+    #[must_use]
+    pub fn from_owned_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Bytes::from(bytes),
+        }
+    }
+
+    /// Copies one borrowed request buffer into its single retained backing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PosixError::OutOfMemory`] when the owned allocation cannot be
+    /// reserved.
+    pub fn try_copy_from_slice(source: &[u8]) -> Result<Self, PosixError> {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(source.len())
+            .map_err(|_| PosixError::OutOfMemory)?;
+        owned.extend_from_slice(source);
+        Ok(Self::from_owned_bytes(owned))
+    }
+
+    /// Returns the complete immutable byte view.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the logical byte length of this view.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Reports whether this view is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Creates a zero-copy sub-view when `start..end` lies inside this payload.
+    #[must_use]
+    pub fn checked_slice(&self, start: usize, end: usize) -> Option<Self> {
+        if start > end || end > self.bytes.len() {
+            return None;
+        }
+        Some(Self {
+            bytes: self.bytes.slice(start..end),
+        })
+    }
+
+    #[cfg(test)]
+    fn starts_at_same_address(&self, other: &Self) -> bool {
+        self.bytes.as_ptr() == other.bytes.as_ptr()
+    }
+
+    #[cfg(test)]
+    fn is_uniquely_owned(&self) -> bool {
+        self.bytes.is_unique()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InodeId(NonZeroU64);
@@ -179,6 +368,15 @@ pub enum Operation<'a> {
         handle: Option<HandleId>,
         length: u64,
     },
+    CloneRange {
+        source_inode: InodeId,
+        source_handle: HandleId,
+        source_offset: u64,
+        target_inode: InodeId,
+        target_handle: HandleId,
+        target_offset: u64,
+        length: u64,
+    },
     Sync {
         inode: InodeId,
         handle: HandleId,
@@ -191,6 +389,13 @@ pub enum Operation<'a> {
     Unlink {
         parent: InodeId,
         name: &'a [u8],
+    },
+    Rename {
+        parent: InodeId,
+        name: &'a [u8],
+        new_parent: InodeId,
+        new_name: &'a [u8],
+        no_replace: bool,
     },
     ReadDirectory {
         inode: InodeId,
@@ -211,6 +416,7 @@ pub enum Reply {
     Opened(HandleId),
     Data(Vec<u8>),
     Written { bytes: u32, mutation_sequence: u64 },
+    Cloned { bytes: u64, mutation_sequence: u64 },
     Directory(Vec<DirectoryEntry>),
     Empty,
 }
@@ -280,10 +486,14 @@ pub trait MutationObserver: std::fmt::Debug + Send + Sync {
         inode: InodeId,
         offset: u64,
         mutation_sequence: u64,
-        bytes: &[u8],
+        bytes: MutationPayload,
     ) -> Vec<ExternalizedExtent>;
 
     fn accepted_truncate(&self, inode: InodeId, mutation_sequence: u64, length: u64);
+
+    /// Waits until every accepted mutation through `mutation_sequence` has
+    /// left the observer's asynchronous processing queue.
+    fn wait_through(&self, _inode: InodeId, _mutation_sequence: u64) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -461,6 +671,28 @@ impl CommitInode {
         self.frozen_epoch
             .as_ref()
             .map_or_else(|| Ok(Vec::new()), |epoch| epoch.changed_ranges())
+    }
+
+    /// Returns verified write-through recipes wholly reusable in one range.
+    ///
+    /// Partial content-addressed Chunks are omitted because their identity no
+    /// longer describes the requested bytes. FILL recipes may be clipped.
+    /// Missing ranges remain readable through [`Self::read_at`] and must be
+    /// planned normally by the checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity, arithmetic, or bounded-allocation error while
+    /// examining the immutable frozen epoch.
+    pub fn prepared_extents_in_range(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<PreparedCommitExtent>, PosixError> {
+        self.frozen_epoch.as_ref().map_or_else(
+            || Ok(Vec::new()),
+            |epoch| epoch.prepared_extents_in_range(offset, length),
+        )
     }
 
     /// Counts allocated bytes in the frozen version without reading content.
@@ -648,7 +880,7 @@ struct ExternalDirtyData {
 struct SparseData {
     logical_size: u64,
     allocated_bytes: u64,
-    extents: BTreeMap<u64, Vec<u8>>,
+    extents: BTreeMap<u64, MutationPayload>,
     external_extents: BTreeMap<u64, ExternalDirtyData>,
 }
 
@@ -668,10 +900,10 @@ impl SparseData {
         output.resize(output_length, 0);
 
         if let Some((&extent_start, bytes)) = self.extents.range(..=offset).next_back() {
-            overlay_extent(&mut output, offset, end, extent_start, bytes);
+            overlay_extent(&mut output, offset, end, extent_start, bytes.as_bytes());
         }
         for (&extent_start, bytes) in self.extents.range((Excluded(offset), Excluded(end))) {
-            overlay_extent(&mut output, offset, end, extent_start, bytes);
+            overlay_extent(&mut output, offset, end, extent_start, bytes.as_bytes());
         }
         if let Some((&extent_start, external)) = self.external_extents.range(..=offset).next_back()
         {
@@ -686,7 +918,7 @@ impl SparseData {
         Ok(output)
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), PosixError> {
+    fn write(&mut self, offset: u64, data: MutationPayload) -> Result<(), PosixError> {
         assert!(
             !data.is_empty(),
             "ASSERT: empty writes are handled by caller"
@@ -696,16 +928,6 @@ impl SparseData {
             .checked_add(data_length)
             .ok_or(PosixError::FileTooLarge)?;
         self.remove_external_overlaps(offset, end)?;
-        if self.try_append_to_previous(offset, end, data)? {
-            return Ok(());
-        }
-
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(data.len())
-            .map_err(|_| PosixError::OutOfMemory)?;
-        payload.extend_from_slice(data);
-
         let mut overlapping = Vec::new();
         let mut fragments = Vec::new();
         if let Some((&extent_start, bytes)) = self.extents.range(..=offset).next_back() {
@@ -754,7 +976,7 @@ impl SparseData {
             .checked_add(data_length)
             .expect("ASSERT: allocated extent bytes must not overflow");
         assert!(
-            self.extents.insert(offset, payload).is_none(),
+            self.extents.insert(offset, data).is_none(),
             "ASSERT: new write extent must replace every overlap"
         );
         self.logical_size = self.logical_size.max(end);
@@ -765,42 +987,50 @@ impl SparseData {
         Ok(())
     }
 
-    fn try_append_to_previous(
+    fn write_external(
         &mut self,
         offset: u64,
-        end: u64,
-        data: &[u8],
-    ) -> Result<bool, PosixError> {
-        if self.extents.range(offset..end).next().is_some() {
-            return Ok(false);
+        source: Arc<dyn CommittedFile>,
+        source_offset: u64,
+        length: u64,
+        through_sequence: u64,
+    ) -> Result<(), PosixError> {
+        assert!(length > 0, "ASSERT: external writes are nonempty");
+        let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
+        let source_end = source_offset
+            .checked_add(length)
+            .ok_or(PosixError::FileTooLarge)?;
+        if source_end > source.logical_size()
+            || source.allocated_bytes_in_range(source_offset, length)? != length
+        {
+            return Err(PosixError::Unsupported);
         }
-        let Some((&previous_start, previous)) = self.extents.range_mut(..offset).next_back() else {
-            return Ok(false);
-        };
-        let previous_length = u64::try_from(previous.len()).expect("ASSERT: usize must fit in u64");
-        let previous_end = previous_start
-            .checked_add(previous_length)
-            .expect("ASSERT: validated extent end must not overflow");
-        let combined = previous
-            .len()
-            .checked_add(data.len())
-            .ok_or(PosixError::OutOfMemory)?;
-        if previous_end != offset || combined > MAX_COALESCED_EXTENT_BYTES {
-            return Ok(false);
-        }
-        previous
-            .try_reserve(data.len())
-            .map_err(|_| PosixError::OutOfMemory)?;
-        previous.extend_from_slice(data);
+        self.remove_resident_overlaps(offset, end)?;
+        self.remove_external_overlaps(offset, end)?;
+        assert!(
+            self.external_extents
+                .insert(
+                    offset,
+                    ExternalDirtyData {
+                        source,
+                        source_offset,
+                        length,
+                        through_sequence,
+                    },
+                )
+                .is_none(),
+            "ASSERT: external write must replace every overlap"
+        );
         self.allocated_bytes = self
             .allocated_bytes
-            .checked_add(u64::try_from(data.len()).expect("ASSERT: usize must fit in u64"))
-            .expect("ASSERT: allocated extent bytes must not overflow");
+            .checked_add(length)
+            .expect("ASSERT: external allocation cannot overflow");
         self.logical_size = self.logical_size.max(end);
-        self.assert_valid_around(previous_start);
+        self.assert_valid_around(offset);
+        self.assert_valid_around(end);
         #[cfg(test)]
         self.audit_valid();
-        Ok(true)
+        Ok(())
     }
 
     fn truncate(&mut self, length: u64) -> Result<(), PosixError> {
@@ -822,7 +1052,7 @@ impl SparseData {
                     .checked_add(extent_length)
                     .expect("ASSERT: validated extent end must not overflow");
                 if end > length {
-                    Some((start, bytes.as_slice()))
+                    Some((start, bytes))
                 } else {
                     None
                 }
@@ -830,7 +1060,10 @@ impl SparseData {
         let crossing = if let Some((start, bytes)) = crossing {
             let keep = usize::try_from(length - start)
                 .expect("ASSERT: truncated extent must fit in usize");
-            Some((start, copy_bytes(&bytes[..keep])?))
+            Some((
+                start,
+                MutationPayload::try_copy_from_slice(&bytes.as_bytes()[..keep])?,
+            ))
         } else {
             None
         };
@@ -1046,10 +1279,10 @@ impl SparseData {
 
     fn assert_valid_around(&self, position: u64) {
         if let Some((&start, bytes)) = self.extents.range(..=position).next_back() {
-            self.assert_extent_valid(start, bytes);
+            self.assert_extent_valid(start, bytes.as_bytes());
         }
         if let Some((&start, bytes)) = self.extents.range(position..).next() {
-            self.assert_extent_valid(start, bytes);
+            self.assert_extent_valid(start, bytes.as_bytes());
         }
     }
 
@@ -1227,9 +1460,9 @@ fn external_overlapping_starts(
 
 fn plan_overlap(
     overlapping: &mut Vec<u64>,
-    fragments: &mut Vec<(u64, Vec<u8>)>,
+    fragments: &mut Vec<(u64, MutationPayload)>,
     extent_start: u64,
-    bytes: &[u8],
+    bytes: &MutationPayload,
     write_start: u64,
     write_end: u64,
 ) -> Result<(), PosixError> {
@@ -1244,12 +1477,18 @@ fn plan_overlap(
     if extent_start < write_start {
         let keep = usize::try_from(write_start - extent_start)
             .expect("ASSERT: left fragment must fit in usize");
-        fragments.push((extent_start, copy_bytes(&bytes[..keep])?));
+        fragments.push((
+            extent_start,
+            MutationPayload::try_copy_from_slice(&bytes.as_bytes()[..keep])?,
+        ));
     }
     if extent_end > write_end {
         let skip = usize::try_from(write_end - extent_start)
             .expect("ASSERT: right fragment must fit in usize");
-        fragments.push((write_end, copy_bytes(&bytes[skip..])?));
+        fragments.push((
+            write_end,
+            MutationPayload::try_copy_from_slice(&bytes.as_bytes()[skip..])?,
+        ));
     }
     Ok(())
 }
@@ -1265,6 +1504,7 @@ fn copy_bytes(source: &[u8]) -> Result<Vec<u8>, PosixError> {
 #[derive(Debug)]
 #[repr(align(64))]
 struct Inode {
+    observer_order: Mutex<()>,
     state: RwLock<InodeState>,
 }
 
@@ -1400,6 +1640,7 @@ impl Namespace {
         );
 
         let root = Arc::new(Inode {
+            observer_order: Mutex::new(()),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
                 mode: 0o755,
@@ -1490,6 +1731,7 @@ impl Namespace {
             "ASSERT: maximum name length must be nonzero"
         );
         let root = Arc::new(Inode {
+            observer_order: Mutex::new(()),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
                 mode: 0o755,
@@ -1511,6 +1753,7 @@ impl Namespace {
             }
             let inode = committed.inode;
             let object = Arc::new(Inode {
+                observer_order: Mutex::new(()),
                 state: RwLock::new(InodeState {
                     kind: FileKind::Regular,
                     mode: committed.mode,
@@ -1723,6 +1966,12 @@ impl Namespace {
     /// bytes, so a failed durable publication can retry without opening a
     /// second in-flight epoch.
     ///
+    /// Forming the cut briefly takes the mutation-admission write fence. This
+    /// waits for every already admitted mutation, including its acceleration
+    /// observer, without closing admission for the duration of persistence.
+    /// Consequently a Frozen Commit Cut can never overtake the corresponding
+    /// write-through staging operation.
+    ///
     /// # Errors
     ///
     /// Returns a bounded allocation or counter-exhaustion error. `Ok(None)`
@@ -1733,6 +1982,10 @@ impl Namespace {
     /// Panics when internal namespace reachability, link counts, or lock order
     /// disagree while the catalog is exclusively locked.
     pub fn begin_commit(&self) -> Result<Option<NamespaceCommit>, PosixError> {
+        let _mutation_fence = self
+            .mutations_admitted
+            .write()
+            .expect("ASSERT: mutation admission lock poisoned");
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         if let Some(inflight) = &catalog.inflight_commit {
             return Ok(Some(inflight.clone()));
@@ -1964,6 +2217,23 @@ impl Namespace {
                 handle,
                 length,
             } => self.set_length(inode, handle, length),
+            Operation::CloneRange {
+                source_inode,
+                source_handle,
+                source_offset,
+                target_inode,
+                target_handle,
+                target_offset,
+                length,
+            } => self.clone_range(
+                source_inode,
+                source_handle,
+                source_offset,
+                target_inode,
+                target_handle,
+                target_offset,
+                length,
+            ),
             Operation::Sync {
                 inode,
                 handle,
@@ -1971,6 +2241,13 @@ impl Namespace {
             } => self.sync(inode, handle),
             Operation::Release { inode, handle } => self.release(inode, handle),
             Operation::Unlink { parent, name } => self.unlink(parent, name),
+            Operation::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                no_replace,
+            } => self.rename(parent, name, new_parent, new_name, no_replace),
             Operation::ReadDirectory {
                 inode,
                 offset,
@@ -1981,6 +2258,27 @@ impl Namespace {
                 lookup_count,
             } => Ok(self.forget(inode, lookup_count)),
         }
+    }
+
+    /// Executes one write from an already owned immutable payload.
+    ///
+    /// FUSE uses this seam after moving potentially blocking observer-queue
+    /// admission onto its bounded blocking executor. The Dirty Extent Map and
+    /// mutation observer receive views of the same backing allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same handle, range, admission, allocation, and capacity
+    /// errors as [`Operation::Write`].
+    pub fn dispatch_owned_write(
+        &self,
+        _context: RequestContext,
+        inode: InodeId,
+        handle: HandleId,
+        offset: u64,
+        payload: MutationPayload,
+    ) -> Result<Reply, PosixError> {
+        self.write_payload(inode, handle, offset, payload)
     }
 
     fn lookup(&self, parent: InodeId, name: &[u8]) -> Result<Reply, PosixError> {
@@ -2131,19 +2429,34 @@ impl Namespace {
         requested_offset: u64,
         data: &[u8],
     ) -> Result<Reply, PosixError> {
+        let payload = MutationPayload::try_copy_from_slice(data)?;
+        self.write_payload(inode, handle, requested_offset, payload)
+    }
+
+    fn write_payload(
+        &self,
+        inode: InodeId,
+        handle: HandleId,
+        requested_offset: u64,
+        payload: MutationPayload,
+    ) -> Result<Reply, PosixError> {
         let _admission = self.require_mutation_admission()?;
-        let written = u32::try_from(data.len()).map_err(|_| PosixError::FileTooLarge)?;
+        let written = u32::try_from(payload.len()).map_err(|_| PosixError::FileTooLarge)?;
         let (object, open) = self.resolve_open_file(inode, handle)?;
         if open.options.access == AccessMode::ReadOnly {
             return Err(PosixError::BadHandle);
         }
+        let observer_order = object
+            .observer_order
+            .lock()
+            .expect("ASSERT: inode observer-order lock poisoned");
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
         assert_eq!(
             state.kind,
             FileKind::Regular,
             "ASSERT: a file handle must reference a regular inode"
         );
-        if data.is_empty() {
+        if payload.is_empty() {
             return Ok(Reply::Written {
                 bytes: 0,
                 mutation_sequence: state.mutation_sequence,
@@ -2154,7 +2467,7 @@ impl Namespace {
         } else {
             requested_offset
         };
-        let data_length = u64::try_from(data.len()).expect("ASSERT: usize must fit in u64");
+        let data_length = u64::try_from(payload.len()).expect("ASSERT: usize must fit in u64");
         let end = offset
             .checked_add(data_length)
             .ok_or(PosixError::FileTooLarge)?;
@@ -2163,28 +2476,30 @@ impl Namespace {
         }
         let next_sequence = state
             .mutation_sequence
-            .checked_add(u64::from(!data.is_empty()))
+            .checked_add(u64::from(!payload.is_empty()))
             .ok_or(PosixError::NoSpace)?;
 
         let dirty_before = state.data.active_resident_payload_bytes();
-        state.data.write(offset, data, next_sequence)?;
+        state
+            .data
+            .write_payload(offset, payload.clone(), next_sequence)?;
         let dirty_after = state.data.active_resident_payload_bytes();
         if state.link_count > 0 {
             self.dirty_payload.replace(dirty_before, dirty_after);
         }
         state.mutation_sequence = next_sequence;
-
         drop(state);
-        if let Some(observer) = self
+        let externalized = self
             .mutation_observer
             .read()
             .expect("ASSERT: mutation observer lock poisoned")
             .as_ref()
             .cloned()
-        {
-            let externalized = observer.accepted_write(inode, offset, next_sequence, data);
-            self.externalize_dirty_extents(externalized);
-        }
+            .map_or_else(Vec::new, |observer| {
+                observer.accepted_write(inode, offset, next_sequence, payload)
+            });
+        drop(observer_order);
+        self.externalize_verified_extents(externalized);
 
         Ok(Reply::Written {
             bytes: written,
@@ -2192,7 +2507,18 @@ impl Namespace {
         })
     }
 
-    fn externalize_dirty_extents(&self, extents: Vec<ExternalizedExtent>) {
+    /// Replaces matching resident dirty ranges with independently verified
+    /// immutable sources while retaining the byte-exact fallback on rejection.
+    ///
+    /// This acceleration interface does not change mutation order, commit
+    /// membership, or visibility. Sources that do not match either the Active
+    /// Dirty Epoch or the one Frozen Commit Cut are ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an inode lock is poisoned, which marks an impossible internal
+    /// synchronization failure.
+    pub fn externalize_verified_extents(&self, extents: Vec<ExternalizedExtent>) {
         let mut by_inode = BTreeMap::<InodeId, Vec<(u64, u64, Arc<dyn CommittedFile>)>>::new();
         for extent in extents {
             by_inode.entry(extent.inode).or_default().push((
@@ -2217,6 +2543,18 @@ impl Namespace {
         }
     }
 
+    fn observe_truncate(&self, inode: InodeId, mutation_sequence: u64, length: u64) {
+        if let Some(observer) = self
+            .mutation_observer
+            .read()
+            .expect("ASSERT: mutation observer lock poisoned")
+            .as_ref()
+            .cloned()
+        {
+            observer.accepted_truncate(inode, mutation_sequence, length);
+        }
+    }
+
     fn set_length(
         &self,
         inode: InodeId,
@@ -2237,6 +2575,10 @@ impl Namespace {
             }
             None => self.resolve_inode(inode)?,
         };
+        let observer_order = object
+            .observer_order
+            .lock()
+            .expect("ASSERT: inode observer-order lock poisoned");
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
         if state.kind == FileKind::Directory {
             return Err(PosixError::IsDirectory);
@@ -2257,6 +2599,121 @@ impl Namespace {
         state.mutation_sequence = next_sequence;
         let attr = state.attributes(inode);
         drop(state);
+        self.observe_truncate(inode, next_sequence, length);
+        drop(observer_order);
+        Ok(Reply::Attr(attr))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn clone_range(
+        &self,
+        source_inode: InodeId,
+        source_handle: HandleId,
+        source_offset: u64,
+        target_inode: InodeId,
+        target_handle: HandleId,
+        target_offset: u64,
+        length: u64,
+    ) -> Result<Reply, PosixError> {
+        let _admission = self.require_mutation_admission()?;
+        let (source_object, source_open) = self.resolve_open_file(source_inode, source_handle)?;
+        let (target_object, target_open) = self.resolve_open_file(target_inode, target_handle)?;
+        if source_open.options.access == AccessMode::WriteOnly
+            || target_open.options.access == AccessMode::ReadOnly
+        {
+            return Err(PosixError::BadHandle);
+        }
+        let source_end = source_offset
+            .checked_add(length)
+            .ok_or(PosixError::FileTooLarge)?;
+        let target_end = target_offset
+            .checked_add(length)
+            .ok_or(PosixError::FileTooLarge)?;
+        if target_end > self.config.maximum_file_bytes {
+            return Err(PosixError::FileTooLarge);
+        }
+        if source_inode == target_inode
+            && source_offset < target_end
+            && target_offset < source_end
+            && length != 0
+        {
+            return Err(PosixError::Unsupported);
+        }
+        if length == 0 {
+            let target = target_object
+                .state
+                .read()
+                .expect("ASSERT: target inode lock poisoned");
+            return Ok(Reply::Cloned {
+                bytes: 0,
+                mutation_sequence: target.mutation_sequence,
+            });
+        }
+
+        let source = {
+            let state = source_object
+                .state
+                .read()
+                .expect("ASSERT: source inode lock poisoned");
+            if state.kind != FileKind::Regular || source_end > state.data.logical_size() {
+                return Err(PosixError::InvalidArgument);
+            }
+            let source = state.data.stable_clone_source()?;
+            let Some(prepared) = source.prepared_clone_extents(source_offset, length)? else {
+                return Err(PosixError::Unsupported);
+            };
+            verify_prepared_clone_partition(&prepared, source_offset, length)?;
+            source
+        };
+
+        let observer_order = target_object
+            .observer_order
+            .lock()
+            .expect("ASSERT: target observer-order lock poisoned");
+        let mut target = target_object
+            .state
+            .write()
+            .expect("ASSERT: target inode lock poisoned");
+        assert_eq!(
+            target.kind,
+            FileKind::Regular,
+            "ASSERT: a file handle must reference a regular inode"
+        );
+        let next_sequence = target
+            .mutation_sequence
+            .checked_add(1)
+            .ok_or(PosixError::NoSpace)?;
+        let dirty_before = target.data.active_resident_payload_bytes();
+        target
+            .data
+            .clone_range(target_offset, source, source_offset, length, next_sequence)?;
+        let dirty_after = target.data.active_resident_payload_bytes();
+        assert_eq!(
+            dirty_before, dirty_after,
+            "ASSERT: a metadata clone must not allocate resident dirty payload"
+        );
+        target.mutation_sequence = next_sequence;
+        let target_size = target.data.logical_size();
+        drop(target);
+        self.observe_truncate(target_inode, next_sequence, target_size);
+        drop(observer_order);
+        Ok(Reply::Cloned {
+            bytes: length,
+            mutation_sequence: next_sequence,
+        })
+    }
+
+    fn sync(&self, inode: InodeId, handle: HandleId) -> Result<Reply, PosixError> {
+        let (object, _) = self.resolve_open_file(inode, handle)?;
+        let observer_order = object
+            .observer_order
+            .lock()
+            .expect("ASSERT: inode observer-order lock poisoned");
+        let mutation_sequence = object
+            .state
+            .read()
+            .expect("ASSERT: inode lock poisoned")
+            .mutation_sequence;
         if let Some(observer) = self
             .mutation_observer
             .read()
@@ -2264,17 +2721,33 @@ impl Namespace {
             .as_ref()
             .cloned()
         {
-            observer.accepted_truncate(inode, next_sequence, length);
+            observer.wait_through(inode, mutation_sequence);
         }
-        Ok(Reply::Attr(attr))
-    }
-
-    fn sync(&self, inode: InodeId, handle: HandleId) -> Result<Reply, PosixError> {
-        let _ = self.resolve_open_file(inode, handle)?;
+        drop(observer_order);
         Ok(Reply::Empty)
     }
 
     fn release(&self, inode: InodeId, handle: HandleId) -> Result<Reply, PosixError> {
+        let (object, _) = self.resolve_open_file(inode, handle)?;
+        let observer_order = object
+            .observer_order
+            .lock()
+            .expect("ASSERT: inode observer-order lock poisoned");
+        let mutation_sequence = object
+            .state
+            .read()
+            .expect("ASSERT: inode lock poisoned")
+            .mutation_sequence;
+        if let Some(observer) = self
+            .mutation_observer
+            .read()
+            .expect("ASSERT: mutation observer lock poisoned")
+            .as_ref()
+            .cloned()
+        {
+            observer.wait_through(inode, mutation_sequence);
+        }
+        drop(observer_order);
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         let open = *catalog.handles.get(&handle).ok_or(PosixError::BadHandle)?;
         if open.inode != inode {
@@ -2318,6 +2791,10 @@ impl Namespace {
             .get(&inode)
             .cloned()
             .expect("ASSERT: directory entry must reference a live inode");
+        let observer_order = object
+            .observer_order
+            .lock()
+            .expect("ASSERT: inode observer-order lock poisoned");
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
         if state.kind == FileKind::Directory {
             return Err(PosixError::IsDirectory);
@@ -2353,6 +2830,113 @@ impl Namespace {
                 "ASSERT: unlinked inode disappeared early"
             );
         }
+        drop(catalog);
+        self.observe_truncate(inode, next_sequence, 0);
+        drop(observer_order);
+        Ok(Reply::Empty)
+    }
+
+    fn rename(
+        &self,
+        parent: InodeId,
+        name: &[u8],
+        new_parent: InodeId,
+        new_name: &[u8],
+        no_replace: bool,
+    ) -> Result<Reply, PosixError> {
+        self.validate_name(name)?;
+        self.validate_name(new_name)?;
+        let _admission = self.require_mutation_admission()?;
+        let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        validate_directory(&catalog, parent)?;
+        validate_directory(&catalog, new_parent)?;
+        let old_key = (parent, name.to_vec());
+        let new_key = (new_parent, new_name.to_vec());
+        let source_inode = *catalog.entries.get(&old_key).ok_or(PosixError::NoEntry)?;
+        if old_key == new_key {
+            return Ok(Reply::Empty);
+        }
+        let replaced_inode = catalog.entries.get(&new_key).copied();
+        if no_replace && replaced_inode.is_some() {
+            return Err(PosixError::Exists);
+        }
+        if replaced_inode == Some(source_inode) {
+            return Ok(Reply::Empty);
+        }
+        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
+        let target_object = replaced_inode.map(|target_inode| {
+            catalog
+                .inodes
+                .get(&target_inode)
+                .cloned()
+                .expect("ASSERT: target name must reference a live inode")
+        });
+        let target_observer_order = target_object.as_ref().map(|target_object| {
+            target_object
+                .observer_order
+                .lock()
+                .expect("ASSERT: target observer-order lock poisoned")
+        });
+        let mut target_sequence = None;
+        if let (Some(target_inode), Some(target_object)) = (replaced_inode, &target_object) {
+            let mut target = target_object
+                .state
+                .write()
+                .expect("ASSERT: target inode lock poisoned");
+            if target.kind == FileKind::Directory {
+                return Err(PosixError::IsDirectory);
+            }
+            assert_eq!(
+                target.link_count, 1,
+                "ASSERT: first slice has exactly one name per regular inode"
+            );
+            let next_sequence = target
+                .mutation_sequence
+                .checked_add(1)
+                .ok_or(PosixError::NoSpace)?;
+            let dirty_before = target.data.active_resident_payload_bytes();
+            target.data.advance_mutation_sequence(next_sequence);
+            target.link_count = 0;
+            target.mutation_sequence = next_sequence;
+            self.dirty_payload.replace(dirty_before, 0);
+            target_sequence = Some((target_inode, next_sequence));
+        }
+        let removed = catalog.entries.remove(&old_key);
+        assert_eq!(
+            removed,
+            Some(source_inode),
+            "ASSERT: validated rename source disappeared"
+        );
+        let previous = catalog.entries.insert(new_key, source_inode);
+        assert_eq!(
+            previous, replaced_inode,
+            "ASSERT: rename target changed under the catalog write lock"
+        );
+        install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        if let Some(target_inode) = replaced_inode {
+            let has_lookup = catalog
+                .lookup_counts
+                .get(&target_inode)
+                .copied()
+                .unwrap_or(0)
+                != 0;
+            let has_handle = catalog
+                .handles
+                .values()
+                .any(|candidate| candidate.inode == target_inode);
+            if !has_lookup && !has_handle {
+                let removed = catalog.inodes.remove(&target_inode);
+                assert!(
+                    removed.is_some(),
+                    "ASSERT: replaced unpinned inode must remain live until rename"
+                );
+            }
+        }
+        drop(catalog);
+        if let Some((target_inode, next_sequence)) = target_sequence {
+            self.observe_truncate(target_inode, next_sequence, 0);
+        }
+        drop(target_observer_order);
         Ok(Reply::Empty)
     }
 
@@ -2573,6 +3157,28 @@ fn install_root_mutation_sequence(catalog: &Catalog, sequence: u64) {
     state.mutation_sequence = sequence;
 }
 
+fn verify_prepared_clone_partition(
+    extents: &[PreparedCommitExtent],
+    offset: u64,
+    length: u64,
+) -> Result<(), PosixError> {
+    let expected_end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
+    let mut cursor = offset;
+    for extent in extents {
+        if extent.offset() != cursor || extent.length() == 0 {
+            return Err(PosixError::Io);
+        }
+        cursor = cursor.checked_add(extent.length()).ok_or(PosixError::Io)?;
+        if cursor > expected_end {
+            return Err(PosixError::Io);
+        }
+    }
+    if cursor != expected_end {
+        return Err(PosixError::Unsupported);
+    }
+    Ok(())
+}
+
 fn assert_commit_reachability(inodes: &[CommitInode], entries: &[CommitEntry]) {
     let mut observed_links = BTreeMap::<InodeId, u32>::new();
     for entry in entries {
@@ -2611,6 +3217,10 @@ fn open_existing_for_create(
         .get(&inode)
         .cloned()
         .expect("ASSERT: directory entry must reference a live inode");
+    let observer_order = object
+        .observer_order
+        .lock()
+        .expect("ASSERT: inode observer-order lock poisoned");
     let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
     if state.kind == FileKind::Directory {
         return Err(PosixError::IsDirectory);
@@ -2654,6 +3264,7 @@ fn open_existing_for_create(
     {
         observer.accepted_truncate(inode, sequence, 0);
     }
+    drop(observer_order);
     assert!(
         catalog
             .handles
@@ -2683,6 +3294,7 @@ fn create_new_file(
     let inode = allocate_inode(catalog)?;
     let handle = allocate_handle(catalog)?;
     let object = Arc::new(Inode {
+        observer_order: Mutex::new(()),
         state: RwLock::new(InodeState {
             kind: FileKind::Regular,
             mode: request.mode & 0o7777,
@@ -2781,7 +3393,7 @@ fn acquire_lookup(catalog: &mut Catalog, inode: InodeId, count: u64) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{Inode, MAX_COALESCED_EXTENT_BYTES, SparseData};
+    use super::{Inode, MutationPayload, SparseData};
 
     #[test]
     fn inode_sequencers_start_on_separate_cache_lines() {
@@ -2789,18 +3401,19 @@ mod tests {
     }
 
     #[test]
-    fn sequential_writes_coalesce_into_bounded_extents() {
+    fn sequential_shared_payload_extents_remain_byte_exact() {
         let mut data = SparseData::default();
         let block = vec![0x5a; 1_024 * 1_024];
 
         for index in 0_u64..20 {
-            data.write(index * 1_024 * 1_024, &block)
-                .expect("sequential write must succeed");
+            data.write(
+                index * 1_024 * 1_024,
+                MutationPayload::try_copy_from_slice(&block).expect("allocate fixture payload"),
+            )
+            .expect("sequential write must succeed");
         }
 
-        assert_eq!(data.extents.len(), 2);
-        assert_eq!(data.extents[&0].len(), MAX_COALESCED_EXTENT_BYTES);
-        assert_eq!(data.extents[&(16 * 1_024 * 1_024)].len(), 4 * 1_024 * 1_024);
+        assert_eq!(data.extents.len(), 20);
         assert_eq!(data.allocated_bytes(), 20 * 1_024 * 1_024);
         assert_eq!(
             data.read(1, 0).expect("zero-length read must succeed"),
@@ -2812,5 +3425,38 @@ mod tests {
             vec![0x5a; 16]
         );
         data.audit_valid();
+    }
+
+    #[test]
+    fn mutation_payload_clones_and_prefix_slices_share_the_owned_bytes() {
+        let payload = MutationPayload::try_copy_from_slice(b"shared-payload")
+            .expect("allocate fixture payload");
+        let clone = payload.clone();
+        let prefix = payload
+            .checked_slice(0, 6)
+            .expect("prefix lies inside fixture payload");
+
+        assert!(payload.starts_at_same_address(&clone));
+        assert!(payload.starts_at_same_address(&prefix));
+        assert_eq!(prefix.as_bytes(), b"shared");
+    }
+
+    #[test]
+    fn partial_overwrite_does_not_retain_the_large_obsolete_backing() {
+        let mut data = SparseData::default();
+        let original = MutationPayload::try_copy_from_slice(&vec![0x41; 1_024 * 1_024])
+            .expect("allocate original fixture payload");
+        data.write(0, original.clone())
+            .expect("install original fixture payload");
+        data.write(
+            1,
+            MutationPayload::try_copy_from_slice(&vec![0x42; 1_024 * 1_024 - 2])
+                .expect("allocate overwrite fixture payload"),
+        )
+        .expect("partially overwrite fixture payload");
+
+        assert_eq!(data.extents[&0].as_bytes(), b"A");
+        assert_eq!(data.extents[&(1_024 * 1_024 - 1)].as_bytes(), b"A");
+        assert!(original.is_uniquely_owned());
     }
 }

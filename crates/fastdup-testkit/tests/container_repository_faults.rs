@@ -130,7 +130,6 @@ fn exact_length_is_finalized_before_verification_and_durability() {
             StorageOperation::WriteAt,
             StorageOperation::WriteAt,
             StorageOperation::WriteAt,
-            StorageOperation::WriteAt,
             StorageOperation::SetLen,
             StorageOperation::Read,
             StorageOperation::SyncFile,

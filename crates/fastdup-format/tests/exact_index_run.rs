@@ -2,7 +2,7 @@ use fastdup_format::{
     ChunkId, ContainerId, EXACT_INDEX_ENTRY_BYTES, EXACT_INDEX_HEADER_BYTES,
     EXACT_INDEX_PAGE_BYTES, ExactIndexEntry, ExactIndexFormatError, ExactIndexLocation,
     ExactIndexPagePosition, ExactIndexProfileId, ExactIndexRun, ExactIndexRunDescriptor,
-    MAX_CONTAINER_BYTES, SealedContainer,
+    ExactIndexRunStreamEncoder, MAX_CONTAINER_BYTES, SealedContainer,
 };
 
 fn entry(ordinal: u8, logical_length: u32) -> ExactIndexEntry {
@@ -60,6 +60,72 @@ fn exact_index_run_has_stable_pages_and_canonical_round_trip() {
     assert_eq!(run.entries()[0].chunk_id(), ChunkId::from_bytes([0; 32]));
     assert_eq!(run.entries()[31].chunk_id(), ChunkId::from_bytes([31; 32]));
     assert_eq!(ExactIndexRun::decode(&encoded), Ok(run));
+}
+
+#[test]
+fn streaming_writer_is_byte_identical_to_the_canonical_full_run_writer() {
+    let run = worked_run();
+    let expected = run.encode().expect("canonical full Run encodes");
+    let mut encoder = ExactIndexRunStreamEncoder::new(
+        run.profile(),
+        run.generation(),
+        run.entries().len(),
+        run.entries()
+            .first()
+            .expect("worked Run is nonempty")
+            .chunk_id(),
+        run.entries()
+            .last()
+            .expect("worked Run is nonempty")
+            .chunk_id(),
+    )
+    .expect("streaming geometry is valid");
+    let mut observed = Vec::new();
+    observed.extend_from_slice(encoder.header());
+    for entries in run.entries().chunks(31) {
+        observed.extend_from_slice(
+            &encoder
+                .encode_next_page(entries)
+                .expect("canonical page streams"),
+        );
+    }
+    let (footer, descriptor) = encoder.finish().expect("streamed Run finishes");
+    observed.extend_from_slice(&footer);
+
+    assert_eq!(observed, expected);
+    assert_eq!(descriptor.entry_count(), run.entries().len());
+    assert_eq!(descriptor.run_hash(), {
+        let footer_offset = expected.len() - EXACT_INDEX_PAGE_BYTES;
+        ExactIndexRunDescriptor::decode(
+            &expected[..EXACT_INDEX_HEADER_BYTES],
+            &expected[footer_offset..],
+            u64::try_from(expected.len()).expect("worked length fits u64"),
+        )
+        .expect("canonical envelope verifies")
+        .run_hash()
+    });
+}
+
+#[test]
+fn streaming_writer_rejects_a_merge_summary_that_disagrees_with_emitted_bounds() {
+    let run = worked_run();
+    let mut encoder = ExactIndexRunStreamEncoder::new(
+        run.profile(),
+        run.generation(),
+        run.entries().len(),
+        ChunkId::from_bytes([1; 32]),
+        run.entries()
+            .last()
+            .expect("worked Run is nonempty")
+            .chunk_id(),
+    )
+    .expect("the declared geometry is structurally representable");
+
+    assert_eq!(
+        encoder.encode_next_page(&run.entries()[..31]),
+        Err(ExactIndexFormatError::InvalidPage),
+        "the streaming writer must pair first-pass key bounds with second-pass entries"
+    );
 }
 
 #[test]

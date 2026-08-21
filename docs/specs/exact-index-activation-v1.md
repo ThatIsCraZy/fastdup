@@ -1,11 +1,10 @@
-# Exact Index Activation WAL v1
+# Exact Index Activation Log v1
 
-Status: draft, pre-stable format; canonical record writer/reader, Run Set
-publication, activation, bounded lookup, recovery, and fail-before/fail-after
-crash matrices are implemented, including replacement activation after bounded
-Run compaction.
+Status: draft, pre-stable format; canonical record writer/reader, paired-slot
+rotation, legacy migration, Run Set publication, bounded lookup, recovery,
+offline audit, and fail-before/fail-after crash matrices are implemented.
 
-This WAL selects exactly one immutable
+This log selects exactly one immutable
 [Exact Index Run Set v1](exact-index-run-set-v1.md). It is acceleration state,
 not content or Namespace authority. Losing or rejecting the complete Exact
 Index graph may reduce ingest performance, but cannot make a committed
@@ -14,27 +13,38 @@ Manifest disappear and never authorizes Container deletion.
 This format follows
 [ADR 0015](../adr/0015-keep-exact-dedup-correct-without-index-authority.md),
 [ADR 0023](../adr/0023-rebuild-indexes-as-new-generations.md), and
-[ADR 0035](../adr/0035-build-the-exact-index-from-immutable-sorted-runs.md).
+[ADR 0035](../adr/0035-build-the-exact-index-from-immutable-sorted-runs.md),
+with lifetime rotation defined by
+[ADR 0044](../adr/0044-rotate-the-exact-index-activation-log-through-paired-slots.md).
 All integers are little-endian. Every reserved byte is zero and rejected when
 nonzero. Rust layout is never serialized.
 
-## File and record geometry
+## Slot and record geometry
 
-The canonical WAL name inside the Exact Index storage root is
-`exact-index.activation.wal`. It is an append-only sequence of complete 4-KiB
-records with no file header:
+The canonical slot names inside the Exact Index storage root are
+`exact-index.activation.wal` and `exact-index.activation.1.wal`. Both are
+created, file-synchronized, and made directory-durable before the first
+Activation Record. Each ordinary slot is a sequence of at most 64 complete
+4-KiB records with no file header:
 
 ```text
-[Activation Record generation 1]
-[Activation Record generation 2]
+[first retained Activation Record, possibly a bridge]
+[successor Activation Record]
 ...
 ```
 
-Version 1 bounds the WAL at 64 MiB, or exactly 16,384 records. A writer must
-reject an activation that would cross that bound before performing the append;
-it must never acknowledge a WAL that recovery will reject. Rotation or a
-checkpointed successor WAL is a later format and protocol change. Reaching the
-bound disables new index activations, not Namespace commits.
+The first record in a slot may be generation 1 with a zero predecessor hash, or
+a bridge copied byte-for-byte from the previously selected slot's last record.
+An ordinary slot is at most 262,144 bytes. For migration only, the first slot
+may contain the former single-file v1 chain up to 64 MiB (16,384 records). The
+first subsequent activation rotates from that legacy chain into the bounded
+second slot; subsequent reuse makes both files ordinary bounded slots.
+
+Two nonempty slots form one valid topology only when the first record of the
+newer slot is byte-identical to the final record of the older slot. Equal final
+generations require byte-identical final records. A longer valid prefix is
+selected when those final records agree; equal-length prefixes must be wholly
+byte-identical. Missing overlap or divergent bytes are corruption.
 
 ## Activation Record
 
@@ -54,7 +64,7 @@ Each record is exactly 4,096 bytes:
 | 48 | 32 | `previous_record_hash` | zero only for generation 1; otherwise BLAKE3-256 of the complete preceding encoded record |
 | 80 | 32 | `run_set_id` | nonzero content ID of the exact Metadata-object bytes |
 | 112 | 32 | `index_profile_id` | nonzero and equal to the selected Run Set and every Run |
-| 144 | 8 | `run_set_generation` | nonzero and strictly increasing in the WAL |
+| 144 | 8 | `run_set_generation` | nonzero and strictly increasing in the log |
 | 152 | 4 | `record_crc32c` | CRC32C over the complete record with this field zero |
 | 156 | 3,940 | reserved | zero |
 
@@ -76,34 +86,43 @@ To activate Run Set generation `N`, the writer must:
 2. encode the canonical content-addressed Run Set, reread it through the
    production parser, synchronize it, publish with no-replace rename, and
    synchronize the index directory;
-3. create and durably publish the empty WAL if it does not exist;
-4. validate the complete existing activation chain and require a clean record
-   boundary, contiguous activation generations, and increasing Run Set
-   generations;
-5. preflight that the next complete record remains within 64 MiB;
-6. append one record, reread the exact 4-KiB range, compare the bytes and parsed
-   fields, and then synchronize the WAL.
+3. create, synchronize, and make both empty slot names directory-durable when
+   they do not yet exist;
+4. validate both slot-local chains and select one unique overlapping current
+   prefix with a clean tail;
+5. if fewer than 64 records are selected, append the successor to that slot;
+6. otherwise truncate only the inactive slot, write the selected final record
+   as a bridge followed by the successor, and set its exact length to 8 KiB;
+7. reread the complete target slot, validate its chain and exact intended
+   bytes, then synchronize that slot.
 
-The WAL synchronization in step 6 is the only activation commit point and the
-last fallible storage operation before success is returned. Retrying the exact
-already-active Run Set rereads its dependencies and synchronizes the WAL again;
-it does not append another record.
+The target-slot synchronization in step 7 is the only activation and rotation
+commit point and the last fallible storage operation before success is
+returned. Both names were made directory-durable before any record mutation.
+Retrying the exact already-active Run Set rereads its dependencies and
+synchronizes the selected slot again; it does not append another record.
 
 ## Recovery and lookup
 
-Recovery ignores a trailing incomplete record below the physical WAL bound.
-It rejects an invalid complete record, broken hash link, noncontiguous
-activation generation, non-increasing Run Set generation, or oversized WAL; it
-does not silently select an older index generation. This disables the index,
-not the Namespace.
+Recovery reads no more than the two bounded slots after migration. It validates
+each local chain and their cross-slot overlap before selecting the newest final
+record. A trailing incomplete record is ignored for recovery, but a nonempty
+slot without one valid record, an invalid complete record, broken hash link,
+noncontiguous activation generation, non-increasing Run Set generation,
+oversized ordinary slot, or divergent topology disables the index. It does not
+silently select an unrelated older index generation and never affects Namespace
+recovery.
 
 For the newest complete record, recovery loads the exact content-addressed Run
 Set, pairs its profile, ID, and generation with the record, then fully audits
-every pinned Run before exposing the active reader. Version 1 permits at most
-64 active Runs.
+every pinned Run before exposing the active reader. The active set permits at
+most 64 logical Run families; a complete family may contain multiple
+key-disjoint physical Runs as defined by
+[ADR 0045](../adr/0045-partition-exact-index-compaction-into-run-families.md).
 
-Lookup visits Runs newest-generation-first, skips key-disjoint Runs using
-verified minimum/maximum Chunk IDs, validates every touched 4-KiB page, and
+Lookup visits families newest-generation-first, selects at most one partition
+per family from verified minimum/maximum Chunk IDs, validates every touched
+4-KiB page, and
 returns at most 64 Location transitions. `complete=false` means the bounded
 candidate prefix truncated possible transitions. `complete=true` is complete
 only for this activated Run Set; a negative Exact Index result is never proof
@@ -133,16 +152,18 @@ successor would approach the 64-Run reader bound. Compacted Runs and the new Run
 Set are immutable RoW objects. A deterministic fail-before/fail-after matrix
 over source audit, output publication, and replacement activation observes only
 the prior active Run Set or the complete replacement; no mixed dependency graph
-is recoverable.
+is recoverable. The same matrix now covers an inactive-slot rewrite at the
+rotation boundary. An explicit offline audit repeats slot selection and fully
+audits the selected dependency graph.
 
 ## ASSERT, VERIFY, and AUDIT pairing
 
 | Invariant | Writer | Reader/recovery | Offline scrub/rebuild |
 | --- | --- | --- | --- |
-| activation selects only durable dependencies | full-audit Runs; sync Run Set and directory before append | pair record, Run Set, and every Run descriptor | traverse and hash every referenced object |
-| committed activation is one atomic cut | reread record; final WAL sync is commit point | accept only the contiguous durable prefix | fail before and after every storage operation; observe old or complete new set |
-| chain and bounds are exact | checked generation/hash/length arithmetic before append | validate every complete record and reject WAL over 64 MiB | exhaustive record prefix and byte-mutation tests |
-| lookup work is bounded | cap active Runs and format candidate fanout | range-read only touched pages; cap result at 64 | exercise hot keys spanning pages and Runs |
+| activation selects only durable dependencies | full-audit Runs; sync Run Set and directory before append | pair record, Run Set, and every Run descriptor | traverse and hash every selected object |
+| committed activation is one atomic cut | reread exact target slot; final slot sync is commit point | accept only one contiguous overlapping durable prefix | fail before and after every rotation operation; observe old or complete new set |
+| chain and bounds are exact | checked generation/hash/length arithmetic; rotate at 64 records | validate both complete local chains, bridge equality, and bounded lengths | reject corruption in either selected or inactive peer through `audit_activation_log` |
+| lookup work is bounded | cap active families and format candidate fanout | range-read at most one partition per family; cap result at 64 | exercise hot keys spanning pages and partitioned families |
 | index is nonauthoritative | never couple Namespace commit to index success | disable corrupt index; preserve Namespace recovery | discard and rebuild the complete index graph |
 
 Poisoned writer locks or contradictions in already verified fixed geometry are

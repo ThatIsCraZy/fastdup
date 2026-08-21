@@ -2,30 +2,46 @@
 
 //! Durable container lifecycle behind an injectable storage boundary.
 
+mod container_descriptor_cache;
+mod exact_activation_log;
 mod exact_index_repository;
 mod generation;
 mod generation_log;
 mod manifest_reader;
 mod manifest_tree;
-pub use manifest_tree::ManifestRangeExtent;
+pub use manifest_tree::{ManifestRangeExtent, ManifestTreeSummary};
+mod maintenance;
+mod read_cache;
 mod reduction;
 mod reduction_codec;
 mod reduction_dictionary;
 mod reduction_filter;
 mod reduction_similarity;
 
+pub use container_descriptor_cache::ContainerDescriptorCacheStatus;
 pub use exact_index_repository::{
-    ActivatedExactIndex, ExactIndexLookup, ExactIndexRunReader, ExactIndexRunRepository,
-    ExactIndexStoreError, MAX_ACTIVE_EXACT_INDEX_RUNS, MAX_EXACT_COMPACTION_ENTRIES,
-    MAX_EXACT_LOOKUP_CANDIDATES,
+    ActivatedExactIndex, EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES, ExactIndexLocationAudit,
+    ExactIndexLookup, ExactIndexPageCacheStatus, ExactIndexRunFamily, ExactIndexRunReader,
+    ExactIndexRunRepository, ExactIndexStoreError, ExactRunMembershipStatus,
+    MAX_ACTIVE_EXACT_INDEX_FAMILIES, MAX_ACTIVE_EXACT_INDEX_RUNS, MAX_EXACT_LOOKUP_CANDIDATES,
 };
 pub use generation::{
-    CommittedDataGeneration, GenerationError, GenerationRepository, IndexedRequiredChunkVerifier,
-    RecoveredDataGeneration, RecoveredGeneration, RequiredChunkVerifier, VerifiedCommittedFile,
+    CommittedDataGeneration, GenerationError, GenerationRepository, GenerationScrubSummary,
+    IndexedRequiredChunkVerifier, ManifestSuccessorProof, RecoveredDataGeneration,
+    RecoveredGeneration, RequiredChunkVerifier, SuccessorPredecessor, VerifiedCommittedFile,
     WalTail,
+};
+pub use maintenance::{
+    BackgroundMaintenanceJob, BackgroundMaintenanceReport, DataPoolUsage, DataPoolUsageError,
+    EndToEndScrubReport, ExactIndexRebuildReport, GarbageCollectionPlan, GarbageCollectionReport,
+    MaintenanceError, MaintenancePriority, MaintenanceRepository,
 };
 pub use manifest_reader::{MAX_MANIFEST_READ_BYTES, ManifestReadError, VerifiedManifestFile};
 pub use manifest_tree::ManifestTreeError;
+pub use read_cache::{
+    MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig, VerifiedReadCacheError,
+    VerifiedReadCacheStatus,
+};
 pub use reduction::{
     ReducedObject, ReductionAuditReport, ReductionEngine, ReductionError, ReductionFeatures,
     ReductionPolicy, ReductionReport, ReductionRuntime,
@@ -43,6 +59,7 @@ use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fastdup_format::{
@@ -50,9 +67,11 @@ use fastdup_format::{
     ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, MAX_CONTAINER_BYTES,
     SealedContainer, SealedContainerDescriptor,
 };
+use rayon::prelude::*;
 
 /// Hard allocation bound for one exact random read through [`StorageIo`].
 pub const MAX_STORAGE_RANGE_BYTES: usize = 1_024 * 1_024;
+const MAINTENANCE_VERIFY_WINDOW_BYTES: u64 = 256 * 1_024 * 1_024;
 
 /// Process-cost and byte-accounting evidence for one adaptive Container
 /// publication.
@@ -70,6 +89,20 @@ pub struct AdaptiveContainerPublishMetrics {
     logical_bytes: u64,
     raw_records: usize,
     zstd_records: usize,
+}
+
+/// Opaque encoded Container image awaiting ordered durable publication.
+///
+/// Construction performs the CPU-heavy adaptive region encoding. Publication
+/// consumes this proof and still rereads the complete object before returning
+/// verified Locations.
+#[derive(Clone, Debug)]
+pub struct PreparedAdaptiveContainer {
+    container_id: ContainerId,
+    container_generation: u64,
+    sealed: Vec<u8>,
+    encode_wall: Duration,
+    encode_process_cpu: Duration,
 }
 
 impl AdaptiveContainerPublishMetrics {
@@ -221,6 +254,51 @@ pub struct PublishedContainerSummary {
     file_length: u64,
 }
 
+/// Aggregate evidence from a bounded parallel, canonically reduced audit.
+///
+/// No decoded payload or per-Chunk map is retained in this report.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContainerAuditSummary {
+    containers: u64,
+    chunks: u64,
+    raw_records: u64,
+    zstd_records: u64,
+    file_bytes: u64,
+    generation_high_water: Option<u64>,
+}
+
+impl ContainerAuditSummary {
+    #[must_use]
+    pub const fn containers(self) -> u64 {
+        self.containers
+    }
+
+    #[must_use]
+    pub const fn chunks(self) -> u64 {
+        self.chunks
+    }
+
+    #[must_use]
+    pub const fn raw_records(self) -> u64 {
+        self.raw_records
+    }
+
+    #[must_use]
+    pub const fn zstd_records(self) -> u64 {
+        self.zstd_records
+    }
+
+    #[must_use]
+    pub const fn file_bytes(self) -> u64 {
+        self.file_bytes
+    }
+
+    #[must_use]
+    pub const fn generation_high_water(self) -> Option<u64> {
+        self.generation_high_water
+    }
+}
+
 impl PublishedContainerSummary {
     #[must_use]
     pub const fn container_id(self) -> ContainerId {
@@ -250,6 +328,72 @@ impl PublishedContainerSummary {
     #[must_use]
     pub const fn file_length(self) -> u64 {
         self.file_length
+    }
+}
+
+/// One complete immutable Container image transferred into its publication
+/// adapter exactly once.
+///
+/// The adapter owns every buffer until publication either fails or the root
+/// directory sync makes the no-replace name durable. Implementations must
+/// preserve the Building -> Body -> Sealed -> reread/VERIFY -> file sync ->
+/// rename -> root sync order encoded by [`StorageIo::publish_owned_container`].
+#[derive(Debug)]
+pub struct OwnedContainerPublication {
+    container_id: ContainerId,
+    container_generation: u64,
+    building_header: Box<[u8; HEADER_BYTES]>,
+    sealed: Vec<u8>,
+    temporary_name: String,
+    published_name: String,
+}
+
+impl OwnedContainerPublication {
+    #[must_use]
+    pub const fn container_id(&self) -> ContainerId {
+        self.container_id
+    }
+
+    #[must_use]
+    pub const fn container_generation(&self) -> u64 {
+        self.container_generation
+    }
+
+    #[must_use]
+    pub fn sealed_len(&self) -> usize {
+        self.sealed.len()
+    }
+
+    #[must_use]
+    pub fn temporary_name(&self) -> &str {
+        &self.temporary_name
+    }
+
+    #[must_use]
+    pub fn published_name(&self) -> &str {
+        &self.published_name
+    }
+
+    /// Consumes the capability into the exact writer inputs.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        ContainerId,
+        u64,
+        Box<[u8; HEADER_BYTES]>,
+        Vec<u8>,
+        String,
+        String,
+    ) {
+        (
+            self.container_id,
+            self.container_generation,
+            self.building_header,
+            self.sealed,
+            self.temporary_name,
+            self.published_name,
+        )
     }
 }
 
@@ -316,23 +460,77 @@ pub trait StorageIo {
     ///
     /// Returns lookup, collision, or namespace mutation errors.
     fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()>;
+    /// Removes exactly one canonical internal name.
+    ///
+    /// The removal is not crash-durable until a following [`Self::sync_root`].
+    /// Callers must establish replacement/liveness safety before invoking this
+    /// operation; the storage adapter does not interpret object reachability.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's lookup or namespace-mutation error.
+    fn remove_file(&self, name: &str) -> io::Result<()>;
     /// Makes namespace publication stable.
     ///
     /// # Errors
     ///
     /// Returns the backend's directory durability error.
     fn sync_root(&self) -> io::Result<()>;
+
+    /// Consumes one complete Container image and runs the ordered publication
+    /// protocol. Adapters may keep many owned publications in flight, but may
+    /// return only after the captured root-sync cohort is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first format, I/O, verification, or durability failure.
+    fn publish_owned_container(
+        &self,
+        publication: OwnedContainerPublication,
+    ) -> Result<SealedContainer, StoreError> {
+        publish_owned_container_synchronously(self, publication)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ContainerRepository<I> {
     storage: I,
+    descriptors: Arc<container_descriptor_cache::ContainerDescriptorCache>,
 }
 
 impl<I: StorageIo> ContainerRepository<I> {
     #[must_use]
-    pub const fn new(storage: I) -> Self {
-        Self { storage }
+    pub fn new(storage: I) -> Self {
+        Self {
+            storage,
+            descriptors: Arc::new(
+                container_descriptor_cache::ContainerDescriptorCache::new_system(),
+            ),
+        }
+    }
+
+    /// Constructs a repository with deterministic descriptor-cache pressure.
+    ///
+    /// This is intended for tests and runtimes with an external memory
+    /// governor. Normal appliances use [`Self::new`] and refresh host/cgroup
+    /// pressure automatically.
+    #[must_use]
+    pub fn new_with_descriptor_cache_snapshot(
+        storage: I,
+        snapshot: MemoryPressureSnapshot,
+    ) -> Self {
+        Self {
+            storage,
+            descriptors: Arc::new(
+                container_descriptor_cache::ContainerDescriptorCache::new_with_snapshot(snapshot),
+            ),
+        }
+    }
+
+    /// Returns bounded process-local Container-envelope cache telemetry.
+    #[must_use]
+    pub fn descriptor_cache_status(&self) -> ContainerDescriptorCacheStatus {
+        self.descriptors.status()
     }
 
     /// Runs the format writer and ordered durable publication protocol.
@@ -353,7 +551,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunks: &[&[u8]],
     ) -> Result<(), StoreError> {
         let sealed = SealedContainer::encode(container_id, container_generation, chunks)?;
-        self.publish_sealed(container_id, container_generation, &sealed)
+        self.publish_sealed(container_id, container_generation, sealed)
             .map(drop)
     }
 
@@ -377,7 +575,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Result<(), StoreError> {
         let sealed =
             SealedContainer::encode_adaptive_regions(container_id, container_generation, regions)?;
-        self.publish_sealed(container_id, container_generation, &sealed)
+        self.publish_sealed(container_id, container_generation, sealed)
             .map(drop)
     }
 
@@ -405,7 +603,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         )
     }
 
-    /// Publishes adaptive regions encoded by a bounded scoped worker pool and
+    /// Publishes adaptive regions encoded by the bounded permanent worker pool and
     /// returns the mandatory complete writer-reread proof.
     ///
     /// # Errors
@@ -426,6 +624,29 @@ impl<I: StorageIo> ContainerRepository<I> {
             workers,
         )
         .map(|(verified, _metrics)| verified)
+    }
+
+    /// Encodes and durably publishes one GC replacement Container, resuming
+    /// the same deterministic temporary name after an interrupted offline
+    /// maintenance attempt.
+    ///
+    /// This seam is deliberately crate-private: ordinary ingest publication
+    /// remains no-replace. Offline GC alone owns the deterministic replacement
+    /// identity and may overwrite its non-authoritative `.building` object.
+    pub(crate) fn publish_gc_replacement_adaptive_verified(
+        &self,
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[&[u8]]],
+        workers: NonZeroUsize,
+    ) -> Result<SealedContainer, StoreError> {
+        let sealed = SealedContainer::encode_adaptive_regions_parallel(
+            container_id,
+            container_generation,
+            regions,
+            workers,
+        )?;
+        self.publish_sealed_resumable(container_id, container_generation, &sealed)
     }
 
     /// Publishes adaptive regions while measuring encoding separately from
@@ -451,6 +672,29 @@ impl<I: StorageIo> ContainerRepository<I> {
         regions: &[&[&[u8]]],
         workers: NonZeroUsize,
     ) -> Result<(SealedContainer, AdaptiveContainerPublishMetrics), StoreError> {
+        let prepared = Self::prepare_adaptive_regions_parallel(
+            container_id,
+            container_generation,
+            regions,
+            workers,
+        )?;
+        self.publish_prepared_adaptive_profiled(prepared)
+    }
+
+    /// Encodes adaptive Compression Regions without performing storage I/O.
+    ///
+    /// This split lets a caller retire scarce CPU-worker permits before the
+    /// prepared immutable image waits on data-tier durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns format, compression, allocation, or worker failures.
+    pub fn prepare_adaptive_regions_parallel(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[&[u8]]],
+        workers: NonZeroUsize,
+    ) -> Result<PreparedAdaptiveContainer, StoreError> {
         let encode_wall_started = Instant::now();
         let encode_cpu_started = process_cpu_time();
         let sealed = SealedContainer::encode_adaptive_regions_parallel(
@@ -461,11 +705,42 @@ impl<I: StorageIo> ContainerRepository<I> {
         )?;
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
+        Ok(PreparedAdaptiveContainer {
+            container_id,
+            container_generation,
+            sealed,
+            encode_wall,
+            encode_process_cpu,
+        })
+    }
+
+    /// Durably publishes one prepared adaptive Container and returns mandatory
+    /// writer-reread evidence plus complete phase metrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns publication I/O, durability, reread, or integrity failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a validated format-v1 image violates its bounded length
+    /// or decoded-byte accounting invariants.
+    pub fn publish_prepared_adaptive_profiled(
+        &self,
+        prepared: PreparedAdaptiveContainer,
+    ) -> Result<(SealedContainer, AdaptiveContainerPublishMetrics), StoreError> {
+        let PreparedAdaptiveContainer {
+            container_id,
+            container_generation,
+            sealed,
+            encode_wall,
+            encode_process_cpu,
+        } = prepared;
         let file_bytes = u64::try_from(sealed.len())
             .expect("ASSERT: a format-v1 Container image length fits u64");
         let publish_wall_started = Instant::now();
         let publish_cpu_started = process_cpu_time();
-        let verified = self.publish_sealed(container_id, container_generation, &sealed)?;
+        let verified = self.publish_sealed(container_id, container_generation, sealed)?;
         let publish_wall = publish_wall_started.elapsed();
         let publish_process_cpu = process_cpu_elapsed(publish_cpu_started);
         let logical_bytes = verified.records().iter().try_fold(0_u64, |total, record| {
@@ -493,7 +768,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         container_id: ContainerId,
         container_generation: u64,
-        sealed: &[u8],
+        sealed: Vec<u8>,
     ) -> Result<SealedContainer, StoreError> {
         let building = BuildingContainerHeader::new(container_id, container_generation)?.encode();
         let temporary_name = temporary_name(container_id);
@@ -505,22 +780,54 @@ impl<I: StorageIo> ContainerRepository<I> {
             "ASSERT: the format writer returned an oversized container"
         );
 
-        self.storage.create_new(&temporary_name)?;
-        self.storage.write_at(&temporary_name, 0, &building)?;
-        let mut offset = HEADER_BYTES;
-        while offset < sealed.len() {
-            let end = offset
-                .checked_add(HEADER_BYTES)
-                .expect("ASSERT: a bounded container write cursor cannot overflow")
-                .min(sealed.len());
-            self.storage.write_at(
-                &temporary_name,
-                u64::try_from(offset)
-                    .expect("ASSERT: a bounded container write offset always fits u64"),
-                &sealed[offset..end],
-            )?;
-            offset = end;
+        self.storage
+            .publish_owned_container(OwnedContainerPublication {
+                container_id,
+                container_generation,
+                building_header: Box::new(building),
+                sealed,
+                temporary_name,
+                published_name,
+            })
+    }
+
+    fn publish_sealed_resumable(
+        &self,
+        container_id: ContainerId,
+        container_generation: u64,
+        sealed: &[u8],
+    ) -> Result<SealedContainer, StoreError> {
+        let temporary_name = temporary_name(container_id);
+        let published_name = published_name(container_id);
+        if self.storage.exists(&published_name)? {
+            let existing = self.storage.read(&published_name)?;
+            if existing != sealed {
+                return Err(StoreError::PublishVerificationMismatch);
+            }
+            let verified = SealedContainer::decode(&existing)?;
+            if verified.header().container_id() != container_id
+                || verified.header().container_generation() != container_generation
+            {
+                return Err(StoreError::PublishVerificationMismatch);
+            }
+            return Ok(verified);
         }
+        if !self.storage.exists(&temporary_name)? {
+            self.storage.create_new(&temporary_name)?;
+        }
+        let building = BuildingContainerHeader::new(container_id, container_generation)?.encode();
+        let sealed_length = u64::try_from(sealed.len())
+            .expect("ASSERT: a format-v1 Container image length fits u64");
+        assert!(
+            sealed_length <= MAX_CONTAINER_BYTES,
+            "ASSERT: resumable GC publication cannot exceed the format-v1 Container limit"
+        );
+        self.storage.write_at(&temporary_name, 0, &building)?;
+        self.storage.write_at(
+            &temporary_name,
+            u64::try_from(HEADER_BYTES).expect("ASSERT: format Header size fits u64"),
+            &sealed[HEADER_BYTES..],
+        )?;
         self.storage
             .write_at(&temporary_name, 0, &sealed[..HEADER_BYTES])?;
         self.storage.set_len(&temporary_name, sealed_length)?;
@@ -624,29 +931,35 @@ impl<I: StorageIo> ContainerRepository<I> {
         }
         let location = candidate.location();
         let name = published_name(location.container_id());
-        let actual_length = self.storage.object_len(&name)?;
-        let minimum_length = u64::try_from(HEADER_BYTES)
-            .map_err(|_| FormatError::ArithmeticOverflow)?
-            .checked_add(FOOTER_BYTES)
-            .ok_or(FormatError::ArithmeticOverflow)?;
-        if actual_length < minimum_length
-            || actual_length > MAX_CONTAINER_BYTES
-            || !actual_length.is_multiple_of(FOOTER_BYTES)
-        {
-            return Err(StoreError::Format(FormatError::InvalidContainerLength(
-                usize::try_from(actual_length).unwrap_or(usize::MAX),
-            )));
-        }
-        let footer_offset = actual_length
-            .checked_sub(FOOTER_BYTES)
-            .ok_or(FormatError::ArithmeticOverflow)?;
-        let footer = self.storage.read_exact_at(
-            &name,
-            footer_offset,
-            usize::try_from(FOOTER_BYTES).map_err(|_| FormatError::ArithmeticOverflow)?,
-        )?;
-        let header = self.storage.read_exact_at(&name, 0, HEADER_BYTES)?;
-        let descriptor = SealedContainerDescriptor::decode(&header, &footer, actual_length)?;
+        let descriptor = if let Some(descriptor) = self.descriptors.get(location.container_id()) {
+            descriptor
+        } else {
+            let actual_length = self.storage.object_len(&name)?;
+            let minimum_length = u64::try_from(HEADER_BYTES)
+                .map_err(|_| FormatError::ArithmeticOverflow)?
+                .checked_add(FOOTER_BYTES)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            if actual_length < minimum_length
+                || actual_length > MAX_CONTAINER_BYTES
+                || !actual_length.is_multiple_of(FOOTER_BYTES)
+            {
+                return Err(StoreError::Format(FormatError::InvalidContainerLength(
+                    usize::try_from(actual_length).unwrap_or(usize::MAX),
+                )));
+            }
+            let footer_offset = actual_length
+                .checked_sub(FOOTER_BYTES)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            let footer = self.storage.read_exact_at(
+                &name,
+                footer_offset,
+                usize::try_from(FOOTER_BYTES).map_err(|_| FormatError::ArithmeticOverflow)?,
+            )?;
+            let header = self.storage.read_exact_at(&name, 0, HEADER_BYTES)?;
+            let descriptor = SealedContainerDescriptor::decode(&header, &footer, actual_length)?;
+            self.descriptors.insert(location.container_id(), descriptor);
+            descriptor
+        };
         let range = descriptor
             .record_range(candidate)
             .map_err(map_exact_location_error)?;
@@ -914,6 +1227,124 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(verified)
     }
 
+    /// Sequentially audits every published Container and returns aggregate
+    /// evidence without retaining decoded payload or a per-Chunk map.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first namespace, naming, format, identity, or counter
+    /// overflow failure.
+    pub fn audit_published(&self) -> Result<ContainerAuditSummary, StoreError> {
+        self.visit_verified_published_pipelined::<StoreError, _>(|_| Ok(()))
+    }
+
+    pub(crate) fn remove_verified_published(
+        &self,
+        container_ids: &BTreeMap<[u8; 16], ContainerId>,
+    ) -> Result<u64, StoreError> {
+        let mut removed_bytes = 0_u64;
+        for container_id in container_ids.values().copied() {
+            let name = published_name(container_id);
+            let bytes = self.storage.read(&name)?;
+            let container = SealedContainer::decode(&bytes)?;
+            if container.header().container_id() != container_id {
+                return Err(StoreError::PublishedIdentityMismatch {
+                    name: container_id,
+                    header: container.header().container_id(),
+                });
+            }
+            removed_bytes = removed_bytes
+                .checked_add(container.header().layout().file_length)
+                .ok_or_else(audit_counter_overflow)?;
+            self.storage.remove_file(&name)?;
+        }
+        if !container_ids.is_empty() {
+            self.storage.sync_root()?;
+        }
+        Ok(removed_bytes)
+    }
+
+    pub(crate) fn visit_verified_published_pipelined<E, F>(
+        &self,
+        mut visitor: F,
+    ) -> Result<ContainerAuditSummary, E>
+    where
+        E: From<StoreError>,
+        F: FnMut(&SealedContainer) -> Result<(), E>,
+    {
+        let mut names = self
+            .storage
+            .list_names()
+            .map_err(|error| E::from(StoreError::from(error)))?;
+        names.sort_unstable();
+        let worker_limit = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let mut summary = ContainerAuditSummary::default();
+        let mut cursor = 0_usize;
+        while cursor < names.len() {
+            let mut encoded = Vec::new();
+            let mut encoded_bytes = 0_u64;
+            while cursor < names.len() && encoded.len() < worker_limit {
+                let name = &names[cursor];
+                let Some(expected_id) = parse_published_name(name).map_err(E::from)? else {
+                    cursor += 1;
+                    continue;
+                };
+                let length = self
+                    .storage
+                    .object_len(name)
+                    .map_err(|error| E::from(StoreError::from(error)))?;
+                if !encoded.is_empty()
+                    && encoded_bytes
+                        .checked_add(length)
+                        .is_none_or(|total| total > MAINTENANCE_VERIFY_WINDOW_BYTES)
+                {
+                    break;
+                }
+                let bytes = self
+                    .storage
+                    .read(name)
+                    .map_err(|error| E::from(StoreError::from(error)))?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(
+                        u64::try_from(bytes.len())
+                            .map_err(|_| E::from(audit_counter_overflow()))?,
+                    )
+                    .ok_or_else(audit_counter_overflow)
+                    .map_err(E::from)?;
+                encoded.push((expected_id, bytes));
+                cursor += 1;
+            }
+            assert!(
+                !encoded.is_empty(),
+                "ASSERT: a maintenance verification window must make input progress"
+            );
+            assert!(
+                encoded_bytes <= MAINTENANCE_VERIFY_WINDOW_BYTES,
+                "ASSERT: one format-v1 Container cannot exceed the maintenance verification window"
+            );
+            let decoded = encoded
+                .into_par_iter()
+                .map(|(expected_id, bytes)| {
+                    let container = SealedContainer::decode(&bytes).map_err(StoreError::from)?;
+                    let embedded_id = container.header().container_id();
+                    if embedded_id != expected_id {
+                        return Err(StoreError::PublishedIdentityMismatch {
+                            name: expected_id,
+                            header: embedded_id,
+                        });
+                    }
+                    Ok(container)
+                })
+                .collect::<Result<Vec<_>, StoreError>>()
+                .map_err(E::from)?;
+            for container in decoded {
+                add_container_to_audit_summary(&mut summary, &container).map_err(E::from)?;
+                visitor(&container)?;
+            }
+        }
+        Ok(summary)
+    }
+
     pub(crate) fn verify_required_chunks(
         &self,
         required: &BTreeMap<fastdup_format::ChunkId, u64>,
@@ -968,6 +1399,52 @@ impl<I: StorageIo> ContainerRepository<I> {
     pub fn into_storage(self) -> I {
         self.storage
     }
+}
+
+fn publish_owned_container_synchronously<I: StorageIo + ?Sized>(
+    storage: &I,
+    publication: OwnedContainerPublication,
+) -> Result<SealedContainer, StoreError> {
+    let (
+        container_id,
+        container_generation,
+        building_header,
+        sealed,
+        temporary_name,
+        published_name,
+    ) = publication.into_parts();
+    let sealed_length =
+        u64::try_from(sealed.len()).expect("ASSERT: a format-v1 Container image length fits u64");
+    assert!(
+        sealed_length <= MAX_CONTAINER_BYTES,
+        "ASSERT: owned publication cannot exceed the format-v1 Container limit"
+    );
+    assert!(
+        sealed.len() > HEADER_BYTES,
+        "ASSERT: a sealed Container includes its body and Footer"
+    );
+
+    storage.create_new(&temporary_name)?;
+    storage.write_at(&temporary_name, 0, &building_header[..])?;
+    storage.write_at(
+        &temporary_name,
+        u64::try_from(HEADER_BYTES).expect("ASSERT: format Header size fits u64"),
+        &sealed[HEADER_BYTES..],
+    )?;
+    storage.write_at(&temporary_name, 0, &sealed[..HEADER_BYTES])?;
+    storage.set_len(&temporary_name, sealed_length)?;
+    let reread = storage.read(&temporary_name)?;
+    let verified = SealedContainer::decode(&reread)?;
+    if reread != sealed
+        || verified.header().container_id() != container_id
+        || verified.header().container_generation() != container_generation
+    {
+        return Err(StoreError::PublishVerificationMismatch);
+    }
+    storage.sync_file(&temporary_name)?;
+    storage.publish_noreplace(&temporary_name, &published_name)?;
+    storage.sync_root()?;
+    Ok(verified)
 }
 
 #[derive(Clone, Debug)]
@@ -1114,6 +1591,10 @@ impl StorageIo for FsStorageIo {
         .map_err(io::Error::from)
     }
 
+    fn remove_file(&self, name: &str) -> io::Result<()> {
+        std::fs::remove_file(self.path(name)?)
+    }
+
     fn sync_root(&self) -> io::Result<()> {
         File::open(&self.root)?.sync_all()
     }
@@ -1252,6 +1733,49 @@ fn container_too_large(length: u64) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("container length {length} exceeds {MAX_CONTAINER_BYTES} bytes"),
     )
+}
+
+fn add_container_to_audit_summary(
+    summary: &mut ContainerAuditSummary,
+    container: &SealedContainer,
+) -> Result<(), StoreError> {
+    let header = container.header();
+    summary.containers = summary
+        .containers
+        .checked_add(1)
+        .ok_or_else(audit_counter_overflow)?;
+    summary.chunks = summary
+        .chunks
+        .checked_add(u64::try_from(container.chunk_count()).map_err(|_| audit_counter_overflow())?)
+        .ok_or_else(audit_counter_overflow)?;
+    summary.raw_records = summary
+        .raw_records
+        .checked_add(
+            u64::try_from(container.raw_record_count()).map_err(|_| audit_counter_overflow())?,
+        )
+        .ok_or_else(audit_counter_overflow)?;
+    summary.zstd_records = summary
+        .zstd_records
+        .checked_add(
+            u64::try_from(container.zstd_record_count()).map_err(|_| audit_counter_overflow())?,
+        )
+        .ok_or_else(audit_counter_overflow)?;
+    summary.file_bytes = summary
+        .file_bytes
+        .checked_add(header.layout().file_length)
+        .ok_or_else(audit_counter_overflow)?;
+    summary.generation_high_water = Some(
+        summary
+            .generation_high_water
+            .map_or(header.container_generation(), |generation| {
+                generation.max(header.container_generation())
+            }),
+    );
+    Ok(())
+}
+
+fn audit_counter_overflow() -> StoreError {
+    StoreError::Io(io::Error::other("Container audit counter overflow"))
 }
 
 fn map_exact_location_error(error: FormatError) -> StoreError {

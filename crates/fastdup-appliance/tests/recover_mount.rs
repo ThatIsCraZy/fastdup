@@ -349,16 +349,16 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
             .iter()
             .filter(|operation| **operation == StorageOperation::ObjectLen)
             .count(),
-        3,
-        "two graph proofs and Container-generation discovery must each pair the physical object length: {writable_recovery_operations:?}"
+        1,
+        "graph proofs must reuse the verified immutable envelope; only independent Container-generation discovery measures the object: {writable_recovery_operations:?}"
     );
     assert_eq!(
         writable_recovery_operations
             .iter()
             .filter(|operation| **operation == StorageOperation::ReadExactAt)
             .count(),
-        8,
-        "the two graph proofs use three ranges each and generation discovery reads only Header/Footer: {writable_recovery_operations:?}"
+        4,
+        "the two graph proofs each verify only their Record while generation discovery independently reads Header/Footer: {writable_recovery_operations:?}"
     );
     let writable_baseline = container_storage.operation_count();
     let Reply::Entry(writable_entry) = writable

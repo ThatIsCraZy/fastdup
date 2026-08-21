@@ -21,3 +21,8 @@
   format.
 - Pair each new durable invariant at writer, reader/recovery, and offline-scrub
   boundaries, including a fault-injection case where applicable.
+
+## Writing
+
+- Before producing any user-facing text, read and apply
+  `/root/.codex/skills/unslop/SKILL.md`.

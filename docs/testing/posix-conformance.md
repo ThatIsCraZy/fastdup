@@ -25,13 +25,18 @@ namespace/FUSE seam, and the bounded adaptive RAW/Zstd orchestration recorded in
 runtime loop, event-driven 512-MiB active-Dirty-DATA pressure trigger, and
 mutation-admission gate are connected to the real mount.
 FastCDC-v1, automatic level-zero Exact-Index publication, cross-checkpoint Exact
-Hits, and bounded parallel RAW/Zstd region encoding are connected. It does not
-yet implement hierarchical Manifest path rewriting, Exact-Index compaction,
-per-region serialized Chunking Profile IDs, fake-clock deadline proof,
-process-kill coverage, nested directories, rename, links, locks, xattrs/ACLs,
-allocation operations, or the remaining scalable durable sparse tree. When a
-valid Run Set already exists, normal POSIX reads use bounded verified Locations
-and transparently fall back to Container scans on index loss or corruption.
+Hits, bounded parallel RAW/Zstd region encoding, hierarchical tree-native
+Manifest updates, four-way Exact-Index compaction, and atomic replacement rename
+are connected. Offline maintenance now scrubs every retained generation,
+published Container, active Exact object, and ACTIVE Location, and can rebuild
+the Exact Index through hidden RoW Runs plus final atomic activation. It does
+not yet implement per-region serialized Chunking Profile IDs, fake-clock
+stalled-I/O deadline proof, nested directories, links, locks, xattrs/ACLs, or
+allocation operations. A bounded real-process
+[`SIGKILL`/remount/deadline matrix](sigkill-remount-deadline.md) now covers
+acknowledged sequential writes. When a valid Run Set already exists,
+normal POSIX reads use bounded verified Locations and transparently fall back to
+Container scans on index loss or corruption.
 
 `fastdup_store::StorageIo` is an internal adapter for publishing canonical
 container files. Its `create_new`, `write_at`, `set_len`, `read`, sync, and
@@ -59,8 +64,9 @@ pass overall until it passes at every applicable later level.
    behavior as well as returned bytes, metadata, and errno values.
 3. **K -- SIGKILL and remount.** Kill the daemon at controlled or randomized
    commit phases, restart it, and compare the recovered namespace with complete
-   generation oracles. Block-device power-cut and torn-write injection extend
-   this level when available.
+   generation oracles. The first bounded public K-level tracer is implemented
+   in the `SIGKILL`/remount/deadline harness. Block-device power-cut and
+   torn-write injection extend this level when available.
 4. **S -- Samba consumer.** After the FUSE MVP, run Samba and SMB conformance
    tests against the same mount. ADR 0032 deliberately places production Samba
    hardening after the POSIX Exact-Dedup MVP; S results cannot substitute for M,
@@ -79,7 +85,9 @@ results.
   column is the first level at which its complete oracle applies. The checkpoint
   provides partial M/F evidence for mount, inode identity within one process,
   create/lookup, acknowledged writes, mutation ordering, open orphans, truncate
-  bytes, byte-exact names, append, and expected errors; it provides no K evidence.
+  bytes, byte-exact names, append, and expected errors. The dedicated
+  real-process harness provides bounded K evidence for acknowledged sequential
+  writes and their ten-second deadline, but not yet for the remaining rows.
 
 ## P0 conformance matrix
 
@@ -153,10 +161,16 @@ the POSIX mount as the source of storage semantics.
 The public namespace seam, real FUSE mount, atomic commit cut, immutable
 generation writer, recovery adapter, Inode reservation, scheduler gate, sparse
 RAW/Zstd checkpoint, pinned Exact-Index demand reads, and deterministic
-storage-operation fault matrix are green.
+storage-operation fault matrix are green. The bounded real-process
+`SIGKILL`/remount matrix additionally proves complete-prefix recovery inside
+the accepted window and recovery of every acknowledged record after its
+ten-second deadline.
 This provides direct M/F evidence and durable-operation fault evidence for the
-implemented subset. No P0 row is complete as an MVP claim: fake-clock and
-`SIGKILL` deadline coverage, scalable bounded Manifest updates, Exact Dedup in
-the durable path, atomic rename, allocation operations, links, and corruption
-scrub remain absent. Container Store, deterministic namespace, durable
-orchestration, and real-mount results remain separately reported evidence.
+implemented subset. The public maintenance seam adds deterministic corruption,
+global-index-invariant, and fail-before/fail-after evidence, but does not replace
+real block-device power-cut campaigns. No P0 row is complete as an MVP claim:
+fake-clock stalled-I/O coverage, broad randomized process-kill coverage,
+allocation operations, links, and the remaining POSIX/Samba matrices are still
+absent. Container Store,
+deterministic namespace, durable orchestration, offline scrub/rebuild, and
+real-mount results remain separately reported evidence.
