@@ -1,90 +1,170 @@
 # fastdup
 
-fastdup is an integrity-first prototype for a POSIX deduplicating storage
-appliance. The repository is deliberately early: the implemented slice is the
-versioned RAW/Zstd container format, durable metadata generations, immutable
-Exact-Index runs, their XFS publication paths, and a deterministic crash model.
-A separate in-memory reference pipeline exercises
-FastCDC, Exact Dedup, Zstd/Dictionary, bounded Similarity/Depth-1 Delta, FILL,
-and bounded Reorder. Dependency-free Zstd Compression Regions now have a durable
-on-disk format; Dictionary, Similarity, Delta, and Reorder records do not yet.
-A low-level FUSE checkpoint is mountable with writable live POSIX semantics,
-five-second durable checkpoints, a ten-second mutation-admission gate, and an
-additional 512-MiB active-Dirty-DATA pressure checkpoint.
-Versioned Manifest/Namespace/Commit-WAL formats recover through a type-erased
-adapter into the same seam, including lazy verified DATA/FILL/HOLE reads. A
-valid activated Exact-Index Run Set is pinned at mount and bounds normal DATA
-reads. New checkpoints stream FastCDC-v1 boundaries, publish verified RAW/Zstd
-Locations as level-zero Runs, and reuse Exact Hits across later checkpoints;
-four same-level Runs are merged RoW before the 64-Run reader bound is reached.
-Missing or corrupt index state falls back to verified Container scans. Adaptive
-Compression Regions are encoded by a bounded cache-local worker pool and merged
-in deterministic input order. The format writer also has the versioned
-`incompressibility-gate-v1` benchmark policy: it uses bounded LZ4 and, when
-needed, a Zstd level-1 rescue trial to skip an unhelpful level-3 Zstd attempt
-for regions of at least 128 KiB. Predictor output is never written to disk;
-the resulting records remain RAW or dependency-free Zstd. The production store
-keeps that policy off while its CPU, latency, and physical-byte promotion gates
-remain unmet. Exact-Index activation now rotates through two
-overlapping 64-record slots and migrates the former 16,384-record WAL without a
-lifetime write stop.
-The POSIX/FUSE seam also supports metadata-only range clones across arbitrary
-FastCDC boundaries through Manifest v2 Chunk slices, plus atomic replacement
-rename. Clone checkpoints allocate no frontend payload, rechunk no bytes, and
-perform no DATA-container I/O. This is the filesystem primitive needed by
-Veeam synthetic full. The experimental GPL `vfs_fastdup` Samba adapter now
-advertises block refcounting only when explicitly enabled, maps Duplicate
-Extents to FUSE `copy_file_range`, and exposes one fixed Integrity Information
-state. It compiles against Samba 4.23.5, but Veeam Fast Clone is not advertised
-as supported until a real SMB/Veeam trace and protocol matrix are green.
-This remains an experimental checkpoint rather than a production backup target.
+fastdup ist ein einzelner POSIX-Speicher auf FUSE-Basis. Er speichert Dateien
+bytegenau, reduziert wiederholte Inhalte und schreibt dauerhaft nur vollständig
+geprüfte Generationen. Der aktuelle Stand ist ein experimenteller Prototyp,
+kein Backup-Produkt. Besonders wichtig: Exact Dedup, RAW/Zstd-Container,
+Manifeste, Commit-WAL und Wiederherstellung sind im dauerhaften FUSE-Pfad
+implementiert. Similarity, Delta, Dictionary und Reorder existieren bisher nur
+in der Referenz-Pipeline.
 
-Start with [CONTEXT.md](CONTEXT.md), the accepted decisions in
-[`docs/adr/`](docs/adr/), and the byte-exact
-[`container-v1` specification](docs/specs/container-v1.md). The current measured
-baseline is recorded in
-[`docs/benchmarks/stage0-raw-container.md`](docs/benchmarks/stage0-raw-container.md).
-The sustained ten-ISO ingest and byte-exact restore is recorded in
-[`docs/benchmarks/stage1-iso-raw-ingest.md`](docs/benchmarks/stage1-iso-raw-ingest.md),
-and the future filesystem is gated by the explicit
-[`POSIX conformance plan`](docs/testing/posix-conformance.md).
-Its durable namespace and recovery rules are specified in
-[`metadata-generation-v1`](docs/specs/metadata-generation-v1.md).
-The current reduction policy, real 10-ISO results, worker scaling, integrity
-gates, and explicit limitations are recorded in
-[`data-reduction-reference-v1`](docs/benchmarks/data-reduction-reference-v1.md).
-The persistent CPU-pool scaling result is recorded in
-[`reduction-worker-pool`](docs/benchmarks/reduction-worker-pool.md).
-The gate design, promotion criteria, and initial Rocky ISO comparison are in
-[`zstd-incompressibility-gate`](docs/research/zstd-incompressibility-gate.md).
-The first sustained kernel-FUSE write/checkpoint/read/delete run, including
-per-stage CPU, memory, Exact/Compression efficiency, and device-I/O evidence,
-is recorded in
-[`io-intensive-fuse-600s`](docs/benchmarks/io-intensive-fuse-600s.md).
-The range-clone design, crash matrix, and real FUSE evidence are recorded in
-[`veeam-fast-clone`](docs/testing/veeam-fast-clone.md).
-Offline integrity verification and RoW Exact-Index reconstruction are described
-in [`scrub and Exact-Index rebuild`](docs/operations/scrub-and-exact-index-rebuild.md).
+Die wichtigsten Begriffe und Abgrenzungen stehen in [CONTEXT.md](CONTEXT.md).
+Das dauerhafte Format ist absichtlich versioniert. Die genauen Bytes stehen in
+den Spezifikationen für [Container](docs/specs/container-v1.md),
+[Metadatengenerationen](docs/specs/metadata-generation-v1.md) und den
+[Exact Index](docs/specs/exact-index-run-v1.md).
 
-## Workspace
+## Was heute funktioniert
 
-- `fastdup-format`: explicit bytes to validated durable objects; no implicit
-  Rust layout.
-- `fastdup-appliance`: the narrow orchestration seam from verified generations
-  and Manifest-backed content into the POSIX namespace.
-- `fastdup-posix`: byte-exact volatile namespace semantics, deterministic model
-  tests, committed-base/dirty-epoch layering, a thin low-level FUSE adapter, and
-  a real-mount smoke harness.
-- `fastdup-store`: ordered BUILDING-to-PUBLISHED container lifecycle behind an
-  injectable storage boundary, plus the non-durable reduction reference engine.
-- `fastdup-testkit`: separate live/durable state, crash simulation, and
-  deterministic I/O failures.
-- `samba/vfs_fastdup`: GPL Samba VFS adapter and a dependency-free executable
-  contract test for Duplicate Extents, Integrity Information, and CLOSE
-  ordering.
+Der dauerhafte FUSE-Pfad kann Dateien anlegen, öffnen, lesen, schreiben,
+verkürzen, umbenennen, löschen und Verzeichnisse auflisten. Er unterstützt
+zufällige Writes, append, `O_TRUNC`, `O_EXCL`, `RENAME_NOREPLACE`, `fsync`,
+`flush` und sparse Dateien mit sehr großen Offsets. Ein Write in eine Lücke
+legt nur die geschriebenen Bytes ab. Unbelegte Bereiche bleiben HOLE-Extents.
 
-All generated artifacts stay under `/source/fastdup/.artifacts/`. With the
-workspace-local toolchain installed, run:
+`copy_file_range` erzeugt Metadatenklone. Dabei liest fastdup weder die
+Quell-DATA noch zerlegt es sie neu, wenn die Quelle vollständig allokiert und
+bereits unveränderlich ist. Der Test klonte 2 MiB ab einem nicht an
+FastCDC-Grenzen ausgerichteten Offset. Der Checkpoint schrieb dabei keine neuen
+Container und die Wiederherstellung war bytegenau. Details und Fehlerfälle
+stehen im [Fast-Clone-Testplan](docs/testing/veeam-fast-clone.md).
+
+Der derzeitige FUSE-Adapter implementiert keinen vollständigen POSIX-Umfang.
+`mkdir`, Unterverzeichnisse, Hardlinks, Symlinks, xattrs, Besitz- und
+Rechteänderungen, Dateisperren, `statfs` sowie `fallocate` fehlen oder liefern
+`EOPNOTSUPP`. Die [POSIX-Konformanzplanung](docs/testing/posix-conformance.md)
+führt den verbleibenden Umfang mit Tests auf.
+
+## Dauerhaftes Speicher- und Integritätsmodell
+
+Jede akzeptierte Änderung wird sofort im Live-Namensraum sichtbar. Ein
+Checkpoint friert einen konsistenten Präfix ein und veröffentlicht ihn nur,
+nachdem DATA, Metadaten und Commit Record vollständig geschrieben und geprüft
+sind. Nach einem Absturz lädt fastdup die jüngste vollständige Generation.
+Eine unterbrochene Ingest-Datei kann daher mit einem gültigen, bereits
+committeten Präfix zurückkehren.
+
+Der Standard-Daemon plant einen Checkpoint alle fünf Sekunden. Bei 512 MiB
+einzigartiger, noch nicht eingecheckter DATA schließt er kurz die Aufnahme
+neuer Mutationen, damit die Dirty-DATA-Menge begrenzt bleibt. Bereits
+angenommene Writes und Reads bleiben verfügbar. `fsync` macht daraus keine
+eigene private Transaktion. Siehe [Checkpoint-Design und Fehlerfälle](docs/testing/durable-posix-checkpoint.md).
+
+Der Speicher prüft Daten an mehreren Grenzen:
+
+- BLAKE3-256 identifiziert jeden Logical Chunk und verifiziert wiederhergestellte Bytes.
+- CRC32C, Header, Footer und physische Länge prüfen Container-Struktur und Veröffentlichung.
+- Ein Commit-WAL mit verketteten, gecheckten Records wählt die sichtbare Namespace-Generation.
+- Immutable Manifeste beschreiben Dateien inklusive DATA-, FILL- und HOLE-Extents.
+- Der Exact Index beschleunigt Treffer, ist aber keine Wahrheitsquelle. Fehlt er
+  oder ist er beschädigt, sucht der Leser über geprüfte Container weiter.
+- Offline Scrub prüft erreichbare Generationen, Container und aktive Locations.
+  Der [Ablauf für Scrub und Index-Rebuild](docs/operations/scrub-and-exact-index-rebuild.md)
+  beschreibt diese Wartung.
+
+Container durchlaufen `BUILDING`, vollständigen Reread, `fsync`, atomisches
+Veröffentlichen ohne Überschreiben und Directory-Sync. Ein Fehlereinwurf-Test
+akzeptiert bei der Wiederherstellung nur "nicht vorhanden" oder "vollständig
+geprüft". Das Dateiformat speichert Felder einzeln und hängt nicht vom
+Speicherlayout von Rust ab.
+
+## Datenreduktion und Algorithmen
+
+Der dauerhafte Pfad verwendet FastCDC v2020 mit 16 KiB Minimum, 64 KiB Ziel
+und 256 KiB Maximum. Gleiche Chunks trifft der Exact Index über BLAKE3-256 und
+verwendet eine bereits geprüfte Location erneut. Neue, benachbarte Chunks
+bilden maximal 512 KiB große Compression Regions. Der Writer wählt RAW oder
+unabhängiges Zstd Level 3 nur dann, wenn die komplette Speicherung mindestens
+4 KiB und 3 Prozent spart. Gleichförmige allokierte Bereiche werden als FILL
+gespeichert, unallokierte Nullbereiche als HOLE.
+
+| Technik | Dauerhafter FUSE-Pfad | Referenz-Pipeline |
+| --- | --- | --- |
+| FastCDC, BLAKE3-Exact Dedup, FILL und HOLE | Ja | Ja |
+| RAW und unabhängiges Zstd Level 3 | Ja | Ja |
+| Immutable Container, Manifest, Commit-WAL, Exact-Index-Runs | Ja | Nein |
+| LZ4 plus Zstd-Level-1 Inkompressibilitäts-Schranke | Benchmark-Policy, Store bleibt auf `off` | Nein |
+| Zstd-Dictionaries | Noch nicht dauerhaft | Ja |
+| Similarity-Suche und Depth-1 Sparse-XOR Delta | Noch nicht dauerhaft | Ja |
+| Bounded Reorder | Noch nicht dauerhaft | Ja |
+| Automatische Garbage Collection | Noch nicht online | Nein |
+
+Die Inkompressibilitäts-Schranke probiert bei Regionen ab 128 KiB zuerst LZ4
+und bei Bedarf Zstd Level 1, um einen voraussichtlich nutzlosen Zstd-Level-3
+Lauf zu vermeiden. Sie schreibt keine zusätzlichen Formate. RAW und Zstd
+bleiben die einzigen unabhängigen Records. Die aktuelle Rocky-ISO-Messung
+verfehlte jedoch die CPU- und Platz-Grenzen für die Freigabe. Deshalb nutzt der
+Store weiter den Baseline-Modus. Die Messwerte und Kriterien stehen in
+[zstd-incompressibility-gate](docs/research/zstd-incompressibility-gate.md).
+
+Die Referenz-Pipeline ist nützlich, um die späteren Algorithmen gegen echte
+Daten zu prüfen. Sie ist kein Ersatz für den dauerhaften FUSE-Pfad. Ihre
+Similarity-Suche begrenzt Kandidaten, Delta-Tiefe und Speicher pro Bucket.
+Ein Delta darf nur einen Base Chunk benötigen. Dictionaries bleiben immutable
+und inhaltsidentifiziert. [Die vollständige Referenzbeschreibung](docs/benchmarks/data-reduction-reference-v1.md)
+enthält Grenzen, Korpora und negative Fälle.
+
+## Gemessene Datenreduktion
+
+Die Quoten hängen stark vom Datenbestand ab. Sie sind keine Kapazitätszusage.
+Alle folgenden Läufe haben die Ergebnisse bytegenau wiederhergestellt.
+
+| Pfad und Workload | Ergebnis | Einordnung |
+| --- | ---: | --- |
+| Dauerhafter FUSE-Lauf, 50 eng verwandte Rocky-ISO-Varianten | 61,18x Logical/DATA, 42,95x mit Metadaten | 98,311 Prozent der Checkpoint-Bytes waren Exact Hits. Gelöschte Container blieben mangels GC liegen. Das ist daher Ingest-Reduktion, keine aktuelle freie Kapazität. |
+| Samba plus FUSE, drei serielle Kopien derselben 2,07-GB Rocky-ISO | 2,840x bis 2,904x | Alle drei Dateien blieben live. Der Exact-Index-Filter senkte Exact-Page-Zugriffe um rund 75 Prozent bei etwa 41 KiB Filterdaten. |
+| Referenz-Pipeline, zehn leicht veränderte Rocky-ISOs | 10,676x Payload-Reduktion | Enthält Exact, Zstd, Similarity, Delta, FILL und Reorder. Container-Overhead, Metadaten und Dateisystembelegung sind nicht enthalten. |
+| Referenz-Pipeline, XML und JSON | 6,174x Payload-Reduktion | Jede CDC-Region änderte sich, deshalb gab es dort keine Exact Hits. |
+
+Der aktuelle Ende-zu-Ende-FUSE-Lauf schrieb mit einem p95 von 545,3 MB/s und
+las bytegeprüft mit einem p95 von 922,7 MB/s. Seine DATA-Checkpoints lagen bei
+2,496 s p95 und 2,846 s maximal. Er erfüllte die geprüfte 10-Sekunden-Grenze,
+lief 601 Sekunden, schrieb 124,2 GB logisch und startete nach dem Abschluss in
+55 ms mit einem leeren Namespace. Die vollständige Messmethode, I/O-Zähler und
+Einschränkungen stehen in [io-intensive-fuse-600s](docs/benchmarks/io-intensive-fuse-600s.md).
+
+## SMB und Samba
+
+`samba/vfs_fastdup` ist ein experimentelles GPL-3.0-or-later VFS-Modul für
+Samba 4.23.5. Eine normale SMB-Freigabe kann den fastdup-FUSE-Mount verwenden.
+Das Modul ergänzt gezielt die Funktionen, die ein Fast-Clone-Client benötigt:
+
+- Es meldet `FILE_SUPPORTS_BLOCK_REFCOUNTING` nur bei explizit aktivierter Freigabe.
+- Es übersetzt `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in genau einen Linux-
+  `copy_file_range`-Aufruf auf dem FUSE-Dateideskriptor.
+- Es implementiert einen festen, neustartstabilen Integrity-Information-Zustand.
+- Es lehnt unzulässige, nicht ausgerichtete, übergroße, überlappende oder kurze
+  Klone ab. Es kopiert dann nicht heimlich gepufferte Daten.
+- Es hält `CLOSE` hinter allen vorher akzeptierten Operationen auf demselben
+  Samba-Handle zurück.
+
+Ein Loopback-Test mit SMB 3.1.1 konnte das Modul laden sowie PUT, Listing, GET,
+CLOSE, Bytevergleich und Delete ausführen. Der Modul-Contract und der Build
+gegen Samba 4.23.5 sind dokumentiert in [samba/vfs_fastdup/README.md](samba/vfs_fastdup/README.md).
+Veeam Fast Clone ist noch nicht freigegeben. Es fehlen ein echter Veeam-Trace,
+Protokolltests und die verbleibenden Ausrichtungs-, Lock- und Fehlerfälle.
+
+## Architektur
+
+| Komponente | Aufgabe |
+| --- | --- |
+| `fastdup-format` | Versionierte, geprüfte Bytes für Container, Manifeste, Commit Records und Exact-Index-Runs |
+| `fastdup-store` | Aufbau, Verifikation und atomische Veröffentlichung immutable Container |
+| `fastdup-posix` | Gemeinsames POSIX-Modell, Live-Dirty-Overlay und Low-Level-FUSE-Adapter |
+| `fastdup-appliance` | Checkpoints, Recovery, Metadatengenerationen und der dauerhafte FUSE-Daemon |
+| `fastdup-testkit` | Deterministische I/O-Fehler, Crash-Modell und Corpus-Werkzeuge |
+| `samba/vfs_fastdup` | Experimentelles Samba-VFS-Modul für Duplicate Extents und Integrity FSCTLs |
+
+Die Datenebene trennt Metadaten und DATA. Metadaten, Index, WAL und Recovery
+liegen auf dem Metadata Tier. Große immutable Container liegen auf dem Data
+Tier. Der Speicher setzt Schutz und Redundanz der Geräte voraus. RAID,
+Snapshots und der Schutz vor Geräteverlust gehören nicht zum Projekt.
+
+## Lokal bauen und prüfen
+
+Alle erzeugten Dateien gehören unter `.artifacts`. Die folgenden Variablen
+setzen dafür Rustup, Cargo, Build-Ausgabe und temporäre Dateien auf lokale
+Verzeichnisse:
 
 ```bash
 export RUSTUP_HOME=/source/fastdup/.artifacts/rustup
@@ -93,49 +173,35 @@ export CARGO_TARGET_DIR=/source/fastdup/.artifacts/target
 export TMPDIR=/source/fastdup/.artifacts/tmp
 export PATH=/source/fastdup/.artifacts/cargo/bin:$PATH
 
+mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p fastdup-posix --example fuse_mount_smoke -- \
-  /source/fastdup/.artifacts/tier-meta/fuse-mount
-cargo run --release -p fastdup-store --example raw_store_bench -- \
-  /source/fastdup/.artifacts/bench 32
-cargo run --release -p fastdup-testkit --example generate_structured_corpus -- \
-  /source/fastdup/.artifacts/corpus/structured-v1
-cargo run --release -p fastdup-testkit --example ingest_iso_variants
-cargo run --release -p fastdup-testkit --example audit_container_store
-cargo run --release -p fastdup-store --example reduction_matrix -- \
-  --preset all --workers 8 --inflight-mib 128 \
-  /source/fastdup/.artifacts/corpus/structured-v1/*
-cargo run --release -p fastdup-format --example incompressibility_gate_matrix -- \
-  ISO_PATH 8 v1
-cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
-  --offline scrub METADATA_ROOT CONTAINER_ROOT
 ```
 
-Verified Locations now provide commit-time and recovery DATA proof without a
-Container-directory scan while the active index is healthy. Namespace commits
-rotate through two bounded, overlapping Commit-Log slots, and large recipes are
-published as content-addressed Manifest trees. Lazy reads, equal-length updates,
-append, truncate, and arbitrary length-changing middle splice/concat reuse
-unchanged subtrees without flattening the file recipe. Exact-Run compaction and
-offline rebuild stream inputs with one verified 4-KiB page per source family
-instead of retaining a complete entry set. Offline scrub verifies every retained
-generation, published Container, active index object, and ACTIVE Location; the
-RoW rebuild activates only a fully audited replacement Run Set.
+Eine Matrix für die Inkompressibilitäts-Schranke liest einen Pfad, prüft jedes
+geschriebene Containerbild und gibt CSV aus:
 
-Offline scrub-bound GC removes fully unreachable Containers and compacts
-profitable sets of partially live Containers only after verified replacements
-and a filtered RoW Exact Index are active and the current/previous generation
-proof is revalidated. Online GC still requires RETIRING transitions and pin
-drain. The next recovery work is Metadata GC, a durable
-Container-generation high-water, per-DATA-region Chunking Profile identities,
-and an Appliance Lease/format-epoch fence. A bounded real-process
-[`SIGKILL`/remount/deadline harness](docs/testing/sigkill-remount-deadline.md)
-is green; broad load, randomized kill, and block-device power-cut evidence
-remain open. Partitioned Run
-families remain necessary only when one canonical output exceeds the Run-v1
-one-GiB object bound. Large-store rebuild/scrub performance remains a production
-gate even though the bounded integrity path and deterministic fault matrix are
-implemented.
-The reference reduction implementation remains benchmark evidence and a
-format-design oracle, not permission to bypass POSIX conformance gates.
+```bash
+cargo run --release -p fastdup-format --example incompressibility_gate_matrix -- \
+  ISO_PATH 8 v1
+```
+
+Für das Samba-Modul gibt es einen portablen Contract-Test:
+
+```bash
+sh samba/vfs_fastdup/tests/run.sh
+```
+
+## Grenzen vor einem produktiven Einsatz
+
+fastdup ist noch kein Produkt für produktive Backups. Die wichtigsten offenen
+Punkte sind vollständige POSIX-Abdeckung, Online-GC mit RETIRING-Transitions,
+Metadata-GC, Schutz gegen Geräteverlust, Langzeit-Lasttests, zufällige
+Kill-Tests und Stromausfalltests auf Blockgeräten. Dictionary, Similarity,
+Delta und Reorder brauchen vor einem dauerhaften Format jeweils Writer-,
+Recovery- und Scrub-Invarianten. Für Samba fehlen der reale Veeam-Trace und
+Protokollevidenz für Fast Clone.
+
+Die [ADRs](docs/adr/) enthalten die akzeptierten Entscheidungen und ihre
+Folgen. Die [Test- und Benchmark-Dokumentation](docs/testing/) sowie
+[Benchmarks](docs/benchmarks/) enthalten die belastbaren Messwerte.
