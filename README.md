@@ -1,207 +1,258 @@
 # fastdup
 
-fastdup ist ein einzelner POSIX-Speicher auf FUSE-Basis. Er speichert Dateien
-bytegenau, reduziert wiederholte Inhalte und schreibt dauerhaft nur vollständig
-geprüfte Generationen. Der aktuelle Stand ist ein experimenteller Prototyp,
-kein Backup-Produkt. Besonders wichtig: Exact Dedup, RAW/Zstd-Container,
-Manifeste, Commit-WAL und Wiederherstellung sind im dauerhaften FUSE-Pfad
-implementiert. Similarity, Delta, Dictionary und Reorder existieren bisher nur
-in der Referenz-Pipeline.
+fastdup ist ein experimenteller Single-Node-POSIX-Speicher für Linux. Ein
+FUSE-Dateisystem nimmt normale Dateioperationen an, zerlegt neue Inhalte mit
+SeqCDC-v1 und speichert identische Chunks nur einmal. Dateien werden bytegenau
+aus unveränderlichen, geprüften Containern und versionierten Metadaten
+wiederhergestellt.
 
-Die wichtigsten Begriffe und Abgrenzungen stehen in [CONTEXT.md](CONTEXT.md).
-Das dauerhafte Format ist absichtlich versioniert. Die genauen Bytes stehen in
-den Spezifikationen für [Container](docs/specs/container-v1.md),
-[Metadatengenerationen](docs/specs/metadata-generation-v1.md) und den
-[Exact Index](docs/specs/exact-index-run-v1.md).
+Das Repository ist ein Prototyp und noch kein Backup-Produkt. Der dauerhafte
+Pfad umfasst Exact Dedup, RAW/Zstd-Encoding, sparse Dateien, Checkpoints,
+Recovery, Scrub und einen neu aufbaubaren Exact Index. Similarity, Delta,
+Dictionary und Reorder sind Forschungs- oder Referenzpfade und noch nicht Teil
+des dauerhaften FUSE-Formats.
 
-## Was heute funktioniert
+Die verbindlichen Begriffe stehen in [CONTEXT.md](CONTEXT.md). Entscheidungen
+über Haltbarkeit und Formate stehen in den [ADRs](docs/adr/).
 
-Der dauerhafte FUSE-Pfad kann Dateien anlegen, öffnen, lesen, schreiben,
-verkürzen, umbenennen, löschen und Verzeichnisse auflisten. Er unterstützt
-zufällige Writes, append, `O_TRUNC`, `O_EXCL`, `RENAME_NOREPLACE`, `fsync`,
-`flush` und sparse Dateien mit sehr großen Offsets. Ein Write in eine Lücke
-legt nur die geschriebenen Bytes ab. Unbelegte Bereiche bleiben HOLE-Extents.
+## Aktueller Funktionsumfang
 
-`copy_file_range` erzeugt Metadatenklone. Dabei liest fastdup weder die
-Quell-DATA noch zerlegt es sie neu, wenn die Quelle vollständig allokiert und
-bereits unveränderlich ist. Der Test klonte 2 MiB ab einem nicht an
-FastCDC-Grenzen ausgerichteten Offset. Der Checkpoint schrieb dabei keine neuen
-Container und die Wiederherstellung war bytegenau. Details und Fehlerfälle
-stehen im [Fast-Clone-Testplan](docs/testing/veeam-fast-clone.md).
+Der FUSE-Pfad unterstützt unter anderem:
 
-Der derzeitige FUSE-Adapter implementiert keinen vollständigen POSIX-Umfang.
-`mkdir`, Unterverzeichnisse, Hardlinks, Symlinks, xattrs, Besitz- und
-Rechteänderungen, Dateisperren, `statfs` sowie `fallocate` fehlen oder liefern
-`EOPNOTSUPP`. Die [POSIX-Konformanzplanung](docs/testing/posix-conformance.md)
-führt den verbleibenden Umfang mit Tests auf.
+- Dateien anlegen, öffnen, lesen, schreiben, verkürzen, umbenennen und löschen
+- zufällige Writes, Append, `O_TRUNC`, `O_EXCL`, `RENAME_NOREPLACE`, `flush`
+  und `fsync`
+- sparse Dateien mit DATA-, FILL- und HOLE-Extents
+- Metadatenklone über `copy_file_range`, ohne bereits unveränderliche DATA
+  erneut zu lesen oder zu chunken
+- absturzsichere Checkpoints und Recovery auf den jüngsten vollständigen
+  Commit
+- Offline-Scrub, Garbage Collection und Neuaufbau des Exact Index
 
-## Dauerhaftes Speicher- und Integritätsmodell
+Der Adapter bildet noch nicht den gesamten POSIX-Umfang ab. Unterverzeichnisse,
+Hardlinks, Symlinks, xattrs, Besitz- und Rechteänderungen, Dateisperren,
+`statfs` und `fallocate` fehlen ganz oder teilweise. Der verbleibende Umfang
+ist in der [POSIX-Testplanung](docs/testing/posix-conformance.md) erfasst.
 
-Jede akzeptierte Änderung wird sofort im Live-Namensraum sichtbar. Ein
-Checkpoint friert einen konsistenten Präfix ein und veröffentlicht ihn nur,
-nachdem DATA, Metadaten und Commit Record vollständig geschrieben und geprüft
-sind. Nach einem Absturz lädt fastdup die jüngste vollständige Generation.
-Eine unterbrochene Ingest-Datei kann daher mit einem gültigen, bereits
-committeten Präfix zurückkehren.
+## Ingest-Pipeline
 
-Der Standard-Daemon plant einen Checkpoint alle fünf Sekunden. Bei 512 MiB
-einzigartiger, noch nicht eingecheckter DATA schließt er kurz die Aufnahme
-neuer Mutationen, damit die Dirty-DATA-Menge begrenzt bleibt. Bereits
-angenommene Writes und Reads bleiben verfügbar. `fsync` macht daraus keine
-eigene private Transaktion. Siehe [Checkpoint-Design und Fehlerfälle](docs/testing/durable-posix-checkpoint.md).
+Ein Write durchläuft den Live-Namensraum und anschließend die dauerhafte
+Reduktionspipeline:
 
-Der Speicher prüft Daten an mehreren Grenzen:
+1. SeqCDC-v1 bestimmt inhaltsabhängige Chunkgrenzen.
+2. BLAKE3-256 bildet die Chunk-ID und prüft rekonstruierte Bytes.
+3. Der Exact Index sucht eine bereits geprüfte Location. Er ist nur eine
+   Beschleunigung und keine Wahrheitsquelle.
+4. Neue benachbarte Chunks werden zu höchstens 512 KiB großen Compression
+   Regions zusammengefasst.
+5. Jede Region wird RAW oder als unabhängiger Zstd-Level-3-Record gespeichert.
+   Zstd wird nur gewählt, wenn die vollständige Speicherung mindestens 4 KiB
+   und 3 Prozent spart.
+6. Ein Checkpoint veröffentlicht Container, Manifeste, Exact-Index-Runs und
+   den neuen Namespace-Commit in der vorgeschriebenen Reihenfolge.
 
-- BLAKE3-256 identifiziert jeden Logical Chunk und verifiziert wiederhergestellte Bytes.
-- CRC32C, Header, Footer und physische Länge prüfen Container-Struktur und Veröffentlichung.
-- Ein Commit-WAL mit verketteten, gecheckten Records wählt die sichtbare Namespace-Generation.
-- Immutable Manifeste beschreiben Dateien inklusive DATA-, FILL- und HOLE-Extents.
-- Der Exact Index beschleunigt Treffer, ist aber keine Wahrheitsquelle. Fehlt er
-  oder ist er beschädigt, sucht der Leser über geprüfte Container weiter.
-- Offline Scrub prüft erreichbare Generationen, Container und aktive Locations.
-  Der [Ablauf für Scrub und Index-Rebuild](docs/operations/scrub-and-exact-index-rebuild.md)
-  beschreibt diese Wartung.
+Gleichförmige allokierte Bereiche werden als FILL gespeichert. Nicht
+allokierte Nullbereiche bleiben HOLE und benötigen keinen DATA-Record.
 
-Container durchlaufen `BUILDING`, vollständigen Reread, `fsync`, atomisches
-Veröffentlichen ohne Überschreiben und Directory-Sync. Ein Fehlereinwurf-Test
-akzeptiert bei der Wiederherstellung nur "nicht vorhanden" oder "vollständig
-geprüft". Das Dateiformat speichert Felder einzeln und hängt nicht vom
-Speicherlayout von Rust ab.
+```text
+POSIX/FUSE write
+      |
+      v
+Live-Namensraum -> SeqCDC -> BLAKE3 -> Exact Lookup
+                                           | Treffer
+                                           +----------> vorhandene Location
+                                           |
+                                           | neu
+                                           v
+                                      RAW oder Zstd
+                                           |
+                                           v
+                                Container -> Manifest -> Commit-WAL
+```
 
-## Datenreduktion und Algorithmen
+Die Stufen teilen sich ein begrenztes CPU- und Speicherbudget. Dadurch kann
+ein einzelner Stream freie Kerne nutzen, ohne bei mehreren Streams unbegrenzt
+zusätzliche Arbeit oder Speicher zu erzeugen.
 
-Der dauerhafte Pfad verwendet FastCDC v2020 mit 16 KiB Minimum, 64 KiB Ziel
-und 256 KiB Maximum. Gleiche Chunks trifft der Exact Index über BLAKE3-256 und
-verwendet eine bereits geprüfte Location erneut. Neue, benachbarte Chunks
-bilden maximal 512 KiB große Compression Regions. Der Writer wählt RAW oder
-unabhängiges Zstd Level 3 nur dann, wenn die komplette Speicherung mindestens
-4 KiB und 3 Prozent spart. Gleichförmige allokierte Bereiche werden als FILL
-gespeichert, unallokierte Nullbereiche als HOLE.
+## SeqCDC-v1 und SIMD
 
-| Technik | Dauerhafter FUSE-Pfad | Referenz-Pipeline |
-| --- | --- | --- |
-| FastCDC, BLAKE3-Exact Dedup, FILL und HOLE | Ja | Ja |
-| RAW und unabhängiges Zstd Level 3 | Ja | Ja |
-| Immutable Container, Manifest, Commit-WAL, Exact-Index-Runs | Ja | Nein |
-| LZ4 plus Zstd-Level-1 Inkompressibilitäts-Schranke | Benchmark-Policy, Store bleibt auf `off` | Nein |
-| Zstd-Dictionaries | Noch nicht dauerhaft | Ja |
-| Similarity-Suche und Depth-1 Sparse-XOR Delta | Noch nicht dauerhaft | Ja |
-| Bounded Reorder | Noch nicht dauerhaft | Ja |
-| Automatische Garbage Collection | Noch nicht online | Nein |
+SeqCDC-v1 ist das Standardprofil für Write-through-Ingest und
+Checkpoint-Rechunking. Die Parameter sind:
 
-Die Inkompressibilitäts-Schranke probiert bei Regionen ab 128 KiB zuerst LZ4
-und bei Bedarf Zstd Level 1, um einen voraussichtlich nutzlosen Zstd-Level-3
-Lauf zu vermeiden. Sie schreibt keine zusätzlichen Formate. RAW und Zstd
-bleiben die einzigen unabhängigen Records. Die aktuelle Rocky-ISO-Messung
-verfehlte jedoch die CPU- und Platz-Grenzen für die Freigabe. Deshalb nutzt der
-Store weiter den Baseline-Modus. Die Messwerte und Kriterien stehen in
-[zstd-incompressibility-gate](docs/research/zstd-incompressibility-gate.md).
+| Parameter | Wert |
+| --- | ---: |
+| Modus | Increasing |
+| Sequenzlänge | 6 Bytes |
+| Skip-Trigger | 50 Gegenflanken |
+| Skip-Länge | 1.024 Bytes |
+| Minimale Chunkgröße | 16 KiB |
+| Maximale Chunkgröße | 256 KiB |
 
-Die Referenz-Pipeline ist nützlich, um die späteren Algorithmen gegen echte
-Daten zu prüfen. Sie ist kein Ersatz für den dauerhaften FUSE-Pfad. Ihre
-Similarity-Suche begrenzt Kandidaten, Delta-Tiefe und Speicher pro Bucket.
-Ein Delta darf nur einen Base Chunk benötigen. Dictionaries bleiben immutable
-und inhaltsidentifiziert. [Die vollständige Referenzbeschreibung](docs/benchmarks/data-reduction-reference-v1.md)
-enthält Grenzen, Korpora und negative Fälle.
+Auf CPUs mit AVX2 und BMI2 verwendet der Scanner automatisch einen
+vektorisierten Kernel. Auf anderen CPUs läuft die skalare Implementierung.
+Beide Pfade liefern exakt dieselben Grenzen; Differentialtests prüfen diese
+Eigenschaft. Punktuelles `unsafe` ist auf den SIMD-Kernel begrenzt, der sichere
+Aufrufer prüft die CPU-Features und Slice-Grenzen.
 
-## Gemessene Datenreduktion
+`FASTDUP_SEQCDC_FORCE_SCALAR=1` schaltet ausschließlich für Diagnose und
+Vergleichsmessungen auf den skalaren Pfad. Für den normalen Betrieb ist keine
+Umgebungsvariable nötig.
 
-Die Quoten hängen stark vom Datenbestand ab. Sie sind keine Kapazitätszusage.
-Alle folgenden Läufe haben die Ergebnisse bytegenau wiederhergestellt.
+Auf der gemessenen Rocky-ISO erreichte der isolierte AVX2/BMI2-Scanner 8.009
+MiB/s und damit das 2,90-Fache des skalaren SeqCDC-Scanners. Im gepaarten
+SingleStream-SMB-Test stieg der Median des Gesamtdurchsatzes gegenüber
+skalarem SeqCDC um 13,8 Prozent; bei zwei gleichzeitigen Streams waren es
+4,4 Prozent. Das sind Ergebnisse eines bestimmten Hosts und keine
+Kapazitätszusage. Aufbau, Rohdaten, Streuung und Einschränkungen stehen im
+[SeqCDC-Benchmark](docs/benchmarks/seqcdc-prototype-2026-08-22.md).
 
-| Pfad und Workload | Ergebnis | Einordnung |
-| --- | ---: | --- |
-| Dauerhafter FUSE-Lauf, 50 eng verwandte Rocky-ISO-Varianten | 61,18x Logical/DATA, 42,95x mit Metadaten | 98,311 Prozent der Checkpoint-Bytes waren Exact Hits. Gelöschte Container blieben mangels GC liegen. Das ist daher Ingest-Reduktion, keine aktuelle freie Kapazität. |
-| Samba plus FUSE, drei serielle Kopien derselben 2,07-GB Rocky-ISO | 2,840x bis 2,904x | Alle drei Dateien blieben live. Der Exact-Index-Filter senkte Exact-Page-Zugriffe um rund 75 Prozent bei etwa 41 KiB Filterdaten. |
-| Referenz-Pipeline, zehn leicht veränderte Rocky-ISOs | 10,676x Payload-Reduktion | Enthält Exact, Zstd, Similarity, Delta, FILL und Reorder. Container-Overhead, Metadaten und Dateisystembelegung sind nicht enthalten. |
-| Referenz-Pipeline, XML und JSON | 6,174x Payload-Reduktion | Jede CDC-Region änderte sich, deshalb gab es dort keine Exact Hits. |
+Der Wechsel auf SeqCDC-v1 änderte die Policy- und Exact-Index-Profilidentitäten.
+Ältere FastCDC-Prototyp-Repositories sind absichtlich inkompatibel. Die
+Entscheidung ist in [ADR 0054](docs/adr/0054-use-seqcdc-v1-as-the-default-chunking-profile.md)
+festgehalten.
 
-Der aktuelle Ende-zu-Ende-FUSE-Lauf schrieb mit einem p95 von 545,3 MB/s und
-las bytegeprüft mit einem p95 von 922,7 MB/s. Seine DATA-Checkpoints lagen bei
-2,496 s p95 und 2,846 s maximal. Er erfüllte die geprüfte 10-Sekunden-Grenze,
-lief 601 Sekunden, schrieb 124,2 GB logisch und startete nach dem Abschluss in
-55 ms mit einem leeren Namespace. Die vollständige Messmethode, I/O-Zähler und
-Einschränkungen stehen in [io-intensive-fuse-600s](docs/benchmarks/io-intensive-fuse-600s.md).
+## Haltbarkeit und Integrität
 
-## SMB und Samba
+Akzeptierte Änderungen sind sofort im Live-Namensraum sichtbar. Ein Checkpoint
+friert einen konsistenten Präfix ein und veröffentlicht ihn erst, nachdem DATA,
+Metadaten und Commit Record vollständig geschrieben und geprüft wurden. Nach
+einem Absturz lädt fastdup die jüngste vollständige Generation. Eine
+unterbrochene Datei kann deshalb mit ihrem bereits committeten Präfix
+zurückkehren.
 
-`samba/vfs_fastdup` ist ein experimentelles GPL-3.0-or-later VFS-Modul für
-Samba 4.23.5. Eine normale SMB-Freigabe kann den fastdup-FUSE-Mount verwenden.
-Das Modul ergänzt gezielt die Funktionen, die ein Fast-Clone-Client benötigt:
+Der Standard-Daemon plant etwa alle fünf Sekunden einen Checkpoint. Bei 512
+MiB einzigartiger, noch nicht committeter DATA stoppt er kurz die Aufnahme
+neuer Mutationen, um die Dirty-DATA-Menge zu begrenzen. `fsync` erzeugt keine
+private Transaktion und verschärft die Haltbarkeitsgarantie nicht.
 
-- Es meldet `FILE_SUPPORTS_BLOCK_REFCOUNTING` nur bei explizit aktivierter Freigabe.
-- Es übersetzt `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in genau einen Linux-
-  `copy_file_range`-Aufruf auf dem FUSE-Dateideskriptor.
-- Es implementiert einen festen, neustartstabilen Integrity-Information-Zustand.
-- Es lehnt unzulässige, nicht ausgerichtete, übergroße, überlappende oder kurze
-  Klone ab. Es kopiert dann nicht heimlich gepufferte Daten.
-- Es hält `CLOSE` hinter allen vorher akzeptierten Operationen auf demselben
-  Samba-Handle zurück.
+Die dauerhaften Grenzen werden mehrfach geprüft:
 
-Ein Loopback-Test mit SMB 3.1.1 konnte das Modul laden sowie PUT, Listing, GET,
-CLOSE, Bytevergleich und Delete ausführen. Der Modul-Contract und der Build
-gegen Samba 4.23.5 sind dokumentiert in [samba/vfs_fastdup/README.md](samba/vfs_fastdup/README.md).
-Veeam Fast Clone ist noch nicht freigegeben. Es fehlen ein echter Veeam-Trace,
-Protokolltests und die verbleibenden Ausrichtungs-, Lock- und Fehlerfälle.
+- BLAKE3-256 bindet Logical Chunks an ihre Inhalte.
+- CRC32C, Header, Footer, physische Länge und Container-Hash prüfen Container.
+- Unveränderliche Manifeste beschreiben jede sichtbare Dateiversion.
+- Ein verkettetes, gechecksummtes Commit-WAL wählt die Namespace-Generation.
+- Der Exact Index darf fehlen oder neu aufgebaut werden, ohne zur
+  Inhaltsautorität zu werden.
+- Scrub prüft erreichbare Generationen, Container und aktive Locations.
 
-## Architektur
+Container werden zunächst aufgebaut, vollständig erneut gelesen und geprüft,
+mit `fsync` stabilisiert, atomisch ohne Überschreiben veröffentlicht und durch
+einen Directory-Sync abgeschlossen. Das Modell setzt einen ehrlichen
+Stable-Storage-Stack voraus. RAID, Gerätespiegelung, Snapshots und Schutz gegen
+Geräteverlust gehören nicht zu fastdup.
 
-| Komponente | Aufgabe |
-| --- | --- |
-| `fastdup-format` | Versionierte, geprüfte Bytes für Container, Manifeste, Commit Records und Exact-Index-Runs |
-| `fastdup-store` | Aufbau, Verifikation und atomische Veröffentlichung immutable Container |
-| `fastdup-posix` | Gemeinsames POSIX-Modell, Live-Dirty-Overlay und Low-Level-FUSE-Adapter |
-| `fastdup-appliance` | Checkpoints, Recovery, Metadatengenerationen und der dauerhafte FUSE-Daemon |
-| `fastdup-testkit` | Deterministische I/O-Fehler, Crash-Modell und Corpus-Werkzeuge |
-| `samba/vfs_fastdup` | Experimentelles Samba-VFS-Modul für Duplicate Extents und Integrity FSCTLs |
+Details stehen im
+[Checkpoint-Testplan](docs/testing/durable-posix-checkpoint.md), in der
+[Container-Spezifikation](docs/specs/container-v1.md), der
+[Metadatenspezifikation](docs/specs/metadata-generation-v1.md) und der
+[Exact-Index-Spezifikation](docs/specs/exact-index-run-v1.md).
 
-Die Datenebene trennt Metadaten und DATA. Metadaten, Index, WAL und Recovery
-liegen auf dem Metadata Tier. Große immutable Container liegen auf dem Data
-Tier. Der Speicher setzt Schutz und Redundanz der Geräte voraus. RAID,
-Snapshots und der Schutz vor Geräteverlust gehören nicht zum Projekt.
+## Bauen und testen
 
-## Lokal bauen und prüfen
-
-Alle erzeugten Dateien gehören unter `.artifacts`. Die folgenden Variablen
-setzen dafür Rustup, Cargo, Build-Ausgabe und temporäre Dateien auf lokale
-Verzeichnisse:
+Vorausgesetzt werden Linux, eine aktuelle Rust-Toolchain und für einen echten
+Mount ein nutzbares `/dev/fuse`. Alle erzeugten Dateien bleiben unter
+`.artifacts`:
 
 ```bash
+cd /source/fastdup
+
 export RUSTUP_HOME=/source/fastdup/.artifacts/rustup
 export CARGO_HOME=/source/fastdup/.artifacts/cargo
 export CARGO_TARGET_DIR=/source/fastdup/.artifacts/target
 export TMPDIR=/source/fastdup/.artifacts/tmp
 export PATH=/source/fastdup/.artifacts/cargo/bin:$PATH
 
-mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
-cargo test --workspace
+mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR" "$TMPDIR"
+
+cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+cargo build --release -p fastdup-appliance
 ```
 
-Eine Matrix für die Inkompressibilitäts-Schranke liest einen Pfad, prüft jedes
-geschriebene Containerbild und gibt CSV aus:
+## Lokalen Mount starten
+
+Mountpunkt, Metadatenwurzel und Containerwurzel müssen bestehende
+Verzeichnisse sein. Metadaten und Container dürfen nicht dasselbe Verzeichnis
+sein. Für einen lokalen Funktionstest reichen getrennte Unterverzeichnisse;
+repräsentative Messungen sollten getrennte Metadata- und DATA-Geräte nutzen.
 
 ```bash
-cargo run --release -p fastdup-format --example incompressibility_gate_matrix -- \
-  ISO_PATH 8 v1
+mkdir -p \
+  /source/fastdup/.artifacts/mount \
+  /source/fastdup/.artifacts/repository/metadata \
+  /source/fastdup/.artifacts/repository/containers
+
+/source/fastdup/.artifacts/target/release/fastdup-durable-fuse \
+  /source/fastdup/.artifacts/mount \
+  /source/fastdup/.artifacts/repository/metadata \
+  /source/fastdup/.artifacts/repository/containers
 ```
 
-Für das Samba-Modul gibt es einen portablen Contract-Test:
+Der Daemon läuft im Vordergrund. `Ctrl-C` stoppt die Mutationsannahme, führt
+den abschließenden Checkpoint aus und hängt den Mount aus.
+
+## Offline-Wartung
+
+Vor Wartungsarbeiten muss der fastdup-Daemon beendet und der Mount ausgehängt
+sein. `--offline` ist deshalb verpflichtend.
+
+```bash
+BIN=/source/fastdup/.artifacts/target/release/fastdup-maintenance
+META=/source/fastdup/.artifacts/repository/metadata
+DATA=/source/fastdup/.artifacts/repository/containers
+
+"$BIN" --offline scrub "$META" "$DATA"
+"$BIN" --offline rebuild-exact "$META" "$DATA"
+"$BIN" --offline scrub-gc "$META" "$DATA"
+```
+
+`scrub-gc` koppelt Garbage Collection an einen erfolgreichen Scrub und den
+beobachteten Füllstand des DATA-Geräts. Ablauf und Ausgaben beschreibt die
+[Wartungsanleitung](docs/operations/scrub-and-exact-index-rebuild.md).
+
+## SMB und Samba
+
+Eine Samba-Freigabe kann auf dem FUSE-Mount liegen. Das experimentelle Modul
+[`samba/vfs_fastdup`](samba/vfs_fastdup/README.md) ergänzt Duplicate Extents
+und Integrity FSCTLs für Fast-Clone-Clients. Es übersetzt einen gültigen
+`FSCTL_DUPLICATE_EXTENTS_TO_FILE`-Aufruf in genau einen Linux-
+`copy_file_range`-Aufruf und fällt bei Fehlern nicht unbemerkt auf eine
+gepufferte Kopie zurück.
+
+Das Modul ist noch nicht für Veeam Fast Clone freigegeben. Es fehlen reale
+Veeam-Traces, breitere Protokolltests und weitere Lock-, Alignment- und
+Fehlerfälle. Der portable Contract-Test läuft mit:
 
 ```bash
 sh samba/vfs_fastdup/tests/run.sh
 ```
 
-## Grenzen vor einem produktiven Einsatz
+## Workspace
 
-fastdup ist noch kein Produkt für produktive Backups. Die wichtigsten offenen
-Punkte sind vollständige POSIX-Abdeckung, Online-GC mit RETIRING-Transitions,
-Metadata-GC, Schutz gegen Geräteverlust, Langzeit-Lasttests, zufällige
-Kill-Tests und Stromausfalltests auf Blockgeräten. Dictionary, Similarity,
-Delta und Reorder brauchen vor einem dauerhaften Format jeweils Writer-,
-Recovery- und Scrub-Invarianten. Für Samba fehlen der reale Veeam-Trace und
-Protokollevidenz für Fast Clone.
+| Komponente | Aufgabe |
+| --- | --- |
+| `fastdup-format` | Versionierte Container-, Manifest-, Commit- und Exact-Index-Bytes |
+| `fastdup-store` | SeqCDC, Reduktion, Container, Exact Index, Scrub und GC |
+| `fastdup-io-uring` | Linux-`io_uring`-Pfad für Container-I/O mit geprüftem Fallback |
+| `fastdup-posix` | POSIX-Modell, Live-Dirty-Overlay und Low-Level-FUSE-Adapter |
+| `fastdup-appliance` | Ingest, Checkpoints, Recovery und ausführbare Programme |
+| `fastdup-copy-metrics` | Günstige Hot-Path- und Kopiertelemetrie |
+| `fastdup-testkit` | Deterministische Fehler, Crash-Modell und Corpus-Werkzeuge |
+| `samba/vfs_fastdup` | Experimentelles Samba-VFS-Modul für Fast Clone |
 
-Die [ADRs](docs/adr/) enthalten die akzeptierten Entscheidungen und ihre
-Folgen. Die [Test- und Benchmark-Dokumentation](docs/testing/) sowie
-[Benchmarks](docs/benchmarks/) enthalten die belastbaren Messwerte.
+## Grenzen
+
+Vor einem produktiven Einsatz fehlen insbesondere:
+
+- vollständige POSIX-Abdeckung und breitere Client-Kompatibilität
+- Online-GC und Metadata-GC im laufenden Betrieb
+- Schutz vor Geräteverlust
+- Langzeit-, Zufalls-Kill- und echte Stromausfalltests auf Blockgeräten
+- dauerhafte Writer-, Recovery- und Scrub-Invarianten für Similarity, Delta,
+  Dictionary und Reorder
+- Veeam-Protokollevidenz für das Samba-Modul
+
+Messwerte sind workload- und hostabhängig. Reproduzierbare Methoden und
+Einschränkungen liegen unter [docs/benchmarks](docs/benchmarks/), Testpläne
+unter [docs/testing](docs/testing/) und Betriebsnotizen unter
+[docs/operations](docs/operations/).
