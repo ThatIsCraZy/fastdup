@@ -254,6 +254,38 @@ fn prepared_container_transfers_owned_image_once_into_the_ring_publisher() {
 }
 
 #[test]
+fn one_large_publication_uses_parallel_container_hash_verification() {
+    let root = test_root("parallel-container-hash");
+    let storage = IoUringStorageIo::open_required(&root, IoUringStorageConfig::default())
+        .expect("active io_uring backend");
+    let repository = ContainerRepository::new(storage.clone());
+    let payload = pseudorandom_bytes(8 * 1_024 * 1_024, 0x87ad_190e_44bc_f217);
+    let chunks = payload.chunks(256 * 1_024).collect::<Vec<_>>();
+    let regions = chunks.chunks(2).collect::<Vec<_>>();
+    let prepared = ContainerRepository::<IoUringStorageIo>::prepare_adaptive_regions_parallel(
+        ContainerId::new([0xD3; 16]).expect("fixture Container ID is nonzero"),
+        29,
+        &regions,
+        NonZeroUsize::MIN,
+    )
+    .expect("prepare large fixture Container");
+
+    repository
+        .publish_prepared_adaptive_profiled(prepared)
+        .expect("publish and verify large fixture Container");
+
+    let status = storage.status();
+    assert_eq!(status.parallel_hash_verifications(), 1);
+    assert_eq!(status.verification_jobs_started(), 1);
+    assert_eq!(status.verification_jobs_completed(), 1);
+    assert_eq!(status.verification_jobs_failed(), 0);
+
+    drop(repository);
+    drop(storage);
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
 fn owned_publication_rejected_by_budget_creates_no_temporary_name() {
     let root = test_root("owned-budget-rejection");
     let config = IoUringStorageConfig::new(

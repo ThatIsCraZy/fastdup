@@ -1954,6 +1954,138 @@ fn append_checkpoint_container_range_reads(prefix_bytes: usize) -> usize {
 }
 
 #[test]
+fn checkpoint_consumes_writer_verified_dependencies_without_record_reread() {
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let indexes = MemoryStorageIo::new();
+    let appliance = DurableNamespace::open_with_index(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        ContainerRepository::new(containers.clone()),
+        &ExactIndexRunRepository::new(indexes),
+        16,
+    )
+    .expect("open proof-carrying appliance");
+    let payload = pseudorandom_payload(2 * 1_024 * 1_024, 0x3e62_1f8b_94ad_c507);
+    create_and_write(&appliance, b"verified-dependency", &payload);
+
+    let baseline = containers.operation_count();
+    appliance
+        .checkpoint()
+        .expect("commit writer-verified DATA")
+        .expect("new DATA requires one generation");
+    let record_rereads = containers.operations()[baseline..]
+        .iter()
+        .filter(|operation| **operation == StorageOperation::ReadExactAt)
+        .count();
+    assert_eq!(
+        record_rereads, 0,
+        "the online successor commit must consume writer verification instead of rereading DATA Records"
+    );
+}
+
+#[test]
+fn second_identical_file_reuses_online_dependency_proof_without_data_reread() {
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let indexes = MemoryStorageIo::new();
+    let appliance = DurableNamespace::open_with_index(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        ContainerRepository::new(containers.clone()),
+        &ExactIndexRunRepository::new(indexes),
+        16,
+    )
+    .expect("open online-proof appliance");
+    let payload = pseudorandom_payload(2 * 1_024 * 1_024, 0x197e_38a4_cd52_f06b);
+    create_and_write(&appliance, b"first-copy", &payload);
+    appliance
+        .checkpoint()
+        .expect("commit first copy")
+        .expect("first copy requires one generation");
+    let after_first = appliance.historical_proof_cache_status();
+    assert!(after_first.admissions() > 0);
+    assert!(after_first.entry_count() > 0);
+
+    let baseline = containers.operation_count();
+    let cache_hits = after_first.hits();
+    create_and_write(&appliance, b"second-copy", &payload);
+    appliance
+        .checkpoint()
+        .expect("commit second copy")
+        .expect("second copy requires one generation");
+    let record_rereads = containers.operations()[baseline..]
+        .iter()
+        .filter(|operation| **operation == StorageOperation::ReadExactAt)
+        .count();
+    assert_eq!(
+        record_rereads, 0,
+        "an immutable Location already proven in this process must not be reread for an identical successor file"
+    );
+    assert!(
+        appliance.historical_proof_cache_status().hits() > cache_hits,
+        "the second stream must consume committed history through production S3-FIFO"
+    );
+}
+
+#[test]
+fn actual_ingest_emits_replayable_online_proof_events() {
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let indexes = MemoryStorageIo::new();
+    let appliance = DurableNamespace::open_with_index(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        ContainerRepository::new(containers),
+        &ExactIndexRunRepository::new(indexes),
+        16,
+    )
+    .expect("open traceable appliance");
+    appliance
+        .start_online_proof_trace(16_384)
+        .expect("start bounded trace");
+    let payload = pseudorandom_payload(2 * 1_024 * 1_024, 0x9f41_37bd_82a6_c501);
+    create_and_write(&appliance, b"trace-first", &payload);
+    appliance
+        .checkpoint()
+        .expect("commit first traced copy")
+        .expect("first traced copy changes namespace");
+    create_and_write(&appliance, b"trace-second", &payload);
+    appliance
+        .checkpoint()
+        .expect("commit second traced copy")
+        .expect("second traced copy changes namespace");
+    let trace = appliance
+        .finish_online_proof_trace()
+        .expect("finish bounded trace");
+
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        fastdup_appliance::ProofCacheEvent::AdmitPublished { .. }
+    )));
+    assert!(
+        trace
+            .events()
+            .iter()
+            .any(|event| matches!(event, fastdup_appliance::ProofCacheEvent::Lookup { .. }))
+    );
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        fastdup_appliance::ProofCacheEvent::AdmitExactReuse { .. }
+    )));
+    let budget = 64 * 1_024 * 1_024;
+    for policy in [
+        fastdup_appliance::ProofCachePolicy::S3Fifo,
+        fastdup_appliance::ProofCachePolicy::Sieve,
+    ] {
+        let report = fastdup_appliance::replay_proof_cache_trace(&trace, policy, budget)
+            .expect("replay actual ingest trace");
+        assert!(report.lookups() > 0);
+        assert_eq!(report.byte_budget(), budget);
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn sparse_update_reuses_unchanged_data_and_preserves_holes() {
     let root = unique_test_root("bounded-sparse-checkpoint");

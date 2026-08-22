@@ -9,6 +9,7 @@ fastdup-format.workspace = true
 fastdup-store.workspace = true
 io-uring.workspace = true
 libc.workspace = true
+rayon.workspace = true
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

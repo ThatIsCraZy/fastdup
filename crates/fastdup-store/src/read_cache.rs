@@ -163,7 +163,12 @@ impl VerifiedReadCacheConfig {
     }
 }
 
-pub(crate) fn shared_cache_reserve_bytes(effective_limit_bytes: u64) -> u64 {
+/// Returns the process headroom that all rebuildable caches must leave free.
+///
+/// Cache modules share this rule so independent byte budgets cannot redefine
+/// the memory needed by Dirty DATA, reduction workers, XFS, and device queues.
+#[must_use]
+pub fn shared_cache_reserve_bytes(effective_limit_bytes: u64) -> u64 {
     (effective_limit_bytes / 4).max(MINIMUM_SYSTEM_RESERVE_BYTES)
 }
 

@@ -148,10 +148,24 @@ fn retry_after_ambiguous_container_publish_consumes_a_fresh_generation() {
         appliance.checkpoint().is_err(),
         "fail-after directory sync must remain an ambiguous publication error"
     );
+    assert_eq!(
+        appliance.historical_proof_cache_status().entry_count(),
+        0,
+        "a failed commit must keep its Frozen proofs pinned outside Historical S3-FIFO"
+    );
     appliance
         .checkpoint()
         .expect("retry the same frozen commit cut")
         .expect("retry publishes a complete generation");
+    assert!(
+        appliance.historical_proof_cache_status().entry_count() > 0,
+        "only the successful retry may demote Frozen proofs into Historical S3-FIFO"
+    );
+    assert_eq!(
+        appliance.generation_proof_set_status().frozen_proofs(),
+        0,
+        "a successful retry must release its Frozen proof ownership"
+    );
     let mut generations = ContainerRepository::new(containers)
         .verify_published()
         .expect("both immutable publications verify")
@@ -164,6 +178,48 @@ fn retry_after_ambiguous_container_publish_consumes_a_fresh_generation() {
         vec![1, 2],
         "an ambiguous durable container must not cause generation reuse"
     );
+}
+
+#[test]
+fn metadata_failure_keeps_verified_data_proofs_frozen_until_retry_commits() {
+    let probe_metadata = MemoryStorageIo::new();
+    let probe_containers = MemoryStorageIo::new();
+    let probe = open(probe_metadata.clone(), probe_containers);
+    let baseline = probe_metadata.operation_count();
+    write_fixture(&probe);
+    probe
+        .checkpoint()
+        .expect("probe checkpoint succeeds")
+        .expect("probe writes one generation");
+    assert!(
+        !probe_metadata.operations()[baseline..].is_empty(),
+        "checkpoint must publish metadata after DATA verification"
+    );
+
+    let metadata = MemoryStorageIo::with_fail_before(baseline);
+    let containers = MemoryStorageIo::new();
+    let appliance = open(metadata, containers);
+    write_fixture(&appliance);
+    assert!(
+        appliance.checkpoint().is_err(),
+        "metadata failure after DATA verification must fail the commit"
+    );
+    assert_eq!(
+        appliance.historical_proof_cache_status().entry_count(),
+        0,
+        "failed metadata visibility must not demote Frozen proofs"
+    );
+    assert!(
+        appliance.generation_proof_set_status().frozen_proofs() > 0,
+        "verified DATA must remain pinned for the Frozen retry"
+    );
+
+    appliance
+        .checkpoint()
+        .expect("retry Frozen metadata commit")
+        .expect("retry commits the generation");
+    assert_eq!(appliance.generation_proof_set_status().frozen_proofs(), 0);
+    assert!(appliance.historical_proof_cache_status().entry_count() > 0);
 }
 
 #[test]

@@ -35,6 +35,24 @@ confined to kernel I/O boundaries. Maintenance job admission and coordinator
 priority retain ADR 0048's policy; the common CPU pool itself does not claim a
 separate priority scheduler.
 
+FastCDC Chunk identities are parallelized across a bounded batch of complete
+Chunks; one 16--256-KiB Chunk never creates nested Rayon work. Container-image
+BLAKE3 may use the tree hasher across the shared pool only at or above the
+measured 2-MiB crossover and only when the caller owns permits for the complete
+pool. A verifier batch with several Containers parallelizes across Containers;
+only a single large Container may consume the full pool internally. This keeps
+thread count fixed and prevents nested jobs from claiming more CPU than their
+admission budget.
+
+The identity computed for a stable FastCDC Chunk is carried through the
+Container writer together with the immutable Chunk bytes. It is optimization
+evidence, not authority: the writer may use it for the Chunk table and avoid
+rehashing or serializing a losing RAW candidate, but publication must reread
+the completed image and recompute every Chunk identity before making the
+canonical Container name visible. Recovery and scrub retain the same
+independent verification. The writer does not immediately decompress a Zstd
+record merely to repeat the mandatory publication reread.
+
 Exact lookup accepts a sorted, deduplicated Chunk batch. It groups probes by
 immutable Run page, uses Bloom negatives only to skip persistent lookup, and
 verifies every selected Container Location before reuse. Newly verified
@@ -70,12 +88,21 @@ rules and shares the same memory and CPU admission policy as foreground work.
 - Writer publication rereads and verifies the immutable Container before it
   produces externalization evidence. Recovery and scrub continue to verify the
   same Container envelope, records, Chunk identities, and manifest dependency.
+- The ordinary writer and the proof-bearing writer produce byte-identical
+  images for the same inputs. A deliberately incorrect carried identity can
+  create only a non-authoritative prepared image: the publication reread must
+  reject it, and no canonical Container name may become visible.
 - Queue accounting asserts that detached work never exceeds 64 MiB and that all
   write-through state remains within 384 MiB. Backpressure tests fill both
   detached slots and the admission queue before requiring a writer to wait.
 - Exact batch lookup treats Bloom and recent-overlay results as hints. Writer,
   demand reader, recovery, and scrub all require verified Container evidence
   before using the selected Location.
+- A single-stream tracer requires more than one worker to hash a stable
+  FastCDC batch. Serial and four-worker Container writers must produce
+  identical bytes, and the budgeted parallel reader must accept that exact
+  image. io_uring telemetry separately counts large parallel Container-hash
+  verifications.
 - Staged metadata publication cannot select visibility. The single commit writer checks
   deterministic results, synchronizes immutable dependencies, then performs
   the unchanged Commit-WAL sync as the final visibility operation.

@@ -11,6 +11,52 @@ const RESERVATION_END: u64 = 1_024;
 const WINDOW_BYTES: u64 = 64 * 1_024 * 1_024;
 
 #[test]
+fn append_to_empty_manifest_drops_the_zero_length_predecessor_leaf() {
+    let policy = PolicySetId::new([0xD9; 32]).expect("policy identity is nonzero");
+    let metadata = MemoryStorageIo::new();
+    let repository = GenerationRepository::new(metadata, policy);
+    let reservation = repository
+        .commit_namespace(
+            &NamespaceRoot::new(RESERVATION_END, FILE_INODE, 0, Vec::new(), Vec::new())
+                .expect("reservation root is valid"),
+        )
+        .expect("commit initial inode reservation");
+    let predecessor = fastdup_store::SuccessorPredecessor::from_committed_record(reservation);
+    let empty = ManifestLeaf::new(0, Vec::new()).expect("empty Manifest is valid");
+    let empty_root = repository
+        .publish_manifest(&empty)
+        .expect("publish canonical empty Manifest");
+    let empty_summary = repository
+        .scrub_manifest_tree_metadata(empty_root)
+        .expect("verify canonical empty Manifest");
+    let appended = ManifestExtent::Fill {
+        logical_length: WINDOW_BYTES,
+        value: 0x5a,
+    };
+
+    let successor = repository
+        .publish_manifest_append(predecessor, empty_summary, std::slice::from_ref(&appended))
+        .expect("append to canonical empty Manifest");
+    let successor = successor.summary();
+
+    assert_eq!(successor.logical_size(), WINDOW_BYTES);
+    assert_eq!(successor.allocated_bytes(), WINDOW_BYTES);
+    assert_eq!(
+        repository
+            .read_manifest(successor.root())
+            .expect("read appended Manifest")
+            .extents(),
+        std::slice::from_ref(&appended),
+    );
+    assert_eq!(
+        repository
+            .scrub_manifest_tree_metadata(successor.root())
+            .expect("AUDIT appended Manifest"),
+        successor,
+    );
+}
+
+#[test]
 fn tail_read_of_large_manifest_revalidates_only_its_lazy_tree_path() {
     let policy = PolicySetId::new([0xD1; 32]).expect("policy identity is nonzero");
     let metadata = MemoryStorageIo::new();

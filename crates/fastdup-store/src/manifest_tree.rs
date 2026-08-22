@@ -881,11 +881,13 @@ where
             leaves
                 .try_reserve_exact(appended_leaves.len().saturating_add(1))
                 .map_err(|_| ManifestTreeError::OutOfMemory)?;
-            leaves.push(NodeRef {
-                logical_length: leaf.file_length(),
-                allocated_bytes: leaf_allocated_bytes,
-                object_id: candidate.object_id,
-            });
+            if leaf.file_length() != 0 {
+                leaves.push(NodeRef {
+                    logical_length: leaf.file_length(),
+                    allocated_bytes: leaf_allocated_bytes,
+                    object_id: candidate.object_id,
+                });
+            }
             leaves.extend_from_slice(appended_leaves);
             Ok((0, leaves))
         }

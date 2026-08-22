@@ -18,7 +18,7 @@ pub use commit::{
 pub use container::{
     BuildingContainerHeader, ChunkId, ContainerHeader, ContainerId, ContainerLayout,
     ContainerRecordRange, FOOTER_BYTES, FormatError, HEADER_BYTES, MAX_CONTAINER_BYTES,
-    MAX_LOGICAL_CHUNK_BYTES, RECORD_HEADER_BYTES, RawRecord, SealedContainer,
+    MAX_LOGICAL_CHUNK_BYTES, PrehashedChunk, RECORD_HEADER_BYTES, RawRecord, SealedContainer,
     SealedContainerDescriptor, VerifiedChunkLocation, VerifiedRawLocation,
 };
 pub use exact_index::{

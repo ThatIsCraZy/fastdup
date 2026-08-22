@@ -147,6 +147,25 @@ fn one_stream_chunks_a_second_container_while_the_first_waits_for_durability() {
 }
 
 #[test]
+fn one_stream_hashes_stable_chunk_batches_on_multiple_workers() {
+    let appliance = open_appliance();
+    let (inode, handle) = create_file(&appliance, b"parallel-chunk-hashes");
+    let mut block = fixture_block();
+    for ordinal in 0_u64..34 {
+        block[0] = u8::try_from(ordinal).expect("fixture ordinal is bounded");
+        write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
+    }
+    fence_ingest(&appliance, inode, handle);
+
+    let status = appliance.write_through_status();
+    assert!(status.hash_batches() > 0, "stable Chunks form a hash batch");
+    assert!(
+        status.maximum_hash_workers() > 1,
+        "one long stream must use multiple CPU workers for independent Chunk hashes: {status:?}"
+    );
+}
+
+#[test]
 fn release_waits_for_its_last_queued_write_without_blocking_write_admission() {
     let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));

@@ -35,6 +35,23 @@ Immutable Container corruption discovered later still fails demand reads and
 is handled by scrub/quarantine; repeatedly rereading every historical Chunk at
 five-second commit cadence is not a substitute for scrub.
 
+The online writer may also retain a bounded process-local proof for a Chunk
+Location that it has already obtained from a successful Exact candidate
+verification or the mandatory reread of a newly published Container. The
+proof is an opaque appliance capability, not a serialized flag and not an
+Exact-Index assertion. A later write in the same process may reuse it during
+externalization, and an online successor commit may consume it for a matching
+Chunk ID and logical length. Eviction only causes another full
+verification. Restart, recovery, scrub, and index rebuild never consume this
+cache.
+
+V1 retains at most 65,536 such capabilities, enough for two simultaneous
+512-MiB generations at FastCDC-v1's 16-KiB minimum. The cache uses bounded LRU
+replacement and remains separate from payload and Exact-page caches. A
+successful online proof does not suppress demand-read verification or later
+scrub: immutable corruption discovered after the proof still fails the reader
+and enters the normal corruption path.
+
 ## Implementation boundary
 
 The installed online state is an opaque Manifest Root, logical length, and

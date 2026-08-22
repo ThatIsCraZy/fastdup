@@ -98,6 +98,14 @@ It retains no full in-RAM Chunk set. Recovery and offline verification never use
 this shortcut and prove the complete selected graph from durable objects. This
 is the [Successor Graph Proof decision](../adr/0036-compose-successor-data-proofs-from-the-installed-generation.md).
 
+Writer verification now survives as a bounded opaque online dependency proof.
+One public checkpoint test publishes 2 MiB of DATA and requires zero
+`ReadExactAt` operations between the mandatory writer reread and Commit-WAL
+visibility; it observed 32 redundant Record reads before the change. A second
+public test writes an identical file in a later generation and likewise
+requires zero DATA reads. Recovery and the existing fault matrices reopen with
+an empty online-proof cache and continue to verify durable DATA independently.
+
 ## Scheduler and admission
 
 The `fastdup-durable-fuse` binary mounts this namespace through the same
@@ -409,6 +417,17 @@ MALLOC_MMAP_THRESHOLD_=131072 \
 
 Production must additionally place the daemon in a no-swap cgroup as described
 in [memory and swap containment](../operations/memory-and-swap.md).
+
+The online dependency cache now separates correctness pins from historical
+acceleration. Active and Frozen Generation Proof Sets together retain at most
+65,536 verified Locations and never enter eviction. A successful commit moves
+only its Frozen set into the sharded Historical S3-FIFO cache. A failed commit
+keeps the same Frozen set for retry. Historical admission uses a dynamic
+two-percent-of-effective-RAM target, a shared headroom reserve, 224 accounted
+bytes per proof, and an immediate purge when Swap use is observed. Cache lookup
+matches the full Chunk ID and logical length. The daemon reports hits, misses,
+Ghost hits, admission/allocation rejections, evictions, target and resident
+bytes, maximum eviction steps, available RAM, and Swap use after checkpoints.
 
 ## Explicitly incomplete
 

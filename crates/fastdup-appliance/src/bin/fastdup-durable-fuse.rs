@@ -9,10 +9,12 @@ use fastdup_appliance::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction, CheckpointPressure, DurableNamespace,
     MUTATION_COMMIT_TARGET, ProfiledCheckpoint, checkpoint_action, checkpoint_policy_set_v1,
 };
+use fastdup_format::{HEADER_BYTES, SealedContainer};
 use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo};
 use fastdup_posix::{FuseFilesystem, NamespaceConfig, volatile_mount_options};
 use fastdup_store::{
-    ContainerRepository, ExactIndexRunRepository, FsStorageIo, GenerationRepository, StorageIo,
+    ContainerRepository, ExactIndexRunRepository, FsStorageIo, GenerationRepository,
+    OwnedContainerPublication, StorageIo, StoreError,
 };
 use fuse3::raw::Session;
 use tokio::task::JoinHandle;
@@ -166,6 +168,7 @@ fn emit_io_uring_state(storage: &TelemetryStorageIo) {
             "borrowed_write_copy_bytes={} ",
             "verifier_workers={} verification_jobs_started={} ",
             "verification_jobs_completed={} verification_jobs_failed={} ",
+            "parallel_hash_verifications={} ",
             "active_verifications={} peak_active_verifications={} ",
             "fallback_reason={:?}"
         ),
@@ -185,9 +188,19 @@ fn emit_io_uring_state(storage: &TelemetryStorageIo) {
         status.verification_jobs_started(),
         status.verification_jobs_completed(),
         status.verification_jobs_failed(),
+        status.parallel_hash_verifications(),
         status.active_verifications(),
         status.peak_active_verifications(),
         status.fallback_reason(),
+    );
+}
+
+fn emit_write_through_cpu_state(appliance: &FsAppliance) {
+    let status = appliance.write_through_status();
+    eprintln!(
+        "write_through_cpu hash_batches={} maximum_hash_workers={}",
+        status.hash_batches(),
+        status.maximum_hash_workers(),
     );
 }
 
@@ -287,6 +300,7 @@ async fn catch_up(appliance: Arc<FsAppliance>) -> Result<(), String> {
 }
 
 fn emit_verified_read_cache(appliance: &FsAppliance) {
+    emit_write_through_cpu_state(appliance);
     let membership = appliance.exact_run_membership_status();
     eprintln!(
         concat!(
@@ -347,6 +361,7 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         descriptors.available_bytes(),
         descriptors.swap_used_bytes(),
     );
+    emit_dependency_proof_caches(appliance);
     let cache = appliance.verified_read_cache_status();
     eprintln!(
         concat!(
@@ -370,6 +385,45 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         cache.effective_limit_bytes(),
         cache.available_bytes(),
         cache.swap_used_bytes(),
+    );
+}
+
+fn emit_dependency_proof_caches(appliance: &FsAppliance) {
+    let proofs = appliance.historical_proof_cache_status();
+    eprintln!(
+        concat!(
+            "historical_proof_cache policy=s3-fifo hits={} misses={} ",
+            "hit_rate_basis_points={} admissions={} admission_rejections={} ",
+            "allocation_rejections={} evictions={} ghost_hits={} entries={} ",
+            "target_entries={} resident_bytes={} metadata_bytes={} hard_limit_bytes={} ",
+            "reserve_bytes={} maximum_eviction_steps={} effective_limit_bytes={} ",
+            "available_bytes={} swap_used_bytes={}"
+        ),
+        proofs.hits(),
+        proofs.misses(),
+        proofs.hit_rate_basis_points(),
+        proofs.admissions(),
+        proofs.admission_rejections(),
+        proofs.allocation_rejections(),
+        proofs.evictions(),
+        proofs.ghost_hits(),
+        proofs.entry_count(),
+        proofs.target_entries(),
+        proofs.resident_bytes(),
+        proofs.metadata_bytes(),
+        proofs.hard_limit_bytes(),
+        proofs.reserve_bytes(),
+        proofs.maximum_eviction_steps(),
+        proofs.effective_limit_bytes(),
+        proofs.available_bytes(),
+        proofs.swap_used_bytes(),
+    );
+    let generation_proofs = appliance.generation_proof_set_status();
+    eprintln!(
+        "generation_proof_set active={} frozen={} accounted_bytes={}",
+        generation_proofs.active_proofs(),
+        generation_proofs.frozen_proofs(),
+        generation_proofs.accounted_bytes(),
     );
 }
 
@@ -529,6 +583,23 @@ impl DataIoTelemetry {
             self.nonsequential_writes.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    fn record_owned_publication(&self, sealed_bytes: usize) {
+        let sealed_bytes =
+            u64::try_from(sealed_bytes).expect("ASSERT: format-v1 Container length fits u64");
+        let durable_write_bytes = sealed_bytes
+            .checked_add(
+                u64::try_from(HEADER_BYTES).expect("ASSERT: format Header length fits u64"),
+            )
+            .expect("ASSERT: bounded Container publication bytes cannot overflow");
+        self.whole_reads.fetch_add(1, Ordering::Relaxed);
+        self.whole_read_bytes
+            .fetch_add(sealed_bytes, Ordering::Relaxed);
+        self.writes.fetch_add(3, Ordering::Relaxed);
+        self.write_bytes
+            .fetch_add(durable_write_bytes, Ordering::Relaxed);
+        self.nonsequential_writes.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl StorageIo for TelemetryStorageIo {
@@ -615,5 +686,79 @@ impl StorageIo for TelemetryStorageIo {
 
     fn sync_root(&self) -> io::Result<()> {
         self.inner.sync_root()
+    }
+
+    fn publish_owned_container(
+        &self,
+        publication: OwnedContainerPublication,
+    ) -> Result<SealedContainer, StoreError> {
+        let sealed_bytes = publication.sealed_len();
+        let verified = self.inner.publish_owned_container(publication)?;
+        if self.enabled {
+            self.telemetry.record_owned_publication(sealed_bytes);
+        }
+        Ok(verified)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use fastdup_format::ContainerId;
+
+    use super::*;
+
+    #[test]
+    fn telemetry_adapter_preserves_owned_container_publication() {
+        let root =
+            std::env::temp_dir().join(format!("fastdup-telemetry-owned-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("create unique test root");
+        let inner = IoUringStorageIo::open_required(&root, IoUringStorageConfig::default())
+            .expect("test requires the production io_uring backend");
+        let storage = TelemetryStorageIo::new(inner, true);
+        let repository = ContainerRepository::new(storage.clone());
+        let chunk = b"telemetry-owned-publication".repeat(8_192);
+        let region = [chunk.as_slice()];
+        let regions = [region.as_slice()];
+        let prepared =
+            ContainerRepository::<TelemetryStorageIo>::prepare_adaptive_regions_parallel(
+                ContainerId::new([0xA7; 16]).expect("fixture Container ID is nonzero"),
+                1,
+                &regions,
+                NonZeroUsize::MIN,
+            )
+            .expect("prepare fixture Container");
+
+        let (_, metrics) = repository
+            .publish_prepared_adaptive_profiled(prepared)
+            .expect("publish fixture Container through telemetry adapter");
+
+        let status = storage.inner.status();
+        assert_eq!(status.owned_publications_started(), 1);
+        assert_eq!(status.owned_publications_completed(), 1);
+        assert_eq!(status.borrowed_write_copy_bytes(), 0);
+        assert_eq!(storage.telemetry.whole_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            storage.telemetry.whole_read_bytes.load(Ordering::Relaxed),
+            metrics.file_bytes()
+        );
+        assert_eq!(storage.telemetry.writes.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            storage.telemetry.write_bytes.load(Ordering::Relaxed),
+            metrics.file_bytes()
+                + u64::try_from(HEADER_BYTES).expect("format Header length fits u64")
+        );
+        assert_eq!(
+            storage
+                .telemetry
+                .nonsequential_writes
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        drop(repository);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("remove test root");
     }
 }

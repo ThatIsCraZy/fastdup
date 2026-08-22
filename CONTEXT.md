@@ -241,6 +241,18 @@ A decoded chunk or region admitted to a shared read cache only after its complet
 stored encoding and logical content identity were verified.
 _Avoid_: Kernel-dirty page, cache location
 
+**Generation proof set**:
+The bounded in-memory set of verified DATA Locations required by the Active and
+Frozen Commit Generations. Its entries remain pinned until the owning generation
+commits, aborts, or rolls back; a historical cache policy cannot evict them.
+_Avoid_: Historical proof cache, Exact Index authority
+
+**Historical proof cache**:
+Process-local acceleration for previously verified immutable DATA Locations.
+It uses S3-FIFO, starts empty after restart, and may be purged under memory
+pressure without changing correctness or durability.
+_Avoid_: Generation proof set, persistent Exact Index, source of truth
+
 **Exact Index hot page**:
 An independently verified immutable Exact Index page retained as bounded RAM
 acceleration. It avoids repeated Metadata-Tier I/O but never authorizes Chunk

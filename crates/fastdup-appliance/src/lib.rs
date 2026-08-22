@@ -4,16 +4,23 @@
 
 mod checkpoint;
 mod checkpoint_trigger;
+mod historical_proof_cache;
+mod proof_cache_trace;
 
 pub use checkpoint::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, DurableNamespace,
-    DurableNamespaceError, ProfiledCheckpoint, WriteThroughStatus,
+    DurableNamespaceError, GenerationProofSetStatus, ProfiledCheckpoint, WriteThroughStatus,
     checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1,
 };
 pub use checkpoint_trigger::{
     CONTAINER_COMMIT_COALESCE, CheckpointAction, CheckpointPressure, CheckpointTrigger,
     MUTATION_ADMISSION_GUARD, MUTATION_COMMIT_TARGET, SEALED_CONTAINER_COMMIT_LIMIT,
     checkpoint_action,
+};
+pub use historical_proof_cache::HistoricalProofCacheStatus;
+pub use proof_cache_trace::{
+    ProofCacheEvent, ProofCachePolicy, ProofCacheReplayError, ProofCacheReplayReport,
+    ProofCacheTrace, ProofKey, replay_proof_cache_trace,
 };
 
 use std::fmt;

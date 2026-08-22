@@ -315,7 +315,7 @@ impl DirtyEpoch {
         self.holes.remove(offset, end);
         self.result_size = previous_size.max(end);
         self.record_sequence(sequence);
-        self.assert_valid();
+        self.assert_valid_after_mutation();
         Ok(())
     }
 
@@ -339,7 +339,7 @@ impl DirtyEpoch {
         self.holes.remove(offset, end);
         self.result_size = previous_size.max(end);
         self.record_sequence(sequence);
-        self.assert_valid();
+        self.assert_valid_after_mutation();
         Ok(())
     }
 
@@ -354,7 +354,7 @@ impl DirtyEpoch {
         }
         self.result_size = length;
         self.record_sequence(sequence);
-        self.assert_valid();
+        self.assert_valid_after_mutation();
         Ok(())
     }
 
@@ -387,67 +387,57 @@ impl DirtyEpoch {
             self.through_sequence != self.base_sequence,
             "ASSERT: dirty epoch sequence bounds must agree"
         );
-        let mut accounted_data = 0_u64;
+        assert!(
+            self.data.allocated_bytes <= self.result_size,
+            "ASSERT: dirty DATA allocation must not exceed the result size"
+        );
+    }
+
+    fn assert_valid_after_mutation(&self) {
+        self.assert_valid();
+        #[cfg(test)]
+        self.audit_valid();
+    }
+
+    fn audit_valid(&self) {
+        self.assert_valid();
+        self.data.audit_valid();
+        self.holes.assert_valid();
         for (&data_start, bytes) in &self.data.extents {
             let data_length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64");
             let data_end = data_start
                 .checked_add(data_length)
-                .expect("ASSERT: validated DATA extent must not overflow");
+                .expect("AUDIT: validated DATA extent must not overflow");
             assert!(
                 self.holes
                     .overlapping_starts(data_start, data_end)
                     .is_empty(),
-                "ASSERT: dirty DATA and HOLE extents must not overlap"
+                "AUDIT: dirty DATA and HOLE extents must not overlap"
             );
-            accounted_data = accounted_data
-                .checked_add(data_length)
-                .expect("ASSERT: dirty DATA accounting cannot overflow");
         }
-        let mut previous_external_end = 0_u64;
         for (&data_start, external) in &self.data.external_extents {
             let data_end = data_start
                 .checked_add(external.length)
-                .expect("ASSERT: external dirty extent must not overflow");
+                .expect("AUDIT: external dirty extent must not overflow");
             assert!(
                 self.holes
                     .overlapping_starts(data_start, data_end)
                     .is_empty(),
-                "ASSERT: external dirty DATA and HOLE extents must not overlap"
-            );
-            assert!(
-                data_start >= previous_external_end,
-                "ASSERT: external dirty DATA extents must not overlap"
+                "AUDIT: external dirty DATA and HOLE extents must not overlap"
             );
             assert!(
                 external.through_sequence > self.base_sequence
                     && external.through_sequence <= self.through_sequence,
-                "ASSERT: external dirty DATA must belong to this mutation epoch"
+                "AUDIT: external dirty DATA must belong to this mutation epoch"
             );
             assert!(
                 external
                     .source_offset
                     .checked_add(external.length)
                     .is_some_and(|end| end <= external.source.logical_size()),
-                "ASSERT: external dirty DATA must stay inside its verified source"
+                "AUDIT: external dirty DATA must stay inside its verified source"
             );
-            assert!(
-                self.data.extents.iter().all(|(&resident_start, bytes)| {
-                    let resident_end = resident_start
-                        .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize fits u64"))
-                        .expect("ASSERT: resident dirty DATA must not overflow");
-                    resident_end <= data_start || resident_start >= data_end
-                }),
-                "ASSERT: resident and external dirty DATA must not overlap"
-            );
-            previous_external_end = data_end;
-            accounted_data = accounted_data
-                .checked_add(external.length)
-                .expect("ASSERT: dirty DATA accounting cannot overflow");
         }
-        assert_eq!(
-            accounted_data, self.data.allocated_bytes,
-            "ASSERT: resident plus external dirty DATA must match cached allocation"
-        );
     }
 }
 
@@ -868,7 +858,7 @@ impl VersionedFile {
                 }
             }
         }
-        self.active.assert_valid();
+        self.active.assert_valid_after_mutation();
         if accepted {
             Ok(())
         } else {
@@ -1007,7 +997,7 @@ impl VersionedFile {
     pub(super) fn advance_mutation_sequence(&mut self, sequence: u64) {
         self.active.assert_next_sequence(sequence);
         self.active.record_sequence(sequence);
-        self.active.assert_valid();
+        self.active.assert_valid_after_mutation();
     }
 
     fn allocated_bytes_in_range(&self, start: u64, end: u64) -> Result<u64, PosixError> {
@@ -1058,6 +1048,7 @@ impl VersionedFile {
             "ASSERT: only one commit epoch may be in flight"
         );
         self.active.first_sequence?;
+        self.active.audit_valid();
         let result_size = self.active.result_size;
         let through_sequence = self.active.through_sequence;
         let dirty = std::mem::replace(
@@ -1826,6 +1817,17 @@ mod tests {
                 .expect("read"),
             b"abc\0\0\0\0"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "AUDIT: cached allocated extent bytes must match the extent map")]
+    fn freeze_runs_the_full_dirty_epoch_audit() {
+        let mut file = VersionedFile::new_empty();
+        file.write(0, b"payload", 1)
+            .expect("fixture write must succeed");
+        file.active.data.allocated_bytes -= 1;
+
+        let _ = file.freeze_active(CommitToken::new(1).expect("fixture token is nonzero"));
     }
 
     #[test]

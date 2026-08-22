@@ -10,6 +10,10 @@ pub const HEADER_BYTES: usize = 4_096;
 pub const RECORD_HEADER_BYTES: usize = 128;
 pub const FOOTER_BYTES: u64 = 4_096;
 pub const MAX_CONTAINER_BYTES: u64 = 64 * 1_024 * 1_024;
+/// Minimum complete Container image for BLAKE3 tree hashing on the shared
+/// Rayon pool. Logical Chunks remain below this threshold and are batched by
+/// their caller instead of spawning nested parallel hashes.
+pub const PARALLEL_CONTAINER_HASH_MIN_BYTES: usize = 2 * 1_024 * 1_024;
 pub const MAX_RECORD_BYTES: usize = 1_024 * 1_024;
 pub const MAX_DECODED_RECORD_BYTES: usize = 512 * 1_024;
 pub const MAX_LOGICAL_CHUNK_BYTES: usize = 256 * 1_024;
@@ -367,7 +371,12 @@ impl SealedContainer {
         for chunk in chunks {
             encoded_records.push(RawRecord::encode(chunk)?);
         }
-        encode_container_from_records(container_id, container_generation, encoded_records)
+        encode_container_from_records(
+            container_id,
+            container_generation,
+            encoded_records,
+            NonZeroUsize::MIN,
+        )
     }
 
     /// Encodes bounded multi-Chunk Compression Regions as independent Zstd
@@ -397,7 +406,12 @@ impl SealedContainer {
         for region in regions {
             encoded_records.push(encode_zstd_record(region, ZSTD_LEVEL_V1)?);
         }
-        encode_container_from_records(container_id, container_generation, encoded_records)
+        encode_container_from_records(
+            container_id,
+            container_generation,
+            encoded_records,
+            NonZeroUsize::MIN,
+        )
     }
 
     /// Encodes bounded regions using Zstd only when the complete encoded
@@ -448,6 +462,47 @@ impl SealedContainer {
         regions: &[&[&[u8]]],
         workers: NonZeroUsize,
     ) -> Result<Vec<u8>, FormatError> {
+        let prehashed = regions
+            .iter()
+            .map(|region| {
+                region
+                    .iter()
+                    .map(|bytes| PrehashedChunk::new(ChunkId::of(bytes), bytes))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let prehashed_regions = prehashed.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        Self::encode_prehashed_adaptive_regions_parallel(
+            container_id,
+            container_generation,
+            &prehashed_regions,
+            workers,
+        )
+    }
+
+    /// Encodes adaptive Compression Regions from Chunk identities already
+    /// computed by the ingest writer.
+    ///
+    /// The supplied identities are writer evidence, not durable verification.
+    /// A mismatch produces an image that the mandatory writer reread rejects
+    /// before publication, and every ordinary reader and scrubber independently
+    /// recomputes the identity from decoded bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded region, codec, allocation, and layout errors as
+    /// [`Self::encode_adaptive_regions_parallel`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if worker result ownership or ordering violates an internal
+    /// writer invariant.
+    pub fn encode_prehashed_adaptive_regions_parallel(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[PrehashedChunk<'_>]],
+        workers: NonZeroUsize,
+    ) -> Result<Vec<u8>, FormatError> {
         if regions.is_empty() {
             return Err(FormatError::InvalidContainerLayout);
         }
@@ -484,7 +539,7 @@ impl SealedContainer {
                 region.expect("ASSERT: every Compression Region worker must return its output"),
             );
         }
-        encode_container_from_records(container_id, container_generation, encoded_records)
+        encode_container_from_records(container_id, container_generation, encoded_records, workers)
     }
 
     /// Fully validates and decodes one sealed container image.
@@ -492,8 +547,24 @@ impl SealedContainer {
     /// # Errors
     ///
     /// Returns the first structural, checksum, index, or content-integrity error.
-    #[allow(clippy::too_many_lines)]
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        Self::decode_with_hash_workers(bytes, NonZeroUsize::MIN)
+    }
+
+    /// Fully validates one sealed Container while permitting a large
+    /// Container hash to use the shared Rayon pool.
+    ///
+    /// Inputs below [`PARALLEL_CONTAINER_HASH_MIN_BYTES`] and callers that do
+    /// not own the complete Rayon-pool budget remain single-threaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same integrity error as [`Self::decode`].
+    #[allow(clippy::too_many_lines)]
+    pub fn decode_with_hash_workers(
+        bytes: &[u8],
+        permitted_workers: NonZeroUsize,
+    ) -> Result<Self, FormatError> {
         validate_container_file_length(bytes.len())?;
         let footer_offset = bytes
             .len()
@@ -610,7 +681,7 @@ impl SealedContainer {
         {
             return Err(FormatError::NonZeroContainerPadding);
         }
-        let computed_hash = calculate_container_hash(bytes, footer_offset);
+        let computed_hash = calculate_container_hash(bytes, footer_offset, permitted_workers);
         if computed_hash != footer.container_hash {
             return Err(FormatError::ContainerHashMismatch);
         }
@@ -622,6 +693,24 @@ impl SealedContainer {
             raw_record_count,
             zstd_record_count,
         })
+    }
+
+    /// Returns the exact upper bound used by the Container-hash implementation
+    /// for one image and one already-acquired CPU-worker budget.
+    #[must_use]
+    pub fn container_hash_worker_count(
+        file_length: usize,
+        permitted_workers: NonZeroUsize,
+    ) -> NonZeroUsize {
+        let rayon_workers = rayon::current_num_threads();
+        if file_length >= PARALLEL_CONTAINER_HASH_MIN_BYTES
+            && rayon_workers > 1
+            && permitted_workers.get() >= rayon_workers
+        {
+            NonZeroUsize::new(rayon_workers).unwrap_or(NonZeroUsize::MIN)
+        } else {
+            NonZeroUsize::MIN
+        }
     }
 
     #[must_use]
@@ -936,6 +1025,31 @@ impl ChunkId {
     }
 }
 
+/// One immutable Chunk payload paired with identity evidence computed earlier
+/// in the writer pipeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrehashedChunk<'a> {
+    chunk_id: ChunkId,
+    bytes: &'a [u8],
+}
+
+impl<'a> PrehashedChunk<'a> {
+    #[must_use]
+    pub const fn new(chunk_id: ChunkId, bytes: &'a [u8]) -> Self {
+        Self { chunk_id, bytes }
+    }
+
+    #[must_use]
+    pub const fn chunk_id(self) -> ChunkId {
+        self.chunk_id
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EncodingCodec {
     Raw,
@@ -949,40 +1063,49 @@ struct DecodedEncodingRecord {
 }
 
 #[allow(clippy::too_many_lines)]
-fn encode_adaptive_region(region: &[&[u8]]) -> Result<Vec<Vec<u8>>, FormatError> {
+fn encode_adaptive_region(region: &[PrehashedChunk<'_>]) -> Result<Vec<Vec<u8>>, FormatError> {
     if region.is_empty() {
         return Err(FormatError::InvalidZstdRecord);
     }
-    let zstd = encode_zstd_record(region, ZSTD_LEVEL_V1)?;
-    let mut raw_records = Vec::new();
-    raw_records
-        .try_reserve_exact(region.len())
-        .map_err(|_| FormatError::ArithmeticOverflow)?;
-    let mut raw_bytes = 0_usize;
-    for chunk in region {
-        let raw = RawRecord::encode(chunk)?;
-        raw_bytes = raw_bytes
-            .checked_add(raw.len())
-            .ok_or(FormatError::ArithmeticOverflow)?;
-        raw_records.push(raw);
-    }
+    let zstd = encode_prehashed_zstd_record(region, ZSTD_LEVEL_V1)?;
+    let raw_bytes = region.iter().try_fold(0_usize, |total, chunk| {
+        total
+            .checked_add(raw_record_length(chunk.bytes.len())?)
+            .ok_or(FormatError::ArithmeticOverflow)
+    })?;
     if zstd_record_wins(raw_bytes, zstd.len())? {
         Ok(vec![zstd])
     } else {
-        Ok(raw_records)
+        region
+            .iter()
+            .copied()
+            .map(RawRecord::encode_prehashed)
+            .collect()
     }
 }
 
 #[allow(clippy::too_many_lines)]
 fn encode_zstd_record(chunks: &[&[u8]], level: i32) -> Result<Vec<u8>, FormatError> {
+    let prehashed = chunks
+        .iter()
+        .map(|chunk| PrehashedChunk::new(ChunkId::of(chunk), chunk))
+        .collect::<Vec<_>>();
+    encode_prehashed_zstd_record(&prehashed, level)
+}
+
+#[allow(clippy::too_many_lines)]
+fn encode_prehashed_zstd_record(
+    chunks: &[PrehashedChunk<'_>],
+    level: i32,
+) -> Result<Vec<u8>, FormatError> {
     if chunks.is_empty() || level != ZSTD_LEVEL_V1 {
         return Err(FormatError::InvalidZstdRecord);
     }
     let mut decoded_length = 0_usize;
     for chunk in chunks {
-        validate_logical_chunk_length(chunk.len())?;
+        validate_logical_chunk_length(chunk.bytes.len())?;
         decoded_length = decoded_length
-            .checked_add(chunk.len())
+            .checked_add(chunk.bytes.len())
             .ok_or(FormatError::ArithmeticOverflow)?;
     }
     if decoded_length > MAX_DECODED_RECORD_BYTES {
@@ -993,7 +1116,7 @@ fn encode_zstd_record(chunks: &[&[u8]], level: i32) -> Result<Vec<u8>, FormatErr
         .try_reserve_exact(decoded_length)
         .map_err(|_| FormatError::ArithmeticOverflow)?;
     for chunk in chunks {
-        decoded.extend_from_slice(chunk);
+        decoded.extend_from_slice(chunk.bytes);
     }
     let payload = compress_zstd_v1(&decoded, level)?;
     let table_bytes = chunks
@@ -1054,7 +1177,7 @@ fn encode_zstd_record(chunks: &[&[u8]], level: i32) -> Result<Vec<u8>, FormatErr
                     .ok_or(FormatError::ArithmeticOverflow)?,
             )
             .ok_or(FormatError::ArithmeticOverflow)?;
-        bytes[table_offset..table_offset + 32].copy_from_slice(&ChunkId::of(chunk).0);
+        bytes[table_offset..table_offset + 32].copy_from_slice(&chunk.chunk_id.0);
         put_u32(
             &mut bytes,
             table_offset + 32,
@@ -1063,26 +1186,15 @@ fn encode_zstd_record(chunks: &[&[u8]], level: i32) -> Result<Vec<u8>, FormatErr
         put_u32(
             &mut bytes,
             table_offset + 36,
-            u32::try_from(chunk.len()).map_err(|_| FormatError::ArithmeticOverflow)?,
+            u32::try_from(chunk.bytes.len()).map_err(|_| FormatError::ArithmeticOverflow)?,
         );
         decoded_offset = decoded_offset
-            .checked_add(chunk.len())
+            .checked_add(chunk.bytes.len())
             .ok_or(FormatError::ArithmeticOverflow)?;
     }
     bytes[payload_offset..payload_end].copy_from_slice(&payload);
     let checksum = crc32c::crc32c(&bytes);
     put_u32(&mut bytes, RECORD_CRC_OFFSET, checksum);
-    let verified = decode_encoding_record(&bytes)?;
-    if verified.codec != EncodingCodec::Zstd
-        || verified.chunks.len() != chunks.len()
-        || verified
-            .chunks
-            .iter()
-            .zip(chunks)
-            .any(|(observed, expected)| observed.payload() != *expected)
-    {
-        return Err(FormatError::InvalidZstdRecord);
-    }
     Ok(bytes)
 }
 
@@ -1270,6 +1382,11 @@ impl RawRecord {
     ///
     /// Returns an error when the chunk or resulting record exceeds v1 bounds.
     pub fn encode(payload: &[u8]) -> Result<Vec<u8>, FormatError> {
+        Self::encode_prehashed(PrehashedChunk::new(ChunkId::of(payload), payload))
+    }
+
+    fn encode_prehashed(chunk: PrehashedChunk<'_>) -> Result<Vec<u8>, FormatError> {
+        let payload = chunk.bytes;
         let record_length = raw_record_length(payload.len())?;
         let record_length_u32 =
             u32::try_from(record_length).map_err(|_| FormatError::ArithmeticOverflow)?;
@@ -1289,8 +1406,7 @@ impl RawRecord {
         put_u16(&mut bytes, 52, CHUNK_TABLE_ENTRY_BYTES_U16);
         put_u32(&mut bytes, 56, 1);
 
-        let chunk_id = ChunkId::of(payload);
-        bytes[128..160].copy_from_slice(&chunk_id.0);
+        bytes[128..160].copy_from_slice(&chunk.chunk_id.0);
         put_u32(&mut bytes, 160, 0);
         put_u32(&mut bytes, 164, payload_length_u32);
         bytes[RAW_PAYLOAD_OFFSET..RAW_PAYLOAD_OFFSET + payload.len()].copy_from_slice(payload);
@@ -1760,11 +1876,19 @@ fn decode_footer(bytes: &[u8]) -> Result<Footer, FormatError> {
     })
 }
 
-fn calculate_container_hash(bytes: &[u8], footer_offset: usize) -> [u8; 32] {
+fn calculate_container_hash(
+    bytes: &[u8],
+    footer_offset: usize,
+    permitted_workers: NonZeroUsize,
+) -> [u8; 32] {
     let hash_start = footer_offset + FOOTER_HASH_OFFSET;
     let checksum_end = footer_offset + FOOTER_CRC_OFFSET + 4;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&bytes[..hash_start]);
+    if SealedContainer::container_hash_worker_count(bytes.len(), permitted_workers).get() > 1 {
+        hasher.update_rayon(&bytes[..hash_start]);
+    } else {
+        hasher.update(&bytes[..hash_start]);
+    }
     hasher.update(&[0_u8; 36]);
     hasher.update(&bytes[checksum_end..]);
     *hasher.finalize().as_bytes()
@@ -1804,7 +1928,14 @@ fn encoded_container_layout(records: &[Vec<u8>]) -> Result<ContainerLayout, Form
     let mut index_offset =
         u64::try_from(HEADER_BYTES).map_err(|_| FormatError::ArithmeticOverflow)?;
     for record in records {
-        decode_encoding_record(record)?;
+        assert!(
+            record.len() >= MIN_RAW_RECORD_BYTES
+                && record.len() <= MAX_RECORD_BYTES
+                && record.len().is_multiple_of(usize::from(RECORD_ALIGNMENT))
+                && usize::try_from(get_u32(record, 32)) == Ok(record.len())
+                && get_u32(record, 56) != 0,
+            "ASSERT: internal record writer emitted an impossible structural shape"
+        );
         chunk_entry_count = chunk_entry_count
             .checked_add(get_u32(record, 56))
             .ok_or(FormatError::ArithmeticOverflow)?;
@@ -1844,6 +1975,7 @@ fn encode_container_from_records(
     container_id: ContainerId,
     container_generation: u64,
     encoded_records: Vec<Vec<u8>>,
+    permitted_hash_workers: NonZeroUsize,
 ) -> Result<Vec<u8>, FormatError> {
     let layout = encoded_container_layout(&encoded_records)?;
     let mut record_offset = HEADER_BYTES as u64;
@@ -1884,7 +2016,7 @@ fn encode_container_from_records(
         .ok_or(FormatError::ArithmeticOverflow)?;
     container[cursor..index_end].copy_from_slice(&index);
     encode_footer(&mut container[footer_offset_usize..], &header);
-    let hash = calculate_container_hash(&container, footer_offset_usize);
+    let hash = calculate_container_hash(&container, footer_offset_usize, permitted_hash_workers);
     container
         [footer_offset_usize + FOOTER_HASH_OFFSET..footer_offset_usize + FOOTER_HASH_OFFSET + 32]
         .copy_from_slice(&hash);

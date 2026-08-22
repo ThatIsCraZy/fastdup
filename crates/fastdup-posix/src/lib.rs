@@ -134,6 +134,7 @@ impl PreparedCommitExtent {
 
 pub const ROOT_INODE: InodeId = InodeId(NonZeroU64::MIN);
 const MAX_DIRECTORY_ENTRIES_PER_REPLY: usize = 256;
+const MAX_RETAINED_PAYLOAD_AMPLIFICATION: usize = 4;
 
 /// One immutable, owned write payload shared by the POSIX Dirty Extent Map and
 /// asynchronous mutation observers.
@@ -142,17 +143,28 @@ const MAX_DIRECTORY_ENTRIES_PER_REPLY: usize = 256;
 /// exactly one backing allocation when adapting the borrowed FUSE request;
 /// observers may therefore retain or split this value after the write reply
 /// without copying its bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MutationPayload {
     bytes: Bytes,
+    backing_bytes: usize,
 }
+
+impl PartialEq for MutationPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for MutationPayload {}
 
 impl MutationPayload {
     /// Adopts one already-owned immutable request buffer without copying it.
     #[must_use]
     pub fn from_owned_bytes(bytes: Vec<u8>) -> Self {
+        let backing_bytes = bytes.capacity().max(bytes.len());
         Self {
             bytes: Bytes::from(bytes),
+            backing_bytes,
         }
     }
 
@@ -197,7 +209,30 @@ impl MutationPayload {
         }
         Some(Self {
             bytes: self.bytes.slice(start..end),
+            backing_bytes: self.backing_bytes,
         })
+    }
+
+    fn retained_fragment(&self, start: usize, end: usize) -> Result<Self, PosixError> {
+        let fragment_bytes = end
+            .checked_sub(start)
+            .expect("ASSERT: retained fragment bounds are ordered");
+        // Share large tails while they move through write-through ingestion.
+        // Compact a small long-lived survivor once so it cannot pin an
+        // arbitrarily larger FUSE request allocation.
+        let minimum_shared_bytes = self
+            .backing_bytes
+            .div_ceil(MAX_RETAINED_PAYLOAD_AMPLIFICATION);
+        if fragment_bytes >= minimum_shared_bytes {
+            return Ok(self
+                .checked_slice(start, end)
+                .expect("ASSERT: retained fragment lies inside its payload"));
+        }
+        Self::try_copy_from_slice(
+            self.as_bytes()
+                .get(start..end)
+                .expect("ASSERT: compact fragment lies inside its payload"),
+        )
     }
 
     #[cfg(test)]
@@ -1322,62 +1357,61 @@ impl SparseData {
         }
     }
 
-    #[cfg(test)]
     fn audit_valid(&self) {
         let mut ranges = Vec::with_capacity(self.extents.len() + self.external_extents.len());
         let mut allocated_bytes = 0_u64;
         for (&start, bytes) in &self.extents {
             assert!(
                 !bytes.is_empty(),
-                "ASSERT: sparse DATA extent must be nonempty"
+                "AUDIT: sparse DATA extent must be nonempty"
             );
             let length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit in u64");
             let end = start
                 .checked_add(length)
-                .expect("ASSERT: sparse extent end must not overflow");
+                .expect("AUDIT: sparse extent end must not overflow");
             assert!(
                 end <= self.logical_size,
-                "ASSERT: sparse extent must stay inside logical size"
+                "AUDIT: sparse extent must stay inside logical size"
             );
             ranges.push((start, end));
             allocated_bytes = allocated_bytes
                 .checked_add(length)
-                .expect("ASSERT: allocated extent bytes must not overflow");
+                .expect("AUDIT: allocated extent bytes must not overflow");
         }
         for (&start, external) in &self.external_extents {
             assert!(
                 external.length != 0,
-                "ASSERT: external dirty DATA extent must be nonempty"
+                "AUDIT: external dirty DATA extent must be nonempty"
             );
             let end = start
                 .checked_add(external.length)
-                .expect("ASSERT: external dirty extent end must not overflow");
+                .expect("AUDIT: external dirty extent end must not overflow");
             assert!(
                 end <= self.logical_size,
-                "ASSERT: external dirty extent must stay inside logical size"
+                "AUDIT: external dirty extent must stay inside logical size"
             );
             assert!(
                 external
                     .source_offset
                     .checked_add(external.length)
                     .is_some_and(|source_end| source_end <= external.source.logical_size()),
-                "ASSERT: external dirty extent must stay inside its verified source"
+                "AUDIT: external dirty extent must stay inside its verified source"
             );
             ranges.push((start, end));
             allocated_bytes = allocated_bytes
                 .checked_add(external.length)
-                .expect("ASSERT: allocated extent bytes must not overflow");
+                .expect("AUDIT: allocated extent bytes must not overflow");
         }
         ranges.sort_unstable();
         for pair in ranges.windows(2) {
             assert!(
                 pair[0].1 <= pair[1].0,
-                "ASSERT: resident and external dirty DATA extents must not overlap"
+                "AUDIT: resident and external dirty DATA extents must not overlap"
             );
         }
         assert_eq!(
             allocated_bytes, self.allocated_bytes,
-            "ASSERT: cached allocated extent bytes must match the extent map"
+            "AUDIT: cached allocated extent bytes must match the extent map"
         );
     }
 }
@@ -1477,18 +1511,12 @@ fn plan_overlap(
     if extent_start < write_start {
         let keep = usize::try_from(write_start - extent_start)
             .expect("ASSERT: left fragment must fit in usize");
-        fragments.push((
-            extent_start,
-            MutationPayload::try_copy_from_slice(&bytes.as_bytes()[..keep])?,
-        ));
+        fragments.push((extent_start, bytes.retained_fragment(0, keep)?));
     }
     if extent_end > write_end {
         let skip = usize::try_from(write_end - extent_start)
             .expect("ASSERT: right fragment must fit in usize");
-        fragments.push((
-            write_end,
-            MutationPayload::try_copy_from_slice(&bytes.as_bytes()[skip..])?,
-        ));
+        fragments.push((write_end, bytes.retained_fragment(skip, bytes.len())?));
     }
     Ok(())
 }
@@ -3439,6 +3467,25 @@ mod tests {
         assert!(payload.starts_at_same_address(&clone));
         assert!(payload.starts_at_same_address(&prefix));
         assert_eq!(prefix.as_bytes(), b"shared");
+    }
+
+    #[test]
+    fn large_overlap_survivor_reuses_the_original_backing() {
+        let mut data = SparseData::default();
+        let original = MutationPayload::try_copy_from_slice(&vec![0x41; 1_024 * 1_024])
+            .expect("allocate original fixture payload");
+        data.write(0, original.clone())
+            .expect("install original fixture payload");
+        data.write(
+            512 * 1_024,
+            MutationPayload::try_copy_from_slice(&vec![0x42; 512 * 1_024])
+                .expect("allocate overwrite fixture payload"),
+        )
+        .expect("overwrite right half of fixture payload");
+
+        let survivor = &data.extents[&0];
+        assert_eq!(survivor.as_bytes(), vec![0x41; 512 * 1_024]);
+        assert!(original.starts_at_same_address(survivor));
     }
 
     #[test]

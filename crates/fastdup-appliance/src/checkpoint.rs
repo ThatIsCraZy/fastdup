@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
-use fastcdc::v2020::{FastCDC, Normalization, StreamCDC};
+use fastcdc::v2020::{FastCDC, MASKS, Normalization, StreamCDC, get_gear_with_seed};
 use fastdup_format::{
     ChunkId, CommitRecord, ContainerId, DurableInode, ExactIndexEntry, ExactIndexProfileId,
     ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, MAX_LOGICAL_CHUNK_BYTES, ManifestExtent,
     ManifestLeaf, MetadataFormatError, MetadataObjectId, NamespaceEntry, NamespaceRoot,
-    PolicySetId,
+    PolicySetId, PrehashedChunk,
 };
 use fastdup_posix::{
     CommitInode, CommitRange, CommittedFile, CommittedFileInstall, ExternalizedExtent, InodeId,
@@ -28,8 +28,14 @@ use fastdup_store::{
     StorageIo, StoreError, SuccessorPredecessor, VerifiedCommittedFile, VerifiedManifestFile,
     VerifiedReadCache, VerifiedReadCacheError, VerifiedReadCacheStatus,
 };
+use rayon::prelude::*;
 
-use crate::{ManifestCommittedFile, MountError, namespace_from_verified_files_using};
+use crate::historical_proof_cache::{HistoricalProofAdmission, HistoricalProofCache};
+use crate::proof_cache_trace::ProofCacheTraceRecorder;
+use crate::{
+    HistoricalProofCacheStatus, ManifestCommittedFile, MountError, ProofCacheEvent,
+    ProofCacheReplayError, ProofCacheTrace, ProofKey, namespace_from_verified_files_using,
+};
 
 const FIRST_REGULAR_INODE: u64 = 2;
 const CONTAINER_PAYLOAD_TARGET_BYTES: usize = 32 * 1_024 * 1_024;
@@ -48,6 +54,9 @@ const CDC_SEED_V1: u64 = 0;
 const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
 const EXACT_PUBLICATION_QUEUE_BATCHES: usize = 8;
 const MAX_RECENT_EXACT_LOCATIONS: usize = 8_192;
+// Combined Active and Frozen 512-MiB generations at FastCDC-v1's 16-KiB minimum.
+const MAX_ONLINE_DEPENDENCY_PROOFS_V1: usize = 65_536;
+const ACCOUNTED_GENERATION_PROOF_BYTES: usize = 256;
 const WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1: usize = 384 * 1_024 * 1_024;
 const WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1: usize = 16 * 1_024 * 1_024;
 const DETACHED_CONTAINER_BUDGET_BYTES_V1: usize = 2 * CONTAINER_PAYLOAD_TARGET_BYTES;
@@ -80,6 +89,8 @@ pub struct WriteThroughStatus {
     active_lanes: u64,
     sealed_uncommitted_containers: u64,
     oldest_sealed_age: Option<Duration>,
+    hash_batches: u64,
+    maximum_hash_workers: u64,
     degraded: bool,
 }
 
@@ -107,6 +118,16 @@ impl WriteThroughStatus {
     #[must_use]
     pub const fn oldest_sealed_age(self) -> Option<Duration> {
         self.oldest_sealed_age
+    }
+
+    #[must_use]
+    pub const fn hash_batches(self) -> u64 {
+        self.hash_batches
+    }
+
+    #[must_use]
+    pub const fn maximum_hash_workers(self) -> u64 {
+        self.maximum_hash_workers
     }
 
     #[must_use]
@@ -418,6 +439,324 @@ pub struct DurableNamespace<M, C> {
     manifest_readers: Arc<dyn ManifestReaderPolicy<C>>,
     checkpoint_workers: NonZeroUsize,
     write_through: Arc<WriteThroughIngest<C>>,
+    online_dependency_proofs: Arc<OnlineDependencyProofs>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GenerationProof {
+    entry: ExactIndexEntry,
+    admission: HistoricalProofAdmission,
+}
+
+/// Bounded, non-evictable proof ownership for the two live commit generations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GenerationProofSetStatus {
+    active_proofs: usize,
+    frozen_proofs: usize,
+    accounted_bytes: usize,
+}
+
+impl GenerationProofSetStatus {
+    #[must_use]
+    pub const fn active_proofs(self) -> usize {
+        self.active_proofs
+    }
+
+    #[must_use]
+    pub const fn frozen_proofs(self) -> usize {
+        self.frozen_proofs
+    }
+
+    #[must_use]
+    pub const fn accounted_bytes(self) -> usize {
+        self.accounted_bytes
+    }
+}
+
+#[derive(Debug, Default)]
+struct GenerationProofState {
+    active: BTreeMap<(ChunkId, u32), GenerationProof>,
+    frozen: Option<BTreeMap<(ChunkId, u32), GenerationProof>>,
+}
+
+#[derive(Debug)]
+struct OnlineDependencyProofs {
+    generation: Mutex<GenerationProofState>,
+    historical: HistoricalProofCache,
+    trace: ProofCacheTraceRecorder,
+}
+
+#[derive(Clone, Copy)]
+enum OnlineProofAdmission {
+    Published,
+    ExactReuse,
+    Touch,
+}
+
+impl OnlineDependencyProofs {
+    fn new() -> Result<Self, DurableNamespaceError> {
+        Ok(Self {
+            generation: Mutex::new(GenerationProofState::default()),
+            historical: HistoricalProofCache::new_system()
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?,
+            trace: ProofCacheTraceRecorder::default(),
+        })
+    }
+
+    fn remember_active(&self, entry: ExactIndexEntry, admission: OnlineProofAdmission) {
+        self.remember_generation(entry, admission, false);
+    }
+
+    fn remember_frozen(&self, entry: ExactIndexEntry, admission: OnlineProofAdmission) {
+        self.remember_generation(entry, admission, true);
+    }
+
+    fn remember_generation(
+        &self,
+        entry: ExactIndexEntry,
+        admission: OnlineProofAdmission,
+        frozen: bool,
+    ) {
+        assert_eq!(
+            entry.transition(),
+            fastdup_format::ExactLocationTransition::Active,
+            "ASSERT: only an ACTIVE verified Location can prove an online dependency"
+        );
+        let key = (entry.chunk_id(), entry.logical_length());
+        let mut state = self
+            .generation
+            .lock()
+            .expect("ASSERT: Generation Proof Set lock poisoned");
+        let target = if frozen {
+            state
+                .frozen
+                .as_mut()
+                .expect("ASSERT: commit-only proof requires one Frozen Generation")
+        } else {
+            &mut state.active
+        };
+        let historical_admission = match admission {
+            OnlineProofAdmission::Published => HistoricalProofAdmission::Published,
+            OnlineProofAdmission::ExactReuse | OnlineProofAdmission::Touch => {
+                HistoricalProofAdmission::ExactReuse
+            }
+        };
+        if let Some(previous) = target.insert(
+            key,
+            GenerationProof {
+                entry,
+                admission: historical_admission,
+            },
+        ) {
+            assert_eq!(
+                previous.entry.chunk_id(),
+                entry.chunk_id(),
+                "ASSERT: online dependency proof key must match its verified Location"
+            );
+            assert_eq!(
+                previous.entry.logical_length(),
+                entry.logical_length(),
+                "ASSERT: one Chunk ID cannot acquire another logical length"
+            );
+            if previous.admission == HistoricalProofAdmission::ExactReuse {
+                target
+                    .get_mut(&key)
+                    .expect("ASSERT: replaced Generation Proof remains present")
+                    .admission = HistoricalProofAdmission::ExactReuse;
+            }
+        }
+        let active_proofs = state.active.len();
+        let frozen_proofs = state.frozen.as_ref().map_or(0, BTreeMap::len);
+        assert!(
+            active_proofs
+                .checked_add(frozen_proofs)
+                .is_some_and(|total| total <= MAX_ONLINE_DEPENDENCY_PROOFS_V1),
+            "ASSERT: combined Active and Frozen Generation Proof Sets exceeded their budget"
+        );
+        drop(state);
+        let key = ProofKey::new(entry.chunk_id(), entry.logical_length());
+        let verify_bytes = entry.location().record_length();
+        match admission {
+            OnlineProofAdmission::Published => self
+                .trace
+                .record(ProofCacheEvent::admit_published(key, verify_bytes)),
+            OnlineProofAdmission::ExactReuse | OnlineProofAdmission::Touch => self
+                .trace
+                .record(ProofCacheEvent::admit_exact_reuse(key, verify_bytes)),
+        }
+    }
+
+    fn freeze_for_commit(&self) -> bool {
+        let mut state = self
+            .generation
+            .lock()
+            .expect("ASSERT: Generation Proof Set lock poisoned");
+        if state.frozen.is_some() {
+            return false;
+        }
+        let frozen = std::mem::take(&mut state.active);
+        state.frozen = Some(frozen);
+        true
+    }
+
+    fn cancel_new_freeze(&self, newly_frozen: bool) {
+        if !newly_frozen {
+            return;
+        }
+        let mut state = self
+            .generation
+            .lock()
+            .expect("ASSERT: Generation Proof Set lock poisoned");
+        let frozen = state
+            .frozen
+            .take()
+            .expect("ASSERT: a new proof freeze must still own Frozen state");
+        for (key, proof) in frozen {
+            state.active.entry(key).or_insert(proof);
+        }
+        assert!(
+            state.active.len() <= MAX_ONLINE_DEPENDENCY_PROOFS_V1,
+            "ASSERT: canceled proof freeze exceeded the combined Generation Proof budget"
+        );
+    }
+
+    fn complete_frozen(&self) {
+        let frozen = self
+            .generation
+            .lock()
+            .expect("ASSERT: Generation Proof Set lock poisoned")
+            .frozen
+            .take()
+            .expect("ASSERT: a successful commit owns one Frozen Generation Proof Set");
+        for proof in frozen.into_values() {
+            self.historical.admit(proof.entry, proof.admission);
+        }
+    }
+
+    fn generation_entry(&self, key: (ChunkId, u32)) -> Option<ExactIndexEntry> {
+        let state = self
+            .generation
+            .lock()
+            .expect("ASSERT: Generation Proof Set lock poisoned");
+        state
+            .active
+            .get(&key)
+            .or_else(|| state.frozen.as_ref().and_then(|frozen| frozen.get(&key)))
+            .map(|proof| proof.entry)
+    }
+
+    fn unproven(&self, required: &BTreeMap<ChunkId, u64>) -> BTreeMap<ChunkId, u64> {
+        let mut unproven = BTreeMap::new();
+        let mut history_hits = Vec::new();
+        for (chunk_id, logical_length) in required {
+            let Ok(index_length) = u32::try_from(*logical_length) else {
+                unproven.insert(*chunk_id, *logical_length);
+                continue;
+            };
+            let key = (*chunk_id, index_length);
+            if let Some(entry) = self.generation_entry(key) {
+                assert_entry_matches(entry, *chunk_id, index_length);
+                continue;
+            }
+            if let Some(entry) = self.historical.get(*chunk_id, *logical_length) {
+                assert_entry_matches(entry, *chunk_id, index_length);
+                history_hits.push(entry);
+            } else {
+                unproven.insert(*chunk_id, *logical_length);
+            }
+        }
+        for entry in history_hits {
+            self.remember_frozen(entry, OnlineProofAdmission::Touch);
+        }
+        for (chunk_id, logical_length) in required {
+            if let Ok(logical_length) = u32::try_from(*logical_length) {
+                self.trace.record(ProofCacheEvent::lookup(ProofKey::new(
+                    *chunk_id,
+                    logical_length,
+                )));
+            }
+        }
+        unproven
+    }
+
+    fn verified_entry(&self, chunk_id: ChunkId, logical_length: u64) -> Option<ExactIndexEntry> {
+        let logical_length = u32::try_from(logical_length).ok()?;
+        let entry = self
+            .generation_entry((chunk_id, logical_length))
+            .or_else(|| self.historical.get(chunk_id, u64::from(logical_length)));
+        self.trace.record(ProofCacheEvent::lookup(ProofKey::new(
+            chunk_id,
+            logical_length,
+        )));
+        entry
+    }
+
+    fn verified_entries(&self, requests: &[(ChunkId, u64)]) -> Vec<Option<ExactIndexEntry>> {
+        let entries = requests
+            .iter()
+            .map(|(chunk_id, logical_length)| {
+                let logical_length = u32::try_from(*logical_length).ok()?;
+                self.generation_entry((*chunk_id, logical_length))
+                    .or_else(|| self.historical.get(*chunk_id, u64::from(logical_length)))
+            })
+            .collect();
+        for (chunk_id, logical_length) in requests {
+            if let Ok(logical_length) = u32::try_from(*logical_length) {
+                self.trace.record(ProofCacheEvent::lookup(ProofKey::new(
+                    *chunk_id,
+                    logical_length,
+                )));
+            }
+        }
+        entries
+    }
+
+    fn historical_status(&self) -> HistoricalProofCacheStatus {
+        self.historical.status()
+    }
+
+    fn generation_status(&self) -> GenerationProofSetStatus {
+        let state = self
+            .generation
+            .lock()
+            .expect("ASSERT: Generation Proof Set lock poisoned");
+        let active_proofs = state.active.len();
+        let frozen_proofs = state.frozen.as_ref().map_or(0, BTreeMap::len);
+        let accounted_bytes = active_proofs
+            .checked_add(frozen_proofs)
+            .and_then(|proofs| proofs.checked_mul(ACCOUNTED_GENERATION_PROOF_BYTES))
+            .expect("ASSERT: bounded Generation Proof accounting cannot overflow");
+        GenerationProofSetStatus {
+            active_proofs,
+            frozen_proofs,
+            accounted_bytes,
+        }
+    }
+}
+
+fn assert_entry_matches(entry: ExactIndexEntry, chunk_id: ChunkId, logical_length: u32) {
+    assert_eq!(
+        entry.chunk_id(),
+        chunk_id,
+        "ASSERT: Generation Proof key matches its verified Location"
+    );
+    assert_eq!(
+        entry.logical_length(),
+        logical_length,
+        "ASSERT: Generation Proof length matches its verified Location"
+    );
+}
+
+struct OnlineSuccessorVerifier {
+    proofs: Arc<OnlineDependencyProofs>,
+    fallback: Box<dyn RequiredChunkVerifier>,
+}
+
+impl RequiredChunkVerifier for OnlineSuccessorVerifier {
+    fn verify_required_chunks(&self, required: &BTreeMap<ChunkId, u64>) -> Result<(), StoreError> {
+        self.fallback
+            .verify_required_chunks(&self.proofs.unproven(required))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -566,6 +905,7 @@ enum StableExtraction {
 struct SegmentedIngestTail {
     segments: VecDeque<MutationPayload>,
     length: usize,
+    materialized_bytes: usize,
 }
 
 impl SegmentedIngestTail {
@@ -580,6 +920,7 @@ impl SegmentedIngestTail {
     fn clear(&mut self) {
         self.segments.clear();
         self.length = 0;
+        self.materialized_bytes = 0;
     }
 
     fn push(&mut self, payload: MutationPayload) {
@@ -598,46 +939,41 @@ impl SegmentedIngestTail {
         self.segments.front().map_or(&[], MutationPayload::as_bytes)
     }
 
-    fn make_prefix_contiguous(&mut self, maximum: usize) -> Result<(), DurableNamespaceError> {
-        assert!(maximum != 0, "ASSERT: contiguous prefix bound is nonzero");
-        let desired = maximum.min(self.length);
-        if desired == 0 || self.front_bytes().len() >= desired {
-            return Ok(());
-        }
-        let mut contiguous = Vec::new();
-        contiguous
-            .try_reserve_exact(desired)
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for segment in &self.segments {
-            let remaining = desired - contiguous.len();
-            if remaining == 0 {
-                break;
-            }
-            let copy = remaining.min(segment.len());
-            contiguous.extend_from_slice(&segment.as_bytes()[..copy]);
-        }
-        assert_eq!(
-            contiguous.len(),
-            desired,
-            "ASSERT: cached Ingest Tail length must match its segments"
-        );
-        self.discard_prefix(desired);
-        self.length = self
-            .length
-            .checked_add(desired)
-            .expect("ASSERT: replacing a compacted prefix cannot overflow");
-        self.segments
-            .push_front(MutationPayload::from_owned_bytes(contiguous));
-        self.assert_valid();
-        Ok(())
-    }
-
     fn take_prefix(&mut self, length: usize) -> Result<MutationPayload, DurableNamespaceError> {
         assert!(length != 0, "ASSERT: consumed Ingest prefix is nonempty");
         if length > self.length {
             return Err(DurableNamespaceError::FrozenViewMismatch);
         }
-        self.make_prefix_contiguous(length)?;
+        if self
+            .segments
+            .front()
+            .is_some_and(|front| front.len() < length)
+        {
+            let mut contiguous = Vec::new();
+            contiguous
+                .try_reserve_exact(length)
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+            for segment in &self.segments {
+                let remaining = length - contiguous.len();
+                if remaining == 0 {
+                    break;
+                }
+                let copied = remaining.min(segment.len());
+                contiguous.extend_from_slice(&segment.as_bytes()[..copied]);
+            }
+            assert_eq!(
+                contiguous.len(),
+                length,
+                "ASSERT: cached Ingest Tail length must match its segments"
+            );
+            self.discard_prefix(length);
+            self.materialized_bytes = self
+                .materialized_bytes
+                .checked_add(length)
+                .expect("ASSERT: bounded materialized-byte counter cannot overflow");
+            self.assert_valid();
+            return Ok(MutationPayload::from_owned_bytes(contiguous));
+        }
         let front = self
             .segments
             .pop_front()
@@ -662,6 +998,11 @@ impl SegmentedIngestTail {
             .expect("ASSERT: consumed prefix was accounted");
         self.assert_valid();
         Ok(consumed)
+    }
+
+    #[cfg(test)]
+    fn materialized_bytes(&self) -> usize {
+        self.materialized_bytes
     }
 
     fn discard_prefix(&mut self, mut length: usize) {
@@ -710,32 +1051,233 @@ impl SegmentedIngestTail {
     }
 }
 
+struct SegmentByteCursor<'a> {
+    segments: &'a VecDeque<MutationPayload>,
+    current: &'a [u8],
+    next_segment_index: usize,
+}
+
+impl<'a> SegmentByteCursor<'a> {
+    fn at(segments: &'a VecDeque<MutationPayload>, mut offset: usize) -> Self {
+        let mut segment_index = 0;
+        while let Some(segment) = segments.get(segment_index) {
+            if offset < segment.len() {
+                return Self {
+                    segments,
+                    current: &segment.as_bytes()[offset..],
+                    next_segment_index: segment_index + 1,
+                };
+            }
+            offset -= segment.len();
+            segment_index += 1;
+        }
+        assert_eq!(offset, 0, "ASSERT: byte cursor offset lies inside its Tail");
+        Self {
+            segments,
+            current: &[],
+            next_segment_index: segment_index,
+        }
+    }
+
+    fn next(&mut self) -> u8 {
+        loop {
+            if let Some((byte, remaining)) = self.current.split_first() {
+                self.current = remaining;
+                return *byte;
+            }
+            let segment = self
+                .segments
+                .get(self.next_segment_index)
+                .expect("ASSERT: FastCDC byte cursor stays inside its Tail");
+            self.current = segment.as_bytes();
+            self.next_segment_index += 1;
+        }
+    }
+}
+
+fn segmented_fastcdc_cut(tail: &SegmentedIngestTail) -> usize {
+    assert!(
+        tail.len() > CDC_MAXIMUM_BYTES,
+        "ASSERT: stable FastCDC scan owns more than one maximum Chunk"
+    );
+    assert!(
+        CDC_TARGET_BYTES.is_power_of_two(),
+        "ASSERT: v1 FastCDC target has an exact base-two mask"
+    );
+    let normalization = Normalization::Level1.bits();
+    let bits = CDC_TARGET_BYTES.ilog2();
+    let mask_s = MASKS
+        [usize::try_from(bits + normalization).expect("ASSERT: FastCDC mask index fits usize")];
+    let mask_l = MASKS
+        [usize::try_from(bits - normalization).expect("ASSERT: FastCDC mask index fits usize")];
+    let small_mask_left_shifted = mask_s << 1;
+    let large_mask_left_shifted = mask_l << 1;
+    let (gear, gear_ls) = get_gear_with_seed(CDC_SEED_V1);
+    let mut cursor = SegmentByteCursor::at(&tail.segments, CDC_MINIMUM_BYTES);
+    let mut index = CDC_MINIMUM_BYTES / 2;
+    let mut hash = 0_u64;
+    while index < CDC_TARGET_BYTES / 2 {
+        let offset = index * 2;
+        hash = (hash << 2).wrapping_add(gear_ls[usize::from(cursor.next())]);
+        if (hash & small_mask_left_shifted) == 0 {
+            return offset;
+        }
+        hash = hash.wrapping_add(gear[usize::from(cursor.next())]);
+        if (hash & mask_s) == 0 {
+            return offset + 1;
+        }
+        index += 1;
+    }
+    while index < CDC_MAXIMUM_BYTES / 2 {
+        let offset = index * 2;
+        hash = (hash << 2).wrapping_add(gear_ls[usize::from(cursor.next())]);
+        if (hash & large_mask_left_shifted) == 0 {
+            return offset;
+        }
+        hash = hash.wrapping_add(gear[usize::from(cursor.next())]);
+        if (hash & mask_l) == 0 {
+            return offset + 1;
+        }
+        index += 1;
+    }
+    CDC_MAXIMUM_BYTES
+}
+
 fn take_next_stable_fastcdc_chunk(
     tail: &mut SegmentedIngestTail,
 ) -> Result<Option<MutationPayload>, DurableNamespaceError> {
     if tail.len() <= CDC_MAXIMUM_BYTES {
         return Ok(None);
     }
-    tail.make_prefix_contiguous(CDC_MAXIMUM_BYTES)?;
     let stable_before = tail.len() - CDC_MAXIMUM_BYTES;
-    let first = FastCDC::with_level_and_seed(
-        tail.front_bytes(),
-        CDC_MINIMUM_BYTES,
-        CDC_TARGET_BYTES,
-        CDC_MAXIMUM_BYTES,
-        Normalization::Level1,
-        CDC_SEED_V1,
-    )
-    .next()
-    .expect("ASSERT: a nonempty maximum-sized CDC prefix yields one Chunk");
-    assert_eq!(
-        first.offset, 0,
-        "ASSERT: front-prefix FastCDC must begin at zero"
-    );
-    if first.length > stable_before {
+    let length = if tail.front_bytes().len() >= CDC_MAXIMUM_BYTES {
+        let first = FastCDC::with_level_and_seed(
+            tail.front_bytes(),
+            CDC_MINIMUM_BYTES,
+            CDC_TARGET_BYTES,
+            CDC_MAXIMUM_BYTES,
+            Normalization::Level1,
+            CDC_SEED_V1,
+        )
+        .next()
+        .expect("ASSERT: a nonempty maximum-sized CDC prefix yields one Chunk");
+        assert_eq!(
+            first.offset, 0,
+            "ASSERT: front-prefix FastCDC must begin at zero"
+        );
+        first.length
+    } else {
+        segmented_fastcdc_cut(tail)
+    };
+    if length > stable_before {
         return Ok(None);
     }
-    tail.take_prefix(first.length).map(Some)
+    tail.take_prefix(length).map(Some)
+}
+
+#[derive(Debug)]
+struct StableChunk {
+    offset: u64,
+    bytes: MutationPayload,
+}
+
+fn take_stable_chunk_batch(
+    state: &mut WriteThroughStream,
+    maximum_bytes: usize,
+) -> Result<Vec<StableChunk>, DurableNamespaceError> {
+    assert!(maximum_bytes != 0, "ASSERT: stable batch budget is nonzero");
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0_usize;
+    while let Some(bytes) = take_next_stable_fastcdc_chunk(&mut state.tail)? {
+        let offset = state.tail_offset;
+        state.tail_offset = state
+            .tail_offset
+            .checked_add(
+                u64::try_from(bytes.len()).expect("ASSERT: bounded FastCDC Chunk length fits u64"),
+            )
+            .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+        batch_bytes = batch_bytes
+            .checked_add(bytes.len())
+            .ok_or(DurableNamespaceError::OutOfMemory)?;
+        batch
+            .try_reserve(1)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        batch.push(StableChunk { offset, bytes });
+        if batch_bytes >= maximum_bytes {
+            break;
+        }
+    }
+    Ok(batch)
+}
+
+fn classify_stable_chunk_batch(
+    batch: &[StableChunk],
+    workers: NonZeroUsize,
+) -> Result<Vec<Option<ChunkId>>, DurableNamespaceError> {
+    assert!(
+        !batch.is_empty() && workers.get() <= batch.len(),
+        "ASSERT: stable Chunk hash workers are nonempty and bounded by the batch"
+    );
+    if workers.get() == 1 {
+        return classify_stable_chunk_shard(batch);
+    }
+    let worker_results = (0..workers.get())
+        .into_par_iter()
+        .map(|worker| {
+            let (start, end) = contiguous_worker_shard(batch.len(), workers.get(), worker);
+            classify_stable_chunk_shard(&batch[start..end])
+        })
+        .collect::<Vec<_>>();
+    let mut classified = Vec::new();
+    classified
+        .try_reserve_exact(batch.len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    for result in worker_results {
+        classified.extend(result?);
+    }
+    assert_eq!(
+        classified.len(),
+        batch.len(),
+        "ASSERT: hash-worker shards partition the stable Chunk batch"
+    );
+    Ok(classified)
+}
+
+fn classify_stable_chunk_shard(
+    batch: &[StableChunk],
+) -> Result<Vec<Option<ChunkId>>, DurableNamespaceError> {
+    let mut classified = Vec::new();
+    classified
+        .try_reserve_exact(batch.len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    for chunk in batch {
+        let bytes = chunk.bytes.as_bytes();
+        assert!(!bytes.is_empty(), "ASSERT: FastCDC Chunk is nonempty");
+        classified.push((!bytes.iter().all(|byte| *byte == bytes[0])).then(|| ChunkId::of(bytes)));
+    }
+    Ok(classified)
+}
+
+fn contiguous_worker_shard(jobs: usize, workers: usize, worker: usize) -> (usize, usize) {
+    assert!(
+        jobs >= workers && worker < workers,
+        "ASSERT: hash worker receives one nonempty stable Chunk shard"
+    );
+    let base = jobs / workers;
+    let extra = jobs % workers;
+    let start = worker
+        .checked_mul(base)
+        .and_then(|offset| offset.checked_add(worker.min(extra)))
+        .expect("ASSERT: bounded hash-worker shard start cannot overflow");
+    let length = base + usize::from(worker < extra);
+    let end = start
+        .checked_add(length)
+        .expect("ASSERT: bounded hash-worker shard end cannot overflow");
+    assert!(
+        start < end && end <= jobs,
+        "ASSERT: hash-worker shard is nonempty and in bounds"
+    );
+    (start, end)
 }
 
 #[derive(Debug, Default)]
@@ -853,11 +1395,14 @@ struct WriteThroughIngest<C> {
     worker_budget: NonZeroUsize,
     worker_permits: WorkerPermits,
     active_writers: AtomicUsize,
+    hash_batches: AtomicUsize,
+    maximum_hash_workers: AtomicUsize,
     registry: Mutex<WriteThroughRegistry>,
     queue: Arc<IngestQueue>,
     publication_queue: Arc<PublicationQueue>,
     namespace: OnceLock<Weak<Namespace>>,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    online_dependency_proofs: Arc<OnlineDependencyProofs>,
 }
 
 #[derive(Debug)]
@@ -1730,6 +2275,10 @@ where
             sealed_uncommitted_containers: u64::try_from(snapshot.sealed_uncommitted_containers)
                 .expect("ASSERT: process Container count fits in u64"),
             oldest_sealed_age: snapshot.oldest_sealed_age,
+            hash_batches: u64::try_from(self.hash_batches.load(Ordering::Relaxed))
+                .expect("ASSERT: process hash-batch count fits u64"),
+            maximum_hash_workers: u64::try_from(self.maximum_hash_workers.load(Ordering::Relaxed))
+                .expect("ASSERT: process hash-worker count fits u64"),
             degraded: snapshot.degraded,
         }
     }
@@ -1935,55 +2484,85 @@ where
             return Ok(Vec::new());
         }
         let mut externalized = Vec::new();
-        while let Some(chunk) = take_next_stable_fastcdc_chunk(&mut state.tail)? {
-            let logical_offset = state.tail_offset;
-            state.tail_offset = state
-                .tail_offset
-                .checked_add(
-                    u64::try_from(chunk.len())
-                        .expect("ASSERT: bounded FastCDC Chunk length fits u64"),
-                )
-                .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
-            let chunk_bytes = chunk.as_bytes();
-            if chunk_bytes.iter().all(|byte| *byte == chunk_bytes[0]) {
-                externalized.push(ExternalizedExtent::new(
-                    inode,
-                    logical_offset,
-                    through_sequence,
-                    Arc::new(FillCommittedFile {
-                        value: chunk_bytes[0],
-                        length: u64::try_from(chunk_bytes.len())
-                            .expect("ASSERT: bounded FastCDC Chunk length fits u64"),
-                    }),
-                )?);
-                continue;
-            }
-            let chunk_id = ChunkId::of(chunk_bytes);
-            let logical_length = u64::try_from(chunk_bytes.len())
-                .expect("ASSERT: bounded FastCDC Chunk length fits u64");
-            if let Some(entry) =
-                self.index
-                    .verified_location(&self.containers, chunk_id, logical_length)
-            {
-                externalized.push(self.externalized_location(
-                    inode,
-                    logical_offset,
-                    through_sequence,
-                    entry,
-                )?);
-                continue;
-            }
-            state.pending_bytes = state
-                .pending_bytes
-                .checked_add(chunk_bytes.len())
-                .ok_or(DurableNamespaceError::OutOfMemory)?;
-            state.pending_chunks.push(PendingWriteThroughChunk {
-                offset: logical_offset,
-                chunk_id,
-                bytes: chunk,
-            });
-            if state.pending_bytes >= CONTAINER_PAYLOAD_FLUSH_BYTES {
+        while state.pending_bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
+            let maximum_batch_bytes = CONTAINER_PAYLOAD_FLUSH_BYTES
+                .checked_sub(state.pending_bytes)
+                .expect("ASSERT: pending bytes remain below the flush threshold");
+            let batch = take_stable_chunk_batch(state, maximum_batch_bytes)?;
+            if batch.is_empty() {
                 break;
+            }
+            let desired_workers = workers_per_ingest_job(
+                self.worker_budget,
+                self.active_writers.load(Ordering::Acquire),
+            );
+            let worker_lease = self.worker_permits.acquire(desired_workers);
+            let workers = NonZeroUsize::new(worker_lease.workers().get().min(batch.len()))
+                .expect("ASSERT: a nonempty Chunk batch has one hash worker");
+            let chunk_ids = classify_stable_chunk_batch(&batch, workers)?;
+            drop(worker_lease);
+            self.hash_batches
+                .fetch_add(1, Ordering::Relaxed)
+                .checked_add(1)
+                .expect("ASSERT: hash-batch telemetry cannot overflow");
+            self.maximum_hash_workers
+                .fetch_max(workers.get(), Ordering::Relaxed);
+            assert_eq!(
+                batch.len(),
+                chunk_ids.len(),
+                "ASSERT: every stable Chunk has one classification"
+            );
+            for (chunk, chunk_id) in batch.into_iter().zip(chunk_ids) {
+                let chunk_bytes = chunk.bytes.as_bytes();
+                let logical_length = u64::try_from(chunk_bytes.len())
+                    .expect("ASSERT: bounded FastCDC Chunk length fits u64");
+                let Some(chunk_id) = chunk_id else {
+                    externalized.push(ExternalizedExtent::new(
+                        inode,
+                        chunk.offset,
+                        through_sequence,
+                        Arc::new(FillCommittedFile {
+                            value: chunk_bytes[0],
+                            length: logical_length,
+                        }),
+                    )?);
+                    continue;
+                };
+                if let Some(entry) = self
+                    .online_dependency_proofs
+                    .verified_entry(chunk_id, logical_length)
+                {
+                    externalized.push(self.externalized_location(
+                        inode,
+                        chunk.offset,
+                        through_sequence,
+                        entry,
+                        OnlineProofAdmission::Touch,
+                    )?);
+                    continue;
+                }
+                if let Some(entry) =
+                    self.index
+                        .verified_location(&self.containers, chunk_id, logical_length)
+                {
+                    externalized.push(self.externalized_location(
+                        inode,
+                        chunk.offset,
+                        through_sequence,
+                        entry,
+                        OnlineProofAdmission::ExactReuse,
+                    )?);
+                    continue;
+                }
+                state.pending_bytes = state
+                    .pending_bytes
+                    .checked_add(chunk_bytes.len())
+                    .ok_or(DurableNamespaceError::OutOfMemory)?;
+                state.pending_chunks.push(PendingWriteThroughChunk {
+                    offset: chunk.offset,
+                    chunk_id,
+                    bytes: chunk.bytes,
+                });
             }
         }
         assert_pending_write_through_state(state);
@@ -2018,7 +2597,7 @@ where
             !chunks.is_empty(),
             "ASSERT: Container publication requires at least one pending Chunk"
         );
-        let mut locations = BTreeMap::<ChunkId, ExactIndexEntry>::new();
+        let mut locations = BTreeMap::<ChunkId, (ExactIndexEntry, OnlineProofAdmission)>::new();
         let mut candidates = BTreeMap::<ChunkId, (u32, &PendingWriteThroughChunk)>::new();
         let mut new_chunks = Vec::new();
         new_chunks
@@ -2044,16 +2623,45 @@ where
             .iter()
             .map(|(chunk_id, (logical_length, _))| (*chunk_id, u64::from(*logical_length)))
             .collect::<Vec<_>>();
-        let resolved = self.index.verified_locations(&self.containers, &requests);
+        let mut resolved = self.online_dependency_proofs.verified_entries(&requests);
+        let resolved_from_cache = resolved.iter().map(Option::is_some).collect::<Vec<_>>();
+        let missing_requests = requests
+            .iter()
+            .zip(&resolved)
+            .filter_map(|(request, resolved)| resolved.is_none().then_some(*request))
+            .collect::<Vec<_>>();
+        let mut looked_up = self
+            .index
+            .verified_locations(&self.containers, &missing_requests)
+            .into_iter();
+        for resolved in &mut resolved {
+            if resolved.is_none() {
+                *resolved = looked_up
+                    .next()
+                    .expect("ASSERT: batched Exact lookup returns every missing result");
+            }
+        }
+        assert!(
+            looked_up.next().is_none(),
+            "ASSERT: batched Exact lookup cannot return surplus results"
+        );
         assert_eq!(
             resolved.len(),
             candidates.len(),
             "ASSERT: batched Exact lookup returns one result per sorted unique request"
         );
-        for ((chunk_id, (_logical_length, chunk)), location) in candidates.into_iter().zip(resolved)
+        for (((chunk_id, (_logical_length, chunk)), location), from_cache) in candidates
+            .into_iter()
+            .zip(resolved)
+            .zip(resolved_from_cache)
         {
             if let Some(entry) = location {
-                locations.insert(chunk_id, entry);
+                let admission = if from_cache {
+                    OnlineProofAdmission::Touch
+                } else {
+                    OnlineProofAdmission::ExactReuse
+                };
+                locations.insert(chunk_id, (entry, admission));
             } else {
                 new_chunks.push(chunk);
             }
@@ -2065,7 +2673,9 @@ where
         }
         let entries = self.publish_new_chunks(&new_chunks)?;
         for entry in &entries {
-            if let Some(previous) = locations.insert(entry.chunk_id(), *entry) {
+            if let Some((previous, _)) =
+                locations.insert(entry.chunk_id(), (*entry, OnlineProofAdmission::Published))
+            {
                 assert_eq!(
                     previous.logical_length(),
                     entry.logical_length(),
@@ -2086,7 +2696,7 @@ where
             !new_chunks.is_empty(),
             "ASSERT: a new-Chunk Container must contain at least one Chunk"
         );
-        let mut regions = Vec::<Vec<&[u8]>>::new();
+        let mut regions = Vec::<Vec<PrehashedChunk<'_>>>::new();
         let mut region_bytes = 0_usize;
         for chunk in new_chunks {
             if region_bytes != 0
@@ -2103,7 +2713,7 @@ where
             regions
                 .last_mut()
                 .expect("ASSERT: active region exists")
-                .push(chunk.bytes.as_bytes());
+                .push(PrehashedChunk::new(chunk.chunk_id, chunk.bytes.as_bytes()));
             region_bytes = region_bytes
                 .checked_add(chunk.bytes.len())
                 .ok_or(DurableNamespaceError::OutOfMemory)?;
@@ -2118,7 +2728,7 @@ where
             workers.get() <= self.worker_budget.get(),
             "ASSERT: one encode job cannot exceed the write-through worker budget"
         );
-        let prepared = ContainerRepository::<C>::prepare_adaptive_regions_parallel(
+        let prepared = ContainerRepository::<C>::prepare_prehashed_adaptive_regions_parallel(
             random_container_id()?,
             generation,
             &region_refs,
@@ -2145,7 +2755,7 @@ where
         chunks: &[PendingWriteThroughChunk],
         inode: InodeId,
         through_sequence: u64,
-        locations: &BTreeMap<ChunkId, ExactIndexEntry>,
+        locations: &BTreeMap<ChunkId, (ExactIndexEntry, OnlineProofAdmission)>,
     ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
         let mut externalized = Vec::new();
         externalized
@@ -2153,7 +2763,7 @@ where
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         for pending in chunks {
             let chunk_id = pending.chunk_id;
-            let entry = locations
+            let (entry, admission) = locations
                 .get(&chunk_id)
                 .copied()
                 .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
@@ -2171,6 +2781,7 @@ where
                 pending.offset,
                 through_sequence,
                 entry,
+                admission,
             )?);
         }
         Ok(externalized)
@@ -2182,7 +2793,10 @@ where
         offset: u64,
         through_sequence: u64,
         entry: ExactIndexEntry,
+        admission: OnlineProofAdmission,
     ) -> Result<ExternalizedExtent, DurableNamespaceError> {
+        self.online_dependency_proofs
+            .remember_active(entry, admission);
         ExternalizedExtent::new(
             inode,
             offset,
@@ -2252,6 +2866,7 @@ fn install_write_through<C>(
     next_generation: Arc<Mutex<u64>>,
     index: Arc<dyn ManifestReaderPolicy<C>>,
     worker_budget: NonZeroUsize,
+    online_dependency_proofs: Arc<OnlineDependencyProofs>,
 ) -> Arc<WriteThroughIngest<C>>
 where
     C: Clone + Send + Sync + StorageIo + 'static,
@@ -2263,11 +2878,14 @@ where
         worker_budget,
         worker_permits: WorkerPermits::new(worker_budget),
         active_writers: AtomicUsize::new(0),
+        hash_batches: AtomicUsize::new(0),
+        maximum_hash_workers: AtomicUsize::new(0),
         registry: Mutex::new(WriteThroughRegistry::default()),
         queue: Arc::new(IngestQueue::new()),
         publication_queue: Arc::new(PublicationQueue::new()),
         namespace: OnceLock::new(),
         workers: Mutex::new(Vec::new()),
+        online_dependency_proofs,
     });
     write_through.start_workers(namespace);
     namespace.install_mutation_observer(write_through.clone());
@@ -2908,12 +3526,14 @@ where
         let available_workers = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
         let checkpoint_workers = available_workers;
         let namespace = Arc::new(namespace);
+        let online_dependency_proofs = Arc::new(OnlineDependencyProofs::new()?);
         let write_through = install_write_through(
             &namespace,
             containers.clone(),
             Arc::clone(&next_container_generation),
             Arc::clone(&manifest_readers),
             checkpoint_workers,
+            Arc::clone(&online_dependency_proofs),
         );
         Ok(Self {
             namespace,
@@ -2928,6 +3548,7 @@ where
             manifest_readers,
             checkpoint_workers,
             write_through,
+            online_dependency_proofs,
         })
     }
 
@@ -2984,6 +3605,21 @@ where
         self.containers.descriptor_cache_status()
     }
 
+    /// Returns pressure, admission, and hit evidence for historical S3-FIFO.
+    ///
+    /// Active and Frozen Generation proofs are pinned separately and therefore
+    /// do not contribute to this rebuildable cache's entry count.
+    #[must_use]
+    pub fn historical_proof_cache_status(&self) -> HistoricalProofCacheStatus {
+        self.online_dependency_proofs.historical_status()
+    }
+
+    /// Returns memory accounting for the non-evictable Active and Frozen proof sets.
+    #[must_use]
+    pub fn generation_proof_set_status(&self) -> GenerationProofSetStatus {
+        self.online_dependency_proofs.generation_status()
+    }
+
     /// Returns the runtime worker cap for independent Compression Regions.
     #[must_use]
     pub const fn checkpoint_worker_limit(&self) -> NonZeroUsize {
@@ -2994,6 +3630,28 @@ where
     #[must_use]
     pub fn write_through_status(&self) -> WriteThroughStatus {
         self.write_through.status()
+    }
+
+    /// Starts a bounded, payload-free trace of real online proof-cache events.
+    ///
+    /// Trace capture is benchmark instrumentation. It never changes cache
+    /// authority, admission, eviction, durability, or recovery behavior.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero or excessive bounds and a second concurrent capture.
+    pub fn start_online_proof_trace(&self, max_events: usize) -> Result<(), ProofCacheReplayError> {
+        self.online_dependency_proofs.trace.start(max_events)
+    }
+
+    /// Finishes the active online proof-cache trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if capture was not active or exceeded its declared
+    /// event bound. An overflow never truncates a trace silently.
+    pub fn finish_online_proof_trace(&self) -> Result<ProofCacheTrace, ProofCacheReplayError> {
+        self.online_dependency_proofs.trace.finish()
     }
 
     /// Durably commits one complete prefix of accepted mutations.
@@ -3037,13 +3695,29 @@ where
             .checkpoint_lock
             .lock()
             .expect("ASSERT: durable namespace checkpoint lock poisoned");
+        // Freeze proofs before the namespace takes its mutation cut. Anything
+        // accepted concurrently afterward stays in the next Active set. A
+        // late proof for the selected cut may remain Active for one extra
+        // generation, which is conservative and never demotes it too early.
+        let newly_frozen_proofs = self.online_dependency_proofs.freeze_for_commit();
         let sealed_at_cut = self.write_through.capture_cut();
         let freeze_started = PhaseStarted::now();
-        let Some(commit) = self.namespace.begin_commit()? else {
-            // With no dirty generation, every Container trigger captured above
-            // is stale acceleration evidence rather than uncommitted data.
-            self.write_through.complete_cut(sealed_at_cut);
-            return Ok(None);
+        let commit = match self.namespace.begin_commit() {
+            Ok(Some(commit)) => commit,
+            Ok(None) => {
+                // With no dirty generation, every Container trigger captured
+                // above is stale acceleration evidence rather than uncommitted
+                // data. Undo only the freeze created by this call.
+                self.write_through.complete_cut(sealed_at_cut);
+                self.online_dependency_proofs
+                    .cancel_new_freeze(newly_frozen_proofs);
+                return Ok(None);
+            }
+            Err(error) => {
+                self.online_dependency_proofs
+                    .cancel_new_freeze(newly_frozen_proofs);
+                return Err(error.into());
+            }
         };
         let mut metrics = CheckpointMetrics::default();
         freeze_started.finish_into(&mut metrics.freeze);
@@ -3055,6 +3729,7 @@ where
             &self.next_container_generation,
             self.manifest_readers.as_ref(),
             self.checkpoint_workers,
+            Arc::clone(&self.online_dependency_proofs),
         );
         let manifest_plan_started = PhaseStarted::now();
         let mut manifests = Vec::new();
@@ -3094,6 +3769,7 @@ where
         let metadata_started = PhaseStarted::now();
         let record = self.publish_generation(&commit, manifests, &retained_ranges)?;
         self.write_through.complete_cut(sealed_at_cut);
+        self.online_dependency_proofs.complete_frozen();
         metadata_started.finish_into(&mut metrics.metadata_commit);
         total_started.finish_into(&mut metrics.total);
         Ok(Some(ProfiledCheckpoint { record, metrics }))
@@ -3223,9 +3899,13 @@ where
             .try_reserve_exact(commit.inodes().len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         let root = namespace_root_for_commit(commit, durable_inodes)?;
-        let graph_verifier = self
+        let fallback = self
             .manifest_readers
             .graph_verifier(self.containers.clone());
+        let graph_verifier = OnlineSuccessorVerifier {
+            proofs: Arc::clone(&self.online_dependency_proofs),
+            fallback,
+        };
         let committed = self
             .generations
             .commit_namespace_with_successor_proofs_using(
@@ -3233,7 +3913,7 @@ where
                 &self.containers,
                 predecessor,
                 &successor_proofs,
-                graph_verifier.as_ref(),
+                &graph_verifier,
             )?;
         let (record, verified_files) = committed.into_parts();
         assert_eq!(
@@ -4420,6 +5100,7 @@ struct AdaptiveCommitWriter<'a, C> {
     metrics: CheckpointReductionMetrics,
     current_inode: Option<u64>,
     retained_ranges: RetainedManifestRanges,
+    online_dependency_proofs: Arc<OnlineDependencyProofs>,
 }
 
 impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
@@ -4428,6 +5109,7 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
         next_generation: &'a Mutex<u64>,
         index: &'a dyn ManifestReaderPolicy<C>,
         workers: NonZeroUsize,
+        online_dependency_proofs: Arc<OnlineDependencyProofs>,
     ) -> Self {
         Self {
             containers,
@@ -4441,6 +5123,7 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             metrics: CheckpointReductionMetrics::default(),
             current_inode: None,
             retained_ranges: BTreeMap::new(),
+            online_dependency_proofs,
         }
     }
 
@@ -4545,11 +5228,22 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             exact_started.finish_into(&mut self.metrics.exact_lookup);
             return Ok(());
         }
-        if self
+        if let Some(entry) = self
+            .online_dependency_proofs
+            .verified_entry(chunk_id, length)
+        {
+            self.online_dependency_proofs
+                .remember_frozen(entry, OnlineProofAdmission::Touch);
+            self.record_exact_hit(length);
+            exact_started.finish_into(&mut self.metrics.exact_lookup);
+            return Ok(());
+        }
+        if let Some(entry) = self
             .index
             .verified_location(self.containers, chunk_id, length)
-            .is_some()
         {
+            self.online_dependency_proofs
+                .remember_frozen(entry, OnlineProofAdmission::ExactReuse);
             self.record_exact_hit(length);
             exact_started.finish_into(&mut self.metrics.exact_lookup);
             return Ok(());
@@ -4659,12 +5353,14 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
         self.level_zero_entries
             .try_reserve(verified.locations().len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        self.level_zero_entries
-            .extend(verified.locations().iter().copied().map(|location| {
-                ExactIndexEntry::from_verified(location).expect(
+        for location in verified.locations().iter().copied() {
+            let entry = ExactIndexEntry::from_verified(location).expect(
                 "ASSERT: fully verified Container evidence must form a valid Exact-Index Location",
-            )
-            }));
+            );
+            self.online_dependency_proofs
+                .remember_frozen(entry, OnlineProofAdmission::Published);
+            self.level_zero_entries.push(entry);
+        }
         self.chunks.clear();
         self.payload_bytes = 0;
         Ok(())
@@ -4877,7 +5573,7 @@ mod tests {
     }
 
     #[test]
-    fn segmented_ingest_tail_compacts_once_and_consumes_without_memmove() {
+    fn segmented_ingest_tail_materializes_only_the_selected_prefix() {
         let mut tail = SegmentedIngestTail::default();
         for bytes in [b"abc".as_slice(), b"defg".as_slice(), b"hijkl".as_slice()] {
             tail.push(
@@ -4885,15 +5581,15 @@ mod tests {
             );
         }
 
-        tail.make_prefix_contiguous(8)
-            .expect("compact bounded fixture prefix");
-        assert_eq!(tail.front_bytes(), b"abcdefgh");
         let consumed = tail.take_prefix(5).expect("consume compact prefix");
         assert_eq!(consumed.as_bytes(), b"abcde");
         assert_eq!(tail.len(), 7);
-        tail.make_prefix_contiguous(7)
-            .expect("compact remaining fixture bytes");
-        assert_eq!(tail.front_bytes(), b"fghijkl");
+        assert_eq!(tail.materialized_bytes(), 5);
+        let remaining = tail
+            .take_prefix(7)
+            .expect("consume remaining fixture bytes");
+        assert_eq!(remaining.as_bytes(), b"fghijkl");
+        assert_eq!(tail.materialized_bytes(), 12);
     }
 
     #[test]
@@ -4947,9 +5643,33 @@ mod tests {
         }
 
         assert_eq!(observed, expected);
+        assert!(
+            tail.materialized_bytes() <= observed.iter().map(Vec::len).sum::<usize>(),
+            "CDC may materialize selected Chunks, never lookahead bytes"
+        );
         assert_eq!(
             tail.len(),
             source.len() - expected.iter().map(Vec::len).sum::<usize>()
+        );
+
+        let mut fragmented = SegmentedIngestTail::default();
+        for bytes in source.chunks(4_096) {
+            fragmented.push(
+                MutationPayload::try_copy_from_slice(bytes).expect("allocate fragmented fixture"),
+            );
+        }
+        let mut selected_bytes = 0_usize;
+        while let Some(chunk) =
+            take_next_stable_fastcdc_chunk(&mut fragmented).expect("chunk fragmented fixture")
+        {
+            selected_bytes = selected_bytes
+                .checked_add(chunk.len())
+                .expect("fixture byte count cannot overflow");
+        }
+        assert_eq!(
+            fragmented.materialized_bytes(),
+            selected_bytes,
+            "4-KiB segments force every >=16-KiB Chunk to span segments; only selected bytes may copy"
         );
     }
 

@@ -40,7 +40,7 @@ pub use manifest_reader::{MAX_MANIFEST_READ_BYTES, ManifestReadError, VerifiedMa
 pub use manifest_tree::ManifestTreeError;
 pub use read_cache::{
     MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig, VerifiedReadCacheError,
-    VerifiedReadCacheStatus,
+    VerifiedReadCacheStatus, shared_cache_reserve_bytes,
 };
 pub use reduction::{
     ReducedObject, ReductionAuditReport, ReductionEngine, ReductionError, ReductionFeatures,
@@ -65,7 +65,7 @@ use std::time::{Duration, Instant};
 use fastdup_format::{
     BuildingContainerHeader, ContainerId, ExactIndexEntry, ExactIndexLocation,
     ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, MAX_CONTAINER_BYTES,
-    SealedContainer, SealedContainerDescriptor,
+    PrehashedChunk, SealedContainer, SealedContainerDescriptor,
 };
 use rayon::prelude::*;
 
@@ -698,6 +698,40 @@ impl<I: StorageIo> ContainerRepository<I> {
         let encode_wall_started = Instant::now();
         let encode_cpu_started = process_cpu_time();
         let sealed = SealedContainer::encode_adaptive_regions_parallel(
+            container_id,
+            container_generation,
+            regions,
+            workers,
+        )?;
+        let encode_wall = encode_wall_started.elapsed();
+        let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
+        Ok(PreparedAdaptiveContainer {
+            container_id,
+            container_generation,
+            sealed,
+            encode_wall,
+            encode_process_cpu,
+        })
+    }
+
+    /// Encodes adaptive Compression Regions while preserving Chunk identities
+    /// already computed by the ingest stage.
+    ///
+    /// The returned image remains non-authoritative. Publication rereads it and
+    /// recomputes every identity before the Container name can become visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns format, compression, allocation, or worker failures.
+    pub fn prepare_prehashed_adaptive_regions_parallel(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[PrehashedChunk<'_>]],
+        workers: NonZeroUsize,
+    ) -> Result<PreparedAdaptiveContainer, StoreError> {
+        let encode_wall_started = Instant::now();
+        let encode_cpu_started = process_cpu_time();
+        let sealed = SealedContainer::encode_prehashed_adaptive_regions_parallel(
             container_id,
             container_generation,
             regions,

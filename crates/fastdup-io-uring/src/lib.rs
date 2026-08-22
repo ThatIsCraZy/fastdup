@@ -117,6 +117,7 @@ pub struct IoUringStorageStatus {
     verification_jobs_started: u64,
     verification_jobs_completed: u64,
     verification_jobs_failed: u64,
+    parallel_hash_verifications: u64,
     active_verifications: u64,
     peak_active_verifications: u64,
 }
@@ -205,6 +206,11 @@ impl IoUringStorageStatus {
     #[must_use]
     pub const fn verification_jobs_failed(&self) -> u64 {
         self.verification_jobs_failed
+    }
+
+    #[must_use]
+    pub const fn parallel_hash_verifications(&self) -> u64 {
+        self.parallel_hash_verifications
     }
 
     #[must_use]
@@ -338,6 +344,7 @@ impl IoUringStorageIo {
                 verification_jobs_started: 0,
                 verification_jobs_completed: 0,
                 verification_jobs_failed: 0,
+                parallel_hash_verifications: 0,
                 active_verifications: 0,
                 peak_active_verifications: 0,
             },
@@ -525,7 +532,7 @@ impl ActiveBackend {
         let entries = usize::try_from(config.ring_entries.get())
             .expect("ASSERT: u32 ring entry count fits usize");
         let verifier_pool =
-            VerificationPool::start(config.verifier_workers, entries, &worker_counters)?;
+            VerificationPool::start(config.verifier_workers, entries, &worker_counters);
         let worker = thread::Builder::new()
             .name("fastdup-io-uring".to_owned())
             .spawn(move || {
@@ -578,6 +585,11 @@ impl ActiveBackend {
                 .jobs_completed
                 .load(Ordering::Relaxed),
             verification_jobs_failed: self.counters.verifier.jobs_failed.load(Ordering::Relaxed),
+            parallel_hash_verifications: self
+                .counters
+                .verifier
+                .parallel_hashes
+                .load(Ordering::Relaxed),
             active_verifications: self.counters.verifier.active.load(Ordering::Relaxed),
             peak_active_verifications: self.counters.verifier.peak_active.load(Ordering::Relaxed),
         }
@@ -741,6 +753,7 @@ struct VerifierCounters {
     jobs_started: AtomicU64,
     jobs_completed: AtomicU64,
     jobs_failed: AtomicU64,
+    parallel_hashes: AtomicU64,
     active: AtomicU64,
     peak_active: AtomicU64,
 }
@@ -1176,8 +1189,9 @@ fn verify_owned_reread(
     expected_container_hash: [u8; 32],
     container_id: fastdup_format::ContainerId,
     container_generation: u64,
+    hash_workers: NonZeroUsize,
 ) -> Result<SealedContainer, StoreError> {
-    let verified = SealedContainer::decode(reread)?;
+    let verified = SealedContainer::decode_with_hash_workers(reread, hash_workers)?;
     let footer_bytes =
         usize::try_from(FOOTER_BYTES).expect("ASSERT: format-v1 Footer size fits usize");
     let footer_offset = reread
@@ -1684,6 +1698,7 @@ fn verify_publications(
                 pending.operation.expected_container_hash,
                 pending.operation.container_id,
                 pending.operation.container_generation,
+                NonZeroUsize::MIN,
             );
             if let Some(operation) = finish_verified_operation(pending.operation, verified) {
                 ready.push(operation);

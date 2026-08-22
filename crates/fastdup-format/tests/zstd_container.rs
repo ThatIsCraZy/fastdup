@@ -1,6 +1,59 @@
 use std::num::NonZeroUsize;
 
-use fastdup_format::{ContainerId, FormatError, HEADER_BYTES, SealedContainer};
+use fastdup_format::{
+    ChunkId, ContainerId, FormatError, HEADER_BYTES, PrehashedChunk, SealedContainer,
+};
+
+#[test]
+fn prehashed_adaptive_input_is_byte_identical_to_the_regular_writer() {
+    let first = vec![b'A'; 192 * 1_024];
+    let second = (0..192 * 1_024)
+        .map(|index| u8::try_from((index * 131 + 17) % 251).expect("fixture byte fits u8"))
+        .collect::<Vec<_>>();
+    let chunks = [first.as_slice(), second.as_slice()];
+    let identified = chunks
+        .iter()
+        .map(|bytes| PrehashedChunk::new(ChunkId::of(bytes), bytes))
+        .collect::<Vec<_>>();
+    let container_id = ContainerId::new([0xC0; 16]).expect("container identity is nonzero");
+
+    let regular = SealedContainer::encode_adaptive_regions_parallel(
+        container_id,
+        9,
+        &[&chunks],
+        NonZeroUsize::MIN,
+    )
+    .expect("encode ordinary adaptive region");
+    let prehashed = SealedContainer::encode_prehashed_adaptive_regions_parallel(
+        container_id,
+        9,
+        &[identified.as_slice()],
+        NonZeroUsize::MIN,
+    )
+    .expect("encode prehashed adaptive region");
+
+    assert_eq!(prehashed, regular);
+    SealedContainer::decode(&prehashed).expect("prehashed writer output verifies byte exactly");
+}
+
+#[test]
+fn wrong_prehashed_identity_is_rejected_by_the_mandatory_reader() {
+    let payload = vec![b'Q'; 192 * 1_024];
+    let wrong = PrehashedChunk::new(ChunkId::from_bytes([0x55; 32]), &payload);
+    let region = [wrong];
+    let encoded = SealedContainer::encode_prehashed_adaptive_regions_parallel(
+        ContainerId::new([0xCF; 16]).expect("container identity is nonzero"),
+        10,
+        &[&region],
+        NonZeroUsize::MIN,
+    )
+    .expect("non-authoritative writer image is constructed");
+
+    assert_eq!(
+        SealedContainer::decode(&encoded),
+        Err(FormatError::ChunkHashMismatch)
+    );
+}
 
 #[test]
 fn zstd_region_round_trips_multiple_logical_chunks_byte_exactly() {
@@ -94,12 +147,15 @@ fn every_zstd_container_prefix_and_single_byte_corruption_is_rejected_without_pa
 
 #[test]
 fn parallel_adaptive_encoding_is_byte_identical_to_one_worker() {
-    let owned = (0..24_usize)
+    let owned = (0..40_usize)
         .map(|ordinal| {
+            let mut state = u64::try_from(ordinal + 1).expect("fixture ordinal fits u64");
             (0..64 * 1_024)
-                .map(|index| {
-                    let lane = (index + ordinal * 7) % 29;
-                    b'a' + u8::try_from(lane).expect("fixture lane fits u8")
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
                 })
                 .collect::<Vec<_>>()
         })
@@ -117,15 +173,28 @@ fn parallel_adaptive_encoding_is_byte_identical_to_one_worker() {
         NonZeroUsize::new(1).expect("one is nonzero"),
     )
     .expect("encode with one worker");
-    let four = SealedContainer::encode_adaptive_regions_parallel(
-        container_id,
-        17,
-        &references,
-        NonZeroUsize::new(4).expect("four is nonzero"),
-    )
-    .expect("encode with four workers");
+    let four_workers = NonZeroUsize::new(4).expect("four is nonzero");
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(four_workers.get())
+        .build()
+        .expect("dedicated test pool");
+    let four = pool.install(|| {
+        SealedContainer::encode_adaptive_regions_parallel(
+            container_id,
+            17,
+            &references,
+            four_workers,
+        )
+        .expect("encode with four workers")
+    });
     assert_eq!(four, one);
-    let decoded = SealedContainer::decode(&four).expect("decode the parallel writer output");
+    assert_eq!(
+        pool.install(|| SealedContainer::container_hash_worker_count(four.len(), four_workers)),
+        four_workers
+    );
+    let decoded = pool
+        .install(|| SealedContainer::decode_with_hash_workers(&four, four_workers))
+        .expect("decode the parallel writer output");
     assert_eq!(decoded.chunk_count(), owned.len());
 }
 

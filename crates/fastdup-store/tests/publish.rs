@@ -1,7 +1,8 @@
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use fastdup_format::{ChunkId, ContainerId, MAX_CONTAINER_BYTES};
-use fastdup_store::{ContainerStore, StoreError};
+use fastdup_format::{ChunkId, ContainerId, FormatError, MAX_CONTAINER_BYTES, PrehashedChunk};
+use fastdup_store::{ContainerRepository, ContainerStore, FsStorageIo, StoreError};
 
 fn test_root(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -42,6 +43,39 @@ fn published_container_is_immediately_reopenable_by_id() {
             .count(),
         0
     );
+}
+
+#[test]
+fn wrong_prehashed_identity_never_becomes_a_published_container() {
+    let root = test_root("publish-wrong-prehash");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let repository = ContainerRepository::new(
+        FsStorageIo::open(&root).expect("create workspace-local repository"),
+    );
+    let id = ContainerId::new([0x9A; 16]).expect("nonzero container id");
+    let payload = vec![b'R'; 192 * 1_024];
+    let chunk = PrehashedChunk::new(ChunkId::from_bytes([0x66; 32]), &payload);
+    let region = [chunk];
+    let prepared = ContainerRepository::<FsStorageIo>::prepare_prehashed_adaptive_regions_parallel(
+        id,
+        1,
+        &[&region],
+        NonZeroUsize::MIN,
+    )
+    .expect("construct non-authoritative writer image");
+
+    assert!(matches!(
+        repository.publish_prepared_adaptive_profiled(prepared),
+        Err(StoreError::Format(FormatError::ChunkHashMismatch))
+    ));
+    match repository.read(id) {
+        Err(StoreError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        result => panic!("invalid writer evidence became visible: {result:?}"),
+    }
+
+    std::fs::remove_dir_all(&root).expect("remove only this test repository");
 }
 
 #[test]
