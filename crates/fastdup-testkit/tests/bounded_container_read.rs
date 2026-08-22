@@ -109,7 +109,11 @@ fn exact_location_read_uses_only_bounded_ranges_and_returns_verified_bytes() {
 #[test]
 fn repeated_location_reads_reuse_the_verified_container_envelope() {
     let storage = MemoryStorageIo::new();
-    let repository = ContainerRepository::new(storage.clone());
+    let gib = 1_024_u64.pow(3);
+    let repository = ContainerRepository::new_with_descriptor_cache_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 * gib, 96 * gib, 0),
+    );
     let container_id = ContainerId::new([0xB4; 16]).expect("container identity is nonzero");
     let first = b"first record in one immutable container";
     let second = b"second record reuses the verified envelope";

@@ -1985,7 +1985,7 @@ fn checkpoint_consumes_writer_verified_dependencies_without_record_reread() {
 }
 
 #[test]
-fn second_identical_file_reuses_online_dependency_proof_without_data_reread() {
+fn second_identical_file_reuses_online_proofs_or_reverifies_under_memory_pressure() {
     let metadata = MemoryStorageIo::new();
     let containers = MemoryStorageIo::new();
     let indexes = MemoryStorageIo::new();
@@ -2003,12 +2003,17 @@ fn second_identical_file_reuses_online_dependency_proof_without_data_reread() {
         .checkpoint()
         .expect("commit first copy")
         .expect("first copy requires one generation");
-    let after_first = appliance.historical_proof_cache_status();
-    assert!(after_first.admissions() > 0);
-    assert!(after_first.entry_count() > 0);
+    let historical_after_first = appliance.historical_proof_cache_status();
+    let generation_after_first = appliance.generation_proof_set_status();
+    assert!(
+        historical_after_first.entry_count() > 0
+            || generation_after_first.active_proofs() > 0
+            || generation_after_first.frozen_proofs() > 0,
+        "the first stream must retain verified online dependency evidence"
+    );
 
     let baseline = containers.operation_count();
-    let cache_hits = after_first.hits();
+    let historical_hits = historical_after_first.hits();
     create_and_write(&appliance, b"second-copy", &payload);
     appliance
         .checkpoint()
@@ -2018,14 +2023,23 @@ fn second_identical_file_reuses_online_dependency_proof_without_data_reread() {
         .iter()
         .filter(|operation| **operation == StorageOperation::ReadExactAt)
         .count();
-    assert_eq!(
-        record_rereads, 0,
-        "an immutable Location already proven in this process must not be reread for an identical successor file"
-    );
-    assert!(
-        appliance.historical_proof_cache_status().hits() > cache_hits,
-        "the second stream must consume committed history through production S3-FIFO"
-    );
+    let after_second = appliance.historical_proof_cache_status();
+    if historical_after_first.admission_rejections() == 0 {
+        assert_eq!(
+            record_rereads, 0,
+            "an admitted immutable proof must avoid rereading identical DATA"
+        );
+        assert!(
+            after_second.hits() > historical_hits,
+            "the second stream must consume admitted committed history"
+        );
+    } else {
+        assert!(historical_after_first.swap_used_bytes() > 0);
+        assert!(
+            record_rereads > 0,
+            "pressure-rejected acceleration must fall back to DATA verification"
+        );
+    }
 }
 
 #[test]

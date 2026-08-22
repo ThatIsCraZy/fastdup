@@ -448,6 +448,7 @@ fn map_worker_result(
 
 fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
     let metrics = profiled.metrics();
+    let gate = metrics.incompressibility_gate();
     eprintln!(
         concat!(
             "checkpoint_metrics generation={} ",
@@ -460,7 +461,12 @@ fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
             "fill_chunks={} fill_bytes={} exact_hit_chunks={} exact_hit_bytes={} ",
             "new_chunks={} new_bytes={} container_file_bytes={} raw_records={} ",
             "zstd_records={} containers={} peak_buffered_bytes={} peak_buffered_chunks={} ",
-            "recipe_reuse_chunks={} recipe_reuse_bytes={} checkpoint_rechunk_bytes={}"
+            "recipe_reuse_chunks={} recipe_reuse_bytes={} checkpoint_rechunk_bytes={} ",
+            "gate_policy=off gate_disabled={} gate_eligible={} gate_size_bypass={} ",
+            "gate_lz4_allowed={} ",
+            "gate_lz4_rejected={} ",
+            "gate_zstd1_allowed={} gate_zstd1_rejected={} gate_target_trials={} ",
+            "gate_target_accepted={} gate_target_rejected={} gate_raw={} gate_scratch_hwm={}"
         ),
         profiled.record().generation(),
         metrics.total().wall().as_nanos(),
@@ -500,6 +506,18 @@ fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
         metrics.recipe_reuse_chunks(),
         metrics.recipe_reuse_bytes(),
         metrics.checkpoint_rechunk_bytes(),
+        gate.disabled_regions(),
+        gate.eligible_regions(),
+        gate.size_bypassed_regions(),
+        gate.lz4_allowed_regions(),
+        gate.lz4_rejected_regions(),
+        gate.zstd1_allowed_regions(),
+        gate.zstd1_rejected_regions(),
+        gate.target_zstd_trials(),
+        gate.target_zstd_accepted(),
+        gate.target_zstd_rejected(),
+        gate.raw_regions_after_gate(),
+        gate.scratch_high_water_bytes(),
     );
 }
 

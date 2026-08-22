@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use fastcdc::v2020::{FastCDC, MASKS, Normalization, StreamCDC, get_gear_with_seed};
 use fastdup_format::{
     ChunkId, CommitRecord, ContainerId, DurableInode, ExactIndexEntry, ExactIndexProfileId,
-    ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, MAX_LOGICAL_CHUNK_BYTES, ManifestExtent,
-    ManifestLeaf, MetadataFormatError, MetadataObjectId, NamespaceEntry, NamespaceRoot,
-    PolicySetId, PrehashedChunk,
+    ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, IncompressibilityGateMetrics,
+    MAX_LOGICAL_CHUNK_BYTES, ManifestExtent, ManifestLeaf, MetadataFormatError, MetadataObjectId,
+    NamespaceEntry, NamespaceRoot, PolicySetId, PrehashedChunk,
 };
 use fastdup_posix::{
     CommitInode, CommitRange, CommittedFile, CommittedFileInstall, ExternalizedExtent, InodeId,
@@ -194,6 +194,7 @@ pub struct CheckpointMetrics {
     container_file_bytes: u64,
     raw_records: u64,
     zstd_records: u64,
+    incompressibility_gate: IncompressibilityGateMetrics,
     containers: u64,
     peak_buffered_chunk_bytes: u64,
     peak_buffered_chunks: u64,
@@ -279,6 +280,11 @@ impl CheckpointMetrics {
     }
 
     #[must_use]
+    pub const fn incompressibility_gate(self) -> IncompressibilityGateMetrics {
+        self.incompressibility_gate
+    }
+
+    #[must_use]
     pub const fn containers(self) -> u64 {
         self.containers
     }
@@ -325,6 +331,7 @@ impl CheckpointMetrics {
         self.container_file_bytes = reduction.container_file_bytes;
         self.raw_records = reduction.raw_records;
         self.zstd_records = reduction.zstd_records;
+        self.incompressibility_gate = reduction.incompressibility_gate;
         self.containers = reduction.containers;
         self.peak_buffered_chunk_bytes = reduction.peak_buffered_chunk_bytes;
         self.peak_buffered_chunks = reduction.peak_buffered_chunks;
@@ -370,6 +377,7 @@ struct CheckpointReductionMetrics {
     container_file_bytes: u64,
     raw_records: u64,
     zstd_records: u64,
+    incompressibility_gate: IncompressibilityGateMetrics,
     containers: u64,
     peak_buffered_chunk_bytes: u64,
     peak_buffered_chunks: u64,
@@ -5394,6 +5402,10 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
                     .expect("ASSERT: bounded Zstd Record count fits u64"),
             )
             .expect("ASSERT: checkpoint Zstd Record count cannot overflow u64");
+        self.metrics
+            .incompressibility_gate
+            .checked_merge(published.incompressibility_gate())
+            .expect("ASSERT: bounded gate metrics cannot overflow within one checkpoint");
         self.metrics.containers = self
             .metrics
             .containers

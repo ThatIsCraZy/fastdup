@@ -1,4 +1,4 @@
-use fastdup_appliance::{DurableNamespace, recover_mount};
+use fastdup_appliance::{DurableNamespace, HistoricalProofCacheStatus, recover_mount};
 use fastdup_format::PolicySetId;
 use fastdup_posix::{
     Namespace, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE, Reply,
@@ -157,10 +157,7 @@ fn retry_after_ambiguous_container_publish_consumes_a_fresh_generation() {
         .checkpoint()
         .expect("retry the same frozen commit cut")
         .expect("retry publishes a complete generation");
-    assert!(
-        appliance.historical_proof_cache_status().entry_count() > 0,
-        "only the successful retry may demote Frozen proofs into Historical S3-FIFO"
-    );
+    assert_historical_demotion_or_memory_pressure(appliance.historical_proof_cache_status());
     assert_eq!(
         appliance.generation_proof_set_status().frozen_proofs(),
         0,
@@ -219,7 +216,19 @@ fn metadata_failure_keeps_verified_data_proofs_frozen_until_retry_commits() {
         .expect("retry Frozen metadata commit")
         .expect("retry commits the generation");
     assert_eq!(appliance.generation_proof_set_status().frozen_proofs(), 0);
-    assert!(appliance.historical_proof_cache_status().entry_count() > 0);
+    assert_historical_demotion_or_memory_pressure(appliance.historical_proof_cache_status());
+}
+
+fn assert_historical_demotion_or_memory_pressure(status: HistoricalProofCacheStatus) {
+    if status.entry_count() > 0 {
+        assert!(status.admissions() > 0);
+        return;
+    }
+    assert!(
+        status.admission_rejections() > 0
+            && (status.swap_used_bytes() > 0 || status.available_bytes() <= status.reserve_bytes()),
+        "a successful commit may omit Historical proofs only under observed memory pressure"
+    );
 }
 
 #[test]

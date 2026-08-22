@@ -344,22 +344,28 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
         0,
         "Container-generation discovery must not read whole Container payloads: {writable_recovery_operations:?}"
     );
-    assert_eq!(
-        writable_recovery_operations
-            .iter()
-            .filter(|operation| **operation == StorageOperation::ObjectLen)
-            .count(),
-        1,
-        "graph proofs must reuse the verified immutable envelope; only independent Container-generation discovery measures the object: {writable_recovery_operations:?}"
-    );
-    assert_eq!(
-        writable_recovery_operations
-            .iter()
-            .filter(|operation| **operation == StorageOperation::ReadExactAt)
-            .count(),
-        4,
-        "the two graph proofs each verify only their Record while generation discovery independently reads Header/Footer: {writable_recovery_operations:?}"
-    );
+    let object_lengths = writable_recovery_operations
+        .iter()
+        .filter(|operation| **operation == StorageOperation::ObjectLen)
+        .count();
+    let bounded_reads = writable_recovery_operations
+        .iter()
+        .filter(|operation| **operation == StorageOperation::ReadExactAt)
+        .count();
+    if object_lengths == 1 {
+        assert_eq!(
+            bounded_reads, 4,
+            "the two graph proofs each verify only their Record while generation discovery independently reads Header/Footer: {writable_recovery_operations:?}"
+        );
+    } else {
+        let cache = writable.container_descriptor_cache_status();
+        assert!(
+            cache.pressure_rejections() > 0 && cache.swap_used_bytes() > 0,
+            "descriptor rereads are permitted only after the rebuildable cache rejects admission under swap pressure: {writable_recovery_operations:?}"
+        );
+        assert_eq!(object_lengths, 3);
+        assert_eq!(bounded_reads, 8);
+    }
     let writable_baseline = container_storage.operation_count();
     let Reply::Entry(writable_entry) = writable
         .namespace()

@@ -19,7 +19,13 @@ Locations as level-zero Runs, and reuse Exact Hits across later checkpoints;
 four same-level Runs are merged RoW before the 64-Run reader bound is reached.
 Missing or corrupt index state falls back to verified Container scans. Adaptive
 Compression Regions are encoded by a bounded cache-local worker pool and merged
-in deterministic input order. Exact-Index activation now rotates through two
+in deterministic input order. The format writer also has the versioned
+`incompressibility-gate-v1` benchmark policy: it uses bounded LZ4 and, when
+needed, a Zstd level-1 rescue trial to skip an unhelpful level-3 Zstd attempt
+for regions of at least 128 KiB. Predictor output is never written to disk;
+the resulting records remain RAW or dependency-free Zstd. The production store
+keeps that policy off while its CPU, latency, and physical-byte promotion gates
+remain unmet. Exact-Index activation now rotates through two
 overlapping 64-record slots and migrates the former 16,384-record WAL without a
 lifetime write stop.
 The POSIX/FUSE seam also supports metadata-only range clones across arbitrary
@@ -49,6 +55,8 @@ gates, and explicit limitations are recorded in
 [`data-reduction-reference-v1`](docs/benchmarks/data-reduction-reference-v1.md).
 The persistent CPU-pool scaling result is recorded in
 [`reduction-worker-pool`](docs/benchmarks/reduction-worker-pool.md).
+The gate design, promotion criteria, and initial Rocky ISO comparison are in
+[`zstd-incompressibility-gate`](docs/research/zstd-incompressibility-gate.md).
 The first sustained kernel-FUSE write/checkpoint/read/delete run, including
 per-stage CPU, memory, Exact/Compression efficiency, and device-I/O evidence,
 is recorded in
@@ -98,6 +106,8 @@ cargo run --release -p fastdup-testkit --example audit_container_store
 cargo run --release -p fastdup-store --example reduction_matrix -- \
   --preset all --workers 8 --inflight-mib 128 \
   /source/fastdup/.artifacts/corpus/structured-v1/*
+cargo run --release -p fastdup-format --example incompressibility_gate_matrix -- \
+  ISO_PATH 8 v1
 cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
   --offline scrub METADATA_ROOT CONTAINER_ROOT
 ```

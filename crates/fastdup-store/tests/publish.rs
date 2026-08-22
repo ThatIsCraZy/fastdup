@@ -133,16 +133,20 @@ fn adaptive_region_publication_uses_zstd_only_when_the_complete_record_wins() {
     if root.exists() {
         std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
     }
-    let store = ContainerStore::open(&root).expect("create workspace-local store");
+    let repository = ContainerRepository::new(
+        FsStorageIo::open(&root).expect("create workspace-local repository"),
+    );
     let compressible_a = vec![b'A'; 256 * 1_024];
     let compressible_b = vec![b'B'; 256 * 1_024];
     let region = [compressible_a.as_slice(), compressible_b.as_slice()];
     let id = ContainerId::new([0xD1; 16]).expect("container identity is nonzero");
 
-    store
-        .publish_adaptive_regions(id, 1, &[&region])
+    let (_published, metrics) = repository
+        .publish_adaptive_regions_parallel_profiled(id, 1, &[&region], NonZeroUsize::MIN)
         .expect("publish one adaptive Compression Region durably");
-    let reopened = store
+    assert_eq!(metrics.incompressibility_gate().disabled_regions(), 1);
+    assert_eq!(metrics.incompressibility_gate().eligible_regions(), 0);
+    let reopened = repository
         .read(id)
         .expect("reopen through the production Container verifier");
 

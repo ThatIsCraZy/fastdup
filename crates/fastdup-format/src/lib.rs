@@ -16,8 +16,9 @@ pub use commit::{
     COMMIT_RECORD_BYTES, CommitFormatError, CommitRecord, CommitRecordHash, PolicySetId,
 };
 pub use container::{
-    BuildingContainerHeader, ChunkId, ContainerHeader, ContainerId, ContainerLayout,
-    ContainerRecordRange, FOOTER_BYTES, FormatError, HEADER_BYTES, MAX_CONTAINER_BYTES,
+    AdaptiveContainerEncoding, BuildingContainerHeader, ChunkId, ContainerHeader, ContainerId,
+    ContainerLayout, ContainerRecordRange, FOOTER_BYTES, FormatError, HEADER_BYTES,
+    IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
     MAX_LOGICAL_CHUNK_BYTES, PrehashedChunk, RECORD_HEADER_BYTES, RawRecord, SealedContainer,
     SealedContainerDescriptor, VerifiedChunkLocation, VerifiedRawLocation,
 };

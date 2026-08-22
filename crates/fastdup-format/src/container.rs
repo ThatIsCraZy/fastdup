@@ -32,6 +32,8 @@ const RECORD_MAGIC: &[u8; 8] = b"FDRECD01";
 pub(crate) const RAW_CODEC: u16 = 1;
 pub(crate) const ZSTD_CODEC: u16 = 2;
 const ZSTD_LEVEL_V1: i32 = 3;
+const ZSTD_RESCUE_LEVEL_V1: i32 = 1;
+const INCOMPRESSIBILITY_GATE_MIN_BYTES_V1: usize = 128 * 1_024;
 const ZSTD_MINIMUM_SAVINGS_BYTES_V1: usize = 4 * 1_024;
 const ZSTD_MINIMUM_SAVINGS_PERCENT_V1: u128 = 3;
 const CHUNK_TABLE_ENTRY_BYTES: usize = 64;
@@ -51,7 +53,7 @@ const FOOTER_BYTES_USIZE: usize = 4_096;
 const FOOTER_HASH_OFFSET: usize = 96;
 
 thread_local! {
-    static ZSTD_ENCODER_V1: RefCell<Option<zstd::bulk::Compressor<'static>>> =
+    static ADAPTIVE_ENCODER_V1: RefCell<Option<AdaptiveEncoderV1>> =
         const { RefCell::new(None) };
 }
 const FOOTER_CRC_OFFSET: usize = 128;
@@ -105,6 +107,155 @@ pub struct SealedContainer {
     raw_locations: Vec<VerifiedRawLocation>,
     raw_record_count: usize,
     zstd_record_count: usize,
+}
+
+/// Runtime evidence from the version-1 incompressibility gate.
+///
+/// These counters describe writer work only. They are not serialized and do
+/// not authorize any Container bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IncompressibilityGateMetrics {
+    disabled_regions: usize,
+    eligible_regions: usize,
+    size_bypassed_regions: usize,
+    lz4_allowed_regions: usize,
+    lz4_rejected_regions: usize,
+    zstd1_allowed_regions: usize,
+    zstd1_rejected_regions: usize,
+    target_zstd_trials: usize,
+    target_zstd_accepted: usize,
+    target_zstd_rejected: usize,
+    raw_regions_after_gate: usize,
+    scratch_high_water_bytes: usize,
+}
+
+impl IncompressibilityGateMetrics {
+    #[must_use]
+    pub const fn disabled_regions(self) -> usize {
+        self.disabled_regions
+    }
+
+    #[must_use]
+    pub const fn eligible_regions(self) -> usize {
+        self.eligible_regions
+    }
+
+    #[must_use]
+    pub const fn size_bypassed_regions(self) -> usize {
+        self.size_bypassed_regions
+    }
+
+    #[must_use]
+    pub const fn lz4_allowed_regions(self) -> usize {
+        self.lz4_allowed_regions
+    }
+
+    #[must_use]
+    pub const fn lz4_rejected_regions(self) -> usize {
+        self.lz4_rejected_regions
+    }
+
+    #[must_use]
+    pub const fn zstd1_allowed_regions(self) -> usize {
+        self.zstd1_allowed_regions
+    }
+
+    #[must_use]
+    pub const fn zstd1_rejected_regions(self) -> usize {
+        self.zstd1_rejected_regions
+    }
+
+    #[must_use]
+    pub const fn target_zstd_trials(self) -> usize {
+        self.target_zstd_trials
+    }
+
+    #[must_use]
+    pub const fn target_zstd_accepted(self) -> usize {
+        self.target_zstd_accepted
+    }
+
+    #[must_use]
+    pub const fn target_zstd_rejected(self) -> usize {
+        self.target_zstd_rejected
+    }
+
+    #[must_use]
+    pub const fn raw_regions_after_gate(self) -> usize {
+        self.raw_regions_after_gate
+    }
+
+    #[must_use]
+    pub const fn scratch_high_water_bytes(self) -> usize {
+        self.scratch_high_water_bytes
+    }
+
+    /// Adds disjoint worker or Container observations with checked counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::ArithmeticOverflow`] if a counter cannot be
+    /// represented.
+    pub fn checked_merge(&mut self, other: Self) -> Result<(), FormatError> {
+        macro_rules! add {
+            ($field:ident) => {
+                self.$field = self
+                    .$field
+                    .checked_add(other.$field)
+                    .ok_or(FormatError::ArithmeticOverflow)?;
+            };
+        }
+        add!(eligible_regions);
+        add!(disabled_regions);
+        add!(size_bypassed_regions);
+        add!(lz4_allowed_regions);
+        add!(lz4_rejected_regions);
+        add!(zstd1_allowed_regions);
+        add!(zstd1_rejected_regions);
+        add!(target_zstd_trials);
+        add!(target_zstd_accepted);
+        add!(target_zstd_rejected);
+        add!(raw_regions_after_gate);
+        self.scratch_high_water_bytes = self
+            .scratch_high_water_bytes
+            .max(other.scratch_high_water_bytes);
+        Ok(())
+    }
+}
+
+/// Execution policy for the dependency-free Zstd incompressibility gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncompressibilityGatePolicy {
+    /// Measurement baseline that trials target Zstd for every region.
+    Off,
+    /// Benchmark challenger that rejects after bounded LZ4 alone.
+    Lz4Only,
+    /// Bounded LZ4 plus Zstd-1 rescue policy accepted by ADR 0052.
+    V1,
+}
+
+/// One encoded Container image paired with non-authoritative gate metrics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdaptiveContainerEncoding {
+    bytes: Vec<u8>,
+    metrics: IncompressibilityGateMetrics,
+}
+
+impl AdaptiveContainerEncoding {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub const fn metrics(&self) -> IncompressibilityGateMetrics {
+        self.metrics
+    }
+
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// Header/Footer proof for bounded on-demand reads from one sealed Container.
@@ -462,6 +613,47 @@ impl SealedContainer {
         regions: &[&[&[u8]]],
         workers: NonZeroUsize,
     ) -> Result<Vec<u8>, FormatError> {
+        Self::encode_adaptive_regions_parallel_profiled(
+            container_id,
+            container_generation,
+            regions,
+            workers,
+        )
+        .map(AdaptiveContainerEncoding::into_bytes)
+    }
+
+    /// Encodes adaptive regions and returns runtime-only gate evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::encode_adaptive_regions_parallel`].
+    pub fn encode_adaptive_regions_parallel_profiled(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[&[u8]]],
+        workers: NonZeroUsize,
+    ) -> Result<AdaptiveContainerEncoding, FormatError> {
+        Self::encode_adaptive_regions_parallel_profiled_with_gate(
+            container_id,
+            container_generation,
+            regions,
+            workers,
+            IncompressibilityGatePolicy::V1,
+        )
+    }
+
+    /// Encodes adaptive regions with an explicit benchmarkable gate policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::encode_adaptive_regions_parallel`].
+    pub fn encode_adaptive_regions_parallel_profiled_with_gate(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[&[u8]]],
+        workers: NonZeroUsize,
+        gate: IncompressibilityGatePolicy,
+    ) -> Result<AdaptiveContainerEncoding, FormatError> {
         let prehashed = regions
             .iter()
             .map(|region| {
@@ -472,11 +664,12 @@ impl SealedContainer {
             })
             .collect::<Vec<_>>();
         let prehashed_regions = prehashed.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        Self::encode_prehashed_adaptive_regions_parallel(
+        Self::encode_prehashed_adaptive_regions_parallel_profiled_with_gate(
             container_id,
             container_generation,
             &prehashed_regions,
             workers,
+            gate,
         )
     }
 
@@ -503,6 +696,60 @@ impl SealedContainer {
         regions: &[&[PrehashedChunk<'_>]],
         workers: NonZeroUsize,
     ) -> Result<Vec<u8>, FormatError> {
+        Self::encode_prehashed_adaptive_regions_parallel_profiled(
+            container_id,
+            container_generation,
+            regions,
+            workers,
+        )
+        .map(AdaptiveContainerEncoding::into_bytes)
+    }
+
+    /// Encodes prehashed adaptive regions and returns runtime-only gate
+    /// evidence without weakening the mandatory publication reread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as
+    /// [`Self::encode_prehashed_adaptive_regions_parallel`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if worker ownership, deterministic ordering, or final gate
+    /// accounting violates an internal writer invariant.
+    pub fn encode_prehashed_adaptive_regions_parallel_profiled(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[PrehashedChunk<'_>]],
+        workers: NonZeroUsize,
+    ) -> Result<AdaptiveContainerEncoding, FormatError> {
+        Self::encode_prehashed_adaptive_regions_parallel_profiled_with_gate(
+            container_id,
+            container_generation,
+            regions,
+            workers,
+            IncompressibilityGatePolicy::V1,
+        )
+    }
+
+    /// Encodes prehashed regions with an explicit benchmarkable gate policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as
+    /// [`Self::encode_prehashed_adaptive_regions_parallel`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if worker ownership, deterministic ordering, or final gate
+    /// accounting violates an internal writer invariant.
+    pub fn encode_prehashed_adaptive_regions_parallel_profiled_with_gate(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[PrehashedChunk<'_>]],
+        workers: NonZeroUsize,
+        gate: IncompressibilityGatePolicy,
+    ) -> Result<AdaptiveContainerEncoding, FormatError> {
         if regions.is_empty() {
             return Err(FormatError::InvalidContainerLayout);
         }
@@ -512,7 +759,7 @@ impl SealedContainer {
             .map(|worker| {
                 let mut completed = Vec::new();
                 for ordinal in (worker..regions.len()).step_by(worker_count) {
-                    completed.push((ordinal, encode_adaptive_region(regions[ordinal])?));
+                    completed.push((ordinal, encode_adaptive_region(regions[ordinal], gate)?));
                 }
                 Ok::<_, FormatError>(completed)
             })
@@ -534,12 +781,39 @@ impl SealedContainer {
             Ok::<_, FormatError>(ordered)
         }?;
         let mut encoded_records = Vec::new();
+        let mut gate_metrics = IncompressibilityGateMetrics::default();
         for region in encoded_by_region {
-            encoded_records.extend(
-                region.expect("ASSERT: every Compression Region worker must return its output"),
-            );
+            let encoded =
+                region.expect("ASSERT: every Compression Region worker must return its output");
+            gate_metrics.checked_merge(encoded.metrics)?;
+            encoded_records.extend(encoded.records);
         }
-        encode_container_from_records(container_id, container_generation, encoded_records, workers)
+        let bytes = encode_container_from_records(
+            container_id,
+            container_generation,
+            encoded_records,
+            workers,
+        )?;
+        assert_eq!(
+            gate_metrics
+                .disabled_regions
+                .checked_add(gate_metrics.eligible_regions)
+                .and_then(|total| total.checked_add(gate_metrics.size_bypassed_regions)),
+            Some(regions.len()),
+            "ASSERT: every adaptive region has exactly one gate disposition"
+        );
+        assert_eq!(
+            gate_metrics
+                .target_zstd_accepted
+                .checked_add(gate_metrics.target_zstd_rejected)
+                .and_then(|total| total.checked_add(gate_metrics.raw_regions_after_gate)),
+            Some(regions.len()),
+            "ASSERT: every adaptive region has exactly one final encoding disposition"
+        );
+        Ok(AdaptiveContainerEncoding {
+            bytes,
+            metrics: gate_metrics,
+        })
     }
 
     /// Fully validates and decodes one sealed container image.
@@ -1056,6 +1330,16 @@ enum EncodingCodec {
     Zstd,
 }
 
+struct AdaptiveEncoderV1 {
+    zstd: zstd::bulk::Compressor<'static>,
+    scratch: Box<[u8]>,
+}
+
+struct EncodedAdaptiveRegion {
+    records: Vec<Vec<u8>>,
+    metrics: IncompressibilityGateMetrics,
+}
+
 #[derive(Debug)]
 struct DecodedEncodingRecord {
     codec: EncodingCodec,
@@ -1063,25 +1347,110 @@ struct DecodedEncodingRecord {
 }
 
 #[allow(clippy::too_many_lines)]
-fn encode_adaptive_region(region: &[PrehashedChunk<'_>]) -> Result<Vec<Vec<u8>>, FormatError> {
+fn encode_adaptive_region(
+    region: &[PrehashedChunk<'_>],
+    gate: IncompressibilityGatePolicy,
+) -> Result<EncodedAdaptiveRegion, FormatError> {
     if region.is_empty() {
         return Err(FormatError::InvalidZstdRecord);
     }
-    let zstd = encode_prehashed_zstd_record(region, ZSTD_LEVEL_V1)?;
+    let decoded = collect_prehashed_decoded(region)?;
     let raw_bytes = region.iter().try_fold(0_usize, |total, chunk| {
         total
             .checked_add(raw_record_length(chunk.bytes.len())?)
             .ok_or(FormatError::ArithmeticOverflow)
     })?;
-    if zstd_record_wins(raw_bytes, zstd.len())? {
-        Ok(vec![zstd])
+    let payload_cap = useful_zstd_payload_cap(raw_bytes, region.len())?;
+    let mut metrics = IncompressibilityGateMetrics {
+        // The worker-local encoder owns one fixed-size destination buffer.
+        // Report resident scratch, not merely the smaller cap passed to a
+        // particular codec invocation.
+        scratch_high_water_bytes: MAX_DECODED_RECORD_BYTES,
+        ..IncompressibilityGateMetrics::default()
+    };
+
+    let should_try_target = if gate == IncompressibilityGatePolicy::Off {
+        metrics.disabled_regions = 1;
+        true
+    } else if decoded.len() < INCOMPRESSIBILITY_GATE_MIN_BYTES_V1 {
+        metrics.size_bypassed_regions = 1;
+        true
     } else {
-        region
-            .iter()
-            .copied()
-            .map(RawRecord::encode_prehashed)
-            .collect()
+        metrics.eligible_regions = 1;
+        with_adaptive_encoder_v1(|encoder| {
+            if encoder.lz4_fits(&decoded, payload_cap)? {
+                metrics.lz4_allowed_regions = 1;
+                return Ok(true);
+            }
+            metrics.lz4_rejected_regions = 1;
+            if gate == IncompressibilityGatePolicy::Lz4Only {
+                return Ok(false);
+            }
+            if encoder.zstd_fits(&decoded, ZSTD_RESCUE_LEVEL_V1, payload_cap)? {
+                metrics.zstd1_allowed_regions = 1;
+                Ok(true)
+            } else {
+                metrics.zstd1_rejected_regions = 1;
+                Ok(false)
+            }
+        })?
+    };
+
+    if should_try_target {
+        metrics.target_zstd_trials = 1;
+        let zstd = with_adaptive_encoder_v1(|encoder| {
+            let Some(payload) = encoder.zstd_payload(&decoded, ZSTD_LEVEL_V1, payload_cap)? else {
+                return Ok(None);
+            };
+            encode_prehashed_zstd_record_from_payload(region, decoded.len(), payload, ZSTD_LEVEL_V1)
+                .map(Some)
+        })?;
+        if let Some(zstd) = zstd {
+            assert!(
+                zstd_record_wins(raw_bytes, zstd.len())?,
+                "ASSERT: a payload bounded by the v1 useful cap must beat RAW"
+            );
+            metrics.target_zstd_accepted = 1;
+            return Ok(EncodedAdaptiveRegion {
+                records: vec![zstd],
+                metrics,
+            });
+        }
+        metrics.target_zstd_rejected = 1;
+    } else {
+        metrics.raw_regions_after_gate = 1;
     }
+
+    let records = region
+        .iter()
+        .copied()
+        .map(RawRecord::encode_prehashed)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(EncodedAdaptiveRegion { records, metrics })
+}
+
+fn useful_zstd_payload_cap(raw_bytes: usize, chunks: usize) -> Result<usize, FormatError> {
+    let percent_numerator = raw_bytes
+        .checked_mul(
+            usize::try_from(ZSTD_MINIMUM_SAVINGS_PERCENT_V1)
+                .map_err(|_| FormatError::ArithmeticOverflow)?,
+        )
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let percentage_saving = percent_numerator
+        .checked_add(99)
+        .ok_or(FormatError::ArithmeticOverflow)?
+        / 100;
+    let required_saving = ZSTD_MINIMUM_SAVINGS_BYTES_V1.max(percentage_saving);
+    let complete_cap = raw_bytes.saturating_sub(required_saving);
+    let aligned_complete_cap = complete_cap - complete_cap % usize::from(RECORD_ALIGNMENT);
+    let payload_offset = RECORD_HEADER_BYTES
+        .checked_add(
+            chunks
+                .checked_mul(CHUNK_TABLE_ENTRY_BYTES)
+                .ok_or(FormatError::ArithmeticOverflow)?,
+        )
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    Ok(aligned_complete_cap.saturating_sub(payload_offset))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1101,6 +1470,12 @@ fn encode_prehashed_zstd_record(
     if chunks.is_empty() || level != ZSTD_LEVEL_V1 {
         return Err(FormatError::InvalidZstdRecord);
     }
+    let decoded = collect_prehashed_decoded(chunks)?;
+    let payload = compress_zstd_v1(&decoded, level)?;
+    encode_prehashed_zstd_record_from_payload(chunks, decoded.len(), &payload, level)
+}
+
+fn collect_prehashed_decoded(chunks: &[PrehashedChunk<'_>]) -> Result<Vec<u8>, FormatError> {
     let mut decoded_length = 0_usize;
     for chunk in chunks {
         validate_logical_chunk_length(chunk.bytes.len())?;
@@ -1118,7 +1493,19 @@ fn encode_prehashed_zstd_record(
     for chunk in chunks {
         decoded.extend_from_slice(chunk.bytes);
     }
-    let payload = compress_zstd_v1(&decoded, level)?;
+    Ok(decoded)
+}
+
+#[allow(clippy::too_many_lines)]
+fn encode_prehashed_zstd_record_from_payload(
+    chunks: &[PrehashedChunk<'_>],
+    decoded_length: usize,
+    payload: &[u8],
+    level: i32,
+) -> Result<Vec<u8>, FormatError> {
+    if chunks.is_empty() || level != ZSTD_LEVEL_V1 || decoded_length > MAX_DECODED_RECORD_BYTES {
+        return Err(FormatError::InvalidZstdRecord);
+    }
     let table_bytes = chunks
         .len()
         .checked_mul(CHUNK_TABLE_ENTRY_BYTES)
@@ -1192,7 +1579,7 @@ fn encode_prehashed_zstd_record(
             .checked_add(chunk.bytes.len())
             .ok_or(FormatError::ArithmeticOverflow)?;
     }
-    bytes[payload_offset..payload_end].copy_from_slice(&payload);
+    bytes[payload_offset..payload_end].copy_from_slice(payload);
     let checksum = crc32c::crc32c(&bytes);
     put_u32(&mut bytes, RECORD_CRC_OFFSET, checksum);
     Ok(bytes)
@@ -1202,19 +1589,108 @@ fn compress_zstd_v1(decoded: &[u8], level: i32) -> Result<Vec<u8>, FormatError> 
     if level != ZSTD_LEVEL_V1 {
         return Err(FormatError::InvalidZstdRecord);
     }
-    ZSTD_ENCODER_V1.with(|encoder| {
-        let mut encoder = encoder.borrow_mut();
-        if encoder.is_none() {
-            *encoder = Some(
-                zstd::bulk::Compressor::new(ZSTD_LEVEL_V1).map_err(|_| FormatError::ZstdFailure)?,
-            );
-        }
+    with_adaptive_encoder_v1(|encoder| {
         encoder
-            .as_mut()
-            .expect("ASSERT: worker-local Zstd encoder was initialized")
+            .zstd
+            .set_compression_level(level)
+            .map_err(|_| FormatError::ZstdFailure)?;
+        encoder
+            .zstd
             .compress(decoded)
             .map_err(|_| FormatError::ZstdFailure)
     })
+}
+
+fn with_adaptive_encoder_v1<T>(
+    operation: impl FnOnce(&mut AdaptiveEncoderV1) -> Result<T, FormatError>,
+) -> Result<T, FormatError> {
+    ADAPTIVE_ENCODER_V1.with(|encoder| {
+        let mut encoder = encoder.borrow_mut();
+        if encoder.is_none() {
+            *encoder = Some(AdaptiveEncoderV1::new()?);
+        }
+        operation(
+            encoder
+                .as_mut()
+                .expect("ASSERT: worker-local adaptive encoder was initialized"),
+        )
+    })
+}
+
+impl AdaptiveEncoderV1 {
+    fn new() -> Result<Self, FormatError> {
+        let zstd =
+            zstd::bulk::Compressor::new(ZSTD_LEVEL_V1).map_err(|_| FormatError::ZstdFailure)?;
+        let scratch = vec![0_u8; MAX_DECODED_RECORD_BYTES].into_boxed_slice();
+        Ok(Self { zstd, scratch })
+    }
+
+    fn lz4_fits(&mut self, decoded: &[u8], payload_cap: usize) -> Result<bool, FormatError> {
+        if payload_cap == 0 {
+            return Ok(false);
+        }
+        let output = self
+            .scratch
+            .get_mut(..payload_cap)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        match lz4::block::compress_to_buffer(decoded, None, false, output) {
+            Ok(written) => {
+                assert!(
+                    written <= payload_cap,
+                    "ASSERT: bounded LZ4 cannot exceed its destination"
+                );
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Other => Ok(false),
+            Err(_) => Err(FormatError::CompressionGateFailure),
+        }
+    }
+
+    fn zstd_fits(
+        &mut self,
+        decoded: &[u8],
+        level: i32,
+        payload_cap: usize,
+    ) -> Result<bool, FormatError> {
+        Ok(self.zstd_payload(decoded, level, payload_cap)?.is_some())
+    }
+
+    fn zstd_payload<'a>(
+        &'a mut self,
+        decoded: &[u8],
+        level: i32,
+        payload_cap: usize,
+    ) -> Result<Option<&'a [u8]>, FormatError> {
+        if payload_cap == 0 {
+            return Ok(None);
+        }
+        self.zstd
+            .context_mut()
+            .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+            .map_err(|_| FormatError::ZstdFailure)?;
+        self.zstd
+            .set_compression_level(level)
+            .map_err(|_| FormatError::ZstdFailure)?;
+        let output = self
+            .scratch
+            .get_mut(..payload_cap)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        match self.zstd.context_mut().compress2(output, decoded) {
+            Ok(written) => {
+                assert!(
+                    written <= payload_cap,
+                    "ASSERT: bounded Zstd cannot exceed its destination"
+                );
+                Ok(Some(&output[..written]))
+            }
+            Err(error)
+                if zstd::zstd_safe::get_error_name(error) == "Destination buffer is too small" =>
+            {
+                Ok(None)
+            }
+            Err(_) => Err(FormatError::ZstdFailure),
+        }
+    }
 }
 
 fn zstd_record_wins(raw_bytes: usize, zstd_bytes: usize) -> Result<bool, FormatError> {
@@ -1641,6 +2117,7 @@ pub enum FormatError {
     InvalidRawRecord,
     InvalidZstdRecord,
     ZstdFailure,
+    CompressionGateFailure,
     ChunkHashMismatch,
     InvalidContainerLength(usize),
     InvalidFooter,

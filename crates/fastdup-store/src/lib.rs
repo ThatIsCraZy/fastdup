@@ -64,8 +64,9 @@ use std::time::{Duration, Instant};
 
 use fastdup_format::{
     BuildingContainerHeader, ContainerId, ExactIndexEntry, ExactIndexLocation,
-    ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, MAX_CONTAINER_BYTES,
-    PrehashedChunk, SealedContainer, SealedContainerDescriptor,
+    ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
+    IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, PrehashedChunk, SealedContainer,
+    SealedContainerDescriptor,
 };
 use rayon::prelude::*;
 
@@ -89,6 +90,7 @@ pub struct AdaptiveContainerPublishMetrics {
     logical_bytes: u64,
     raw_records: usize,
     zstd_records: usize,
+    incompressibility_gate: IncompressibilityGateMetrics,
 }
 
 /// Opaque encoded Container image awaiting ordered durable publication.
@@ -103,6 +105,7 @@ pub struct PreparedAdaptiveContainer {
     sealed: Vec<u8>,
     encode_wall: Duration,
     encode_process_cpu: Duration,
+    incompressibility_gate: IncompressibilityGateMetrics,
 }
 
 impl AdaptiveContainerPublishMetrics {
@@ -144,6 +147,11 @@ impl AdaptiveContainerPublishMetrics {
     #[must_use]
     pub const fn zstd_records(self) -> usize {
         self.zstd_records
+    }
+
+    #[must_use]
+    pub const fn incompressibility_gate(self) -> IncompressibilityGateMetrics {
+        self.incompressibility_gate
     }
 }
 
@@ -640,12 +648,14 @@ impl<I: StorageIo> ContainerRepository<I> {
         regions: &[&[&[u8]]],
         workers: NonZeroUsize,
     ) -> Result<SealedContainer, StoreError> {
-        let sealed = SealedContainer::encode_adaptive_regions_parallel(
+        let encoded = SealedContainer::encode_adaptive_regions_parallel_profiled_with_gate(
             container_id,
             container_generation,
             regions,
             workers,
+            IncompressibilityGatePolicy::Off,
         )?;
+        let sealed = encoded.into_bytes();
         self.publish_sealed_resumable(container_id, container_generation, &sealed)
     }
 
@@ -697,18 +707,20 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Result<PreparedAdaptiveContainer, StoreError> {
         let encode_wall_started = Instant::now();
         let encode_cpu_started = process_cpu_time();
-        let sealed = SealedContainer::encode_adaptive_regions_parallel(
+        let encoded = SealedContainer::encode_adaptive_regions_parallel_profiled_with_gate(
             container_id,
             container_generation,
             regions,
             workers,
+            IncompressibilityGatePolicy::Off,
         )?;
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
         Ok(PreparedAdaptiveContainer {
             container_id,
             container_generation,
-            sealed,
+            incompressibility_gate: encoded.metrics(),
+            sealed: encoded.into_bytes(),
             encode_wall,
             encode_process_cpu,
         })
@@ -731,18 +743,21 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Result<PreparedAdaptiveContainer, StoreError> {
         let encode_wall_started = Instant::now();
         let encode_cpu_started = process_cpu_time();
-        let sealed = SealedContainer::encode_prehashed_adaptive_regions_parallel(
-            container_id,
-            container_generation,
-            regions,
-            workers,
-        )?;
+        let encoded =
+            SealedContainer::encode_prehashed_adaptive_regions_parallel_profiled_with_gate(
+                container_id,
+                container_generation,
+                regions,
+                workers,
+                IncompressibilityGatePolicy::Off,
+            )?;
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
         Ok(PreparedAdaptiveContainer {
             container_id,
             container_generation,
-            sealed,
+            incompressibility_gate: encoded.metrics(),
+            sealed: encoded.into_bytes(),
             encode_wall,
             encode_process_cpu,
         })
@@ -769,6 +784,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             sealed,
             encode_wall,
             encode_process_cpu,
+            incompressibility_gate,
         } = prepared;
         let file_bytes = u64::try_from(sealed.len())
             .expect("ASSERT: a format-v1 Container image length fits u64");
@@ -794,6 +810,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             logical_bytes,
             raw_records: verified.raw_record_count(),
             zstd_records: verified.zstd_record_count(),
+            incompressibility_gate,
         };
         Ok((verified, metrics))
     }
