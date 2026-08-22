@@ -3,6 +3,7 @@ use crate::{
     InodeId, Namespace, OpenOptions, Operation, PosixError, Reply, RequestContext,
 };
 use bytes::Bytes;
+use fastdup_copy_metrics::{CopyClass, record_copy};
 use fuse3::raw::Filesystem;
 use fuse3::raw::Request;
 use fuse3::raw::reply::{
@@ -121,6 +122,42 @@ impl FuseFilesystem {
         })
         .await
         .expect("ASSERT: bounded FUSE blocking work must not panic")
+    }
+
+    async fn write_payload(
+        &self,
+        request: Request,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+        payload: crate::MutationPayload,
+        write_flags: u32,
+    ) -> fuse3::Result<ReplyWrite> {
+        if write_flags & fuse3::raw::flags::FUSE_WRITE_CACHE != 0 {
+            return Err(libc::EIO.into());
+        }
+        let inode = inode_from_raw(inode)?;
+        let handle = handle_from_raw(handle)?;
+        let request = context(request);
+        let reply = loop {
+            self.namespace
+                .wait_for_mutation_admission()
+                .await
+                .map_err(errno)?;
+            let namespace = Arc::clone(&self.namespace);
+            let payload = payload.clone();
+            match self
+                .run_blocking(move || {
+                    namespace.dispatch_owned_write(request, inode, handle, offset, payload)
+                })
+                .await
+            {
+                Err(PosixError::Again) => {}
+                result => break result.map_err(errno)?,
+            }
+        };
+        let (bytes, _) = expect_written(&reply);
+        Ok(ReplyWrite { written: bytes })
     }
 }
 
@@ -366,32 +403,25 @@ impl Filesystem for FuseFilesystem {
         write_flags: u32,
         _flags: u32,
     ) -> fuse3::Result<ReplyWrite> {
-        if write_flags & fuse3::raw::flags::FUSE_WRITE_CACHE != 0 {
-            return Err(libc::EIO.into());
-        }
-        let inode = inode_from_raw(inode)?;
-        let handle = handle_from_raw(handle)?;
-        let request = context(request);
+        record_copy(CopyClass::FuseRequestAdaptation, data.len());
         let payload = crate::MutationPayload::try_copy_from_slice(data).map_err(errno)?;
-        let reply = loop {
-            self.namespace
-                .wait_for_mutation_admission()
-                .await
-                .map_err(errno)?;
-            let namespace = Arc::clone(&self.namespace);
-            let payload = payload.clone();
-            match self
-                .run_blocking(move || {
-                    namespace.dispatch_owned_write(request, inode, handle, offset, payload)
-                })
-                .await
-            {
-                Err(PosixError::Again) => {}
-                result => break result.map_err(errno)?,
-            }
-        };
-        let (bytes, _) = expect_written(&reply);
-        Ok(ReplyWrite { written: bytes })
+        self.write_payload(request, inode, handle, offset, payload, write_flags)
+            .await
+    }
+
+    async fn write_owned(
+        &self,
+        request: Request,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+        data: Vec<u8>,
+        write_flags: u32,
+        _flags: u32,
+    ) -> fuse3::Result<ReplyWrite> {
+        let payload = crate::MutationPayload::from_owned_bytes(data);
+        self.write_payload(request, inode, handle, offset, payload, write_flags)
+            .await
     }
 
     async fn statfs(&self, _request: Request, _inode: u64) -> fuse3::Result<ReplyStatFs> {

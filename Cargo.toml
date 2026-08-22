@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/fastdup-appliance",
+    "crates/fastdup-copy-metrics",
     "crates/fastdup-format",
     "crates/fastdup-io-uring",
     "crates/fastdup-posix",
@@ -18,6 +19,7 @@ license = "Apache-2.0"
 blake3 = { version = "1", features = ["rayon"] }
 bytes = "1.11.1"
 crc32c = "0.6"
+fastdup-copy-metrics = { path = "crates/fastdup-copy-metrics" }
 fastdup-format = { path = "crates/fastdup-format" }
 fastdup-posix = { path = "crates/fastdup-posix" }
 fastdup-store = { path = "crates/fastdup-store" }
@@ -44,3 +46,6 @@ pedantic = "deny"
 debug = 1
 overflow-checks = true
 panic = "abort"
+
+[patch.crates-io]
+fuse3 = { path = "vendor/fuse3" }

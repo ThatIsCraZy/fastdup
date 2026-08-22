@@ -121,6 +121,12 @@ canonical filename. It proves structural identity, layout, and generation for
 allocator recovery, but neither the payload hash nor any logical Chunk bytes.
 _Avoid_: Verified Container, verified Location
 
+**Container publication proof**:
+Evidence that one complete immutable Container reread passed its envelope,
+record, Recovery Index, logical Chunk identity, and Container-hash checks. It
+may authorize Locations without retaining decoded file bytes.
+_Avoid_: Read cache entry, Container envelope proof, Exact-Index hit
+
 **Manifest**:
 An immutable recipe for reconstructing one file version from logical chunk IDs
 and file-layout metadata.

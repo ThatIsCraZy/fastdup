@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
+fastdup-copy-metrics.workspace = true
 fuse3.workspace = true
 futures-util.workspace = true
 libc.workspace = true

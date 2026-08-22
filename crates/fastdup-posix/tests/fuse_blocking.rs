@@ -23,6 +23,26 @@ struct SlowFenceObserver;
 #[derive(Debug)]
 struct SlowWriteObserver;
 
+#[derive(Debug)]
+struct PayloadPointerObserver(std::sync::mpsc::Sender<usize>);
+
+impl MutationObserver for PayloadPointerObserver {
+    fn accepted_write(
+        &self,
+        _inode: InodeId,
+        _offset: u64,
+        _mutation_sequence: u64,
+        bytes: MutationPayload,
+    ) -> Vec<fastdup_posix::ExternalizedExtent> {
+        self.0
+            .send(bytes.as_bytes().as_ptr() as usize)
+            .expect("fixture receiver remains alive");
+        Vec::new()
+    }
+
+    fn accepted_truncate(&self, _inode: InodeId, _mutation_sequence: u64, _length: u64) {}
+}
+
 impl MutationObserver for SlowWriteObserver {
     fn accepted_write(
         &self,
@@ -227,5 +247,53 @@ async fn write_queue_admission_does_not_block_the_fuse_runtime_thread() {
     assert_eq!(
         write.await.expect("FUSE write task does not panic").written,
         1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_fuse_write_reaches_the_namespace_without_a_second_payload_copy() {
+    let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
+    let Reply::Created { entry, handle } = namespace
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"owned-write",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("fixture file is created")
+    else {
+        panic!("create returned the wrong reply");
+    };
+    let (pointer_sender, pointer_receiver) = std::sync::mpsc::channel();
+    namespace.install_mutation_observer(Arc::new(PayloadPointerObserver(pointer_sender)));
+    let filesystem = FuseFilesystem::new(namespace);
+    let payload = vec![0x5a; 128 * 1_024];
+    let original_pointer = payload.as_ptr() as usize;
+
+    let reply = Filesystem::write_owned(
+        &filesystem,
+        Request::default(),
+        entry.attr.inode.get(),
+        handle.get(),
+        0,
+        payload,
+        0,
+        0,
+    )
+    .await
+    .expect("owned FUSE write succeeds");
+
+    assert_eq!(reply.written, 128 * 1_024);
+    assert_eq!(
+        pointer_receiver
+            .recv()
+            .expect("observer reports the retained payload allocation"),
+        original_pointer,
+        "the owned FUSE write must preserve its request allocation"
     );
 }

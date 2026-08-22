@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use fastdup_format::{
     FOOTER_BYTES, HEADER_BYTES, MAX_CONTAINER_BYTES, SealedContainer, SealedContainerDescriptor,
+    VerifiedContainerPublication,
 };
 use fastdup_store::{
     FsStorageIo, MAX_STORAGE_RANGE_BYTES, OwnedContainerPublication, StorageIo, StoreError,
@@ -481,7 +482,7 @@ impl StorageIo for IoUringStorageIo {
     fn publish_owned_container(
         &self,
         publication: OwnedContainerPublication,
-    ) -> Result<SealedContainer, StoreError> {
+    ) -> Result<VerifiedContainerPublication, StoreError> {
         let Some(active) = self.active() else {
             return self.filesystem.publish_owned_container(publication);
         };
@@ -667,7 +668,7 @@ impl ActiveBackend {
         new_name: CString,
         publication: OwnedContainerPublication,
         lease: BudgetLease,
-    ) -> Result<SealedContainer, StoreError> {
+    ) -> Result<VerifiedContainerPublication, StoreError> {
         assert_eq!(
             lease.bytes,
             u64::try_from(publication.sealed_len())
@@ -841,7 +842,7 @@ enum Command {
         new_name: CString,
         publication: OwnedContainerPublication,
         lease: BudgetLease,
-        reply: mpsc::SyncSender<Result<SealedContainer, StoreError>>,
+        reply: mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>,
     },
     Write {
         file: File,
@@ -896,9 +897,9 @@ struct PublishOperation {
     building_header: Box<[u8; HEADER_BYTES]>,
     sealed: Vec<u8>,
     phase: PublishPhase,
-    verified: Option<SealedContainer>,
+    verified: Option<VerifiedContainerPublication>,
     lease: Option<BudgetLease>,
-    reply: Option<mpsc::SyncSender<Result<SealedContainer, StoreError>>>,
+    reply: Option<mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>>,
 }
 
 impl PublishOperation {
@@ -909,7 +910,7 @@ impl PublishOperation {
         new_name: CString,
         publication: OwnedContainerPublication,
         lease: BudgetLease,
-        reply: mpsc::SyncSender<Result<SealedContainer, StoreError>>,
+        reply: mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>,
     ) -> Self {
         let (
             container_id,
@@ -1144,7 +1145,7 @@ impl PublishOperation {
 
     fn finish_verification(
         mut self,
-        verified: Result<SealedContainer, StoreError>,
+        verified: Result<VerifiedContainerPublication, StoreError>,
     ) -> OperationCompletion {
         assert!(
             matches!(self.phase, PublishPhase::AwaitVerification),
@@ -1190,8 +1191,8 @@ fn verify_owned_reread(
     container_id: fastdup_format::ContainerId,
     container_generation: u64,
     hash_workers: NonZeroUsize,
-) -> Result<SealedContainer, StoreError> {
-    let verified = SealedContainer::decode_with_hash_workers(reread, hash_workers)?;
+) -> Result<VerifiedContainerPublication, StoreError> {
+    let verified = SealedContainer::verify_publication_with_hash_workers(reread, hash_workers)?;
     let footer_bytes =
         usize::try_from(FOOTER_BYTES).expect("ASSERT: format-v1 Footer size fits usize");
     let footer_offset = reread
@@ -1214,13 +1215,13 @@ fn verify_owned_reread(
 
 struct PublishReady {
     directory: File,
-    verified: SealedContainer,
-    reply: mpsc::SyncSender<Result<SealedContainer, StoreError>>,
+    verified: VerifiedContainerPublication,
+    reply: mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>,
 }
 
 struct RootPublication {
-    verified: SealedContainer,
-    reply: mpsc::SyncSender<Result<SealedContainer, StoreError>>,
+    verified: VerifiedContainerPublication,
+    reply: mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>,
 }
 
 struct PendingVerification {
@@ -1738,7 +1739,7 @@ fn verify_publications(
 
 fn finish_verified_operation(
     operation: Box<PublishOperation>,
-    verified: Result<SealedContainer, StoreError>,
+    verified: Result<VerifiedContainerPublication, StoreError>,
 ) -> Option<Operation> {
     match operation.finish_verification(verified) {
         OperationCompletion::Pending(operation) => Some(operation),
@@ -1802,7 +1803,7 @@ fn advance_write(
     progress: &mut usize,
     total: usize,
     transferred: usize,
-    reply: &mut Option<mpsc::SyncSender<Result<SealedContainer, StoreError>>>,
+    reply: &mut Option<mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>>,
 ) -> bool {
     let remaining = total
         .checked_sub(*progress)
@@ -1835,8 +1836,8 @@ fn receive_reply<T>(receiver: &mpsc::Receiver<io::Result<T>>) -> io::Result<T> {
 }
 
 fn receive_store_reply(
-    receiver: &mpsc::Receiver<Result<SealedContainer, StoreError>>,
-) -> Result<SealedContainer, StoreError> {
+    receiver: &mpsc::Receiver<Result<VerifiedContainerPublication, StoreError>>,
+) -> Result<VerifiedContainerPublication, StoreError> {
     receiver.recv().map_err(|_| {
         StoreError::Io(io::Error::new(
             io::ErrorKind::BrokenPipe,

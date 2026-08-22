@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::File;
@@ -9,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use fastcdc::v2020::{FastCDC, MASKS, Normalization, StreamCDC, get_gear_with_seed};
+use fastdup_copy_metrics::{CopyClass, record_copy};
 use fastdup_format::{
     ChunkId, CommitRecord, ContainerId, DurableInode, ExactIndexEntry, ExactIndexProfileId,
     ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, IncompressibilityGateMetrics,
@@ -44,6 +46,7 @@ const COMPRESSION_REGION_TARGET_BYTES: usize = 512 * 1_024;
 const CDC_MINIMUM_BYTES: usize = 16 * 1_024;
 const CDC_TARGET_BYTES: usize = 64 * 1_024;
 const CDC_MAXIMUM_BYTES: usize = 256 * 1_024;
+const MAX_CHUNK_FRAGMENTS_V1: usize = 1_024;
 type RetainedManifestRanges = BTreeMap<u64, BTreeMap<MetadataObjectId, Vec<Range<u64>>>>;
 type AdaptiveCommitFinish = (
     Vec<ExactIndexEntry>,
@@ -900,7 +903,82 @@ impl CommittedFile for FillCommittedFile {
 struct PendingWriteThroughChunk {
     offset: u64,
     chunk_id: ChunkId,
-    bytes: MutationPayload,
+    bytes: ChunkFragments,
+}
+
+#[derive(Debug)]
+struct ChunkFragments {
+    parts: Vec<MutationPayload>,
+    length: usize,
+}
+
+impl ChunkFragments {
+    fn new(parts: Vec<MutationPayload>, length: usize) -> Self {
+        assert!(length != 0, "ASSERT: a FastCDC Chunk is nonempty");
+        let actual = parts.iter().fold(0_usize, |total, part| {
+            assert!(!part.is_empty(), "ASSERT: Chunk fragments are nonempty");
+            total
+                .checked_add(part.len())
+                .expect("ASSERT: bounded Chunk fragment sum cannot overflow")
+        });
+        assert_eq!(actual, length, "ASSERT: Chunk fragment length is exact");
+        Self { parts, length }
+    }
+
+    const fn len(&self) -> usize {
+        self.length
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    fn first_byte(&self) -> u8 {
+        self.parts[0].as_bytes()[0]
+    }
+
+    fn is_fill(&self) -> bool {
+        let first = self.first_byte();
+        self.parts
+            .iter()
+            .all(|part| part.as_bytes().iter().all(|byte| *byte == first))
+    }
+
+    fn chunk_id(&self) -> ChunkId {
+        let mut hasher = blake3::Hasher::new();
+        for part in &self.parts {
+            hasher.update(part.as_bytes());
+        }
+        ChunkId::from_bytes(*hasher.finalize().as_bytes())
+    }
+
+    fn materialize_new_chunk(&self) -> Result<Cow<'_, [u8]>, DurableNamespaceError> {
+        if self.parts.len() == 1 {
+            return Ok(Cow::Borrowed(self.parts[0].as_bytes()));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.length)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for part in &self.parts {
+            bytes.extend_from_slice(part.as_bytes());
+        }
+        assert_eq!(
+            bytes.len(),
+            self.length,
+            "ASSERT: new-Chunk coalescing preserves its exact length"
+        );
+        record_copy(CopyClass::ChunkFragmentCoalescing, bytes.len());
+        Ok(Cow::Owned(bytes))
+    }
+
+    #[cfg(test)]
+    fn materialize_fixture(&self) -> Vec<u8> {
+        self.parts
+            .iter()
+            .flat_map(|part| part.as_bytes().iter().copied())
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -947,94 +1025,75 @@ impl SegmentedIngestTail {
         self.segments.front().map_or(&[], MutationPayload::as_bytes)
     }
 
+    #[cfg(test)]
     fn take_prefix(&mut self, length: usize) -> Result<MutationPayload, DurableNamespaceError> {
+        let fragments = self.take_prefix_fragments(length)?;
+        let bytes = fragments.materialize_new_chunk()?.into_owned();
+        self.materialized_bytes = self
+            .materialized_bytes
+            .checked_add(length)
+            .expect("ASSERT: bounded materialized-byte counter cannot overflow");
+        Ok(MutationPayload::from_owned_bytes(bytes))
+    }
+
+    fn take_prefix_fragments(
+        &mut self,
+        length: usize,
+    ) -> Result<ChunkFragments, DurableNamespaceError> {
         assert!(length != 0, "ASSERT: consumed Ingest prefix is nonempty");
         if length > self.length {
             return Err(DurableNamespaceError::FrozenViewMismatch);
         }
-        if self
-            .segments
-            .front()
-            .is_some_and(|front| front.len() < length)
-        {
-            let mut contiguous = Vec::new();
-            contiguous
+        let mut parts = Vec::new();
+        let mut remaining = length;
+        while remaining != 0 {
+            let front = self
+                .segments
+                .pop_front()
+                .expect("ASSERT: accounted Ingest Tail owns a front segment");
+            let consumed = remaining.min(front.len());
+            parts
+                .try_reserve(1)
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+            parts.push(
+                front
+                    .checked_slice(0, consumed)
+                    .expect("ASSERT: consumed fragment lies inside front segment"),
+            );
+            if consumed < front.len() {
+                self.segments.push_front(
+                    front
+                        .checked_slice(consumed, front.len())
+                        .expect("ASSERT: retained suffix lies inside front segment"),
+                );
+            }
+            remaining -= consumed;
+            self.length -= consumed;
+        }
+        if parts.len() > MAX_CHUNK_FRAGMENTS_V1 {
+            let mut compact = Vec::new();
+            compact
                 .try_reserve_exact(length)
                 .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-            for segment in &self.segments {
-                let remaining = length - contiguous.len();
-                if remaining == 0 {
-                    break;
-                }
-                let copied = remaining.min(segment.len());
-                contiguous.extend_from_slice(&segment.as_bytes()[..copied]);
+            for part in &parts {
+                compact.extend_from_slice(part.as_bytes());
             }
             assert_eq!(
-                contiguous.len(),
+                compact.len(),
                 length,
-                "ASSERT: cached Ingest Tail length must match its segments"
+                "ASSERT: fragment-limit compaction preserves the complete Chunk"
             );
-            self.discard_prefix(length);
-            self.materialized_bytes = self
-                .materialized_bytes
-                .checked_add(length)
-                .expect("ASSERT: bounded materialized-byte counter cannot overflow");
-            self.assert_valid();
-            return Ok(MutationPayload::from_owned_bytes(contiguous));
+            record_copy(CopyClass::ChunkFragmentCoalescing, compact.len());
+            parts.clear();
+            parts.push(MutationPayload::from_owned_bytes(compact));
         }
-        let front = self
-            .segments
-            .pop_front()
-            .expect("ASSERT: nonempty Ingest Tail owns a front segment");
-        assert!(
-            front.len() >= length,
-            "ASSERT: compacted front must cover requested prefix"
-        );
-        let consumed = front
-            .checked_slice(0, length)
-            .expect("ASSERT: consumed prefix lies inside front segment");
-        if front.len() > length {
-            self.segments.push_front(
-                front
-                    .checked_slice(length, front.len())
-                    .expect("ASSERT: retained suffix lies inside front segment"),
-            );
-        }
-        self.length = self
-            .length
-            .checked_sub(length)
-            .expect("ASSERT: consumed prefix was accounted");
         self.assert_valid();
-        Ok(consumed)
+        Ok(ChunkFragments::new(parts, length))
     }
 
     #[cfg(test)]
     fn materialized_bytes(&self) -> usize {
         self.materialized_bytes
-    }
-
-    fn discard_prefix(&mut self, mut length: usize) {
-        assert!(
-            length <= self.length,
-            "ASSERT: discarded prefix stays inside Ingest Tail"
-        );
-        while length != 0 {
-            let front = self
-                .segments
-                .pop_front()
-                .expect("ASSERT: accounted Ingest Tail owns a front segment");
-            if front.len() > length {
-                self.segments.push_front(
-                    front
-                        .checked_slice(length, front.len())
-                        .expect("ASSERT: retained tail suffix lies inside front segment"),
-                );
-                self.length -= length;
-                return;
-            }
-            length -= front.len();
-            self.length -= front.len();
-        }
     }
 
     fn assert_valid(&self) {
@@ -1153,7 +1212,7 @@ fn segmented_fastcdc_cut(tail: &SegmentedIngestTail) -> usize {
 
 fn take_next_stable_fastcdc_chunk(
     tail: &mut SegmentedIngestTail,
-) -> Result<Option<MutationPayload>, DurableNamespaceError> {
+) -> Result<Option<ChunkFragments>, DurableNamespaceError> {
     if tail.len() <= CDC_MAXIMUM_BYTES {
         return Ok(None);
     }
@@ -1180,13 +1239,13 @@ fn take_next_stable_fastcdc_chunk(
     if length > stable_before {
         return Ok(None);
     }
-    tail.take_prefix(length).map(Some)
+    tail.take_prefix_fragments(length).map(Some)
 }
 
 #[derive(Debug)]
 struct StableChunk {
     offset: u64,
-    bytes: MutationPayload,
+    bytes: ChunkFragments,
 }
 
 fn take_stable_chunk_batch(
@@ -1259,9 +1318,8 @@ fn classify_stable_chunk_shard(
         .try_reserve_exact(batch.len())
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
     for chunk in batch {
-        let bytes = chunk.bytes.as_bytes();
-        assert!(!bytes.is_empty(), "ASSERT: FastCDC Chunk is nonempty");
-        classified.push((!bytes.iter().all(|byte| *byte == bytes[0])).then(|| ChunkId::of(bytes)));
+        assert!(!chunk.bytes.is_empty(), "ASSERT: FastCDC Chunk is nonempty");
+        classified.push((!chunk.bytes.is_fill()).then(|| chunk.bytes.chunk_id()));
     }
     Ok(classified)
 }
@@ -2521,8 +2579,7 @@ where
                 "ASSERT: every stable Chunk has one classification"
             );
             for (chunk, chunk_id) in batch.into_iter().zip(chunk_ids) {
-                let chunk_bytes = chunk.bytes.as_bytes();
-                let logical_length = u64::try_from(chunk_bytes.len())
+                let logical_length = u64::try_from(chunk.bytes.len())
                     .expect("ASSERT: bounded FastCDC Chunk length fits u64");
                 let Some(chunk_id) = chunk_id else {
                     externalized.push(ExternalizedExtent::new(
@@ -2530,7 +2587,7 @@ where
                         chunk.offset,
                         through_sequence,
                         Arc::new(FillCommittedFile {
-                            value: chunk_bytes[0],
+                            value: chunk.bytes.first_byte(),
                             length: logical_length,
                         }),
                     )?);
@@ -2564,7 +2621,7 @@ where
                 }
                 state.pending_bytes = state
                     .pending_bytes
-                    .checked_add(chunk_bytes.len())
+                    .checked_add(chunk.bytes.len())
                     .ok_or(DurableNamespaceError::OutOfMemory)?;
                 state.pending_chunks.push(PendingWriteThroughChunk {
                     offset: chunk.offset,
@@ -2704,12 +2761,16 @@ where
             !new_chunks.is_empty(),
             "ASSERT: a new-Chunk Container must contain at least one Chunk"
         );
+        let materialized = new_chunks
+            .iter()
+            .map(|chunk| chunk.bytes.materialize_new_chunk())
+            .collect::<Result<Vec<_>, _>>()?;
         let mut regions = Vec::<Vec<PrehashedChunk<'_>>>::new();
         let mut region_bytes = 0_usize;
-        for chunk in new_chunks {
+        for (chunk, bytes) in new_chunks.iter().zip(&materialized) {
             if region_bytes != 0
                 && region_bytes
-                    .checked_add(chunk.bytes.len())
+                    .checked_add(bytes.len())
                     .ok_or(DurableNamespaceError::OutOfMemory)?
                     > COMPRESSION_REGION_TARGET_BYTES
             {
@@ -2721,9 +2782,9 @@ where
             regions
                 .last_mut()
                 .expect("ASSERT: active region exists")
-                .push(PrehashedChunk::new(chunk.chunk_id, chunk.bytes.as_bytes()));
+                .push(PrehashedChunk::new(chunk.chunk_id, bytes));
             region_bytes = region_bytes
-                .checked_add(chunk.bytes.len())
+                .checked_add(bytes.len())
                 .ok_or(DurableNamespaceError::OutOfMemory)?;
         }
         let region_refs = regions.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -5605,6 +5666,26 @@ mod tests {
     }
 
     #[test]
+    fn pathological_tiny_writes_compact_before_chunk_fragment_metadata_can_grow_unbounded() {
+        let mut tail = SegmentedIngestTail::default();
+        let length = MAX_CHUNK_FRAGMENTS_V1 + 1;
+        for ordinal in 0..length {
+            tail.push(MutationPayload::from_owned_bytes(vec![
+                u8::try_from(ordinal % 251).expect("fixture byte fits u8"),
+            ]));
+        }
+
+        let chunk = tail
+            .take_prefix_fragments(length)
+            .expect("bounded fragment compaction succeeds");
+
+        assert_eq!(chunk.parts.len(), 1);
+        assert_eq!(chunk.len(), length);
+        assert_eq!(chunk.materialize_fixture().len(), length);
+        assert!(tail.is_empty());
+    }
+
+    #[test]
     fn independent_ingest_lane_state_starts_on_cache_lines() {
         assert_eq!(std::mem::align_of::<WriteThroughStream>(), 64);
     }
@@ -5651,14 +5732,11 @@ mod tests {
         while let Some(chunk) =
             take_next_stable_fastcdc_chunk(&mut tail).expect("chunk segmented fixture")
         {
-            observed.push(chunk.as_bytes().to_vec());
+            observed.push(chunk.materialize_fixture());
         }
 
         assert_eq!(observed, expected);
-        assert!(
-            tail.materialized_bytes() <= observed.iter().map(Vec::len).sum::<usize>(),
-            "CDC may materialize selected Chunks, never lookahead bytes"
-        );
+        assert_eq!(tail.materialized_bytes(), 0);
         assert_eq!(
             tail.len(),
             source.len() - expected.iter().map(Vec::len).sum::<usize>()
@@ -5678,10 +5756,14 @@ mod tests {
                 .checked_add(chunk.len())
                 .expect("fixture byte count cannot overflow");
         }
+        assert_ne!(
+            selected_bytes, 0,
+            "fragmented fixture must expose stable Chunks"
+        );
         assert_eq!(
             fragmented.materialized_bytes(),
-            selected_bytes,
-            "4-KiB segments force every >=16-KiB Chunk to span segments; only selected bytes may copy"
+            0,
+            "FastCDC extraction and hashing retain request fragments without copying"
         );
     }
 
@@ -5826,8 +5908,13 @@ mod tests {
             pending_chunks: vec![PendingWriteThroughChunk {
                 offset: 0,
                 chunk_id: ChunkId::of(&[1, 2, 3]),
-                bytes: MutationPayload::try_copy_from_slice(&[1, 2, 3])
-                    .expect("allocate fixture payload"),
+                bytes: ChunkFragments::new(
+                    vec![
+                        MutationPayload::try_copy_from_slice(&[1, 2, 3])
+                            .expect("allocate fixture payload"),
+                    ],
+                    3,
+                ),
             }],
             pending_bytes: 2,
             ..WriteThroughStream::default()

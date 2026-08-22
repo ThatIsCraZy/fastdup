@@ -235,8 +235,11 @@ fn prepared_container_transfers_owned_image_once_into_the_ring_publisher() {
         .publish_prepared_adaptive_profiled(prepared)
         .expect("owned publication succeeds");
     assert_eq!(verified.header().container_id(), id);
+    let readable = repository
+        .read(id)
+        .expect("published Container remains readable through the full reader");
     assert_eq!(
-        verified.chunk(fastdup_format::ChunkId::of(&chunk)),
+        readable.chunk(fastdup_format::ChunkId::of(&chunk)),
         Some(chunk.as_slice())
     );
     let status = storage.status();

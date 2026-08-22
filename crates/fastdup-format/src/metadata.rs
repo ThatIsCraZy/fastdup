@@ -223,11 +223,7 @@ fn align_up(value: usize, alignment: usize) -> Result<usize, MetadataFormatError
         .ok_or(MetadataFormatError::ArithmeticOverflow)
 }
 
-fn crc32c_with_zeroed_field(bytes: &[u8], field_offset: usize) -> u32 {
-    let mut checksummed = bytes.to_vec();
-    checksummed[field_offset..field_offset + 4].fill(0);
-    crc32c::crc32c(&checksummed)
-}
+use crate::crc32c_with_zeroed_u32 as crc32c_with_zeroed_field;
 
 fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());

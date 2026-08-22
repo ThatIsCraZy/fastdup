@@ -9,7 +9,8 @@ use fastdup_appliance::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction, CheckpointPressure, DurableNamespace,
     MUTATION_COMMIT_TARGET, ProfiledCheckpoint, checkpoint_action, checkpoint_policy_set_v1,
 };
-use fastdup_format::{HEADER_BYTES, SealedContainer};
+use fastdup_copy_metrics::copy_telemetry;
+use fastdup_format::{HEADER_BYTES, VerifiedContainerPublication};
 use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo};
 use fastdup_posix::{FuseFilesystem, NamespaceConfig, volatile_mount_options};
 use fastdup_store::{
@@ -192,6 +193,19 @@ fn emit_io_uring_state(storage: &TelemetryStorageIo) {
         status.active_verifications(),
         status.peak_active_verifications(),
         status.fallback_reason(),
+    );
+    let copies = copy_telemetry();
+    eprintln!(
+        concat!(
+            "copy_bytes checksum_scratch_bytes={} publication_verify_materialization_bytes={} ",
+            "fuse_request_adaptation_bytes={} container_assembly_bytes={} ",
+            "chunk_fragment_coalescing_bytes={}"
+        ),
+        copies.checksum_scratch_bytes,
+        copies.publication_verify_materialization_bytes,
+        copies.fuse_request_adaptation_bytes,
+        copies.container_assembly_bytes,
+        copies.chunk_fragment_coalescing_bytes,
     );
 }
 
@@ -709,7 +723,7 @@ impl StorageIo for TelemetryStorageIo {
     fn publish_owned_container(
         &self,
         publication: OwnedContainerPublication,
-    ) -> Result<SealedContainer, StoreError> {
+    ) -> Result<VerifiedContainerPublication, StoreError> {
         let sealed_bytes = publication.sealed_len();
         let verified = self.inner.publish_owned_container(publication)?;
         if self.enabled {

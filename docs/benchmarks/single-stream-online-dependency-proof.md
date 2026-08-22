@@ -49,3 +49,52 @@ The corresponding report names are:
 - `smb-single-stream-online-proof-profile.json`
 - `smb-single-stream-online-proof-reuse-profile.json`
 - `smb-single-stream-s3-fifo.json`
+
+## Copy-elimination follow-up
+
+On 2026-08-22, a fresh io_uring run compared the copy-elimination build with
+the last evaluable io_uring callgraph build. Both used the pinned ISO, the same
+Samba configuration, the same XFS mounts, and zero Swap.
+
+| Measurement | Prior callgraph build | Copy-elimination build |
+|---|---:|---:|
+| Aggregate SMB write rate | 207.69 MiB/s | 674.54 MiB/s |
+| Copy 1 | 129.77 MiB/s | 454.30 MiB/s |
+| Copy 2 | 288.48 MiB/s | 888.97 MiB/s |
+| Copy 3 | 305.64 MiB/s | 891.75 MiB/s |
+| Completed-file p99 | 15.23 s | 4.35 s |
+| Daemon CPU | 66.35 s | 17.38 s |
+| Peak RSS | 888.4 MB | 651.7 MB |
+| DATA-device writes | 2.195 GB | 2.065 GB |
+| Data reduction | 2.807x | 2.983x |
+
+The final copy counters were 0 bytes for checksum scratch,
+publication-verifier materialization, FUSE request adaptation, and adaptive
+Container assembly. New Chunks crossing FUSE-request boundaries required
+189,918,888 bytes of fragment coalescing. This is 3.1% of the 6.217-GB logical
+three-copy stream and is bounded before codec admission.
+
+A second run under `perf` completed all three uploads but the benchmark report
+is marked failed because the benchmark terminates its daemon with SIGTERM and
+the wrapper reported that expected signal as an error. The `perf.data` file has
+6,000 samples and zero lost samples. In the selected fastdup ingest, publish,
+verifier, and Tokio threads, `memmove` fell from 16.22% in the prior callgraph
+capture to 11.07%. Its remaining self time was 5.17% in ingest workers, 3.68%
+in Tokio/FUSE workers, and 2.22% in publication workers. The largest remaining
+attributed callers are Compression-Region coalescing, FUSE's required
+receive-buffer-to-owned-request copy, sparse-overlay externalization, and the
+one necessary RAW source-to-final-record copy.
+
+The measured throughput changed by 3.25x in one run. Treat that as a regression
+gate, not a stable hardware limit. Source-page-cache warmth and VM scheduling
+were not controlled tightly enough to assign the entire change to one code
+path. The CPU, RSS, byte counters, and reduced `memmove` share independently
+confirm that the removed copies were exercised.
+
+The local evidence is:
+
+- `smb-single-stream-current-bottleneck-callgraph.json`
+- `smb-single-stream-copy-elimination.json`
+- `smb-single-stream-copy-elimination-profile.json`
+- `smb-single-stream-copy-elimination.perf.data`
+- `copy-elimination-memmove-callers.txt`

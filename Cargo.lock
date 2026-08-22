@@ -175,6 +175,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fastcdc",
+ "fastdup-copy-metrics",
  "fastdup-format",
  "fastdup-io-uring",
  "fastdup-posix",
@@ -188,11 +189,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastdup-copy-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "fastdup-format"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "crc32c",
+ "fastdup-copy-metrics",
  "lz4",
  "rayon",
  "zstd",
@@ -214,6 +220,7 @@ name = "fastdup-posix"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fastdup-copy-metrics",
  "fuse3",
  "futures-util",
  "libc",
@@ -257,8 +264,6 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "fuse3"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c0779ad9d9223794030dd90640b2b50a0c42d4f29434636e23b29fac7d41568"
 dependencies = [
  "async-notify",
  "bytes",

@@ -66,7 +66,7 @@ use fastdup_format::{
     BuildingContainerHeader, ContainerId, ExactIndexEntry, ExactIndexLocation,
     ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
     IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, PrehashedChunk, SealedContainer,
-    SealedContainerDescriptor,
+    SealedContainerDescriptor, VerifiedContainerPublication,
 };
 use rayon::prelude::*;
 
@@ -495,7 +495,7 @@ pub trait StorageIo {
     fn publish_owned_container(
         &self,
         publication: OwnedContainerPublication,
-    ) -> Result<SealedContainer, StoreError> {
+    ) -> Result<VerifiedContainerPublication, StoreError> {
         publish_owned_container_synchronously(self, publication)
     }
 }
@@ -602,7 +602,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_id: ContainerId,
         container_generation: u64,
         regions: &[&[&[u8]]],
-    ) -> Result<SealedContainer, StoreError> {
+    ) -> Result<VerifiedContainerPublication, StoreError> {
         self.publish_adaptive_regions_parallel_verified(
             container_id,
             container_generation,
@@ -624,7 +624,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_generation: u64,
         regions: &[&[&[u8]]],
         workers: NonZeroUsize,
-    ) -> Result<SealedContainer, StoreError> {
+    ) -> Result<VerifiedContainerPublication, StoreError> {
         self.publish_adaptive_regions_parallel_profiled(
             container_id,
             container_generation,
@@ -681,7 +681,13 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_generation: u64,
         regions: &[&[&[u8]]],
         workers: NonZeroUsize,
-    ) -> Result<(SealedContainer, AdaptiveContainerPublishMetrics), StoreError> {
+    ) -> Result<
+        (
+            VerifiedContainerPublication,
+            AdaptiveContainerPublishMetrics,
+        ),
+        StoreError,
+    > {
         let prepared = Self::prepare_adaptive_regions_parallel(
             container_id,
             container_generation,
@@ -777,7 +783,13 @@ impl<I: StorageIo> ContainerRepository<I> {
     pub fn publish_prepared_adaptive_profiled(
         &self,
         prepared: PreparedAdaptiveContainer,
-    ) -> Result<(SealedContainer, AdaptiveContainerPublishMetrics), StoreError> {
+    ) -> Result<
+        (
+            VerifiedContainerPublication,
+            AdaptiveContainerPublishMetrics,
+        ),
+        StoreError,
+    > {
         let PreparedAdaptiveContainer {
             container_id,
             container_generation,
@@ -793,14 +805,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         let verified = self.publish_sealed(container_id, container_generation, sealed)?;
         let publish_wall = publish_wall_started.elapsed();
         let publish_process_cpu = process_cpu_elapsed(publish_cpu_started);
-        let logical_bytes = verified.records().iter().try_fold(0_u64, |total, record| {
-            total.checked_add(
-                u64::try_from(record.payload().len())
-                    .expect("ASSERT: a bounded decoded Chunk length fits u64"),
-            )
-        });
-        let logical_bytes = logical_bytes
-            .expect("ASSERT: a bounded format-v1 Container logical byte sum cannot overflow");
+        let logical_bytes = verified.logical_bytes();
         let metrics = AdaptiveContainerPublishMetrics {
             encode_wall,
             encode_process_cpu,
@@ -820,7 +825,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_id: ContainerId,
         container_generation: u64,
         sealed: Vec<u8>,
-    ) -> Result<SealedContainer, StoreError> {
+    ) -> Result<VerifiedContainerPublication, StoreError> {
         let building = BuildingContainerHeader::new(container_id, container_generation)?.encode();
         let temporary_name = temporary_name(container_id);
         let published_name = published_name(container_id);
@@ -1455,7 +1460,7 @@ impl<I: StorageIo> ContainerRepository<I> {
 fn publish_owned_container_synchronously<I: StorageIo + ?Sized>(
     storage: &I,
     publication: OwnedContainerPublication,
-) -> Result<SealedContainer, StoreError> {
+) -> Result<VerifiedContainerPublication, StoreError> {
     let (
         container_id,
         container_generation,
@@ -1485,7 +1490,8 @@ fn publish_owned_container_synchronously<I: StorageIo + ?Sized>(
     storage.write_at(&temporary_name, 0, &sealed[..HEADER_BYTES])?;
     storage.set_len(&temporary_name, sealed_length)?;
     let reread = storage.read(&temporary_name)?;
-    let verified = SealedContainer::decode(&reread)?;
+    let verified =
+        SealedContainer::verify_publication_with_hash_workers(&reread, NonZeroUsize::MIN)?;
     if reread != sealed
         || verified.header().container_id() != container_id
         || verified.header().container_generation() != container_generation

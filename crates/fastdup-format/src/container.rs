@@ -4,6 +4,9 @@ use std::num::NonZeroUsize;
 
 use rayon::prelude::*;
 
+use fastdup_copy_metrics::{CopyClass, record_copy};
+
+use crate::crc32c_with_zeroed_u32;
 use crate::exact_index::{ExactIndexEntry, ExactLocationTransition};
 
 pub const HEADER_BYTES: usize = 4_096;
@@ -107,6 +110,53 @@ pub struct SealedContainer {
     raw_locations: Vec<VerifiedRawLocation>,
     raw_record_count: usize,
     zstd_record_count: usize,
+}
+
+/// Payload-free evidence produced by the mandatory publication reread.
+///
+/// Every record, Chunk identity, Recovery Index entry, envelope field and the
+/// complete Container hash has been verified. Unlike [`SealedContainer`], this
+/// type never retains a second owned copy of decoded logical Chunk bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedContainerPublication {
+    header: ContainerHeader,
+    locations: Vec<VerifiedChunkLocation>,
+    raw_locations: Vec<VerifiedRawLocation>,
+    logical_bytes: u64,
+    raw_record_count: usize,
+    zstd_record_count: usize,
+}
+
+impl VerifiedContainerPublication {
+    #[must_use]
+    pub const fn header(&self) -> &ContainerHeader {
+        &self.header
+    }
+
+    #[must_use]
+    pub fn locations(&self) -> &[VerifiedChunkLocation] {
+        &self.locations
+    }
+
+    #[must_use]
+    pub fn raw_locations(&self) -> &[VerifiedRawLocation] {
+        &self.raw_locations
+    }
+
+    #[must_use]
+    pub const fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
+    }
+
+    #[must_use]
+    pub const fn raw_record_count(&self) -> usize {
+        self.raw_record_count
+    }
+
+    #[must_use]
+    pub const fn zstd_record_count(&self) -> usize {
+        self.zstd_record_count
+    }
 }
 
 /// Runtime evidence from the version-1 incompressibility gate.
@@ -788,7 +838,7 @@ impl SealedContainer {
             gate_metrics.checked_merge(encoded.metrics)?;
             encoded_records.extend(encoded.records);
         }
-        let bytes = encode_container_from_records(
+        let bytes = encode_container_from_adaptive_plans(
             container_id,
             container_generation,
             encoded_records,
@@ -964,6 +1014,158 @@ impl SealedContainer {
             records,
             locations,
             raw_locations,
+            raw_record_count,
+            zstd_record_count,
+        })
+    }
+
+    /// Fully validates a sealed Container for publication without retaining
+    /// owned copies of its decoded logical Chunk payloads.
+    ///
+    /// RAW Chunk identities are hashed directly from the reread image. Zstd
+    /// records retain only their one bounded decode buffer while their Chunk
+    /// table is verified. The returned evidence is sufficient for Exact-Index
+    /// publication and phase metrics, but it cannot serve file reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structural, checksum, index, or content-integrity
+    /// errors as [`Self::decode_with_hash_workers`].
+    #[allow(clippy::too_many_lines)]
+    pub fn verify_publication_with_hash_workers(
+        bytes: &[u8],
+        permitted_workers: NonZeroUsize,
+    ) -> Result<VerifiedContainerPublication, FormatError> {
+        validate_container_file_length(bytes.len())?;
+        let footer_offset = bytes
+            .len()
+            .checked_sub(FOOTER_BYTES_USIZE)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        let footer = decode_footer(&bytes[footer_offset..])?;
+        let header = ContainerHeader::decode(&bytes[..HEADER_BYTES])?;
+        if header.container_id != footer.container_id
+            || header.container_generation != footer.container_generation
+            || header.layout != footer.layout
+            || usize::try_from(header.layout.footer_offset) != Ok(footer_offset)
+            || usize::try_from(header.layout.file_length) != Ok(bytes.len())
+        {
+            return Err(FormatError::HeaderFooterMismatch);
+        }
+
+        let index_offset = usize::try_from(header.layout.index_offset)
+            .map_err(|_| FormatError::ArithmeticOverflow)?;
+        let index_length = usize::try_from(header.layout.index_length)
+            .map_err(|_| FormatError::ArithmeticOverflow)?;
+        let index_end = index_offset
+            .checked_add(index_length)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        if index_end > footer_offset {
+            return Err(FormatError::InvalidContainerLayout);
+        }
+
+        let entry_capacity = usize::try_from(header.layout.chunk_entry_count)
+            .map_err(|_| FormatError::ArithmeticOverflow)?;
+        let mut expected_entries = Vec::with_capacity(entry_capacity);
+        let mut locations = Vec::with_capacity(entry_capacity);
+        let mut raw_locations = Vec::with_capacity(
+            usize::try_from(header.layout.record_count)
+                .map_err(|_| FormatError::ArithmeticOverflow)?,
+        );
+        let mut logical_bytes = 0_u64;
+        let mut raw_record_count = 0_usize;
+        let mut zstd_record_count = 0_usize;
+        let mut cursor = HEADER_BYTES;
+        for _ in 0..header.layout.record_count {
+            let fixed_end = cursor
+                .checked_add(RECORD_HEADER_BYTES)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            if fixed_end > index_offset {
+                return Err(FormatError::InvalidContainerLayout);
+            }
+            let record_length = usize::try_from(get_u32(bytes, cursor + 32))
+                .map_err(|_| FormatError::ArithmeticOverflow)?;
+            let end = cursor
+                .checked_add(record_length)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            if end > index_offset {
+                return Err(FormatError::InvalidContainerLayout);
+            }
+            let encoded = &bytes[cursor..end];
+            let decoded = verify_encoding_record(encoded)?;
+            logical_bytes = logical_bytes
+                .checked_add(decoded.logical_bytes)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            let index_entries = IndexEntry::from_encoded_record(
+                encoded,
+                u64::try_from(cursor).map_err(|_| FormatError::ArithmeticOverflow)?,
+            )?;
+            for index_entry in &index_entries {
+                locations.push(VerifiedChunkLocation {
+                    chunk_id: index_entry.chunk_id,
+                    logical_length: index_entry.logical_length,
+                    container_id: header.container_id,
+                    container_generation: header.container_generation,
+                    record_offset: index_entry.record_offset,
+                    record_length: index_entry.record_length,
+                    chunk_ordinal: index_entry.chunk_ordinal,
+                    decoded_offset: index_entry.decoded_offset,
+                    codec_id: index_entry.codec_id,
+                    record_crc32c: index_entry.record_crc32c,
+                    record_decoded_length: index_entry.record_decoded_length,
+                    record_payload_length: index_entry.record_payload_length,
+                });
+            }
+            match decoded.codec {
+                EncodingCodec::Raw => {
+                    raw_record_count = raw_record_count
+                        .checked_add(1)
+                        .ok_or(FormatError::ArithmeticOverflow)?;
+                    let index_entry = index_entries.first().ok_or(FormatError::InvalidRawRecord)?;
+                    raw_locations.push(VerifiedRawLocation {
+                        chunk_id: index_entry.chunk_id,
+                        logical_length: index_entry.logical_length,
+                        container_id: header.container_id,
+                        container_generation: header.container_generation,
+                        record_offset: index_entry.record_offset,
+                        record_length: index_entry.record_length,
+                        record_crc32c: index_entry.record_crc32c,
+                    });
+                }
+                EncodingCodec::Zstd => {
+                    zstd_record_count = zstd_record_count
+                        .checked_add(1)
+                        .ok_or(FormatError::ArithmeticOverflow)?;
+                }
+            }
+            expected_entries.extend(index_entries);
+            cursor = end;
+        }
+        if cursor != index_offset {
+            return Err(FormatError::InvalidContainerLayout);
+        }
+        expected_entries.sort_unstable();
+        let actual_entries = decode_index(
+            &bytes[index_offset..index_end],
+            header.layout.chunk_entry_count,
+        )?;
+        if actual_entries != expected_entries {
+            return Err(FormatError::IndexRecordMismatch);
+        }
+        if bytes[index_end..footer_offset]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(FormatError::NonZeroContainerPadding);
+        }
+        let computed_hash = calculate_container_hash(bytes, footer_offset, permitted_workers);
+        if computed_hash != footer.container_hash {
+            return Err(FormatError::ContainerHashMismatch);
+        }
+        Ok(VerifiedContainerPublication {
+            header,
+            locations,
+            raw_locations,
+            logical_bytes,
             raw_record_count,
             zstd_record_count,
         })
@@ -1335,22 +1537,69 @@ struct AdaptiveEncoderV1 {
     scratch: Box<[u8]>,
 }
 
-struct EncodedAdaptiveRegion {
-    records: Vec<Vec<u8>>,
+struct EncodedAdaptiveRegion<'a> {
+    records: Vec<AdaptiveRecordPlan<'a>>,
     metrics: IncompressibilityGateMetrics,
+}
+
+enum AdaptiveRecordPlan<'a> {
+    Raw(PrehashedChunk<'a>),
+    Zstd {
+        chunks: &'a [PrehashedChunk<'a>],
+        decoded_length: usize,
+        payload: Vec<u8>,
+        level: i32,
+    },
+}
+
+impl AdaptiveRecordPlan<'_> {
+    fn record_length(&self) -> Result<usize, FormatError> {
+        match self {
+            Self::Raw(chunk) => raw_record_length(chunk.bytes.len()),
+            Self::Zstd {
+                chunks, payload, ..
+            } => zstd_record_length(chunks.len(), payload.len()),
+        }
+    }
+
+    fn chunk_count(&self) -> usize {
+        match self {
+            Self::Raw(_) => 1,
+            Self::Zstd { chunks, .. } => chunks.len(),
+        }
+    }
+
+    fn encode_into(&self, destination: &mut [u8]) -> Result<(), FormatError> {
+        match self {
+            Self::Raw(chunk) => encode_prehashed_raw_record_into(*chunk, destination),
+            Self::Zstd {
+                chunks,
+                decoded_length,
+                payload,
+                level,
+            } => encode_prehashed_zstd_record_into(
+                chunks,
+                *decoded_length,
+                payload,
+                *level,
+                destination,
+            ),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct DecodedEncodingRecord {
     codec: EncodingCodec,
     chunks: Vec<RawRecord>,
+    logical_bytes: u64,
 }
 
 #[allow(clippy::too_many_lines)]
-fn encode_adaptive_region(
-    region: &[PrehashedChunk<'_>],
+fn encode_adaptive_region<'a>(
+    region: &'a [PrehashedChunk<'a>],
     gate: IncompressibilityGatePolicy,
-) -> Result<EncodedAdaptiveRegion, FormatError> {
+) -> Result<EncodedAdaptiveRegion<'a>, FormatError> {
     if region.is_empty() {
         return Err(FormatError::InvalidZstdRecord);
     }
@@ -1399,20 +1648,26 @@ fn encode_adaptive_region(
     if should_try_target {
         metrics.target_zstd_trials = 1;
         let zstd = with_adaptive_encoder_v1(|encoder| {
-            let Some(payload) = encoder.zstd_payload(&decoded, ZSTD_LEVEL_V1, payload_cap)? else {
+            let Some(payload) = encoder.zstd_owned_payload(&decoded, ZSTD_LEVEL_V1, payload_cap)?
+            else {
                 return Ok(None);
             };
-            encode_prehashed_zstd_record_from_payload(region, decoded.len(), payload, ZSTD_LEVEL_V1)
-                .map(Some)
+            let record_length = zstd_record_length(region.len(), payload.len())?;
+            Ok(Some((payload, record_length)))
         })?;
-        if let Some(zstd) = zstd {
+        if let Some((payload, zstd_length)) = zstd {
             assert!(
-                zstd_record_wins(raw_bytes, zstd.len())?,
+                zstd_record_wins(raw_bytes, zstd_length)?,
                 "ASSERT: a payload bounded by the v1 useful cap must beat RAW"
             );
             metrics.target_zstd_accepted = 1;
             return Ok(EncodedAdaptiveRegion {
-                records: vec![zstd],
+                records: vec![AdaptiveRecordPlan::Zstd {
+                    chunks: region,
+                    decoded_length: decoded.len(),
+                    payload,
+                    level: ZSTD_LEVEL_V1,
+                }],
                 metrics,
             });
         }
@@ -1424,8 +1679,8 @@ fn encode_adaptive_region(
     let records = region
         .iter()
         .copied()
-        .map(RawRecord::encode_prehashed)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(AdaptiveRecordPlan::Raw)
+        .collect();
     Ok(EncodedAdaptiveRegion { records, metrics })
 }
 
@@ -1503,6 +1758,37 @@ fn encode_prehashed_zstd_record_from_payload(
     payload: &[u8],
     level: i32,
 ) -> Result<Vec<u8>, FormatError> {
+    let record_length = zstd_record_length(chunks.len(), payload.len())?;
+    let mut bytes = vec![0_u8; record_length];
+    encode_prehashed_zstd_record_into(chunks, decoded_length, payload, level, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn zstd_record_length(chunk_count: usize, payload_length: usize) -> Result<usize, FormatError> {
+    let table_bytes = chunk_count
+        .checked_mul(CHUNK_TABLE_ENTRY_BYTES)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let payload_offset = RECORD_HEADER_BYTES
+        .checked_add(table_bytes)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let payload_end = payload_offset
+        .checked_add(payload_length)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let record_length = align_up_usize(payload_end, usize::from(RECORD_ALIGNMENT))?;
+    if record_length > MAX_RECORD_BYTES {
+        return Err(FormatError::InvalidRecordLength(record_length));
+    }
+    Ok(record_length)
+}
+
+#[allow(clippy::too_many_lines)]
+fn encode_prehashed_zstd_record_into(
+    chunks: &[PrehashedChunk<'_>],
+    decoded_length: usize,
+    payload: &[u8],
+    level: i32,
+    bytes: &mut [u8],
+) -> Result<(), FormatError> {
     if chunks.is_empty() || level != ZSTD_LEVEL_V1 || decoded_length > MAX_DECODED_RECORD_BYTES {
         return Err(FormatError::InvalidZstdRecord);
     }
@@ -1516,40 +1802,40 @@ fn encode_prehashed_zstd_record_from_payload(
     let payload_end = payload_offset
         .checked_add(payload.len())
         .ok_or(FormatError::ArithmeticOverflow)?;
-    let record_length = align_up_usize(payload_end, usize::from(RECORD_ALIGNMENT))?;
-    if record_length > MAX_RECORD_BYTES {
-        return Err(FormatError::InvalidRecordLength(record_length));
+    let record_length = zstd_record_length(chunks.len(), payload.len())?;
+    if bytes.len() != record_length {
+        return Err(FormatError::InvalidRecordLength(bytes.len()));
     }
-    let mut bytes = vec![0_u8; record_length];
+    bytes.fill(0);
     bytes[0..8].copy_from_slice(RECORD_MAGIC);
-    put_u16(&mut bytes, 8, FORMAT_VERSION);
-    put_u16(&mut bytes, 10, RECORD_HEADER_BYTES_U16);
-    put_u16(&mut bytes, 12, ZSTD_CODEC);
-    put_u16(&mut bytes, 14, 0);
+    put_u16(bytes, 8, FORMAT_VERSION);
+    put_u16(bytes, 10, RECORD_HEADER_BYTES_U16);
+    put_u16(bytes, 12, ZSTD_CODEC);
+    put_u16(bytes, 14, 0);
     put_u32(
-        &mut bytes,
+        bytes,
         32,
         u32::try_from(record_length).map_err(|_| FormatError::ArithmeticOverflow)?,
     );
     put_u32(
-        &mut bytes,
+        bytes,
         36,
         u32::try_from(decoded_length).map_err(|_| FormatError::ArithmeticOverflow)?,
     );
     put_u32(
-        &mut bytes,
+        bytes,
         40,
         u32::try_from(payload_offset).map_err(|_| FormatError::ArithmeticOverflow)?,
     );
     put_u32(
-        &mut bytes,
+        bytes,
         44,
         u32::try_from(payload.len()).map_err(|_| FormatError::ArithmeticOverflow)?,
     );
-    put_u32(&mut bytes, 48, RECORD_HEADER_BYTES_U32);
-    put_u16(&mut bytes, 52, CHUNK_TABLE_ENTRY_BYTES_U16);
+    put_u32(bytes, 48, RECORD_HEADER_BYTES_U32);
+    put_u16(bytes, 52, CHUNK_TABLE_ENTRY_BYTES_U16);
     put_u32(
-        &mut bytes,
+        bytes,
         56,
         u32::try_from(chunks.len()).map_err(|_| FormatError::ArithmeticOverflow)?,
     );
@@ -1566,12 +1852,12 @@ fn encode_prehashed_zstd_record_from_payload(
             .ok_or(FormatError::ArithmeticOverflow)?;
         bytes[table_offset..table_offset + 32].copy_from_slice(&chunk.chunk_id.0);
         put_u32(
-            &mut bytes,
+            bytes,
             table_offset + 32,
             u32::try_from(decoded_offset).map_err(|_| FormatError::ArithmeticOverflow)?,
         );
         put_u32(
-            &mut bytes,
+            bytes,
             table_offset + 36,
             u32::try_from(chunk.bytes.len()).map_err(|_| FormatError::ArithmeticOverflow)?,
         );
@@ -1580,9 +1866,9 @@ fn encode_prehashed_zstd_record_from_payload(
             .ok_or(FormatError::ArithmeticOverflow)?;
     }
     bytes[payload_offset..payload_end].copy_from_slice(payload);
-    let checksum = crc32c::crc32c(&bytes);
-    put_u32(&mut bytes, RECORD_CRC_OFFSET, checksum);
-    Ok(bytes)
+    let checksum = crc32c::crc32c(bytes);
+    put_u32(bytes, RECORD_CRC_OFFSET, checksum);
+    Ok(())
 }
 
 fn compress_zstd_v1(decoded: &[u8], level: i32) -> Result<Vec<u8>, FormatError> {
@@ -1691,6 +1977,49 @@ impl AdaptiveEncoderV1 {
             Err(_) => Err(FormatError::ZstdFailure),
         }
     }
+
+    fn zstd_owned_payload(
+        &mut self,
+        decoded: &[u8],
+        level: i32,
+        payload_cap: usize,
+    ) -> Result<Option<Vec<u8>>, FormatError> {
+        if payload_cap == 0 {
+            return Ok(None);
+        }
+        self.zstd
+            .context_mut()
+            .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+            .map_err(|_| FormatError::ZstdFailure)?;
+        self.zstd
+            .set_compression_level(level)
+            .map_err(|_| FormatError::ZstdFailure)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(payload_cap)
+            .map_err(|_| FormatError::ArithmeticOverflow)?;
+        output.resize(payload_cap, 0);
+        match self
+            .zstd
+            .context_mut()
+            .compress2(output.as_mut_slice(), decoded)
+        {
+            Ok(written) => {
+                assert!(
+                    written <= payload_cap,
+                    "ASSERT: bounded Zstd cannot exceed its owned destination"
+                );
+                output.truncate(written);
+                Ok(Some(output))
+            }
+            Err(error)
+                if zstd::zstd_safe::get_error_name(error) == "Destination buffer is too small" =>
+            {
+                Ok(None)
+            }
+            Err(_) => Err(FormatError::ZstdFailure),
+        }
+    }
 }
 
 fn zstd_record_wins(raw_bytes: usize, zstd_bytes: usize) -> Result<bool, FormatError> {
@@ -1707,6 +2036,19 @@ fn zstd_record_wins(raw_bytes: usize, zstd_bytes: usize) -> Result<bool, FormatE
 
 #[allow(clippy::too_many_lines)]
 fn decode_encoding_record(bytes: &[u8]) -> Result<DecodedEncodingRecord, FormatError> {
+    decode_encoding_record_mode(bytes, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_encoding_record(bytes: &[u8]) -> Result<DecodedEncodingRecord, FormatError> {
+    decode_encoding_record_mode(bytes, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn decode_encoding_record_mode(
+    bytes: &[u8],
+    retain_payloads: bool,
+) -> Result<DecodedEncodingRecord, FormatError> {
     if bytes.len() < MIN_RAW_RECORD_BYTES
         || bytes.len() > MAX_RECORD_BYTES
         || !bytes.len().is_multiple_of(usize::from(RECORD_ALIGNMENT))
@@ -1738,10 +2080,21 @@ fn decode_encoding_record(bytes: &[u8]) -> Result<DecodedEncodingRecord, FormatE
         return Err(FormatError::InvalidZstdRecord);
     }
     if get_u16(bytes, 12) == RAW_CODEC {
-        let record = RawRecord::decode(bytes)?;
+        let (chunk_id, payload) = decode_raw_record_view(bytes)?;
+        let logical_bytes =
+            u64::try_from(payload.len()).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let chunks = if retain_payloads {
+            vec![RawRecord {
+                chunk_id,
+                payload: payload.to_vec(),
+            }]
+        } else {
+            Vec::new()
+        };
         return Ok(DecodedEncodingRecord {
             codec: EncodingCodec::Raw,
-            chunks: vec![record],
+            chunks,
+            logical_bytes,
         });
     }
     if get_u16(bytes, 12) != ZSTD_CODEC
@@ -1826,14 +2179,19 @@ fn decode_encoding_record(bytes: &[u8]) -> Result<DecodedEncodingRecord, FormatE
         {
             return Err(FormatError::InvalidZstdRecord);
         }
-        let payload = decoded[decoded_offset..decoded_end].to_vec();
         let mut stored_id = [0_u8; 32];
         stored_id.copy_from_slice(&bytes[table_offset..table_offset + 32]);
-        let chunk_id = ChunkId::of(&payload);
+        let payload = &decoded[decoded_offset..decoded_end];
+        let chunk_id = ChunkId::of(payload);
         if chunk_id.0 != stored_id {
             return Err(FormatError::ChunkHashMismatch);
         }
-        chunks.push(RawRecord { chunk_id, payload });
+        if retain_payloads {
+            chunks.push(RawRecord {
+                chunk_id,
+                payload: payload.to_vec(),
+            });
+        }
         expected_decoded_offset = decoded_end;
     }
     if expected_decoded_offset != decoded_length {
@@ -1842,6 +2200,8 @@ fn decode_encoding_record(bytes: &[u8]) -> Result<DecodedEncodingRecord, FormatE
     Ok(DecodedEncodingRecord {
         codec: EncodingCodec::Zstd,
         chunks,
+        logical_bytes: u64::try_from(decoded_length)
+            .map_err(|_| FormatError::ArithmeticOverflow)?,
     })
 }
 
@@ -1862,32 +2222,9 @@ impl RawRecord {
     }
 
     fn encode_prehashed(chunk: PrehashedChunk<'_>) -> Result<Vec<u8>, FormatError> {
-        let payload = chunk.bytes;
-        let record_length = raw_record_length(payload.len())?;
-        let record_length_u32 =
-            u32::try_from(record_length).map_err(|_| FormatError::ArithmeticOverflow)?;
-        let payload_length_u32 =
-            u32::try_from(payload.len()).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let record_length = raw_record_length(chunk.bytes.len())?;
         let mut bytes = vec![0_u8; record_length];
-        bytes[0..8].copy_from_slice(RECORD_MAGIC);
-        put_u16(&mut bytes, 8, FORMAT_VERSION);
-        put_u16(&mut bytes, 10, RECORD_HEADER_BYTES_U16);
-        put_u16(&mut bytes, 12, RAW_CODEC);
-        put_u16(&mut bytes, 14, 0);
-        put_u32(&mut bytes, 32, record_length_u32);
-        put_u32(&mut bytes, 36, payload_length_u32);
-        put_u32(&mut bytes, 40, RAW_PAYLOAD_OFFSET_U32);
-        put_u32(&mut bytes, 44, payload_length_u32);
-        put_u32(&mut bytes, 48, RECORD_HEADER_BYTES_U32);
-        put_u16(&mut bytes, 52, CHUNK_TABLE_ENTRY_BYTES_U16);
-        put_u32(&mut bytes, 56, 1);
-
-        bytes[128..160].copy_from_slice(&chunk.chunk_id.0);
-        put_u32(&mut bytes, 160, 0);
-        put_u32(&mut bytes, 164, payload_length_u32);
-        bytes[RAW_PAYLOAD_OFFSET..RAW_PAYLOAD_OFFSET + payload.len()].copy_from_slice(payload);
-        let checksum = crc32c::crc32c(&bytes);
-        put_u32(&mut bytes, RECORD_CRC_OFFSET, checksum);
+        encode_prehashed_raw_record_into(chunk, &mut bytes)?;
         Ok(bytes)
     }
 
@@ -1897,56 +2234,11 @@ impl RawRecord {
     ///
     /// Returns a structural, checksum, or logical Chunk-ID integrity error.
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
-        if bytes.len() < MIN_RAW_RECORD_BYTES
-            || bytes.len() > MAX_RECORD_BYTES
-            || !bytes.len().is_multiple_of(usize::from(RECORD_ALIGNMENT))
-        {
-            return Err(FormatError::InvalidRecordLength(bytes.len()));
-        }
-        if &bytes[0..8] != RECORD_MAGIC {
-            return Err(FormatError::InvalidRecordMagic);
-        }
-        let declared_length =
-            usize::try_from(get_u32(bytes, 32)).map_err(|_| FormatError::ArithmeticOverflow)?;
-        if declared_length != bytes.len() {
-            return Err(FormatError::InvalidRecordLength(declared_length));
-        }
-        let stored_checksum = get_u32(bytes, RECORD_CRC_OFFSET);
-        let mut checksummed = bytes.to_vec();
-        checksummed[RECORD_CRC_OFFSET..RECORD_CRC_OFFSET + 4].fill(0);
-        if crc32c::crc32c(&checksummed) != stored_checksum {
-            return Err(FormatError::RecordChecksumMismatch);
-        }
-        validate_raw_record_constants(bytes)?;
-
-        let decoded_length =
-            usize::try_from(get_u32(bytes, 36)).map_err(|_| FormatError::ArithmeticOverflow)?;
-        validate_logical_chunk_length(decoded_length)?;
-        let payload_length =
-            usize::try_from(get_u32(bytes, 44)).map_err(|_| FormatError::ArithmeticOverflow)?;
-        let logical_length =
-            usize::try_from(get_u32(bytes, 164)).map_err(|_| FormatError::ArithmeticOverflow)?;
-        if payload_length != decoded_length || logical_length != decoded_length {
-            return Err(FormatError::InvalidRawRecord);
-        }
-        let payload_end = RAW_PAYLOAD_OFFSET
-            .checked_add(payload_length)
-            .ok_or(FormatError::ArithmeticOverflow)?;
-        let expected_record_length = align_up_usize(payload_end, usize::from(RECORD_ALIGNMENT))?;
-        if expected_record_length != bytes.len()
-            || bytes[payload_end..].iter().any(|byte| *byte != 0)
-        {
-            return Err(FormatError::InvalidRawRecord);
-        }
-
-        let mut stored_id = [0_u8; 32];
-        stored_id.copy_from_slice(&bytes[128..160]);
-        let payload = bytes[RAW_PAYLOAD_OFFSET..payload_end].to_vec();
-        let chunk_id = ChunkId::of(&payload);
-        if chunk_id.0 != stored_id {
-            return Err(FormatError::ChunkHashMismatch);
-        }
-        Ok(Self { chunk_id, payload })
+        let (chunk_id, payload) = decode_raw_record_view(bytes)?;
+        Ok(Self {
+            chunk_id,
+            payload: payload.to_vec(),
+        })
     }
 
     #[must_use]
@@ -1958,6 +2250,91 @@ impl RawRecord {
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
+}
+
+fn encode_prehashed_raw_record_into(
+    chunk: PrehashedChunk<'_>,
+    bytes: &mut [u8],
+) -> Result<(), FormatError> {
+    let payload = chunk.bytes;
+    let record_length = raw_record_length(payload.len())?;
+    if bytes.len() != record_length {
+        return Err(FormatError::InvalidRecordLength(bytes.len()));
+    }
+    bytes.fill(0);
+    let record_length_u32 =
+        u32::try_from(record_length).map_err(|_| FormatError::ArithmeticOverflow)?;
+    let payload_length_u32 =
+        u32::try_from(payload.len()).map_err(|_| FormatError::ArithmeticOverflow)?;
+    bytes[0..8].copy_from_slice(RECORD_MAGIC);
+    put_u16(bytes, 8, FORMAT_VERSION);
+    put_u16(bytes, 10, RECORD_HEADER_BYTES_U16);
+    put_u16(bytes, 12, RAW_CODEC);
+    put_u16(bytes, 14, 0);
+    put_u32(bytes, 32, record_length_u32);
+    put_u32(bytes, 36, payload_length_u32);
+    put_u32(bytes, 40, RAW_PAYLOAD_OFFSET_U32);
+    put_u32(bytes, 44, payload_length_u32);
+    put_u32(bytes, 48, RECORD_HEADER_BYTES_U32);
+    put_u16(bytes, 52, CHUNK_TABLE_ENTRY_BYTES_U16);
+    put_u32(bytes, 56, 1);
+
+    bytes[128..160].copy_from_slice(&chunk.chunk_id.0);
+    put_u32(bytes, 160, 0);
+    put_u32(bytes, 164, payload_length_u32);
+    bytes[RAW_PAYLOAD_OFFSET..RAW_PAYLOAD_OFFSET + payload.len()].copy_from_slice(payload);
+    let checksum = crc32c::crc32c(bytes);
+    put_u32(bytes, RECORD_CRC_OFFSET, checksum);
+    Ok(())
+}
+
+fn decode_raw_record_view(bytes: &[u8]) -> Result<(ChunkId, &[u8]), FormatError> {
+    if bytes.len() < MIN_RAW_RECORD_BYTES
+        || bytes.len() > MAX_RECORD_BYTES
+        || !bytes.len().is_multiple_of(usize::from(RECORD_ALIGNMENT))
+    {
+        return Err(FormatError::InvalidRecordLength(bytes.len()));
+    }
+    if &bytes[0..8] != RECORD_MAGIC {
+        return Err(FormatError::InvalidRecordMagic);
+    }
+    let declared_length =
+        usize::try_from(get_u32(bytes, 32)).map_err(|_| FormatError::ArithmeticOverflow)?;
+    if declared_length != bytes.len() {
+        return Err(FormatError::InvalidRecordLength(declared_length));
+    }
+    let stored_checksum = get_u32(bytes, RECORD_CRC_OFFSET);
+    if crc32c_with_zeroed_u32(bytes, RECORD_CRC_OFFSET) != stored_checksum {
+        return Err(FormatError::RecordChecksumMismatch);
+    }
+    validate_raw_record_constants(bytes)?;
+
+    let decoded_length =
+        usize::try_from(get_u32(bytes, 36)).map_err(|_| FormatError::ArithmeticOverflow)?;
+    validate_logical_chunk_length(decoded_length)?;
+    let payload_length =
+        usize::try_from(get_u32(bytes, 44)).map_err(|_| FormatError::ArithmeticOverflow)?;
+    let logical_length =
+        usize::try_from(get_u32(bytes, 164)).map_err(|_| FormatError::ArithmeticOverflow)?;
+    if payload_length != decoded_length || logical_length != decoded_length {
+        return Err(FormatError::InvalidRawRecord);
+    }
+    let payload_end = RAW_PAYLOAD_OFFSET
+        .checked_add(payload_length)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let expected_record_length = align_up_usize(payload_end, usize::from(RECORD_ALIGNMENT))?;
+    if expected_record_length != bytes.len() || bytes[payload_end..].iter().any(|byte| *byte != 0) {
+        return Err(FormatError::InvalidRawRecord);
+    }
+
+    let mut stored_id = [0_u8; 32];
+    stored_id.copy_from_slice(&bytes[128..160]);
+    let payload = &bytes[RAW_PAYLOAD_OFFSET..payload_end];
+    let chunk_id = ChunkId::of(payload);
+    if chunk_id.0 != stored_id {
+        return Err(FormatError::ChunkHashMismatch);
+    }
+    Ok((chunk_id, payload))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2058,10 +2435,7 @@ impl ContainerHeader {
             return Err(FormatError::InvalidHeaderMagic);
         }
         let stored_checksum = get_u32(bytes, HEADER_CRC_OFFSET);
-        let mut checksummed = [0_u8; HEADER_BYTES];
-        checksummed.copy_from_slice(bytes);
-        checksummed[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].fill(0);
-        if crc32c::crc32c(&checksummed) != stored_checksum {
+        if crc32c_with_zeroed_u32(bytes, HEADER_CRC_OFFSET) != stored_checksum {
             return Err(FormatError::HeaderChecksumMismatch);
         }
         if get_u16(bytes, 12) == 1 {
@@ -2372,9 +2746,7 @@ fn calculate_container_hash(
 }
 
 fn crc32c_with_zeroed_field(bytes: &[u8], field_offset: usize) -> u32 {
-    let mut checksummed = bytes.to_vec();
-    checksummed[field_offset..field_offset + 4].fill(0);
-    crc32c::crc32c(&checksummed)
+    crc32c_with_zeroed_u32(bytes, field_offset)
 }
 
 fn validate_logical_chunk_length(length: usize) -> Result<(), FormatError> {
@@ -2394,6 +2766,115 @@ fn raw_record_length(payload_length: usize) -> Result<usize, FormatError> {
         return Err(FormatError::InvalidRecordLength(record_length));
     }
     Ok(record_length)
+}
+
+fn adaptive_container_layout(
+    records: &[AdaptiveRecordPlan<'_>],
+) -> Result<ContainerLayout, FormatError> {
+    if records.is_empty() {
+        return Err(FormatError::InvalidContainerLayout);
+    }
+    let record_count = u32::try_from(records.len()).map_err(|_| FormatError::ArithmeticOverflow)?;
+    let mut chunk_entry_count = 0_u32;
+    let mut index_offset =
+        u64::try_from(HEADER_BYTES).map_err(|_| FormatError::ArithmeticOverflow)?;
+    for record in records {
+        chunk_entry_count = chunk_entry_count
+            .checked_add(
+                u32::try_from(record.chunk_count()).map_err(|_| FormatError::ArithmeticOverflow)?,
+            )
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        index_offset = index_offset
+            .checked_add(
+                u64::try_from(record.record_length()?)
+                    .map_err(|_| FormatError::ArithmeticOverflow)?,
+            )
+            .ok_or(FormatError::ArithmeticOverflow)?;
+    }
+    let index_length = INDEX_HEADER_BYTES
+        .checked_add(
+            u64::from(chunk_entry_count)
+                .checked_mul(INDEX_ENTRY_BYTES)
+                .ok_or(FormatError::ArithmeticOverflow)?,
+        )
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let footer_offset = align_up(
+        index_offset
+            .checked_add(index_length)
+            .ok_or(FormatError::ArithmeticOverflow)?,
+        FOOTER_BYTES,
+    )?;
+    let file_length = footer_offset
+        .checked_add(FOOTER_BYTES)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let layout = ContainerLayout {
+        record_count,
+        chunk_entry_count,
+        index_offset,
+        index_length,
+        footer_offset,
+        file_length,
+    };
+    validate_layout(layout)?;
+    Ok(layout)
+}
+
+fn encode_container_from_adaptive_plans(
+    container_id: ContainerId,
+    container_generation: u64,
+    records: Vec<AdaptiveRecordPlan<'_>>,
+    permitted_hash_workers: NonZeroUsize,
+) -> Result<Vec<u8>, FormatError> {
+    let layout = adaptive_container_layout(&records)?;
+    let header = ContainerHeader::sealed(container_id, container_generation, layout)?;
+    let file_length =
+        usize::try_from(layout.file_length).map_err(|_| FormatError::ArithmeticOverflow)?;
+    let footer_offset =
+        usize::try_from(layout.footer_offset).map_err(|_| FormatError::ArithmeticOverflow)?;
+    let entry_capacity =
+        usize::try_from(layout.chunk_entry_count).map_err(|_| FormatError::ArithmeticOverflow)?;
+    let mut index_entries = Vec::new();
+    index_entries
+        .try_reserve_exact(entry_capacity)
+        .map_err(|_| FormatError::ArithmeticOverflow)?;
+    let mut container = vec![0_u8; file_length];
+    container[..HEADER_BYTES].copy_from_slice(&header.encode());
+    let mut cursor = HEADER_BYTES;
+    for record in records {
+        let record_length = record.record_length()?;
+        let end = cursor
+            .checked_add(record_length)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        record.encode_into(&mut container[cursor..end])?;
+        index_entries.extend(IndexEntry::from_encoded_record(
+            &container[cursor..end],
+            u64::try_from(cursor).map_err(|_| FormatError::ArithmeticOverflow)?,
+        )?);
+        cursor = end;
+    }
+    assert_eq!(
+        u64::try_from(cursor),
+        Ok(layout.index_offset),
+        "ASSERT: adaptive record plans exactly fill the record region"
+    );
+    index_entries.sort_unstable();
+    let index = encode_index(&index_entries)?;
+    assert_eq!(u64::try_from(index.len()), Ok(layout.index_length));
+    let index_end = cursor
+        .checked_add(index.len())
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    container[cursor..index_end].copy_from_slice(&index);
+    encode_footer(&mut container[footer_offset..], &header);
+    let hash = calculate_container_hash(&container, footer_offset, permitted_hash_workers);
+    container[footer_offset + FOOTER_HASH_OFFSET..footer_offset + FOOTER_HASH_OFFSET + 32]
+        .copy_from_slice(&hash);
+    let footer_checksum = crc32c_with_zeroed_field(&container[footer_offset..], FOOTER_CRC_OFFSET);
+    put_u32(
+        &mut container[footer_offset..],
+        FOOTER_CRC_OFFSET,
+        footer_checksum,
+    );
+    Ok(container)
 }
 
 fn encoded_container_layout(records: &[Vec<u8>]) -> Result<ContainerLayout, FormatError> {
@@ -2485,6 +2966,7 @@ fn encode_container_from_records(
         let end = cursor
             .checked_add(record.len())
             .ok_or(FormatError::ArithmeticOverflow)?;
+        record_copy(CopyClass::ContainerAssembly, record.len());
         container[cursor..end].copy_from_slice(&record);
         cursor = end;
     }

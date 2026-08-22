@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use fastdup_format::{ContainerId, SealedContainer};
+use fastdup_format::{ContainerId, SealedContainer, VerifiedContainerPublication};
 use fastdup_store::StoreError;
 
 use super::{Counters, verify_owned_reread};
@@ -35,7 +35,7 @@ impl VerificationRequest {
 
 pub(super) struct VerificationResult {
     ordinal: usize,
-    verified: Result<SealedContainer, StoreError>,
+    verified: Result<VerifiedContainerPublication, StoreError>,
 }
 
 impl VerificationResult {
@@ -43,7 +43,7 @@ impl VerificationResult {
         self.ordinal
     }
 
-    pub(super) fn into_verified(self) -> Result<SealedContainer, StoreError> {
+    pub(super) fn into_verified(self) -> Result<VerifiedContainerPublication, StoreError> {
         self.verified
     }
 }
