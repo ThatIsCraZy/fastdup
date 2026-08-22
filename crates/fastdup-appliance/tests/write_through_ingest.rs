@@ -132,7 +132,7 @@ fn one_stream_chunks_a_second_container_while_the_first_waits_for_durability() {
 
     assert!(
         completed_while_paused,
-        "same-inode FastCDC must advance beyond one blocked Container publication: {status:?}"
+        "same-inode SeqCDC must advance beyond one blocked Container publication: {status:?}"
     );
     assert_eq!(live_tail.len(), 4_096);
     assert_eq!(
@@ -516,7 +516,7 @@ fn sequential_writes_publish_reduced_data_before_the_namespace_commit() {
     assert_eq!(staged.sealed_uncommitted_containers(), 1);
     assert!(
         staged.buffered_bytes() <= 32 * 1_024 * 1_024 + 256 * 1_024,
-        "the next Container plus one FastCDC tail is the hard staging bound: {staged:?}"
+        "the next Container plus one SeqCDC tail is the hard staging bound: {staged:?}"
     );
     assert!(
         appliance.namespace().checkpointable_dirty_payload_bytes() < 4 * 1_024 * 1_024,
@@ -535,7 +535,7 @@ fn sequential_writes_publish_reduced_data_before_the_namespace_commit() {
     );
     assert!(
         committed.metrics().checkpoint_rechunk_bytes() <= 4 * 1_024 * 1_024,
-        "only the incomplete FastCDC tail may be re-read and rechunked"
+        "only the incomplete SeqCDC tail may be re-read and rechunked"
     );
     assert_eq!(
         appliance

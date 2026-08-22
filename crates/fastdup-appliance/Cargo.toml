@@ -11,7 +11,6 @@ fastdup-format.workspace = true
 fastdup-io-uring = { path = "../fastdup-io-uring" }
 fastdup-posix.workspace = true
 fastdup-store.workspace = true
-fastcdc.workspace = true
 fuse3.workspace = true
 hashbrown.workspace = true
 rayon.workspace = true
@@ -19,6 +18,7 @@ rustix.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+fastcdc.workspace = true
 fastdup-testkit = { path = "../fastdup-testkit" }
 
 [lints]

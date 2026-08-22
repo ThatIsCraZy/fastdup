@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Durable container lifecycle behind an injectable storage boundary.
 
@@ -17,6 +17,7 @@ mod reduction_codec;
 mod reduction_dictionary;
 mod reduction_filter;
 mod reduction_similarity;
+mod seqcdc;
 
 pub use container_descriptor_cache::ContainerDescriptorCacheStatus;
 pub use exact_index_repository::{
@@ -51,6 +52,7 @@ pub use reduction_filter::{
     BlockedBloomHint, BloomLookupHint, HintStructureError, PerWorkerLocationHintCache,
     UnverifiedLocationHint,
 };
+pub use seqcdc::{SeqCdcConfig, seqcdc_cut, seqcdc_cut_scalar};
 
 use std::collections::BTreeMap;
 use std::fmt;

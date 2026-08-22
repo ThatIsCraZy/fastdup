@@ -216,6 +216,29 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
         status.hash_batches(),
         status.maximum_hash_workers(),
     );
+    emit_cpu_phase_state("write_through_hash_cpu", status.hash_cpu());
+    emit_cpu_phase_state("write_through_encode_cpu", status.encode_cpu());
+}
+
+fn emit_cpu_phase_state(label: &str, status: fastdup_appliance::CpuPhaseStatus) {
+    eprintln!(
+        concat!(
+            "{} phases={} active={} maximum_active={} runnable_wall_ns={} ",
+            "permit_blocked_phases={} permit_wait_ns={} maximum_permit_wait_ns={} ",
+            "requested_workers={} granted_workers={} partial_grants={}"
+        ),
+        label,
+        status.phases(),
+        status.active(),
+        status.maximum_active(),
+        status.runnable_wall_ns(),
+        status.permit_blocked_phases(),
+        status.permit_wait_ns(),
+        status.maximum_permit_wait_ns(),
+        status.requested_workers(),
+        status.granted_workers(),
+        status.partial_grants(),
+    );
 }
 
 fn emit_checkpoint_pressure(appliance: &FsAppliance, dirty_bytes: u64, running: bool) {
@@ -489,8 +512,8 @@ fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
         metrics.freeze().process_cpu().as_nanos(),
         metrics.manifest_plan().wall().as_nanos(),
         metrics.manifest_plan().process_cpu().as_nanos(),
-        metrics.fastcdc().wall().as_nanos(),
-        metrics.fastcdc().process_cpu().as_nanos(),
+        metrics.cdc().wall().as_nanos(),
+        metrics.cdc().process_cpu().as_nanos(),
         metrics.hash_and_fill().wall().as_nanos(),
         metrics.hash_and_fill().process_cpu().as_nanos(),
         metrics.exact_lookup().wall().as_nanos(),

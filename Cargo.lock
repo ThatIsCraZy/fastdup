@@ -232,7 +232,6 @@ name = "fastdup-store"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "fastcdc",
  "fastdup-format",
  "rayon",
  "rustix",

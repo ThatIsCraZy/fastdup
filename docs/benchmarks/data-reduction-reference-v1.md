@@ -11,14 +11,15 @@ manifests, replicas, and filesystem allocation are excluded unless stated.
 
 ## Implemented policy stages
 
-The versioned policy exposes RAW, FastCDC, Exact, Zstd, Compression Grouping,
+The versioned policy exposes RAW, SeqCDC, Exact, Zstd, Compression Grouping,
 Similarity, Depth-1 sparse-XOR Delta, and bounded Reorder independently.
 Constant-byte FILL detection is part of CDC preprocessing. An immutable
 BLAKE3-identified Zstd dictionary is an optional dependency of compression.
 
 The important v1 bounds are:
 
-- FastCDC `16 KiB / 64 KiB / 256 KiB`, v2020 Level 1, seed 0;
+- SeqCDC Increasing Mode, sequence length 6, opposing-slope skip trigger 50,
+  skip length 1024 bytes, `16 KiB / 64 KiB nominal / 256 KiB`;
 - Compression Regions at most 512 KiB;
 - Placement Windows 64 MiB;
 - 64 representatives per `(profile, slot, length, superfeature)` bucket;
@@ -160,7 +161,7 @@ Current tests cover:
 - deterministic worker decisions after Base ingest and accepted Delta work for
   1, 2, 4, and 8 workers;
 - eight deterministic differential seeds over every valid feature prefix;
-- FastCDC resynchronization after insertion and Exact suffix reuse;
+- SeqCDC resynchronization after insertion and Exact suffix reuse;
 - Zstd threshold/fallback, grouped region bounds, immutable dictionary
   identity and wrong-dictionary rejection;
 - FILL threshold/boundary cases;

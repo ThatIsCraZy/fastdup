@@ -4,11 +4,9 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::BitOr;
 
-use fastcdc::v2020::{FastCDC, Normalization};
 use fastdup_format::ChunkId;
 use rayon::prelude::*;
 
-use crate::ReductionDictionary;
 use crate::reduction_codec::{
     IndependentEncoding, PreparedDictionary, WorkerCodec, accept_zstd_v1,
 };
@@ -17,11 +15,15 @@ use crate::reduction_similarity::{
     IndependentBaseRef, SimilarityCandidate, SimilarityError, SimilarityFingerprint,
     SimilarityIndex, SparseXorDelta,
 };
+use crate::{ReductionDictionary, SeqCdcConfig, seqcdc_cut};
 
 const FIXED_CHUNK_BYTES: usize = 64 * 1_024;
 const CDC_MIN_BYTES: u32 = 16 * 1_024;
 const CDC_TARGET_BYTES: u32 = 64 * 1_024;
 const CDC_MAX_BYTES: u32 = 256 * 1_024;
+const SEQCDC_SEQUENCE_LENGTH: u16 = 6;
+const SEQCDC_SKIP_TRIGGER: u16 = 50;
+const SEQCDC_SKIP_BYTES: u32 = 1_024;
 const COMPRESSION_REGION_BYTES: u32 = 512 * 1_024;
 const PLACEMENT_WINDOW_BYTES: u32 = 64 * 1_024 * 1_024;
 const MAXIMUM_SIMILARITY_CANDIDATES: u8 = 16;
@@ -124,8 +126,8 @@ impl ReductionPolicy {
             ));
         }
 
-        let mut canonical = [0_u8; 32];
-        canonical[0..8].copy_from_slice(b"FDRPOL01");
+        let mut canonical = [0_u8; 40];
+        canonical[0..8].copy_from_slice(b"FDRSEQ01");
         canonical[8..10].copy_from_slice(&1_u16.to_le_bytes());
         canonical[10..12].copy_from_slice(&features.0.to_le_bytes());
         canonical[12..16].copy_from_slice(&CDC_MIN_BYTES.to_le_bytes());
@@ -134,7 +136,10 @@ impl ReductionPolicy {
         canonical[24..28].copy_from_slice(&COMPRESSION_REGION_BYTES.to_le_bytes());
         canonical[28] = MAXIMUM_SIMILARITY_CANDIDATES;
         canonical[29] = MAXIMUM_TRIAL_ENCODINGS;
-        canonical[30..32].copy_from_slice(&0_u16.to_le_bytes());
+        canonical[30..32].copy_from_slice(&SEQCDC_SEQUENCE_LENGTH.to_le_bytes());
+        canonical[32..34].copy_from_slice(&SEQCDC_SKIP_TRIGGER.to_le_bytes());
+        canonical[34..38].copy_from_slice(&SEQCDC_SKIP_BYTES.to_le_bytes());
+        canonical[38] = 1;
         Ok(Self {
             features,
             id: ChunkId::of(&canonical).bytes(),
@@ -974,41 +979,36 @@ impl ReductionEngine {
                 .collect();
         }
 
-        let chunker = FastCDC::with_level_and_seed(
-            input,
-            CDC_MIN_BYTES as usize,
-            CDC_TARGET_BYTES as usize,
-            CDC_MAX_BYTES as usize,
-            Normalization::Level1,
-            0,
-        );
+        let config = SeqCdcConfig {
+            sequence_length: SEQCDC_SEQUENCE_LENGTH,
+            skip_trigger: SEQCDC_SKIP_TRIGGER,
+            skip_bytes: SEQCDC_SKIP_BYTES as usize,
+            minimum_bytes: CDC_MIN_BYTES as usize,
+            maximum_bytes: CDC_MAX_BYTES as usize,
+        };
         let mut expected_offset = 0_usize;
-        let ranges = chunker
-            .map(|chunk| {
-                assert_eq!(
-                    chunk.offset, expected_offset,
-                    "ASSERT: FastCDC chunks must be contiguous"
-                );
-                assert!(chunk.length > 0, "ASSERT: FastCDC chunks are nonempty");
-                assert!(
-                    chunk.length <= CDC_MAX_BYTES as usize,
-                    "ASSERT: FastCDC exceeded the configured maximum"
-                );
-                expected_offset = chunk
-                    .offset
-                    .checked_add(chunk.length)
-                    .expect("ASSERT: FastCDC chunk end cannot overflow");
-                assert!(
-                    expected_offset <= input.len(),
-                    "ASSERT: FastCDC chunk lies outside the input"
-                );
-                (chunk.offset, chunk.length)
-            })
-            .collect::<Vec<_>>();
+        let mut ranges = Vec::new();
+        while expected_offset < input.len() {
+            let length = seqcdc_cut(&input[expected_offset..], config);
+            assert!(length > 0, "ASSERT: SeqCDC Chunks are nonempty");
+            assert!(
+                length <= CDC_MAX_BYTES as usize,
+                "ASSERT: SeqCDC exceeded the configured maximum"
+            );
+            let offset = expected_offset;
+            expected_offset = expected_offset
+                .checked_add(length)
+                .expect("ASSERT: SeqCDC Chunk end cannot overflow");
+            assert!(
+                expected_offset <= input.len(),
+                "ASSERT: SeqCDC Chunk lies outside the input"
+            );
+            ranges.push((offset, length));
+        }
         assert_eq!(
             expected_offset,
             input.len(),
-            "ASSERT: FastCDC must partition the complete input"
+            "ASSERT: SeqCDC must partition the complete input"
         );
         ranges
     }

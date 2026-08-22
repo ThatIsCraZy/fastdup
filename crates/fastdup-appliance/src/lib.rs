@@ -8,9 +8,9 @@ mod historical_proof_cache;
 mod proof_cache_trace;
 
 pub use checkpoint::{
-    CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, DurableNamespace,
-    DurableNamespaceError, GenerationProofSetStatus, ProfiledCheckpoint, WriteThroughStatus,
-    checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1,
+    CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, CpuPhaseStatus,
+    DurableNamespace, DurableNamespaceError, GenerationProofSetStatus, ProfiledCheckpoint,
+    WriteThroughStatus, checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1,
 };
 pub use checkpoint_trigger::{
     CONTAINER_COMMIT_COALESCE, CheckpointAction, CheckpointPressure, CheckpointTrigger,

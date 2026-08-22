@@ -5,11 +5,10 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
-use fastcdc::v2020::{FastCDC, MASKS, Normalization, StreamCDC, get_gear_with_seed};
 use fastdup_copy_metrics::{CopyClass, record_copy};
 use fastdup_format::{
     ChunkId, CommitRecord, ContainerId, DurableInode, ExactIndexEntry, ExactIndexProfileId,
@@ -27,8 +26,9 @@ use fastdup_store::{
     ContainerRepository, ExactIndexPageCacheStatus, ExactIndexRunRepository,
     ExactRunMembershipStatus, GenerationError, GenerationRepository, IndexedRequiredChunkVerifier,
     ManifestReadError, ManifestSuccessorProof, ManifestTreeSummary, RequiredChunkVerifier,
-    StorageIo, StoreError, SuccessorPredecessor, VerifiedCommittedFile, VerifiedManifestFile,
-    VerifiedReadCache, VerifiedReadCacheError, VerifiedReadCacheStatus,
+    SeqCdcConfig, StorageIo, StoreError, SuccessorPredecessor, VerifiedCommittedFile,
+    VerifiedManifestFile, VerifiedReadCache, VerifiedReadCacheError, VerifiedReadCacheStatus,
+    seqcdc_cut, seqcdc_cut_scalar,
 };
 use rayon::prelude::*;
 
@@ -44,8 +44,14 @@ const CONTAINER_PAYLOAD_TARGET_BYTES: usize = 32 * 1_024 * 1_024;
 const CONTAINER_PAYLOAD_FLUSH_BYTES: usize = CONTAINER_PAYLOAD_TARGET_BYTES - CDC_MAXIMUM_BYTES;
 const COMPRESSION_REGION_TARGET_BYTES: usize = 512 * 1_024;
 const CDC_MINIMUM_BYTES: usize = 16 * 1_024;
-const CDC_TARGET_BYTES: usize = 64 * 1_024;
 const CDC_MAXIMUM_BYTES: usize = 256 * 1_024;
+const SEQCDC_CONFIG_V1: SeqCdcConfig = SeqCdcConfig {
+    sequence_length: 6,
+    skip_trigger: 50,
+    skip_bytes: 1_024,
+    minimum_bytes: CDC_MINIMUM_BYTES,
+    maximum_bytes: CDC_MAXIMUM_BYTES,
+};
 const MAX_CHUNK_FRAGMENTS_V1: usize = 1_024;
 type RetainedManifestRanges = BTreeMap<u64, BTreeMap<MetadataObjectId, Vec<Range<u64>>>>;
 type AdaptiveCommitFinish = (
@@ -53,11 +59,10 @@ type AdaptiveCommitFinish = (
     CheckpointReductionMetrics,
     RetainedManifestRanges,
 );
-const CDC_SEED_V1: u64 = 0;
 const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
 const EXACT_PUBLICATION_QUEUE_BATCHES: usize = 8;
 const MAX_RECENT_EXACT_LOCATIONS: usize = 8_192;
-// Combined Active and Frozen 512-MiB generations at FastCDC-v1's 16-KiB minimum.
+// Combined Active and Frozen 512-MiB generations at SeqCDC-v1's 16-KiB minimum.
 const MAX_ONLINE_DEPENDENCY_PROOFS_V1: usize = 65_536;
 const ACCOUNTED_GENERATION_PROOF_BYTES: usize = 256;
 const WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1: usize = 384 * 1_024 * 1_024;
@@ -84,6 +89,78 @@ const _: () = assert!(
 /// backpressure until durable progress catches up.
 pub const CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1: u64 = 8 * fastdup_format::MAX_CONTAINER_BYTES;
 
+/// Cumulative scheduler evidence for one write-through CPU phase.
+///
+/// Runnable wall time starts after permit acquisition and ends after the CPU
+/// work. `permit_wait_ns` includes uncontended lock acquisition, while
+/// `permit_blocked_phases` counts phases that actually waited on the permit
+/// condition variable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CpuPhaseStatus {
+    phases: u64,
+    active: u64,
+    maximum_active: u64,
+    runnable_wall_ns: u64,
+    permit_blocked_phases: u64,
+    permit_wait_ns: u64,
+    maximum_permit_wait_ns: u64,
+    requested_workers: u64,
+    granted_workers: u64,
+    partial_grants: u64,
+}
+
+impl CpuPhaseStatus {
+    #[must_use]
+    pub const fn phases(self) -> u64 {
+        self.phases
+    }
+
+    #[must_use]
+    pub const fn active(self) -> u64 {
+        self.active
+    }
+
+    #[must_use]
+    pub const fn maximum_active(self) -> u64 {
+        self.maximum_active
+    }
+
+    #[must_use]
+    pub const fn runnable_wall_ns(self) -> u64 {
+        self.runnable_wall_ns
+    }
+
+    #[must_use]
+    pub const fn permit_blocked_phases(self) -> u64 {
+        self.permit_blocked_phases
+    }
+
+    #[must_use]
+    pub const fn permit_wait_ns(self) -> u64 {
+        self.permit_wait_ns
+    }
+
+    #[must_use]
+    pub const fn maximum_permit_wait_ns(self) -> u64 {
+        self.maximum_permit_wait_ns
+    }
+
+    #[must_use]
+    pub const fn requested_workers(self) -> u64 {
+        self.requested_workers
+    }
+
+    #[must_use]
+    pub const fn granted_workers(self) -> u64 {
+        self.granted_workers
+    }
+
+    #[must_use]
+    pub const fn partial_grants(self) -> u64 {
+        self.partial_grants
+    }
+}
+
 /// Bounded process-local state of the pre-commit reduction pipeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteThroughStatus {
@@ -94,6 +171,8 @@ pub struct WriteThroughStatus {
     oldest_sealed_age: Option<Duration>,
     hash_batches: u64,
     maximum_hash_workers: u64,
+    hash_cpu: CpuPhaseStatus,
+    encode_cpu: CpuPhaseStatus,
     degraded: bool,
 }
 
@@ -134,6 +213,16 @@ impl WriteThroughStatus {
     }
 
     #[must_use]
+    pub const fn hash_cpu(self) -> CpuPhaseStatus {
+        self.hash_cpu
+    }
+
+    #[must_use]
+    pub const fn encode_cpu(self) -> CpuPhaseStatus {
+        self.encode_cpu
+    }
+
+    #[must_use]
     pub const fn degraded(self) -> bool {
         self.degraded
     }
@@ -170,7 +259,7 @@ impl CheckpointPhaseMetrics {
 
 /// Per-checkpoint data-reduction and durability measurements.
 ///
-/// Nested `manifest_plan` contains `FastCDC`, hash/FILL, Exact lookup, encoding,
+/// Nested `manifest_plan` contains CDC, hash/FILL, Exact lookup, encoding,
 /// and Container publication. The leaf phases may be summed; callers must not
 /// add the parent to them. Process CPU includes all process threads active in
 /// the phase, including compression workers and concurrent FUSE request work.
@@ -179,7 +268,7 @@ pub struct CheckpointMetrics {
     total: CheckpointPhaseMetrics,
     freeze: CheckpointPhaseMetrics,
     manifest_plan: CheckpointPhaseMetrics,
-    fastcdc: CheckpointPhaseMetrics,
+    cdc: CheckpointPhaseMetrics,
     hash_and_fill: CheckpointPhaseMetrics,
     exact_lookup: CheckpointPhaseMetrics,
     compression_encode: CheckpointPhaseMetrics,
@@ -219,7 +308,7 @@ impl CheckpointMetrics {
     phase_getter!(total);
     phase_getter!(freeze);
     phase_getter!(manifest_plan);
-    phase_getter!(fastcdc);
+    phase_getter!(cdc);
     phase_getter!(hash_and_fill);
     phase_getter!(exact_lookup);
     phase_getter!(compression_encode);
@@ -318,7 +407,7 @@ impl CheckpointMetrics {
     }
 
     fn merge_reduction(&mut self, reduction: &CheckpointReductionMetrics) {
-        self.fastcdc = reduction.fastcdc;
+        self.cdc = reduction.cdc;
         self.hash_and_fill = reduction.hash_and_fill;
         self.exact_lookup = reduction.exact_lookup;
         self.compression_encode = reduction.compression_encode;
@@ -364,7 +453,7 @@ impl ProfiledCheckpoint {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CheckpointReductionMetrics {
-    fastcdc: CheckpointPhaseMetrics,
+    cdc: CheckpointPhaseMetrics,
     hash_and_fill: CheckpointPhaseMetrics,
     exact_lookup: CheckpointPhaseMetrics,
     compression_encode: CheckpointPhaseMetrics,
@@ -414,7 +503,7 @@ impl PhaseStarted {
 /// Returns the immutable identity of the currently implemented durable
 /// checkpoint writer policy.
 ///
-/// The canonical bytes pin FastCDC-v1, region sizing, adaptive Zstd thresholds,
+/// The canonical bytes pin SeqCDC-v1, region sizing, adaptive Zstd thresholds,
 /// and automatic level-zero Exact-Index publication. Changing any decision
 /// requires a new canonical policy string rather than silently reusing this ID.
 ///
@@ -426,7 +515,7 @@ impl PhaseStarted {
 pub fn checkpoint_policy_set_v1() -> PolicySetId {
     PolicySetId::new(
         ChunkId::of(
-            b"fastdup/checkpoint-policy-v1/FastCDC=16384:65536:262144:norm1:seed0:append-tail-anchor-v1/region=524288/Zstd=level3:min4096:min3pct/exact=l0-runs-v2:fanin4:partition262144/proof=installed-successor-delta-v1",
+            b"fastdup/checkpoint-policy-v1/SeqCDC=increasing:seq6:skip-trigger50:skip1024:min16384:max262144:append-tail-anchor-v1/region=524288/Zstd=level3:min4096:min3pct/exact=l0-runs-v2:fanin4:partition262144/proof=installed-successor-delta-v1",
         )
         .bytes(),
     )
@@ -914,7 +1003,7 @@ struct ChunkFragments {
 
 impl ChunkFragments {
     fn new(parts: Vec<MutationPayload>, length: usize) -> Self {
-        assert!(length != 0, "ASSERT: a FastCDC Chunk is nonempty");
+        assert!(length != 0, "ASSERT: a SeqCDC Chunk is nonempty");
         let actual = parts.iter().fold(0_usize, |total, part| {
             assert!(!part.is_empty(), "ASSERT: Chunk fragments are nonempty");
             total
@@ -1155,62 +1244,77 @@ impl<'a> SegmentByteCursor<'a> {
             let segment = self
                 .segments
                 .get(self.next_segment_index)
-                .expect("ASSERT: FastCDC byte cursor stays inside its Tail");
+                .expect("ASSERT: SeqCDC byte cursor stays inside its Tail");
+            self.current = segment.as_bytes();
+            self.next_segment_index += 1;
+        }
+    }
+
+    fn skip(&mut self, mut length: usize) {
+        while length != 0 {
+            if length < self.current.len() {
+                self.current = &self.current[length..];
+                return;
+            }
+            length -= self.current.len();
+            let segment = self
+                .segments
+                .get(self.next_segment_index)
+                .expect("ASSERT: byte cursor skip stays inside its Tail");
             self.current = segment.as_bytes();
             self.next_segment_index += 1;
         }
     }
 }
 
-fn segmented_fastcdc_cut(tail: &SegmentedIngestTail) -> usize {
+fn seqcdc_force_scalar() -> bool {
+    static FORCE_SCALAR: OnceLock<bool> = OnceLock::new();
+    *FORCE_SCALAR.get_or_init(|| {
+        std::env::var("FASTDUP_SEQCDC_FORCE_SCALAR").is_ok_and(|value| value == "1")
+    })
+}
+
+fn segmented_seqcdc_cut(tail: &SegmentedIngestTail) -> usize {
     assert!(
         tail.len() > CDC_MAXIMUM_BYTES,
-        "ASSERT: stable FastCDC scan owns more than one maximum Chunk"
+        "ASSERT: stable SeqCDC scan owns more than one maximum Chunk"
     );
-    assert!(
-        CDC_TARGET_BYTES.is_power_of_two(),
-        "ASSERT: v1 FastCDC target has an exact base-two mask"
-    );
-    let normalization = Normalization::Level1.bits();
-    let bits = CDC_TARGET_BYTES.ilog2();
-    let mask_s = MASKS
-        [usize::try_from(bits + normalization).expect("ASSERT: FastCDC mask index fits usize")];
-    let mask_l = MASKS
-        [usize::try_from(bits - normalization).expect("ASSERT: FastCDC mask index fits usize")];
-    let small_mask_left_shifted = mask_s << 1;
-    let large_mask_left_shifted = mask_l << 1;
-    let (gear, gear_ls) = get_gear_with_seed(CDC_SEED_V1);
-    let mut cursor = SegmentByteCursor::at(&tail.segments, CDC_MINIMUM_BYTES);
-    let mut index = CDC_MINIMUM_BYTES / 2;
-    let mut hash = 0_u64;
-    while index < CDC_TARGET_BYTES / 2 {
-        let offset = index * 2;
-        hash = (hash << 2).wrapping_add(gear_ls[usize::from(cursor.next())]);
-        if (hash & small_mask_left_shifted) == 0 {
-            return offset;
+    let mut cursor = SegmentByteCursor::at(&tail.segments, CDC_MINIMUM_BYTES - 1);
+    let mut previous = cursor.next();
+    let mut position = CDC_MINIMUM_BYTES;
+    let mut opposing_slopes = 0_u16;
+    let mut sequence_length = 0_u16;
+    while position < CDC_MAXIMUM_BYTES {
+        let current = cursor.next();
+        position += 1;
+        if current == previous {
+            previous = current;
+            continue;
         }
-        hash = hash.wrapping_add(gear[usize::from(cursor.next())]);
-        if (hash & mask_s) == 0 {
-            return offset + 1;
+        if current < previous {
+            opposing_slopes += 1;
+            sequence_length = 0;
+        } else {
+            sequence_length += 1;
         }
-        index += 1;
-    }
-    while index < CDC_MAXIMUM_BYTES / 2 {
-        let offset = index * 2;
-        hash = (hash << 2).wrapping_add(gear_ls[usize::from(cursor.next())]);
-        if (hash & large_mask_left_shifted) == 0 {
-            return offset;
+        previous = current;
+        if sequence_length == SEQCDC_CONFIG_V1.sequence_length {
+            return position - 1;
         }
-        hash = hash.wrapping_add(gear[usize::from(cursor.next())]);
-        if (hash & mask_l) == 0 {
-            return offset + 1;
+        if opposing_slopes == SEQCDC_CONFIG_V1.skip_trigger {
+            if position.saturating_add(SEQCDC_CONFIG_V1.skip_bytes) >= CDC_MAXIMUM_BYTES {
+                return CDC_MAXIMUM_BYTES;
+            }
+            cursor.skip(SEQCDC_CONFIG_V1.skip_bytes - 1);
+            previous = cursor.next();
+            position += SEQCDC_CONFIG_V1.skip_bytes;
+            opposing_slopes = 0;
         }
-        index += 1;
     }
     CDC_MAXIMUM_BYTES
 }
 
-fn take_next_stable_fastcdc_chunk(
+fn take_next_stable_seqcdc_chunk(
     tail: &mut SegmentedIngestTail,
 ) -> Result<Option<ChunkFragments>, DurableNamespaceError> {
     if tail.len() <= CDC_MAXIMUM_BYTES {
@@ -1218,23 +1322,13 @@ fn take_next_stable_fastcdc_chunk(
     }
     let stable_before = tail.len() - CDC_MAXIMUM_BYTES;
     let length = if tail.front_bytes().len() >= CDC_MAXIMUM_BYTES {
-        let first = FastCDC::with_level_and_seed(
-            tail.front_bytes(),
-            CDC_MINIMUM_BYTES,
-            CDC_TARGET_BYTES,
-            CDC_MAXIMUM_BYTES,
-            Normalization::Level1,
-            CDC_SEED_V1,
-        )
-        .next()
-        .expect("ASSERT: a nonempty maximum-sized CDC prefix yields one Chunk");
-        assert_eq!(
-            first.offset, 0,
-            "ASSERT: front-prefix FastCDC must begin at zero"
-        );
-        first.length
+        if seqcdc_force_scalar() {
+            seqcdc_cut_scalar(tail.front_bytes(), SEQCDC_CONFIG_V1)
+        } else {
+            seqcdc_cut(tail.front_bytes(), SEQCDC_CONFIG_V1)
+        }
     } else {
-        segmented_fastcdc_cut(tail)
+        segmented_seqcdc_cut(tail)
     };
     if length > stable_before {
         return Ok(None);
@@ -1255,12 +1349,12 @@ fn take_stable_chunk_batch(
     assert!(maximum_bytes != 0, "ASSERT: stable batch budget is nonzero");
     let mut batch = Vec::new();
     let mut batch_bytes = 0_usize;
-    while let Some(bytes) = take_next_stable_fastcdc_chunk(&mut state.tail)? {
+    while let Some(bytes) = take_next_stable_seqcdc_chunk(&mut state.tail)? {
         let offset = state.tail_offset;
         state.tail_offset = state
             .tail_offset
             .checked_add(
-                u64::try_from(bytes.len()).expect("ASSERT: bounded FastCDC Chunk length fits u64"),
+                u64::try_from(bytes.len()).expect("ASSERT: bounded SeqCDC Chunk length fits u64"),
             )
             .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
         batch_bytes = batch_bytes
@@ -1318,7 +1412,7 @@ fn classify_stable_chunk_shard(
         .try_reserve_exact(batch.len())
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
     for chunk in batch {
-        assert!(!chunk.bytes.is_empty(), "ASSERT: FastCDC Chunk is nonempty");
+        assert!(!chunk.bytes.is_empty(), "ASSERT: SeqCDC Chunk is nonempty");
         classified.push((!chunk.bytes.is_fill()).then(|| chunk.bytes.chunk_id()));
     }
     Ok(classified)
@@ -1463,6 +1557,8 @@ struct WriteThroughIngest<C> {
     active_writers: AtomicUsize,
     hash_batches: AtomicUsize,
     maximum_hash_workers: AtomicUsize,
+    hash_cpu: CpuPhaseTelemetry,
+    encode_cpu: CpuPhaseTelemetry,
     registry: Mutex<WriteThroughRegistry>,
     queue: Arc<IngestQueue>,
     publication_queue: Arc<PublicationQueue>,
@@ -1921,11 +2017,14 @@ impl WorkerPermits {
             desired.get() <= self.total.get(),
             "ASSERT: requested encode workers exceed the write-through worker budget"
         );
+        let wait_started = Instant::now();
+        let mut blocked = false;
         let mut available = self
             .available
             .lock()
             .expect("ASSERT: encode worker permit lock poisoned");
         while *available == 0 {
+            blocked = true;
             available = self
                 .changed
                 .wait(available)
@@ -1942,6 +2041,9 @@ impl WorkerPermits {
             pool: self,
             acquired: NonZeroUsize::new(acquired)
                 .expect("ASSERT: a granted worker lease is nonempty"),
+            requested: desired,
+            wait_ns: duration_ns_saturating(wait_started.elapsed()),
+            blocked,
         }
     }
 }
@@ -1949,11 +2051,26 @@ impl WorkerPermits {
 struct WorkerPermitLease<'a> {
     pool: &'a WorkerPermits,
     acquired: NonZeroUsize,
+    requested: NonZeroUsize,
+    wait_ns: u64,
+    blocked: bool,
 }
 
 impl WorkerPermitLease<'_> {
     const fn workers(&self) -> NonZeroUsize {
         self.acquired
+    }
+
+    const fn requested_workers(&self) -> NonZeroUsize {
+        self.requested
+    }
+
+    const fn wait_ns(&self) -> u64 {
+        self.wait_ns
+    }
+
+    const fn blocked(&self) -> bool {
+        self.blocked
     }
 }
 
@@ -1973,6 +2090,102 @@ impl Drop for WorkerPermitLease<'_> {
         );
         self.pool.changed.notify_all();
     }
+}
+
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct CpuPhaseTelemetry {
+    phases: AtomicU64,
+    active: AtomicU64,
+    maximum_active: AtomicU64,
+    runnable_wall_ns: AtomicU64,
+    permit_blocked_phases: AtomicU64,
+    permit_wait_ns: AtomicU64,
+    maximum_permit_wait_ns: AtomicU64,
+    requested_workers: AtomicU64,
+    granted_workers: AtomicU64,
+    partial_grants: AtomicU64,
+}
+
+impl CpuPhaseTelemetry {
+    fn begin(&self) -> CpuPhaseGuard<'_> {
+        atomic_saturating_add(&self.phases, 1);
+        let active = self
+            .active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                active.checked_add(1)
+            })
+            .expect("ASSERT: active CPU-phase telemetry cannot overflow")
+            .checked_add(1)
+            .expect("ASSERT: active CPU-phase telemetry cannot overflow");
+        self.maximum_active.fetch_max(active, Ordering::Relaxed);
+        CpuPhaseGuard {
+            telemetry: self,
+            started: Instant::now(),
+        }
+    }
+
+    fn record_permit(&self, lease: &WorkerPermitLease<'_>) {
+        let requested = u64::try_from(lease.requested_workers().get())
+            .expect("ASSERT: worker count fits telemetry");
+        let granted =
+            u64::try_from(lease.workers().get()).expect("ASSERT: worker count fits telemetry");
+        atomic_saturating_add(&self.requested_workers, requested);
+        atomic_saturating_add(&self.granted_workers, granted);
+        atomic_saturating_add(&self.permit_wait_ns, lease.wait_ns());
+        self.maximum_permit_wait_ns
+            .fetch_max(lease.wait_ns(), Ordering::Relaxed);
+        if lease.blocked() {
+            atomic_saturating_add(&self.permit_blocked_phases, 1);
+        }
+        if granted < requested {
+            atomic_saturating_add(&self.partial_grants, 1);
+        }
+    }
+
+    fn status(&self) -> CpuPhaseStatus {
+        CpuPhaseStatus {
+            phases: self.phases.load(Ordering::Relaxed),
+            active: self.active.load(Ordering::Relaxed),
+            maximum_active: self.maximum_active.load(Ordering::Relaxed),
+            runnable_wall_ns: self.runnable_wall_ns.load(Ordering::Relaxed),
+            permit_blocked_phases: self.permit_blocked_phases.load(Ordering::Relaxed),
+            permit_wait_ns: self.permit_wait_ns.load(Ordering::Relaxed),
+            maximum_permit_wait_ns: self.maximum_permit_wait_ns.load(Ordering::Relaxed),
+            requested_workers: self.requested_workers.load(Ordering::Relaxed),
+            granted_workers: self.granted_workers.load(Ordering::Relaxed),
+            partial_grants: self.partial_grants.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct CpuPhaseGuard<'a> {
+    telemetry: &'a CpuPhaseTelemetry,
+    started: Instant,
+}
+
+impl Drop for CpuPhaseGuard<'_> {
+    fn drop(&mut self) {
+        atomic_saturating_add(
+            &self.telemetry.runnable_wall_ns,
+            duration_ns_saturating(self.started.elapsed()),
+        );
+        let previous = self.telemetry.active.fetch_sub(1, Ordering::Relaxed);
+        assert!(
+            previous != 0,
+            "ASSERT: active CPU-phase telemetry underflow"
+        );
+    }
+}
+
+fn atomic_saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
+fn duration_ns_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 struct ActiveWriteThrough<'a> {
@@ -2016,7 +2229,7 @@ fn assert_pending_write_through_state(state: &WriteThroughStream) {
     for pending in &state.pending_chunks {
         assert!(
             !pending.bytes.is_empty() && pending.bytes.len() <= CDC_MAXIMUM_BYTES,
-            "ASSERT: pending write-through Chunk violates FastCDC length bounds"
+            "ASSERT: pending write-through Chunk violates SeqCDC length bounds"
         );
         let end = pending
             .offset
@@ -2345,6 +2558,8 @@ where
                 .expect("ASSERT: process hash-batch count fits u64"),
             maximum_hash_workers: u64::try_from(self.maximum_hash_workers.load(Ordering::Relaxed))
                 .expect("ASSERT: process hash-worker count fits u64"),
+            hash_cpu: self.hash_cpu.status(),
+            encode_cpu: self.encode_cpu.status(),
             degraded: snapshot.degraded,
         }
     }
@@ -2376,7 +2591,7 @@ where
             "ASSERT: completed cut cannot retire future Containers"
         );
         registry.sealed.drain(..sealed_at_cut);
-        // Preserve the incomplete FastCDC suffix across generations. It is the
+        // Preserve the incomplete SeqCDC suffix across generations. It is the
         // exact content anchor required for a later append to make the same
         // cuts as the checkpoint planner. Chunks the checkpoint published from
         // this suffix are filtered through the newly active Exact Index before
@@ -2563,9 +2778,12 @@ where
                 self.active_writers.load(Ordering::Acquire),
             );
             let worker_lease = self.worker_permits.acquire(desired_workers);
+            self.hash_cpu.record_permit(&worker_lease);
+            let cpu_phase = self.hash_cpu.begin();
             let workers = NonZeroUsize::new(worker_lease.workers().get().min(batch.len()))
                 .expect("ASSERT: a nonempty Chunk batch has one hash worker");
             let chunk_ids = classify_stable_chunk_batch(&batch, workers)?;
+            drop(cpu_phase);
             drop(worker_lease);
             self.hash_batches
                 .fetch_add(1, Ordering::Relaxed)
@@ -2580,7 +2798,7 @@ where
             );
             for (chunk, chunk_id) in batch.into_iter().zip(chunk_ids) {
                 let logical_length = u64::try_from(chunk.bytes.len())
-                    .expect("ASSERT: bounded FastCDC Chunk length fits u64");
+                    .expect("ASSERT: bounded SeqCDC Chunk length fits u64");
                 let Some(chunk_id) = chunk_id else {
                     externalized.push(ExternalizedExtent::new(
                         inode,
@@ -2792,6 +3010,8 @@ where
         let active_writers = self.active_writers.load(Ordering::Acquire);
         let desired_workers = workers_per_ingest_job(self.worker_budget, active_writers);
         let worker_lease = self.worker_permits.acquire(desired_workers);
+        self.encode_cpu.record_permit(&worker_lease);
+        let cpu_phase = self.encode_cpu.begin();
         let workers = worker_lease.workers();
         assert!(
             workers.get() <= self.worker_budget.get(),
@@ -2803,6 +3023,7 @@ where
             &region_refs,
             workers,
         )?;
+        drop(cpu_phase);
         drop(worker_lease);
         let (verified, _) = self
             .containers
@@ -2949,6 +3170,8 @@ where
         active_writers: AtomicUsize::new(0),
         hash_batches: AtomicUsize::new(0),
         maximum_hash_workers: AtomicUsize::new(0),
+        hash_cpu: CpuPhaseTelemetry::default(),
+        encode_cpu: CpuPhaseTelemetry::default(),
         registry: Mutex::new(WriteThroughRegistry::default()),
         queue: Arc::new(IngestQueue::new()),
         publication_queue: Arc::new(PublicationQueue::new()),
@@ -3695,7 +3918,7 @@ where
         self.checkpoint_workers
     }
 
-    /// Returns bounded live state of the pre-commit FastCDC/Container pipeline.
+    /// Returns bounded live state of the pre-commit SeqCDC/Container pipeline.
     #[must_use]
     pub fn write_through_status(&self) -> WriteThroughStatus {
         self.write_through.status()
@@ -4377,7 +4600,7 @@ fn allocated_bytes_in_range(
     Ok(allocated)
 }
 
-/// Exact-Index profile paired with the durable checkpoint's FastCDC-v1 rules.
+/// Exact-Index profile paired with the durable checkpoint's SeqCDC-v1 rules.
 ///
 /// # Panics
 ///
@@ -4387,9 +4610,12 @@ fn allocated_bytes_in_range(
 #[must_use]
 pub fn checkpoint_exact_index_profile_v1() -> ExactIndexProfileId {
     ExactIndexProfileId::new(
-        ChunkId::of(b"fastdup/FastCDC-v1/min=16384,target=65536,max=262144,norm=1,seed=0").bytes(),
+        ChunkId::of(
+            b"fastdup/SeqCDC-v1/mode=increasing,sequence=6,skip-trigger=50,skip=1024,min=16384,max=262144",
+        )
+        .bytes(),
     )
-    .expect("ASSERT: the FastCDC-v1 Exact-Index profile hash is nonzero")
+    .expect("ASSERT: the SeqCDC-v1 Exact-Index profile hash is nonzero")
 }
 
 fn discover_next_container_generation<I: StorageIo>(
@@ -4512,7 +4738,7 @@ fn plan_incremental_manifest<C: StorageIo>(
     let logical_size = inode.logical_size();
     let mut rewrites = rewrite_ranges_before(changed, logical_size, previous_length)?;
     if previous_length < logical_size {
-        // A completed FastCDC Chunk is a reset point. Replaying the final DATA
+        // A completed SeqCDC Chunk is a reset point. Replaying the final DATA
         // Chunk therefore reconstructs exactly the CDC state needed for an
         // appended suffix while bounding old-prefix work by the format maximum.
         // FILL and HOLE already force a region boundary and need no replay.
@@ -4953,7 +5179,7 @@ fn plan_allocated_range<C: StorageIo>(
     assert!(length > 0, "ASSERT: a DATA range must be nonempty");
     assert_eq!(
         CDC_MAXIMUM_BYTES, MAX_LOGICAL_CHUNK_BYTES,
-        "ASSERT: FastCDC-v1 maximum must equal the durable format bound"
+        "ASSERT: SeqCDC-v1 maximum must equal the durable format bound"
     );
     writer.metrics.checkpoint_rechunk_bytes = writer
         .metrics
@@ -4966,38 +5192,26 @@ fn plan_allocated_range<C: StorageIo>(
         consumed: 0,
         length,
     };
-    let mut chunks = StreamCDC::with_level_and_seed(
-        reader,
-        CDC_MINIMUM_BYTES,
-        CDC_TARGET_BYTES,
-        CDC_MAXIMUM_BYTES,
-        Normalization::Level1,
-        CDC_SEED_V1,
-    );
+    let mut chunks = SeqCdcStream::new(reader)?;
     let mut expected_offset = 0_u64;
     loop {
         let cdc_started = PhaseStarted::now();
-        let result = chunks.next();
-        cdc_started.finish_into(&mut writer.metrics.fastcdc);
-        let Some(result) = result else {
+        let chunk = chunks.next_chunk()?;
+        cdc_started.finish_into(&mut writer.metrics.cdc);
+        let Some(chunk) = chunk else {
             break;
         };
-        let chunk = result.map_err(io::Error::from)?;
         assert_eq!(
-            chunk.offset, expected_offset,
-            "ASSERT: FastCDC-v1 chunks must be contiguous"
-        );
-        assert_eq!(
-            chunk.length,
-            chunk.data.len(),
-            "ASSERT: a FastCDC chunk length must equal its owned bytes"
+            expected_offset,
+            chunks.consumed_bytes() - u64::try_from(chunk.len()).expect("bounded Chunk length"),
+            "ASSERT: SeqCDC-v1 chunks must be contiguous"
         );
         assert!(
-            chunk.length > 0 && chunk.length <= CDC_MAXIMUM_BYTES,
-            "ASSERT: FastCDC-v1 returned an invalid logical Chunk length"
+            !chunk.is_empty() && chunk.len() <= CDC_MAXIMUM_BYTES,
+            "ASSERT: SeqCDC-v1 returned an invalid logical Chunk length"
         );
         let logical_length =
-            u64::try_from(chunk.length).expect("ASSERT: a bounded FastCDC chunk length fits u64");
+            u64::try_from(chunk.len()).expect("ASSERT: a bounded SeqCDC Chunk length fits u64");
         writer.metrics.logical_chunks = writer
             .metrics
             .logical_chunks
@@ -5010,10 +5224,10 @@ fn plan_allocated_range<C: StorageIo>(
             .expect("ASSERT: checkpoint logical Chunk bytes cannot overflow u64");
         expected_offset = expected_offset
             .checked_add(logical_length)
-            .expect("ASSERT: a FastCDC DATA range cursor cannot overflow");
+            .expect("ASSERT: a SeqCDC DATA range cursor cannot overflow");
         let hash_started = PhaseStarted::now();
-        let fill = chunk.data.iter().all(|byte| *byte == chunk.data[0]);
-        let chunk_id = (!fill).then(|| ChunkId::of(&chunk.data));
+        let fill = chunk.iter().all(|byte| *byte == chunk[0]);
+        let chunk_id = (!fill).then(|| ChunkId::of(&chunk));
         hash_started.finish_into(&mut writer.metrics.hash_and_fill);
         if fill {
             writer.metrics.fill_chunks = writer
@@ -5030,12 +5244,12 @@ fn plan_allocated_range<C: StorageIo>(
                 extents,
                 ManifestExtent::Fill {
                     logical_length,
-                    value: chunk.data[0],
+                    value: chunk[0],
                 },
             )?;
         } else {
             let chunk_id = chunk_id.expect("ASSERT: non-FILL data must have one Chunk ID");
-            writer.push(chunk_id, chunk.data)?;
+            writer.push(chunk_id, chunk)?;
             push_extent(
                 extents,
                 ManifestExtent::Data {
@@ -5049,6 +5263,82 @@ fn plan_allocated_range<C: StorageIo>(
         return Err(DurableNamespaceError::FrozenViewMismatch);
     }
     Ok(())
+}
+
+struct SeqCdcStream<R> {
+    reader: R,
+    buffer: Vec<u8>,
+    start: usize,
+    eof: bool,
+    consumed_bytes: u64,
+}
+
+impl<R: Read> SeqCdcStream<R> {
+    fn new(reader: R) -> Result<Self, DurableNamespaceError> {
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(2 * CDC_MAXIMUM_BYTES)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        Ok(Self {
+            reader,
+            buffer,
+            start: 0,
+            eof: false,
+            consumed_bytes: 0,
+        })
+    }
+
+    fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, DurableNamespaceError> {
+        if self.start >= CDC_MAXIMUM_BYTES {
+            self.buffer.copy_within(self.start.., 0);
+            self.buffer.truncate(self.buffer.len() - self.start);
+            self.start = 0;
+        }
+        while self.buffer.len() - self.start < CDC_MAXIMUM_BYTES && !self.eof {
+            let available = self.buffer.len() - self.start;
+            let requested = CDC_MAXIMUM_BYTES - available;
+            let old_length = self.buffer.len();
+            let new_length = old_length
+                .checked_add(requested)
+                .expect("ASSERT: bounded SeqCDC stream buffer cannot overflow");
+            assert!(
+                new_length <= self.buffer.capacity(),
+                "ASSERT: SeqCDC stream buffer exceeds its fixed reservation"
+            );
+            self.buffer.resize(new_length, 0);
+            let read = self.reader.read(&mut self.buffer[old_length..])?;
+            self.buffer.truncate(old_length + read);
+            self.eof = read == 0;
+        }
+        let remaining = &self.buffer[self.start..];
+        if remaining.is_empty() {
+            return Ok(None);
+        }
+        let length = if seqcdc_force_scalar() {
+            seqcdc_cut_scalar(remaining, SEQCDC_CONFIG_V1)
+        } else {
+            seqcdc_cut(remaining, SEQCDC_CONFIG_V1)
+        };
+        assert!(
+            length != 0 && length <= remaining.len() && length <= CDC_MAXIMUM_BYTES,
+            "ASSERT: SeqCDC selected an invalid stream Chunk length"
+        );
+        let mut chunk = Vec::new();
+        chunk
+            .try_reserve_exact(length)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        chunk.extend_from_slice(&remaining[..length]);
+        self.start += length;
+        self.consumed_bytes = self
+            .consumed_bytes
+            .checked_add(u64::try_from(length).expect("ASSERT: bounded Chunk length fits u64"))
+            .expect("ASSERT: SeqCDC stream position cannot overflow");
+        Ok(Some(chunk))
+    }
+
+    const fn consumed_bytes(&self) -> u64 {
+        self.consumed_bytes
+    }
 }
 
 struct CommitRangeReader<'a> {
@@ -5072,7 +5362,7 @@ impl Read for CommitRangeReader<'_> {
             .min(output.len())
             .min(CDC_MAXIMUM_BYTES);
         let requested_u32 =
-            u32::try_from(requested).expect("ASSERT: FastCDC-v1 reads never exceed 256 KiB");
+            u32::try_from(requested).expect("ASSERT: SeqCDC-v1 reads never exceed 256 KiB");
         let read_offset = self
             .start
             .checked_add(self.consumed)
@@ -5691,7 +5981,7 @@ mod tests {
     }
 
     #[test]
-    fn segmented_fastcdc_matches_contiguous_v1_boundaries() {
+    fn segmented_seqcdc_matches_contiguous_v1_boundaries() {
         let mut state = 0x5eed_cafe_1234_5678_u64;
         let mut source = vec![0_u8; 4 * 1_024 * 1_024 + 91_337];
         for byte in &mut source {
@@ -5700,18 +5990,16 @@ mod tests {
             state ^= state << 17;
             *byte = state.to_le_bytes()[0];
         }
-        let stable_end = source.len() - CDC_MAXIMUM_BYTES;
-        let expected = FastCDC::with_level_and_seed(
-            &source,
-            CDC_MINIMUM_BYTES,
-            CDC_TARGET_BYTES,
-            CDC_MAXIMUM_BYTES,
-            Normalization::Level1,
-            CDC_SEED_V1,
-        )
-        .take_while(|chunk| chunk.offset + chunk.length <= stable_end)
-        .map(|chunk| source[chunk.offset..chunk.offset + chunk.length].to_vec())
-        .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        let mut expected_offset = 0_usize;
+        while source.len() - expected_offset > CDC_MAXIMUM_BYTES {
+            let length = seqcdc_cut(&source[expected_offset..], SEQCDC_CONFIG_V1);
+            if length > source.len() - expected_offset - CDC_MAXIMUM_BYTES {
+                break;
+            }
+            expected.push(source[expected_offset..expected_offset + length].to_vec());
+            expected_offset += length;
+        }
 
         let mut tail = SegmentedIngestTail::default();
         let segment_sizes = [1, 4_095, 131_071, 17, 1_048_576, 65_537];
@@ -5730,7 +6018,7 @@ mod tests {
         }
         let mut observed = Vec::new();
         while let Some(chunk) =
-            take_next_stable_fastcdc_chunk(&mut tail).expect("chunk segmented fixture")
+            take_next_stable_seqcdc_chunk(&mut tail).expect("chunk segmented fixture")
         {
             observed.push(chunk.materialize_fixture());
         }
@@ -5750,7 +6038,7 @@ mod tests {
         }
         let mut selected_bytes = 0_usize;
         while let Some(chunk) =
-            take_next_stable_fastcdc_chunk(&mut fragmented).expect("chunk fragmented fixture")
+            take_next_stable_seqcdc_chunk(&mut fragmented).expect("chunk fragmented fixture")
         {
             selected_bytes = selected_bytes
                 .checked_add(chunk.len())
@@ -5763,8 +6051,31 @@ mod tests {
         assert_eq!(
             fragmented.materialized_bytes(),
             0,
-            "FastCDC extraction and hashing retain request fragments without copying"
+            "SeqCDC extraction and hashing retain request fragments without copying"
         );
+    }
+
+    #[test]
+    fn streaming_seqcdc_matches_contiguous_v1_boundaries() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut source = vec![0_u8; 4 * 1_024 * 1_024 + 73_019];
+        for byte in &mut source {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state.to_le_bytes()[0];
+        }
+
+        let mut stream = SeqCdcStream::new(std::io::Cursor::new(source.as_slice()))
+            .expect("allocate SeqCDC stream fixture");
+        let mut offset = 0_usize;
+        while let Some(observed) = stream.next_chunk().expect("scan SeqCDC stream fixture") {
+            let expected_length = seqcdc_cut(&source[offset..], SEQCDC_CONFIG_V1);
+            assert_eq!(observed, source[offset..offset + expected_length]);
+            offset += expected_length;
+        }
+        assert_eq!(offset, source.len());
+        assert_eq!(stream.consumed_bytes(), source.len() as u64);
     }
 
     #[test]
@@ -5872,10 +6183,27 @@ mod tests {
     fn encode_worker_permits_cannot_overbook_the_write_through_budget() {
         let budget = NonZeroUsize::new(10).expect("fixture budget is nonzero");
         let permits = WorkerPermits::new(budget);
+        let telemetry = CpuPhaseTelemetry::default();
         let first = permits.acquire(NonZeroUsize::new(6).expect("fixture share is nonzero"));
+        telemetry.record_permit(&first);
+        let first_phase = telemetry.begin();
         let second = permits.acquire(NonZeroUsize::new(10).expect("fixture share is nonzero"));
+        telemetry.record_permit(&second);
+        let second_phase = telemetry.begin();
         assert_eq!(first.workers().get(), 6);
         assert_eq!(second.workers().get(), 4);
+        assert_eq!(first.requested_workers().get(), 6);
+        assert_eq!(second.requested_workers().get(), 10);
+        assert!(!first.blocked());
+        assert!(!second.blocked());
+        let active = telemetry.status();
+        assert_eq!(active.phases(), 2);
+        assert_eq!(active.active(), 2);
+        assert_eq!(active.maximum_active(), 2);
+        assert_eq!(active.requested_workers(), 16);
+        assert_eq!(active.granted_workers(), 10);
+        assert_eq!(active.partial_grants(), 1);
+        assert_eq!(active.permit_blocked_phases(), 0);
         assert_eq!(
             *permits
                 .available
@@ -5883,8 +6211,14 @@ mod tests {
                 .expect("fixture permit lock is not poisoned"),
             0
         );
-        drop(first);
+        drop(second_phase);
+        drop(first_phase);
         drop(second);
+        drop(first);
+        let completed = telemetry.status();
+        assert_eq!(completed.active(), 0);
+        assert!(completed.runnable_wall_ns() > 0);
+        assert!(completed.maximum_permit_wait_ns() <= completed.permit_wait_ns());
         assert_eq!(
             *permits
                 .available

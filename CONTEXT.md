@@ -7,7 +7,7 @@ and ADRs.
 
 **MVP**:
 The first usable FUSE appliance with crash-safe manifests, bounded updates,
-FastCDC, Exact Dedup, bounded in-memory acceleration, and RAW/Zstd encodings.
+SeqCDC, Exact Dedup, bounded in-memory acceleration, and RAW/Zstd encodings.
 Similarity, Delta, automatic GC, production Samba hardening, and device-loss
 protection are later stages.
 _Avoid_: Container-store milestone, production appliance
@@ -361,7 +361,7 @@ closed while the generation is persisted.
 _Avoid_: Active dirty epoch, filesystem freeze
 
 **Ingest lane**:
-A bounded process-local FastCDC and Container-staging stream for one hot inode.
+A bounded process-local SeqCDC and Container-staging stream for one hot inode.
 It controls reduction continuity but has no durable identity and does not define
 commit visibility.
 _Avoid_: Commit group, worker thread
@@ -414,7 +414,7 @@ Process-local proof carried from a byte-verified externalized dirty range into
 the Frozen Commit Cut. It may avoid re-reading a complete Chunk or FILL extent,
 but it neither contains a physical Location nor makes a generation visible;
 generation publication must still verify every changed DATA dependency.
-Stable FastCDC Chunks still below the normal Container-fill threshold are
+Stable SeqCDC Chunks still below the normal Container-fill threshold are
 drained immediately after the cut and may attach this proof to the frozen range;
 only one boundary Chunk plus the incomplete bounded CDC suffix remain resident
 for checkpoint replay.

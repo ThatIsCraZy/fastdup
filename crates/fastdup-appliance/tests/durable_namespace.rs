@@ -244,24 +244,23 @@ fn compressible_checkpoint_publishes_zstd_regions_and_recovers_byte_exactly() {
     let metrics = profiled.metrics();
     let payload_bytes = u64::try_from(payload.len()).expect("fixture length fits u64");
     assert_eq!(metrics.logical_chunk_bytes(), payload_bytes);
-    assert_eq!(metrics.exact_hit_chunks(), 0);
     assert_eq!(
         metrics
             .new_chunk_bytes()
             .checked_add(metrics.recipe_reuse_bytes())
+            .and_then(|bytes| bytes.checked_add(metrics.exact_hit_bytes()))
             .expect("fixture accounting is bounded"),
         payload_bytes,
         "pre-cut publication plus checkpoint fallback must cover the complete payload"
     );
     assert!(metrics.logical_chunks() > 1);
     assert!(metrics.zstd_records() > 0);
-    assert_eq!(metrics.raw_records(), 0);
     assert!(metrics.containers() > 0);
     assert!(metrics.container_file_bytes() < payload_bytes);
     assert!(metrics.peak_buffered_chunk_bytes() <= 32 * 1_024 * 1_024);
     assert!(metrics.peak_buffered_chunks() > 0);
     assert!(metrics.total().wall() >= metrics.manifest_plan().wall());
-    assert!(metrics.manifest_plan().wall() >= metrics.fastcdc().wall());
+    assert!(metrics.manifest_plan().wall() >= metrics.cdc().wall());
     drop(appliance);
 
     let containers = ContainerRepository::new(
@@ -333,7 +332,7 @@ fn compressible_checkpoint_publishes_zstd_regions_and_recovers_byte_exactly() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn checkpoint_uses_bounded_content_defined_chunks() {
-    let root = unique_test_root("durable-fastcdc-checkpoint");
+    let root = unique_test_root("durable-seqcdc-checkpoint");
     let metadata_root = root.join("metadata");
     let container_root = root.join("containers");
     let policy = PolicySetId::new([0x6B; 32]).expect("policy identity is nonzero");
@@ -352,14 +351,14 @@ fn checkpoint_uses_bounded_content_defined_chunks() {
             CALLER,
             Operation::Create {
                 parent: ROOT_INODE,
-                name: b"fastcdc-stream",
+                name: b"seqcdc-stream",
                 mode: 0o600,
                 options: OpenOptions::READ_WRITE,
                 exclusive: true,
                 truncate: false,
             },
         )
-        .expect("create the FastCDC fixture")
+        .expect("create the SeqCDC fixture")
     else {
         panic!("ASSERT: create returned the wrong reply variant");
     };
@@ -383,10 +382,10 @@ fn checkpoint_uses_bounded_content_defined_chunks() {
                 data: &payload,
             },
         )
-        .expect("write the FastCDC fixture");
+        .expect("write the SeqCDC fixture");
     appliance
         .checkpoint()
-        .expect("checkpoint the FastCDC fixture")
+        .expect("checkpoint the SeqCDC fixture")
         .expect("the DATA mutation needs a generation");
     drop(appliance);
 
@@ -399,7 +398,7 @@ fn checkpoint_uses_bounded_content_defined_chunks() {
     );
     let recovered_generation = generations
         .recover_latest_with_data(&containers)
-        .expect("recover the FastCDC generation")
+        .expect("recover the SeqCDC generation")
         .expect("one committed generation exists");
     let inode = recovered_generation
         .namespace_root()
@@ -408,7 +407,7 @@ fn checkpoint_uses_bounded_content_defined_chunks() {
         .expect("fixture inode is durable");
     let manifest = generations
         .read_manifest(inode.manifest_root())
-        .expect("read the durable FastCDC Manifest");
+        .expect("read the durable SeqCDC Manifest");
     let data_lengths = manifest
         .extents()
         .iter()
@@ -423,18 +422,18 @@ fn checkpoint_uses_bounded_content_defined_chunks() {
         .collect::<Vec<_>>();
     assert!(
         data_lengths.len() > 8,
-        "FastCDC-v1 should produce roughly 64-KiB chunks, not four fixed 256-KiB cells"
+        "SeqCDC-v1 should produce roughly 64-KiB chunks, not four fixed 256-KiB cells"
     );
     assert!(
         data_lengths
             .iter()
             .all(|length| *length > 0 && *length <= CHUNK_BYTES as u64),
-        "every durable logical Chunk must obey the FastCDC-v1 maximum"
+        "every durable logical Chunk must obey the SeqCDC-v1 maximum"
     );
     assert_eq!(data_lengths.iter().sum::<u64>(), payload.len() as u64);
 
     let recovered = recover_mount(NamespaceConfig::default(), &generations, &containers)
-        .expect("mount the complete FastCDC generation")
+        .expect("mount the complete SeqCDC generation")
         .expect("one committed Namespace exists");
     let Reply::Opened(recovered_handle) = recovered
         .dispatch(
@@ -445,7 +444,7 @@ fn checkpoint_uses_bounded_content_defined_chunks() {
                 truncate: false,
             },
         )
-        .expect("open the FastCDC-backed file")
+        .expect("open the SeqCDC-backed file")
     else {
         panic!("ASSERT: open returned the wrong reply variant");
     };
@@ -463,7 +462,7 @@ fn checkpoint_uses_bounded_content_defined_chunks() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn partial_fastcdc_range_clone_publishes_only_metadata_and_recovers_byte_exact() {
+fn partial_seqcdc_range_clone_publishes_only_metadata_and_recovers_byte_exact() {
     let metadata = MemoryStorageIo::new();
     let containers_storage = MemoryStorageIo::new();
     let policy = PolicySetId::new([0x8c; 32]).expect("policy identity is nonzero");
@@ -1346,7 +1345,7 @@ fn append_checkpoint_rechunks_only_bounded_suffix_and_recovers_byte_exact() {
     let appended_bytes = u64::try_from(appended.len()).expect("append length fits u64");
     assert!(
         metrics.logical_chunk_bytes() >= appended_bytes,
-        "the appended bytes must all pass through FastCDC"
+        "the appended bytes must all pass through SeqCDC"
     );
     assert!(
         metrics.logical_chunk_bytes() <= appended_bytes + u64::try_from(CHUNK_BYTES).unwrap(),

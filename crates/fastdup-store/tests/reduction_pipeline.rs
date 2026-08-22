@@ -66,11 +66,11 @@ fn raw_baseline_round_trips_empty_and_chunk_boundary_inputs() {
 }
 
 #[test]
-fn fastcdc_resynchronizes_after_an_insertion_and_exact_reuses_the_unchanged_suffix() {
+fn seqcdc_resynchronizes_after_an_insertion_and_exact_reuses_the_unchanged_suffix() {
     let policy = ReductionPolicy::v1(
         ReductionFeatures::RAW | ReductionFeatures::CDC | ReductionFeatures::EXACT,
     )
-    .expect("FastCDC plus Exact is valid");
+    .expect("SeqCDC plus Exact is valid");
     let runtime = ReductionRuntime::new(
         NonZeroUsize::new(4).expect("fixture worker count is nonzero"),
         16 * 1_024 * 1_024,
@@ -99,7 +99,7 @@ fn fastcdc_resynchronizes_after_an_insertion_and_exact_reuses_the_unchanged_suff
     assert!(report.maximum_chunk_bytes() <= 256 * 1_024);
     assert!(
         report.exact_hit_bytes() >= 3 * 1_024 * 1_024,
-        "FastCDC should resynchronize and reuse most of a 4-MiB shifted stream"
+        "SeqCDC should resynchronize and reuse most of a 4-MiB shifted stream"
     );
     assert!(report.exact_hits() > 0);
 }
