@@ -229,14 +229,17 @@ derives allocation from v2 summaries plus the replacement, and retains complete
 prefix and shifted-suffix child IDs. HOLE/FILL may split at either boundary;
 DATA may not.
 
-## Namespace Root v1 and v2 payload
+## Namespace Root v1, v2, v3, and v4 payload
 
 A Namespace Root is Metadata Object kind `2`. Both versions embed inode
 versions and directory entries in one bounded object. Version 1 is the legacy
 flat form with only the implicit root Inode ID `1`; every v1 inode record is a
 regular file. Version 2 adds directory inode records and nested parent IDs.
-Writers emit v2 and readers retain v1 support. This remains a pre-stable,
-bounded format rather than the final scalable namespace tree.
+Version 3 adds root-inode metadata, per-inode immutable flags, and bounded
+inline extended attributes including POSIX ACL wire values. Version 4 adds
+nanosecond timestamps and byte-exact symbolic-link targets. Writers emit v3
+when v4 state is absent and v4 otherwise; readers retain v1 and v2 support. This remains a pre-stable, bounded format
+rather than the final scalable namespace tree.
 
 The payload layout is:
 
@@ -244,22 +247,28 @@ The payload layout is:
 [128-byte header]
 [inode_count * 96-byte Durable Inode records]
 [entry_count variable Namespace Entry records]
+[xattr_count variable Xattr records, v3/v4 only]
+[inode_count + 1 variable POSIX metadata records, v4 only]
 ```
 
-There are no bytes after the final Namespace Entry. Empty namespaces consist of
-the 128-byte payload header alone.
+There are no bytes after the final Xattr record. A v1 or v2 payload ends after
+its final Namespace Entry. An empty v3 namespace without root attributes
+consists of the 128-byte payload header alone.
 
 ### Namespace Root header
 
 | Offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
 | 0 | 8 | `magic` | ASCII `FDNSRT01` |
-| 8 | 2 | `format_version` | `1` or `2`; writers emit `2` |
+| 8 | 2 | `format_version` | `1`, `2`, `3`, or `4`; writers emit `3` or `4` |
 | 10 | 2 | `header_length` | `128` |
 | 12 | 2 | `inode_record_length` | `96` |
 | 14 | 2 | `entry_header_length` | `24` |
-| 16 | 8 | required-flags slot | zero |
-| 24 | 8 | compatible-flags slot | zero |
+| 16 | 2 | `root_mode` | v3/v4: root permission and special bits; v1/v2: zero |
+| 18 | 2 | reserved | zero |
+| 20 | 4 | `root_uid` | v3/v4: root owner UID; v1/v2: zero |
+| 24 | 4 | `root_gid` | v3/v4: root owner GID; v1/v2: zero |
+| 28 | 4 | `root_file_flags` | v3/v4: zero or `FS_IMMUTABLE_FL` (`0x10`); v1/v2: zero |
 | 32 | 8 | `root_inode` | `1` |
 | 40 | 8 | `inode_reservation_end` | at least `2`, and greater than every inode record ID |
 | 48 | 8 | `namespace_mutation_sequence` | committed namespace mutation cutoff |
@@ -269,7 +278,14 @@ the 128-byte payload header alone.
 | 72 | 8 | `entries_offset` | `128 + inode_count * 96` |
 | 80 | 8 | `payload_length` | exact payload length through the final entry |
 | 88 | 8 | `inode_allocation_cursor` | at least `2`, no greater than `inode_reservation_end`, and greater than every inode record ID |
-| 96 | 32 | reserved | zero |
+| 96 | 4 | `xattr_count` | v3/v4: total root-plus-inode Xattr records; v1/v2: zero |
+| 100 | 2 | `xattr_record_header_length` | v3/v4: `24`; v1/v2: zero |
+| 102 | 2 | reserved | zero |
+| 104 | 8 | `xattrs_offset` | v3/v4: exact end of Namespace Entry records; v1/v2: zero |
+| 112 | 4 | `posix_metadata_count` | v4: `inode_count + 1`; older versions: zero |
+| 116 | 2 | `posix_metadata_header_length` | v4: `64`; older versions: zero |
+| 118 | 2 | reserved | zero |
+| 120 | 8 | `posix_metadata_offset` | v4: exact end of Xattr records; older versions: zero |
 
 The field widths sum to 128 bytes. Before allocating record vectors, a reader
 proves the inode byte equation, `entries_offset <= payload_length`, and that
@@ -292,14 +308,15 @@ prevents reuse after falling back to an older metadata graph.
 | ---: | ---: | --- | --- |
 | 0 | 8 | `inode_id` | greater than `1` |
 | 8 | 2 | `mode` | stored POSIX mode bits |
-| 10 | 2 | `inode_kind` | v1: zero and implicitly regular; v2: `1` = regular, `2` = directory |
+| 10 | 2 | `inode_kind` | v1: zero and implicitly regular; v2/v3: `1` = regular, `2` = directory; v4 also permits `3` = symlink |
 | 12 | 4 | `uid` | stored owner UID |
 | 16 | 4 | `gid` | stored owner GID |
-| 20 | 4 | `link_count` | regular: incoming names; directory: `2 + immediate child directories` |
+| 20 | 4 | `link_count` | regular/symlink: incoming names; directory: `2 + immediate child directories` |
 | 24 | 8 | `mutation_sequence` | committed per-inode mutation sequence |
-| 32 | 8 | `logical_size` | regular: exact Manifest length; directory: zero |
-| 40 | 32 | `manifest_root` | regular: nonzero Metadata Object ID; directory: zero |
-| 72 | 24 | reserved | zero |
+| 32 | 8 | `logical_size` | regular: exact Manifest length; symlink: target length; directory: zero |
+| 40 | 32 | `manifest_root` | regular: nonzero Metadata Object ID; directory/symlink: zero |
+| 72 | 4 | `file_flags` | v3/v4: zero or `FS_IMMUTABLE_FL` (`0x10`); v1/v2: zero |
+| 76 | 20 | reserved | zero |
 
 The field widths sum to 96 bytes. Records are strictly increasing by numeric
 `inode_id`; duplicate or reordered records are invalid. No record is written
@@ -329,6 +346,39 @@ two plus its immediate child-directory count. Full traversal from root must
 reach every inode exactly once except that several names may reach one regular
 inode. Recovery and scrub reject dangling parents, non-directory parents,
 cycles, disconnected subtrees, and incorrect link counts.
+
+### Xattr record (v3)
+
+| Relative offset | Width | Field | Requirement |
+| ---: | ---: | --- | --- |
+| 0 | 4 | `record_length` | `align_up(24 + name_length + value_length, 8)` |
+| 4 | 2 | `name_length` | `1..=255` |
+| 6 | 2 | reserved | zero |
+| 8 | 8 | `inode_id` | root `1` or an inode present in the inode table |
+| 16 | 4 | `value_length` | `0..=65,536` |
+| 20 | 4 | reserved | zero |
+| 24 | variable | `name` | exact non-NUL Xattr name bytes |
+| after name | variable | `value` | exact Xattr value bytes |
+| after value | variable | padding | zero through `record_length` |
+
+Records are strictly ordered by `(inode_id, unsigned-bytewise name)`. Names are
+limited to `user.*`, `trusted.*`, `security.*`,
+`system.posix_acl_access`, and `system.posix_acl_default`; default ACLs are
+valid only on directories. Each inode has at most 1,024 attributes and at most
+1,048,576 aggregate name-plus-value bytes. POSIX ACL values use Linux xattr
+version 2 and canonical entry order: owner, increasing named users, owning
+group, increasing named groups, optional mask, and other. Named entries require
+a mask. Writer, recovery, and offline scrub enforce the same bounds and ACL
+grammar.
+
+### POSIX metadata record (v4)
+
+Each inode, including the implicit root first, has one record ordered by inode.
+The 64-byte header stores record length, optional symlink-target length and
+flag, inode ID, and atime/mtime/ctime as signed seconds plus nanoseconds and a
+zero reserved word. The byte-exact target follows the header and the record is
+zero-padded to eight-byte alignment. Non-symlinks have no target; symlink
+targets are 1..=4,096 bytes and their Durable Inode kind is `3`.
 
 ## Commit Record v1
 
@@ -657,10 +707,9 @@ This implemented checkpoint intentionally does **not** provide:
   equal-length replacement, truncate, and arbitrary middle splice/concat are
   tree-native, while compatibility inspection may still flatten only bounded
   recipes;
-- a scalable Namespace tree: NamespaceRoot v2 rewrites one bounded object,
-  contains only regular inodes below the implicit root directory, and has no
-  nested directories, symlinks, ACLs, xattrs, timestamps, or directory metadata
-  record beyond its reservation end and allocation cursor;
+- a scalable Namespace tree: NamespaceRoot v3 rewrites one bounded object and
+  keeps Xattrs and ACLs inline; nested directories are supported, while
+  symlinks, timestamps, and external large-metadata objects remain future work;
 - automatic dirty-tail repair, an offline paired-slot scrub, or a stable
   downgrade/format-epoch fence;
 - serialization or transitive verification of the Policy Set itself;

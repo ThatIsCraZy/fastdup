@@ -9,15 +9,21 @@ use std::num::NonZeroU64;
 use std::ops::Bound::Excluded;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 mod fuse_adapter;
+mod inode_metadata;
 mod versioned_file;
 
 use versioned_file::VersionedFile;
 
 pub use fuse_adapter::{
     FuseFilesystem, StatFsSnapshot, StatFsSnapshotError, StatFsSource, volatile_mount_options,
+};
+pub use inode_metadata::{
+    ExtendedAttribute, FS_IMMUTABLE_FL, InodeMetadata, POSIX_ACL_ACCESS_XATTR,
+    POSIX_ACL_DEFAULT_XATTR, XattrSetMode,
 };
 pub use versioned_file::CommittedFile;
 
@@ -355,6 +361,66 @@ impl OpenOptions {
 pub enum FileKind {
     Directory,
     Regular,
+    Symlink,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct PosixTimestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+impl PosixTimestamp {
+    #[must_use]
+    pub const fn new(seconds: i64, nanoseconds: u32) -> Self {
+        Self {
+            seconds,
+            nanoseconds,
+        }
+    }
+
+    fn now() -> Self {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(value) => Self {
+                seconds: i64::try_from(value.as_secs()).unwrap_or(i64::MAX),
+                nanoseconds: value.subsec_nanos(),
+            },
+            Err(value) => {
+                let duration = value.duration();
+                Self {
+                    seconds: -i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+                    nanoseconds: duration.subsec_nanos(),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PosixTimes {
+    pub atime: PosixTimestamp,
+    pub mtime: PosixTimestamp,
+    pub ctime: PosixTimestamp,
+}
+
+impl PosixTimes {
+    fn now() -> Self {
+        let now = PosixTimestamp::now();
+        Self {
+            atime: now,
+            mtime: now,
+            ctime: now,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InodeAttributesUpdate {
+    pub mode: Option<u16>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub atime: Option<PosixTimestamp>,
+    pub mtime: Option<PosixTimestamp>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,6 +464,7 @@ pub struct FileAttr {
     pub gid: u32,
     pub link_count: u32,
     pub mutation_sequence: u64,
+    pub times: PosixTimes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -423,6 +490,51 @@ pub enum Operation<'a> {
     GetAttr {
         inode: InodeId,
     },
+    GetXattr {
+        inode: InodeId,
+        name: &'a [u8],
+    },
+    ListXattrs {
+        inode: InodeId,
+    },
+    SetXattr {
+        inode: InodeId,
+        name: &'a [u8],
+        value: &'a [u8],
+        mode: XattrSetMode,
+    },
+    RemoveXattr {
+        inode: InodeId,
+        name: &'a [u8],
+    },
+    GetFileFlags {
+        inode: InodeId,
+    },
+    SetFileFlags {
+        inode: InodeId,
+        flags: u32,
+    },
+    SetMode {
+        inode: InodeId,
+        mode: u16,
+    },
+    SetAttributes {
+        inode: InodeId,
+        update: InodeAttributesUpdate,
+    },
+    Link {
+        inode: InodeId,
+        new_parent: InodeId,
+        new_name: &'a [u8],
+    },
+    Symlink {
+        parent: InodeId,
+        name: &'a [u8],
+        target: &'a [u8],
+    },
+    Readlink {
+        inode: InodeId,
+    },
     Create {
         parent: InodeId,
         name: &'a [u8],
@@ -431,10 +543,25 @@ pub enum Operation<'a> {
         exclusive: bool,
         truncate: bool,
     },
+    CreateWithUmask {
+        parent: InodeId,
+        name: &'a [u8],
+        mode: u16,
+        umask: u16,
+        options: OpenOptions,
+        exclusive: bool,
+        truncate: bool,
+    },
     Mkdir {
         parent: InodeId,
         name: &'a [u8],
         mode: u16,
+    },
+    MkdirWithUmask {
+        parent: InodeId,
+        name: &'a [u8],
+        mode: u16,
+        umask: u16,
     },
     Open {
         inode: InodeId,
@@ -539,6 +666,9 @@ pub enum Reply {
     Created { entry: Entry, handle: HandleId },
     Opened(HandleId),
     Data(Vec<u8>),
+    LinkTarget(Vec<u8>),
+    Xattr(Vec<u8>),
+    FileFlags(u32),
     Written { bytes: u32, mutation_sequence: u64 },
     Cloned { bytes: u64, mutation_sequence: u64 },
     Offset(u64),
@@ -563,6 +693,9 @@ pub enum PosixError {
     OutOfMemory,
     NoLocks,
     NoSuchAddress,
+    NoData,
+    TooBig,
+    PermissionDenied,
     Unsupported,
     Io,
     ReadOnly,
@@ -654,6 +787,8 @@ pub struct CommittedInode {
     gid: u32,
     link_count: u32,
     mutation_sequence: u64,
+    metadata: Arc<InodeMetadata>,
+    times: PosixTimes,
     file: Arc<dyn CommittedFile>,
 }
 
@@ -665,6 +800,19 @@ pub struct CommittedDirectory {
     gid: u32,
     link_count: u32,
     mutation_sequence: u64,
+    metadata: Arc<InodeMetadata>,
+    times: PosixTimes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedSymlink {
+    inode: InodeId,
+    uid: u32,
+    gid: u32,
+    link_count: u32,
+    mutation_sequence: u64,
+    times: PosixTimes,
+    target: Arc<[u8]>,
 }
 
 impl CommittedDirectory {
@@ -692,7 +840,35 @@ impl CommittedDirectory {
             gid,
             link_count,
             mutation_sequence,
+            metadata: Arc::new(InodeMetadata::default()),
+            times: PosixTimes::default(),
         })
+    }
+
+    /// Describes one verified committed directory with extended metadata.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the same malformed directory identity as [`Self::new`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_metadata(
+        inode: u64,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        link_count: u32,
+        mutation_sequence: u64,
+        metadata: InodeMetadata,
+    ) -> Result<Self, PosixError> {
+        let mut committed = Self::new(inode, mode, uid, gid, link_count, mutation_sequence)?;
+        committed.metadata = Arc::new(metadata);
+        Ok(committed)
+    }
+
+    #[must_use]
+    pub fn with_times(mut self, times: PosixTimes) -> Self {
+        self.times = times;
+        self
     }
 }
 
@@ -724,7 +900,67 @@ impl CommittedInode {
             gid,
             link_count,
             mutation_sequence,
+            metadata: Arc::new(InodeMetadata::default()),
+            times: PosixTimes::default(),
             file,
+        })
+    }
+
+    /// Describes one verified committed regular inode with extended metadata.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the same malformed inode state as [`Self::new`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_metadata(
+        inode: u64,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        link_count: u32,
+        mutation_sequence: u64,
+        metadata: InodeMetadata,
+        file: Arc<dyn CommittedFile>,
+    ) -> Result<Self, PosixError> {
+        let mut committed = Self::new(inode, mode, uid, gid, link_count, mutation_sequence, file)?;
+        committed.metadata = Arc::new(metadata);
+        Ok(committed)
+    }
+
+    #[must_use]
+    pub fn with_times(mut self, times: PosixTimes) -> Self {
+        self.times = times;
+        self
+    }
+}
+
+impl CommittedSymlink {
+    /// Describes one verified committed symbolic link.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid inode identities, link counts, and target lengths.
+    pub fn new(
+        inode: u64,
+        uid: u32,
+        gid: u32,
+        link_count: u32,
+        mutation_sequence: u64,
+        times: PosixTimes,
+        target: Vec<u8>,
+    ) -> Result<Self, PosixError> {
+        let inode = InodeId::new(inode).ok_or(PosixError::InvalidArgument)?;
+        if inode <= ROOT_INODE || link_count == 0 || target.is_empty() || target.len() > 4_096 {
+            return Err(PosixError::InvalidArgument);
+        }
+        Ok(Self {
+            inode,
+            uid,
+            gid,
+            link_count,
+            mutation_sequence,
+            times,
+            target: Arc::from(target),
         })
     }
 }
@@ -784,6 +1020,8 @@ pub struct CommitInode {
     gid: u32,
     link_count: u32,
     mutation_sequence: u64,
+    metadata: Arc<InodeMetadata>,
+    times: PosixTimes,
     file: Arc<dyn CommittedFile>,
     frozen_epoch: Option<Arc<versioned_file::FrozenEpoch>>,
 }
@@ -797,6 +1035,19 @@ pub struct CommitDirectory {
     gid: u32,
     link_count: u32,
     mutation_sequence: u64,
+    metadata: Arc<InodeMetadata>,
+    times: PosixTimes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitSymlink {
+    inode: InodeId,
+    uid: u32,
+    gid: u32,
+    link_count: u32,
+    mutation_sequence: u64,
+    times: PosixTimes,
+    target: Arc<[u8]>,
 }
 
 impl CommitDirectory {
@@ -829,6 +1080,47 @@ impl CommitDirectory {
     pub const fn mutation_sequence(&self) -> u64 {
         self.mutation_sequence
     }
+
+    #[must_use]
+    pub fn metadata(&self) -> &InodeMetadata {
+        &self.metadata
+    }
+
+    #[must_use]
+    pub const fn times(&self) -> PosixTimes {
+        self.times
+    }
+}
+
+impl CommitSymlink {
+    #[must_use]
+    pub const fn inode(&self) -> InodeId {
+        self.inode
+    }
+    #[must_use]
+    pub const fn uid(&self) -> u32 {
+        self.uid
+    }
+    #[must_use]
+    pub const fn gid(&self) -> u32 {
+        self.gid
+    }
+    #[must_use]
+    pub const fn link_count(&self) -> u32 {
+        self.link_count
+    }
+    #[must_use]
+    pub const fn mutation_sequence(&self) -> u64 {
+        self.mutation_sequence
+    }
+    #[must_use]
+    pub const fn times(&self) -> PosixTimes {
+        self.times
+    }
+    #[must_use]
+    pub fn target(&self) -> &[u8] {
+        &self.target
+    }
 }
 
 impl CommitInode {
@@ -860,6 +1152,16 @@ impl CommitInode {
     #[must_use]
     pub const fn mutation_sequence(&self) -> u64 {
         self.mutation_sequence
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &InodeMetadata {
+        &self.metadata
+    }
+
+    #[must_use]
+    pub const fn times(&self) -> PosixTimes {
+        self.times
     }
 
     #[must_use]
@@ -963,8 +1265,10 @@ pub struct NamespaceCommit {
     inode_reservation_end: u64,
     inode_allocation_cursor: u64,
     namespace_mutation_sequence: u64,
+    root: CommitDirectory,
     inodes: Vec<CommitInode>,
     directories: Vec<CommitDirectory>,
+    symlinks: Vec<CommitSymlink>,
     entries: Vec<CommitEntry>,
 }
 
@@ -990,6 +1294,11 @@ impl NamespaceCommit {
     }
 
     #[must_use]
+    pub const fn root(&self) -> &CommitDirectory {
+        &self.root
+    }
+
+    #[must_use]
     pub fn inodes(&self) -> &[CommitInode] {
         &self.inodes
     }
@@ -997,6 +1306,11 @@ impl NamespaceCommit {
     #[must_use]
     pub fn directories(&self) -> &[CommitDirectory] {
         &self.directories
+    }
+
+    #[must_use]
+    pub fn symlinks(&self) -> &[CommitSymlink] {
+        &self.symlinks
     }
 
     #[must_use]
@@ -1029,8 +1343,14 @@ pub struct CommittedNamespaceSnapshot {
     next_inode: u64,
     inode_reservation_end: u64,
     namespace_mutation_sequence: u64,
+    root_mode: u16,
+    root_uid: u32,
+    root_gid: u32,
+    root_metadata: Arc<InodeMetadata>,
+    root_times: PosixTimes,
     inodes: Vec<CommittedInode>,
     directories: Vec<CommittedDirectory>,
+    symlinks: Vec<CommittedSymlink>,
     entries: Vec<CommittedEntry>,
 }
 
@@ -1059,8 +1379,14 @@ impl CommittedNamespaceSnapshot {
             next_inode,
             inode_reservation_end,
             namespace_mutation_sequence,
+            root_mode: 0o755,
+            root_uid: 0,
+            root_gid: 0,
+            root_metadata: Arc::new(InodeMetadata::default()),
+            root_times: PosixTimes::default(),
             inodes,
             directories: Vec::new(),
+            symlinks: Vec::new(),
             entries,
         })
     }
@@ -1088,6 +1414,33 @@ impl CommittedNamespaceSnapshot {
         snapshot.directories = directories;
         Ok(snapshot)
     }
+
+    /// Installs the verified metadata of the implicit root directory.
+    #[must_use]
+    pub fn with_root_metadata(
+        mut self,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        metadata: InodeMetadata,
+    ) -> Self {
+        self.root_mode = mode & 0o7777;
+        self.root_uid = uid;
+        self.root_gid = gid;
+        self.root_metadata = Arc::new(metadata);
+        self
+    }
+
+    #[must_use]
+    pub fn with_posix_state(
+        mut self,
+        root_times: PosixTimes,
+        symlinks: Vec<CommittedSymlink>,
+    ) -> Self {
+        self.root_times = root_times;
+        self.symlinks = symlinks;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -1098,21 +1451,29 @@ struct InodeState {
     gid: u32,
     link_count: u32,
     mutation_sequence: u64,
+    metadata: Arc<InodeMetadata>,
+    times: PosixTimes,
+    symlink_target: Option<Arc<[u8]>>,
     data: VersionedFile,
 }
 
 impl InodeState {
     fn attributes(&self, inode: InodeId) -> FileAttr {
+        let (size, allocated_bytes) = match &self.symlink_target {
+            Some(target) => (u64::try_from(target.len()).unwrap_or(u64::MAX), 0),
+            None => (self.data.logical_size(), self.data.allocated_bytes()),
+        };
         FileAttr {
             inode,
-            size: self.data.logical_size(),
-            allocated_bytes: self.data.allocated_bytes(),
+            size,
+            allocated_bytes,
             kind: self.kind,
             mode: self.mode,
             uid: self.uid,
             gid: self.gid,
             link_count: self.link_count,
             mutation_sequence: self.mutation_sequence,
+            times: self.times,
         }
     }
 }
@@ -1879,6 +2240,7 @@ struct CreateRequest<'a> {
     parent: InodeId,
     name: &'a [u8],
     mode: u16,
+    umask: u16,
     options: OpenOptions,
     exclusive: bool,
     truncate: bool,
@@ -2000,7 +2362,6 @@ impl Namespace {
             config.maximum_name_bytes > 0,
             "ASSERT: maximum name length must be nonzero"
         );
-
         let root = Arc::new(Inode {
             observer_order: Mutex::new(()),
             state: RwLock::new(InodeState {
@@ -2010,6 +2371,9 @@ impl Namespace {
                 gid: 0,
                 link_count: 2,
                 mutation_sequence: 0,
+                metadata: Arc::new(InodeMetadata::default()),
+                times: PosixTimes::now(),
+                symlink_target: None,
                 data: VersionedFile::new_empty(),
             }),
         });
@@ -2096,15 +2460,20 @@ impl Namespace {
             config.maximum_name_bytes > 0,
             "ASSERT: maximum name length must be nonzero"
         );
+        let root_times = snapshot.root_times;
+        let committed_symlinks = snapshot.symlinks;
         let root = Arc::new(Inode {
             observer_order: Mutex::new(()),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
-                mode: 0o755,
-                uid: 0,
-                gid: 0,
+                mode: snapshot.root_mode,
+                uid: snapshot.root_uid,
+                gid: snapshot.root_gid,
                 link_count: 2,
                 mutation_sequence: snapshot.namespace_mutation_sequence,
+                metadata: snapshot.root_metadata,
+                times: root_times,
+                symlink_target: None,
                 data: VersionedFile::new_empty(),
             }),
         });
@@ -2127,6 +2496,9 @@ impl Namespace {
                     gid: committed.gid,
                     link_count: committed.link_count,
                     mutation_sequence: committed.mutation_sequence,
+                    metadata: committed.metadata,
+                    times: committed.times,
+                    symlink_target: None,
                     data: VersionedFile::from_committed(
                         committed.file,
                         committed.mutation_sequence,
@@ -2151,6 +2523,33 @@ impl Namespace {
                     gid: committed.gid,
                     link_count: committed.link_count,
                     mutation_sequence: committed.mutation_sequence,
+                    metadata: committed.metadata,
+                    times: committed.times,
+                    symlink_target: None,
+                    data: VersionedFile::new_empty(),
+                }),
+            });
+            if inodes.insert(inode, object).is_some() {
+                return Err(PosixError::InvalidArgument);
+            }
+        }
+        for committed in committed_symlinks {
+            if committed.inode.get() >= snapshot.next_inode {
+                return Err(PosixError::InvalidArgument);
+            }
+            let inode = committed.inode;
+            let object = Arc::new(Inode {
+                observer_order: Mutex::new(()),
+                state: RwLock::new(InodeState {
+                    kind: FileKind::Symlink,
+                    mode: 0o777,
+                    uid: committed.uid,
+                    gid: committed.gid,
+                    link_count: committed.link_count,
+                    mutation_sequence: committed.mutation_sequence,
+                    metadata: Arc::new(InodeMetadata::default()),
+                    times: committed.times,
+                    symlink_target: Some(committed.target),
                     data: VersionedFile::new_empty(),
                 }),
             });
@@ -2206,7 +2605,7 @@ impl Namespace {
                 .read()
                 .expect("ASSERT: new committed inode lock poisoned");
             match state.kind {
-                FileKind::Regular => {
+                FileKind::Regular | FileKind::Symlink => {
                     if observed_links.get(&inode).copied() != Some(state.link_count) {
                         return Err(PosixError::InvalidArgument);
                     }
@@ -2503,6 +2902,29 @@ impl Namespace {
         directories
             .try_reserve_exact(catalog.inodes.len().saturating_sub(1))
             .map_err(|_| PosixError::OutOfMemory)?;
+        let mut symlinks = Vec::new();
+        symlinks
+            .try_reserve_exact(catalog.inodes.len().saturating_sub(1))
+            .map_err(|_| PosixError::OutOfMemory)?;
+        let root = {
+            let state = catalog
+                .inodes
+                .get(&ROOT_INODE)
+                .expect("ASSERT: root inode exists")
+                .state
+                .read()
+                .expect("ASSERT: root inode lock poisoned");
+            CommitDirectory {
+                inode: ROOT_INODE,
+                mode: state.mode,
+                uid: state.uid,
+                gid: state.gid,
+                link_count: state.link_count,
+                mutation_sequence: state.mutation_sequence,
+                metadata: Arc::clone(&state.metadata),
+                times: state.times,
+            }
+        };
         for (&inode, object) in &catalog.inodes {
             if inode == ROOT_INODE {
                 continue;
@@ -2519,6 +2941,25 @@ impl Namespace {
                     gid: state.gid,
                     link_count: state.link_count,
                     mutation_sequence: state.mutation_sequence,
+                    metadata: Arc::clone(&state.metadata),
+                    times: state.times,
+                });
+                continue;
+            }
+            if state.kind == FileKind::Symlink {
+                symlinks.push(CommitSymlink {
+                    inode,
+                    uid: state.uid,
+                    gid: state.gid,
+                    link_count: state.link_count,
+                    mutation_sequence: state.mutation_sequence,
+                    times: state.times,
+                    target: Arc::clone(
+                        state
+                            .symlink_target
+                            .as_ref()
+                            .expect("ASSERT: symlink has target"),
+                    ),
                 });
                 continue;
             }
@@ -2533,19 +2974,23 @@ impl Namespace {
                 gid: state.gid,
                 link_count: state.link_count,
                 mutation_sequence: state.mutation_sequence,
+                metadata: Arc::clone(&state.metadata),
+                times: state.times,
                 file,
                 frozen_epoch,
             });
         }
-        assert_commit_reachability(&inodes, &directories, &entries);
+        assert_commit_reachability(&inodes, &directories, &symlinks, &entries);
 
         let commit = NamespaceCommit {
             token,
             inode_reservation_end: catalog.inode_reservation_end,
             inode_allocation_cursor: catalog.next_inode,
             namespace_mutation_sequence,
+            root,
             inodes,
             directories,
+            symlinks,
             entries,
         };
         catalog.next_commit_token = next_commit_token;
@@ -2653,6 +3098,32 @@ impl Namespace {
         match operation {
             Operation::Lookup { parent, name } => self.lookup(parent, name),
             Operation::GetAttr { inode } => self.getattr(inode),
+            Operation::GetXattr { inode, name } => self.get_xattr(inode, name),
+            Operation::ListXattrs { inode } => self.list_xattrs(inode),
+            Operation::SetXattr {
+                inode,
+                name,
+                value,
+                mode,
+            } => self.set_xattr(context, inode, name, value, mode),
+            Operation::RemoveXattr { inode, name } => self.remove_xattr(context, inode, name),
+            Operation::GetFileFlags { inode } => self.get_file_flags(inode),
+            Operation::SetFileFlags { inode, flags } => self.set_file_flags(context, inode, flags),
+            Operation::SetMode { inode, mode } => self.set_mode(context, inode, mode),
+            Operation::SetAttributes { inode, update } => {
+                self.set_attributes(context, inode, update)
+            }
+            Operation::Link {
+                inode,
+                new_parent,
+                new_name,
+            } => self.link(context, inode, new_parent, new_name),
+            Operation::Symlink {
+                parent,
+                name,
+                target,
+            } => self.symlink(context, parent, name, target),
+            Operation::Readlink { inode } => self.readlink(inode),
             Operation::Create {
                 parent,
                 name,
@@ -2665,11 +3136,36 @@ impl Namespace {
                 parent,
                 name,
                 mode,
+                umask: 0,
                 options,
                 exclusive,
                 truncate,
             }),
-            Operation::Mkdir { parent, name, mode } => self.mkdir(context, parent, name, mode),
+            Operation::CreateWithUmask {
+                parent,
+                name,
+                mode,
+                umask,
+                options,
+                exclusive,
+                truncate,
+            } => self.create_and_track_writer(CreateRequest {
+                context,
+                parent,
+                name,
+                mode,
+                umask,
+                options,
+                exclusive,
+                truncate,
+            }),
+            Operation::Mkdir { parent, name, mode } => self.mkdir(context, parent, name, mode, 0),
+            Operation::MkdirWithUmask {
+                parent,
+                name,
+                mode,
+                umask,
+            } => self.mkdir(context, parent, name, mode, umask),
             Operation::Open {
                 inode,
                 options,
@@ -2852,6 +3348,415 @@ impl Namespace {
         Ok(Reply::Attr(state.attributes(inode)))
     }
 
+    fn get_xattr(&self, inode: InodeId, name: &[u8]) -> Result<Reply, PosixError> {
+        let object = self.resolve_inode(inode)?;
+        let state = object.state.read().expect("ASSERT: inode lock poisoned");
+        Ok(Reply::Xattr(state.metadata.get_xattr(name)?))
+    }
+
+    fn list_xattrs(&self, inode: InodeId) -> Result<Reply, PosixError> {
+        let object = self.resolve_inode(inode)?;
+        let state = object.state.read().expect("ASSERT: inode lock poisoned");
+        Ok(Reply::Xattr(state.metadata.list_xattrs()?))
+    }
+
+    fn set_xattr(
+        &self,
+        context: RequestContext,
+        inode: InodeId,
+        name: &[u8],
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> Result<Reply, PosixError> {
+        self.mutate_metadata(context, inode, name, |state| {
+            let metadata = Arc::make_mut(&mut state.metadata);
+            if let Some(access_mode) = metadata.set_xattr(state.kind, name, value, mode)? {
+                state.mode = state.mode & !0o777 | access_mode;
+            }
+            Ok(())
+        })
+    }
+
+    fn remove_xattr(
+        &self,
+        context: RequestContext,
+        inode: InodeId,
+        name: &[u8],
+    ) -> Result<Reply, PosixError> {
+        self.mutate_metadata(context, inode, name, |state| {
+            Arc::make_mut(&mut state.metadata).remove_xattr(name)
+        })
+    }
+
+    fn get_file_flags(&self, inode: InodeId) -> Result<Reply, PosixError> {
+        let object = self.resolve_inode(inode)?;
+        let state = object.state.read().expect("ASSERT: inode lock poisoned");
+        Ok(Reply::FileFlags(state.metadata.file_flags()))
+    }
+
+    fn set_file_flags(
+        &self,
+        context: RequestContext,
+        inode: InodeId,
+        flags: u32,
+    ) -> Result<Reply, PosixError> {
+        if context.uid != 0 {
+            return Err(PosixError::PermissionDenied);
+        }
+        let _admission = self.require_mutation_admission()?;
+        let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        let object = catalog
+            .inodes
+            .get(&inode)
+            .cloned()
+            .ok_or(PosixError::NoEntry)?;
+        let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
+        if state.metadata.file_flags() == flags {
+            return Ok(Reply::Empty);
+        }
+        Arc::make_mut(&mut state.metadata).set_file_flags(flags)?;
+        state.times.ctime = PosixTimestamp::now();
+        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
+        state.mutation_sequence = if inode == ROOT_INODE {
+            next_namespace_sequence
+        } else {
+            state
+                .mutation_sequence
+                .checked_add(1)
+                .ok_or(PosixError::NoSpace)?
+        };
+        if state.kind == FileKind::Regular {
+            let mutation_sequence = state.mutation_sequence;
+            state.data.advance_mutation_sequence(mutation_sequence);
+        }
+        drop(state);
+        if inode != ROOT_INODE {
+            install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        }
+        Ok(Reply::Empty)
+    }
+
+    fn set_mode(
+        &self,
+        context: RequestContext,
+        inode: InodeId,
+        mode: u16,
+    ) -> Result<Reply, PosixError> {
+        let _admission = self.require_mutation_admission()?;
+        let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        let object = catalog
+            .inodes
+            .get(&inode)
+            .cloned()
+            .ok_or(PosixError::NoEntry)?;
+        let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
+        if context.uid != 0 && context.uid != state.uid {
+            return Err(PosixError::PermissionDenied);
+        }
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
+        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
+        let next_inode_sequence = if inode == ROOT_INODE {
+            next_namespace_sequence
+        } else {
+            state
+                .mutation_sequence
+                .checked_add(1)
+                .ok_or(PosixError::NoSpace)?
+        };
+        state.mode = Arc::make_mut(&mut state.metadata).chmod(mode)?;
+        state.times.ctime = PosixTimestamp::now();
+        if state.kind == FileKind::Regular {
+            state.data.advance_mutation_sequence(next_inode_sequence);
+        }
+        state.mutation_sequence = next_inode_sequence;
+        let attr = state.attributes(inode);
+        drop(state);
+        if inode != ROOT_INODE {
+            install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        }
+        Ok(Reply::Attr(attr))
+    }
+
+    fn set_attributes(
+        &self,
+        context: RequestContext,
+        inode: InodeId,
+        update: InodeAttributesUpdate,
+    ) -> Result<Reply, PosixError> {
+        if update.mode.is_none()
+            && update.uid.is_none()
+            && update.gid.is_none()
+            && update.atime.is_none()
+            && update.mtime.is_none()
+        {
+            return self.getattr(inode);
+        }
+        if update
+            .atime
+            .is_some_and(|time| time.nanoseconds >= 1_000_000_000)
+            || update
+                .mtime
+                .is_some_and(|time| time.nanoseconds >= 1_000_000_000)
+        {
+            return Err(PosixError::InvalidArgument);
+        }
+        let _admission = self.require_mutation_admission()?;
+        let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        let object = catalog
+            .inodes
+            .get(&inode)
+            .cloned()
+            .ok_or(PosixError::NoEntry)?;
+        let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
+        if context.uid != 0 {
+            if context.uid != state.uid || update.uid.is_some() {
+                return Err(PosixError::PermissionDenied);
+            }
+            if update.gid.is_some_and(|gid| gid != context.gid) {
+                return Err(PosixError::PermissionDenied);
+            }
+        }
+        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
+        let next_inode_sequence = if inode == ROOT_INODE {
+            next_namespace_sequence
+        } else {
+            state
+                .mutation_sequence
+                .checked_add(1)
+                .ok_or(PosixError::NoSpace)?
+        };
+        if let Some(mode) = update.mode {
+            state.mode = Arc::make_mut(&mut state.metadata).chmod(mode)?;
+        }
+        if let Some(uid) = update.uid {
+            state.uid = uid;
+        }
+        if let Some(gid) = update.gid {
+            state.gid = gid;
+        }
+        if update.uid.is_some() || update.gid.is_some() {
+            state.mode &= !0o6000;
+        }
+        if let Some(atime) = update.atime {
+            state.times.atime = atime;
+        }
+        if let Some(mtime) = update.mtime {
+            state.times.mtime = mtime;
+        }
+        state.times.ctime = PosixTimestamp::now();
+        if state.kind == FileKind::Regular {
+            state.data.advance_mutation_sequence(next_inode_sequence);
+        }
+        state.mutation_sequence = next_inode_sequence;
+        let attr = state.attributes(inode);
+        drop(state);
+        if inode != ROOT_INODE {
+            install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        }
+        Ok(Reply::Attr(attr))
+    }
+
+    fn link(
+        &self,
+        context: RequestContext,
+        inode: InodeId,
+        new_parent: InodeId,
+        new_name: &[u8],
+    ) -> Result<Reply, PosixError> {
+        self.validate_name(new_name)?;
+        let _admission = self.require_mutation_admission()?;
+        let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        validate_directory(&catalog, new_parent)?;
+        validate_mutable_directory(&catalog, new_parent)?;
+        let key = (new_parent, new_name.to_vec());
+        if catalog.entries.contains_key(&key) {
+            return Err(PosixError::Exists);
+        }
+        let object = catalog
+            .inodes
+            .get(&inode)
+            .cloned()
+            .ok_or(PosixError::NoEntry)?;
+        let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
+        if state.kind == FileKind::Directory {
+            return Err(PosixError::PermissionDenied);
+        }
+        if context.uid != 0 && context.uid != state.uid {
+            return Err(PosixError::PermissionDenied);
+        }
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
+        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
+        let next_inode_sequence = state
+            .mutation_sequence
+            .checked_add(1)
+            .ok_or(PosixError::NoSpace)?;
+        state.link_count = state.link_count.checked_add(1).ok_or(PosixError::NoSpace)?;
+        state.mutation_sequence = next_inode_sequence;
+        state.times.ctime = PosixTimestamp::now();
+        if state.kind == FileKind::Regular {
+            state.data.advance_mutation_sequence(next_inode_sequence);
+        }
+        let attr = state.attributes(inode);
+        drop(state);
+        assert!(catalog.entries.insert(key, inode).is_none());
+        install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        acquire_lookup(&mut catalog, inode, 1)?;
+        Ok(Reply::Entry(Entry { attr }))
+    }
+
+    fn symlink(
+        &self,
+        context: RequestContext,
+        parent: InodeId,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<Reply, PosixError> {
+        self.validate_name(name)?;
+        if target.is_empty() || target.len() > 4_096 {
+            return Err(PosixError::InvalidArgument);
+        }
+        let _admission = self.require_mutation_admission()?;
+        let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        validate_directory(&catalog, parent)?;
+        validate_mutable_directory(&catalog, parent)?;
+        let key = (parent, name.to_vec());
+        if catalog.entries.contains_key(&key) {
+            return Err(PosixError::Exists);
+        }
+        let mut copied = Vec::new();
+        copied
+            .try_reserve_exact(target.len())
+            .map_err(|_| PosixError::OutOfMemory)?;
+        copied.extend_from_slice(target);
+        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
+        let inode = allocate_inode(&mut catalog)?;
+        let object = Arc::new(Inode {
+            observer_order: Mutex::new(()),
+            state: RwLock::new(InodeState {
+                kind: FileKind::Symlink,
+                mode: 0o777,
+                uid: context.uid,
+                gid: context.gid,
+                link_count: 1,
+                mutation_sequence: 0,
+                metadata: Arc::new(InodeMetadata::default()),
+                times: PosixTimes::now(),
+                symlink_target: Some(Arc::from(copied)),
+                data: VersionedFile::new_empty(),
+            }),
+        });
+        let attr = object
+            .state
+            .read()
+            .expect("ASSERT: symlink lock poisoned")
+            .attributes(inode);
+        assert!(catalog.inodes.insert(inode, object).is_none());
+        assert!(catalog.lookup_counts.insert(inode, 1).is_none());
+        assert!(catalog.entries.insert(key, inode).is_none());
+        install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        Ok(Reply::Entry(Entry { attr }))
+    }
+
+    fn readlink(&self, inode: InodeId) -> Result<Reply, PosixError> {
+        let object = self.resolve_inode(inode)?;
+        let state = object.state.read().expect("ASSERT: inode lock poisoned");
+        let target = state
+            .symlink_target
+            .as_ref()
+            .ok_or(PosixError::InvalidArgument)?;
+        let target = target.to_vec();
+        drop(state);
+        self.update_relatime(inode, &object);
+        Ok(Reply::LinkTarget(target))
+    }
+
+    fn update_relatime(&self, inode: InodeId, object: &Arc<Inode>) {
+        if !self.mutations_supported {
+            return;
+        }
+        let now = PosixTimestamp::now();
+        let should_update = {
+            let state = object.state.read().expect("ASSERT: inode lock poisoned");
+            relatime_due(state.times, now)
+        };
+        if !should_update {
+            return;
+        }
+        let Ok(_admission) = self.require_mutation_admission() else {
+            return;
+        };
+        let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        let Some(live) = catalog.inodes.get(&inode) else {
+            return;
+        };
+        if !Arc::ptr_eq(live, object) {
+            return;
+        }
+        let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
+        if !relatime_due(state.times, now) {
+            return;
+        }
+        let Ok(next_namespace_sequence) = next_root_mutation_sequence(&catalog) else {
+            return;
+        };
+        state.times.atime = now;
+        if inode == ROOT_INODE {
+            state.mutation_sequence = next_namespace_sequence;
+        }
+        drop(state);
+        if inode != ROOT_INODE {
+            install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        }
+    }
+
+    fn mutate_metadata(
+        &self,
+        context: RequestContext,
+        inode: InodeId,
+        name: &[u8],
+        mutation: impl FnOnce(&mut InodeState) -> Result<(), PosixError>,
+    ) -> Result<Reply, PosixError> {
+        let _admission = self.require_mutation_admission()?;
+        let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
+        let object = catalog
+            .inodes
+            .get(&inode)
+            .cloned()
+            .ok_or(PosixError::NoEntry)?;
+        let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
+        authorize_xattr_mutation(context, &state, name)?;
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
+        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
+        let next_inode_sequence = if inode == ROOT_INODE {
+            next_namespace_sequence
+        } else {
+            state
+                .mutation_sequence
+                .checked_add(1)
+                .ok_or(PosixError::NoSpace)?
+        };
+        mutation(&mut state)?;
+        state.times.ctime = PosixTimestamp::now();
+        if state.kind == FileKind::Regular {
+            state.data.advance_mutation_sequence(next_inode_sequence);
+        }
+        state.mutation_sequence = next_inode_sequence;
+        drop(state);
+        if inode != ROOT_INODE {
+            install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        }
+        Ok(Reply::Empty)
+    }
+
     fn create(&self, request: CreateRequest<'_>) -> Result<Reply, PosixError> {
         self.validate_name(request.name)?;
         let _admission = self.require_mutation_admission()?;
@@ -2875,6 +3780,7 @@ impl Namespace {
                 observer.as_deref(),
             );
         }
+        validate_mutable_directory(&catalog, request.parent)?;
         create_new_file(&mut catalog, key, request)
     }
 
@@ -2884,6 +3790,7 @@ impl Namespace {
         parent: InodeId,
         name: &[u8],
         mode: u16,
+        umask: u16,
     ) -> Result<Reply, PosixError> {
         self.validate_name(name)?;
         let _admission = self.require_mutation_admission()?;
@@ -2893,6 +3800,7 @@ impl Namespace {
         if catalog.entries.contains_key(&key) {
             return Err(PosixError::Exists);
         }
+        validate_mutable_directory(&catalog, parent)?;
         let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
         let parent_object = catalog
             .inodes
@@ -2915,16 +3823,22 @@ impl Namespace {
                 .checked_add(1)
                 .ok_or(PosixError::NoSpace)?
         };
+        let (mode, metadata) = parent_state
+            .metadata
+            .for_child(FileKind::Directory, mode, umask)?;
         let inode = allocate_inode(&mut catalog)?;
         let object = Arc::new(Inode {
             observer_order: Mutex::new(()),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
-                mode: mode & 0o7777,
+                mode,
                 uid: context.uid,
                 gid: context.gid,
                 link_count: 2,
                 mutation_sequence: 0,
+                metadata: Arc::new(metadata),
+                times: PosixTimes::now(),
+                symlink_target: None,
                 data: VersionedFile::new_empty(),
             }),
         });
@@ -2973,6 +3887,12 @@ impl Namespace {
         if state.kind == FileKind::Directory {
             return Err(PosixError::IsDirectory);
         }
+        if state.kind != FileKind::Regular {
+            return Err(PosixError::InvalidArgument);
+        }
+        if (options.access != AccessMode::ReadOnly || truncate) && state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
         if truncate && options.access == AccessMode::ReadOnly {
             return Err(PosixError::BadHandle);
         }
@@ -2996,6 +3916,9 @@ impl Namespace {
                 self.dirty_payload.replace(dirty_before, dirty_after);
             }
             state.mutation_sequence = sequence;
+            let now = PosixTimestamp::now();
+            state.times.mtime = now;
+            state.times.ctime = now;
         }
         drop(state);
         assert!(
@@ -3038,7 +3961,9 @@ impl Namespace {
         );
         let plan = state.data.plan_read(offset, length)?;
         drop(state);
-        Ok(Reply::Data(plan.execute()?))
+        let bytes = plan.execute()?;
+        self.update_relatime(inode, &object);
+        Ok(Reply::Data(bytes))
     }
 
     fn write(
@@ -3081,6 +4006,9 @@ impl Namespace {
                 mutation_sequence: state.mutation_sequence,
             });
         }
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
         let offset = if open.options.append {
             state.data.logical_size()
         } else {
@@ -3107,6 +4035,9 @@ impl Namespace {
             self.dirty_payload.replace(dirty_before, dirty_after);
         }
         state.mutation_sequence = next_sequence;
+        let now = PosixTimestamp::now();
+        state.times.mtime = now;
+        state.times.ctime = now;
         drop(state);
         let externalized = self
             .mutation_observer
@@ -3202,6 +4133,12 @@ impl Namespace {
         if state.kind == FileKind::Directory {
             return Err(PosixError::IsDirectory);
         }
+        if state.kind != FileKind::Regular {
+            return Err(PosixError::InvalidArgument);
+        }
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
         if length == state.data.logical_size() {
             return Ok(Reply::Attr(state.attributes(inode)));
         }
@@ -3216,6 +4153,9 @@ impl Namespace {
             self.dirty_payload.replace(dirty_before, dirty_after);
         }
         state.mutation_sequence = next_sequence;
+        let now = PosixTimestamp::now();
+        state.times.mtime = now;
+        state.times.ctime = now;
         let attr = state.attributes(inode);
         drop(state);
         self.observe_truncate(inode, next_sequence, length);
@@ -3247,6 +4187,9 @@ impl Namespace {
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
         if state.kind != FileKind::Regular {
             return Err(PosixError::IsDirectory);
+        }
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
         }
         let current_size = state.data.logical_size();
         let result_size = match mode {
@@ -3318,6 +4261,9 @@ impl Namespace {
             self.dirty_payload.replace(dirty_before, dirty_after);
         }
         state.mutation_sequence = next_sequence;
+        let now = PosixTimestamp::now();
+        state.times.mtime = now;
+        state.times.ctime = now;
         let attr = state.attributes(inode);
         drop(state);
         self.observe_truncate(inode, next_sequence, result_size);
@@ -3420,6 +4366,9 @@ impl Namespace {
             FileKind::Regular,
             "ASSERT: a file handle must reference a regular inode"
         );
+        if target.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
         let next_sequence = target
             .mutation_sequence
             .checked_add(1)
@@ -3434,6 +4383,9 @@ impl Namespace {
             "ASSERT: a metadata clone must not allocate resident dirty payload"
         );
         target.mutation_sequence = next_sequence;
+        let now = PosixTimestamp::now();
+        target.times.mtime = now;
+        target.times.ctime = now;
         let target_size = target.data.logical_size();
         drop(target);
         self.observe_truncate(target_inode, next_sequence, target_size);
@@ -3676,6 +4628,7 @@ impl Namespace {
         let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, parent)?;
+        validate_mutable_directory(&catalog, parent)?;
         let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
         let key = (parent, name.to_vec());
         let inode = *catalog.entries.get(&key).ok_or(PosixError::NoEntry)?;
@@ -3692,26 +4645,32 @@ impl Namespace {
         if state.kind == FileKind::Directory {
             return Err(PosixError::IsDirectory);
         }
-        assert_eq!(
-            state.link_count, 1,
-            "ASSERT: first slice has exactly one name per regular inode"
-        );
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
         let next_sequence = state
             .mutation_sequence
             .checked_add(1)
             .ok_or(PosixError::NoSpace)?;
+        let final_link = state.link_count == 1;
         let dirty_before = state.data.active_resident_payload_bytes();
-        state.data.advance_mutation_sequence(next_sequence);
-        state.link_count = 0;
+        if state.kind == FileKind::Regular {
+            state.data.advance_mutation_sequence(next_sequence);
+        }
+        state.link_count -= 1;
         state.mutation_sequence = next_sequence;
-        self.dirty_payload.replace(dirty_before, 0);
+        state.times.ctime = PosixTimestamp::now();
+        if final_link && state.kind == FileKind::Regular {
+            self.dirty_payload.replace(dirty_before, 0);
+        }
         drop(state);
         let removed = catalog.entries.remove(&key);
         assert_eq!(removed, Some(inode), "ASSERT: validated name disappeared");
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
 
         let has_lookup = catalog.lookup_counts.get(&inode).copied().unwrap_or(0) != 0;
-        if !has_lookup
+        if final_link
+            && !has_lookup
             && !catalog
                 .handles
                 .values()
@@ -3724,7 +4683,16 @@ impl Namespace {
             );
         }
         drop(catalog);
-        self.observe_truncate(inode, next_sequence, 0);
+        if final_link
+            && object
+                .state
+                .read()
+                .expect("ASSERT: inode lock poisoned")
+                .kind
+                == FileKind::Regular
+        {
+            self.observe_truncate(inode, next_sequence, 0);
+        }
         drop(observer_order);
         Ok(Reply::Empty)
     }
@@ -3734,6 +4702,7 @@ impl Namespace {
         let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, parent)?;
+        validate_mutable_directory(&catalog, parent)?;
         let key = (parent, name.to_vec());
         let inode = *catalog.entries.get(&key).ok_or(PosixError::NoEntry)?;
         let object = catalog
@@ -3744,6 +4713,9 @@ impl Namespace {
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
         if state.kind != FileKind::Directory {
             return Err(PosixError::NotDirectory);
+        }
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
         }
         if catalog
             .entries
@@ -3824,6 +4796,10 @@ impl Namespace {
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, parent)?;
         validate_directory(&catalog, new_parent)?;
+        validate_mutable_directory(&catalog, parent)?;
+        if parent != new_parent {
+            validate_mutable_directory(&catalog, new_parent)?;
+        }
         let old_key = (parent, name.to_vec());
         let new_key = (new_parent, new_name.to_vec());
         let source_inode = *catalog.entries.get(&old_key).ok_or(PosixError::NoEntry)?;
@@ -3845,6 +4821,31 @@ impl Namespace {
             .read()
             .expect("ASSERT: rename source inode lock poisoned")
             .kind;
+        if catalog
+            .inodes
+            .get(&source_inode)
+            .expect("ASSERT: rename source entry references a live inode")
+            .state
+            .read()
+            .expect("ASSERT: rename source inode lock poisoned")
+            .metadata
+            .is_immutable()
+        {
+            return Err(PosixError::PermissionDenied);
+        }
+        if let Some(replaced_inode) = replaced_inode
+            && catalog
+                .inodes
+                .get(&replaced_inode)
+                .expect("ASSERT: rename target entry references a live inode")
+                .state
+                .read()
+                .expect("ASSERT: rename target inode lock poisoned")
+                .metadata
+                .is_immutable()
+        {
+            return Err(PosixError::PermissionDenied);
+        }
         if source_kind == FileKind::Directory {
             return rename_directory(
                 &mut catalog,
@@ -3879,21 +4880,34 @@ impl Namespace {
             if target.kind == FileKind::Directory {
                 return Err(PosixError::IsDirectory);
             }
-            assert_eq!(
-                target.link_count, 1,
-                "ASSERT: first slice has exactly one name per regular inode"
-            );
             let next_sequence = target
                 .mutation_sequence
                 .checked_add(1)
                 .ok_or(PosixError::NoSpace)?;
+            let final_link = target.link_count == 1;
             let dirty_before = target.data.active_resident_payload_bytes();
-            target.data.advance_mutation_sequence(next_sequence);
-            target.link_count = 0;
+            if target.kind == FileKind::Regular {
+                target.data.advance_mutation_sequence(next_sequence);
+            }
+            target.link_count -= 1;
             target.mutation_sequence = next_sequence;
-            self.dirty_payload.replace(dirty_before, 0);
-            target_sequence = Some((target_inode, next_sequence));
+            target.times.ctime = PosixTimestamp::now();
+            if final_link && target.kind == FileKind::Regular {
+                self.dirty_payload.replace(dirty_before, 0);
+                target_sequence = Some((target_inode, next_sequence));
+            }
         }
+        let source_object = catalog
+            .inodes
+            .get(&source_inode)
+            .cloned()
+            .expect("ASSERT: rename source inode remains live");
+        let mut source = source_object
+            .state
+            .write()
+            .expect("ASSERT: source inode lock poisoned");
+        source.times.ctime = PosixTimestamp::now();
+        drop(source);
         let removed = catalog.entries.remove(&old_key);
         assert_eq!(
             removed,
@@ -3917,7 +4931,15 @@ impl Namespace {
                 .handles
                 .values()
                 .any(|candidate| candidate.inode == target_inode);
-            if !has_lookup && !has_handle {
+            let is_orphan = target_object
+                .as_ref()
+                .expect("ASSERT: replaced target object exists")
+                .state
+                .read()
+                .expect("ASSERT: target inode lock poisoned")
+                .link_count
+                == 0;
+            if is_orphan && !has_lookup && !has_handle {
                 let removed = catalog.inodes.remove(&target_inode);
                 assert!(
                     removed.is_some(),
@@ -4220,6 +5242,20 @@ fn validate_component(config: &NamespaceConfig, name: &[u8]) -> Result<(), Posix
     Ok(())
 }
 
+fn authorize_xattr_mutation(
+    context: RequestContext,
+    state: &InodeState,
+    name: &[u8],
+) -> Result<(), PosixError> {
+    if (name.starts_with(b"trusted.") || name.starts_with(b"security.")) && context.uid != 0 {
+        return Err(PosixError::PermissionDenied);
+    }
+    if context.uid != 0 && context.uid != state.uid {
+        return Err(PosixError::PermissionDenied);
+    }
+    Ok(())
+}
+
 fn root_mutation_sequence(catalog: &Catalog) -> u64 {
     catalog
         .inodes
@@ -4282,6 +5318,7 @@ fn verify_prepared_clone_partition(
 fn assert_commit_reachability(
     inodes: &[CommitInode],
     directories: &[CommitDirectory],
+    symlinks: &[CommitSymlink],
     entries: &[CommitEntry],
 ) {
     let mut observed_links = BTreeMap::<InodeId, u32>::new();
@@ -4293,6 +5330,10 @@ fn assert_commit_reachability(
         .iter()
         .map(|inode| inode.inode)
         .collect::<BTreeSet<_>>();
+    let symlink_ids = symlinks
+        .iter()
+        .map(|symlink| symlink.inode)
+        .collect::<BTreeSet<_>>();
     let mut directory_children = BTreeMap::<InodeId, u32>::new();
     for entry in entries {
         assert!(
@@ -4300,7 +5341,9 @@ fn assert_commit_reachability(
             "ASSERT: committed entry parent must be a directory"
         );
         assert!(
-            file_ids.contains(&entry.target) || directory_ids.contains(&entry.target),
+            file_ids.contains(&entry.target)
+                || directory_ids.contains(&entry.target)
+                || symlink_ids.contains(&entry.target),
             "ASSERT: committed entry target must be reachable"
         );
         let count = observed_links.entry(entry.target).or_default();
@@ -4316,7 +5359,7 @@ fn assert_commit_reachability(
     }
     assert_eq!(
         observed_links.len(),
-        inodes.len() + directories.len(),
+        inodes.len() + directories.len() + symlinks.len(),
         "ASSERT: commit inode and reachable target counts must agree"
     );
     for inode in inodes {
@@ -4324,6 +5367,13 @@ fn assert_commit_reachability(
             observed_links.get(&inode.inode).copied(),
             Some(inode.link_count),
             "ASSERT: commit link count must equal exact namespace reachability"
+        );
+    }
+    for symlink in symlinks {
+        assert_eq!(
+            observed_links.get(&symlink.inode).copied(),
+            Some(symlink.link_count),
+            "ASSERT: symlink link count must equal exact namespace reachability"
         );
     }
     for directory in directories {
@@ -4553,6 +5603,14 @@ fn open_existing_for_create(
     if state.kind == FileKind::Directory {
         return Err(PosixError::IsDirectory);
     }
+    if state.kind != FileKind::Regular {
+        return Err(PosixError::InvalidArgument);
+    }
+    if (request.options.access != AccessMode::ReadOnly || request.truncate)
+        && state.metadata.is_immutable()
+    {
+        return Err(PosixError::PermissionDenied);
+    }
     if request.truncate && request.options.access == AccessMode::ReadOnly {
         return Err(PosixError::BadHandle);
     }
@@ -4584,6 +5642,9 @@ fn open_existing_for_create(
         );
         dirty_payload.replace(dirty_before, dirty_after);
         state.mutation_sequence = sequence;
+        let now = PosixTimestamp::now();
+        state.times.mtime = now;
+        state.times.ctime = now;
     }
     let attr = state.attributes(inode);
     drop(state);
@@ -4619,17 +5680,32 @@ fn create_new_file(
     request: CreateRequest<'_>,
 ) -> Result<Reply, PosixError> {
     let next_namespace_sequence = next_root_mutation_sequence(catalog)?;
+    let parent = catalog
+        .inodes
+        .get(&request.parent)
+        .expect("ASSERT: validated parent directory exists")
+        .state
+        .read()
+        .expect("ASSERT: parent directory lock poisoned");
+    let (mode, metadata) =
+        parent
+            .metadata
+            .for_child(FileKind::Regular, request.mode, request.umask)?;
+    drop(parent);
     let inode = allocate_inode(catalog)?;
     let handle = allocate_handle(catalog)?;
     let object = Arc::new(Inode {
         observer_order: Mutex::new(()),
         state: RwLock::new(InodeState {
             kind: FileKind::Regular,
-            mode: request.mode & 0o7777,
+            mode,
             uid: request.context.uid,
             gid: request.context.gid,
             link_count: 1,
             mutation_sequence: 0,
+            metadata: Arc::new(metadata),
+            times: PosixTimes::now(),
+            symlink_target: None,
             data: VersionedFile::new_empty(),
         }),
     });
@@ -4677,6 +5753,28 @@ fn validate_directory(catalog: &Catalog, inode: InodeId) -> Result<(), PosixErro
     let state = object.state.read().expect("ASSERT: inode lock poisoned");
     if state.kind != FileKind::Directory {
         return Err(PosixError::NotDirectory);
+    }
+    Ok(())
+}
+
+fn relatime_due(times: PosixTimes, now: PosixTimestamp) -> bool {
+    const RELATIME_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
+    times.atime <= times.mtime
+        || times.atime <= times.ctime
+        || now
+            .seconds
+            .checked_sub(RELATIME_INTERVAL_SECONDS)
+            .is_some_and(|cutoff| times.atime.seconds <= cutoff)
+}
+
+fn validate_mutable_directory(catalog: &Catalog, inode: InodeId) -> Result<(), PosixError> {
+    let object = catalog.inodes.get(&inode).ok_or(PosixError::NoEntry)?;
+    let state = object.state.read().expect("ASSERT: inode lock poisoned");
+    if state.kind != FileKind::Directory {
+        return Err(PosixError::NotDirectory);
+    }
+    if state.metadata.is_immutable() {
+        return Err(PosixError::PermissionDenied);
     }
     Ok(())
 }

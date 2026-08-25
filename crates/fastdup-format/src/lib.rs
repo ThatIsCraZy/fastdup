@@ -59,7 +59,8 @@ pub use metadata::{
     MetadataObjectKind, metadata_object_kind,
 };
 pub use namespace::{
-    DurableInode, DurableInodeKind, NAMESPACE_ROOT_HEADER_BYTES, NamespaceEntry, NamespaceRoot,
+    DurableInode, DurableInodeKind, DurableRootMetadata, DurableTimes, DurableTimestamp,
+    DurableXattr, NAMESPACE_ROOT_HEADER_BYTES, NamespaceEntry, NamespaceRoot,
 };
 
 #[cfg(test)]

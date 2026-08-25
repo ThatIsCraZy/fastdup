@@ -976,25 +976,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     self.handle_bmap(request, in_header, data_ref, &fs).await;
                 }
 
-                /*fuse_opcode::FUSE_IOCTL => {
-                    let mut resp_sender = self.response_sender().clone();
-
-                    let ioctl_in = match fuse_ioctl_in::read_from_prefix(data) {
-                        Err(err) => {
-                            error!("deserialize fuse_ioctl_in failed {}", err);
-
-                             self.response_sender2.send_err(&request, libc::EINVAL.into()).await;
-
-                            continue;
-                        }
-
-                        Ok(ioctl_in) => ioctl_in,
-                    };
-
-                    let ioctl_data = (&data[FUSE_IOCTL_IN_SIZE..]).to_vec();
-
-                    let fs = fs.clone();
-                }*/
+                fuse_opcode::FUSE_IOCTL => {
+                    self.handle_ioctl(request, in_header, data_ref, &fs).await;
+                }
                 fuse_opcode::FUSE_POLL => {
                     self.handle_poll(request, in_header, data_ref, &fs).await;
                 }
@@ -2606,7 +2590,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                     let out_header = fuse_out_header {
                         len: (FUSE_OUT_HEADER_SIZE + FUSE_GETXATTR_OUT_SIZE) as u32,
-                        error: libc::ERANGE,
+                        error: 0,
                         unique: request.unique,
                     };
 
@@ -3327,6 +3311,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                     in_header.nodeid,
                     &name,
                     create_in.mode,
+                    create_in._umask,
                     create_in.flags,
                 )
                 .await
@@ -3452,6 +3437,88 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             };
 
             let _ = resp_sender.send2(&out_header, bmap_out.as_bytes()).await;
+        });
+    }
+
+    #[instrument(skip(self, data, fs))]
+    async fn handle_ioctl(
+        &mut self,
+        request: Request,
+        in_header: fuse_in_header,
+        data: &[u8],
+        fs: &Arc<FS>,
+    ) {
+        let (ioctl_in, input) = match fuse_ioctl_in::read_from_prefix(data) {
+            Err(err) => {
+                error!(
+                    "deserialize fuse_ioctl_in failed {}, request unique {}",
+                    err, request.unique
+                );
+                self.response_sender()
+                    .send_err(&request, libc::EINVAL.into())
+                    .await;
+                return;
+            }
+            Ok(value) => value,
+        };
+        if input.len() != ioctl_in.in_size as usize {
+            self.response_sender()
+                .send_err(&request, libc::EINVAL.into())
+                .await;
+            return;
+        }
+        let input = input.to_vec();
+        let resp_sender = self.response_sender().clone();
+        let fs = fs.clone();
+        spawn(debug_span!("fuse_ioctl"), async move {
+            let reply = match fs
+                .ioctl(
+                    request,
+                    in_header.nodeid,
+                    ioctl_in.fh,
+                    ioctl_in.flags,
+                    ioctl_in.cmd,
+                    ioctl_in.arg,
+                    &input,
+                    ioctl_in.out_size,
+                )
+                .await
+            {
+                Err(err) => {
+                    resp_sender.send_err(&request, err).await;
+                    return;
+                }
+                Ok(reply) => reply,
+            };
+            if reply.data.len() > ioctl_in.out_size as usize {
+                resp_sender.send_err(&request, libc::EOVERFLOW.into()).await;
+                return;
+            }
+            let ioctl_out = fuse_ioctl_out {
+                result: reply.result,
+                flags: 0,
+                in_iovs: 0,
+                out_iovs: 0,
+            };
+            let response_length = match FUSE_OUT_HEADER_SIZE
+                .checked_add(FUSE_IOCTL_OUT_SIZE)
+                .and_then(|length| length.checked_add(reply.data.len()))
+                .and_then(|length| u32::try_from(length).ok())
+            {
+                Some(length) => length,
+                None => {
+                    resp_sender.send_err(&request, libc::EOVERFLOW.into()).await;
+                    return;
+                }
+            };
+            let out_header = fuse_out_header {
+                len: response_length,
+                error: 0,
+                unique: request.unique,
+            };
+            resp_sender
+                .send3(&out_header, ioctl_out.as_bytes(), &reply.data)
+                .await;
         });
     }
 

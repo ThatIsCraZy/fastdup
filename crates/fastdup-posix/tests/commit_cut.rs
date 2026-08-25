@@ -481,7 +481,11 @@ fn commit_cut_is_retryable_and_later_write_remains_live_after_install() {
         .expect("cut later write")
         .expect("later write still requires durability");
     assert_ne!(second.token(), first.token());
-    assert_eq!(second.namespace_mutation_sequence(), 1);
+    assert_eq!(
+        second.namespace_mutation_sequence(),
+        2,
+        "the first post-write read contributes one relatime metadata mutation"
+    );
     assert_eq!(second.inodes()[0].mutation_sequence(), 2);
     assert_eq!(second.inodes()[0].read_at(0, 32), Ok(b"abXYefgh".to_vec()));
     assert_eq!(changed_ranges(&second.inodes()[0]), vec![(2, 2)]);

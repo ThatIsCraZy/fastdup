@@ -47,3 +47,33 @@ the supplied lock owner. Blocking acquisition waits outside the FUSE runtime's
 blocking worker pool. Locks neither enter a Namespace Root nor make ordinary
 reads and writes mandatory-lock operations, and no lock survives process loss
 or remount. Version 1 advertises FUSE POSIX locks, not BSD `flock` locks.
+
+Regular files and symbolic links may have multiple directory entries. A hard
+link increments the shared inode link count and never duplicates Manifest or
+symlink-target data; removing or replacing one name reclaims the inode only
+after its final link and live reference disappear. Directory hardlinks are
+rejected. Symbolic-link targets are byte-exact metadata of at most 4,096 bytes
+and never enter the DATA ingest pipeline.
+
+UID, GID, mode, atime, mtime, and ctime are atomic inode metadata. Only root may
+change UID; an owner may select its request primary GID, while root may select
+any GID. Ownership changes clear setuid and setgid. Explicit atime and mtime
+accept nanosecond precision and advance ctime; successful nonempty content
+mutations advance mtime and ctime with one wall-clock sample after admission.
+
+Extended attributes are byte-exact, bounded copy-on-write inode metadata.
+Supported names are `user.*`, `trusted.*`, `security.*`, and the two POSIX ACL
+names. POSIX ACL values retain the Linux version-2 xattr wire form; an access
+ACL projects its owner, mask/group, and other classes into the inode mode.
+`chmod` updates those ACL class entries, and a directory default ACL is copied
+atomically into each new child while its mask is intersected with the requested
+creation mode. A default ACL replaces the process umask as POSIX requires.
+
+The Linux `FS_IMMUTABLE_FL` inode flag is durable and is exposed through both
+the classic flags ioctls and the `fsxattr` ioctl family used by XFS-compatible
+tools. Setting or clearing it requires the root request context. While set, it
+blocks content writes, writable/truncating opens, allocation and range-clone
+targets, mode and xattr changes, unlink/rmdir/rename, and namespace changes
+inside an immutable directory. The `user.immutable.until` attribute is stored
+byte-exactly but is not a clock-driven policy: management software records the
+retention time and explicitly sets or clears the independently enforced flag.

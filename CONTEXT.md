@@ -503,3 +503,15 @@ The file content and structural metadata needed to reproduce sparse extents,
 links, ownership, permissions, timestamps, ACLs, and extended attributes.
 Internal allocation choices are not part of this state.
 _Avoid_: File bytes, XFS layout
+
+**Extended attribute**:
+A bounded byte-exact name/value pair versioned with one inode. POSIX ACL wire
+values and retention hints are extended attributes; they are not DATA extents.
+_Avoid_: File stream, immutable policy
+
+**Immutable inode flag**:
+The enforced `FS_IMMUTABLE_FL` state that rejects content, metadata, and name
+mutations until an authorized request clears it. A retention-time xattr may
+explain when management software intends to clear the flag but does not replace
+the flag itself.
+_Avoid_: Read-only mount, retention timestamp

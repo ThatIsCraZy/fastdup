@@ -885,6 +885,7 @@ where
         parent: u64,
         name: &OsStr,
         mode: u32,
+        _umask: u32,
         flags: u32,
     ) -> Result<ReplyCreated> {
         let mut inode_name_manager = self.inode_name_manager.write().await;

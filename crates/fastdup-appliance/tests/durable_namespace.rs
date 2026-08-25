@@ -6,8 +6,8 @@ use fastdup_appliance::{
 };
 use fastdup_format::PolicySetId;
 use fastdup_posix::{
-    FallocateMode, NamespaceConfig, OpenOptions, Operation, ROOT_INODE, Reply, RequestContext,
-    SeekKind,
+    FS_IMMUTABLE_FL, FallocateMode, InodeAttributesUpdate, NamespaceConfig, OpenOptions, Operation,
+    PosixTimestamp, ROOT_INODE, Reply, RequestContext, SeekKind, XattrSetMode,
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, FsStorageIo, GenerationRepository,
@@ -19,7 +19,253 @@ const CALLER: RequestContext = RequestContext {
     gid: 1_000,
     pid: 52,
 };
+const ROOT_CALLER: RequestContext = RequestContext {
+    uid: 0,
+    gid: 0,
+    pid: 1,
+};
 const CHUNK_BYTES: usize = 256 * 1_024;
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn hardlinks_symlinks_ownership_and_times_survive_checkpoint_recovery() {
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0x5A; 32]).unwrap();
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), policy),
+        ContainerRepository::new(containers.clone()),
+        16,
+    )
+    .unwrap();
+    let Reply::Created { entry, .. } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"data",
+                mode: 0o660,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("create reply")
+    };
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Link {
+                inode: entry.attr.inode,
+                new_parent: ROOT_INODE,
+                new_name: b"data-alias",
+            },
+        )
+        .unwrap();
+    let Reply::Entry(symlink) = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Symlink {
+                parent: ROOT_INODE,
+                name: b"latest",
+                target: b"data-alias",
+            },
+        )
+        .unwrap()
+    else {
+        panic!("symlink reply")
+    };
+    let mtime = PosixTimestamp::new(1_234, 567);
+    appliance
+        .namespace()
+        .dispatch(
+            ROOT_CALLER,
+            Operation::SetAttributes {
+                inode: entry.attr.inode,
+                update: InodeAttributesUpdate {
+                    uid: Some(2_000),
+                    gid: Some(3_000),
+                    mtime: Some(mtime),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+    appliance.checkpoint().unwrap().expect("checkpoint");
+    metadata.crash();
+    containers.crash();
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, policy),
+        &ContainerRepository::new(containers),
+    )
+    .unwrap()
+    .expect("recovered namespace");
+    let Reply::Entry(alias) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: ROOT_INODE,
+                name: b"data-alias",
+            },
+        )
+        .unwrap()
+    else {
+        panic!("lookup reply")
+    };
+    assert_eq!(alias.attr.link_count, 2);
+    assert_eq!((alias.attr.uid, alias.attr.gid), (2_000, 3_000));
+    assert_eq!(alias.attr.times.mtime, mtime);
+    assert_eq!(
+        recovered.dispatch(
+            CALLER,
+            Operation::Readlink {
+                inode: symlink.attr.inode
+            }
+        ),
+        Ok(Reply::LinkTarget(b"data-alias".to_vec()))
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn xattrs_posix_acl_and_immutable_flag_survive_checkpoint_recovery_and_scrub() {
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), PolicySetId::new([0x4D; 32]).unwrap()),
+        ContainerRepository::new(containers.clone()),
+        16,
+    )
+    .expect("open metadata durability fixture");
+    let Reply::Created { entry, .. } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"veeam-backup",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create metadata durability fixture")
+    else {
+        panic!("ASSERT: create reply");
+    };
+    let inode = entry.attr.inode;
+    let retention = b"2038-01-19T03:14:07Z";
+    let access_acl = posix_acl(&[
+        (0x01, 7, u32::MAX),
+        (0x04, 4, u32::MAX),
+        (0x20, 1, u32::MAX),
+    ]);
+    for (name, value) in [
+        (b"user.immutable.until".as_slice(), retention.as_slice()),
+        (b"system.posix_acl_access".as_slice(), access_acl.as_slice()),
+    ] {
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::SetXattr {
+                    inode,
+                    name,
+                    value,
+                    mode: XattrSetMode::Upsert,
+                },
+            )
+            .expect("set durable inode metadata");
+    }
+    appliance
+        .namespace()
+        .dispatch(
+            ROOT_CALLER,
+            Operation::SetFileFlags {
+                inode,
+                flags: FS_IMMUTABLE_FL,
+            },
+        )
+        .expect("set immutable flag");
+    appliance
+        .checkpoint()
+        .expect("checkpoint inode metadata")
+        .expect("metadata mutation produces a generation");
+    metadata.crash();
+    containers.crash();
+
+    let generations =
+        GenerationRepository::new(metadata.clone(), PolicySetId::new([0x4D; 32]).unwrap());
+    let container_repository = ContainerRepository::new(containers.clone());
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &generations,
+        &container_repository,
+    )
+    .expect("recover metadata generation")
+    .expect("metadata generation exists");
+    assert_eq!(
+        recovered.dispatch(
+            CALLER,
+            Operation::GetXattr {
+                inode,
+                name: b"user.immutable.until",
+            },
+        ),
+        Ok(Reply::Xattr(retention.to_vec()))
+    );
+    assert_eq!(
+        recovered.dispatch(CALLER, Operation::GetFileFlags { inode }),
+        Ok(Reply::FileFlags(FS_IMMUTABLE_FL))
+    );
+    let Reply::Attr(attr) = recovered
+        .dispatch(CALLER, Operation::GetAttr { inode })
+        .expect("get recovered ACL-projected mode")
+    else {
+        panic!("ASSERT: getattr reply");
+    };
+    assert_eq!(attr.mode & 0o777, 0o741);
+    generations
+        .scrub_all_with_data(&container_repository)
+        .expect("offline scrub accepts durable xattrs, ACL, and immutable flag");
+    drop(recovered);
+    let reopened = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, PolicySetId::new([0x4D; 32]).unwrap()),
+        ContainerRepository::new(containers),
+        16,
+    )
+    .expect("reopen metadata generation for mutation");
+    assert_eq!(
+        reopened.namespace().dispatch(
+            CALLER,
+            Operation::Unlink {
+                parent: ROOT_INODE,
+                name: b"veeam-backup",
+            },
+        ),
+        Err(fastdup_posix::PosixError::PermissionDenied)
+    );
+}
+
+fn posix_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut bytes = 2_u32.to_le_bytes().to_vec();
+    for &(tag, permissions, id) in entries {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&permissions.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    bytes
+}
 
 #[test]
 #[allow(clippy::too_many_lines)]

@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use fastdup_copy_metrics::{CopyClass, record_copy};
 use fastdup_format::{
-    ChunkId, CommitRecord, ContainerId, DurableInode, ExactIndexEntry, ExactIndexProfileId,
-    ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, IncompressibilityGateMetrics,
-    MAX_LOGICAL_CHUNK_BYTES, ManifestExtent, ManifestLeaf, MetadataFormatError, MetadataObjectId,
-    NamespaceEntry, NamespaceRoot, PolicySetId, PrehashedAdaptiveRegion, PrehashedChunk,
-    PrehashedContiguousRegion,
+    ChunkId, CommitRecord, ContainerId, DurableInode, DurableRootMetadata, DurableTimes,
+    DurableTimestamp, DurableXattr, ExactIndexEntry, ExactIndexProfileId, ExactIndexRun,
+    ExactIndexRunRef, ExactIndexRunSet, IncompressibilityGateMetrics, MAX_LOGICAL_CHUNK_BYTES,
+    ManifestExtent, ManifestLeaf, MetadataFormatError, MetadataObjectId, NamespaceEntry,
+    NamespaceRoot, PolicySetId, PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
 };
 use fastdup_posix::{
     CommitInode, CommitRange, CommittedFile, CommittedFileInstall, ExternalizedExtent, InodeId,
@@ -4526,10 +4526,11 @@ where
                 let reservation_end = next_inode
                     .checked_add(inode_reservation_span)
                     .ok_or(DurableNamespaceError::InodeReservationExhausted)?;
-                let root = NamespaceRoot::new(
+                let root = NamespaceRoot::new_with_root_metadata(
                     reservation_end,
                     next_inode,
                     previous.namespace_mutation_sequence(),
+                    previous.root_metadata().clone(),
                     previous.inodes().to_vec(),
                     previous.entries().to_vec(),
                 )?;
@@ -4810,6 +4811,7 @@ where
         Ok(Some(ProfiledCheckpoint { record, metrics }))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn publish_manifest_plans(
         &self,
         commit: &NamespaceCommit,
@@ -4903,16 +4905,21 @@ where
                 }
             }
             successor_proofs.push(proof);
-            durable_inodes.push(DurableInode::new(
-                inode.inode().get(),
-                inode.mode(),
-                inode.uid(),
-                inode.gid(),
-                inode.link_count(),
-                inode.mutation_sequence(),
-                inode.logical_size(),
-                manifest_root,
-            )?);
+            durable_inodes.push(
+                DurableInode::new_with_metadata(
+                    inode.inode().get(),
+                    inode.mode(),
+                    inode.uid(),
+                    inode.gid(),
+                    inode.link_count(),
+                    inode.mutation_sequence(),
+                    inode.logical_size(),
+                    manifest_root,
+                    inode.metadata().file_flags(),
+                    durable_xattrs(inode.metadata())?,
+                )?
+                .with_times(durable_times(inode.times())),
+            );
         }
         Ok((durable_inodes, successor_proofs))
     }
@@ -5022,17 +5029,35 @@ fn namespace_root_for_commit(
     mut durable_inodes: Vec<DurableInode>,
 ) -> Result<NamespaceRoot, DurableNamespaceError> {
     durable_inodes
-        .try_reserve_exact(commit.directories().len())
+        .try_reserve_exact(commit.directories().len() + commit.symlinks().len())
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
     for directory in commit.directories() {
-        durable_inodes.push(DurableInode::new_directory(
-            directory.inode().get(),
-            directory.mode(),
-            directory.uid(),
-            directory.gid(),
-            directory.link_count(),
-            directory.mutation_sequence(),
-        )?);
+        durable_inodes.push(
+            DurableInode::new_directory_with_metadata(
+                directory.inode().get(),
+                directory.mode(),
+                directory.uid(),
+                directory.gid(),
+                directory.link_count(),
+                directory.mutation_sequence(),
+                directory.metadata().file_flags(),
+                durable_xattrs(directory.metadata())?,
+            )?
+            .with_times(durable_times(directory.times())),
+        );
+    }
+    for symlink in commit.symlinks() {
+        durable_inodes.push(
+            DurableInode::new_symlink(
+                symlink.inode().get(),
+                symlink.uid(),
+                symlink.gid(),
+                symlink.link_count(),
+                symlink.mutation_sequence(),
+                symlink.target().to_vec(),
+            )?
+            .with_times(durable_times(symlink.times())),
+        );
     }
     let mut entries = Vec::new();
     entries
@@ -5045,14 +5070,53 @@ fn namespace_root_for_commit(
             entry.name().to_vec(),
         )?);
     }
-    NamespaceRoot::new(
+    NamespaceRoot::new_with_root_metadata(
         commit.inode_reservation_end(),
         commit.inode_allocation_cursor(),
         commit.namespace_mutation_sequence(),
+        DurableRootMetadata::new(
+            commit.root().mode(),
+            commit.root().uid(),
+            commit.root().gid(),
+            commit.root().metadata().file_flags(),
+            durable_xattrs(commit.root().metadata())?,
+        )?
+        .with_times(durable_times(commit.root().times())),
         durable_inodes,
         entries,
     )
     .map_err(Into::into)
+}
+
+fn durable_times(times: fastdup_posix::PosixTimes) -> DurableTimes {
+    fn timestamp(value: fastdup_posix::PosixTimestamp) -> DurableTimestamp {
+        DurableTimestamp {
+            seconds: value.seconds,
+            nanoseconds: value.nanoseconds,
+        }
+    }
+    DurableTimes {
+        atime: timestamp(times.atime),
+        mtime: timestamp(times.mtime),
+        ctime: timestamp(times.ctime),
+    }
+}
+
+fn durable_xattrs(
+    metadata: &fastdup_posix::InodeMetadata,
+) -> Result<Vec<DurableXattr>, DurableNamespaceError> {
+    let attributes = metadata.xattrs();
+    let mut durable = Vec::new();
+    durable
+        .try_reserve_exact(attributes.len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    for xattr in attributes {
+        durable.push(DurableXattr::new(
+            xattr.name().to_vec(),
+            xattr.value().to_vec(),
+        )?);
+    }
+    Ok(durable)
 }
 
 enum ManifestPublication {

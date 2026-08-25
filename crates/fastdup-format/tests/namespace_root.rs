@@ -1,10 +1,51 @@
 use fastdup_format::{
-    DurableInode, DurableInodeKind, METADATA_HEADER_BYTES, MetadataFormatError, MetadataObjectId,
-    NamespaceEntry, NamespaceRoot,
+    DurableInode, DurableInodeKind, DurableRootMetadata, DurableTimes, DurableTimestamp,
+    DurableXattr, METADATA_HEADER_BYTES, MetadataFormatError, MetadataObjectId, NamespaceEntry,
+    NamespaceRoot,
 };
 
 fn object_id(byte: u8) -> MetadataObjectId {
     MetadataObjectId::new([byte; 32]).expect("fixture object ID is nonzero")
+}
+
+#[test]
+fn version_four_round_trips_timestamps_and_byte_exact_symlinks() {
+    let times = DurableTimes {
+        atime: DurableTimestamp {
+            seconds: -2,
+            nanoseconds: 3,
+        },
+        mtime: DurableTimestamp {
+            seconds: 4,
+            nanoseconds: 5,
+        },
+        ctime: DurableTimestamp {
+            seconds: 6,
+            nanoseconds: 7,
+        },
+    };
+    let root = NamespaceRoot::new_with_root_metadata(
+        16,
+        3,
+        9,
+        DurableRootMetadata::default().with_times(times),
+        vec![
+            DurableInode::new_symlink(2, 1_000, 1_001, 2, 11, b"../target/\xff".to_vec())
+                .unwrap()
+                .with_times(times),
+        ],
+        vec![
+            NamespaceEntry::new(1, 2, b"one".to_vec()).unwrap(),
+            NamespaceEntry::new(1, 2, b"two".to_vec()).unwrap(),
+        ],
+    )
+    .unwrap();
+    let encoded = root.encode().unwrap();
+    assert_eq!(
+        &encoded[METADATA_HEADER_BYTES + 8..METADATA_HEADER_BYTES + 10],
+        &4_u16.to_le_bytes()
+    );
+    assert_eq!(NamespaceRoot::decode(&encoded), Ok(root));
 }
 
 #[test]
@@ -126,11 +167,80 @@ fn decoder_accepts_version_one_regular_file_namespace_roots() {
     let mut encoded = root.encode().expect("namespace root encodes");
     let payload = METADATA_HEADER_BYTES;
     encoded[payload + 8..payload + 10].copy_from_slice(&1_u16.to_le_bytes());
+    encoded[payload + 16..payload + 32].fill(0);
+    encoded[payload + 96..payload + 128].fill(0);
     let inode = payload + 128;
     encoded[inode + 10..inode + 12].fill(0);
+    encoded[inode + 72..inode + 96].fill(0);
     reauthenticate_metadata_object(&mut encoded);
 
     assert_eq!(NamespaceRoot::decode(&encoded), Ok(root));
+}
+
+#[test]
+fn version_three_round_trips_root_file_flags_xattrs_and_posix_acls() {
+    let access_acl = acl(&[
+        (0x01, 0o7, u32::MAX),
+        (0x02, 0o6, 2_000),
+        (0x04, 0o5, u32::MAX),
+        (0x10, 0o4, u32::MAX),
+        (0x20, 0o1, u32::MAX),
+    ]);
+    let root_metadata = DurableRootMetadata::new(
+        0o750,
+        10,
+        20,
+        0,
+        vec![DurableXattr::new(b"user.root".to_vec(), b"metadata".to_vec()).expect("root xattr")],
+    )
+    .expect("root metadata");
+    let inode = DurableInode::new_with_metadata(
+        2,
+        0o741,
+        1_000,
+        1_001,
+        1,
+        9,
+        15,
+        object_id(0x22),
+        0x10,
+        vec![
+            DurableXattr::new(POSIX_ACL_ACCESS.to_vec(), access_acl).expect("access ACL"),
+            DurableXattr::new(
+                b"user.immutable.until".to_vec(),
+                b"2030-01-01 00:00:00".to_vec(),
+            )
+            .expect("retention xattr"),
+        ],
+    )
+    .expect("regular inode metadata");
+    let root = NamespaceRoot::new_with_root_metadata(
+        16,
+        3,
+        11,
+        root_metadata,
+        vec![inode],
+        vec![NamespaceEntry::new(1, 2, b"backup.vbk".to_vec()).expect("entry")],
+    )
+    .expect("namespace root");
+    let encoded = root.encode().expect("version three encodes");
+    assert_eq!(
+        &encoded[METADATA_HEADER_BYTES + 8..METADATA_HEADER_BYTES + 10],
+        &3_u16.to_le_bytes()
+    );
+    assert_eq!(NamespaceRoot::decode(&encoded), Ok(root));
+}
+
+const POSIX_ACL_ACCESS: &[u8] = b"system.posix_acl_access";
+
+fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut value = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in entries {
+        value.extend_from_slice(&tag.to_le_bytes());
+        value.extend_from_slice(&permissions.to_le_bytes());
+        value.extend_from_slice(&id.to_le_bytes());
+    }
+    value
 }
 
 #[test]

@@ -6,7 +6,7 @@ use fuse3::raw::Session;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -90,6 +90,8 @@ fn exercise_syscalls(mount_path: &std::path::Path) -> io::Result<()> {
     writer.read_exact_at(&mut bytes, 0)?;
     assert_eq!(&bytes, b"abZZef");
 
+    exercise_xattrs_acl_and_immutable(&path, &writer)?;
+
     writer.set_len(SPARSE_OFFSET)?;
     assert_eq!(writer.write_at(b"X", SPARSE_OFFSET)?, 1);
     let mut boundary = [1_u8; 5];
@@ -127,9 +129,189 @@ fn exercise_syscalls(mount_path: &std::path::Path) -> io::Result<()> {
     exercise_concurrent_append(mount_path)?;
     exercise_process_record_lock(mount_path)?;
     exercise_sparse_allocation_syscalls(mount_path)?;
+    exercise_links_ownership_and_times(mount_path)?;
     exercise_sequential_extent_coalescing(mount_path)?;
     exercise_readdirplus_pagination(mount_path)?;
     Ok(())
+}
+
+fn exercise_links_ownership_and_times(mount_path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, chown, symlink};
+
+    let original = mount_path.join("posix-original");
+    let hardlink = mount_path.join("posix-hardlink");
+    let symlink_path = mount_path.join("posix-symlink");
+    std::fs::write(&original, b"one inode")?;
+    std::fs::hard_link(&original, &hardlink)?;
+    let original_metadata = std::fs::metadata(&original)?;
+    let hardlink_metadata = std::fs::metadata(&hardlink)?;
+    assert_eq!(original_metadata.ino(), hardlink_metadata.ino());
+    assert_eq!(hardlink_metadata.nlink(), 2);
+    symlink("posix-hardlink", &symlink_path)?;
+    assert_eq!(
+        std::fs::read_link(&symlink_path)?,
+        std::path::Path::new("posix-hardlink")
+    );
+
+    let atime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123);
+    let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(456);
+    let file = OpenOptions::new().read(true).write(true).open(&original)?;
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(atime)
+            .set_modified(mtime),
+    )?;
+    let metadata = file.metadata()?;
+    assert_eq!(metadata.atime(), 123);
+    assert_eq!(metadata.mtime(), 456);
+    chown(&original, Some(1_234), Some(2_345))?;
+    let metadata = file.metadata()?;
+    assert_eq!(metadata.uid(), 1_234);
+    assert_eq!(metadata.gid(), 2_345);
+
+    std::fs::remove_file(&original)?;
+    assert_eq!(std::fs::read(&hardlink)?, b"one inode");
+    std::fs::remove_file(&symlink_path)?;
+    std::fs::remove_file(&hardlink)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn exercise_xattrs_acl_and_immutable(
+    path: &std::path::Path,
+    file: &std::fs::File,
+) -> io::Result<()> {
+    use rustix::fs::{
+        IFlags, XattrFlags, fgetxattr, flistxattr, fremovexattr, fsetxattr, ioctl_getflags,
+    };
+
+    fsetxattr(
+        file,
+        "user.immutable.until",
+        b"2030-01-01 00:00:00",
+        XattrFlags::CREATE,
+    )
+    .map_err(io::Error::from)?;
+    let mut retention_buffer = vec![0_u8; 64];
+    let retention_length =
+        fgetxattr(file, "user.immutable.until", &mut retention_buffer).map_err(io::Error::from)?;
+    assert_eq!(
+        &retention_buffer[..retention_length],
+        b"2030-01-01 00:00:00"
+    );
+    let mut list_buffer = vec![0_u8; 256];
+    let list_length = flistxattr(file, &mut list_buffer).map_err(io::Error::from)?;
+    assert!(
+        list_buffer[..list_length]
+            .split(|byte| *byte == 0)
+            .any(|name| name == b"user.immutable.until")
+    );
+
+    let access_acl = acl(&[
+        (0x01, 0o7, u32::MAX),
+        (0x02, 0o6, 2_000),
+        (0x04, 0o5, u32::MAX),
+        (0x10, 0o4, u32::MAX),
+        (0x20, 0o1, u32::MAX),
+    ]);
+    fsetxattr(
+        file,
+        "system.posix_acl_access",
+        &access_acl,
+        XattrFlags::empty(),
+    )
+    .map_err(io::Error::from)?;
+    assert_eq!(file.metadata()?.mode() & 0o777, 0o741);
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o601))?;
+    assert_eq!(file.metadata()?.mode() & 0o777, 0o601);
+
+    assert!(
+        Command::new("chattr")
+            .arg("+i")
+            .arg(path)
+            .status()?
+            .success()
+    );
+    assert!(
+        ioctl_getflags(file)
+            .map_err(io::Error::from)?
+            .contains(IFlags::IMMUTABLE)
+    );
+    let listed_flags = Command::new("lsattr").arg("-d").arg(path).output()?;
+    assert!(listed_flags.status.success());
+    assert!(
+        listed_flags
+            .stdout
+            .iter()
+            .take(24)
+            .any(|byte| *byte == b'i')
+    );
+    assert_eq!(
+        file.write_at(b"blocked", 0)
+            .expect_err("immutable write fails")
+            .raw_os_error(),
+        Some(libc::EPERM)
+    );
+    assert_eq!(
+        std::fs::remove_file(path)
+            .expect_err("immutable unlink fails")
+            .raw_os_error(),
+        Some(libc::EPERM)
+    );
+    assert!(
+        Command::new("chattr")
+            .arg("-i")
+            .arg(path)
+            .status()?
+            .success()
+    );
+    fremovexattr(file, "user.immutable.until").map_err(io::Error::from)?;
+
+    let acl_directory = path
+        .parent()
+        .expect("ASSERT: smoke path has a parent")
+        .join("acl-default");
+    std::fs::create_dir(&acl_directory)?;
+    let directory = std::fs::File::open(&acl_directory)?;
+    let default_acl = acl(&[
+        (0x01, 0o7, u32::MAX),
+        (0x02, 0o6, 2_000),
+        (0x04, 0o5, u32::MAX),
+        (0x10, 0o4, u32::MAX),
+        (0x20, 0o1, u32::MAX),
+    ]);
+    fsetxattr(
+        &directory,
+        "system.posix_acl_default",
+        &default_acl,
+        XattrFlags::CREATE,
+    )
+    .map_err(io::Error::from)?;
+    let inherited_path = acl_directory.join("inherited.vbk");
+    let inherited = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&inherited_path)?;
+    assert_eq!(inherited.metadata()?.mode() & 0o777, 0o640);
+    let mut inherited_acl = vec![0_u8; 256];
+    let inherited_length = fgetxattr(&inherited, "system.posix_acl_access", &mut inherited_acl)
+        .map_err(io::Error::from)?;
+    assert!(inherited_length > 4);
+    drop(inherited);
+    std::fs::remove_file(inherited_path)?;
+    std::fs::remove_dir(acl_directory)?;
+    Ok(())
+}
+
+fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut value = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in entries {
+        value.extend_from_slice(&tag.to_le_bytes());
+        value.extend_from_slice(&permissions.to_le_bytes());
+        value.extend_from_slice(&id.to_le_bytes());
+    }
+    value
 }
 
 fn exercise_statfs(mount_path: &std::path::Path) -> io::Result<()> {

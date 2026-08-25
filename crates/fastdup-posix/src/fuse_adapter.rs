@@ -1,14 +1,15 @@
 use crate::{
-    AccessMode, DirectoryEntry as NamespaceDirectoryEntry, Entry, FallocateMode, FileAttr,
-    FileKind, FileLock, HandleId, InodeId, LockKind, Namespace, OpenOptions, Operation, PosixError,
-    Reply, RequestContext, SeekKind,
+    AccessMode, DirectoryEntry as NamespaceDirectoryEntry, Entry, FS_IMMUTABLE_FL, FallocateMode,
+    FileAttr, FileKind, FileLock, HandleId, InodeAttributesUpdate, InodeId, LockKind, Namespace,
+    OpenOptions, Operation, PosixError, PosixTimestamp, Reply, RequestContext, SeekKind,
+    XattrSetMode,
 };
 use bytes::Bytes;
 use fastdup_copy_metrics::{CopyClass, record_copy};
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, FileAttr as FuseFileAttr, ReplyAttr, ReplyCopyFileRange,
-    ReplyCreated, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyLSeek,
-    ReplyLock as FuseReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite,
+    ReplyCreated, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyIoctl,
+    ReplyLSeek, ReplyLock as FuseReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
 };
 use fuse3::raw::{Filesystem, OwnedRequestPayload, Request};
 use fuse3::{Errno, FileType, MountOptions, SetAttr, Timestamp};
@@ -295,6 +296,7 @@ pub fn volatile_mount_options() -> MountOptions {
     options
         .fs_name("fastdup")
         .default_permissions(true)
+        .dont_mask(true)
         .write_back(false);
     #[cfg(target_os = "linux")]
     // fuse3 serializes this integer as the textual octal mount option.
@@ -388,16 +390,40 @@ impl Filesystem for FuseFilesystem {
         handle: Option<u64>,
         set_attr: SetAttr,
     ) -> fuse3::Result<ReplyAttr> {
-        if set_attr.mode.is_some()
-            || set_attr.uid.is_some()
-            || set_attr.gid.is_some()
-            || set_attr.atime.is_some()
-            || set_attr.mtime.is_some()
-            || set_attr.ctime.is_some()
-        {
+        if set_attr.ctime.is_some() {
             return Err(libc::EOPNOTSUPP.into());
         }
         let inode = inode_from_raw(inode)?;
+        let has_metadata = set_attr.mode.is_some()
+            || set_attr.uid.is_some()
+            || set_attr.gid.is_some()
+            || set_attr.atime.is_some()
+            || set_attr.mtime.is_some();
+        if has_metadata {
+            if set_attr.size.is_some() || set_attr.lock_owner.is_some() {
+                return Err(libc::EOPNOTSUPP.into());
+            }
+            let request = context(request);
+            let update = InodeAttributesUpdate {
+                mode: set_attr
+                    .mode
+                    .map(|mode| u16::try_from(mode & 0o7777).expect("ASSERT: mode fits")),
+                uid: set_attr.uid,
+                gid: set_attr.gid,
+                atime: set_attr.atime.map(posix_timestamp),
+                mtime: set_attr.mtime.map(posix_timestamp),
+            };
+            let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+                self.namespace
+                    .dispatch(request, Operation::SetAttributes { inode, update })
+            })
+            .await
+            .map_err(errno)?;
+            return Ok(ReplyAttr {
+                ttl: ZERO_TTL,
+                attr: fuse_attr(expect_attr(&reply)),
+            });
+        }
         let Some(length) = set_attr.size else {
             if set_attr.lock_owner.is_some() {
                 return Err(libc::EOPNOTSUPP.into());
@@ -431,6 +457,67 @@ impl Filesystem for FuseFilesystem {
         })
     }
 
+    async fn readlink(&self, _request: Request, inode: u64) -> fuse3::Result<ReplyData> {
+        let inode = inode_from_raw(inode)?;
+        let reply = self
+            .namespace
+            .dispatch(INTERNAL_CONTEXT, Operation::Readlink { inode })
+            .map_err(errno)?;
+        let Reply::LinkTarget(target) = reply else {
+            panic!("ASSERT: readlink returned a non-link target reply");
+        };
+        Ok(ReplyData {
+            data: target.into(),
+        })
+    }
+
+    async fn symlink(
+        &self,
+        request: Request,
+        parent: u64,
+        name: &OsStr,
+        link: &OsStr,
+    ) -> fuse3::Result<ReplyEntry> {
+        let parent = inode_from_raw(parent)?;
+        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                context(request),
+                Operation::Symlink {
+                    parent,
+                    name: name.as_bytes(),
+                    target: link.as_bytes(),
+                },
+            )
+        })
+        .await
+        .map_err(errno)?;
+        Ok(reply_entry(expect_entry(reply).attr))
+    }
+
+    async fn link(
+        &self,
+        request: Request,
+        inode: u64,
+        new_parent: u64,
+        new_name: &OsStr,
+    ) -> fuse3::Result<ReplyEntry> {
+        let inode = inode_from_raw(inode)?;
+        let new_parent = inode_from_raw(new_parent)?;
+        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                context(request),
+                Operation::Link {
+                    inode,
+                    new_parent,
+                    new_name: new_name.as_bytes(),
+                },
+            )
+        })
+        .await
+        .map_err(errno)?;
+        Ok(reply_entry(expect_entry(reply).attr))
+    }
+
     async fn mkdir(
         &self,
         request: Request,
@@ -440,16 +527,17 @@ impl Filesystem for FuseFilesystem {
         umask: u32,
     ) -> fuse3::Result<ReplyEntry> {
         let parent = inode_from_raw(parent)?;
-        let mode = u16::try_from((mode & !umask) & 0o7777)
-            .expect("ASSERT: masked directory mode must fit in u16");
+        let mode = u16::try_from(mode & 0o7777).expect("ASSERT: directory mode must fit in u16");
+        let umask = u16::try_from(umask & 0o7777).expect("ASSERT: umask must fit in u16");
         let request = context(request);
         let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
             self.namespace.dispatch(
                 request,
-                Operation::Mkdir {
+                Operation::MkdirWithUmask {
                     parent,
                     name: name.as_bytes(),
                     mode,
+                    umask,
                 },
             )
         })
@@ -620,6 +708,218 @@ impl Filesystem for FuseFilesystem {
             .ok_or_else(|| Errno::from(libc::EOPNOTSUPP))?;
         let snapshot = source.snapshot().map_err(Errno::from)?;
         Ok(snapshot.reply())
+    }
+
+    async fn setxattr(
+        &self,
+        request: Request,
+        inode: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: u32,
+        position: u32,
+    ) -> fuse3::Result<()> {
+        const XATTR_CREATE: u32 = libc::XATTR_CREATE as u32;
+        const XATTR_REPLACE: u32 = libc::XATTR_REPLACE as u32;
+        if position != 0 {
+            return Err(libc::EINVAL.into());
+        }
+        let mode = match flags {
+            0 => XattrSetMode::Upsert,
+            XATTR_CREATE => XattrSetMode::Create,
+            XATTR_REPLACE => XattrSetMode::Replace,
+            _ => return Err(libc::EINVAL.into()),
+        };
+        let inode = inode_from_raw(inode)?;
+        let request = context(request);
+        dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                request,
+                Operation::SetXattr {
+                    inode,
+                    name: name.as_bytes(),
+                    value,
+                    mode,
+                },
+            )
+        })
+        .await
+        .map_err(errno)?;
+        Ok(())
+    }
+
+    async fn getxattr(
+        &self,
+        request: Request,
+        inode: u64,
+        name: &OsStr,
+        size: u32,
+    ) -> fuse3::Result<ReplyXAttr> {
+        let inode = inode_from_raw(inode)?;
+        let reply = self
+            .namespace
+            .dispatch(
+                context(request),
+                Operation::GetXattr {
+                    inode,
+                    name: name.as_bytes(),
+                },
+            )
+            .map_err(errno)?;
+        xattr_reply(expect_xattr(reply), size)
+    }
+
+    async fn listxattr(
+        &self,
+        request: Request,
+        inode: u64,
+        size: u32,
+    ) -> fuse3::Result<ReplyXAttr> {
+        let inode = inode_from_raw(inode)?;
+        let reply = self
+            .namespace
+            .dispatch(context(request), Operation::ListXattrs { inode })
+            .map_err(errno)?;
+        xattr_reply(expect_xattr(reply), size)
+    }
+
+    async fn removexattr(&self, request: Request, inode: u64, name: &OsStr) -> fuse3::Result<()> {
+        let inode = inode_from_raw(inode)?;
+        let request = context(request);
+        dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                request,
+                Operation::RemoveXattr {
+                    inode,
+                    name: name.as_bytes(),
+                },
+            )
+        })
+        .await
+        .map_err(errno)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    async fn ioctl(
+        &self,
+        request: Request,
+        inode: u64,
+        _handle: u64,
+        _flags: u32,
+        command: u32,
+        _argument: u64,
+        input: &[u8],
+        output_size: u32,
+    ) -> fuse3::Result<ReplyIoctl> {
+        const FS_IOC_GETFLAGS: u32 = libc::FS_IOC_GETFLAGS as u32;
+        const FS_IOC_SETFLAGS: u32 = libc::FS_IOC_SETFLAGS as u32;
+        const FS_IOC32_GETFLAGS: u32 = 0x8004_6601;
+        const FS_IOC32_SETFLAGS: u32 = 0x4004_6602;
+        const FS_IOC_FSGETXATTR: u32 = 0x801c_581f;
+        const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
+        const FS_XFLAG_IMMUTABLE: u32 = 0x0000_0008;
+        const FSXATTR_BYTES: usize = 28;
+        let inode = inode_from_raw(inode)?;
+        match command {
+            FS_IOC_GETFLAGS | FS_IOC32_GETFLAGS => {
+                if !input.is_empty() || !(4..=8).contains(&output_size) {
+                    return Err(libc::EINVAL.into());
+                }
+                let reply = self
+                    .namespace
+                    .dispatch(context(request), Operation::GetFileFlags { inode })
+                    .map_err(errno)?;
+                let flags = expect_file_flags(&reply);
+                let mut output = vec![0_u8; output_size as usize];
+                output[..4].copy_from_slice(&flags.to_ne_bytes());
+                Ok(ReplyIoctl {
+                    result: 0,
+                    data: output.into(),
+                })
+            }
+            FS_IOC_SETFLAGS | FS_IOC32_SETFLAGS => {
+                if !(4..=8).contains(&u32::try_from(input.len()).unwrap_or(u32::MAX))
+                    || output_size != 0
+                    || input
+                        .get(4..)
+                        .is_some_and(|upper| upper.iter().any(|byte| *byte != 0))
+                {
+                    return Err(libc::EINVAL.into());
+                }
+                let flags = u32::from_ne_bytes(
+                    input[..4]
+                        .try_into()
+                        .expect("ASSERT: ioctl input length was preflighted"),
+                );
+                let request = context(request);
+                dispatch_mutation_with_backpressure(&self.namespace, || {
+                    self.namespace
+                        .dispatch(request, Operation::SetFileFlags { inode, flags })
+                })
+                .await
+                .map_err(errno)?;
+                Ok(ReplyIoctl {
+                    result: 0,
+                    data: Bytes::new(),
+                })
+            }
+            FS_IOC_FSGETXATTR => {
+                if !input.is_empty() || output_size as usize != FSXATTR_BYTES {
+                    return Err(libc::EINVAL.into());
+                }
+                let reply = self
+                    .namespace
+                    .dispatch(context(request), Operation::GetFileFlags { inode })
+                    .map_err(errno)?;
+                let flags = expect_file_flags(&reply);
+                let xflags = if flags & FS_IMMUTABLE_FL != 0 {
+                    FS_XFLAG_IMMUTABLE
+                } else {
+                    0
+                };
+                let mut output = vec![0_u8; FSXATTR_BYTES];
+                output[..4].copy_from_slice(&xflags.to_ne_bytes());
+                Ok(ReplyIoctl {
+                    result: 0,
+                    data: output.into(),
+                })
+            }
+            FS_IOC_FSSETXATTR => {
+                if input.len() != FSXATTR_BYTES
+                    || output_size != 0
+                    || input[4..].iter().any(|byte| *byte != 0)
+                {
+                    return Err(libc::EINVAL.into());
+                }
+                let xflags = u32::from_ne_bytes(
+                    input[..4]
+                        .try_into()
+                        .expect("ASSERT: fsxattr input length was preflighted"),
+                );
+                if xflags & !FS_XFLAG_IMMUTABLE != 0 {
+                    return Err(libc::EOPNOTSUPP.into());
+                }
+                let flags = if xflags & FS_XFLAG_IMMUTABLE != 0 {
+                    FS_IMMUTABLE_FL
+                } else {
+                    0
+                };
+                let request = context(request);
+                dispatch_mutation_with_backpressure(&self.namespace, || {
+                    self.namespace
+                        .dispatch(request, Operation::SetFileFlags { inode, flags })
+                })
+                .await
+                .map_err(errno)?;
+                Ok(ReplyIoctl {
+                    result: 0,
+                    data: Bytes::new(),
+                })
+            }
+            _ => Err(libc::ENOTTY.into()),
+        }
     }
 
     async fn release(
@@ -914,11 +1214,13 @@ impl Filesystem for FuseFilesystem {
         parent: u64,
         name: &OsStr,
         mode: u32,
+        umask: u32,
         flags: u32,
     ) -> fuse3::Result<ReplyCreated> {
         let parent = inode_from_raw(parent)?;
         let options = open_options(flags)?;
         let mode = u16::try_from(mode & 0o7777).expect("ASSERT: masked mode must fit in u16");
+        let umask = u16::try_from(umask & 0o7777).expect("ASSERT: umask must fit in u16");
         let exclusive =
             flags & u32::try_from(libc::O_EXCL).expect("ASSERT: O_EXCL is nonnegative") != 0;
         let truncate =
@@ -927,10 +1229,11 @@ impl Filesystem for FuseFilesystem {
         let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
             self.namespace.dispatch(
                 request,
-                Operation::Create {
+                Operation::CreateWithUmask {
                     parent,
                     name: name.as_bytes(),
                     mode,
+                    umask,
                     options,
                     exclusive,
                     truncate,
@@ -1259,11 +1562,39 @@ fn errno(error: PosixError) -> Errno {
         PosixError::OutOfMemory => libc::ENOMEM.into(),
         PosixError::NoLocks => libc::ENOLCK.into(),
         PosixError::NoSuchAddress => libc::ENXIO.into(),
+        PosixError::NoData => libc::ENODATA.into(),
+        PosixError::TooBig => libc::E2BIG.into(),
+        PosixError::PermissionDenied => libc::EPERM.into(),
         PosixError::Unsupported => libc::EOPNOTSUPP.into(),
         PosixError::Io => libc::EIO.into(),
         PosixError::ReadOnly => libc::EROFS.into(),
         PosixError::Again => libc::EAGAIN.into(),
     }
+}
+
+fn expect_xattr(reply: Reply) -> Vec<u8> {
+    match reply {
+        Reply::Xattr(value) => value,
+        _ => panic!("ASSERT: xattr operation returned an impossible reply variant"),
+    }
+}
+
+fn expect_file_flags(reply: &Reply) -> u32 {
+    match reply {
+        Reply::FileFlags(flags) => *flags,
+        _ => panic!("ASSERT: file-flags operation returned an impossible reply variant"),
+    }
+}
+
+fn xattr_reply(value: Vec<u8>, size: u32) -> fuse3::Result<ReplyXAttr> {
+    let value_size = u32::try_from(value.len()).map_err(|_| Errno::from(libc::E2BIG))?;
+    if size == 0 {
+        return Ok(ReplyXAttr::Size(value_size));
+    }
+    if size < value_size {
+        return Err(libc::ERANGE.into());
+    }
+    Ok(ReplyXAttr::Data(value.into()))
 }
 
 fn reply_entry(attr: FileAttr) -> ReplyEntry {
@@ -1279,12 +1610,13 @@ fn fuse_attr(attr: FileAttr) -> FuseFileAttr {
         ino: attr.inode.get(),
         size: attr.size,
         blocks: attr.allocated_bytes.saturating_add(511) / 512,
-        atime: Timestamp::new(0, 0),
-        mtime: Timestamp::new(0, 0),
-        ctime: Timestamp::new(0, 0),
+        atime: fuse_timestamp(attr.times.atime),
+        mtime: fuse_timestamp(attr.times.mtime),
+        ctime: fuse_timestamp(attr.times.ctime),
         kind: match attr.kind {
             FileKind::Directory => FileType::Directory,
             FileKind::Regular => FileType::RegularFile,
+            FileKind::Symlink => FileType::Symlink,
         },
         perm: attr.mode,
         nlink: attr.link_count,
@@ -1301,6 +1633,7 @@ fn directory_entry(entry: NamespaceDirectoryEntry) -> DirectoryEntry {
         kind: match entry.kind {
             FileKind::Directory => FileType::Directory,
             FileKind::Regular => FileType::RegularFile,
+            FileKind::Symlink => FileType::Symlink,
         },
         name: OsString::from_vec(entry.name),
         offset: entry.next_offset,
@@ -1314,6 +1647,7 @@ fn directory_entry_plus(entry: NamespaceDirectoryEntry) -> DirectoryEntryPlus {
         kind: match entry.kind {
             FileKind::Directory => FileType::Directory,
             FileKind::Regular => FileType::RegularFile,
+            FileKind::Symlink => FileType::Symlink,
         },
         name: OsString::from_vec(entry.name),
         offset: entry.next_offset,
@@ -1321,6 +1655,14 @@ fn directory_entry_plus(entry: NamespaceDirectoryEntry) -> DirectoryEntryPlus {
         entry_ttl: ZERO_TTL,
         attr_ttl: ZERO_TTL,
     }
+}
+
+const fn posix_timestamp(value: Timestamp) -> PosixTimestamp {
+    PosixTimestamp::new(value.sec, value.nsec)
+}
+
+fn fuse_timestamp(value: PosixTimestamp) -> Timestamp {
+    Timestamp::new(value.seconds, value.nanoseconds)
 }
 
 fn expect_entry(reply: Reply) -> Entry {

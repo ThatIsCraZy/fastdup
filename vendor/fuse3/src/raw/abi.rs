@@ -341,8 +341,7 @@ pub enum fuse_opcode {
     FUSE_INTERRUPT = 36,
     FUSE_BMAP = 37,
     FUSE_DESTROY = 38,
-    // TODO implement it after get enough info about it
-    // FUSE_IOCTL = 39,
+    FUSE_IOCTL = 39,
     FUSE_POLL = 40,
     FUSE_NOTIFY_REPLY = 41,
     FUSE_BATCH_FORGET = 42,
@@ -412,7 +411,7 @@ impl TryFrom<u32> for fuse_opcode {
             36 => Ok(fuse_opcode::FUSE_INTERRUPT),
             37 => Ok(fuse_opcode::FUSE_BMAP),
             38 => Ok(fuse_opcode::FUSE_DESTROY),
-            // 39 => Ok(fuse_opcode::FUSE_IOCTL),
+            39 => Ok(fuse_opcode::FUSE_IOCTL),
             40 => Ok(fuse_opcode::FUSE_POLL),
             41 => Ok(fuse_opcode::FUSE_NOTIFY_REPLY),
             42 => Ok(fuse_opcode::FUSE_BATCH_FORGET),
@@ -905,16 +904,17 @@ pub struct fuse_bmap_out {
     pub block: u64,
 }
 
-//#[derive(Debug, Decode)]
-//#[allow(non_camel_case_types, unused)]
-//pub struct fuse_ioctl_in {
-//pub fh: u64,
-//pub flags: u32,
-//pub cmd: u32,
-//pub arg: u64,
-//pub in_size: u32,
-//pub out_size: u32,
-//}
+#[derive(Debug, FromBytes, KnownLayout, Immutable)]
+#[allow(non_camel_case_types, unused)]
+#[repr(C)]
+pub struct fuse_ioctl_in {
+    pub fh: u64,
+    pub flags: u32,
+    pub cmd: u32,
+    pub arg: u64,
+    pub in_size: u32,
+    pub out_size: u32,
+}
 
 //#[derive(Debug)]
 //#[allow(non_camel_case_types, unused)]
@@ -923,14 +923,17 @@ pub struct fuse_bmap_out {
 //pub len: u64,
 //}
 
-//#[derive(Debug)]
-//#[allow(non_camel_case_types, unused)]
-//pub struct fuse_ioctl_out {
-//pub result: i32,
-//pub flags: u32,
-//pub in_iovs: u32,
-//pub out_iovs: u32,
-//}
+#[derive(Debug, IntoBytes, Immutable)]
+#[allow(non_camel_case_types, unused)]
+#[repr(C)]
+pub struct fuse_ioctl_out {
+    pub result: i32,
+    pub flags: u32,
+    pub in_iovs: u32,
+    pub out_iovs: u32,
+}
+
+pub const FUSE_IOCTL_OUT_SIZE: usize = mem::size_of::<fuse_ioctl_out>();
 
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
 #[allow(non_camel_case_types, unused)]

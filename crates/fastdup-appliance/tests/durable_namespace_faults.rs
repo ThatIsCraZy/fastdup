@@ -1,8 +1,8 @@
 use fastdup_appliance::{DurableNamespace, HistoricalProofCacheStatus, recover_mount};
 use fastdup_format::PolicySetId;
 use fastdup_posix::{
-    FallocateMode, HandleId, InodeId, Namespace, NamespaceConfig, OpenOptions, Operation,
-    PosixError, ROOT_INODE, Reply, RequestContext,
+    FS_IMMUTABLE_FL, FallocateMode, HandleId, InodeId, Namespace, NamespaceConfig, OpenOptions,
+    Operation, PosixError, ROOT_INODE, Reply, RequestContext, XattrSetMode,
 };
 use fastdup_store::{ContainerRepository, GenerationRepository};
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
@@ -14,6 +14,139 @@ const CALLER: RequestContext = RequestContext {
 };
 const NAME: &[u8] = b"vm-\xff";
 const PAYLOAD: &[u8] = b"durable-prefix";
+const ROOT_CALLER: RequestContext = RequestContext {
+    uid: 0,
+    gid: 0,
+    pid: 1,
+};
+
+#[test]
+fn every_inode_metadata_checkpoint_fault_recovers_the_previous_or_complete_image() {
+    let probe_metadata = MemoryStorageIo::new();
+    let probe_containers = MemoryStorageIo::new();
+    let probe = open(probe_metadata.clone(), probe_containers);
+    let probe_inode = seed_metadata_predecessor(&probe);
+    probe
+        .checkpoint()
+        .expect("checkpoint metadata predecessor")
+        .expect("predecessor is dirty");
+    let metadata_baseline = probe_metadata.operation_count();
+    install_metadata_successor(&probe, probe_inode);
+    probe
+        .checkpoint()
+        .expect("probe metadata checkpoint")
+        .expect("metadata successor is dirty");
+    let operations = probe_metadata.operations()[metadata_baseline..].to_vec();
+    let final_sync = operations.len() - 1;
+    assert_eq!(operations[final_sync], StorageOperation::SyncFile);
+
+    for relative in 0..operations.len() {
+        for fail_after in [false, true] {
+            let metadata = if fail_after {
+                MemoryStorageIo::with_fail_after(metadata_baseline + relative)
+            } else {
+                MemoryStorageIo::with_fail_before(metadata_baseline + relative)
+            };
+            let containers = MemoryStorageIo::new();
+            let appliance = open(metadata.clone(), containers.clone());
+            let inode = seed_metadata_predecessor(&appliance);
+            appliance
+                .checkpoint()
+                .expect("checkpoint metadata predecessor under injection")
+                .expect("predecessor is dirty");
+            install_metadata_successor(&appliance, inode);
+            assert!(
+                appliance.checkpoint().is_err(),
+                "metadata fault relative={relative} after={fail_after} unexpectedly committed"
+            );
+            metadata.crash();
+            containers.crash();
+            let generations = GenerationRepository::new(metadata, policy());
+            let container_repository = ContainerRepository::new(containers);
+            let recovered = recover_mount(
+                NamespaceConfig::default(),
+                &generations,
+                &container_repository,
+            )
+            .expect("recover one whole metadata image")
+            .expect("metadata predecessor exists");
+            let complete = fail_after && relative == final_sync;
+            assert_metadata_image(&recovered, inode, complete);
+        }
+    }
+}
+
+fn seed_metadata_predecessor(
+    appliance: &DurableNamespace<MemoryStorageIo, MemoryStorageIo>,
+) -> InodeId {
+    let Reply::Created { entry, .. } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"metadata-fault",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create metadata fault fixture")
+    else {
+        panic!("ASSERT: create metadata fixture reply");
+    };
+    entry.attr.inode
+}
+
+fn install_metadata_successor(
+    appliance: &DurableNamespace<MemoryStorageIo, MemoryStorageIo>,
+    inode: InodeId,
+) {
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::SetXattr {
+                inode,
+                name: b"user.immutable.until",
+                value: b"2038-01-19T03:14:07Z",
+                mode: XattrSetMode::Upsert,
+            },
+        )
+        .expect("set retention metadata");
+    appliance
+        .namespace()
+        .dispatch(
+            ROOT_CALLER,
+            Operation::SetFileFlags {
+                inode,
+                flags: FS_IMMUTABLE_FL,
+            },
+        )
+        .expect("set immutable metadata");
+}
+
+fn assert_metadata_image(namespace: &Namespace, inode: InodeId, complete: bool) {
+    assert_eq!(
+        namespace.dispatch(
+            CALLER,
+            Operation::GetXattr {
+                inode,
+                name: b"user.immutable.until",
+            },
+        ),
+        if complete {
+            Ok(Reply::Xattr(b"2038-01-19T03:14:07Z".to_vec()))
+        } else {
+            Err(PosixError::NoData)
+        }
+    );
+    assert_eq!(
+        namespace.dispatch(CALLER, Operation::GetFileFlags { inode }),
+        Ok(Reply::FileFlags(if complete { FS_IMMUTABLE_FL } else { 0 }))
+    );
+}
 
 #[test]
 fn every_checkpoint_fault_recovers_only_the_previous_or_complete_generation() {

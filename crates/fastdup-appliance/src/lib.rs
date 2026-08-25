@@ -30,10 +30,11 @@ pub use statfs::{
 use std::fmt;
 use std::sync::Arc;
 
-use fastdup_format::{ManifestExtent, NamespaceRoot};
+use fastdup_format::{DurableInode, DurableInodeKind, DurableXattr, ManifestExtent, NamespaceRoot};
 use fastdup_posix::{
     CommittedDirectory, CommittedEntry, CommittedFile, CommittedInode, CommittedNamespaceSnapshot,
-    Namespace, NamespaceConfig, PosixError, PreparedCommitExtent, PreparedDataRecipe,
+    CommittedSymlink, ExtendedAttribute, FileKind, InodeMetadata, Namespace, NamespaceConfig,
+    PosixError, PosixTimes, PosixTimestamp, PreparedCommitExtent, PreparedDataRecipe,
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, GenerationError, GenerationRepository,
@@ -211,15 +212,19 @@ fn namespace_from_files(
         .try_reserve_exact(root.file_inode_count())
         .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
     for (inode, file) in root.file_inodes().zip(files) {
-        inodes.push(CommittedInode::new(
-            inode.inode(),
-            inode.mode(),
-            inode.uid(),
-            inode.gid(),
-            inode.link_count(),
-            inode.mutation_sequence(),
-            file,
-        )?);
+        inodes.push(
+            CommittedInode::new_with_metadata(
+                inode.inode(),
+                inode.mode(),
+                inode.uid(),
+                inode.gid(),
+                inode.link_count(),
+                inode.mutation_sequence(),
+                metadata_from_durable(inode)?,
+                file,
+            )?
+            .with_times(posix_times(inode.times())),
+        );
     }
 
     let mut directories = Vec::new();
@@ -227,13 +232,36 @@ fn namespace_from_files(
         .try_reserve_exact(root.inodes().len().saturating_sub(root.file_inode_count()))
         .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
     for inode in root.directory_inodes() {
-        directories.push(CommittedDirectory::new(
+        directories.push(
+            CommittedDirectory::new_with_metadata(
+                inode.inode(),
+                inode.mode(),
+                inode.uid(),
+                inode.gid(),
+                inode.link_count(),
+                inode.mutation_sequence(),
+                metadata_from_durable(inode)?,
+            )?
+            .with_times(posix_times(inode.times())),
+        );
+    }
+
+    let mut symlinks = Vec::new();
+    symlinks
+        .try_reserve_exact(root.symlink_inodes().count())
+        .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
+    for inode in root.symlink_inodes() {
+        symlinks.push(CommittedSymlink::new(
             inode.inode(),
-            inode.mode(),
             inode.uid(),
             inode.gid(),
             inode.link_count(),
             inode.mutation_sequence(),
+            posix_times(inode.times()),
+            inode
+                .symlink_target()
+                .ok_or(MountError::Posix(PosixError::Io))?
+                .to_vec(),
         )?);
     }
 
@@ -249,6 +277,7 @@ fn namespace_from_files(
         )?);
     }
 
+    let root_metadata = root.root_metadata();
     let snapshot = CommittedNamespaceSnapshot::new_with_directories(
         next_inode,
         inode_reservation_end,
@@ -256,12 +285,66 @@ fn namespace_from_files(
         inodes,
         directories,
         entries,
-    )?;
+    )?
+    .with_root_metadata(
+        root_metadata.mode(),
+        root_metadata.uid(),
+        root_metadata.gid(),
+        InodeMetadata::new(
+            FileKind::Directory,
+            root_metadata.file_flags(),
+            extended_attributes(root_metadata.xattrs(), FileKind::Directory)?,
+        )?,
+    )
+    .with_posix_state(posix_times(root_metadata.times()), symlinks);
     if writable {
         Namespace::from_committed_writable(config, snapshot).map_err(Into::into)
     } else {
         Namespace::from_committed(config, snapshot).map_err(Into::into)
     }
+}
+
+fn posix_times(times: fastdup_format::DurableTimes) -> PosixTimes {
+    fn timestamp(value: fastdup_format::DurableTimestamp) -> PosixTimestamp {
+        PosixTimestamp::new(value.seconds, value.nanoseconds)
+    }
+    PosixTimes {
+        atime: timestamp(times.atime),
+        mtime: timestamp(times.mtime),
+        ctime: timestamp(times.ctime),
+    }
+}
+
+fn metadata_from_durable(inode: &DurableInode) -> Result<InodeMetadata, MountError> {
+    let kind = match inode.kind() {
+        DurableInodeKind::Regular => FileKind::Regular,
+        DurableInodeKind::Directory => FileKind::Directory,
+        DurableInodeKind::Symlink => FileKind::Symlink,
+    };
+    InodeMetadata::new(
+        kind,
+        inode.file_flags(),
+        extended_attributes(inode.xattrs(), kind)?,
+    )
+    .map_err(Into::into)
+}
+
+fn extended_attributes(
+    durable: &[DurableXattr],
+    kind: FileKind,
+) -> Result<Vec<ExtendedAttribute>, MountError> {
+    let mut xattrs = Vec::new();
+    xattrs
+        .try_reserve_exact(durable.len())
+        .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
+    for xattr in durable {
+        xattrs.push(ExtendedAttribute::new(
+            kind,
+            xattr.name().to_vec(),
+            xattr.value().to_vec(),
+        )?);
+    }
+    Ok(xattrs)
 }
 
 pub(crate) struct ManifestCommittedFile<I> {
