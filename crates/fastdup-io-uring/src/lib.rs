@@ -5,43 +5,34 @@
 //! publishers can overlap in the kernel. Buffer ownership and the only unsafe
 //! submission call are confined to this platform crate.
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::os::fd::AsRawFd;
+use std::num::{NonZeroU32, NonZeroU64};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
 
-use fastdup_format::{
-    FOOTER_BYTES, HEADER_BYTES, MAX_CONTAINER_BYTES, SealedContainer, SealedContainerDescriptor,
-    VerifiedContainerPublication,
-};
+use fastdup_format::{HEADER_BYTES, MAX_CONTAINER_BYTES, VerifiedContainerPublication};
 use fastdup_store::{
-    FsStorageIo, MAX_STORAGE_RANGE_BYTES, OwnedContainerPublication, StorageIo, StoreError,
+    FsStorageIo, MAX_STORAGE_RANGE_BYTES, OwnedContainerPublication, PublicationSampleRange,
+    StorageIo, StoreError, publication_sample_ranges, verify_publication_sample,
 };
-use io_uring::{IoUring, opcode, squeue, types};
-
-mod verification_pool;
-
-use verification_pool::{VerificationPool, VerificationRequest};
+use io_uring::{IoUring, Probe, opcode, squeue, types};
 
 const DEFAULT_RING_ENTRIES: u32 = 256;
 const DEFAULT_INFLIGHT_BYTES: u64 = 256 * 1_024 * 1_024;
-const MIN_POOLED_VERIFICATION_BYTES: usize = 1_024 * 1_024;
-const ROOT_SYNC_COHORT_DELAY: Duration = Duration::from_micros(200);
-const OWNED_PUBLISH_COHORT_DELAY: Duration = Duration::from_micros(100);
+const WAKE_USER_DATA: u64 = u64::MAX;
 
 /// Bounded shared-ring configuration for the data-tier adapter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringStorageConfig {
     ring_entries: NonZeroU32,
     max_inflight_bytes: NonZeroU64,
-    verifier_workers: NonZeroUsize,
 }
 
 impl IoUringStorageConfig {
@@ -50,14 +41,7 @@ impl IoUringStorageConfig {
         Self {
             ring_entries,
             max_inflight_bytes,
-            verifier_workers: default_verifier_workers(),
         }
-    }
-
-    #[must_use]
-    pub const fn with_verifier_workers(mut self, verifier_workers: NonZeroUsize) -> Self {
-        self.verifier_workers = verifier_workers;
-        self
     }
 
     #[must_use]
@@ -68,11 +52,6 @@ impl IoUringStorageConfig {
     #[must_use]
     pub const fn max_inflight_bytes(self) -> NonZeroU64 {
         self.max_inflight_bytes
-    }
-
-    #[must_use]
-    pub const fn verifier_workers(self) -> NonZeroUsize {
-        self.verifier_workers
     }
 }
 
@@ -86,23 +65,9 @@ impl Default for IoUringStorageConfig {
     }
 }
 
-fn default_verifier_workers() -> NonZeroUsize {
-    thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
-}
-
-/// Kernel-I/O mode selected when the adapter was opened.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IoUringStorageMode {
-    Active,
-    Synchronous,
-    SyncFallback,
-}
-
 /// Point-in-time boundedness and batching telemetry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IoUringStorageStatus {
-    mode: IoUringStorageMode,
-    fallback_reason: Option<String>,
     ring_entries: u32,
     max_inflight_bytes: u64,
     inflight_bytes: u64,
@@ -114,26 +79,9 @@ pub struct IoUringStorageStatus {
     owned_publications_started: u64,
     owned_publications_completed: u64,
     borrowed_write_copy_bytes: u64,
-    verifier_workers: usize,
-    verification_jobs_started: u64,
-    verification_jobs_completed: u64,
-    verification_jobs_failed: u64,
-    parallel_hash_verifications: u64,
-    active_verifications: u64,
-    peak_active_verifications: u64,
 }
 
 impl IoUringStorageStatus {
-    #[must_use]
-    pub const fn mode(&self) -> IoUringStorageMode {
-        self.mode
-    }
-
-    #[must_use]
-    pub fn fallback_reason(&self) -> Option<&str> {
-        self.fallback_reason.as_deref()
-    }
-
     #[must_use]
     pub const fn ring_entries(&self) -> u32 {
         self.ring_entries
@@ -188,47 +136,12 @@ impl IoUringStorageStatus {
     pub const fn borrowed_write_copy_bytes(&self) -> u64 {
         self.borrowed_write_copy_bytes
     }
-
-    #[must_use]
-    pub const fn verifier_workers(&self) -> usize {
-        self.verifier_workers
-    }
-
-    #[must_use]
-    pub const fn verification_jobs_started(&self) -> u64 {
-        self.verification_jobs_started
-    }
-
-    #[must_use]
-    pub const fn verification_jobs_completed(&self) -> u64 {
-        self.verification_jobs_completed
-    }
-
-    #[must_use]
-    pub const fn verification_jobs_failed(&self) -> u64 {
-        self.verification_jobs_failed
-    }
-
-    #[must_use]
-    pub const fn parallel_hash_verifications(&self) -> u64 {
-        self.parallel_hash_verifications
-    }
-
-    #[must_use]
-    pub const fn active_verifications(&self) -> u64 {
-        self.active_verifications
-    }
-
-    #[must_use]
-    pub const fn peak_active_verifications(&self) -> u64 {
-        self.peak_active_verifications
-    }
 }
 
 /// Cloneable data-tier storage adapter backed by one shared bounded ring.
 pub struct IoUringStorageIo {
     filesystem: FsStorageIo,
-    backend: Arc<Backend>,
+    backend: Arc<ActiveBackend>,
     config: IoUringStorageConfig,
 }
 
@@ -253,60 +166,17 @@ impl fmt::Debug for IoUringStorageIo {
 }
 
 impl IoUringStorageIo {
-    /// Opens the root and requires a functioning ring.
+    /// Opens the root and starts its required shared ring.
     ///
     /// # Errors
     ///
     /// Returns root initialization, ring setup, or worker spawn errors.
-    pub fn open_required(root: impl AsRef<Path>, config: IoUringStorageConfig) -> io::Result<Self> {
+    pub fn open(root: impl AsRef<Path>, config: IoUringStorageConfig) -> io::Result<Self> {
         let filesystem = FsStorageIo::open(root)?;
-        let active = ActiveBackend::start(config)?;
+        let backend = Arc::new(ActiveBackend::start(config)?);
         Ok(Self {
             filesystem,
-            backend: Arc::new(Backend::Active(active)),
-            config,
-        })
-    }
-
-    /// Opens the root and falls back to the proven synchronous adapter when
-    /// ring creation is unavailable.
-    ///
-    /// # Errors
-    ///
-    /// Returns only root initialization errors. Ring setup failure is exposed
-    /// through [`Self::status`].
-    pub fn open_or_fallback(
-        root: impl AsRef<Path>,
-        config: IoUringStorageConfig,
-    ) -> io::Result<Self> {
-        let filesystem = FsStorageIo::open(root)?;
-        let backend = match ActiveBackend::start(config) {
-            Ok(active) => Backend::Active(active),
-            Err(error) => Backend::Fallback(error.to_string()),
-        };
-        Ok(Self {
-            filesystem,
-            backend: Arc::new(backend),
-            config,
-        })
-    }
-
-    /// Opens the root with the proven synchronous adapter selected by policy.
-    ///
-    /// This is distinct from fallback after a failed ring setup, allowing
-    /// telemetry to distinguish an intentional benchmark decision from a host
-    /// capability failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns root initialization errors.
-    pub fn open_synchronous(
-        root: impl AsRef<Path>,
-        config: IoUringStorageConfig,
-    ) -> io::Result<Self> {
-        Ok(Self {
-            filesystem: FsStorageIo::open(root)?,
-            backend: Arc::new(Backend::Synchronous),
+            backend,
             config,
         })
     }
@@ -318,50 +188,12 @@ impl IoUringStorageIo {
 
     #[must_use]
     pub fn status(&self) -> IoUringStorageStatus {
-        match self.backend.as_ref() {
-            Backend::Active(active) => active.status(self.config),
-            Backend::Synchronous | Backend::Fallback(_) => IoUringStorageStatus {
-                mode: if matches!(self.backend.as_ref(), Backend::Synchronous) {
-                    IoUringStorageMode::Synchronous
-                } else {
-                    IoUringStorageMode::SyncFallback
-                },
-                fallback_reason: match self.backend.as_ref() {
-                    Backend::Fallback(reason) => Some(reason.clone()),
-                    Backend::Active(_) | Backend::Synchronous => None,
-                },
-                ring_entries: self.config.ring_entries.get(),
-                max_inflight_bytes: self.config.max_inflight_bytes.get(),
-                inflight_bytes: 0,
-                peak_inflight_bytes: 0,
-                submitted_operations: 0,
-                completed_operations: 0,
-                root_sync_callers: 0,
-                root_sync_submissions: 0,
-                owned_publications_started: 0,
-                owned_publications_completed: 0,
-                borrowed_write_copy_bytes: 0,
-                verifier_workers: self.config.verifier_workers.get(),
-                verification_jobs_started: 0,
-                verification_jobs_completed: 0,
-                verification_jobs_failed: 0,
-                parallel_hash_verifications: 0,
-                active_verifications: 0,
-                peak_active_verifications: 0,
-            },
-        }
+        self.backend.status(self.config)
     }
 
     fn path(&self, name: &str) -> io::Result<PathBuf> {
         validate_name(name)?;
         Ok(self.filesystem.root().join(name))
-    }
-
-    fn active(&self) -> Option<&ActiveBackend> {
-        match self.backend.as_ref() {
-            Backend::Active(active) => Some(active),
-            Backend::Synchronous | Backend::Fallback(_) => None,
-        }
     }
 }
 
@@ -375,21 +207,18 @@ impl StorageIo for IoUringStorageIo {
     }
 
     fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        let Some(active) = self.active() else {
-            return self.filesystem.write_at(name, offset, bytes);
-        };
         let byte_length = u64::try_from(bytes.len())
             .map_err(|_| invalid_input("write length does not fit u64"))?;
         offset
             .checked_add(byte_length)
             .ok_or_else(|| invalid_input("write range overflows"))?;
-        let lease = active.budget.acquire(byte_length)?;
+        let lease = self.backend.budget.acquire(byte_length)?;
         let mut owned = Vec::new();
         owned
             .try_reserve_exact(bytes.len())
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         owned.extend_from_slice(bytes);
-        active
+        self.backend
             .counters
             .callers
             .borrowed_write_copy_bytes
@@ -398,19 +227,16 @@ impl StorageIo for IoUringStorageIo {
             .read(true)
             .write(true)
             .open(self.path(name)?)?;
-        active.write(file, offset, owned, lease)
+        self.backend.write(file, offset, owned, lease)
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
-        let Some(active) = self.active() else {
-            return self.filesystem.read(name);
-        };
         let file = File::open(self.path(name)?)?;
         let length = file.metadata()?.len();
         if length > MAX_CONTAINER_BYTES {
             return Err(invalid_data("container exceeds the format-v1 hard limit"));
         }
-        active.read(file, 0, usize_from_u64(length)?)
+        self.backend.read(file, 0, usize_from_u64(length)?)
     }
 
     fn object_len(&self, name: &str) -> io::Result<u64> {
@@ -428,9 +254,6 @@ impl StorageIo for IoUringStorageIo {
         let end = offset
             .checked_add(length_u64)
             .ok_or_else(|| invalid_input("read range overflows"))?;
-        let Some(active) = self.active() else {
-            return self.filesystem.read_exact_at(name, offset, length);
-        };
         let file = File::open(self.path(name)?)?;
         if end > file.metadata()?.len() {
             return Err(io::Error::new(
@@ -438,7 +261,7 @@ impl StorageIo for IoUringStorageIo {
                 "bounded storage read exceeds the current object length",
             ));
         }
-        active.read(file, offset, length)
+        self.backend.read(file, offset, length)
     }
 
     fn list_names(&self) -> io::Result<Vec<String>> {
@@ -450,22 +273,14 @@ impl StorageIo for IoUringStorageIo {
     }
 
     fn sync_file(&self, name: &str) -> io::Result<()> {
-        let Some(active) = self.active() else {
-            return self.filesystem.sync_file(name);
-        };
-        active.fsync(File::open(self.path(name)?)?)
+        self.backend.fsync(File::open(self.path(name)?)?)
     }
 
     fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
-        let Some(active) = self.active() else {
-            return self
-                .filesystem
-                .publish_noreplace(temporary_name, published_name);
-        };
         let old_name = c_name(temporary_name)?;
         let new_name = c_name(published_name)?;
         let directory = File::open(self.filesystem.root())?;
-        active.rename_noreplace(directory, old_name, new_name)
+        self.backend.rename_noreplace(directory, old_name, new_name)
     }
 
     fn remove_file(&self, name: &str) -> io::Result<()> {
@@ -473,20 +288,14 @@ impl StorageIo for IoUringStorageIo {
     }
 
     fn sync_root(&self) -> io::Result<()> {
-        let Some(active) = self.active() else {
-            return self.filesystem.sync_root();
-        };
-        active.sync_root(File::open(self.filesystem.root())?)
+        self.backend.sync_root(File::open(self.filesystem.root())?)
     }
 
     fn publish_owned_container(
         &self,
         publication: OwnedContainerPublication,
     ) -> Result<VerifiedContainerPublication, StoreError> {
-        let Some(active) = self.active() else {
-            return self.filesystem.publish_owned_container(publication);
-        };
-        let lease = active.acquire_publication(&publication)?;
+        let lease = self.backend.acquire_publication(&publication)?;
         let temporary_name = publication.temporary_name().to_owned();
         let published_name = publication.published_name().to_owned();
         let file = OpenOptions::new()
@@ -495,7 +304,7 @@ impl StorageIo for IoUringStorageIo {
             .write(true)
             .open(self.path(&temporary_name)?)?;
         let directory = File::open(self.filesystem.root())?;
-        active.publish_owned(
+        self.backend.publish_owned(
             file,
             directory,
             c_name(&temporary_name)?,
@@ -506,10 +315,85 @@ impl StorageIo for IoUringStorageIo {
     }
 }
 
-enum Backend {
-    Active(ActiveBackend),
-    Synchronous,
-    Fallback(String),
+struct WakeSignal {
+    file: File,
+}
+
+impl WakeSignal {
+    fn new() -> io::Result<Self> {
+        // SAFETY: `eventfd` returns a new owned descriptor on success. `File`
+        // takes that ownership exactly once and closes it on drop.
+        let descriptor = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful `eventfd` call returned one valid owned fd.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        Ok(Self { file })
+    }
+
+    fn notify(&self) -> io::Result<()> {
+        let value = 1_u64.to_ne_bytes();
+        // SAFETY: the eventfd is live for this call and `value` supplies the
+        // exact eight bytes required by eventfd(2).
+        let written =
+            unsafe { libc::write(self.file.as_raw_fd(), value.as_ptr().cast(), value.len()) };
+        if written == isize::try_from(value.len()).expect("ASSERT: eventfd write length fits isize")
+        {
+            Ok(())
+        } else if written < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                // A saturated counter already guarantees a pending wakeup.
+                Ok(())
+            } else if error.kind() == io::ErrorKind::Interrupted {
+                self.notify()
+            } else {
+                Err(error)
+            }
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short eventfd wake write",
+            ))
+        }
+    }
+
+    fn notify_best_effort(&self) {
+        let _ = self.notify();
+    }
+
+    fn drain(&self) -> io::Result<()> {
+        loop {
+            let mut value = [0_u8; std::mem::size_of::<u64>()];
+            // SAFETY: the eventfd is live and `value` is one writable u64.
+            let read = unsafe {
+                libc::read(
+                    self.file.as_raw_fd(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
+            if read == isize::try_from(value.len()).expect("ASSERT: eventfd read length fits isize")
+            {
+                continue;
+            }
+            if read < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short eventfd wake read",
+            ));
+        }
+    }
 }
 
 struct ActiveBackend {
@@ -517,11 +401,16 @@ struct ActiveBackend {
     worker: Mutex<Option<JoinHandle<()>>>,
     budget: Arc<InflightBudget>,
     counters: Arc<Counters>,
+    wake: Arc<WakeSignal>,
 }
 
 impl ActiveBackend {
     fn start(config: IoUringStorageConfig) -> io::Result<Self> {
-        let ring = IoUring::new(config.ring_entries.get())?;
+        if config.ring_entries.get() < 2 {
+            return Err(invalid_input(
+                "io_uring requires one operation entry plus one command wake entry",
+            ));
+        }
         let queue_capacity = usize::try_from(config.ring_entries.get())
             .expect("ASSERT: u32 ring entry count fits usize")
             .checked_mul(2)
@@ -530,27 +419,62 @@ impl ActiveBackend {
         let budget = Arc::new(InflightBudget::new(config.max_inflight_bytes.get()));
         let counters = Arc::new(Counters::default());
         let worker_counters = Arc::clone(&counters);
+        let wake = Arc::new(WakeSignal::new()?);
+        let worker_wake = Arc::clone(&wake);
         let entries = usize::try_from(config.ring_entries.get())
             .expect("ASSERT: u32 ring entry count fits usize");
-        let verifier_pool =
-            VerificationPool::start(config.verifier_workers, entries, &worker_counters);
+        let (initialized, initialization) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("fastdup-io-uring".to_owned())
             .spawn(move || {
-                worker_loop(ring, &receiver, &worker_counters, entries, verifier_pool);
+                let ring = IoUring::builder()
+                    .setup_single_issuer()
+                    .build(config.ring_entries.get());
+                let ring = match ring {
+                    Ok(ring) => ring,
+                    Err(error) => {
+                        let _ = initialized.send(Err(error));
+                        return;
+                    }
+                };
+                if let Err(error) = require_publication_opcodes(&ring) {
+                    let _ = initialized.send(Err(error));
+                    return;
+                }
+                if initialized.send(Ok(())).is_err() {
+                    return;
+                }
+                worker_loop(ring, &receiver, &worker_counters, entries, &worker_wake);
             })?;
+        match initialization.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                worker
+                    .join()
+                    .expect("ASSERT: failed io_uring worker initialization does not panic");
+                return Err(error);
+            }
+            Err(_) => {
+                worker
+                    .join()
+                    .expect("ASSERT: failed io_uring worker initialization does not panic");
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "io_uring worker stopped during initialization",
+                ));
+            }
+        }
         Ok(Self {
             sender,
             worker: Mutex::new(Some(worker)),
             budget,
             counters,
+            wake,
         })
     }
 
     fn status(&self, config: IoUringStorageConfig) -> IoUringStorageStatus {
         IoUringStorageStatus {
-            mode: IoUringStorageMode::Active,
-            fallback_reason: None,
             ring_entries: config.ring_entries.get(),
             max_inflight_bytes: config.max_inflight_bytes.get(),
             inflight_bytes: self.budget.used.load(Ordering::Relaxed),
@@ -578,21 +502,6 @@ impl ActiveBackend {
                 .callers
                 .borrowed_write_copy_bytes
                 .load(Ordering::Relaxed),
-            verifier_workers: config.verifier_workers.get(),
-            verification_jobs_started: self.counters.verifier.jobs_started.load(Ordering::Relaxed),
-            verification_jobs_completed: self
-                .counters
-                .verifier
-                .jobs_completed
-                .load(Ordering::Relaxed),
-            verification_jobs_failed: self.counters.verifier.jobs_failed.load(Ordering::Relaxed),
-            parallel_hash_verifications: self
-                .counters
-                .verifier
-                .parallel_hashes
-                .load(Ordering::Relaxed),
-            active_verifications: self.counters.verifier.active.load(Ordering::Relaxed),
-            peak_active_verifications: self.counters.verifier.peak_active.load(Ordering::Relaxed),
         }
     }
 
@@ -705,13 +614,18 @@ impl ActiveBackend {
     fn send(&self, command: Command) -> io::Result<()> {
         self.sender
             .send(command)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring worker stopped"))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring worker stopped"))?;
+        self.wake
+            .notify()
+            .expect("ASSERT: a live io_uring command channel has a live eventfd wakeup");
+        Ok(())
     }
 }
 
 impl Drop for ActiveBackend {
     fn drop(&mut self) {
         let _ = self.sender.send(Command::Shutdown);
+        self.wake.notify_best_effort();
         if let Some(worker) = self
             .worker
             .lock()
@@ -724,11 +638,31 @@ impl Drop for ActiveBackend {
     }
 }
 
+fn require_publication_opcodes(ring: &IoUring) -> io::Result<()> {
+    let mut probe = Probe::new();
+    ring.submitter().register_probe(&mut probe)?;
+    for (name, code) in [
+        ("READ", opcode::Read::CODE),
+        ("WRITE", opcode::Write::CODE),
+        ("FSYNC", opcode::Fsync::CODE),
+        ("POLL_ADD", opcode::PollAdd::CODE),
+        ("RENAMEAT", opcode::RenameAt::CODE),
+        ("FTRUNCATE", opcode::Ftruncate::CODE),
+    ] {
+        if !probe.is_supported(code) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("required io_uring opcode {name} is unavailable"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Counters {
     worker: WorkerCounters,
     callers: CallerCounters,
-    verifier: VerifierCounters,
 }
 
 #[derive(Default)]
@@ -746,17 +680,6 @@ struct CallerCounters {
     root_sync: AtomicU64,
     owned_publications_started: AtomicU64,
     borrowed_write_copy_bytes: AtomicU64,
-}
-
-#[derive(Default)]
-#[repr(C, align(64))]
-struct VerifierCounters {
-    jobs_started: AtomicU64,
-    jobs_completed: AtomicU64,
-    jobs_failed: AtomicU64,
-    parallel_hashes: AtomicU64,
-    active: AtomicU64,
-    peak_active: AtomicU64,
 }
 
 struct InflightBudget {
@@ -876,11 +799,22 @@ enum Command {
 }
 
 enum PublishPhase {
-    Building { progress: usize },
-    Body { progress: usize },
-    SealedHeader { progress: usize },
-    Reread { bytes: Vec<u8>, progress: usize },
-    AwaitVerification,
+    Building {
+        progress: usize,
+    },
+    Body {
+        progress: usize,
+    },
+    SealedHeader {
+        progress: usize,
+    },
+    SetLength,
+    SampleRead {
+        ordinal: usize,
+        range: PublicationSampleRange,
+        bytes: Vec<u8>,
+        progress: usize,
+    },
     FileSync,
     Rename,
 }
@@ -890,9 +824,6 @@ struct PublishOperation {
     directory: Option<File>,
     old_name: CString,
     new_name: CString,
-    container_id: fastdup_format::ContainerId,
-    container_generation: u64,
-    expected_container_hash: [u8; 32],
     sealed_length: usize,
     building_header: Box<[u8; HEADER_BYTES]>,
     sealed: Vec<u8>,
@@ -917,6 +848,7 @@ impl PublishOperation {
             container_generation,
             building_header,
             sealed,
+            verified,
             temporary_name,
             published_name,
         ) = publication.into_parts();
@@ -934,33 +866,27 @@ impl PublishOperation {
             sealed.len() > HEADER_BYTES,
             "ASSERT: owned publisher receives a complete sealed Container"
         );
-        let footer_bytes =
-            usize::try_from(FOOTER_BYTES).expect("ASSERT: format-v1 Footer size fits usize");
-        let footer_offset = sealed
-            .len()
-            .checked_sub(footer_bytes)
-            .expect("ASSERT: a sealed Container contains its Footer");
+        assert_eq!(
+            verified.header().container_id(),
+            container_id,
+            "ASSERT: writer evidence keeps the owned Container identity"
+        );
+        assert_eq!(
+            verified.header().container_generation(),
+            container_generation,
+            "ASSERT: writer evidence keeps the owned Container generation"
+        );
         let sealed_length = sealed.len();
-        let expected_container_hash = SealedContainerDescriptor::decode(
-            &sealed[..HEADER_BYTES],
-            &sealed[footer_offset..],
-            u64::try_from(sealed_length).expect("ASSERT: bounded Container length fits u64"),
-        )
-        .expect("ASSERT: the format writer produced a valid Container envelope")
-        .container_hash();
         Self {
             file,
             directory: Some(directory),
             old_name,
             new_name,
-            container_id,
-            container_generation,
-            expected_container_hash,
             sealed_length,
             building_header,
             sealed,
             phase: PublishPhase::Building { progress: 0 },
-            verified: None,
+            verified: Some(verified),
             lease: Some(lease),
             reply: Some(reply),
         }
@@ -978,11 +904,23 @@ impl PublishOperation {
             PublishPhase::SealedHeader { progress } => {
                 write_entry(&self.file, &self.sealed[*progress..HEADER_BYTES], *progress)
             }
-            PublishPhase::Reread { bytes, progress } => {
-                read_entry(&self.file, &mut bytes[*progress..], *progress)
-            }
-            PublishPhase::AwaitVerification => {
-                unreachable!("ASSERT: verification owns no kernel operation")
+            PublishPhase::SetLength => Ok(opcode::Ftruncate::new(
+                types::Fd(self.file.as_raw_fd()),
+                u64::try_from(self.sealed_length)
+                    .expect("ASSERT: bounded Container length fits u64"),
+            )
+            .build()),
+            PublishPhase::SampleRead {
+                range,
+                bytes,
+                progress,
+                ..
+            } => {
+                let offset = usize::try_from(range.offset())
+                    .map_err(|_| invalid_input("publication sample offset does not fit usize"))?
+                    .checked_add(*progress)
+                    .ok_or_else(|| invalid_input("publication sample offset overflow"))?;
+                read_entry(&self.file, &mut bytes[*progress..], offset)
             }
             PublishPhase::FileSync => {
                 Ok(opcode::Fsync::new(types::Fd(self.file.as_raw_fd())).build())
@@ -1017,12 +955,19 @@ impl PublishOperation {
             PublishPhase::SealedHeader { progress } => {
                 self.complete_sealed_header(progress, transferred)
             }
-            PublishPhase::Reread { bytes, progress } => {
-                self.complete_reread(bytes, progress, transferred)
+            PublishPhase::SetLength => {
+                assert_eq!(
+                    result, 0,
+                    "ASSERT: owned publisher truncate succeeds with zero"
+                );
+                self.begin_sample_reads()
             }
-            PublishPhase::AwaitVerification => {
-                unreachable!("ASSERT: verification owns no CQE")
-            }
+            PublishPhase::SampleRead {
+                ordinal,
+                range,
+                bytes,
+                progress,
+            } => self.complete_sample_read(ordinal, range, bytes, progress, transferred),
             PublishPhase::FileSync => {
                 assert_eq!(
                     result, 0,
@@ -1044,7 +989,7 @@ impl PublishOperation {
                     verified: self
                         .verified
                         .take()
-                        .expect("ASSERT: rename follows complete writer verification"),
+                        .expect("ASSERT: rename retains writer publication evidence"),
                     reply: self
                         .reply
                         .take()
@@ -1096,26 +1041,38 @@ impl PublishOperation {
             self.phase = PublishPhase::SealedHeader { progress };
             return self.pending();
         }
-        let sealed_length =
-            u64::try_from(self.sealed_length).expect("ASSERT: bounded Container length fits u64");
-        if let Err(error) = self.file.set_len(sealed_length) {
-            self.fail(StoreError::Io(error));
-            return OperationCompletion::Done;
-        }
-        self.sealed = Vec::new();
-        let bytes = match allocate_reread_buffer(self.sealed_length) {
+        self.phase = PublishPhase::SetLength;
+        self.pending()
+    }
+
+    fn begin_sample_reads(mut self) -> OperationCompletion {
+        let ranges = match publication_sample_ranges(self.sealed_length) {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                self.fail(error);
+                return OperationCompletion::Done;
+            }
+        };
+        let bytes = match allocate_sample_buffer(ranges[0].length()) {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.fail(error);
                 return OperationCompletion::Done;
             }
         };
-        self.phase = PublishPhase::Reread { bytes, progress: 0 };
+        self.phase = PublishPhase::SampleRead {
+            ordinal: 0,
+            range: ranges[0],
+            bytes,
+            progress: 0,
+        };
         self.pending()
     }
 
-    fn complete_reread(
+    fn complete_sample_read(
         mut self,
+        ordinal: usize,
+        range: PublicationSampleRange,
         bytes: Vec<u8>,
         mut progress: usize,
         transferred: usize,
@@ -1133,36 +1090,46 @@ impl PublishOperation {
         }
         progress += transferred;
         if progress != bytes.len() {
-            self.phase = PublishPhase::Reread { bytes, progress };
+            self.phase = PublishPhase::SampleRead {
+                ordinal,
+                range,
+                bytes,
+                progress,
+            };
             return self.pending();
         }
-        self.phase = PublishPhase::AwaitVerification;
-        OperationCompletion::NeedsVerification(PendingVerification {
-            operation: Box::new(self),
-            bytes,
-        })
-    }
-
-    fn finish_verification(
-        mut self,
-        verified: Result<VerifiedContainerPublication, StoreError>,
-    ) -> OperationCompletion {
-        assert!(
-            matches!(self.phase, PublishPhase::AwaitVerification),
-            "ASSERT: only a completed writer reread may enter CPU verification"
-        );
-        match verified {
-            Ok(verified) => {
-                self.lease = None;
-                self.verified = Some(verified);
-                self.phase = PublishPhase::FileSync;
-                self.pending()
-            }
+        if let Err(error) = verify_publication_sample(&self.sealed, range, &bytes) {
+            self.fail(error);
+            return OperationCompletion::Done;
+        }
+        let ranges = match publication_sample_ranges(self.sealed_length) {
+            Ok(ranges) => ranges,
             Err(error) => {
                 self.fail(error);
-                OperationCompletion::Done
+                return OperationCompletion::Done;
             }
+        };
+        let next = ordinal + 1;
+        if let Some(range) = ranges.get(next).copied() {
+            let bytes = match allocate_sample_buffer(range.length()) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.fail(error);
+                    return OperationCompletion::Done;
+                }
+            };
+            self.phase = PublishPhase::SampleRead {
+                ordinal: next,
+                range,
+                bytes,
+                progress: 0,
+            };
+            return self.pending();
         }
+        self.sealed = Vec::new();
+        self.lease = None;
+        self.phase = PublishPhase::FileSync;
+        self.pending()
     }
 
     fn pending(self) -> OperationCompletion {
@@ -1176,41 +1143,13 @@ impl PublishOperation {
     }
 }
 
-fn allocate_reread_buffer(length: usize) -> Result<Vec<u8>, StoreError> {
+fn allocate_sample_buffer(length: usize) -> Result<Vec<u8>, StoreError> {
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(length)
         .map_err(|_| StoreError::Io(io::Error::from(io::ErrorKind::OutOfMemory)))?;
     bytes.resize(length, 0);
     Ok(bytes)
-}
-
-fn verify_owned_reread(
-    reread: &[u8],
-    expected_container_hash: [u8; 32],
-    container_id: fastdup_format::ContainerId,
-    container_generation: u64,
-    hash_workers: NonZeroUsize,
-) -> Result<VerifiedContainerPublication, StoreError> {
-    let verified = SealedContainer::verify_publication_with_hash_workers(reread, hash_workers)?;
-    let footer_bytes =
-        usize::try_from(FOOTER_BYTES).expect("ASSERT: format-v1 Footer size fits usize");
-    let footer_offset = reread
-        .len()
-        .checked_sub(footer_bytes)
-        .ok_or(StoreError::PublishVerificationMismatch)?;
-    let descriptor = SealedContainerDescriptor::decode(
-        &reread[..HEADER_BYTES],
-        &reread[footer_offset..],
-        u64::try_from(reread.len()).map_err(|_| StoreError::PublishVerificationMismatch)?,
-    )?;
-    if descriptor.container_hash() != expected_container_hash
-        || verified.header().container_id() != container_id
-        || verified.header().container_generation() != container_generation
-    {
-        return Err(StoreError::PublishVerificationMismatch);
-    }
-    Ok(verified)
 }
 
 struct PublishReady {
@@ -1224,14 +1163,8 @@ struct RootPublication {
     reply: mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>,
 }
 
-struct PendingVerification {
-    operation: Box<PublishOperation>,
-    bytes: Vec<u8>,
-}
-
 enum OperationCompletion {
     Pending(Operation),
-    NeedsVerification(PendingVerification),
     ReadyRoot(PublishReady),
     Done,
 }
@@ -1459,319 +1392,347 @@ fn complete_storage_operation(
 }
 
 fn worker_loop(
-    mut ring: IoUring,
+    ring: IoUring,
     receiver: &mpsc::Receiver<Command>,
     counters: &Counters,
     ring_entries: usize,
-    mut verifier_pool: VerificationPool,
+    wake: &WakeSignal,
 ) {
-    while let Ok(first) = receiver.recv() {
-        if matches!(first, Command::Shutdown) {
-            break;
+    RingWorker {
+        ring,
+        receiver,
+        counters,
+        ring_entries,
+        wake,
+        ready: VecDeque::with_capacity(ring_entries),
+        submitted: HashMap::with_capacity(ring_entries),
+        roots: RootCohort::default(),
+        next_user_data: 1,
+        wake_submitted: false,
+        shutdown: false,
+    }
+    .run();
+}
+
+struct RingWorker<'a> {
+    ring: IoUring,
+    receiver: &'a mpsc::Receiver<Command>,
+    counters: &'a Counters,
+    ring_entries: usize,
+    wake: &'a WakeSignal,
+    ready: VecDeque<Operation>,
+    submitted: HashMap<u64, Operation>,
+    roots: RootCohort,
+    next_user_data: u64,
+    wake_submitted: bool,
+    shutdown: bool,
+}
+
+impl RingWorker<'_> {
+    fn run(mut self) {
+        loop {
+            if let Err(error) = self.reap_completions() {
+                self.fail(&error);
+                return;
+            }
+            self.admit_commands();
+            if let Some(root_sync) = self.roots.take_operation(self.counters) {
+                self.ready.push_back(root_sync);
+            }
+            if self.finished() {
+                return;
+            }
+            self.arm_wakeup();
+            self.submit_ready();
+            if let Err(error) = self.ring.submit_and_wait(1)
+                && error.kind() != io::ErrorKind::Interrupted
+            {
+                self.fail(&error);
+                return;
+            }
         }
-        let first_is_root = matches!(first, Command::SyncRoot { .. });
-        let first_is_owned_publish = matches!(first, Command::PublishOwned { .. });
-        let mut commands = Vec::with_capacity(ring_entries);
-        commands.push(first);
-        if first_is_root || first_is_owned_publish {
-            let delay = if first_is_root {
-                ROOT_SYNC_COHORT_DELAY
-            } else {
-                OWNED_PUBLISH_COHORT_DELAY
+    }
+
+    fn reap_completions(&mut self) -> io::Result<()> {
+        let completions = {
+            let mut completion = self.ring.completion();
+            completion
+                .by_ref()
+                .map(|entry| (entry.user_data(), entry.result()))
+                .collect::<Vec<_>>()
+        };
+        for (user_data, result) in completions {
+            if user_data == WAKE_USER_DATA {
+                self.wake_submitted = false;
+                self.wake.drain()?;
+                continue;
+            }
+            let operation = self
+                .submitted
+                .remove(&user_data)
+                .expect("ASSERT: every operation CQE names one submitted operation");
+            self.counters
+                .worker
+                .completed
+                .fetch_add(1, Ordering::Relaxed);
+            handle_operation_completion(
+                operation.complete(result, self.counters),
+                &mut self.ready,
+                &mut self.roots,
+            );
+        }
+        Ok(())
+    }
+
+    fn admit_commands(&mut self) {
+        while !self.shutdown {
+            match self.receiver.try_recv() {
+                Ok(Command::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.shutdown = true;
+                }
+                Ok(command) => admit_command(command, &mut self.ready, &mut self.roots),
+                Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.shutdown && self.ready.is_empty() && self.submitted.is_empty()
+    }
+
+    fn arm_wakeup(&mut self) {
+        if !self.shutdown && !self.wake_submitted && self.submitted.len() < self.ring_entries {
+            let entry = opcode::PollAdd::new(
+                types::Fd(self.wake.file.as_raw_fd()),
+                u32::try_from(libc::POLLIN).expect("ASSERT: POLLIN fits u32"),
+            )
+            .build()
+            .user_data(WAKE_USER_DATA);
+            let mut submission = self.ring.submission();
+            // SAFETY: PollAdd stores only the eventfd number. `wake` owns that
+            // descriptor until the worker exits and this CQE has completed.
+            unsafe {
+                submission
+                    .push(&entry)
+                    .expect("ASSERT: reserved wake entry fits the ring");
+            }
+            self.wake_submitted = true;
+        }
+    }
+
+    fn submit_ready(&mut self) {
+        while self.submitted.len() + usize::from(self.wake_submitted) < self.ring_entries {
+            let Some(mut operation) = self.ready.pop_front() else {
+                break;
             };
-            let deadline = Instant::now() + delay;
-            while commands.len() < ring_entries {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
+            let user_data = next_operation_token(&mut self.next_user_data, &self.submitted);
+            let entry = match operation.entry(user_data) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    operation.reply_error(&error);
+                    continue;
                 }
-                match receiver.recv_timeout(deadline - now) {
-                    Ok(Command::Shutdown) => break,
-                    Ok(command) => commands.push(command),
-                    Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-                        break;
-                    }
-                }
-            }
-        } else {
-            while commands.len() < ring_entries {
-                match receiver.try_recv() {
-                    Ok(Command::Shutdown)
-                    | Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
-                    Ok(command) => commands.push(command),
+            };
+            {
+                let mut submission = self.ring.submission();
+                // SAFETY: every pointer in the SQE refers to an allocation
+                // owned by `operation`. Moving the enum into `submitted` does
+                // not move Vec or CString allocations, and the map retains the
+                // operation unchanged until its matching CQE is consumed.
+                unsafe {
+                    submission
+                        .push(&entry)
+                        .expect("ASSERT: preflighted operation fits the ring");
                 }
             }
+            let replaced = self.submitted.insert(user_data, operation);
+            assert!(replaced.is_none(), "ASSERT: operation token is unique");
+            self.counters
+                .worker
+                .submitted
+                .fetch_add(1, Ordering::Relaxed);
         }
-        let operations = coalesce_commands(commands, counters);
-        execute_operations(&mut ring, operations, counters, &mut verifier_pool);
+    }
+
+    fn fail(&mut self, error: &io::Error) {
+        fail_worker(
+            error,
+            self.receiver,
+            &mut self.ready,
+            &mut self.submitted,
+            &mut self.roots,
+        );
     }
 }
 
-fn coalesce_commands(commands: Vec<Command>, counters: &Counters) -> Vec<Operation> {
-    let mut operations = Vec::with_capacity(commands.len());
-    let mut root_directory = None;
-    let mut root_replies = Vec::new();
-    for command in commands {
-        match command {
-            Command::PublishOwned {
-                file,
-                directory,
-                old_name,
-                new_name,
-                publication,
-                lease,
-                reply,
-            } => operations.push(Operation::PublishOwned(Box::new(PublishOperation::new(
-                file,
-                directory,
-                old_name,
-                new_name,
-                publication,
-                lease,
-                reply,
-            )))),
-            Command::Write {
-                file,
-                offset,
-                bytes,
-                lease,
-                reply,
-            } => operations.push(Operation::Write {
-                file,
-                offset,
-                bytes,
-                progress: 0,
-                _lease: lease,
-                reply,
-            }),
-            Command::Read {
-                file,
-                offset,
-                bytes,
-                lease,
-                reply,
-            } => operations.push(Operation::Read {
-                file,
-                offset,
-                bytes,
-                progress: 0,
-                _lease: lease,
-                reply,
-            }),
-            Command::Fsync { file, reply } => operations.push(Operation::Fsync { file, reply }),
-            Command::Rename {
-                directory,
-                old_name,
-                new_name,
-                reply,
-            } => operations.push(Operation::Rename {
-                directory,
-                old_name,
-                new_name,
-                reply,
-            }),
-            Command::SyncRoot { directory, reply } => {
-                root_directory.get_or_insert(directory);
-                root_replies.push(reply);
-            }
-            Command::Shutdown => {}
-        }
+#[derive(Default)]
+struct RootCohort {
+    directory: Option<File>,
+    replies: Vec<mpsc::SyncSender<io::Result<()>>>,
+    publications: Vec<RootPublication>,
+}
+
+impl RootCohort {
+    fn add_sync(&mut self, directory: File, reply: mpsc::SyncSender<io::Result<()>>) {
+        self.directory.get_or_insert(directory);
+        self.replies.push(reply);
     }
-    if let Some(directory) = root_directory {
+
+    fn add_publication(&mut self, publication: PublishReady) {
+        self.directory.get_or_insert(publication.directory);
+        self.publications.push(RootPublication {
+            verified: publication.verified,
+            reply: publication.reply,
+        });
+    }
+
+    fn take_operation(&mut self, counters: &Counters) -> Option<Operation> {
+        let directory = self.directory.take()?;
         assert!(
-            !root_replies.is_empty(),
+            !self.replies.is_empty() || !self.publications.is_empty(),
             "ASSERT: a root-sync cohort has at least one caller"
         );
         counters
             .worker
             .root_sync_submissions
             .fetch_add(1, Ordering::Relaxed);
-        operations.push(Operation::RootSync {
+        Some(Operation::RootSync {
             directory,
-            replies: root_replies,
-            publications: Vec::new(),
-        });
+            replies: std::mem::take(&mut self.replies),
+            publications: std::mem::take(&mut self.publications),
+        })
     }
-    operations
+
+    fn fail(&mut self, error: &io::Error) {
+        let kind = error.kind();
+        let message = error.to_string();
+        for reply in self.replies.drain(..) {
+            let _ = reply.send(Err(io::Error::new(kind, message.clone())));
+        }
+        for publication in self.publications.drain(..) {
+            let _ = publication
+                .reply
+                .send(Err(StoreError::Io(io::Error::new(kind, message.clone()))));
+        }
+        self.directory = None;
+    }
 }
 
-fn execute_operations(
-    ring: &mut IoUring,
-    mut operations: Vec<Operation>,
-    counters: &Counters,
-    verifier_pool: &mut VerificationPool,
+fn admit_command(command: Command, ready: &mut VecDeque<Operation>, roots: &mut RootCohort) {
+    match command {
+        Command::PublishOwned {
+            file,
+            directory,
+            old_name,
+            new_name,
+            publication,
+            lease,
+            reply,
+        } => ready.push_back(Operation::PublishOwned(Box::new(PublishOperation::new(
+            file,
+            directory,
+            old_name,
+            new_name,
+            publication,
+            lease,
+            reply,
+        )))),
+        Command::Write {
+            file,
+            offset,
+            bytes,
+            lease,
+            reply,
+        } => ready.push_back(Operation::Write {
+            file,
+            offset,
+            bytes,
+            progress: 0,
+            _lease: lease,
+            reply,
+        }),
+        Command::Read {
+            file,
+            offset,
+            bytes,
+            lease,
+            reply,
+        } => ready.push_back(Operation::Read {
+            file,
+            offset,
+            bytes,
+            progress: 0,
+            _lease: lease,
+            reply,
+        }),
+        Command::Fsync { file, reply } => ready.push_back(Operation::Fsync { file, reply }),
+        Command::Rename {
+            directory,
+            old_name,
+            new_name,
+            reply,
+        } => ready.push_back(Operation::Rename {
+            directory,
+            old_name,
+            new_name,
+            reply,
+        }),
+        Command::SyncRoot { directory, reply } => roots.add_sync(directory, reply),
+        Command::Shutdown => unreachable!("ASSERT: shutdown is handled by the worker loop"),
+    }
+}
+
+fn handle_operation_completion(
+    completion: OperationCompletion,
+    ready: &mut VecDeque<Operation>,
+    roots: &mut RootCohort,
 ) {
-    while !operations.is_empty() {
-        let mut entries = Vec::with_capacity(operations.len());
-        for (index, operation) in operations.iter_mut().enumerate() {
-            match operation.entry(u64::try_from(index).expect("ASSERT: operation index fits u64")) {
-                Ok(entry) => entries.push(entry),
-                Err(error) => {
-                    operation.reply_error(&error);
-                    return;
-                }
-            }
-        }
-        {
-            let mut submission = ring.submission();
-            assert!(
-                submission.capacity() >= entries.len(),
-                "ASSERT: bounded worker batch fits the configured ring"
-            );
-            // SAFETY: every SQE points only into its matching `Operation`.
-            // `operations`, its Files, Vec allocations, and CStrings remain alive
-            // and are not mutated or reallocated until every CQE is consumed.
-            unsafe {
-                submission
-                    .push_multiple(&entries)
-                    .expect("ASSERT: preflighted ring capacity accepts the whole batch");
-            }
-        }
-        counters.worker.submitted.fetch_add(
-            u64::try_from(entries.len()).expect("ASSERT: batch length fits u64"),
-            Ordering::Relaxed,
-        );
-        if let Err(error) = ring.submit_and_wait(entries.len()) {
-            for operation in &mut operations {
-                operation.reply_error(&io::Error::new(error.kind(), error.to_string()));
-            }
-            return;
-        }
-        let mut results = vec![None; operations.len()];
-        let mut completion = ring.completion();
-        for entry in &mut completion {
-            let index =
-                usize::try_from(entry.user_data()).expect("ASSERT: submitted user_data fits usize");
-            assert!(
-                index < results.len(),
-                "ASSERT: CQE index belongs to current batch"
-            );
-            assert!(
-                results[index].is_none(),
-                "ASSERT: one CQE exists per submitted SQE"
-            );
-            results[index] = Some(entry.result());
-        }
-        drop(completion);
-        assert!(
-            results.iter().all(Option::is_some),
-            "ASSERT: submit_and_wait returned every requested CQE"
-        );
-        counters.worker.completed.fetch_add(
-            u64::try_from(results.len()).expect("ASSERT: completion count fits u64"),
-            Ordering::Relaxed,
-        );
-        let mut pending = Vec::new();
-        let mut needs_verification = Vec::new();
-        let mut ready_publications = Vec::new();
-        for (operation, result) in operations.into_iter().zip(results) {
-            match operation.complete(result.expect("ASSERT: CQE exists"), counters) {
-                OperationCompletion::Pending(operation) => pending.push(operation),
-                OperationCompletion::NeedsVerification(verification) => {
-                    needs_verification.push(verification);
-                }
-                OperationCompletion::ReadyRoot(publication) => {
-                    ready_publications.push(publication);
-                }
-                OperationCompletion::Done => {}
-            }
-        }
-        if !ready_publications.is_empty() {
-            pending.push(publication_root_sync(ready_publications, counters));
-        }
-        if !needs_verification.is_empty() {
-            pending.extend(verify_publications(verifier_pool, needs_verification));
-        }
-        operations = pending;
+    match completion {
+        OperationCompletion::Pending(operation) => ready.push_back(operation),
+        OperationCompletion::ReadyRoot(publication) => roots.add_publication(publication),
+        OperationCompletion::Done => {}
     }
 }
 
-fn verify_publications(
-    verifier_pool: &VerificationPool,
-    pending: Vec<PendingVerification>,
-) -> Vec<Operation> {
-    let mut ready = Vec::with_capacity(pending.len());
-    let mut pooled = Vec::with_capacity(pending.len());
-    for pending in pending {
-        if pending.bytes.len() < MIN_POOLED_VERIFICATION_BYTES {
-            let verified = verify_owned_reread(
-                &pending.bytes,
-                pending.operation.expected_container_hash,
-                pending.operation.container_id,
-                pending.operation.container_generation,
-                NonZeroUsize::MIN,
-            );
-            if let Some(operation) = finish_verified_operation(pending.operation, verified) {
-                ready.push(operation);
-            }
+fn next_operation_token(next: &mut u64, submitted: &HashMap<u64, Operation>) -> u64 {
+    loop {
+        let candidate = *next;
+        *next = if candidate == WAKE_USER_DATA - 1 {
+            1
         } else {
-            pooled.push(pending);
-        }
-    }
-    let mut operations = Vec::with_capacity(pooled.len());
-    let mut requests = Vec::with_capacity(pooled.len());
-    for (ordinal, pending) in pooled.into_iter().enumerate() {
-        requests.push(VerificationRequest::new(
-            ordinal,
-            pending.bytes,
-            pending.operation.expected_container_hash,
-            pending.operation.container_id,
-            pending.operation.container_generation,
-        ));
-        operations.push(Some(pending.operation));
-    }
-    for result in verifier_pool.verify_batch(requests) {
-        let ordinal = result.ordinal();
-        let operation = operations
-            .get_mut(ordinal)
-            .and_then(Option::take)
-            .expect("ASSERT: every verifier result names one unique submitted publication");
-        if let Some(operation) = finish_verified_operation(operation, result.into_verified()) {
-            ready.push(operation);
-        }
-    }
-    assert!(
-        operations.into_iter().all(|operation| operation.is_none()),
-        "ASSERT: every submitted publication returned one verifier result"
-    );
-    ready
-}
-
-fn finish_verified_operation(
-    operation: Box<PublishOperation>,
-    verified: Result<VerifiedContainerPublication, StoreError>,
-) -> Option<Operation> {
-    match operation.finish_verification(verified) {
-        OperationCompletion::Pending(operation) => Some(operation),
-        OperationCompletion::Done => None,
-        OperationCompletion::NeedsVerification(_) | OperationCompletion::ReadyRoot(_) => {
-            unreachable!("ASSERT: CPU verification transitions only to file sync or failure")
+            candidate + 1
+        };
+        if !submitted.contains_key(&candidate) {
+            return candidate;
         }
     }
 }
 
-fn publication_root_sync(mut ready: Vec<PublishReady>, counters: &Counters) -> Operation {
-    let first = ready
-        .pop()
-        .expect("ASSERT: publication root-sync cohort is nonempty");
-    let directory = first.directory;
-    let mut publications = Vec::with_capacity(ready.len() + 1);
-    publications.push(RootPublication {
-        verified: first.verified,
-        reply: first.reply,
-    });
-    publications.extend(ready.into_iter().map(|publication| RootPublication {
-        verified: publication.verified,
-        reply: publication.reply,
-    }));
-    counters
-        .worker
-        .root_sync_submissions
-        .fetch_add(1, Ordering::Relaxed);
-    Operation::RootSync {
-        directory,
-        replies: Vec::new(),
-        publications,
+fn fail_worker(
+    error: &io::Error,
+    receiver: &mpsc::Receiver<Command>,
+    ready: &mut VecDeque<Operation>,
+    submitted: &mut HashMap<u64, Operation>,
+    roots: &mut RootCohort,
+) {
+    for operation in ready {
+        operation.reply_error(error);
+    }
+    for operation in submitted.values_mut() {
+        operation.reply_error(error);
+    }
+    roots.fail(error);
+    while let Ok(command) = receiver.try_recv() {
+        if matches!(command, Command::Shutdown) {
+            continue;
+        }
+        let mut queued = VecDeque::new();
+        let mut queued_roots = RootCohort::default();
+        admit_command(command, &mut queued, &mut queued_roots);
+        for operation in &mut queued {
+            operation.reply_error(error);
+        }
+        queued_roots.fail(error);
     }
 }
 

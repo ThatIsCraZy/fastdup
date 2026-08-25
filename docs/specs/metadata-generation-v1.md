@@ -4,7 +4,7 @@ Status: experimental and implemented; pre-`format-v1-stable`.
 
 This specification records the exact durable bytes and publication behavior of
 the first metadata-generation checkpoint. It makes the current implementation
-of immutable Manifest trees, the flat Namespace Root, and the paired Commit Log
+of immutable Manifest trees, the bounded Namespace Root, and the paired Commit Log
 auditable without claiming the complete POSIX Exact-Dedup MVP.
 
 The governing decisions are [ADR 0011](../adr/0011-use-hierarchical-immutable-manifests.md),
@@ -229,13 +229,14 @@ derives allocation from v2 summaries plus the replacement, and retains complete
 prefix and shifted-suffix child IDs. HOLE/FILL may split at either boundary;
 DATA may not.
 
-## Namespace Root v1 payload
+## Namespace Root v1 and v2 payload
 
-A Namespace Root is Metadata Object kind `2`. Version 1 is deliberately flat
-and bounded: inode versions and directory entries are embedded in one object,
-and the only directory is the implicit root Inode ID `1`. Every encoded inode
-record represents a regular file. This is a pre-stable checkpoint format, not
-the final scalable namespace tree.
+A Namespace Root is Metadata Object kind `2`. Both versions embed inode
+versions and directory entries in one bounded object. Version 1 is the legacy
+flat form with only the implicit root Inode ID `1`; every v1 inode record is a
+regular file. Version 2 adds directory inode records and nested parent IDs.
+Writers emit v2 and readers retain v1 support. This remains a pre-stable,
+bounded format rather than the final scalable namespace tree.
 
 The payload layout is:
 
@@ -250,10 +251,10 @@ the 128-byte payload header alone.
 
 ### Namespace Root header
 
-| Offset | Width | Field | Version 1 requirement |
+| Offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
 | 0 | 8 | `magic` | ASCII `FDNSRT01` |
-| 8 | 2 | `format_version` | `1` |
+| 8 | 2 | `format_version` | `1` or `2`; writers emit `2` |
 | 10 | 2 | `header_length` | `128` |
 | 12 | 2 | `inode_record_length` | `96` |
 | 14 | 2 | `entry_header_length` | `24` |
@@ -287,32 +288,31 @@ prevents reuse after falling back to an older metadata graph.
 
 ### Durable Inode record
 
-| Relative offset | Width | Field | Version 1 requirement |
+| Relative offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
 | 0 | 8 | `inode_id` | greater than `1` |
 | 8 | 2 | `mode` | stored POSIX mode bits |
-| 10 | 2 | reserved | zero |
+| 10 | 2 | `inode_kind` | v1: zero and implicitly regular; v2: `1` = regular, `2` = directory |
 | 12 | 4 | `uid` | stored owner UID |
 | 16 | 4 | `gid` | stored owner GID |
-| 20 | 4 | `link_count` | nonzero and exactly cross-checked against entries |
+| 20 | 4 | `link_count` | regular: incoming names; directory: `2 + immediate child directories` |
 | 24 | 8 | `mutation_sequence` | committed per-inode mutation sequence |
-| 32 | 8 | `logical_size` | exact file length expected from its Manifest |
-| 40 | 32 | `manifest_root` | nonzero Metadata Object ID |
+| 32 | 8 | `logical_size` | regular: exact Manifest length; directory: zero |
+| 40 | 32 | `manifest_root` | regular: nonzero Metadata Object ID; directory: zero |
 | 72 | 24 | reserved | zero |
 
 The field widths sum to 96 bytes. Records are strictly increasing by numeric
 `inode_id`; duplicate or reordered records are invalid. No record is written
-for root Inode ID `1`, a directory, a handle, a FUSE lookup reference, or an
-Open Orphan.
+for root Inode ID `1`, a handle, a FUSE lookup reference, or an Open Orphan.
 
 ### Namespace Entry record
 
-| Relative offset | Width | Field | Version 1 requirement |
+| Relative offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
 | 0 | 4 | `record_length` | `align_up(24 + name_length, 8)` |
 | 4 | 2 | `name_length` | `1..=255` |
 | 6 | 2 | reserved | zero |
-| 8 | 8 | `parent_inode` | `1` |
+| 8 | 8 | `parent_inode` | v1: `1`; v2: `1` or a reachable directory inode |
 | 16 | 8 | `target_inode` | greater than `1` and present in the inode table |
 | 24 | variable | `name` | exact component bytes |
 | after name | variable | padding | zero through `record_length` |
@@ -321,12 +321,14 @@ The fixed field widths sum to 24 bytes. Names are case-sensitive byte strings;
 they need not be UTF-8 and undergo no Unicode normalization. Empty names, NUL,
 slash, `.` and `..` are invalid.
 
-Entries are strictly ordered by `(parent_inode, unsigned-bytewise name)`. Since
-v1 accepts only parent `1`, this is bytewise name order. Duplicate names are
-invalid. Every entry target must exist, every inode must have at least one
-entry, and the number of entries targeting each inode must equal that inode's
-`link_count`. These checks preserve hardlink identity and prevent durable Open
-Orphans or dangling entries.
+Entries are strictly ordered by `(parent_inode, unsigned-bytewise name)` and
+duplicate names under one parent are invalid. Every target must exist. A
+regular inode's incoming entry count equals its `link_count`. Each non-root
+directory has exactly one incoming parent entry, and its `link_count` equals
+two plus its immediate child-directory count. Full traversal from root must
+reach every inode exactly once except that several names may reach one regular
+inode. Recovery and scrub reject dangling parents, non-directory parents,
+cycles, disconnected subtrees, and incorrect link counts.
 
 ## Commit Record v1
 
@@ -655,7 +657,7 @@ This implemented checkpoint intentionally does **not** provide:
   equal-length replacement, truncate, and arbitrary middle splice/concat are
   tree-native, while compatibility inspection may still flatten only bounded
   recipes;
-- a scalable Namespace tree: NamespaceRoot v1 rewrites one flat bounded object,
+- a scalable Namespace tree: NamespaceRoot v2 rewrites one bounded object,
   contains only regular inodes below the implicit root directory, and has no
   nested directories, symlinks, ACLs, xattrs, timestamps, or directory metadata
   record beyond its reservation end and allocation cursor;

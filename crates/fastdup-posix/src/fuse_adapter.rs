@@ -1,19 +1,20 @@
 use crate::{
-    AccessMode, DirectoryEntry as NamespaceDirectoryEntry, Entry, FileAttr, FileKind, HandleId,
-    InodeId, Namespace, OpenOptions, Operation, PosixError, Reply, RequestContext,
+    AccessMode, DirectoryEntry as NamespaceDirectoryEntry, Entry, FallocateMode, FileAttr,
+    FileKind, FileLock, HandleId, InodeId, LockKind, Namespace, OpenOptions, Operation, PosixError,
+    Reply, RequestContext, SeekKind,
 };
 use bytes::Bytes;
 use fastdup_copy_metrics::{CopyClass, record_copy};
-use fuse3::raw::Filesystem;
-use fuse3::raw::Request;
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, FileAttr as FuseFileAttr, ReplyAttr, ReplyCopyFileRange,
-    ReplyCreated, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen,
-    ReplyStatFs, ReplyWrite,
+    ReplyCreated, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyLSeek,
+    ReplyLock as FuseReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite,
 };
+use fuse3::raw::{Filesystem, OwnedRequestPayload, Request};
 use fuse3::{Errno, FileType, MountOptions, SetAttr, Timestamp};
 use futures_util::stream::{self, Stream};
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::num::NonZeroU32;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::pin::Pin;
@@ -30,6 +31,125 @@ const INTERNAL_CONTEXT: RequestContext = RequestContext {
     gid: 0,
     pid: 0,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatFsSnapshot {
+    capacity_bytes: u64,
+    free_bytes: u64,
+    available_bytes: u64,
+    files: u64,
+    free_files: u64,
+    block_size: u32,
+    maximum_name_bytes: u32,
+}
+
+impl StatFsSnapshot {
+    /// Creates one internally consistent filesystem-capacity observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero block size, free space above capacity,
+    /// available space above free space, or free inode count above the total.
+    pub const fn new(
+        capacity_bytes: u64,
+        free_bytes: u64,
+        available_bytes: u64,
+        files: u64,
+        free_files: u64,
+        block_size: u32,
+        maximum_name_bytes: u32,
+    ) -> Result<Self, StatFsSnapshotError> {
+        if block_size == 0
+            || free_bytes > capacity_bytes
+            || available_bytes > free_bytes
+            || free_files > files
+        {
+            return Err(StatFsSnapshotError);
+        }
+        Ok(Self {
+            capacity_bytes,
+            free_bytes,
+            available_bytes,
+            files,
+            free_files,
+            block_size,
+            maximum_name_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn capacity_bytes(self) -> u64 {
+        self.capacity_bytes
+    }
+
+    #[must_use]
+    pub const fn free_bytes(self) -> u64 {
+        self.free_bytes
+    }
+
+    #[must_use]
+    pub const fn available_bytes(self) -> u64 {
+        self.available_bytes
+    }
+
+    #[must_use]
+    pub const fn files(self) -> u64 {
+        self.files
+    }
+
+    #[must_use]
+    pub const fn free_files(self) -> u64 {
+        self.free_files
+    }
+
+    #[must_use]
+    pub const fn block_size(self) -> u32 {
+        self.block_size
+    }
+
+    #[must_use]
+    pub const fn maximum_name_bytes(self) -> u32 {
+        self.maximum_name_bytes
+    }
+
+    fn reply(self) -> ReplyStatFs {
+        let block_bytes = u64::from(self.block_size);
+        ReplyStatFs {
+            blocks: self.capacity_bytes / block_bytes,
+            bfree: self.free_bytes / block_bytes,
+            bavail: self.available_bytes / block_bytes,
+            files: self.files,
+            ffree: self.free_files,
+            bsize: self.block_size,
+            namelen: self.maximum_name_bytes,
+            frsize: self.block_size,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatFsSnapshotError;
+
+impl fmt::Display for StatFsSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("statfs values must describe one bounded filesystem")
+    }
+}
+
+impl std::error::Error for StatFsSnapshotError {}
+
+pub trait StatFsSource: fmt::Debug + Send + Sync {
+    /// Returns the current cached capacity presented by the mounted filesystem.
+    ///
+    /// Implementations must not perform blocking I/O. A FUSE client may query
+    /// capacity in its write path, so backing storage refresh belongs outside
+    /// this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the backing capacity cannot be observed.
+    fn snapshot(&self) -> std::io::Result<StatFsSnapshot>;
+}
 
 #[derive(Debug)]
 struct TrackedDirectoryEntryPlus {
@@ -95,6 +215,7 @@ impl Drop for LookupTrackingStream {
 pub struct FuseFilesystem {
     namespace: Arc<Namespace>,
     blocking_permits: Arc<Semaphore>,
+    statfs_source: Option<Arc<dyn StatFsSource>>,
 }
 
 impl FuseFilesystem {
@@ -104,7 +225,14 @@ impl FuseFilesystem {
         Self {
             namespace,
             blocking_permits: Arc::new(Semaphore::new(workers)),
+            statfs_source: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_statfs_source(mut self, source: Arc<dyn StatFsSource>) -> Self {
+        self.statfs_source = Some(source);
+        self
     }
 
     async fn run_blocking<R, F>(&self, work: F) -> R
@@ -303,6 +431,33 @@ impl Filesystem for FuseFilesystem {
         })
     }
 
+    async fn mkdir(
+        &self,
+        request: Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+    ) -> fuse3::Result<ReplyEntry> {
+        let parent = inode_from_raw(parent)?;
+        let mode = u16::try_from((mode & !umask) & 0o7777)
+            .expect("ASSERT: masked directory mode must fit in u16");
+        let request = context(request);
+        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                request,
+                Operation::Mkdir {
+                    parent,
+                    name: name.as_bytes(),
+                    mode,
+                },
+            )
+        })
+        .await
+        .map_err(errno)?;
+        Ok(reply_entry(expect_entry(reply).attr))
+    }
+
     async fn unlink(&self, request: Request, parent: u64, name: &OsStr) -> fuse3::Result<()> {
         let parent = inode_from_raw(parent)?;
         let request = context(request);
@@ -310,6 +465,24 @@ impl Filesystem for FuseFilesystem {
             self.namespace.dispatch(
                 request,
                 Operation::Unlink {
+                    parent,
+                    name: name.as_bytes(),
+                },
+            )
+        })
+        .await
+        .map_err(errno)?;
+        expect_empty(&reply);
+        Ok(())
+    }
+
+    async fn rmdir(&self, request: Request, parent: u64, name: &OsStr) -> fuse3::Result<()> {
+        let parent = inode_from_raw(parent)?;
+        let request = context(request);
+        let reply = dispatch_mutation_with_backpressure(&self.namespace, || {
+            self.namespace.dispatch(
+                request,
+                Operation::Rmdir {
                     parent,
                     name: name.as_bytes(),
                 },
@@ -424,8 +597,29 @@ impl Filesystem for FuseFilesystem {
             .await
     }
 
+    async fn write_owned_request(
+        &self,
+        request: Request,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+        data: OwnedRequestPayload,
+        write_flags: u32,
+        _flags: u32,
+    ) -> fuse3::Result<ReplyWrite> {
+        let (bytes, backing_bytes) = data.into_parts();
+        let payload = crate::MutationPayload::from_shared_bytes(bytes, backing_bytes);
+        self.write_payload(request, inode, handle, offset, payload, write_flags)
+            .await
+    }
+
     async fn statfs(&self, _request: Request, _inode: u64) -> fuse3::Result<ReplyStatFs> {
-        Err(libc::EOPNOTSUPP.into())
+        let source = self
+            .statfs_source
+            .as_ref()
+            .ok_or_else(|| Errno::from(libc::EOPNOTSUPP))?;
+        let snapshot = source.snapshot().map_err(Errno::from)?;
+        Ok(snapshot.reply())
     }
 
     async fn release(
@@ -434,7 +628,7 @@ impl Filesystem for FuseFilesystem {
         inode: u64,
         handle: u64,
         _flags: u32,
-        _lock_owner: u64,
+        lock_owner: u64,
         _flush: bool,
     ) -> fuse3::Result<()> {
         let namespace = Arc::clone(&self.namespace);
@@ -442,7 +636,17 @@ impl Filesystem for FuseFilesystem {
         let inode = inode_from_raw(inode)?;
         let handle = handle_from_raw(handle)?;
         let reply = self
-            .run_blocking(move || namespace.dispatch(request, Operation::Release { inode, handle }))
+            .run_blocking(move || {
+                namespace.dispatch(
+                    request,
+                    Operation::UnlockOwner {
+                        inode,
+                        handle,
+                        owner: lock_owner,
+                    },
+                )?;
+                namespace.dispatch(request, Operation::Release { inode, handle })
+            })
             .await
             .map_err(errno)?;
         expect_empty(&reply);
@@ -464,9 +668,116 @@ impl Filesystem for FuseFilesystem {
         request: Request,
         inode: u64,
         handle: u64,
-        _lock_owner: u64,
+        lock_owner: u64,
     ) -> fuse3::Result<()> {
-        self.sync(request, inode, handle, false).await
+        let namespace = Arc::clone(&self.namespace);
+        let request = context(request);
+        let inode = inode_from_raw(inode)?;
+        let handle = handle_from_raw(handle)?;
+        self.run_blocking(move || {
+            namespace.dispatch(
+                request,
+                Operation::UnlockOwner {
+                    inode,
+                    handle,
+                    owner: lock_owner,
+                },
+            )?;
+            namespace.dispatch(
+                request,
+                Operation::Sync {
+                    inode,
+                    handle,
+                    data_only: false,
+                },
+            )
+        })
+        .await
+        .map_err(errno)
+        .map(|reply| expect_empty(&reply))
+    }
+
+    async fn getlk(
+        &self,
+        request: Request,
+        inode: u64,
+        handle: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        r#type: u32,
+        pid: u32,
+    ) -> fuse3::Result<FuseReplyLock> {
+        let reply = self
+            .namespace
+            .dispatch(
+                context(request),
+                Operation::GetLock {
+                    inode: inode_from_raw(inode)?,
+                    handle: handle_from_raw(handle)?,
+                    owner: lock_owner,
+                    lock: FileLock {
+                        start,
+                        end,
+                        kind: lock_kind(r#type, false)?,
+                        pid,
+                    },
+                },
+            )
+            .map_err(errno)?;
+        let Reply::Lock(lock) = reply else {
+            panic!("ASSERT: namespace get-lock returned a non-lock reply");
+        };
+        Ok(FuseReplyLock {
+            start: lock.start,
+            end: lock.end,
+            r#type: fuse_lock_kind(lock.kind),
+            pid: lock.pid,
+        })
+    }
+
+    async fn setlk(
+        &self,
+        request: Request,
+        inode: u64,
+        handle: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        r#type: u32,
+        pid: u32,
+        block: bool,
+    ) -> fuse3::Result<()> {
+        let request = context(request);
+        let inode = inode_from_raw(inode)?;
+        let handle = handle_from_raw(handle)?;
+        let lock = FileLock {
+            start,
+            end,
+            kind: lock_kind(r#type, true)?,
+            pid,
+        };
+        loop {
+            let observed = self.namespace.lock_sequence();
+            match self.namespace.dispatch(
+                request,
+                Operation::SetLock {
+                    inode,
+                    handle,
+                    owner: lock_owner,
+                    lock,
+                },
+            ) {
+                Err(PosixError::Again) if block => {
+                    self.namespace.wait_for_lock_change(observed).await;
+                }
+                Err(error) => return Err(errno(error)),
+                Ok(reply) => {
+                    expect_empty(&reply);
+                    return Ok(());
+                }
+            }
+        }
     }
 
     async fn opendir(&self, request: Request, inode: u64, _flags: u32) -> fuse3::Result<ReplyOpen> {
@@ -639,6 +950,92 @@ impl Filesystem for FuseFilesystem {
         })
     }
 
+    async fn fallocate(
+        &self,
+        request: Request,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> fuse3::Result<()> {
+        let inode = inode_from_raw(inode)?;
+        let handle = handle_from_raw(handle)?;
+        let mode = fallocate_mode(mode)?;
+        let request = context(request);
+        loop {
+            self.namespace
+                .wait_for_mutation_admission()
+                .await
+                .map_err(errno)?;
+            let namespace = Arc::clone(&self.namespace);
+            match self
+                .run_blocking(move || {
+                    namespace.dispatch(
+                        request,
+                        Operation::Fallocate {
+                            inode,
+                            handle,
+                            offset,
+                            length,
+                            mode,
+                        },
+                    )
+                })
+                .await
+            {
+                Err(PosixError::Again) => {}
+                result => {
+                    let reply = result.map_err(errno)?;
+                    let Reply::Attr(_) = reply else {
+                        panic!("ASSERT: namespace fallocate returned a non-attr reply");
+                    };
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn lseek(
+        &self,
+        request: Request,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+        whence: u32,
+    ) -> fuse3::Result<ReplyLSeek> {
+        let kind = if whence
+            == u32::try_from(libc::SEEK_DATA).expect("ASSERT: SEEK_DATA is nonnegative")
+        {
+            SeekKind::Data
+        } else if whence
+            == u32::try_from(libc::SEEK_HOLE).expect("ASSERT: SEEK_HOLE is nonnegative")
+        {
+            SeekKind::Hole
+        } else {
+            return Err(libc::EINVAL.into());
+        };
+        let namespace = Arc::clone(&self.namespace);
+        let reply = self
+            .run_blocking(move || {
+                namespace.dispatch(
+                    context(request),
+                    Operation::Seek {
+                        inode: inode_from_raw(inode).map_err(|_| PosixError::InvalidArgument)?,
+                        handle: handle_from_raw(handle).map_err(|_| PosixError::BadHandle)?,
+                        offset,
+                        kind,
+                    },
+                )
+            })
+            .await
+            .map_err(errno)?;
+        let Reply::Offset(offset) = reply else {
+            panic!("ASSERT: namespace seek returned a non-offset reply");
+        };
+        Ok(ReplyLSeek { offset })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn copy_file_range(
         &self,
@@ -800,18 +1197,68 @@ fn open_options(flags: u32) -> fuse3::Result<OpenOptions> {
     })
 }
 
+fn lock_kind(value: u32, allow_unlock: bool) -> fuse3::Result<LockKind> {
+    if value == u32::try_from(libc::F_RDLCK).expect("ASSERT: F_RDLCK is nonnegative") {
+        return Ok(LockKind::Read);
+    }
+    if value == u32::try_from(libc::F_WRLCK).expect("ASSERT: F_WRLCK is nonnegative") {
+        return Ok(LockKind::Write);
+    }
+    if allow_unlock
+        && value == u32::try_from(libc::F_UNLCK).expect("ASSERT: F_UNLCK is nonnegative")
+    {
+        return Ok(LockKind::Unlock);
+    }
+    Err(libc::EINVAL.into())
+}
+
+fn fallocate_mode(mode: u32) -> fuse3::Result<FallocateMode> {
+    let keep = u32::try_from(libc::FALLOC_FL_KEEP_SIZE)
+        .expect("ASSERT: FALLOC_FL_KEEP_SIZE is nonnegative");
+    let punch = u32::try_from(libc::FALLOC_FL_PUNCH_HOLE)
+        .expect("ASSERT: FALLOC_FL_PUNCH_HOLE is nonnegative");
+    let zero = u32::try_from(libc::FALLOC_FL_ZERO_RANGE)
+        .expect("ASSERT: FALLOC_FL_ZERO_RANGE is nonnegative");
+    let collapse = u32::try_from(libc::FALLOC_FL_COLLAPSE_RANGE)
+        .expect("ASSERT: FALLOC_FL_COLLAPSE_RANGE is nonnegative");
+    let insert = u32::try_from(libc::FALLOC_FL_INSERT_RANGE)
+        .expect("ASSERT: FALLOC_FL_INSERT_RANGE is nonnegative");
+    match mode {
+        0 => Ok(FallocateMode::Allocate { keep_size: false }),
+        value if value == keep => Ok(FallocateMode::Allocate { keep_size: true }),
+        value if value == punch | keep => Ok(FallocateMode::PunchHole),
+        value if value == zero => Ok(FallocateMode::ZeroRange { keep_size: false }),
+        value if value == zero | keep => Ok(FallocateMode::ZeroRange { keep_size: true }),
+        value if value == collapse => Ok(FallocateMode::CollapseRange),
+        value if value == insert => Ok(FallocateMode::InsertRange),
+        value if value & (punch | zero | collapse | insert) != 0 => Err(libc::EINVAL.into()),
+        _ => Err(libc::EOPNOTSUPP.into()),
+    }
+}
+
+fn fuse_lock_kind(kind: LockKind) -> u32 {
+    match kind {
+        LockKind::Read => u32::try_from(libc::F_RDLCK).expect("ASSERT: F_RDLCK is nonnegative"),
+        LockKind::Write => u32::try_from(libc::F_WRLCK).expect("ASSERT: F_WRLCK is nonnegative"),
+        LockKind::Unlock => u32::try_from(libc::F_UNLCK).expect("ASSERT: F_UNLCK is nonnegative"),
+    }
+}
+
 fn errno(error: PosixError) -> Errno {
     match error {
         PosixError::NoEntry => Errno::new_not_exist(),
         PosixError::Exists => Errno::new_exist(),
         PosixError::NotDirectory => Errno::new_is_not_dir(),
         PosixError::IsDirectory => Errno::new_is_dir(),
+        PosixError::NotEmpty => libc::ENOTEMPTY.into(),
         PosixError::InvalidName | PosixError::InvalidArgument => libc::EINVAL.into(),
         PosixError::NameTooLong => libc::ENAMETOOLONG.into(),
         PosixError::BadHandle => libc::EBADF.into(),
         PosixError::FileTooLarge => libc::EFBIG.into(),
         PosixError::NoSpace => libc::ENOSPC.into(),
         PosixError::OutOfMemory => libc::ENOMEM.into(),
+        PosixError::NoLocks => libc::ENOLCK.into(),
+        PosixError::NoSuchAddress => libc::ENXIO.into(),
         PosixError::Unsupported => libc::EOPNOTSUPP.into(),
         PosixError::Io => libc::EIO.into(),
         PosixError::ReadOnly => libc::EROFS.into(),
@@ -954,9 +1401,13 @@ fn release_lookup_reference(namespace: &Namespace, inode: InodeId) {
 
 #[cfg(test)]
 mod tests {
-    use super::{INTERNAL_CONTEXT, LookupTrackingStream, dispatch_mutation_with_backpressure};
+    use super::{
+        INTERNAL_CONTEXT, LookupTrackingStream, StatFsSnapshot,
+        dispatch_mutation_with_backpressure, fallocate_mode,
+    };
     use crate::{
-        Namespace, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE, Reply,
+        FallocateMode, Namespace, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE,
+        Reply,
     };
     use futures_util::StreamExt;
     use std::sync::Arc;
@@ -1065,5 +1516,62 @@ mod tests {
             Ok(Reply::Empty)
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fallocate_flags_accept_only_the_supported_exact_combinations() {
+        let flag = |value: i32| u32::try_from(value).expect("Linux fallocate flag is nonnegative");
+        assert_eq!(
+            fallocate_mode(0).expect("default allocation"),
+            FallocateMode::Allocate { keep_size: false }
+        );
+        assert_eq!(
+            fallocate_mode(flag(libc::FALLOC_FL_KEEP_SIZE)).expect("keep-size allocation"),
+            FallocateMode::Allocate { keep_size: true }
+        );
+        assert_eq!(
+            fallocate_mode(flag(libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE))
+                .expect("hole punch"),
+            FallocateMode::PunchHole
+        );
+        assert_eq!(
+            fallocate_mode(flag(libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE))
+                .expect("keep-size zero range"),
+            FallocateMode::ZeroRange { keep_size: true }
+        );
+        assert_eq!(
+            fallocate_mode(flag(libc::FALLOC_FL_COLLAPSE_RANGE)).expect("collapse range"),
+            FallocateMode::CollapseRange
+        );
+        assert_eq!(
+            fallocate_mode(flag(libc::FALLOC_FL_INSERT_RANGE)).expect("insert range"),
+            FallocateMode::InsertRange
+        );
+        assert!(fallocate_mode(flag(libc::FALLOC_FL_PUNCH_HOLE)).is_err());
+        assert!(
+            fallocate_mode(flag(
+                libc::FALLOC_FL_COLLAPSE_RANGE | libc::FALLOC_FL_KEEP_SIZE
+            ))
+            .is_err()
+        );
+        assert!(fallocate_mode(flag(libc::FALLOC_FL_UNSHARE_RANGE)).is_err());
+    }
+
+    #[test]
+    fn statfs_snapshot_rejects_inconsistent_values_and_rounds_down_to_blocks() {
+        assert!(StatFsSnapshot::new(0, 0, 0, 0, 0, 0, 255).is_err());
+        assert!(StatFsSnapshot::new(100, 101, 100, 10, 10, 4, 255).is_err());
+        assert!(StatFsSnapshot::new(100, 90, 91, 10, 10, 4, 255).is_err());
+        assert!(StatFsSnapshot::new(100, 90, 80, 10, 11, 4, 255).is_err());
+
+        let reply = StatFsSnapshot::new(4_099, 3_003, 2_007, 10, 7, 1_000, 255)
+            .expect("valid snapshot")
+            .reply();
+        assert_eq!((reply.blocks, reply.bfree, reply.bavail), (4, 3, 2));
+        assert_eq!((reply.files, reply.ffree), (10, 7));
+        assert_eq!(
+            (reply.bsize, reply.frsize, reply.namelen),
+            (1_000, 1_000, 255)
+        );
     }
 }

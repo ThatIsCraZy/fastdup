@@ -53,6 +53,36 @@ pub trait CommittedFile: fmt::Debug + Send + Sync {
         Ok(self.read_at(0, length)? == candidate)
     }
 
+    /// Verifies that ordered resident segments form this complete source.
+    ///
+    /// The default joins the segments and delegates to
+    /// [`Self::matches_complete_bytes`]. Content-addressed implementations
+    /// should hash the segments directly so externalization does not need a
+    /// second full-size payload buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a read, integrity, or bounded-resource error. The caller must
+    /// retain the resident bytes on every error.
+    fn matches_complete_segments(&self, segments: &[&[u8]]) -> Result<bool, PosixError> {
+        let length = segments.iter().try_fold(0_usize, |total, segment| {
+            total
+                .checked_add(segment.len())
+                .ok_or(PosixError::FileTooLarge)
+        })?;
+        if u64::try_from(length).expect("ASSERT: usize fits u64") != self.logical_size() {
+            return Ok(false);
+        }
+        let mut candidate = Vec::new();
+        candidate
+            .try_reserve_exact(length)
+            .map_err(|_| PosixError::OutOfMemory)?;
+        for segment in segments {
+            candidate.extend_from_slice(segment);
+        }
+        self.matches_complete_bytes(&candidate)
+    }
+
     /// Returns an immutable reduction recipe carried by this verified source.
     ///
     /// The default deliberately exposes no recipe. Implementations may return
@@ -142,6 +172,43 @@ impl CommittedFile for EmptyCommittedFile {
 
     fn read_at(&self, _offset: u64, _length: u32) -> Result<Vec<u8>, PosixError> {
         Ok(Vec::new())
+    }
+}
+
+#[derive(Debug)]
+struct ZeroCommittedFile {
+    length: u64,
+}
+
+impl CommittedFile for ZeroCommittedFile {
+    fn logical_size(&self) -> u64 {
+        self.length
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.length
+    }
+
+    fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, PosixError> {
+        let start = offset.min(self.length);
+        let end = offset.saturating_add(length).min(self.length);
+        Ok(end - start)
+    }
+
+    fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+        let start = offset.min(self.length);
+        let end = offset.saturating_add(u64::from(length)).min(self.length);
+        let output_length = usize::try_from(end - start).map_err(|_| PosixError::FileTooLarge)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_length)
+            .map_err(|_| PosixError::OutOfMemory)?;
+        output.resize(output_length, 0);
+        Ok(output)
+    }
+
+    fn prepared_data_recipe(&self) -> Option<PreparedDataRecipe> {
+        Some(PreparedDataRecipe::Fill { value: 0 })
     }
 }
 
@@ -308,7 +375,7 @@ impl DirtyEpoch {
         let previous_size = self.result_size;
         let length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64");
         let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
-        self.data.write(offset, bytes)?;
+        self.data.write(offset, bytes, sequence)?;
         if offset > previous_size {
             self.holes.insert(previous_size, offset);
         }
@@ -353,6 +420,49 @@ impl DirtyEpoch {
             self.holes.truncate(length);
         }
         self.result_size = length;
+        self.record_sequence(sequence);
+        self.assert_valid_after_mutation();
+        Ok(())
+    }
+
+    fn punch_hole(&mut self, offset: u64, end: u64, sequence: u64) -> Result<(), PosixError> {
+        self.assert_next_sequence(sequence);
+        let effective_end = end.min(self.result_size);
+        if offset < effective_end {
+            self.data.punch(offset, effective_end)?;
+            self.holes.insert(offset, effective_end);
+        }
+        self.record_sequence(sequence);
+        self.assert_valid_after_mutation();
+        Ok(())
+    }
+
+    fn zero_ranges(
+        &mut self,
+        ranges: &[(u64, u64)],
+        result_size: u64,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
+        self.assert_next_sequence(sequence);
+        self.data.truncate(result_size)?;
+        if result_size > self.result_size {
+            self.holes.insert(self.result_size, result_size);
+        } else {
+            self.holes.truncate(result_size);
+        }
+        for &(start, end) in ranges {
+            assert!(start < end, "ASSERT: zero range must be nonempty");
+            let length = end - start;
+            self.data.write_external(
+                start,
+                Arc::new(ZeroCommittedFile { length }),
+                0,
+                length,
+                sequence,
+            )?;
+            self.holes.remove(start, end);
+        }
+        self.result_size = result_size;
         self.record_sequence(sequence);
         self.assert_valid_after_mutation();
         Ok(())
@@ -845,7 +955,7 @@ impl VersionedFile {
                     Arc::clone(&source),
                 )])
             })();
-            let frozen_result = self.prepare_inflight(offset, &source);
+            let frozen_result = self.prepare_inflight(offset, through_sequence, &source);
             if active_result.is_ok() || frozen_result.is_ok() {
                 accepted = true;
             } else {
@@ -869,29 +979,27 @@ impl VersionedFile {
     fn prepare_inflight(
         &self,
         offset: u64,
+        through_sequence: u64,
         source: &Arc<dyn CommittedFile>,
     ) -> Result<(), PosixError> {
         let frozen = self.inflight.as_ref().ok_or(PosixError::Again)?;
         let recipe = source.prepared_data_recipe().ok_or(PosixError::Again)?;
         let length = source.logical_size();
         let end = offset.checked_add(length).ok_or(PosixError::Io)?;
-        if length == 0 || end > frozen.dirty.result_size {
-            return Err(PosixError::Again);
-        }
-        let allocated = allocated_bytes_through(&self.committed, &[&frozen.dirty], offset, end)?;
-        if allocated != length {
-            return Err(PosixError::Again);
-        }
-        let requested = u32::try_from(length).map_err(|_| PosixError::FileTooLarge)?;
-        let current = ReadPlan::new(
-            Arc::clone(&self.committed),
-            &[&frozen.dirty],
-            frozen.dirty.result_size,
-            offset,
-            requested,
-        )?
-        .execute()?;
-        if !source.matches_complete_bytes(&current)? {
+        if length == 0
+            || end > frozen.dirty.result_size
+            || through_sequence <= frozen.dirty.base_sequence
+            || through_sequence > frozen.dirty.through_sequence
+            || !frozen
+                .dirty
+                .holes
+                .overlapping_starts(offset, end)
+                .is_empty()
+            || !frozen
+                .dirty
+                .data
+                .range_unchanged_through(offset, end, through_sequence)
+        {
             return Err(PosixError::Again);
         }
         frozen.attach_late_prepared(offset, length, recipe)
@@ -991,6 +1099,227 @@ impl VersionedFile {
             self.live_allocated_bytes <= self.logical_size(),
             "ASSERT: allocated bytes must not exceed logical size"
         );
+        Ok(())
+    }
+
+    pub(super) fn punch_hole(
+        &mut self,
+        offset: u64,
+        end: u64,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
+        self.active.punch_hole(offset, end, sequence)?;
+        self.recompute_live_allocated()
+    }
+
+    pub(super) fn zero_range(
+        &mut self,
+        offset: u64,
+        end: u64,
+        result_size: u64,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
+        self.active
+            .zero_ranges(&[(offset, end)], result_size, sequence)?;
+        self.recompute_live_allocated()
+    }
+
+    pub(super) fn allocate_zero(
+        &mut self,
+        offset: u64,
+        end: u64,
+        result_size: u64,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
+        let ranges = self.unallocated_ranges(offset, end)?;
+        self.active.zero_ranges(&ranges, result_size, sequence)?;
+        self.recompute_live_allocated()
+    }
+
+    pub(super) fn collapse_range(
+        &mut self,
+        offset: u64,
+        end: u64,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
+        let current_size = self.logical_size();
+        let mut flattened = self.flatten_live(sequence)?;
+        let mut replacement = SparseData {
+            logical_size: current_size - (end - offset),
+            ..SparseData::default()
+        };
+        copy_sparse_window(&flattened, 0, offset, 0, sequence, &mut replacement)?;
+        copy_sparse_window(
+            &flattened,
+            end,
+            current_size,
+            offset,
+            sequence,
+            &mut replacement,
+        )?;
+        flattened = replacement;
+        self.install_flattened_active(flattened, sequence);
+        Ok(())
+    }
+
+    pub(super) fn insert_range(
+        &mut self,
+        offset: u64,
+        length: u64,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
+        let current_size = self.logical_size();
+        let result_size = current_size
+            .checked_add(length)
+            .ok_or(PosixError::FileTooLarge)?;
+        let flattened = self.flatten_live(sequence)?;
+        let mut replacement = SparseData {
+            logical_size: result_size,
+            ..SparseData::default()
+        };
+        copy_sparse_window(&flattened, 0, offset, 0, sequence, &mut replacement)?;
+        copy_sparse_window(
+            &flattened,
+            offset,
+            current_size,
+            offset + length,
+            sequence,
+            &mut replacement,
+        )?;
+        self.install_flattened_active(replacement, sequence);
+        Ok(())
+    }
+
+    pub(super) fn seek_data(&self, offset: u64) -> Result<Option<u64>, PosixError> {
+        if offset >= self.logical_size() {
+            return Ok(None);
+        }
+        if self.byte_is_allocated(offset)? {
+            return Ok(Some(offset));
+        }
+        let end = self.uniform_run_end(offset, false)?;
+        Ok((end < self.logical_size()).then_some(end))
+    }
+
+    pub(super) fn seek_hole(&self, offset: u64) -> Result<Option<u64>, PosixError> {
+        if offset >= self.logical_size() {
+            return Ok(None);
+        }
+        if !self.byte_is_allocated(offset)? {
+            return Ok(Some(offset));
+        }
+        Ok(Some(self.uniform_run_end(offset, true)?))
+    }
+
+    fn unallocated_ranges(&self, start: u64, end: u64) -> Result<Vec<(u64, u64)>, PosixError> {
+        let mut cursor = start;
+        let mut ranges = Vec::new();
+        while cursor < end {
+            let allocated = self.byte_is_allocated(cursor)?;
+            let run_end = self.uniform_run_end_bounded(cursor, allocated, end)?;
+            if !allocated {
+                ranges.try_reserve(1).map_err(|_| PosixError::OutOfMemory)?;
+                ranges.push((cursor, run_end));
+            }
+            cursor = run_end;
+        }
+        Ok(ranges)
+    }
+
+    fn byte_is_allocated(&self, offset: u64) -> Result<bool, PosixError> {
+        Ok(self.allocated_bytes_in_range(offset, offset + 1)? == 1)
+    }
+
+    fn uniform_run_end(&self, start: u64, allocated: bool) -> Result<u64, PosixError> {
+        self.uniform_run_end_bounded(start, allocated, self.logical_size())
+    }
+
+    fn uniform_run_end_bounded(
+        &self,
+        start: u64,
+        allocated: bool,
+        bound: u64,
+    ) -> Result<u64, PosixError> {
+        assert!(
+            start < bound,
+            "ASSERT: allocation run starts before its bound"
+        );
+        if allocation_range_is_uniform(
+            |offset, end| self.allocated_bytes_in_range(offset, end),
+            start,
+            bound,
+            allocated,
+        )? {
+            return Ok(bound);
+        }
+        let mut good = start + 1;
+        let mut bad = bound;
+        while good + 1 < bad {
+            let middle = good + (bad - good) / 2;
+            if allocation_range_is_uniform(
+                |offset, end| self.allocated_bytes_in_range(offset, end),
+                start,
+                middle,
+                allocated,
+            )? {
+                good = middle;
+            } else {
+                bad = middle;
+            }
+        }
+        Ok(good)
+    }
+
+    fn flatten_live(&self, sequence: u64) -> Result<SparseData, PosixError> {
+        let committed_size = self.committed.logical_size();
+        let mut flattened = SparseData {
+            logical_size: committed_size,
+            ..SparseData::default()
+        };
+        let mut cursor = 0_u64;
+        while cursor < committed_size {
+            let allocated = self.committed.allocated_bytes_in_range(cursor, 1)? == 1;
+            let run_end = committed_uniform_run_end(&self.committed, cursor, allocated)?;
+            if allocated {
+                flattened.write_external(
+                    cursor,
+                    Arc::clone(&self.committed),
+                    cursor,
+                    run_end - cursor,
+                    sequence,
+                )?;
+            }
+            cursor = run_end;
+        }
+        if let Some(inflight) = &self.inflight {
+            overlay_epoch(&mut flattened, &inflight.dirty, sequence)?;
+        }
+        overlay_epoch(&mut flattened, &self.active, sequence)?;
+        Ok(flattened)
+    }
+
+    fn install_flattened_active(&mut self, flattened: SparseData, sequence: u64) {
+        let holes = complement_holes(&flattened);
+        let base_size = self.active.base_size;
+        let base_sequence = self.active.base_sequence;
+        let first_sequence = self.active.first_sequence.or(Some(sequence));
+        let result_size = flattened.logical_size;
+        let allocated_bytes = flattened.allocated_bytes;
+        self.active = DirtyEpoch {
+            base_size,
+            result_size,
+            base_sequence,
+            through_sequence: sequence,
+            first_sequence,
+            data: flattened,
+            holes,
+        };
+        self.live_allocated_bytes = allocated_bytes;
+        self.active.assert_valid_after_mutation();
+    }
+
+    fn recompute_live_allocated(&mut self) -> Result<(), PosixError> {
+        self.live_allocated_bytes = self.allocated_bytes_in_range(0, self.logical_size())?;
         Ok(())
     }
 
@@ -1139,6 +1468,153 @@ impl VersionedFile {
             "ASSERT: installing a frozen prefix must preserve live allocated bytes"
         );
     }
+}
+
+fn allocation_range_is_uniform(
+    mut allocated_bytes: impl FnMut(u64, u64) -> Result<u64, PosixError>,
+    start: u64,
+    end: u64,
+    allocated: bool,
+) -> Result<bool, PosixError> {
+    let observed = allocated_bytes(start, end)?;
+    Ok(if allocated {
+        observed == end - start
+    } else {
+        observed == 0
+    })
+}
+
+fn committed_uniform_run_end(
+    committed: &Arc<dyn CommittedFile>,
+    start: u64,
+    allocated: bool,
+) -> Result<u64, PosixError> {
+    let bound = committed.logical_size();
+    let uniform = |range_start: u64, range_end: u64| {
+        committed.allocated_bytes_in_range(range_start, range_end - range_start)
+    };
+    if allocation_range_is_uniform(uniform, start, bound, allocated)? {
+        return Ok(bound);
+    }
+    let mut good = start + 1;
+    let mut bad = bound;
+    while good + 1 < bad {
+        let middle = good + (bad - good) / 2;
+        if allocation_range_is_uniform(uniform, start, middle, allocated)? {
+            good = middle;
+        } else {
+            bad = middle;
+        }
+    }
+    Ok(good)
+}
+
+fn overlay_epoch(
+    flattened: &mut SparseData,
+    epoch: &DirtyEpoch,
+    sequence: u64,
+) -> Result<(), PosixError> {
+    flattened.truncate(epoch.result_size)?;
+    for (&start, &end) in &epoch.holes.ranges {
+        flattened.punch(start, end)?;
+    }
+    for (&start, resident) in &epoch.data.extents {
+        flattened.write(start, resident.bytes.clone(), sequence)?;
+    }
+    for (&start, external) in &epoch.data.external_extents {
+        flattened.write_external(
+            start,
+            Arc::clone(&external.source),
+            external.source_offset,
+            external.length,
+            sequence,
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_sparse_window(
+    source: &SparseData,
+    source_start: u64,
+    source_end: u64,
+    target_start: u64,
+    sequence: u64,
+    target: &mut SparseData,
+) -> Result<(), PosixError> {
+    assert!(
+        source_start <= source_end,
+        "ASSERT: copied sparse window is ordered"
+    );
+    for (&extent_start, resident) in &source.extents {
+        let extent_end = extent_start
+            .checked_add(u64::try_from(resident.len()).expect("ASSERT: usize fits u64"))
+            .ok_or(PosixError::Io)?;
+        let selected_start = extent_start.max(source_start);
+        let selected_end = extent_end.min(source_end);
+        if selected_start >= selected_end {
+            continue;
+        }
+        let fragment_start = usize::try_from(selected_start - extent_start)
+            .expect("ASSERT: resident fragment start fits usize");
+        let fragment_end = usize::try_from(selected_end - extent_start)
+            .expect("ASSERT: resident fragment end fits usize");
+        let fragment = resident.retained_fragment(fragment_start, fragment_end)?;
+        let destination = target_start
+            .checked_add(selected_start - source_start)
+            .ok_or(PosixError::FileTooLarge)?;
+        target.write(destination, fragment.bytes, sequence)?;
+    }
+    for (&extent_start, external) in &source.external_extents {
+        let extent_end = extent_start
+            .checked_add(external.length)
+            .ok_or(PosixError::Io)?;
+        let selected_start = extent_start.max(source_start);
+        let selected_end = extent_end.min(source_end);
+        if selected_start >= selected_end {
+            continue;
+        }
+        let destination = target_start
+            .checked_add(selected_start - source_start)
+            .ok_or(PosixError::FileTooLarge)?;
+        let selected_source = external
+            .source_offset
+            .checked_add(selected_start - extent_start)
+            .ok_or(PosixError::Io)?;
+        target.write_external(
+            destination,
+            Arc::clone(&external.source),
+            selected_source,
+            selected_end - selected_start,
+            sequence,
+        )?;
+    }
+    Ok(())
+}
+
+fn complement_holes(data: &SparseData) -> RangeSet {
+    let mut ranges = Vec::with_capacity(data.extents.len() + data.external_extents.len());
+    for (&start, resident) in &data.extents {
+        ranges.push((
+            start,
+            start + u64::try_from(resident.len()).expect("ASSERT: usize fits u64"),
+        ));
+    }
+    for (&start, external) in &data.external_extents {
+        ranges.push((start, start + external.length));
+    }
+    ranges.sort_unstable();
+    let mut holes = RangeSet::default();
+    let mut cursor = 0_u64;
+    for (start, end) in ranges {
+        if cursor < start {
+            holes.insert(cursor, start);
+        }
+        cursor = end;
+    }
+    if cursor < data.logical_size {
+        holes.insert(cursor, data.logical_size);
+    }
+    holes
 }
 
 fn allocated_bytes_through(
@@ -1715,21 +2191,19 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_external_source_preserves_the_resident_fallback() {
+    fn externalization_trusts_the_writer_source_for_an_unchanged_range() {
         let mut file = VersionedFile::new_empty();
         file.write(0, b"abcdefgh", 1).expect("initial write");
 
-        assert_eq!(
-            file.externalize_many(vec![(2, 1, bytes_reader(b"WRNG".to_vec()))]),
-            Err(PosixError::Io)
-        );
-        assert_eq!(file.active_resident_payload_bytes(), 8);
+        file.externalize_many(vec![(2, 1, bytes_reader(b"WRNG".to_vec()))])
+            .expect("writer provenance replaces an unchanged resident range");
+        assert_eq!(file.active_resident_payload_bytes(), 4);
         assert_eq!(
             file.plan_read(0, 8)
-                .expect("fallback read plan")
+                .expect("externalized read plan")
                 .execute()
-                .expect("fallback read"),
-            b"abcdefgh"
+                .expect("externalized read"),
+            b"abWRNGgh"
         );
     }
 

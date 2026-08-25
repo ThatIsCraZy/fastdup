@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::metadata::{NAMESPACE_ROOT_KIND, decode_metadata_object, encode_metadata_object};
 use crate::{
@@ -11,19 +11,27 @@ const NAMESPACE_ENTRY_HEADER_BYTES: usize = 24;
 const NAMESPACE_ENTRY_ALIGNMENT: usize = 8;
 const MAX_NAME_BYTES: usize = 255;
 const NAMESPACE_ROOT_MAGIC: &[u8; 8] = b"FDNSRT01";
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION_V1: u16 = 1;
+const FORMAT_VERSION_V2: u16 = 2;
 const ROOT_INODE: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableInodeKind {
+    Regular,
+    Directory,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableInode {
     inode: u64,
+    kind: DurableInodeKind,
     mode: u16,
     uid: u32,
     gid: u32,
     link_count: u32,
     mutation_sequence: u64,
     logical_size: u64,
-    manifest_root: MetadataObjectId,
+    manifest_root: Option<MetadataObjectId>,
 }
 
 impl DurableInode {
@@ -48,19 +56,54 @@ impl DurableInode {
         }
         Ok(Self {
             inode,
+            kind: DurableInodeKind::Regular,
             mode,
             uid,
             gid,
             link_count,
             mutation_sequence,
             logical_size,
-            manifest_root,
+            manifest_root: Some(manifest_root),
+        })
+    }
+
+    /// Constructs one immutable directory inode version.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the implicit root inode and directory link counts below two.
+    pub fn new_directory(
+        inode: u64,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        link_count: u32,
+        mutation_sequence: u64,
+    ) -> Result<Self, MetadataFormatError> {
+        if inode <= ROOT_INODE || link_count < 2 {
+            return Err(MetadataFormatError::InvalidPayload);
+        }
+        Ok(Self {
+            inode,
+            kind: DurableInodeKind::Directory,
+            mode,
+            uid,
+            gid,
+            link_count,
+            mutation_sequence,
+            logical_size: 0,
+            manifest_root: None,
         })
     }
 
     #[must_use]
     pub const fn inode(&self) -> u64 {
         self.inode
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> DurableInodeKind {
+        self.kind
     }
 
     #[must_use]
@@ -94,7 +137,19 @@ impl DurableInode {
     }
 
     #[must_use]
-    pub const fn manifest_root(&self) -> MetadataObjectId {
+    /// Returns the Manifest Root of a regular-file inode.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called for a directory. Callers traversing a mixed
+    /// Namespace Root must use [`Self::file_manifest_root`] or `file_inodes`.
+    pub fn manifest_root(&self) -> MetadataObjectId {
+        self.manifest_root
+            .expect("ASSERT: only regular durable inodes have Manifest Roots")
+    }
+
+    #[must_use]
+    pub const fn file_manifest_root(&self) -> Option<MetadataObjectId> {
         self.manifest_root
     }
 }
@@ -107,18 +162,19 @@ pub struct NamespaceEntry {
 }
 
 impl NamespaceEntry {
-    /// Constructs one byte-exact directory entry in the implicit root.
+    /// Constructs one byte-exact directory entry.
     ///
     /// # Errors
     ///
-    /// Rejects another parent, an invalid target, or a component that POSIX
-    /// cannot represent as one byte-exact name.
+    /// Rejects a zero parent, an invalid target, or a component that POSIX
+    /// cannot represent as one byte-exact name. The complete Namespace Root
+    /// later proves that the parent is a reachable directory.
     pub fn new(
         parent_inode: u64,
         target_inode: u64,
         name: Vec<u8>,
     ) -> Result<Self, MetadataFormatError> {
-        if parent_inode != ROOT_INODE
+        if parent_inode == 0
             || target_inode <= ROOT_INODE
             || name.is_empty()
             || name.len() > MAX_NAME_BYTES
@@ -162,7 +218,7 @@ pub struct NamespaceRoot {
 }
 
 impl NamespaceRoot {
-    /// Constructs one canonical, bounded flat Namespace Root.
+    /// Constructs one canonical, bounded Namespace Root.
     ///
     /// The root inode is implicit. Input vectors are canonicalized by durable
     /// key before uniqueness, reachability, and exact link counts are checked.
@@ -219,6 +275,23 @@ impl NamespaceRoot {
         &self.inodes
     }
 
+    pub fn file_inodes(&self) -> impl Iterator<Item = &DurableInode> {
+        self.inodes
+            .iter()
+            .filter(|inode| inode.kind == DurableInodeKind::Regular)
+    }
+
+    #[must_use]
+    pub fn file_inode_count(&self) -> usize {
+        self.file_inodes().count()
+    }
+
+    pub fn directory_inodes(&self) -> impl Iterator<Item = &DurableInode> {
+        self.inodes
+            .iter()
+            .filter(|inode| inode.kind == DurableInodeKind::Directory)
+    }
+
     #[must_use]
     pub fn entries(&self) -> &[NamespaceEntry] {
         &self.entries
@@ -252,7 +325,7 @@ impl NamespaceRoot {
             .ok_or(MetadataFormatError::ArithmeticOverflow)?;
         let mut payload = vec![0_u8; payload_length];
         payload[0..8].copy_from_slice(NAMESPACE_ROOT_MAGIC);
-        put_u16(&mut payload, 8, FORMAT_VERSION);
+        put_u16(&mut payload, 8, FORMAT_VERSION_V2);
         put_u16(&mut payload, 10, 128);
         put_u16(&mut payload, 12, 96);
         put_u16(&mut payload, 14, 24);
@@ -289,12 +362,22 @@ impl NamespaceRoot {
             let record = &mut payload[start..start + DURABLE_INODE_BYTES];
             put_u64(record, 0, inode.inode);
             put_u16(record, 8, inode.mode);
+            put_u16(
+                record,
+                10,
+                match inode.kind {
+                    DurableInodeKind::Regular => 1,
+                    DurableInodeKind::Directory => 2,
+                },
+            );
             put_u32(record, 12, inode.uid);
             put_u32(record, 16, inode.gid);
             put_u32(record, 20, inode.link_count);
             put_u64(record, 24, inode.mutation_sequence);
             put_u64(record, 32, inode.logical_size);
-            record[40..72].copy_from_slice(&inode.manifest_root.bytes());
+            if let Some(manifest_root) = inode.manifest_root {
+                record[40..72].copy_from_slice(&manifest_root.bytes());
+            }
         }
 
         let mut cursor = entries_offset;
@@ -328,7 +411,7 @@ impl NamespaceRoot {
         encode_metadata_object(NAMESPACE_ROOT_KIND, &payload)
     }
 
-    /// Fully validates and decodes one `NamespaceRootV1` Metadata Object.
+    /// Fully validates and decodes one Namespace Root Metadata Object.
     ///
     /// # Errors
     ///
@@ -339,7 +422,7 @@ impl NamespaceRoot {
         let payload = object.payload;
         if payload.len() < NAMESPACE_ROOT_HEADER_BYTES
             || &payload[0..8] != NAMESPACE_ROOT_MAGIC
-            || get_u16(payload, 8) != FORMAT_VERSION
+            || !matches!(get_u16(payload, 8), FORMAT_VERSION_V1 | FORMAT_VERSION_V2)
             || usize::from(get_u16(payload, 10)) != NAMESPACE_ROOT_HEADER_BYTES
             || usize::from(get_u16(payload, 12)) != DURABLE_INODE_BYTES
             || usize::from(get_u16(payload, 14)) != NAMESPACE_ENTRY_HEADER_BYTES
@@ -375,7 +458,8 @@ impl NamespaceRoot {
             return Err(MetadataFormatError::InvalidPayload);
         }
 
-        let inodes = decode_inodes(payload, inode_count)?;
+        let format_version = get_u16(payload, 8);
+        let inodes = decode_inodes(payload, inode_count, format_version)?;
         let entries = decode_entries(payload, entries_offset, entry_count)?;
         if inodes.windows(2).any(|pair| pair[0].inode >= pair[1].inode)
             || entries.windows(2).any(|pair| {
@@ -398,6 +482,7 @@ impl NamespaceRoot {
 fn decode_inodes(
     payload: &[u8],
     inode_count: usize,
+    format_version: u16,
 ) -> Result<Vec<DurableInode>, MetadataFormatError> {
     let mut inodes = Vec::with_capacity(inode_count);
     for ordinal in 0..inode_count {
@@ -409,23 +494,42 @@ fn decode_inodes(
             )
             .ok_or(MetadataFormatError::ArithmeticOverflow)?;
         let record = &payload[start..start + DURABLE_INODE_BYTES];
-        if get_u16(record, 10) != 0 || record[72..].iter().any(|byte| *byte != 0) {
+        let kind = match (format_version, get_u16(record, 10)) {
+            (FORMAT_VERSION_V1, 0) | (FORMAT_VERSION_V2, 1) => DurableInodeKind::Regular,
+            (FORMAT_VERSION_V2, 2) => DurableInodeKind::Directory,
+            _ => return Err(MetadataFormatError::InvalidPayload),
+        };
+        if record[72..].iter().any(|byte| *byte != 0) {
             return Err(MetadataFormatError::InvalidPayload);
         }
         let mut manifest_root = [0_u8; 32];
         manifest_root.copy_from_slice(&record[40..72]);
-        let manifest_root =
-            MetadataObjectId::new(manifest_root).ok_or(MetadataFormatError::InvalidPayload)?;
-        inodes.push(DurableInode::new(
-            get_u64(record, 0),
-            get_u16(record, 8),
-            get_u32(record, 12),
-            get_u32(record, 16),
-            get_u32(record, 20),
-            get_u64(record, 24),
-            get_u64(record, 32),
-            manifest_root,
-        )?);
+        let inode = match kind {
+            DurableInodeKind::Regular => DurableInode::new(
+                get_u64(record, 0),
+                get_u16(record, 8),
+                get_u32(record, 12),
+                get_u32(record, 16),
+                get_u32(record, 20),
+                get_u64(record, 24),
+                get_u64(record, 32),
+                MetadataObjectId::new(manifest_root).ok_or(MetadataFormatError::InvalidPayload)?,
+            )?,
+            DurableInodeKind::Directory => {
+                if manifest_root != [0; 32] || get_u64(record, 32) != 0 {
+                    return Err(MetadataFormatError::InvalidPayload);
+                }
+                DurableInode::new_directory(
+                    get_u64(record, 0),
+                    get_u16(record, 8),
+                    get_u32(record, 12),
+                    get_u32(record, 16),
+                    get_u32(record, 20),
+                    get_u64(record, 24),
+                )?
+            }
+        };
+        inodes.push(inode);
     }
     Ok(inodes)
 }
@@ -496,24 +600,77 @@ fn validate_namespace(
     {
         return Err(MetadataFormatError::InvalidPayload);
     }
+    let by_inode = inodes
+        .iter()
+        .map(|inode| (inode.inode, inode))
+        .collect::<BTreeMap<_, _>>();
     let mut observed_links = BTreeMap::<u64, u32>::new();
+    let mut directory_children = BTreeMap::<u64, u32>::new();
+    let mut children = BTreeMap::<u64, Vec<u64>>::new();
     for entry in entries {
         NamespaceEntry::new(entry.parent_inode, entry.target_inode, entry.name.clone())?;
-        if inodes
-            .binary_search_by_key(&entry.target_inode, DurableInode::inode)
-            .is_err()
+        if entry.parent_inode != ROOT_INODE
+            && by_inode
+                .get(&entry.parent_inode)
+                .is_none_or(|parent| parent.kind != DurableInodeKind::Directory)
         {
             return Err(MetadataFormatError::InvalidPayload);
         }
+        let target = by_inode
+            .get(&entry.target_inode)
+            .ok_or(MetadataFormatError::InvalidPayload)?;
         let count = observed_links.entry(entry.target_inode).or_default();
         *count = count
             .checked_add(1)
             .ok_or(MetadataFormatError::ArithmeticOverflow)?;
+        if target.kind == DurableInodeKind::Directory {
+            let count = directory_children.entry(entry.parent_inode).or_default();
+            *count = count
+                .checked_add(1)
+                .ok_or(MetadataFormatError::ArithmeticOverflow)?;
+        }
+        children
+            .entry(entry.parent_inode)
+            .or_default()
+            .push(entry.target_inode);
     }
-    if inodes
-        .iter()
-        .any(|inode| observed_links.get(&inode.inode).copied().unwrap_or(0) != inode.link_count)
-    {
+    for inode in inodes {
+        let incoming = observed_links.get(&inode.inode).copied().unwrap_or(0);
+        match inode.kind {
+            DurableInodeKind::Regular if incoming != inode.link_count => {
+                return Err(MetadataFormatError::InvalidPayload);
+            }
+            DurableInodeKind::Directory => {
+                let child_directories = directory_children.get(&inode.inode).copied().unwrap_or(0);
+                let expected_links = 2_u32
+                    .checked_add(child_directories)
+                    .ok_or(MetadataFormatError::ArithmeticOverflow)?;
+                if incoming != 1 || inode.link_count != expected_links {
+                    return Err(MetadataFormatError::InvalidPayload);
+                }
+            }
+            DurableInodeKind::Regular => {}
+        }
+    }
+
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![ROOT_INODE];
+    while let Some(parent) = pending.pop() {
+        if let Some(targets) = children.get(&parent) {
+            for &target in targets {
+                let is_directory = by_inode
+                    .get(&target)
+                    .is_some_and(|inode| inode.kind == DurableInodeKind::Directory);
+                if !reachable.insert(target) && is_directory {
+                    return Err(MetadataFormatError::InvalidPayload);
+                }
+                if is_directory {
+                    pending.push(target);
+                }
+            }
+        }
+    }
+    if reachable.len() != inodes.len() {
         return Err(MetadataFormatError::InvalidPayload);
     }
     Ok(())

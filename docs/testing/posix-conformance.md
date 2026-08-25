@@ -29,10 +29,16 @@ Hits, bounded parallel RAW/Zstd region encoding, hierarchical tree-native
 Manifest updates, four-way Exact-Index compaction, and atomic replacement rename
 are connected. Offline maintenance now scrubs every retained generation,
 published Container, active Exact object, and ACTIVE Location, and can rebuild
-the Exact Index through hidden RoW Runs plus final atomic activation. It does
-not yet implement per-region serialized Chunking Profile IDs, fake-clock
-stalled-I/O deadline proof, nested directories, links, locks, xattrs/ACLs, or
-allocation operations. A bounded real-process
+the Exact Index through hidden RoW Runs plus final atomic activation. Nested
+`mkdir`, `rmdir`, lookup, `readdir`, cross-parent rename, durable recovery, and
+offline scrub are connected through Namespace Root v2. Volatile advisory POSIX
+byte-range locks implement `F_GETLK`, `F_SETLK`, and `F_SETLKW`, including
+owner cleanup on close. Metadata-only allocation, hole punch, zero range,
+DATA/HOLE seek, and the shared-seam collapse/insert operations are connected.
+The stock Linux FUSE kernel forwards allocate, punch, and zero, but rejects
+collapse/insert flags before userspace. It does not yet implement per-region
+serialized Chunking Profile IDs, fake-clock stalled-I/O deadline proof,
+hardlinks, symlinks, BSD `flock`, or xattrs/ACLs. A bounded real-process
 [`SIGKILL`/remount/deadline matrix](sigkill-remount-deadline.md) now covers
 acknowledged sequential writes. When a valid Run Set already exists,
 normal POSIX reads use bounded verified Locations and transparently fall back to
@@ -100,15 +106,17 @@ results.
 | Mutation ordering | Accepted content and metadata mutations form contiguous per-inode sequence prefixes; a later overlapping write wins. | Record assigned sequence numbers in a test observer, permute worker completion, and compare the live and committed bytes with a serial mutation oracle. | M |
 | Ten-second durability | Every acknowledged mutation becomes part of a recoverable commit within the accepted deadline. | With a fake clock, advance to the deadline and crash at every commit operation; with a real mount, kill after the deadline plus tolerance. Recovery must include the mutation in one wholly valid generation. | M |
 | Admission backpressure | The daemon does not acknowledge new mutations when it cannot preserve the deadline or active Dirty DATA reaches 512 MiB. | Stall durable progress before the configured warning point, advance the fake clock, and prove later calls fail or remain unacknowledged while already admitted mutations retain priority. Separately cross the exact byte-pressure edge, require an immediate checkpoint/gate without timer polling, and prove sparse holes and repeated overwrites do not trigger early. | M |
+| Filesystem capacity | `statfs` reports post-reduction physical data capacity after the ten-percent operating reserve. Exhausting the metadata reserve reports zero available blocks. Explicit fake total and available values affect reporting only. | Compare the reply with `statvfs` on both tiers, cross each reserve boundary in the pure capacity model, mount with exact fake values, and prove malformed override pairs fail startup. | F |
 | `fsync`, `fdatasync`, `O_SYNC`, `O_DSYNC` | Sync calls do not promise a stronger crash boundary than the system window, while acknowledged bytes remain live-readable. | Sync immediately after a write, then verify exact live reads. A crash inside the permitted window may recover the complete old or new generation; a crash after the deadline must recover the write. Never accept a mixed generation. | M |
 | Interrupted ingest | A long open ingest recovers its newest wholly committed prefix. | Append uniquely numbered records for longer than one commit interval and kill at every commit phase. Recovered bytes end exactly at a committed record boundary and equal a prefix of acknowledged bytes. | K |
 | Atomic user rename | Rename replacement is entirely before or entirely after in both namespace and inode state. | Rename a source over an existing target while both have open handles and hardlinks. After each fault, compare paths, inode IDs, link counts, and contents with exactly the pre- or post-rename oracle. | M |
 | Unlink and open orphan | An unlinked inode remains usable through live handles, but has no name and need not reappear after daemon crash. | Open through two handles, unlink, read and write through both, close them independently, then kill and remount. Namespace lookup always fails after unlink and no orphan name is synthesized. | F |
 | Truncate | Shrink removes the exact suffix; grow creates a logical hole; the size transition is atomic. | Generate boundary sizes around chunks and manifest leaves. Compare reads and sparse layout to a byte-plus-extent reference model before and after faults. | M |
 | Sparse seek-write | Writes beyond EOF preserve holes rather than materializing zero chunks. | Seek beyond EOF, write a marker, remount, and compare DATA/HOLE extents and bytes with the reference extent map. | F |
-| Hole punch | Punching creates a HOLE over the exact requested range under the supported `fallocate` flags. | Seed nonzero data, punch aligned and unaligned ranges, and verify bytes, extent kinds, size, and unaffected boundaries before and after crash. | M |
-| Zero range | Zeroing creates allocated `FILL(0)` DATA and not a HOLE. | Apply zero range with and without `KEEP_SIZE`; reads return zero while the internal manifest oracle reports FILL rather than HOLE. Validate the distinction again after remount. | M |
-| Capacity reservation | Successful `fallocate`, including `KEEP_SIZE`, reserves pessimistic RAW capacity; unsupported collapse/insert modes return `EOPNOTSUPP`. | Constrain capacity, reserve it, prove competing admission receives `ENOSPC`, then consume the reservation without a later capacity failure. Check exact errno for unsupported modes. | M |
+| Hole punch | Punching creates a HOLE over the exact requested range under the supported `fallocate` flags. | Seed nonzero data, punch aligned and unaligned ranges, and verify bytes, extent kinds, size, and unaffected boundaries before and after crash. | F |
+| Zero range | Zeroing creates allocated `FILL(0)` DATA and not a HOLE. | Apply zero range with and without `KEEP_SIZE`; reads return zero while the internal manifest oracle reports FILL rather than HOLE. Validate the distinction again after remount. | F |
+| Thin allocation | Successful `fallocate` preserves existing bytes and represents previously sparse bytes as `FILL(0)` metadata. It makes no physical-capacity promise, and `KEEP_SIZE` beyond EOF has no retained effect. | Mix allocation with DATA and holes, compare bytes, `st_blocks`, DATA/HOLE seeks, recovery, and scrub, and prove a 1-TiB allocation retains no dirty payload. | F |
+| Structural range splice | Collapse deletes one middle range and shifts the suffix left; insert adds a HOLE and shifts the suffix right. Both reuse immutable recipes without DATA ingest. | Differentially compare byte and allocation maps, require zero checkpoint rechunk bytes, inject every metadata publication fault, and document the stock Linux FUSE `EOPNOTSUPP` gate. | M |
 | Hardlinks | All names for an inode observe the same content and metadata version and correct link count. | Link a file, mutate through alternating names, rename and unlink each name, and compare `st_ino`, `st_nlink`, bytes, and recovery with one shared-inode model. | M |
 | Symlinks | Symlink targets are reproduced byte-for-byte and remain separate from their referents. | Create relative, absolute, dangling, maximum supported, and non-UTF-8 targets; compare `readlink` bytes before and after rename and remount. | F |
 | Corruption read boundary | Corrupt durable data is never returned as valid user content. | Flip each selected container, index, manifest, and Namespace Root field. Reads return `EIO` or recovery selects a previous whole generation; no corrupt payload bytes reach the caller. | M |
@@ -130,7 +138,7 @@ format decisions part of the POSIX test API.
 | Timestamps | Relatime, mtime, ctime, and explicitly set times follow ADR 0027 as ordinary atomic metadata mutations. | Use a controlled clock, read/write/chmod/rename/`utimensat`, and compare exact timestamp transitions before and after remount. | M |
 | Extended attributes | Binary xattr names/values and create, replace, list, get, and remove semantics are atomic. | Test empty and bounded-large binary values, `XATTR_CREATE`/`XATTR_REPLACE`, missing attributes, concurrent replacements, and every commit fault. | M |
 | POSIX ACLs | Access/default ACLs, inheritance, and mode-mask interactions survive commits byte-exactly. | Use `setfacl`/`getfacl`, create children under default ACLs, mutate mode bits, test access under multiple credentials, and remount. | F |
-| Advisory locks | Supported POSIX byte-range and whole-file locks are enforced before mutation admission and are transient. | Use independent processes for overlapping/non-overlapping lock ranges, close and duplicate descriptors, unlink/rename locked files, kill a lock owner, and verify locks do not survive daemon restart. | F |
+| Advisory locks | POSIX byte-range and whole-file lock conflicts are owner-aware, independent of mutation admission, and transient. Ordinary reads and writes remain advisory rather than mandatory-lock operations. | Use independent processes for overlapping/non-overlapping lock ranges, partial unlock and conversion, close and duplicate descriptors, unlink/rename locked files, kill a lock owner, and verify locks do not survive daemon restart. | F |
 | Kernel read cache | Writes invalidate every affected cached range; stale acknowledged data is never read. | Warm page-cache ranges through multiple descriptors, perform overlapping writes, and immediately reread boundaries under the normal and benchmark-only `direct_io` configurations. | F |
 | Shared writable mapping | Writable shared mappings are consistently rejected in v1; read-only mappings remain coherent. | Attempt `MAP_SHARED|PROT_WRITE` and require the documented failure; exercise read-only faults around concurrent writes and truncation without stale or unchecked bytes. | F |
 | Error mapping | Expected errors such as `ENOENT`, `EEXIST`, `ENOTEMPTY`, `ENOSPC`, `EFBIG`, `EOPNOTSUPP`, and `EIO` are not assertion crashes. | Table-drive invalid and resource-limited operations through the model and FUSE mount; compare operation, errno, and unchanged state with the oracle. | M |
@@ -170,7 +178,7 @@ implemented subset. The public maintenance seam adds deterministic corruption,
 global-index-invariant, and fail-before/fail-after evidence, but does not replace
 real block-device power-cut campaigns. No P0 row is complete as an MVP claim:
 fake-clock stalled-I/O coverage, broad randomized process-kill coverage,
-allocation operations, links, and the remaining POSIX/Samba matrices are still
-absent. Container Store,
+links and the remaining POSIX/Samba matrices are still absent. Stock Linux FUSE
+still prevents mounted collapse/insert despite shared-seam coverage. Container Store,
 deterministic namespace, durable orchestration, offline scrub/rebuild, and
 real-mount results remain separately reported evidence.

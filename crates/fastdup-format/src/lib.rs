@@ -32,9 +32,9 @@ pub use container::{
     AdaptiveContainerEncoding, BuildingContainerHeader, ChunkId, ContainerHeader, ContainerId,
     ContainerLayout, ContainerRecordRange, FOOTER_BYTES, FormatError, HEADER_BYTES,
     IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
-    MAX_LOGICAL_CHUNK_BYTES, PrehashedChunk, RECORD_HEADER_BYTES, RawRecord, SealedContainer,
-    SealedContainerDescriptor, VerifiedChunkLocation, VerifiedContainerPublication,
-    VerifiedRawLocation,
+    MAX_LOGICAL_CHUNK_BYTES, PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
+    RECORD_HEADER_BYTES, RawRecord, SealedContainer, SealedContainerDescriptor,
+    VerifiedChunkLocation, VerifiedContainerPublication, VerifiedRawLocation,
 };
 pub use exact_index::{
     EXACT_INDEX_ENTRY_BYTES, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES, ExactIndexEntry,
@@ -58,7 +58,9 @@ pub use metadata::{
     MAX_METADATA_OBJECT_BYTES, METADATA_HEADER_BYTES, MetadataFormatError, MetadataObjectId,
     MetadataObjectKind, metadata_object_kind,
 };
-pub use namespace::{DurableInode, NAMESPACE_ROOT_HEADER_BYTES, NamespaceEntry, NamespaceRoot};
+pub use namespace::{
+    DurableInode, DurableInodeKind, NAMESPACE_ROOT_HEADER_BYTES, NamespaceEntry, NamespaceRoot,
+};
 
 #[cfg(test)]
 mod checksum_tests {

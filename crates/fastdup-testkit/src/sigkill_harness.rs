@@ -320,7 +320,6 @@ impl MountedDaemon {
             .arg(mount)
             .arg(metadata)
             .arg(data)
-            .env("FASTDUP_IO_URING", "off")
             .stdin(Stdio::null())
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(error_output))

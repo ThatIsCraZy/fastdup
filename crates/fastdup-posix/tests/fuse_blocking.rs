@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -295,5 +296,202 @@ async fn owned_fuse_write_reaches_the_namespace_without_a_second_payload_copy() 
             .expect("observer reports the retained payload allocation"),
         original_pointer,
         "the owned FUSE write must preserve its request allocation"
+    );
+}
+
+#[tokio::test]
+async fn fuse_mkdir_and_rmdir_preserve_directory_errors() {
+    let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
+    let filesystem = FuseFilesystem::new(namespace);
+    let parent = Filesystem::mkdir(
+        &filesystem,
+        Request::default(),
+        ROOT_INODE.get(),
+        OsStr::new("parent"),
+        0o777,
+        0o027,
+    )
+    .await
+    .expect("FUSE mkdir succeeds");
+    assert_eq!(parent.attr.perm, 0o750);
+    Filesystem::mkdir(
+        &filesystem,
+        Request::default(),
+        parent.attr.ino,
+        OsStr::new("child"),
+        0o700,
+        0,
+    )
+    .await
+    .expect("nested FUSE mkdir succeeds");
+
+    let error = Filesystem::rmdir(
+        &filesystem,
+        Request::default(),
+        ROOT_INODE.get(),
+        OsStr::new("parent"),
+    )
+    .await
+    .expect_err("nonempty FUSE rmdir fails");
+    assert_eq!(error, libc::ENOTEMPTY.into());
+    Filesystem::rmdir(
+        &filesystem,
+        Request::default(),
+        parent.attr.ino,
+        OsStr::new("child"),
+    )
+    .await
+    .expect("empty nested directory is removed");
+    Filesystem::rmdir(
+        &filesystem,
+        Request::default(),
+        ROOT_INODE.get(),
+        OsStr::new("parent"),
+    )
+    .await
+    .expect("empty parent directory is removed");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn fuse_record_locks_wait_without_blocking_and_close_releases_the_owner() {
+    let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
+    let Reply::Created { entry, handle } = namespace
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"locks",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("fixture file is created")
+    else {
+        panic!("create returned the wrong reply");
+    };
+    let Reply::Opened(second_handle) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: entry.attr.inode,
+                options: OpenOptions::READ_WRITE,
+                truncate: false,
+            },
+        )
+        .expect("fixture file opens twice")
+    else {
+        panic!("open returned the wrong reply");
+    };
+    let filesystem = FuseFilesystem::new(namespace);
+    let write_lock = u32::try_from(libc::F_WRLCK).expect("F_WRLCK is nonnegative");
+
+    Filesystem::setlk(
+        &filesystem,
+        Request::default(),
+        entry.attr.inode.get(),
+        handle.get(),
+        10,
+        0,
+        u64::MAX,
+        write_lock,
+        110,
+        false,
+    )
+    .await
+    .expect("first owner obtains the whole-file lock");
+    let error = Filesystem::setlk(
+        &filesystem,
+        Request::default(),
+        entry.attr.inode.get(),
+        second_handle.get(),
+        20,
+        0,
+        u64::MAX,
+        write_lock,
+        120,
+        false,
+    )
+    .await
+    .expect_err("nonblocking conflicting lock fails");
+    assert_eq!(error, libc::EAGAIN.into());
+
+    let waiting_filesystem = filesystem.clone();
+    let inode = entry.attr.inode.get();
+    let waiting = tokio::spawn(async move {
+        Filesystem::setlk(
+            &waiting_filesystem,
+            Request::default(),
+            inode,
+            second_handle.get(),
+            20,
+            0,
+            u64::MAX,
+            write_lock,
+            120,
+            true,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !waiting.is_finished(),
+        "blocking lock remains pending while the conflicting owner is live"
+    );
+
+    Filesystem::flush(&filesystem, Request::default(), inode, handle.get(), 10)
+        .await
+        .expect("flush releases every lock for its owner");
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("waiting lock wakes after owner release")
+        .expect("waiting FUSE task does not panic")
+        .expect("waiting owner obtains the lock");
+
+    let conflict = Filesystem::getlk(
+        &filesystem,
+        Request::default(),
+        inode,
+        handle.get(),
+        30,
+        0,
+        u64::MAX,
+        write_lock,
+        130,
+    )
+    .await
+    .expect("FUSE getlk succeeds");
+    assert_eq!(conflict.r#type, write_lock);
+    assert_eq!(conflict.pid, 120);
+
+    Filesystem::release(
+        &filesystem,
+        Request::default(),
+        inode,
+        second_handle.get(),
+        0,
+        20,
+        false,
+    )
+    .await
+    .expect("release drops the second owner's locks and handle");
+    let unlocked = Filesystem::getlk(
+        &filesystem,
+        Request::default(),
+        inode,
+        handle.get(),
+        30,
+        0,
+        u64::MAX,
+        write_lock,
+        130,
+    )
+    .await
+    .expect("FUSE getlk succeeds after release");
+    assert_eq!(
+        unlocked.r#type,
+        u32::try_from(libc::F_UNLCK).expect("F_UNLCK is nonnegative")
     );
 }

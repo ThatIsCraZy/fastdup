@@ -1,14 +1,182 @@
+use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use fastdup_format::{ChunkId, ContainerId, FormatError, MAX_CONTAINER_BYTES, PrehashedChunk};
-use fastdup_store::{ContainerRepository, ContainerStore, FsStorageIo, StoreError};
+use fastdup_format::{
+    ChunkId, ContainerId, FormatError, HEADER_BYTES, MAX_CONTAINER_BYTES, PrehashedChunk,
+};
+use fastdup_store::{ContainerRepository, ContainerStore, FsStorageIo, StorageIo, StoreError};
+
+#[derive(Clone)]
+struct ReadTrackingStorage {
+    inner: FsStorageIo,
+    whole_reads: Arc<Mutex<usize>>,
+    range_reads: Arc<Mutex<Vec<(u64, usize)>>>,
+    corrupt_sample: Option<usize>,
+}
+
+impl ReadTrackingStorage {
+    fn open(root: &Path) -> Self {
+        Self {
+            inner: FsStorageIo::open(root).expect("create tracking storage"),
+            whole_reads: Arc::new(Mutex::new(0)),
+            range_reads: Arc::new(Mutex::new(Vec::new())),
+            corrupt_sample: None,
+        }
+    }
+
+    fn corrupting_sample(root: &Path, ordinal: usize) -> Self {
+        Self {
+            corrupt_sample: Some(ordinal),
+            ..Self::open(root)
+        }
+    }
+}
+
+impl StorageIo for ReadTrackingStorage {
+    fn create_new(&self, name: &str) -> io::Result<()> {
+        self.inner.create_new(name)
+    }
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        self.inner.exists(name)
+    }
+
+    fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.inner.write_at(name, offset, bytes)
+    }
+
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        *self.whole_reads.lock().expect("whole-read lock") += 1;
+        self.inner.read(name)
+    }
+
+    fn object_len(&self, name: &str) -> io::Result<u64> {
+        self.inner.object_len(name)
+    }
+
+    fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let ordinal = {
+            let mut reads = self.range_reads.lock().expect("range-read lock");
+            let ordinal = reads.len();
+            reads.push((offset, length));
+            ordinal
+        };
+        let mut bytes = self.inner.read_exact_at(name, offset, length)?;
+        if self.corrupt_sample == Some(ordinal) {
+            bytes[0] ^= 0xff;
+        }
+        Ok(bytes)
+    }
+
+    fn list_names(&self) -> io::Result<Vec<String>> {
+        self.inner.list_names()
+    }
+
+    fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
+        self.inner.set_len(name, length)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        self.inner.sync_file(name)
+    }
+
+    fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
+        self.inner.publish_noreplace(temporary_name, published_name)
+    }
+
+    fn remove_file(&self, name: &str) -> io::Result<()> {
+        self.inner.remove_file(name)
+    }
+
+    fn sync_root(&self) -> io::Result<()> {
+        self.inner.sync_root()
+    }
+}
 
 fn test_root(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(".artifacts/tests")
         .join(format!("{name}-{}", std::process::id()))
+}
+
+#[test]
+fn owned_publication_rereads_only_header_middle_and_footer_blocks() {
+    let root = test_root("publish-sampled-reread");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let storage = ReadTrackingStorage::open(&root);
+    let repository = ContainerRepository::new(storage.clone());
+    let mut state = 0x8bd8_919f_4a62_14f3_u64;
+    let payload = (0..2 * 1_024 * 1_024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect::<Vec<_>>();
+    let id = ContainerId::new([0x81; 16]).expect("fixture Container ID is nonzero");
+    let chunks = payload.chunks(256 * 1_024).collect::<Vec<_>>();
+
+    repository
+        .publish_raw(id, 1, &chunks)
+        .expect("sampled publication succeeds");
+
+    assert_eq!(*storage.whole_reads.lock().expect("whole-read lock"), 0);
+    let published = root.join(format!("{}.fdc", "81".repeat(16)));
+    let file_length = usize::try_from(
+        std::fs::metadata(published)
+            .expect("published Container metadata")
+            .len(),
+    )
+    .expect("format-v1 Container length fits usize");
+    let middle_offset = (file_length / 2 / HEADER_BYTES) * HEADER_BYTES;
+    assert_eq!(
+        *storage.range_reads.lock().expect("range-read lock"),
+        vec![
+            (0, HEADER_BYTES),
+            (
+                u64::try_from(middle_offset).expect("middle offset fits u64"),
+                HEADER_BYTES,
+            ),
+            (
+                u64::try_from(file_length - HEADER_BYTES).expect("footer offset fits u64"),
+                HEADER_BYTES,
+            ),
+        ]
+    );
+
+    std::fs::remove_dir_all(root).expect("remove only this test repository");
+}
+
+#[test]
+fn owned_publication_rejects_a_changed_header_middle_or_footer_sample() {
+    for ordinal in 0..3 {
+        let root = test_root(&format!("publish-changed-sample-{ordinal}"));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+        }
+        let storage = ReadTrackingStorage::corrupting_sample(&root, ordinal);
+        let repository = ContainerRepository::new(storage);
+        let payload = vec![u8::try_from(ordinal + 1).expect("ordinal fits u8"); 256 * 1_024];
+        let mut id = [0x82; 16];
+        id[0] = u8::try_from(ordinal + 1).expect("ordinal fits u8");
+
+        assert!(matches!(
+            repository.publish_raw(
+                ContainerId::new(id).expect("fixture Container ID is nonzero"),
+                1,
+                &[payload.as_slice()],
+            ),
+            Err(StoreError::PublishVerificationMismatch)
+        ));
+
+        std::fs::remove_dir_all(root).expect("remove only this test repository");
+    }
 }
 
 #[test]
@@ -46,7 +214,7 @@ fn published_container_is_immediately_reopenable_by_id() {
 }
 
 #[test]
-fn wrong_prehashed_identity_never_becomes_a_published_container() {
+fn wrong_prehashed_identity_is_detected_by_the_first_independent_read() {
     let root = test_root("publish-wrong-prehash");
     if root.exists() {
         std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
@@ -64,16 +232,15 @@ fn wrong_prehashed_identity_never_becomes_a_published_container() {
         &[&region],
         NonZeroUsize::MIN,
     )
-    .expect("construct non-authoritative writer image");
+    .expect("construct writer image from prior identity work");
 
+    repository
+        .publish_prepared_adaptive_profiled(prepared)
+        .expect("publication trusts the writer's prior identity work");
     assert!(matches!(
-        repository.publish_prepared_adaptive_profiled(prepared),
+        repository.read(id),
         Err(StoreError::Format(FormatError::ChunkHashMismatch))
     ));
-    match repository.read(id) {
-        Err(StoreError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
-        result => panic!("invalid writer evidence became visible: {result:?}"),
-    }
 
     std::fs::remove_dir_all(&root).expect("remove only this test repository");
 }

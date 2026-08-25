@@ -1,10 +1,55 @@
 use fastdup_format::{
-    DurableInode, METADATA_HEADER_BYTES, MetadataFormatError, MetadataObjectId, NamespaceEntry,
-    NamespaceRoot,
+    DurableInode, DurableInodeKind, METADATA_HEADER_BYTES, MetadataFormatError, MetadataObjectId,
+    NamespaceEntry, NamespaceRoot,
 };
 
 fn object_id(byte: u8) -> MetadataObjectId {
     MetadataObjectId::new([byte; 32]).expect("fixture object ID is nonzero")
+}
+
+#[test]
+fn nested_directory_namespace_round_trips_and_rejects_cycles() {
+    let root = NamespaceRoot::new(
+        32,
+        5,
+        7,
+        vec![
+            DurableInode::new_directory(2, 0o750, 1_000, 1_000, 3, 1)
+                .expect("parent directory is valid"),
+            DurableInode::new_directory(3, 0o700, 1_000, 1_000, 2, 2)
+                .expect("child directory is valid"),
+            DurableInode::new(4, 0o600, 1_000, 1_000, 1, 3, 8, object_id(4))
+                .expect("regular file is valid"),
+        ],
+        vec![
+            NamespaceEntry::new(1, 2, b"parent".to_vec()).expect("root entry is valid"),
+            NamespaceEntry::new(2, 3, b"child".to_vec()).expect("nested entry is valid"),
+            NamespaceEntry::new(3, 4, b"file".to_vec()).expect("file entry is valid"),
+        ],
+    )
+    .expect("nested namespace is valid");
+    let encoded = root.encode().expect("nested namespace encodes");
+    let decoded = NamespaceRoot::decode(&encoded).expect("nested namespace decodes");
+    assert_eq!(decoded, root);
+    assert_eq!(decoded.inodes()[0].kind(), DurableInodeKind::Directory);
+    assert_eq!(decoded.inodes()[2].kind(), DurableInodeKind::Regular);
+
+    let cycle = NamespaceRoot::new(
+        32,
+        4,
+        8,
+        vec![
+            DurableInode::new_directory(2, 0o755, 0, 0, 3, 1)
+                .expect("cycle fixture directory is locally valid"),
+            DurableInode::new_directory(3, 0o755, 0, 0, 3, 1)
+                .expect("cycle fixture directory is locally valid"),
+        ],
+        vec![
+            NamespaceEntry::new(2, 3, b"three".to_vec()).expect("component is valid"),
+            NamespaceEntry::new(3, 2, b"two".to_vec()).expect("component is valid"),
+        ],
+    );
+    assert_eq!(cycle, Err(MetadataFormatError::InvalidPayload));
 }
 
 #[test]
@@ -62,6 +107,29 @@ fn namespace_root_has_stable_bytes_and_round_trips_byte_exact_hardlinks() {
             .iter()
             .all(|byte| *byte == 0)
     );
+    assert_eq!(NamespaceRoot::decode(&encoded), Ok(root));
+}
+
+#[test]
+fn decoder_accepts_version_one_regular_file_namespace_roots() {
+    let root = NamespaceRoot::new(
+        8,
+        3,
+        11,
+        vec![
+            DurableInode::new(2, 0o640, 1_000, 1_001, 1, 7, 42, object_id(0x22))
+                .expect("regular inode is valid"),
+        ],
+        vec![NamespaceEntry::new(1, 2, b"legacy".to_vec()).expect("valid entry")],
+    )
+    .expect("namespace root is valid");
+    let mut encoded = root.encode().expect("namespace root encodes");
+    let payload = METADATA_HEADER_BYTES;
+    encoded[payload + 8..payload + 10].copy_from_slice(&1_u16.to_le_bytes());
+    let inode = payload + 128;
+    encoded[inode + 10..inode + 12].fill(0);
+    reauthenticate_metadata_object(&mut encoded);
+
     assert_eq!(NamespaceRoot::decode(&encoded), Ok(root));
 }
 

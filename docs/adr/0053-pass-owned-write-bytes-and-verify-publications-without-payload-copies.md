@@ -4,25 +4,40 @@ status: accepted
 
 # Pass owned write bytes and verify publications without payload copies
 
-The ingest path transfers the FUSE session's owned write buffer into one
-`MutationPayload`, keeps FastCDC Chunks as immutable fragments through hashing
+The ingest path transfers the FUSE session's receive allocation into one
+`MutationPayload`, keeps SeqCDC Chunks as immutable fragments through hashing
 and Exact lookup, and coalesces only Chunks that must be newly encoded. The
 adaptive Container writer serializes selected RAW or Zstd records directly into
 their final image ranges. Mandatory publication verification returns complete
 Location and metric evidence without retaining decoded Chunk payload copies.
 
-This requires a narrow local extension to `fuse3`: the session calls an owned
-write method whose default forwards to the existing borrowed method. The
-fastdup adapter overrides it and adopts the `Vec<u8>`. This fork is preferable
-to a second full copy on every SMB write, but it must stay source-compatible
-with the pinned upstream release and retain the borrowed fallback.
+This requires a narrow local extension to `fuse3`. On `FUSE_WRITE`, the session
+moves the complete receive `Vec<u8>` out of its decoder, installs a fresh
+receive buffer, and passes a bounded `bytes::Bytes` slice plus the allocation
+size to `write_owned_request`. The fastdup adapter turns that slice directly
+into a `MutationPayload`. The default method copies into the existing owned
+write API, so other `Filesystem` implementations remain source-compatible.
+The receive-allocation test compares pointers before and after dispatch to
+prove that the fastdup path does not copy the payload.
+
+A dedicated `fuse-recv-buf` producer keeps two initialized replacement buffers
+ready. Moving a write buffer into ingest therefore does not allocate and zero
+its successor on the Tokio dispatch thread. The producer refills the bounded
+queue in parallel and blocks when both spares are ready. If thread creation or
+prefetch falls behind, dispatch uses the original synchronous allocation as a
+correctness fallback.
+
+The memory budget charges the complete receive allocation, not just the
+payload slice. This matters for short writes because the immutable slice keeps
+the backing allocation alive until ingest releases it.
 
 CRC32C checksums with embedded checksum fields use incremental prefix, four
 zero bytes, and suffix updates. They never clone the complete durable object.
-Publication still rereads and verifies the complete Container before file sync,
-rename, and root sync. Payload-free evidence is not a read cache and cannot
-return file bytes; ordinary reads, recovery, and scrub keep their independent
-verification paths.
+ADR 0059 supersedes the immediate writer-image verification rule. Publication
+uses evidence produced by the encoder and rereads only the Header, one aligned
+midpoint block, and the Footer before file sync, rename, and root sync.
+Ordinary reads, recovery, and scrub keep their independent Record, Chunk-ID,
+Recovery-Index, envelope, and Container-hash verification paths.
 
 Five process-local byte counters measure remaining avoidable copies:
 checksum scratch, publication-verify materialization, FUSE request adaptation,

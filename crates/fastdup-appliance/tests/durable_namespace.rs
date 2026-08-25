@@ -5,7 +5,10 @@ use fastdup_appliance::{
     DurableNamespace, checkpoint_policy_set_v1, recover_mount, recover_mount_with_index,
 };
 use fastdup_format::PolicySetId;
-use fastdup_posix::{NamespaceConfig, OpenOptions, Operation, ROOT_INODE, Reply, RequestContext};
+use fastdup_posix::{
+    FallocateMode, NamespaceConfig, OpenOptions, Operation, ROOT_INODE, Reply, RequestContext,
+    SeekKind,
+};
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, FsStorageIo, GenerationRepository,
 };
@@ -17,6 +20,198 @@ const CALLER: RequestContext = RequestContext {
     pid: 52,
 };
 const CHUNK_BYTES: usize = 256 * 1_024;
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn sparse_allocation_and_structural_splices_recover_without_data_reingest() {
+    let root = unique_test_root("durable-sparse-allocation");
+    let metadata_root = root.join("metadata");
+    let container_root = root.join("containers");
+    let policy = PolicySetId::new([0x71; 32]).expect("policy identity is nonzero");
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(
+            FsStorageIo::open(&metadata_root).expect("create metadata repository"),
+            policy,
+        ),
+        ContainerRepository::new(
+            FsStorageIo::open(&container_root).expect("create container repository"),
+        ),
+        16,
+    )
+    .expect("bootstrap writable durable namespace");
+    let Reply::Created { entry, handle } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"sparse-splice",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create sparse splice file")
+    else {
+        panic!("ASSERT: create returned the wrong reply");
+    };
+    let inode = entry.attr.inode;
+    let mut oracle = vec![None; 19];
+    for (offset, bytes) in [(0_u64, b"abcdef".as_slice()), (16, b"XYZ".as_slice())] {
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset,
+                    data: bytes,
+                },
+            )
+            .expect("write sparse fixture");
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            oracle[usize::try_from(offset).unwrap() + index] = Some(byte);
+        }
+    }
+    appliance
+        .checkpoint()
+        .expect("commit source generation")
+        .expect("source generation is dirty");
+
+    for (offset, length, mode) in [
+        (4_u64, 6_u64, FallocateMode::ZeroRange { keep_size: true }),
+        (1, 2, FallocateMode::PunchHole),
+        (5, 4, FallocateMode::InsertRange),
+        (12, 3, FallocateMode::CollapseRange),
+    ] {
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Fallocate {
+                    inode,
+                    handle,
+                    offset,
+                    length,
+                    mode,
+                },
+            )
+            .expect("apply metadata-only sparse mutation");
+        match mode {
+            FallocateMode::ZeroRange { .. } => {
+                for slot in oracle
+                    .iter_mut()
+                    .skip(usize::try_from(offset).unwrap())
+                    .take(usize::try_from(length).unwrap())
+                {
+                    *slot = Some(0);
+                }
+            }
+            FallocateMode::PunchHole => {
+                for slot in oracle
+                    .iter_mut()
+                    .skip(usize::try_from(offset).unwrap())
+                    .take(usize::try_from(length).unwrap())
+                {
+                    *slot = None;
+                }
+            }
+            FallocateMode::InsertRange => {
+                oracle.splice(
+                    usize::try_from(offset).unwrap()..usize::try_from(offset).unwrap(),
+                    std::iter::repeat_n(None, usize::try_from(length).unwrap()),
+                );
+            }
+            FallocateMode::CollapseRange => {
+                let start = usize::try_from(offset).unwrap();
+                oracle.drain(start..start + usize::try_from(length).unwrap());
+            }
+            FallocateMode::Allocate { .. } => unreachable!(),
+        }
+    }
+    let checkpoint = appliance
+        .checkpoint_profiled()
+        .expect("commit sparse metadata successor")
+        .expect("sparse successor is dirty");
+    assert_eq!(
+        checkpoint.metrics().checkpoint_rechunk_bytes(),
+        0,
+        "structural sparse edits must reuse committed DATA and FILL recipes"
+    );
+    drop(appliance);
+
+    let generations = GenerationRepository::new(
+        FsStorageIo::open(&metadata_root).expect("reopen metadata repository"),
+        policy,
+    );
+    let containers = ContainerRepository::new(
+        FsStorageIo::open(&container_root).expect("reopen container repository"),
+    );
+    let recovered = recover_mount(NamespaceConfig::default(), &generations, &containers)
+        .expect("recover sparse successor")
+        .expect("committed namespace exists");
+    let Reply::Opened(handle) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open recovered sparse file")
+    else {
+        panic!("ASSERT: open returned the wrong reply");
+    };
+    let expected = oracle
+        .iter()
+        .map(|byte| byte.unwrap_or(0))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read(
+            &recovered,
+            inode,
+            handle,
+            0,
+            u32::try_from(expected.len()).unwrap(),
+        ),
+        expected
+    );
+    let Reply::Attr(attr) = recovered
+        .dispatch(CALLER, Operation::GetAttr { inode })
+        .expect("get recovered attributes")
+    else {
+        panic!("ASSERT: getattr returned the wrong reply");
+    };
+    assert_eq!(attr.size, oracle.len() as u64);
+    assert_eq!(
+        attr.allocated_bytes,
+        oracle.iter().filter(|byte| byte.is_some()).count() as u64
+    );
+    let expected_hole = oracle
+        .iter()
+        .position(Option::is_none)
+        .map_or(oracle.len() as u64, |offset| offset as u64);
+    assert_eq!(
+        recovered.dispatch(
+            CALLER,
+            Operation::Seek {
+                inode,
+                handle,
+                offset: 0,
+                kind: SeekKind::Hole,
+            },
+        ),
+        Ok(Reply::Offset(expected_hole))
+    );
+    let scrub = generations
+        .scrub_all_with_data(&containers)
+        .expect("offline scrub accepts the sparse splice successor");
+    assert_eq!(scrub.latest_manifest_files(), 1);
+}
 
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -1973,13 +2168,20 @@ fn checkpoint_consumes_writer_verified_dependencies_without_record_reread() {
         .checkpoint()
         .expect("commit writer-verified DATA")
         .expect("new DATA requires one generation");
-    let record_rereads = containers.operations()[baseline..]
+    let operations = containers.operations();
+    let operations = &operations[baseline..];
+    let publication_sample_reads = operations
+        .iter()
+        .filter(|operation| **operation == StorageOperation::CreateNew)
+        .count()
+        * 3;
+    let data_range_reads = operations
         .iter()
         .filter(|operation| **operation == StorageOperation::ReadExactAt)
         .count();
     assert_eq!(
-        record_rereads, 0,
-        "the online successor commit must consume writer verification instead of rereading DATA Records"
+        data_range_reads, publication_sample_reads,
+        "the online successor commit may sample each new Container but must not reread DATA Records"
     );
 }
 
@@ -2018,10 +2220,18 @@ fn second_identical_file_reuses_online_proofs_or_reverifies_under_memory_pressur
         .checkpoint()
         .expect("commit second copy")
         .expect("second copy requires one generation");
-    let record_rereads = containers.operations()[baseline..]
+    let operations = containers.operations();
+    let operations = &operations[baseline..];
+    let publication_sample_reads = operations
+        .iter()
+        .filter(|operation| **operation == StorageOperation::CreateNew)
+        .count()
+        * 3;
+    let data_range_reads = operations
         .iter()
         .filter(|operation| **operation == StorageOperation::ReadExactAt)
         .count();
+    let record_rereads = data_range_reads.saturating_sub(publication_sample_reads);
     let after_second = appliance.historical_proof_cache_status();
     if historical_after_first.admission_rejections() == 0 {
         assert_eq!(
@@ -2221,6 +2431,152 @@ fn published_chunk_count(container_root: &Path) -> usize {
         total.checked_add(summary.chunk_count())
     })
     .expect("fixture chunk count cannot overflow")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn nested_directories_checkpoint_recover_and_scrub_with_one_file_manifest() {
+    let metadata = MemoryStorageIo::new();
+    let container_storage = MemoryStorageIo::new();
+    let generations = GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1());
+    let containers = ContainerRepository::new(container_storage.clone());
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1()),
+        ContainerRepository::new(container_storage.clone()),
+        16,
+    )
+    .expect("open writable namespace");
+    let Reply::Entry(parent) = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Mkdir {
+                parent: ROOT_INODE,
+                name: b"parent",
+                mode: 0o750,
+            },
+        )
+        .expect("create durable parent directory")
+    else {
+        panic!("mkdir returned the wrong reply");
+    };
+    let Reply::Entry(child) = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Mkdir {
+                parent: parent.attr.inode,
+                name: b"child",
+                mode: 0o700,
+            },
+        )
+        .expect("create durable child directory")
+    else {
+        panic!("mkdir returned the wrong reply");
+    };
+    let Reply::Created { entry, handle } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: child.attr.inode,
+                name: b"payload",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create file inside nested directory")
+    else {
+        panic!("create returned the wrong reply");
+    };
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: 0,
+                data: b"nested durable bytes",
+            },
+        )
+        .expect("write nested file");
+    appliance
+        .checkpoint()
+        .expect("checkpoint nested namespace")
+        .expect("nested namespace is dirty");
+    drop(appliance);
+
+    let scrub = generations
+        .scrub_all_with_data(&containers)
+        .expect("offline scrub accepts nested namespace");
+    assert_eq!(scrub.latest_namespace_inodes(), 3);
+    assert_eq!(scrub.latest_manifest_files(), 1);
+    let recovered = recover_mount(NamespaceConfig::default(), &generations, &containers)
+        .expect("recover nested namespace")
+        .expect("committed nested namespace exists");
+    let Reply::Entry(recovered_parent) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: ROOT_INODE,
+                name: b"parent",
+            },
+        )
+        .expect("recover parent directory")
+    else {
+        panic!("lookup returned the wrong reply");
+    };
+    let Reply::Entry(recovered_child) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: recovered_parent.attr.inode,
+                name: b"child",
+            },
+        )
+        .expect("recover child directory")
+    else {
+        panic!("lookup returned the wrong reply");
+    };
+    let Reply::Entry(recovered_file) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: recovered_child.attr.inode,
+                name: b"payload",
+            },
+        )
+        .expect("recover nested file")
+    else {
+        panic!("lookup returned the wrong reply");
+    };
+    let Reply::Opened(recovered_handle) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: recovered_file.attr.inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open recovered nested file")
+    else {
+        panic!("open returned the wrong reply");
+    };
+    assert_eq!(
+        read(
+            &recovered,
+            recovered_file.attr.inode,
+            recovered_handle,
+            0,
+            64,
+        ),
+        b"nested durable bytes"
+    );
 }
 
 fn read(

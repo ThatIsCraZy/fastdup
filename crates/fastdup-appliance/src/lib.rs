@@ -6,6 +6,7 @@ mod checkpoint;
 mod checkpoint_trigger;
 mod historical_proof_cache;
 mod proof_cache_trace;
+mod statfs;
 
 pub use checkpoint::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, CpuPhaseStatus,
@@ -22,14 +23,17 @@ pub use proof_cache_trace::{
     ProofCacheEvent, ProofCachePolicy, ProofCacheReplayError, ProofCacheReplayReport,
     ProofCacheTrace, ProofKey, replay_proof_cache_trace,
 };
+pub use statfs::{
+    STATFS_RESERVE_BASIS_POINTS, StatFsOverride, StatFsOverrideError, TieredStatFsSource,
+};
 
 use std::fmt;
 use std::sync::Arc;
 
 use fastdup_format::{ManifestExtent, NamespaceRoot};
 use fastdup_posix::{
-    CommittedEntry, CommittedFile, CommittedInode, CommittedNamespaceSnapshot, Namespace,
-    NamespaceConfig, PosixError, PreparedCommitExtent, PreparedDataRecipe,
+    CommittedDirectory, CommittedEntry, CommittedFile, CommittedInode, CommittedNamespaceSnapshot,
+    Namespace, NamespaceConfig, PosixError, PreparedCommitExtent, PreparedDataRecipe,
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, GenerationError, GenerationRepository,
@@ -159,14 +163,14 @@ where
 {
     assert_eq!(
         verified_files.len(),
-        root.inodes().len(),
+        root.file_inode_count(),
         "ASSERT: opaque DATA graph proof count must match the Namespace Root"
     );
     let mut files = Vec::new();
     files
         .try_reserve_exact(verified_files.len())
         .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
-    for (inode, verified) in root.inodes().iter().zip(verified_files) {
+    for (inode, verified) in root.file_inodes().zip(verified_files) {
         assert_eq!(
             verified.inode(),
             inode.inode(),
@@ -199,14 +203,14 @@ fn namespace_from_files(
     files: Vec<Arc<dyn CommittedFile>>,
     writable: bool,
 ) -> Result<Namespace, MountError> {
-    if files.len() != root.inodes().len() {
+    if files.len() != root.file_inode_count() {
         return Err(MountError::Posix(PosixError::Io));
     }
     let mut inodes = Vec::new();
     inodes
-        .try_reserve_exact(root.inodes().len())
+        .try_reserve_exact(root.file_inode_count())
         .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
-    for (inode, file) in root.inodes().iter().zip(files) {
+    for (inode, file) in root.file_inodes().zip(files) {
         inodes.push(CommittedInode::new(
             inode.inode(),
             inode.mode(),
@@ -215,6 +219,21 @@ fn namespace_from_files(
             inode.link_count(),
             inode.mutation_sequence(),
             file,
+        )?);
+    }
+
+    let mut directories = Vec::new();
+    directories
+        .try_reserve_exact(root.inodes().len().saturating_sub(root.file_inode_count()))
+        .map_err(|_| MountError::Posix(PosixError::OutOfMemory))?;
+    for inode in root.directory_inodes() {
+        directories.push(CommittedDirectory::new(
+            inode.inode(),
+            inode.mode(),
+            inode.uid(),
+            inode.gid(),
+            inode.link_count(),
+            inode.mutation_sequence(),
         )?);
     }
 
@@ -230,11 +249,12 @@ fn namespace_from_files(
         )?);
     }
 
-    let snapshot = CommittedNamespaceSnapshot::new(
+    let snapshot = CommittedNamespaceSnapshot::new_with_directories(
         next_inode,
         inode_reservation_end,
         root.namespace_mutation_sequence(),
         inodes,
+        directories,
         entries,
     )?;
     if writable {

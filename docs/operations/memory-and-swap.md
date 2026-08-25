@@ -26,20 +26,19 @@ verified Exact pages. The data-tier `io_uring`
 adapter has an independent
 256-MiB publication-buffer budget. Its normal owned path transfers a prepared
 Container image once and charges exactly one image for the whole publication.
-After the final Header write, the original allocation is released before the
-equal-sized writer-reread buffer is allocated; the same lease covers both
-phases. Legacy borrowed `write_at` calls still require a completion-lifetime
+The same lease remains charged through writer-image verification and the three
+bounded storage samples. Legacy borrowed `write_at` calls still require a completion-lifetime
 copy and report those bytes separately. Neither tier counts as read-cache
 capacity. This budget begins at publication admission, so the Reduction
 pipeline must independently bound prepared-but-not-yet-submitted images. The
-Ring path is currently opt-in with `FASTDUP_IO_URING=try` or `required`; absent
-or `off` retains the faster measured synchronous path.
+Ring path is required. Missing kernel support or ring setup failure aborts
+daemon startup; there is no synchronous DATA fallback.
 
-Rereads of at least 1 MiB are decoded by a permanent CPU verifier pool using all
-effective CPUs by default; smaller Containers stay inline. Every pooled job
+Writer images of at least 1 MiB are decoded asynchronously by a bounded queue
+on the process Rayon pool; smaller Containers stay inline. Every queued job
 continues holding the same publication-buffer lease, so queued verifier input
 cannot escape the 256-MiB bound. The decoded `SealedContainer` result can
-temporarily coexist with its reread input during verification and is not part
+temporarily coexist with its writer image during verification and is not part
 of `inflight_bytes`; process RSS/cgroup limits remain the authoritative guard
 for that decoded representation. With nominal 64-MiB images, the input budget
 admits at most four such jobs concurrently.

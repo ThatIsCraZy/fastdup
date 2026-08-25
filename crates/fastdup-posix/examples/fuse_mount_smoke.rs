@@ -1,25 +1,59 @@
-use fastdup_posix::{FuseFilesystem, Namespace, NamespaceConfig, volatile_mount_options};
+use fastdup_posix::{
+    FuseFilesystem, Namespace, NamespaceConfig, StatFsSnapshot, StatFsSource,
+    volatile_mount_options,
+};
 use fuse3::raw::Session;
 use std::fs::OpenOptions;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+
+const SMOKE_CAPACITY_BYTES: u64 = 16 * 1_024 * 1_024 * 1_024;
+const SMOKE_AVAILABLE_BYTES: u64 = 12 * 1_024 * 1_024 * 1_024;
+
+#[derive(Debug)]
+struct SmokeStatFs;
+
+impl StatFsSource for SmokeStatFs {
+    fn snapshot(&self) -> io::Result<StatFsSnapshot> {
+        StatFsSnapshot::new(
+            SMOKE_CAPACITY_BYTES,
+            SMOKE_AVAILABLE_BYTES,
+            SMOKE_AVAILABLE_BYTES,
+            1_000_000,
+            900_000,
+            4_096,
+            255,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mount_path = std::env::args_os()
-        .nth(1)
+    let mut arguments = std::env::args_os().skip(1);
+    let first = arguments
+        .next()
         .map(PathBuf::from)
         .ok_or("usage: fuse_mount_smoke MOUNT_PATH")?;
+    if first.as_os_str() == "--lock-child" {
+        let path = arguments
+            .next()
+            .map(PathBuf::from)
+            .ok_or("missing lock path")?;
+        return exercise_lock_child(&path).map_err(Into::into);
+    }
+    let mount_path = first;
     std::fs::create_dir_all(&mount_path)?;
     if std::fs::read_dir(&mount_path)?.next().is_some() {
         return Err("mount directory must be empty".into());
     }
 
     let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
-    let filesystem = FuseFilesystem::new(namespace);
+    let filesystem = FuseFilesystem::new(namespace).with_statfs_source(Arc::new(SmokeStatFs));
     let mut mount_options = volatile_mount_options();
     mount_options.force_readdir_plus(true);
     let session = Session::new(mount_options);
@@ -35,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn exercise_syscalls(mount_path: &std::path::Path) -> io::Result<()> {
     const SPARSE_OFFSET: u64 = 1_024 * 1_024 * 1_024 * 1_024;
+    exercise_statfs(mount_path)?;
     let raw_name = std::ffi::OsString::from_vec(b"vm-\xff".to_vec());
     let path = mount_path.join(&raw_name);
     let writer = OpenOptions::new()
@@ -90,9 +125,126 @@ fn exercise_syscalls(mount_path: &std::path::Path) -> io::Result<()> {
     std::fs::remove_file(path)?;
 
     exercise_concurrent_append(mount_path)?;
+    exercise_process_record_lock(mount_path)?;
+    exercise_sparse_allocation_syscalls(mount_path)?;
     exercise_sequential_extent_coalescing(mount_path)?;
     exercise_readdirplus_pagination(mount_path)?;
     Ok(())
+}
+
+fn exercise_statfs(mount_path: &std::path::Path) -> io::Result<()> {
+    let statistics = rustix::fs::statvfs(mount_path).map_err(io::Error::from)?;
+    assert_eq!(
+        statistics.f_blocks * statistics.f_frsize,
+        SMOKE_CAPACITY_BYTES
+    );
+    assert_eq!(
+        statistics.f_bavail * statistics.f_frsize,
+        SMOKE_AVAILABLE_BYTES
+    );
+    assert_eq!(statistics.f_files, 1_000_000);
+    assert_eq!(statistics.f_ffree, 900_000);
+    assert_eq!(statistics.f_namemax, 255);
+    Ok(())
+}
+
+fn exercise_sparse_allocation_syscalls(mount_path: &std::path::Path) -> io::Result<()> {
+    use rustix::fs::{FallocateFlags, SeekFrom, fallocate, seek};
+
+    let path = mount_path.join("sparse-allocation.dat");
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    file.write_all_at(b"abc", 0)?;
+    file.write_all_at(b"XYZ", 8)?;
+    assert_eq!(seek(&file, SeekFrom::Hole(0)).map_err(io::Error::from)?, 3);
+    assert_eq!(seek(&file, SeekFrom::Data(3)).map_err(io::Error::from)?, 8);
+
+    fallocate(
+        &file,
+        FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
+        1,
+        1,
+    )
+    .map_err(io::Error::from)?;
+    assert_eq!(seek(&file, SeekFrom::Hole(1)).map_err(io::Error::from)?, 1);
+    fallocate(&file, FallocateFlags::ZERO_RANGE, 1, 1).map_err(io::Error::from)?;
+    assert_eq!(seek(&file, SeekFrom::Data(1)).map_err(io::Error::from)?, 1);
+    fallocate(&file, FallocateFlags::empty(), 2, 6).map_err(io::Error::from)?;
+    assert_eq!(seek(&file, SeekFrom::Hole(0)).map_err(io::Error::from)?, 11);
+    assert_eq!(file.metadata()?.blocks(), 11_u64.div_ceil(512));
+
+    for mode in [FallocateFlags::COLLAPSE_RANGE, FallocateFlags::INSERT_RANGE] {
+        let error = fallocate(&file, mode, 1, 1)
+            .expect_err("the Linux FUSE kernel path rejects structural fallocate modes");
+        assert_eq!(error, rustix::io::Errno::OPNOTSUPP);
+    }
+
+    drop(file);
+    std::fs::remove_file(path)
+}
+
+fn exercise_process_record_lock(mount_path: &std::path::Path) -> io::Result<()> {
+    use rustix::fs::{FlockOperation, fcntl_lock};
+
+    let path = mount_path.join("record-lock.dat");
+    OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--lock-child")
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut ready = String::new();
+    BufReader::new(
+        child
+            .stdout
+            .take()
+            .expect("ASSERT: lock child stdout is piped"),
+    )
+    .read_line(&mut ready)?;
+    assert_eq!(ready, "LOCKED\n");
+
+    let contender = OpenOptions::new().read(true).write(true).open(&path)?;
+    let conflict = fcntl_lock(&contender, FlockOperation::NonBlockingLockExclusive)
+        .expect_err("independent process holds a conflicting record lock");
+    assert!(
+        matches!(
+            conflict,
+            rustix::io::Errno::AGAIN | rustix::io::Errno::ACCESS
+        ),
+        "conflicting record lock returned {conflict}"
+    );
+    child
+        .stdin
+        .take()
+        .expect("ASSERT: lock child stdin is piped")
+        .write_all(b"\n")?;
+    assert!(child.wait()?.success());
+
+    fcntl_lock(&contender, FlockOperation::LockExclusive).map_err(io::Error::from)?;
+    fcntl_lock(&contender, FlockOperation::Unlock).map_err(io::Error::from)?;
+    drop(contender);
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+fn exercise_lock_child(path: &std::path::Path) -> io::Result<()> {
+    use rustix::fs::{FlockOperation, fcntl_lock};
+
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    fcntl_lock(&file, FlockOperation::LockExclusive).map_err(io::Error::from)?;
+    println!("LOCKED");
+    io::stdout().flush()?;
+    let mut release = String::new();
+    io::stdin().read_line(&mut release)?;
+    fcntl_lock(&file, FlockOperation::Unlock).map_err(io::Error::from)
 }
 
 fn exercise_concurrent_append(mount_path: &std::path::Path) -> io::Result<()> {

@@ -39,16 +39,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode,
         )?,
         "ring" => {
-            let storage = IoUringStorageIo::open_required(root, IoUringStorageConfig::default())?;
+            let storage = IoUringStorageIo::open(root, IoUringStorageConfig::default())?;
             run(&storage, count, workers, payload_bytes, mode)?;
             let status = storage.status();
             eprintln!(
                 concat!(
                     "ring_status submitted={} completed={} root_callers={} ",
                     "root_submissions={} peak_inflight_bytes={} owned_started={} ",
-                    "owned_completed={} borrowed_write_copy_bytes={} verifier_workers={} ",
-                    "verification_started={} verification_completed={} verification_failed={} ",
-                    "peak_active_verifications={}"
+                    "owned_completed={} borrowed_write_copy_bytes={}"
                 ),
                 status.submitted_operations(),
                 status.completed_operations(),
@@ -58,11 +56,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 status.owned_publications_started(),
                 status.owned_publications_completed(),
                 status.borrowed_write_copy_bytes(),
-                status.verifier_workers(),
-                status.verification_jobs_started(),
-                status.verification_jobs_completed(),
-                status.verification_jobs_failed(),
-                status.peak_active_verifications(),
             );
         }
         _ => return Err("MODE must be sync or ring".into()),

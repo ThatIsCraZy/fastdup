@@ -1,8 +1,8 @@
 use fastdup_appliance::{DurableNamespace, HistoricalProofCacheStatus, recover_mount};
 use fastdup_format::PolicySetId;
 use fastdup_posix::{
-    Namespace, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE, Reply,
-    RequestContext,
+    FallocateMode, HandleId, InodeId, Namespace, NamespaceConfig, OpenOptions, Operation,
+    PosixError, ROOT_INODE, Reply, RequestContext,
 };
 use fastdup_store::{ContainerRepository, GenerationRepository};
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
@@ -422,6 +422,178 @@ fn every_path_local_truncate_fault_recovers_the_previous_or_exact_cut() {
             );
         }
     }
+}
+
+#[test]
+fn every_sparse_splice_fault_recovers_the_previous_or_complete_layout() {
+    let probe_metadata = MemoryStorageIo::new();
+    let probe_containers = MemoryStorageIo::new();
+    let probe = open(probe_metadata.clone(), probe_containers.clone());
+    let (probe_inode, probe_handle, previous) = seed_sparse_splice_predecessor(&probe);
+    let complete = apply_sparse_splice(&probe, probe_inode, probe_handle, previous.clone());
+    let metadata_baseline = probe_metadata.operation_count();
+    let container_baseline = probe_containers.operation_count();
+    probe
+        .checkpoint()
+        .expect("checkpoint sparse splice probe")
+        .expect("sparse splice needs one generation");
+    let operations = probe_metadata.operations()[metadata_baseline..].to_vec();
+    assert_eq!(operations.last(), Some(&StorageOperation::SyncFile));
+    assert_eq!(
+        probe_containers.operation_count(),
+        container_baseline,
+        "sparse structural edits must not read or publish DATA containers"
+    );
+    let final_sync = operations.len() - 1;
+
+    for relative in 0..operations.len() {
+        for fail_after in [false, true] {
+            let metadata = if fail_after {
+                MemoryStorageIo::with_fail_after(metadata_baseline + relative)
+            } else {
+                MemoryStorageIo::with_fail_before(metadata_baseline + relative)
+            };
+            let containers = MemoryStorageIo::new();
+            let appliance = open(metadata.clone(), containers.clone());
+            let (inode, handle, candidate_previous) = seed_sparse_splice_predecessor(&appliance);
+            assert_eq!(candidate_previous, previous);
+            assert_eq!(
+                apply_sparse_splice(&appliance, inode, handle, candidate_previous),
+                complete
+            );
+            assert!(
+                appliance.checkpoint().is_err(),
+                "sparse splice fault relative={relative} after={fail_after} unexpectedly committed"
+            );
+            drop(appliance);
+            metadata.crash();
+            containers.crash();
+            let recovered = recover_mount(
+                NamespaceConfig::default(),
+                &GenerationRepository::new(metadata, policy()),
+                &ContainerRepository::new(containers),
+            )
+            .expect("recover one whole sparse splice generation")
+            .expect("sparse predecessor exists");
+            let Reply::Opened(recovered_handle) = recovered
+                .dispatch(
+                    CALLER,
+                    Operation::Open {
+                        inode,
+                        options: OpenOptions::READ_ONLY,
+                        truncate: false,
+                    },
+                )
+                .expect("open recovered sparse splice file")
+            else {
+                panic!("ASSERT: open returned the wrong reply");
+            };
+            let expected = if fail_after && relative == final_sync {
+                &complete
+            } else {
+                &previous
+            };
+            assert_eq!(
+                read_range(
+                    &recovered,
+                    inode,
+                    recovered_handle,
+                    0,
+                    u32::try_from(expected.len()).expect("fixture length fits u32"),
+                ),
+                *expected,
+                "fault relative={relative} after={fail_after} exposed a mixed sparse splice"
+            );
+        }
+    }
+}
+
+fn seed_sparse_splice_predecessor(
+    appliance: &DurableNamespace<MemoryStorageIo, MemoryStorageIo>,
+) -> (InodeId, HandleId, Vec<u8>) {
+    let Reply::Created { entry, handle } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"sparse-splice-fault",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create sparse splice predecessor")
+    else {
+        panic!("ASSERT: create returned the wrong reply");
+    };
+    let inode = entry.attr.inode;
+    for (offset, bytes) in [(0_u64, b"abcdefgh".as_slice()), (16, b"XYZ".as_slice())] {
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset,
+                    data: bytes,
+                },
+            )
+            .expect("write sparse splice predecessor");
+    }
+    appliance
+        .checkpoint()
+        .expect("commit sparse splice predecessor")
+        .expect("predecessor needs one generation");
+    let mut previous = vec![0; 19];
+    previous[..8].copy_from_slice(b"abcdefgh");
+    previous[16..].copy_from_slice(b"XYZ");
+    (inode, handle, previous)
+}
+
+fn apply_sparse_splice(
+    appliance: &DurableNamespace<MemoryStorageIo, MemoryStorageIo>,
+    inode: InodeId,
+    handle: HandleId,
+    mut bytes: Vec<u8>,
+) -> Vec<u8> {
+    for (offset, length, mode) in [
+        (3_u64, 5_u64, FallocateMode::ZeroRange { keep_size: true }),
+        (5, 4, FallocateMode::InsertRange),
+        (12, 3, FallocateMode::CollapseRange),
+        (1, 2, FallocateMode::PunchHole),
+    ] {
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Fallocate {
+                    inode,
+                    handle,
+                    offset,
+                    length,
+                    mode,
+                },
+            )
+            .expect("apply sparse splice mutation");
+        let start = usize::try_from(offset).expect("fixture offset fits usize");
+        let length = usize::try_from(length).expect("fixture length fits usize");
+        match mode {
+            FallocateMode::ZeroRange { .. } | FallocateMode::PunchHole => {
+                bytes[start..start + length].fill(0);
+            }
+            FallocateMode::InsertRange => {
+                bytes.splice(start..start, std::iter::repeat_n(0, length));
+            }
+            FallocateMode::CollapseRange => {
+                bytes.drain(start..start + length);
+            }
+            FallocateMode::Allocate { .. } => unreachable!(),
+        }
+    }
+    bytes
 }
 
 #[test]

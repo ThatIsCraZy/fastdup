@@ -565,8 +565,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         let predecessor_root =
             self.read_namespace_root(successor.predecessor.record.namespace_root())?;
         let source_inode = predecessor_root
-            .inodes()
-            .iter()
+            .file_inodes()
             .find(|inode| inode.manifest_root() == source_root)
             .ok_or(GenerationError::RetainedManifestNotInPredecessor(
                 source_root,
@@ -997,9 +996,9 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: generation commit lock poisoned");
         let snapshot = self.load_append_snapshot(Some(predecessor))?;
-        if proofs.len() != root.inodes().len() {
+        if proofs.len() != root.file_inode_count() {
             return Err(GenerationError::ManifestCountMismatch {
-                namespace_inodes: root.inodes().len(),
+                namespace_inodes: root.file_inode_count(),
                 manifests: proofs.len(),
             });
         }
@@ -1008,7 +1007,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         manifests
             .try_reserve_exact(proofs.len())
             .map_err(|_| GenerationError::OutOfMemory)?;
-        for (inode, proof) in root.inodes().iter().zip(proofs) {
+        for (inode, proof) in root.file_inodes().zip(proofs) {
             if proof.predecessor != predecessor {
                 return Err(GenerationError::MixedSuccessorPredecessors {
                     expected_generation: predecessor.generation(),
@@ -1457,9 +1456,9 @@ impl<I: StorageIo> GenerationRepository<I> {
         let mut chunk_length_conflict = None;
         let mut manifests = Vec::new();
         manifests
-            .try_reserve_exact(root.inodes().len())
+            .try_reserve_exact(root.file_inode_count())
             .map_err(|_| GenerationError::OutOfMemory)?;
-        for inode in root.inodes() {
+        for inode in root.file_inodes() {
             let summary = scan_manifest_tree(
                 inode.manifest_root(),
                 |node_id| self.read_manifest_node(node_id),

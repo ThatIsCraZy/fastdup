@@ -98,7 +98,7 @@ The header occupies exactly `[0, 4096)`.
 | 12 | 2 | `lifecycle_state` | `1` = `BUILDING`, `2` = `SEALED`; published files contain `2` |
 | 14 | 2 | `crc_algorithm` | `1` = CRC-32C |
 | 16 | 2 | `chunk_id_algorithm` | `1` = unkeyed BLAKE3-256 |
-| 18 | 2 | `container_hash_algorithm` | `1` = unkeyed BLAKE3-256 |
+| 18 | 2 | `container_hash_algorithm` | `2` = domain-separated structural BLAKE3-256 commitment |
 | 20 | 2 | `record_alignment` | `64` |
 | 22 | 2 | reserved | zero |
 | 24 | 8 | `required_flags` | zero |
@@ -257,7 +257,7 @@ matching Recovery Index entry and every Recovery Index entry resolves to exactly
 one Chunk Table entry. The index CRC covers exactly `index_length` bytes with
 bytes `[36, 40)` of the Index Header treated as zero.
 
-## Container footer and whole-container hash
+## Container footer and structural commitment
 
 The footer starts at `footer_offset`, occupies exactly 4,096 bytes, and ends at
 `file_length`.
@@ -278,22 +278,27 @@ The footer starts at `footer_offset`, occupies exactly 4,096 bytes, and ends at
 | 72 | 8 | `index_offset` | equals Container Header value |
 | 80 | 8 | `index_length` | equals Container Header value |
 | 88 | 8 | `footer_offset` | equals Container Header and actual footer offset |
-| 96 | 32 | `container_hash` | whole-container BLAKE3-256 |
+| 96 | 32 | `container_hash` | structural BLAKE3-256 commitment |
 | 128 | 4 | `footer_crc32c` | footer checksum described below |
 | 132 | 3,964 | reserved | zero |
 
-The whole-container BLAKE3 covers exactly `[0, file_length)`, with the footer's
-`container_hash` bytes `[footer_offset + 96, footer_offset + 128)` and
-`footer_crc32c` bytes `[footer_offset + 128, footer_offset + 132)` treated as
-zero. This avoids a self-reference while protecting the header, all records and
-padding, the complete Recovery Index, footer identity fields, and footer
-reserved bytes.
+The structural commitment hashes these byte strings in order: the domain
+separator `fastdup-container-structural-v1\0`, the complete Container Header,
+each Encoding Record's fixed header plus Chunk Table, the complete Recovery
+Index, and the complete Footer with `container_hash` and `footer_crc32c`
+treated as 36 zero bytes. Encoded payload, record padding, and the zero gap
+before the Footer are deliberately excluded. Record CRC32C covers every stored
+record byte, every decoded logical Chunk is independently authenticated by its
+BLAKE3 Chunk ID, and excluded padding is required to be zero. The commitment
+therefore binds the durable identities, layout, codec parameters, checksums,
+and record-to-index bijection without rereading payload during sealing.
 
 The Footer CRC covers all 4,096 footer bytes with only its own bytes
 `[128, 132)` treated as zero. It therefore detects damage to the stored
 container hash as well as to the duplicated structural fields. Verification
 first checks cheap bounds and the Footer CRC, then compares duplicated fields;
-full-container verification recomputes BLAKE3 using the zeroing rule above.
+full-container verification recomputes the structural commitment using the
+ordering and zeroing rule above.
 
 ## Lifecycle and durability protocol
 
@@ -309,19 +314,24 @@ The writer performs these steps in order:
    Generation. Write a zero-reserved `BUILDING` header.
 2. Write complete Encoding Records. Calculate each Record CRC only after its
    header, table, payload, and zero padding are final.
-3. Construct the complete sorted Recovery Index from the records. Verify the
-   index-to-record bijection in memory and calculate the Index CRC.
+3. Construct the complete sorted Recovery Index from the records and calculate
+   the Index CRC. Retain the Locations derived from those same record tables as
+   writer publication evidence.
 4. Calculate final offsets and length with checked arithmetic. Construct the
-   zero gap and footer, compute whole-container BLAKE3 using the defined zeroed
-   footer fields, and finalize the Footer CRC. The on-disk header remains
+   zero gap and footer, compute the structural commitment using the defined
+   field sequence, and finalize the Footer CRC. The on-disk header remains
    `BUILDING` during these writes.
 5. Write the complete record/index/footer body, then write the final `SEALED`
    header last. Reassert the already known exact file length; on XFS this also
    releases speculative unwritten allocation beyond EOF.
-6. Re-read and validate the sealed structure using the reader parser, including
-   all Record CRCs, codec completion, the Recovery Index bijection, and every
-   decoded Chunk ID. This is
-   the writer-side paired verification.
+6. Trust the Chunk IDs, Record CRCs, Recovery Index, Locations, and
+   structural commitment produced in steps 2 through 4. Do not decode or hash
+   the retained image again. Read back the exact stored length plus the 4 KiB
+   Header, one 4 KiB block aligned at the physical midpoint, and the 4 KiB
+   Footer. Each sample must equal the writer image. This sampled check does not
+   prove equality for unsampled stored payload bytes. Readers, recovery,
+   rebuild, scrub, and publishers without writer evidence must read and verify
+   the affected Container independently.
 7. `fsync` the container file. Only now is it `SEALED`.
 8. Atomically rename it, without replacement, from its temporary name to its
    published name in the same directory, then `fsync` that directory. Only now
@@ -376,8 +386,8 @@ allocations:
 6. Validate the Index Header and prove its length equation from `entry_count`.
    Check zero footer padding, Index CRC, sort order, and the complete
    index-to-record bijection without trusting index offsets first.
-7. When whole-container verification is required, recompute and compare the
-   container BLAKE3. When returning a logical chunk, always compute BLAKE3 over
+7. When complete-container verification is required, recompute and compare the
+   structural commitment. When returning a logical chunk, always compute BLAKE3 over
    its decoded bytes and compare it with both table and index Chunk IDs before
    returning any byte to the caller.
 
@@ -394,12 +404,12 @@ The required paired checks are:
 | Invariant | Writer boundary | Reader/recovery boundary | Offline scrub / fault case |
 | --- | --- | --- | --- |
 | offsets and lengths do not overflow or escape the file | checked before every write | checked before every allocation/read/seek | mutate each length and boundary bit; expect VERIFY, never panic or OOM |
-| only complete sealed files can be published | final parser pass, file `fsync`, rename, directory `fsync` | reject `BUILDING`, bad/missing footer, and unpublished paths | crash after every write/sync/rename; accept only the outcomes listed above |
+| only complete sealed files can be published | writer-produced evidence, exact length and three storage samples, file `fsync`, rename, directory `fsync` | reject `BUILDING`, bad/missing footer, and unpublished paths | crash after every write/sync/rename; accept only the outcomes listed above |
 | Record CRC covers exactly stored bytes | compute after all record bytes are final | recompute before decode | flip header, table, payload, and padding bytes independently |
-| Chunk ID identifies exact decoded bytes | compute from input chunk and re-read after encode | recompute after RAW copy or Zstd decode before returning bytes | rehash every decoded slice; a mismatch quarantines that Location |
-| Recovery Index is a complete, sorted bijection | build from final record tables and cross-check | resolve and compare every entry with its record/table | delete, duplicate, reorder, or redirect one entry; expect VERIFY |
+| Chunk ID identifies exact decoded bytes | compute once from the immutable input chunk and carry it through encoding | recompute after RAW copy or Zstd decode before returning bytes | rehash every decoded slice; a mismatch quarantines that Location |
+| Recovery Index is a complete, sorted bijection | build the Index and publication Locations from the same final record tables | resolve and compare every entry with its record/table | delete, duplicate, reorder, or redirect one entry; expect VERIFY |
 | header/footer describe the same immutable object | emit duplicate values from one construction state | compare every duplicate after both block CRCs pass | corrupt each copy independently; do not choose one copy as canonical |
-| the footer authenticates the complete sealed byte sequence | hash the finalized byte sequence using the zeroing rule | recompute for whole-container verification | flip any byte class, including zero padding and reserved fields |
+| the footer binds immutable structure without rescanning payload | hash Header, record metadata, Recovery Index, and Footer once; compare Header, midpoint block, and Footer with storage | recompute the structural commitment and independently validate every Record CRC and decoded Chunk ID | mutate committed metadata and expect a commitment failure; mutate payload and expect Record CRC or Chunk-ID failure |
 | one Chunk ID never has two logical lengths | check entries while sorting | reject an in-container mismatch during index validation | cross-container scrub reports the same mismatch as Corruption |
 
 Persistent-integrity failures are `VERIFY` failures: the smallest isolatable

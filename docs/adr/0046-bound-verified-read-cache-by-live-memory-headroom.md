@@ -107,6 +107,10 @@ this remains a benchmark gate rather than a correctness assumption.
 
 ## XFS publication and io_uring
 
+ADR 0058 supersedes this section's worker-loop, verifier-pool, setup-fallback,
+and synchronous-policy details. The durability order and memory bounds below
+remain in force.
+
 The same memory reserve applies to a future XFS `io_uring` publisher. At high
 load, fastdup may create hundreds or thousands of immutable Containers per
 minute. At 1,000 Containers/minute, per-Container file and directory syncs alone
@@ -189,8 +193,8 @@ Root sync callers form bounded cohorts. Once a root-sync request reaches the
 worker it admits already queued callers for a short bounded interval, submits
 one directory fsync, and releases exactly that captured cohort after its CQE.
 Renames arriving after the cut cannot be acknowledged by that barrier and must
-join a later cohort. The adapter falls back to `FsStorageIo` when ring setup is
-unavailable and exposes the selected mode and reason in mount telemetry.
+join a later cohort. This ADR originally allowed fallback to `FsStorageIo` when
+ring setup was unavailable; ADR 0058 removes that fallback.
 
 The implementation therefore satisfies these previously recorded gates:
 
@@ -204,8 +208,7 @@ The implementation therefore satisfies these previously recorded gates:
   completed Containers without acknowledging a later racing rename;
 - surface the first real CQE error and treat dependent cancellations as one
   failed, retryable immutable publication;
-- fall back to the synchronous backend when setup or required opcodes are
-  unavailable; and
+- report setup or required-opcode failure without weakening durability; and
 - pass the existing fail-before/fail-after crash matrix with the same
   absent-or-complete recovery oracle before becoming the default.
 
@@ -213,7 +216,7 @@ The faultable `StorageIo` protocol is unchanged, so the existing exhaustive
 fail-before/fail-after publication matrix remains the crash oracle. Actual-ring
 tests additionally reopen and verify published Containers, exercise many
 parallel publishers through one bounded ring, validate root-sync coalescing,
-and validate synchronous fallback. A power-cut-capable XFS harness remains a
+and validate setup failure. A power-cut-capable XFS harness remains a
 separate hardware validation gate; process restart cannot emulate loss of an
 unsynced directory entry.
 
@@ -228,12 +231,11 @@ fresh 50-by-63-MiB comparison, the pool reduced Ring wall time from the prior
 about 7% slower rather than 40% slower, retains the 1.51-GiB measured RSS peak,
 and exercised four verifier workers concurrently. Host Swap and `pswpout`
 remained unchanged at zero. The 128-KiB workload stays inline; the latest
-interleaved run still leaves Ring materially slower, so it is not the default.
+interleaved run still leaves Ring materially slower.
 
-Consequently the daemon still defaults to the synchronous data tier.
-`FASTDUP_IO_URING=try` enables Ring with setup fallback;
-`FASTDUP_IO_URING=required` makes setup failure fatal. The benchmark and exact
-measurements are recorded in
+The prototype daemon initially defaulted to Ring with setup fallback so the
+active publisher received end-to-end workload coverage. ADR 0058 later made
+Ring mandatory. The benchmark and exact measurements are recorded in
 [the Container publisher benchmark](../benchmarks/io-uring-container-publisher.md).
 
 No io_uring operation is inserted between CPU-only reduction stages, and the
@@ -264,8 +266,6 @@ to protect durability latency and can later become a NUMA-local proportional
 shrink only if RSS and tail-latency measurements justify the extra state.
 
 `io_uring` is an XFS publisher optimization, not a new crash protocol. High
-Container fan-out is its intended workload. The owned adapter meets its memory
-and correctness gates and approaches the large-Container throughput gate, but
-does not beat the synchronous baseline yet. Administrative ring
-disablement, setup failure, or the default benchmark policy selects the
-synchronous backend rather than weakening durability.
+Container fan-out is its intended workload. The original owned adapter met its
+memory and correctness gates but did not beat the synchronous baseline. ADR
+0058 replaces its batch worker and makes ring capability a startup requirement.

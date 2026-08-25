@@ -97,6 +97,25 @@ fn reservation_root(inode_reservation_end: u64) -> NamespaceRoot {
         .expect("empty reservation generation is valid")
 }
 
+fn nested_directory_root() -> NamespaceRoot {
+    NamespaceRoot::new(
+        1_024,
+        4,
+        2,
+        vec![
+            DurableInode::new_directory(2, 0o750, 1_000, 1_001, 3, 1)
+                .expect("parent directory is valid"),
+            DurableInode::new_directory(3, 0o700, 1_000, 1_001, 2, 1)
+                .expect("child directory is valid"),
+        ],
+        vec![
+            NamespaceEntry::new(1, 2, b"parent".to_vec()).expect("root entry is valid"),
+            NamespaceEntry::new(2, 3, b"child".to_vec()).expect("nested entry is valid"),
+        ],
+    )
+    .expect("nested directory root is valid")
+}
+
 fn bootstrap_inode_reservation(repository: &GenerationRepository<MemoryStorageIo>) {
     let record = repository
         .commit_namespace(&reservation_root(1_024))
@@ -335,6 +354,50 @@ fn every_generation_two_failpoint_recovers_only_the_previous_or_complete_next_ro
             expected,
             "fail-after position {relative_position} exposed a mixed generation"
         );
+    }
+}
+
+#[test]
+fn every_nested_directory_failpoint_recovers_only_the_reservation_or_complete_tree() {
+    let policy = PolicySetId::new([0x7B; 32]).expect("policy identity is nonzero");
+    let old_root = reservation_root(1_024);
+    let new_root = nested_directory_root();
+    let probe_storage = MemoryStorageIo::new();
+    let probe = GenerationRepository::new(probe_storage.clone(), policy);
+    bootstrap_inode_reservation(&probe);
+    let baseline = probe_storage.operation_count();
+    probe
+        .commit_namespace(&new_root)
+        .expect("nested directory probe commits");
+    let operations = probe_storage.operations()[baseline..].to_vec();
+    assert_eq!(operations.last(), Some(&StorageOperation::SyncFile));
+
+    for relative in 0..operations.len() {
+        for fail_after in [false, true] {
+            let storage = if fail_after {
+                MemoryStorageIo::with_fail_after(baseline + relative)
+            } else {
+                MemoryStorageIo::with_fail_before(baseline + relative)
+            };
+            let repository = GenerationRepository::new(storage.clone(), policy);
+            bootstrap_inode_reservation(&repository);
+            assert!(repository.commit_namespace(&new_root).is_err());
+            storage.crash();
+            let recovered = GenerationRepository::new(storage, policy)
+                .recover_latest()
+                .expect("one whole directory generation recovers")
+                .expect("reservation generation remains committed");
+            let expected = if fail_after && relative + 1 == operations.len() {
+                &new_root
+            } else {
+                &old_root
+            };
+            assert_eq!(
+                recovered.namespace_root(),
+                expected,
+                "directory failpoint relative={relative} after={fail_after} exposed a mixed tree"
+            );
+        }
     }
 }
 

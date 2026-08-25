@@ -8,6 +8,7 @@ members = [
     "crates/fastdup-posix",
     "crates/fastdup-store",
     "crates/fastdup-testkit",
+    "vendor/fuse3",
 ]
 
 [workspace.package]
@@ -24,7 +25,7 @@ fastdup-format = { path = "crates/fastdup-format" }
 fastdup-posix = { path = "crates/fastdup-posix" }
 fastdup-store = { path = "crates/fastdup-store" }
 fastcdc = "4.0.1"
-fuse3 = { version = "=0.9.0", features = ["tokio-runtime"] }
+fuse3 = { version = "=0.9.0", features = ["file-lock", "tokio-runtime"] }
 futures-util = "0.3.32"
 hashbrown = "0.17.1"
 libc = "0.2.183"

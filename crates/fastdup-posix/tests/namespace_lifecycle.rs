@@ -1146,3 +1146,177 @@ fn directory_pages_are_bounded_without_skipping_static_entries() {
     }
     assert_eq!(observed, expected);
 }
+
+#[test]
+fn nested_directories_track_dotdot_links_and_empty_removal() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let Reply::Entry(parent) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Mkdir {
+                parent: ROOT_INODE,
+                name: b"parent",
+                mode: 0o750,
+            },
+        )
+        .expect("parent directory is created")
+    else {
+        panic!("mkdir returned the wrong reply");
+    };
+    let Reply::Entry(child) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Mkdir {
+                parent: parent.attr.inode,
+                name: b"child",
+                mode: 0o700,
+            },
+        )
+        .expect("nested directory is created")
+    else {
+        panic!("nested mkdir returned the wrong reply");
+    };
+    assert_eq!(parent.attr.kind, fastdup_posix::FileKind::Directory);
+    assert_eq!(child.attr.kind, fastdup_posix::FileKind::Directory);
+
+    let Reply::Attr(root_attr) = namespace
+        .dispatch(CALLER, Operation::GetAttr { inode: ROOT_INODE })
+        .expect("root attributes remain readable")
+    else {
+        panic!("getattr returned the wrong reply");
+    };
+    let Reply::Attr(parent_attr) = namespace
+        .dispatch(
+            CALLER,
+            Operation::GetAttr {
+                inode: parent.attr.inode,
+            },
+        )
+        .expect("parent attributes remain readable")
+    else {
+        panic!("getattr returned the wrong reply");
+    };
+    assert_eq!(root_attr.link_count, 3);
+    assert_eq!(parent_attr.link_count, 3);
+
+    let Reply::Directory(entries) = namespace
+        .dispatch(
+            CALLER,
+            Operation::ReadDirectory {
+                inode: child.attr.inode,
+                offset: 0,
+                acquire_lookup: false,
+            },
+        )
+        .expect("nested directory is listed")
+    else {
+        panic!("readdir returned the wrong reply");
+    };
+    assert_eq!(entries[0].name, b".");
+    assert_eq!(entries[0].inode, child.attr.inode);
+    assert_eq!(entries[1].name, b"..");
+    assert_eq!(entries[1].inode, parent.attr.inode);
+
+    assert_eq!(
+        namespace.dispatch(
+            CALLER,
+            Operation::Rmdir {
+                parent: ROOT_INODE,
+                name: b"parent",
+            },
+        ),
+        Err(PosixError::NotEmpty)
+    );
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Rmdir {
+                parent: parent.attr.inode,
+                name: b"child",
+            },
+        )
+        .expect("empty child directory is removed");
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Rmdir {
+                parent: ROOT_INODE,
+                name: b"parent",
+            },
+        )
+        .expect("empty parent directory is removed");
+}
+
+#[test]
+fn directory_rename_moves_subtrees_and_rejects_cycles() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let mkdir = |parent, name: &'static [u8]| {
+        let Reply::Entry(entry) = namespace
+            .dispatch(
+                CALLER,
+                Operation::Mkdir {
+                    parent,
+                    name,
+                    mode: 0o755,
+                },
+            )
+            .expect("fixture directory is created")
+        else {
+            panic!("mkdir returned the wrong reply");
+        };
+        entry.attr.inode
+    };
+    let left = mkdir(ROOT_INODE, b"left");
+    let right = mkdir(ROOT_INODE, b"right");
+    let subtree = mkdir(left, b"subtree");
+    let leaf = mkdir(subtree, b"leaf");
+
+    assert_eq!(
+        namespace.dispatch(
+            CALLER,
+            Operation::Rename {
+                parent: ROOT_INODE,
+                name: b"left",
+                new_parent: leaf,
+                new_name: b"cycle",
+                no_replace: false,
+            },
+        ),
+        Err(PosixError::InvalidArgument)
+    );
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Rename {
+                parent: left,
+                name: b"subtree",
+                new_parent: right,
+                new_name: b"moved",
+                no_replace: false,
+            },
+        )
+        .expect("directory subtree moves atomically");
+    assert_eq!(
+        namespace.dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: left,
+                name: b"subtree",
+            },
+        ),
+        Err(PosixError::NoEntry)
+    );
+    let Reply::Entry(moved) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: right,
+                name: b"moved",
+            },
+        )
+        .expect("moved directory is visible under its new parent")
+    else {
+        panic!("lookup returned the wrong reply");
+    };
+    assert_eq!(moved.attr.inode, subtree);
+}

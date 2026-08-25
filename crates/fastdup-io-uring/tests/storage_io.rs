@@ -1,20 +1,48 @@
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use fastdup_format::ContainerId;
-use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo, IoUringStorageMode};
+use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo};
 use fastdup_store::{ContainerRepository, StorageIo};
 
 #[test]
-fn default_verifier_pool_uses_the_effective_cpu_quota() {
-    let available =
-        std::thread::available_parallelism().expect("test host exposes at least one effective CPU");
-
-    assert_eq!(
-        IoUringStorageConfig::default().verifier_workers(),
-        available,
-        "the verifier pool must not leave effective CPUs idle behind an arbitrary cap"
+fn ring_setup_failure_is_returned_instead_of_selecting_another_adapter() {
+    let root = test_root("required-ring");
+    let config = IoUringStorageConfig::new(
+        NonZeroU32::MIN,
+        NonZeroU64::new(1_024 * 1_024).expect("literal is nonzero"),
     );
+
+    let error = IoUringStorageIo::open(&root, config)
+        .expect_err("a ring too small for the wake entry must fail setup");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn dropping_the_last_adapter_stops_the_ring_worker() {
+    let root = test_root("worker-shutdown");
+    let (finished, completion) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn({
+        let root = root.clone();
+        move || {
+            let storage = IoUringStorageIo::open(&root, IoUringStorageConfig::default())
+                .expect("active io_uring backend");
+            storage
+                .sync_root()
+                .expect("exercise the ring before shutdown");
+            drop(storage);
+            finished.send(()).expect("report completed shutdown");
+        }
+    });
+
+    completion
+        .recv_timeout(Duration::from_secs(2))
+        .expect("dropping the adapter must not lose its shutdown wakeup");
+    worker.join().expect("shutdown worker did not panic");
+    std::fs::remove_dir_all(root).expect("remove test root");
 }
 
 #[test]
@@ -24,8 +52,7 @@ fn active_ring_publishes_and_recovers_one_byte_exact_container() {
         NonZeroU32::new(64).expect("literal is nonzero"),
         NonZeroU64::new(128 * 1_024 * 1_024).expect("literal is nonzero"),
     );
-    let storage = IoUringStorageIo::open_required(&root, config).expect("active io_uring backend");
-    assert_eq!(storage.status().mode(), IoUringStorageMode::Active);
+    let storage = IoUringStorageIo::open(&root, config).expect("active io_uring backend");
 
     let repository = ContainerRepository::new(storage.clone());
     let id = ContainerId::new([0x91; 16]).expect("nonzero Container ID");
@@ -37,7 +64,7 @@ fn active_ring_publishes_and_recovers_one_byte_exact_container() {
 
     drop(repository);
     let reopened = ContainerRepository::new(
-        IoUringStorageIo::open_required(&root, config).expect("reopen active backend"),
+        IoUringStorageIo::open(&root, config).expect("reopen active backend"),
     );
     let recovered = reopened.read(id).expect("published container recovers");
     assert_eq!(recovered.chunk_count(), 2);
@@ -58,7 +85,7 @@ fn concurrent_root_sync_callers_share_only_completed_cohorts() {
     const CALLERS: usize = 32;
     let root = test_root("root-sync-cohort");
     let storage = Arc::new(
-        IoUringStorageIo::open_required(&root, IoUringStorageConfig::default())
+        IoUringStorageIo::open(&root, IoUringStorageConfig::default())
             .expect("active io_uring backend"),
     );
     let barrier = Arc::new(Barrier::new(CALLERS));
@@ -93,7 +120,7 @@ fn oversized_request_is_rejected_before_it_can_exceed_the_byte_budget() {
         NonZeroU32::new(8).expect("literal is nonzero"),
         NonZeroU64::new(1_024).expect("literal is nonzero"),
     );
-    let storage = IoUringStorageIo::open_required(&root, config).expect("active io_uring backend");
+    let storage = IoUringStorageIo::open(&root, config).expect("active io_uring backend");
     storage.create_new("bounded").expect("create fixture");
 
     let error = storage
@@ -110,58 +137,6 @@ fn oversized_request_is_rejected_before_it_can_exceed_the_byte_budget() {
 }
 
 #[test]
-fn unavailable_ring_falls_back_without_changing_storage_semantics() {
-    let root = test_root("fallback");
-    let config = IoUringStorageConfig::new(
-        NonZeroU32::MAX,
-        NonZeroU64::new(1_024 * 1_024).expect("literal is nonzero"),
-    );
-    let storage = IoUringStorageIo::open_or_fallback(&root, config).expect("fallback opens root");
-    assert_eq!(storage.status().mode(), IoUringStorageMode::SyncFallback);
-    assert!(storage.status().fallback_reason().is_some());
-
-    storage
-        .create_new("fallback")
-        .expect("create through fallback");
-    storage
-        .write_at("fallback", 0, b"byte-exact")
-        .expect("write through fallback");
-    storage
-        .sync_file("fallback")
-        .expect("sync through fallback");
-    assert_eq!(
-        storage.read("fallback").expect("read through fallback"),
-        b"byte-exact"
-    );
-
-    drop(storage);
-    std::fs::remove_dir_all(root).expect("remove test root");
-}
-
-#[test]
-fn synchronous_policy_is_distinct_from_kernel_fallback() {
-    let root = test_root("synchronous-policy");
-    let storage = IoUringStorageIo::open_synchronous(&root, IoUringStorageConfig::default())
-        .expect("synchronous policy opens root");
-    assert_eq!(storage.status().mode(), IoUringStorageMode::Synchronous);
-    assert_eq!(storage.status().fallback_reason(), None);
-
-    storage.create_new("policy").expect("create through policy");
-    storage
-        .write_at("policy", 0, b"sync-policy")
-        .expect("write through policy");
-    storage.sync_file("policy").expect("sync through policy");
-    assert_eq!(
-        storage.read("policy").expect("read through policy"),
-        b"sync-policy"
-    );
-    assert_eq!(storage.status().submitted_operations(), 0);
-
-    drop(storage);
-    std::fs::remove_dir_all(root).expect("remove test root");
-}
-
-#[test]
 fn many_independent_container_publishers_share_one_bounded_ring() {
     const PUBLISHERS: usize = 32;
     let root = test_root("many-publishers");
@@ -169,7 +144,7 @@ fn many_independent_container_publishers_share_one_bounded_ring() {
         NonZeroU32::new(64).expect("literal is nonzero"),
         NonZeroU64::new(1_024 * 1_024).expect("literal is nonzero"),
     );
-    let storage = IoUringStorageIo::open_required(&root, config).expect("active io_uring backend");
+    let storage = IoUringStorageIo::open(&root, config).expect("active io_uring backend");
     let barrier = Arc::new(Barrier::new(PUBLISHERS));
     let mut publishers = Vec::new();
     for ordinal in 0..PUBLISHERS {
@@ -216,7 +191,7 @@ fn many_independent_container_publishers_share_one_bounded_ring() {
 #[test]
 fn prepared_container_transfers_owned_image_once_into_the_ring_publisher() {
     let root = test_root("owned-publication");
-    let storage = IoUringStorageIo::open_required(&root, IoUringStorageConfig::default())
+    let storage = IoUringStorageIo::open(&root, IoUringStorageConfig::default())
         .expect("active io_uring backend");
     let repository = ContainerRepository::new(storage.clone());
     let id = ContainerId::new([0xB7; 16]).expect("nonzero Container ID");
@@ -246,8 +221,6 @@ fn prepared_container_transfers_owned_image_once_into_the_ring_publisher() {
     assert_eq!(status.owned_publications_started(), 1);
     assert_eq!(status.owned_publications_completed(), 1);
     assert_eq!(status.borrowed_write_copy_bytes(), 0);
-    assert_eq!(status.verification_jobs_started(), 0);
-    assert_eq!(status.peak_active_verifications(), 0);
     assert_eq!(status.peak_inflight_bytes(), metrics.file_bytes());
     assert_eq!(status.inflight_bytes(), 0);
 
@@ -257,9 +230,9 @@ fn prepared_container_transfers_owned_image_once_into_the_ring_publisher() {
 }
 
 #[test]
-fn one_large_publication_uses_parallel_container_hash_verification() {
-    let root = test_root("parallel-container-hash");
-    let storage = IoUringStorageIo::open_required(&root, IoUringStorageConfig::default())
+fn one_large_publication_uses_writer_evidence_without_a_second_verification() {
+    let root = test_root("exact-writer-image-proof");
+    let storage = IoUringStorageIo::open(&root, IoUringStorageConfig::default())
         .expect("active io_uring backend");
     let repository = ContainerRepository::new(storage.clone());
     let payload = pseudorandom_bytes(8 * 1_024 * 1_024, 0x87ad_190e_44bc_f217);
@@ -278,10 +251,7 @@ fn one_large_publication_uses_parallel_container_hash_verification() {
         .expect("publish and verify large fixture Container");
 
     let status = storage.status();
-    assert_eq!(status.parallel_hash_verifications(), 1);
-    assert_eq!(status.verification_jobs_started(), 1);
-    assert_eq!(status.verification_jobs_completed(), 1);
-    assert_eq!(status.verification_jobs_failed(), 0);
+    assert_eq!(status.inflight_bytes(), 0);
 
     drop(repository);
     drop(storage);
@@ -295,7 +265,7 @@ fn owned_publication_rejected_by_budget_creates_no_temporary_name() {
         NonZeroU32::new(8).expect("literal is nonzero"),
         NonZeroU64::new(1_024).expect("literal is nonzero"),
     );
-    let storage = IoUringStorageIo::open_required(&root, config).expect("active io_uring backend");
+    let storage = IoUringStorageIo::open(&root, config).expect("active io_uring backend");
     let id = ContainerId::new([0xC1; 16]).expect("nonzero Container ID");
     let error = ContainerRepository::new(storage.clone())
         .publish_raw(id, 23, &[b"larger-than-the-ring-publication-budget"])
@@ -317,17 +287,15 @@ fn owned_publication_rejected_by_budget_creates_no_temporary_name() {
 }
 
 #[test]
-fn prepared_publications_verify_on_the_bounded_cpu_pool() {
+fn prepared_publications_do_not_repeat_encoder_work_on_a_cpu_pool() {
     const PUBLISHERS: usize = 8;
     const PAYLOAD_BYTES: usize = 8 * 1_024 * 1_024;
     let root = test_root("parallel-verifier-pool");
-    let verifier_workers = NonZeroUsize::new(4).expect("literal is nonzero");
     let config = IoUringStorageConfig::new(
         NonZeroU32::new(64).expect("literal is nonzero"),
         NonZeroU64::new(128 * 1_024 * 1_024).expect("literal is nonzero"),
-    )
-    .with_verifier_workers(verifier_workers);
-    let storage = IoUringStorageIo::open_required(&root, config).expect("active io_uring backend");
+    );
+    let storage = IoUringStorageIo::open(&root, config).expect("active io_uring backend");
     let barrier = Arc::new(Barrier::new(PUBLISHERS));
     let mut publishers = Vec::with_capacity(PUBLISHERS);
     for ordinal in 0..PUBLISHERS {
@@ -367,15 +335,48 @@ fn prepared_publications_verify_on_the_bounded_cpu_pool() {
     }
 
     let status = storage.status();
-    assert_eq!(status.verifier_workers(), verifier_workers.get());
-    assert_eq!(status.verification_jobs_started(), PUBLISHERS as u64);
-    assert_eq!(status.verification_jobs_completed(), PUBLISHERS as u64);
-    assert_eq!(status.verification_jobs_failed(), 0);
-    assert!(status.peak_active_verifications() >= 2);
-    assert!(status.peak_active_verifications() <= verifier_workers.get() as u64);
-    assert_eq!(status.active_verifications(), 0);
     assert_eq!(status.inflight_bytes(), 0);
 
+    drop(storage);
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn root_sync_progresses_while_container_publication_is_running() {
+    const PAYLOAD_BYTES: usize = 63 * 1_024 * 1_024;
+    let root = test_root("root-sync-during-verification");
+    let config = IoUringStorageConfig::new(
+        NonZeroU32::new(32).expect("literal is nonzero"),
+        NonZeroU64::new(128 * 1_024 * 1_024).expect("literal is nonzero"),
+    );
+    let storage = IoUringStorageIo::open(&root, config).expect("active io_uring backend");
+    let publisher_storage = storage.clone();
+    let publisher = std::thread::spawn(move || {
+        let payload = pseudorandom_bytes(PAYLOAD_BYTES, 0x100);
+        let chunks = payload.chunks(256 * 1_024).collect::<Vec<_>>();
+        let regions = chunks.chunks(2).collect::<Vec<_>>();
+        let prepared = ContainerRepository::<IoUringStorageIo>::prepare_adaptive_regions_parallel(
+            ContainerId::new([0xA4; 16]).expect("publisher ID is nonzero"),
+            0x100,
+            &regions,
+            NonZeroUsize::MIN,
+        )
+        .expect("prepare independent Container");
+        ContainerRepository::new(publisher_storage)
+            .publish_prepared_adaptive_profiled(prepared)
+            .expect("verified publication succeeds");
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while storage.status().owned_publications_started() == 0 {
+        assert!(Instant::now() < deadline, "publication did not start");
+        std::thread::yield_now();
+    }
+
+    storage
+        .sync_root()
+        .expect("independent root sync progresses through the active ring");
+    publisher.join().expect("publisher did not panic");
     drop(storage);
     std::fs::remove_dir_all(root).expect("remove test root");
 }

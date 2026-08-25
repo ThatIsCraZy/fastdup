@@ -6,7 +6,7 @@
 //! want to control the inode or do the path<->inode map on yourself, [`Filesystem`] is the only one
 //! choose.
 
-pub use filesystem::Filesystem;
+pub use filesystem::{Filesystem, OwnedRequestPayload};
 pub use request::Request;
 #[cfg(any(feature = "async-io-runtime", feature = "tokio-runtime"))]
 pub use session::{MountHandle, Session};

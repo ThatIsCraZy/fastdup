@@ -72,6 +72,22 @@ the bytes of large holes. DATA reads are bounded to the format-v1 maximum
 logical chunk length. Uniform allocated ranges become FILL, including
 `FILL(0)`; unallocated zero ranges remain HOLE.
 
+The durable daemon supplies production `statfs` values from the data and
+metadata backing filesystems. The client-visible total is physical data-tier
+capacity after a ten-percent operating reserve. Available blocks also subtract
+that reserve and fall to zero if the metadata tier reaches its own reserve.
+The daemon never applies the observed reduction ratio to these values. It
+refreshes the physical observation every five seconds outside the FUSE request
+path. Each `statfs` request reads only the cached snapshot, because Samba may
+ask for free space during an active write.
+
+Two paired environment variables provide a reporting-only override:
+`FASTDUP_STATFS_FAKE_CAPACITY_BYTES` and
+`FASTDUP_STATFS_FAKE_AVAILABLE_BYTES`. Both contain unsigned decimal bytes and
+must be set together with available not greater than capacity. The override
+does not weaken physical write admission, so a later write may still return
+`ENOSPC` before the presented capacity is consumed.
+
 The frozen commit cut exports sorted, coalesced DATA/HOLE change ranges. For a
 size-stable file, the durable planner expands those ranges to bounded 256-KiB
 cells and complete pre-existing DATA extents, replans only those ranges, and
@@ -471,12 +487,20 @@ bytes, maximum eviction steps, available RAM, and Swap use after checkpoints.
   Commit Record and stale proofs are rejected before dependency verification.
   Container-generation discovery separately retains one O(number of Containers)
   mount-time envelope scan until it receives its own durable high-water record.
-- The flat v1 Namespace Root and compatibility Manifest planner retain their
-  documented metadata size limits.
-- Links, nested directories, xattrs/ACLs, locks, allocation operations,
-  automatic GC, and Samba/Veeam conformance remain open. Atomic replacement
-  rename, bounded verified read caching, offline end-to-end scrub, and RoW
-  Exact-Index rebuild are implemented; the maintenance path is documented in
+- The bounded v2 Namespace Root stores regular and directory inode versions
+  plus nested byte-exact entries. `mkdir`, empty-only `rmdir`, `..`, link counts,
+  cycle rejection, cross-parent rename, recovery, and scrub share the same
+  namespace rules. The compatibility Manifest planner retains its documented
+  metadata size limits.
+- Hardlinks, symlinks, xattrs/ACLs, BSD `flock`, automatic GC, and broad
+  Samba/Veeam conformance remain open. Metadata-only allocate, punch, zero,
+  DATA/HOLE seek, collapse, and insert share the durable POSIX seam. The first
+  four reach a real FUSE mount; Linux FUSE rejects collapse/insert flags before
+  dispatching them to userspace. Volatile POSIX record
+  locks are connected through FUSE but intentionally do not enter the durable
+  namespace. Atomic replacement rename, bounded
+  verified read caching, offline end-to-end scrub, and RoW Exact-Index rebuild
+  are implemented; the maintenance path is documented in
   [scrub and Exact-Index rebuild](../operations/scrub-and-exact-index-rebuild.md).
 - Commit-Log rotation is implemented through paired bounded slots. A bounded
   real-process `SIGKILL`/remount/deadline matrix is green. A durable Appliance

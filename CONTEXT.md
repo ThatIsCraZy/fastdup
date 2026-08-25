@@ -122,9 +122,11 @@ allocator recovery, but neither the payload hash nor any logical Chunk bytes.
 _Avoid_: Verified Container, verified Location
 
 **Container publication proof**:
-Evidence that one complete immutable Container reread passed its envelope,
-record, Recovery Index, logical Chunk identity, and Container-hash checks. It
-may authorize Locations without retaining decoded file bytes.
+Evidence carried from the Container writer through sampled durable publication,
+or produced later by a complete independent Container read. Writer evidence
+binds prior Chunk identities to the exact serialized Locations. Independent
+read, recovery, and scrub evidence additionally recomputes checksums and logical
+Chunk identities from stored bytes.
 _Avoid_: Read cache entry, Container envelope proof, Exact-Index hit
 
 **Manifest**:
@@ -154,10 +156,10 @@ IDs acknowledged inside a later lost durability window are skipped after crash
 rather than reused.
 _Avoid_: Next inode, handle range
 
-**Capacity reservation**:
-Committed worst-case physical capacity promised for later file writes, without
-claiming that logical zeroes or dedup savings have already consumed it.
-_Avoid_: File size, quota estimate
+**Thin allocation**:
+An allocated logical range represented by metadata, usually FILL(0), without a
+promise that physical capacity is reserved for a later write.
+_Avoid_: Capacity reservation, preallocation guarantee, file size
 
 **Namespace root**:
 The identity of the immutable directory and inode state selected by one commit

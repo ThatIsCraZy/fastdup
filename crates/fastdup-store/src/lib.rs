@@ -52,7 +52,9 @@ pub use reduction_filter::{
     BlockedBloomHint, BloomLookupHint, HintStructureError, PerWorkerLocationHintCache,
     UnverifiedLocationHint,
 };
-pub use seqcdc::{SeqCdcConfig, seqcdc_cut, seqcdc_cut_scalar};
+pub use seqcdc::{
+    SeqCdcConfig, seqcdc_cut, seqcdc_cut_scalar, seqcdc_cut_segmented, seqcdc_cut_segmented_scalar,
+};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -67,14 +69,107 @@ use std::time::{Duration, Instant};
 use fastdup_format::{
     BuildingContainerHeader, ContainerId, ExactIndexEntry, ExactIndexLocation,
     ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
-    IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, PrehashedChunk, SealedContainer,
-    SealedContainerDescriptor, VerifiedContainerPublication,
+    IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, PrehashedAdaptiveRegion, PrehashedChunk,
+    PrehashedContiguousRegion, SealedContainer, SealedContainerDescriptor,
+    VerifiedContainerPublication,
 };
 use rayon::prelude::*;
 
 /// Hard allocation bound for one exact random read through [`StorageIo`].
 pub const MAX_STORAGE_RANGE_BYTES: usize = 1_024 * 1_024;
+/// Bytes read from each sampled Container region during owned publication.
+pub const PUBLICATION_SAMPLE_BYTES: usize = HEADER_BYTES;
 const MAINTENANCE_VERIFY_WINDOW_BYTES: u64 = 256 * 1_024 * 1_024;
+
+/// One exact range sampled from a just-written Container before publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicationSampleRange {
+    offset: u64,
+    length: usize,
+}
+
+impl PublicationSampleRange {
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn length(self) -> usize {
+        self.length
+    }
+}
+
+/// Returns the Header, aligned middle block, and Footer ranges sampled from an
+/// owned Container publication.
+///
+/// # Errors
+///
+/// Rejects an image too short to contain three distinct format blocks.
+pub fn publication_sample_ranges(
+    file_length: usize,
+) -> Result<[PublicationSampleRange; 3], StoreError> {
+    let footer_bytes = usize::try_from(FOOTER_BYTES)
+        .map_err(|_| StoreError::Format(FormatError::ArithmeticOverflow))?;
+    let minimum = PUBLICATION_SAMPLE_BYTES
+        .checked_mul(3)
+        .ok_or(StoreError::Format(FormatError::ArithmeticOverflow))?;
+    if file_length < minimum || footer_bytes != PUBLICATION_SAMPLE_BYTES {
+        return Err(StoreError::Format(FormatError::InvalidContainerLength(
+            file_length,
+        )));
+    }
+    let middle = (file_length / 2 / PUBLICATION_SAMPLE_BYTES) * PUBLICATION_SAMPLE_BYTES;
+    let footer = file_length
+        .checked_sub(footer_bytes)
+        .ok_or(StoreError::Format(FormatError::ArithmeticOverflow))?;
+    if middle < PUBLICATION_SAMPLE_BYTES
+        || middle
+            .checked_add(PUBLICATION_SAMPLE_BYTES)
+            .is_none_or(|end| end > footer)
+    {
+        return Err(StoreError::Format(FormatError::InvalidContainerLength(
+            file_length,
+        )));
+    }
+    Ok([
+        PublicationSampleRange {
+            offset: 0,
+            length: PUBLICATION_SAMPLE_BYTES,
+        },
+        PublicationSampleRange {
+            offset: u64::try_from(middle)
+                .map_err(|_| StoreError::Format(FormatError::ArithmeticOverflow))?,
+            length: PUBLICATION_SAMPLE_BYTES,
+        },
+        PublicationSampleRange {
+            offset: u64::try_from(footer)
+                .map_err(|_| StoreError::Format(FormatError::ArithmeticOverflow))?,
+            length: footer_bytes,
+        },
+    ])
+}
+
+/// Compares one sampled storage range with the exact writer image.
+///
+/// # Errors
+///
+/// Returns a publication mismatch for a wrong range length or any changed byte.
+pub fn verify_publication_sample(
+    writer_image: &[u8],
+    range: PublicationSampleRange,
+    actual: &[u8],
+) -> Result<(), StoreError> {
+    let start = usize::try_from(range.offset)
+        .map_err(|_| StoreError::Format(FormatError::ArithmeticOverflow))?;
+    let end = start
+        .checked_add(range.length)
+        .ok_or(StoreError::Format(FormatError::ArithmeticOverflow))?;
+    if actual.len() != range.length || writer_image.get(start..end) != Some(actual) {
+        return Err(StoreError::PublishVerificationMismatch);
+    }
+    Ok(())
+}
 
 /// Process-cost and byte-accounting evidence for one adaptive Container
 /// publication.
@@ -97,14 +192,15 @@ pub struct AdaptiveContainerPublishMetrics {
 
 /// Opaque encoded Container image awaiting ordered durable publication.
 ///
-/// Construction performs the CPU-heavy adaptive region encoding. Publication
-/// consumes this proof and still rereads the complete object before returning
-/// verified Locations.
+/// Construction performs the CPU-heavy adaptive region encoding and retains
+/// its Location evidence. Publication samples the stored Header, midpoint
+/// block, and Footer before returning that evidence.
 #[derive(Clone, Debug)]
 pub struct PreparedAdaptiveContainer {
     container_id: ContainerId,
     container_generation: u64,
     sealed: Vec<u8>,
+    publication: VerifiedContainerPublication,
     encode_wall: Duration,
     encode_process_cpu: Duration,
     incompressibility_gate: IncompressibilityGateMetrics,
@@ -346,7 +442,7 @@ impl PublishedContainerSummary {
 ///
 /// The adapter owns every buffer until publication either fails or the root
 /// directory sync makes the no-replace name durable. Implementations must
-/// preserve the Building -> Body -> Sealed -> reread/VERIFY -> file sync ->
+/// preserve the Building -> Body -> Sealed -> sampled VERIFY -> file sync ->
 /// rename -> root sync order encoded by [`StorageIo::publish_owned_container`].
 #[derive(Debug)]
 pub struct OwnedContainerPublication {
@@ -354,6 +450,7 @@ pub struct OwnedContainerPublication {
     container_generation: u64,
     building_header: Box<[u8; HEADER_BYTES]>,
     sealed: Vec<u8>,
+    publication: VerifiedContainerPublication,
     temporary_name: String,
     published_name: String,
 }
@@ -393,6 +490,7 @@ impl OwnedContainerPublication {
         u64,
         Box<[u8; HEADER_BYTES]>,
         Vec<u8>,
+        VerifiedContainerPublication,
         String,
         String,
     ) {
@@ -401,6 +499,7 @@ impl OwnedContainerPublication {
             self.container_generation,
             self.building_header,
             self.sealed,
+            self.publication,
             self.temporary_name,
             self.published_name,
         )
@@ -560,8 +659,13 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_generation: u64,
         chunks: &[&[u8]],
     ) -> Result<(), StoreError> {
-        let sealed = SealedContainer::encode(container_id, container_generation, chunks)?;
-        self.publish_sealed(container_id, container_generation, sealed)
+        let encoded = SealedContainer::encode_with_writer_evidence(
+            container_id,
+            container_generation,
+            chunks,
+        )?;
+        let (sealed, publication) = encoded.into_publication_parts();
+        self.publish_sealed(container_id, container_generation, sealed, publication)
             .map(drop)
     }
 
@@ -583,14 +687,19 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_generation: u64,
         regions: &[&[&[u8]]],
     ) -> Result<(), StoreError> {
-        let sealed =
-            SealedContainer::encode_adaptive_regions(container_id, container_generation, regions)?;
-        self.publish_sealed(container_id, container_generation, sealed)
+        let encoded = SealedContainer::encode_adaptive_regions_parallel_profiled(
+            container_id,
+            container_generation,
+            regions,
+            NonZeroUsize::MIN,
+        )?;
+        let (sealed, publication) = encoded.into_publication_parts();
+        self.publish_sealed(container_id, container_generation, sealed, publication)
             .map(drop)
     }
 
-    /// Publishes adaptive RAW/Zstd regions and returns the complete verified
-    /// Container evidence from the mandatory writer reread.
+    /// Publishes adaptive RAW/Zstd regions and returns writer-produced Location
+    /// evidence paired with the mandatory storage samples.
     ///
     /// This avoids decoding the just-published object a second time when a
     /// checkpoint constructs an Exact-Index level-zero Run.
@@ -613,8 +722,8 @@ impl<I: StorageIo> ContainerRepository<I> {
         )
     }
 
-    /// Publishes adaptive regions encoded by the bounded permanent worker pool and
-    /// returns the mandatory complete writer-reread proof.
+    /// Publishes adaptive regions encoded by the bounded permanent worker pool
+    /// and returns writer-produced Location evidence after storage sampling.
     ///
     /// # Errors
     ///
@@ -662,7 +771,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     }
 
     /// Publishes adaptive regions while measuring encoding separately from
-    /// ordered durable publication and writer reread.
+    /// ordered durable publication and storage sampling.
     ///
     /// The returned Container remains the same complete verification evidence
     /// as [`Self::publish_adaptive_regions_parallel_verified`]. Metrics never
@@ -724,21 +833,25 @@ impl<I: StorageIo> ContainerRepository<I> {
         )?;
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
+        let incompressibility_gate = encoded.metrics();
+        let (sealed, publication) = encoded.into_publication_parts();
         Ok(PreparedAdaptiveContainer {
             container_id,
             container_generation,
-            incompressibility_gate: encoded.metrics(),
-            sealed: encoded.into_bytes(),
+            sealed,
+            publication,
             encode_wall,
             encode_process_cpu,
+            incompressibility_gate,
         })
     }
 
     /// Encodes adaptive Compression Regions while preserving Chunk identities
     /// already computed by the ingest stage.
     ///
-    /// The returned image remains non-authoritative. Publication rereads it and
-    /// recomputes every identity before the Container name can become visible.
+    /// Publication trusts these identities as prior writer work and samples
+    /// stored bytes before the Container name can become visible. Ordinary
+    /// reads, recovery, and scrub independently recompute them.
     ///
     /// # Errors
     ///
@@ -761,22 +874,99 @@ impl<I: StorageIo> ContainerRepository<I> {
             )?;
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
+        let incompressibility_gate = encoded.metrics();
+        let (sealed, publication) = encoded.into_publication_parts();
         Ok(PreparedAdaptiveContainer {
             container_id,
             container_generation,
-            incompressibility_gate: encoded.metrics(),
-            sealed: encoded.into_bytes(),
+            sealed,
+            publication,
             encode_wall,
             encode_process_cpu,
+            incompressibility_gate,
         })
     }
 
-    /// Durably publishes one prepared adaptive Container and returns mandatory
-    /// writer-reread evidence plus complete phase metrics.
+    /// Encodes prehashed regions that already own one contiguous decoded
+    /// buffer, avoiding another full input materialization before compression.
     ///
     /// # Errors
     ///
-    /// Returns publication I/O, durability, reread, or integrity failures.
+    /// Returns format, compression, allocation, or worker failures.
+    pub fn prepare_prehashed_contiguous_regions_parallel(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[PrehashedContiguousRegion<'_>],
+        workers: NonZeroUsize,
+    ) -> Result<PreparedAdaptiveContainer, StoreError> {
+        let encode_wall_started = Instant::now();
+        let encode_cpu_started = process_cpu_time();
+        let encoded =
+            SealedContainer::encode_prehashed_contiguous_regions_parallel_profiled_with_gate(
+                container_id,
+                container_generation,
+                regions,
+                workers,
+                IncompressibilityGatePolicy::Off,
+            )?;
+        let encode_wall = encode_wall_started.elapsed();
+        let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
+        let incompressibility_gate = encoded.metrics();
+        let (sealed, publication) = encoded.into_publication_parts();
+        Ok(PreparedAdaptiveContainer {
+            container_id,
+            container_generation,
+            sealed,
+            publication,
+            encode_wall,
+            encode_process_cpu,
+            incompressibility_gate,
+        })
+    }
+
+    /// Encodes an ordered mixture of borrowed and already-materialized
+    /// prehashed regions.
+    ///
+    /// # Errors
+    ///
+    /// Returns format, compression, allocation, or worker failures.
+    pub fn prepare_mixed_prehashed_adaptive_regions_parallel(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[PrehashedAdaptiveRegion<'_>],
+        workers: NonZeroUsize,
+    ) -> Result<PreparedAdaptiveContainer, StoreError> {
+        let encode_wall_started = Instant::now();
+        let encode_cpu_started = process_cpu_time();
+        let encoded =
+            SealedContainer::encode_mixed_prehashed_adaptive_regions_parallel_profiled_with_gate(
+                container_id,
+                container_generation,
+                regions,
+                workers,
+                IncompressibilityGatePolicy::Off,
+            )?;
+        let encode_wall = encode_wall_started.elapsed();
+        let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
+        let incompressibility_gate = encoded.metrics();
+        let (sealed, publication) = encoded.into_publication_parts();
+        Ok(PreparedAdaptiveContainer {
+            container_id,
+            container_generation,
+            sealed,
+            publication,
+            encode_wall,
+            encode_process_cpu,
+            incompressibility_gate,
+        })
+    }
+
+    /// Durably publishes one prepared adaptive Container and returns complete
+    /// writer-image evidence plus storage-sampling phase metrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns publication I/O, durability, sampling, or integrity failures.
     ///
     /// # Panics
     ///
@@ -796,6 +986,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             container_id,
             container_generation,
             sealed,
+            publication,
             encode_wall,
             encode_process_cpu,
             incompressibility_gate,
@@ -804,7 +995,8 @@ impl<I: StorageIo> ContainerRepository<I> {
             .expect("ASSERT: a format-v1 Container image length fits u64");
         let publish_wall_started = Instant::now();
         let publish_cpu_started = process_cpu_time();
-        let verified = self.publish_sealed(container_id, container_generation, sealed)?;
+        let verified =
+            self.publish_sealed(container_id, container_generation, sealed, publication)?;
         let publish_wall = publish_wall_started.elapsed();
         let publish_process_cpu = process_cpu_elapsed(publish_cpu_started);
         let logical_bytes = verified.logical_bytes();
@@ -827,6 +1019,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_id: ContainerId,
         container_generation: u64,
         sealed: Vec<u8>,
+        publication: VerifiedContainerPublication,
     ) -> Result<VerifiedContainerPublication, StoreError> {
         let building = BuildingContainerHeader::new(container_id, container_generation)?.encode();
         let temporary_name = temporary_name(container_id);
@@ -844,6 +1037,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                 container_generation,
                 building_header: Box::new(building),
                 sealed,
+                publication,
                 temporary_name,
                 published_name,
             })
@@ -1468,6 +1662,7 @@ fn publish_owned_container_synchronously<I: StorageIo + ?Sized>(
         container_generation,
         building_header,
         sealed,
+        verified,
         temporary_name,
         published_name,
     ) = publication.into_parts();
@@ -1491,11 +1686,14 @@ fn publish_owned_container_synchronously<I: StorageIo + ?Sized>(
     )?;
     storage.write_at(&temporary_name, 0, &sealed[..HEADER_BYTES])?;
     storage.set_len(&temporary_name, sealed_length)?;
-    let reread = storage.read(&temporary_name)?;
-    let verified =
-        SealedContainer::verify_publication_with_hash_workers(&reread, NonZeroUsize::MIN)?;
-    if reread != sealed
-        || verified.header().container_id() != container_id
+    if storage.object_len(&temporary_name)? != sealed_length {
+        return Err(StoreError::PublishVerificationMismatch);
+    }
+    for range in publication_sample_ranges(sealed.len())? {
+        let sample = storage.read_exact_at(&temporary_name, range.offset(), range.length())?;
+        verify_publication_sample(&sealed, range, &sample)?;
+    }
+    if verified.header().container_id() != container_id
         || verified.header().container_generation() != container_generation
     {
         return Err(StoreError::PublishVerificationMismatch);
@@ -1727,7 +1925,7 @@ impl fmt::Display for StoreError {
             Self::Io(error) => write!(formatter, "container I/O failed: {error}"),
             Self::Format(error) => write!(formatter, "container verification failed: {error}"),
             Self::PublishVerificationMismatch => formatter.write_str(
-                "writer reread returned valid bytes other than the intended sealed container",
+                "sampled storage bytes or publication identity differ from the intended sealed container",
             ),
             Self::InvalidPublishedName(name) => {
                 write!(formatter, "invalid published container name {name:?}")

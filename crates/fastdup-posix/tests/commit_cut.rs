@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -40,6 +41,56 @@ impl CommittedFile for BytesFile {
             .saturating_add(usize::try_from(length).expect("ASSERT: u32 fits usize"))
             .min(self.0.len());
         Ok(self.0[start..end].to_vec())
+    }
+}
+
+#[derive(Debug)]
+struct SegmentedIdentityFile {
+    bytes: Vec<u8>,
+    contiguous_checks: AtomicUsize,
+    segmented_checks: AtomicUsize,
+}
+
+impl CommittedFile for SegmentedIdentityFile {
+    fn logical_size(&self) -> u64 {
+        u64::try_from(self.bytes.len()).expect("ASSERT: fixture length fits u64")
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.logical_size()
+    }
+
+    fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, PosixError> {
+        let end = offset.saturating_add(length).min(self.logical_size());
+        Ok(end.saturating_sub(offset.min(end)))
+    }
+
+    fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+        let start = usize::try_from(offset).map_err(|_| PosixError::FileTooLarge)?;
+        let end = start
+            .saturating_add(usize::try_from(length).expect("ASSERT: u32 fits usize"))
+            .min(self.bytes.len());
+        Ok(self.bytes.get(start..end).unwrap_or_default().to_vec())
+    }
+
+    fn matches_complete_bytes(&self, candidate: &[u8]) -> Result<bool, PosixError> {
+        self.contiguous_checks.fetch_add(1, Ordering::Relaxed);
+        Ok(candidate == self.bytes)
+    }
+
+    fn matches_complete_segments(&self, segments: &[&[u8]]) -> Result<bool, PosixError> {
+        self.segmented_checks.fetch_add(1, Ordering::Relaxed);
+        let mut expected = self.bytes.as_slice();
+        for segment in segments {
+            let Some(prefix) = expected.get(..segment.len()) else {
+                return Ok(false);
+            };
+            if *segment != prefix {
+                return Ok(false);
+            }
+            expected = &expected[segment.len()..];
+        }
+        Ok(expected.is_empty())
     }
 }
 
@@ -132,6 +183,115 @@ fn mutation_observer_owns_accepted_bytes_after_write_returns() {
         .expect("ASSERT: fixture payload lock poisoned");
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].as_bytes(), b"observer-retains-these-bytes");
+}
+
+#[test]
+fn externalization_trusts_adjacent_resident_payload_provenance_without_rehashing() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let Reply::Created { entry, handle } = create(&namespace, b"segmented-externalization") else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+    let inode = entry.attr.inode;
+    for (offset, data) in [(0, b"abcd".as_slice()), (4, b"efgh".as_slice())] {
+        namespace
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset,
+                    data,
+                },
+            )
+            .expect("write one resident segment");
+    }
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 8);
+
+    let source = Arc::new(SegmentedIdentityFile {
+        bytes: b"abcdefgh".to_vec(),
+        contiguous_checks: AtomicUsize::new(0),
+        segmented_checks: AtomicUsize::new(0),
+    });
+    namespace.externalize_verified_extents(vec![
+        ExternalizedExtent::new(inode, 0, 2, source.clone()).expect("construct verified extent"),
+    ]);
+
+    assert_eq!(source.segmented_checks.load(Ordering::Relaxed), 0);
+    assert_eq!(source.contiguous_checks.load(Ordering::Relaxed), 0);
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 0);
+    assert_eq!(read_all(&namespace, inode, handle), b"abcdefgh");
+}
+
+#[test]
+fn externalization_rejects_a_range_changed_after_its_publication_sequence() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let Reply::Created { entry, handle } = create(&namespace, b"stale-externalization") else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+    let inode = entry.attr.inode;
+    for (offset, data) in [(0, b"abcdefgh".as_slice()), (2, b"ZZ".as_slice())] {
+        namespace
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset,
+                    data,
+                },
+            )
+            .expect("write fixture extent");
+    }
+    let source = Arc::new(SegmentedIdentityFile {
+        bytes: b"abcdefgh".to_vec(),
+        contiguous_checks: AtomicUsize::new(0),
+        segmented_checks: AtomicUsize::new(0),
+    });
+
+    namespace.externalize_verified_extents(vec![
+        ExternalizedExtent::new(inode, 0, 1, source.clone()).expect("construct stale extent"),
+    ]);
+
+    assert_eq!(source.segmented_checks.load(Ordering::Relaxed), 0);
+    assert_eq!(source.contiguous_checks.load(Ordering::Relaxed), 0);
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 8);
+    assert_eq!(read_all(&namespace, inode, handle), b"abZZefgh");
+}
+
+#[test]
+fn externalization_ignores_later_mutations_outside_its_range() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let Reply::Created { entry, handle } = create(&namespace, b"range-externalization") else {
+        panic!("ASSERT: create returned the wrong reply variant");
+    };
+    let inode = entry.attr.inode;
+    for (offset, data) in [(0, b"abcdefgh".as_slice()), (8, b"ZZ".as_slice())] {
+        namespace
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset,
+                    data,
+                },
+            )
+            .expect("write fixture extent");
+    }
+    let source = Arc::new(SegmentedIdentityFile {
+        bytes: b"abcdefgh".to_vec(),
+        contiguous_checks: AtomicUsize::new(0),
+        segmented_checks: AtomicUsize::new(0),
+    });
+
+    namespace.externalize_verified_extents(vec![
+        ExternalizedExtent::new(inode, 0, 1, source.clone()).expect("construct current extent"),
+    ]);
+
+    assert_eq!(source.segmented_checks.load(Ordering::Relaxed), 0);
+    assert_eq!(source.contiguous_checks.load(Ordering::Relaxed), 0);
+    assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 2);
+    assert_eq!(read_all(&namespace, inode, handle), b"abcdefghZZ");
 }
 
 impl CommittedFile for BlockingAllocatedFile {

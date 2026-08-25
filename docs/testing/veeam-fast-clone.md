@@ -103,6 +103,12 @@ Duplicate Extents to `FICLONERANGE`, which cannot reach FUSE's
 `copy_file_range`. The `vfs_fastdup` adapter supplies that mapping and a fixed
 Integrity Information state.
 
+The FUSE mount now negotiates POSIX record locks and implements conflicting
+read/write byte ranges, blocking acquisition, partial unlock, and owner cleanup
+on close. Model, adapter, and two-process kernel tests are green. The remaining
+lock gate is an SMB protocol test against the target Samba build; `smbclient`
+does not exercise Windows byte-range locking without SMB POSIX extensions.
+
 Do not claim Veeam Fast Clone compatibility until a real SMB 3.1.1 Veeam trace,
 Samba protocol tests, alignment/error/lock cases, and Integrity FSCTL behavior
 are green. The module only advertises `FILE_SUPPORTS_BLOCK_REFCOUNTING` when

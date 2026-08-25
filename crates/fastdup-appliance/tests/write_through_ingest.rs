@@ -1,7 +1,7 @@
 use fastdup_appliance::{DurableNamespace, checkpoint_policy_set_v1, recover_mount};
 use fastdup_posix::{
-    HandleId, InodeId, Namespace, NamespaceConfig, OpenOptions, Operation, ROOT_INODE, Reply,
-    RequestContext,
+    HandleId, InodeId, MutationPayload, Namespace, NamespaceConfig, OpenOptions, Operation,
+    ROOT_INODE, Reply, RequestContext,
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, GenerationRepository, StorageIo,
@@ -138,11 +138,42 @@ fn one_stream_chunks_a_second_container_while_the_first_waits_for_durability() {
     assert_eq!(
         status.sealed_uncommitted_containers(),
         1,
-        "queued Containers must recheck newly published Exact locations before writing duplicate DATA"
+        "queued Containers must share in-flight Chunk publication instead of writing duplicate DATA"
     );
     assert!(
         status.buffered_bytes() <= 384 * 1_024 * 1_024,
         "detached publication work remains inside the process ingest budget: {status:?}"
+    );
+    assert!(
+        status.maximum_ingest_ring_slots() >= 2,
+        "a blocked Container publication must leave another SingleStream slot available: {status:?}"
+    );
+}
+
+#[test]
+fn one_stream_reaches_two_container_durability_barriers_in_parallel() {
+    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode, handle) = create_file(&appliance, b"same-inode-publication-window");
+    let mut block = fixture_block();
+    let writer_appliance = Arc::clone(&appliance);
+    let writer = std::thread::spawn(move || {
+        for ordinal in 0_u64..70 {
+            for byte in &mut block {
+                *byte = byte.wrapping_add(1);
+            }
+            write_one_mebibyte(&writer_appliance, inode, handle, ordinal, &block);
+        }
+    });
+
+    let two_publications_in_flight = paused.wait_until_reached_count(2, Duration::from_secs(5));
+    paused.resume();
+    writer.join().expect("writer thread completes");
+    fence_ingest(&appliance, inode, handle);
+
+    assert!(
+        two_publications_in_flight,
+        "one active inode must fill both bounded detached-Container publication slots"
     );
 }
 
@@ -162,6 +193,113 @@ fn one_stream_hashes_stable_chunk_batches_on_multiple_workers() {
     assert!(
         status.maximum_hash_workers() > 1,
         "one long stream must use multiple CPU workers for independent Chunk hashes: {status:?}"
+    );
+}
+
+#[test]
+fn sequential_writes_coalesce_up_to_four_mebibytes_before_sync() {
+    let appliance = open_appliance();
+    let (inode, handle) = create_file(&appliance, b"coalesced-ingest-batches");
+    let mut block = fixture_block();
+    for ordinal in 0_u64..8 {
+        block[0] = u8::try_from(ordinal).expect("fixture ordinal is bounded");
+        write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
+    }
+    fence_ingest(&appliance, inode, handle);
+
+    let status = appliance.write_through_status();
+    assert!(
+        status.ingest_batches() <= 4,
+        "eight sequential one-MiB writes must be coalesced despite the age bound: {status:?}"
+    );
+    assert_eq!(status.ingest_fragments(), 8);
+    assert_eq!(status.maximum_ingest_batch_bytes(), 4 * 1_024 * 1_024);
+    block[0] = 4;
+    assert_eq!(read_fixture(&appliance, inode, handle), block[..4_096]);
+}
+
+#[test]
+fn partial_ingest_batch_flushes_after_its_age_bound() {
+    let appliance = open_appliance();
+    let (inode, handle) = create_file(&appliance, b"aged-ingest-batch");
+    let block = fixture_block();
+    write_one_mebibyte(&appliance, inode, handle, 0, &block);
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    while appliance.write_through_status().ingest_batches() == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let status = appliance.write_through_status();
+    assert_eq!(
+        status.ingest_batches(),
+        1,
+        "an open partial batch must flush without waiting for a caller fence: {status:?}"
+    );
+    assert_eq!(status.maximum_ingest_batch_bytes(), 1_024 * 1_024);
+    fence_ingest(&appliance, inode, handle);
+}
+
+#[test]
+fn multiple_active_streams_restore_one_mebibyte_fragment_scheduling() {
+    let appliance = Arc::new(open_appliance());
+    let files = (0..4)
+        .map(|ordinal| create_file(&appliance, format!("adaptive-stream-{ordinal}").as_bytes()))
+        .collect::<Vec<_>>();
+    let payload = MutationPayload::from_owned_bytes(fixture_block());
+    let barrier = Arc::new(Barrier::new(files.len() + 1));
+    std::thread::scope(|scope| {
+        for &(inode, handle) in &files {
+            let appliance = Arc::clone(&appliance);
+            let payload = payload.clone();
+            let barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                appliance
+                    .namespace()
+                    .dispatch_owned_write(CALLER, inode, handle, 0, payload)
+                    .expect("admit one owned stream fragment");
+            });
+        }
+        barrier.wait();
+    });
+
+    let status = appliance.write_through_status();
+    assert_eq!(status.minimum_ingest_batch_target_bytes(), 1_024 * 1_024);
+    for (inode, handle) in files {
+        fence_ingest(&appliance, inode, handle);
+    }
+}
+
+#[test]
+fn releasing_the_competing_writer_restores_single_stream_coalescing() {
+    let appliance = open_appliance();
+    let (inode, handle) = create_file(&appliance, b"remaining-writer");
+    let (other_inode, other_handle) = create_file(&appliance, b"released-writer");
+    let block = fixture_block();
+    write_one_mebibyte(&appliance, inode, handle, 0, &block);
+    write_one_mebibyte(&appliance, other_inode, other_handle, 0, &block);
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Release {
+                inode: other_inode,
+                handle: other_handle,
+            },
+        )
+        .expect("release the competing writer");
+
+    for ordinal in 1_u64..=4 {
+        write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
+    }
+    fence_ingest(&appliance, inode, handle);
+    assert_eq!(
+        appliance
+            .write_through_status()
+            .maximum_ingest_batch_bytes(),
+        4 * 1_024 * 1_024
     );
 }
 
@@ -236,6 +374,52 @@ fn different_files_reach_container_durability_in_parallel() {
     assert!(
         both_reached_durability,
         "one blocked file must not retain the complete global encode budget during data-tier I/O"
+    );
+}
+
+#[test]
+fn identical_parallel_files_share_one_inflight_chunk_publication() {
+    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode_a, handle_a) = create_file(&appliance, b"singleflight-a");
+    let (inode_b, handle_b) = create_file(&appliance, b"singleflight-b");
+    let barrier = Arc::new(Barrier::new(2));
+
+    let first_appliance = Arc::clone(&appliance);
+    let first_barrier = Arc::clone(&barrier);
+    let writer_a = std::thread::spawn(move || {
+        first_barrier.wait();
+        write_fixture(&first_appliance, inode_a, handle_a)
+    });
+    let second_appliance = Arc::clone(&appliance);
+    let writer_b = std::thread::spawn(move || {
+        barrier.wait();
+        write_fixture(&second_appliance, inode_b, handle_b)
+    });
+
+    assert!(
+        paused.wait_until_reached_count(1, STORAGE_REACH_TIMEOUT),
+        "one identical stream must own the shared Container publication"
+    );
+    assert!(
+        !paused.wait_until_reached_count(2, Duration::from_millis(500)),
+        "the competing identical stream must await the first proof instead of publishing duplicate DATA"
+    );
+    paused.resume();
+    let expected_a = writer_a.join().expect("first identical writer completes");
+    let expected_b = writer_b.join().expect("second identical writer completes");
+    fence_ingest(&appliance, inode_a, handle_a);
+    fence_ingest(&appliance, inode_b, handle_b);
+
+    assert_eq!(expected_a, expected_b);
+    assert_eq!(read_fixture(&appliance, inode_a, handle_a), expected_a);
+    assert_eq!(read_fixture(&appliance, inode_b, handle_b), expected_b);
+    assert_eq!(
+        appliance
+            .write_through_status()
+            .sealed_uncommitted_containers(),
+        1,
+        "two concurrent identical streams must seal only one physical Container"
     );
 }
 
@@ -403,16 +587,28 @@ fn fixture_block() -> Vec<u8> {
         .collect()
 }
 
-fn write_fixture(appliance: &Appliance, inode: InodeId, handle: HandleId) -> Vec<u8> {
+fn write_fixture<M, C>(
+    appliance: &DurableNamespace<M, C>,
+    inode: InodeId,
+    handle: HandleId,
+) -> Vec<u8>
+where
+    M: Clone + Send + Sync + StorageIo + 'static,
+    C: Clone + Send + Sync + StorageIo + 'static,
+{
     write_salted_fixture(appliance, inode, handle, 0)
 }
 
-fn write_salted_fixture(
-    appliance: &Appliance,
+fn write_salted_fixture<M, C>(
+    appliance: &DurableNamespace<M, C>,
     inode: InodeId,
     handle: HandleId,
     salt: u8,
-) -> Vec<u8> {
+) -> Vec<u8>
+where
+    M: Clone + Send + Sync + StorageIo + 'static,
+    C: Clone + Send + Sync + StorageIo + 'static,
+{
     let mut block = fixture_block();
     for byte in &mut block {
         *byte = byte.wrapping_add(salt);

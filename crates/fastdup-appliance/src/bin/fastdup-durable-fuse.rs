@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use fastdup_appliance::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction, CheckpointPressure, DurableNamespace,
-    MUTATION_COMMIT_TARGET, ProfiledCheckpoint, checkpoint_action, checkpoint_policy_set_v1,
+    MUTATION_COMMIT_TARGET, ProfiledCheckpoint, STATFS_RESERVE_BASIS_POINTS, StatFsOverride,
+    TieredStatFsSource, checkpoint_action, checkpoint_policy_set_v1,
 };
 use fastdup_copy_metrics::copy_telemetry;
 use fastdup_format::{HEADER_BYTES, VerifiedContainerPublication};
@@ -15,7 +16,7 @@ use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo};
 use fastdup_posix::{FuseFilesystem, NamespaceConfig, volatile_mount_options};
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, FsStorageIo, GenerationRepository,
-    OwnedContainerPublication, StorageIo, StoreError,
+    OwnedContainerPublication, StorageIo, StoreError, publication_sample_ranges,
 };
 use fuse3::raw::Session;
 use tokio::task::JoinHandle;
@@ -48,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if metadata_root == container_root {
         return Err("metadata and container roots must be distinct".into());
     }
+    let statfs_override = statfs_override_from_environment()?;
 
     let policy = checkpoint_policy_set_v1();
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
@@ -59,22 +61,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &ExactIndexRunRepository::new(FsStorageIo::open(&metadata_root)?),
         INODE_RESERVATION_SPAN,
     )?);
-    let filesystem = FuseFilesystem::new(appliance.namespace_arc());
+    let filesystem =
+        configured_filesystem(&appliance, &container_root, &metadata_root, statfs_override)?;
     let session = Session::new(volatile_mount_options());
     let mount = session.mount(filesystem, &mount_path).await?;
-    eprintln!(
-        "fastdup durable checkpoint mount at {}; metadata+exact-index={}, containers={}, exact-index-runs={}, checkpoint-workers={}, dirty-checkpoint-bytes={}, exact-index-degraded={}",
-        mount_path.display(),
-        metadata_root.display(),
-        container_root.display(),
-        appliance.exact_index_run_count(),
-        appliance.checkpoint_worker_limit(),
-        CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1,
-        appliance.exact_index_degraded(),
+    emit_mount_state(
+        &appliance,
+        &mount_path,
+        &metadata_root,
+        &container_root,
+        &data_storage,
+        io_telemetry_enabled,
+        statfs_override,
     );
-    emit_io_telemetry_state(io_telemetry_enabled);
-    emit_io_uring_state(&data_storage);
-    emit_verified_read_cache(&appliance);
 
     let mut ticks = interval(SCHEDULER_RESOLUTION);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -134,21 +133,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_mount_state(
+    appliance: &FsAppliance,
+    mount_path: &std::path::Path,
+    metadata_root: &std::path::Path,
+    container_root: &std::path::Path,
+    data_storage: &TelemetryStorageIo,
+    io_telemetry_enabled: bool,
+    statfs_override: Option<StatFsOverride>,
+) {
+    eprintln!(
+        "fastdup durable checkpoint mount at {}; metadata+exact-index={}, containers={}, exact-index-runs={}, checkpoint-workers={}, dirty-checkpoint-bytes={}, exact-index-degraded={}",
+        mount_path.display(),
+        metadata_root.display(),
+        container_root.display(),
+        appliance.exact_index_run_count(),
+        appliance.checkpoint_worker_limit(),
+        CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1,
+        appliance.exact_index_degraded(),
+    );
+    emit_io_telemetry_state(io_telemetry_enabled);
+    emit_statfs_state(statfs_override);
+    emit_io_uring_state(data_storage);
+    emit_verified_read_cache(appliance);
+}
+
+fn configured_filesystem(
+    appliance: &FsAppliance,
+    container_root: &std::path::Path,
+    metadata_root: &std::path::Path,
+    capacity_override: Option<StatFsOverride>,
+) -> io::Result<FuseFilesystem> {
+    let source = TieredStatFsSource::open(container_root, metadata_root, capacity_override)?;
+    Ok(FuseFilesystem::new(appliance.namespace_arc()).with_statfs_source(Arc::new(source)))
+}
+
+fn statfs_override_from_environment() -> Result<Option<StatFsOverride>, Box<dyn std::error::Error>>
+{
+    const CAPACITY: &str = "FASTDUP_STATFS_FAKE_CAPACITY_BYTES";
+    const AVAILABLE: &str = "FASTDUP_STATFS_FAKE_AVAILABLE_BYTES";
+    let capacity = std::env::var_os(CAPACITY);
+    let available = std::env::var_os(AVAILABLE);
+    statfs_override_from_values(capacity.as_deref(), available.as_deref())
+}
+
+fn statfs_override_from_values(
+    capacity: Option<&std::ffi::OsStr>,
+    available: Option<&std::ffi::OsStr>,
+) -> Result<Option<StatFsOverride>, Box<dyn std::error::Error>> {
+    const CAPACITY: &str = "FASTDUP_STATFS_FAKE_CAPACITY_BYTES";
+    const AVAILABLE: &str = "FASTDUP_STATFS_FAKE_AVAILABLE_BYTES";
+    match (capacity, available) {
+        (None, None) => Ok(None),
+        (Some(capacity), Some(available)) => {
+            let capacity = parse_environment_bytes(CAPACITY, capacity)?;
+            let available = parse_environment_bytes(AVAILABLE, available)?;
+            Ok(Some(StatFsOverride::new(capacity, available)?))
+        }
+        _ => Err(format!("{CAPACITY} and {AVAILABLE} must be set together").into()),
+    }
+}
+
+fn parse_environment_bytes(
+    name: &str,
+    value: &std::ffi::OsStr,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{name} must contain decimal ASCII bytes"))?;
+    value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid {name}={value:?}: {error}").into())
+}
+
+fn emit_statfs_state(capacity_override: Option<StatFsOverride>) {
+    if let Some(capacity_override) = capacity_override {
+        eprintln!(
+            "statfs_capacity mode=fake capacity_bytes={} available_bytes={}",
+            capacity_override.capacity_bytes(),
+            capacity_override.available_bytes(),
+        );
+    } else {
+        eprintln!(
+            "statfs_capacity mode=physical reserve_basis_points={STATFS_RESERVE_BASIS_POINTS}"
+        );
+    }
+}
+
 fn open_data_storage(root: &std::path::Path, telemetry: bool) -> io::Result<TelemetryStorageIo> {
-    let config = IoUringStorageConfig::default();
-    let storage = match std::env::var("FASTDUP_IO_URING").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("off") => {
-            IoUringStorageIo::open_synchronous(root, config)?
-        }
-        Ok("try") => IoUringStorageIo::open_or_fallback(root, config)?,
-        Ok("required") => IoUringStorageIo::open_required(root, config)?,
-        Ok(_) | Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "FASTDUP_IO_URING must be off, try, or required",
-            ));
-        }
-    };
+    let storage = IoUringStorageIo::open(root, IoUringStorageConfig::default())?;
     Ok(TelemetryStorageIo::new(storage, telemetry))
 }
 
@@ -162,18 +236,12 @@ fn emit_io_uring_state(storage: &TelemetryStorageIo) {
     let status = storage.inner.status();
     eprintln!(
         concat!(
-            "data_io_uring mode={:?} ring_entries={} max_inflight_bytes={} ",
+            "data_io_uring ring_entries={} max_inflight_bytes={} ",
             "inflight_bytes={} peak_inflight_bytes={} submitted_operations={} ",
             "completed_operations={} root_sync_callers={} root_sync_submissions={} ",
             "owned_publications_started={} owned_publications_completed={} ",
-            "borrowed_write_copy_bytes={} ",
-            "verifier_workers={} verification_jobs_started={} ",
-            "verification_jobs_completed={} verification_jobs_failed={} ",
-            "parallel_hash_verifications={} ",
-            "active_verifications={} peak_active_verifications={} ",
-            "fallback_reason={:?}"
+            "borrowed_write_copy_bytes={}"
         ),
-        status.mode(),
         status.ring_entries(),
         status.max_inflight_bytes(),
         status.inflight_bytes(),
@@ -185,27 +253,20 @@ fn emit_io_uring_state(storage: &TelemetryStorageIo) {
         status.owned_publications_started(),
         status.owned_publications_completed(),
         status.borrowed_write_copy_bytes(),
-        status.verifier_workers(),
-        status.verification_jobs_started(),
-        status.verification_jobs_completed(),
-        status.verification_jobs_failed(),
-        status.parallel_hash_verifications(),
-        status.active_verifications(),
-        status.peak_active_verifications(),
-        status.fallback_reason(),
     );
     let copies = copy_telemetry();
     eprintln!(
         concat!(
             "copy_bytes checksum_scratch_bytes={} publication_verify_materialization_bytes={} ",
             "fuse_request_adaptation_bytes={} container_assembly_bytes={} ",
-            "chunk_fragment_coalescing_bytes={}"
+            "chunk_fragment_coalescing_bytes={} compression_region_materialization_bytes={}"
         ),
         copies.checksum_scratch_bytes,
         copies.publication_verify_materialization_bytes,
         copies.fuse_request_adaptation_bytes,
         copies.container_assembly_bytes,
         copies.chunk_fragment_coalescing_bytes,
+        copies.compression_region_materialization_bytes,
     );
 }
 
@@ -215,6 +276,18 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
         "write_through_cpu hash_batches={} maximum_hash_workers={}",
         status.hash_batches(),
         status.maximum_hash_workers(),
+    );
+    eprintln!(
+        concat!(
+            "write_through_ingest_ring batches={} fragments={} maximum_batch_bytes={} ",
+            "minimum_batch_target_bytes={} maximum_slots={} full_wait_ns={}"
+        ),
+        status.ingest_batches(),
+        status.ingest_fragments(),
+        status.maximum_ingest_batch_bytes(),
+        status.minimum_ingest_batch_target_bytes(),
+        status.maximum_ingest_ring_slots(),
+        status.ingest_ring_wait_ns(),
     );
     emit_cpu_phase_state("write_through_hash_cpu", status.hash_cpu());
     emit_cpu_phase_state("write_through_encode_cpu", status.encode_cpu());
@@ -639,7 +712,9 @@ impl DataIoTelemetry {
         }
     }
 
-    fn record_owned_publication(&self, sealed_bytes: usize) {
+    fn record_owned_publication(&self, temporary_name: &str, sealed_bytes: usize) {
+        let ranges = publication_sample_ranges(sealed_bytes)
+            .expect("ASSERT: owned publication has valid format-v1 sample ranges");
         let sealed_bytes =
             u64::try_from(sealed_bytes).expect("ASSERT: format-v1 Container length fits u64");
         let durable_write_bytes = sealed_bytes
@@ -647,9 +722,14 @@ impl DataIoTelemetry {
                 u64::try_from(HEADER_BYTES).expect("ASSERT: format Header length fits u64"),
             )
             .expect("ASSERT: bounded Container publication bytes cannot overflow");
-        self.whole_reads.fetch_add(1, Ordering::Relaxed);
-        self.whole_read_bytes
-            .fetch_add(sealed_bytes, Ordering::Relaxed);
+        for range in ranges {
+            self.classify_range_read(temporary_name, range.offset(), range.length());
+            self.range_reads.fetch_add(1, Ordering::Relaxed);
+            self.range_read_bytes.fetch_add(
+                u64::try_from(range.length()).expect("ASSERT: sample length fits u64"),
+                Ordering::Relaxed,
+            );
+        }
         self.writes.fetch_add(3, Ordering::Relaxed);
         self.write_bytes
             .fetch_add(durable_write_bytes, Ordering::Relaxed);
@@ -748,9 +828,11 @@ impl StorageIo for TelemetryStorageIo {
         publication: OwnedContainerPublication,
     ) -> Result<VerifiedContainerPublication, StoreError> {
         let sealed_bytes = publication.sealed_len();
+        let temporary_name = publication.temporary_name().to_owned();
         let verified = self.inner.publish_owned_container(publication)?;
         if self.enabled {
-            self.telemetry.record_owned_publication(sealed_bytes);
+            self.telemetry
+                .record_owned_publication(&temporary_name, sealed_bytes);
         }
         Ok(verified)
     }
@@ -758,6 +840,7 @@ impl StorageIo for TelemetryStorageIo {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::num::NonZeroUsize;
 
     use fastdup_format::ContainerId;
@@ -765,12 +848,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn telemetry_adapter_preserves_owned_container_publication() {
+    fn statfs_override_requires_a_complete_bounded_decimal_pair() {
+        assert_eq!(
+            statfs_override_from_values(None, None).expect("no override"),
+            None
+        );
+        assert!(statfs_override_from_values(Some(OsStr::new("1")), None).is_err());
+        assert!(statfs_override_from_values(Some(OsStr::new("x")), Some(OsStr::new("1"))).is_err());
+        assert!(
+            statfs_override_from_values(Some(OsStr::new("9")), Some(OsStr::new("10"))).is_err()
+        );
+        assert_eq!(
+            statfs_override_from_values(Some(OsStr::new("1000")), Some(OsStr::new("750")))
+                .expect("valid override"),
+            Some(StatFsOverride::new(1_000, 750).expect("valid fixture"))
+        );
+    }
+
+    #[test]
+    fn production_data_storage_requires_io_uring() {
+        let root =
+            std::env::temp_dir().join(format!("fastdup-default-io-uring-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create unique test root");
+
+        let storage = open_data_storage(&root, false).expect("open production data storage");
+
+        assert!(storage.inner.status().ring_entries() > 0);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn telemetry_adapter_records_sampled_owned_container_publication() {
         let root =
             std::env::temp_dir().join(format!("fastdup-telemetry-owned-{}", std::process::id()));
         std::fs::create_dir(&root).expect("create unique test root");
-        let inner = IoUringStorageIo::open_required(&root, IoUringStorageConfig::default())
-            .expect("test requires the production io_uring backend");
+        let inner = IoUringStorageIo::open(&root, IoUringStorageConfig::default())
+            .expect("open the production io_uring backend");
         let storage = TelemetryStorageIo::new(inner, true);
         let repository = ContainerRepository::new(storage.clone());
         let chunk = b"telemetry-owned-publication".repeat(8_192);
@@ -793,10 +907,15 @@ mod tests {
         assert_eq!(status.owned_publications_started(), 1);
         assert_eq!(status.owned_publications_completed(), 1);
         assert_eq!(status.borrowed_write_copy_bytes(), 0);
-        assert_eq!(storage.telemetry.whole_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(storage.telemetry.whole_reads.load(Ordering::Relaxed), 0);
         assert_eq!(
             storage.telemetry.whole_read_bytes.load(Ordering::Relaxed),
-            metrics.file_bytes()
+            0
+        );
+        assert_eq!(storage.telemetry.range_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            storage.telemetry.range_read_bytes.load(Ordering::Relaxed),
+            u64::try_from(HEADER_BYTES * 3).expect("sample bytes fit u64")
         );
         assert_eq!(storage.telemetry.writes.load(Ordering::Relaxed), 3);
         assert_eq!(

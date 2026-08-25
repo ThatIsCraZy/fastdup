@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use fastdup_format::{ChunkId, ContainerId, FormatError, SealedContainer};
+use fastdup_format::{ChunkId, ContainerId, FormatError, PrehashedChunk, SealedContainer};
 
 #[test]
 fn payload_free_publication_verify_matches_full_reader_evidence() {
@@ -51,6 +51,68 @@ fn payload_free_publication_verify_rejects_corrupt_logical_bytes() {
     assert!(matches!(
         SealedContainer::verify_publication_with_hash_workers(&image, NonZeroUsize::MIN),
         Err(FormatError::RecordChecksumMismatch)
+    ));
+}
+
+#[test]
+fn writer_image_publication_verify_matches_full_reader_evidence() {
+    let payload = pseudorandom_bytes(256 * 1_024, 0x6e5c_49a1_3b72_d80f);
+    let image = SealedContainer::encode(
+        ContainerId::new([0x93; 16]).expect("fixture Container ID is nonzero"),
+        43,
+        &[payload.as_slice()],
+    )
+    .expect("encode fixture");
+
+    let full = SealedContainer::decode(&image).expect("full reader verifies fixture");
+    let publication = SealedContainer::verify_publication_against_writer_image(&image, &image)
+        .expect("exact writer image verifies without a second Container hash");
+
+    assert_eq!(publication.header(), full.header());
+    assert_eq!(publication.locations(), full.locations());
+    assert_eq!(publication.raw_locations(), full.raw_locations());
+}
+
+#[test]
+fn writer_image_publication_verify_rejects_an_unexpected_reread() {
+    let payload = vec![0x5a; 64 * 1_024];
+    let expected = SealedContainer::encode(
+        ContainerId::new([0x94; 16]).expect("fixture Container ID is nonzero"),
+        44,
+        &[payload.as_slice()],
+    )
+    .expect("encode expected fixture");
+    let unexpected = SealedContainer::encode(
+        ContainerId::new([0x95; 16]).expect("fixture Container ID is nonzero"),
+        45,
+        &[payload.as_slice()],
+    )
+    .expect("encode unexpected fixture");
+
+    assert!(matches!(
+        SealedContainer::verify_publication_against_writer_image(&unexpected, &expected),
+        Err(FormatError::WriterImageMismatch)
+    ));
+}
+
+#[test]
+fn writer_image_publication_verify_still_rehashes_chunk_identities() {
+    let payload = pseudorandom_bytes(128 * 1_024, 0xc8d4_7731_21ae_950b);
+    let wrong_chunk_id = ChunkId::of(b"different logical bytes");
+    let chunk = PrehashedChunk::new(wrong_chunk_id, &payload);
+    let region = [chunk];
+    let regions = [region.as_slice()];
+    let image = SealedContainer::encode_prehashed_adaptive_regions_parallel(
+        ContainerId::new([0x96; 16]).expect("fixture Container ID is nonzero"),
+        46,
+        &regions,
+        NonZeroUsize::MIN,
+    )
+    .expect("the writer accepts non-authoritative prehashed evidence");
+
+    assert!(matches!(
+        SealedContainer::verify_publication_against_writer_image(&image, &image),
+        Err(FormatError::ChunkHashMismatch)
     ));
 }
 

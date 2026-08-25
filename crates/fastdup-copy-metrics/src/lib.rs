@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Process-local accounting for the five large-copy classes in the ingest path.
+//! Process-local accounting for the large-copy classes in the ingest path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,6 +12,7 @@ pub enum CopyClass {
     FuseRequestAdaptation,
     ContainerAssembly,
     ChunkFragmentCoalescing,
+    CompressionRegionMaterialization,
 }
 
 /// One point-in-time view of all avoidable-copy counters.
@@ -22,6 +23,7 @@ pub struct CopyTelemetrySnapshot {
     pub fuse_request_adaptation_bytes: u64,
     pub container_assembly_bytes: u64,
     pub chunk_fragment_coalescing_bytes: u64,
+    pub compression_region_materialization_bytes: u64,
 }
 
 #[repr(align(64))]
@@ -51,6 +53,7 @@ struct CopyCounters {
     fuse_request_adaptation: CacheLineCounter,
     container_assembly: CacheLineCounter,
     chunk_fragment_coalescing: CacheLineCounter,
+    compression_region_materialization: CacheLineCounter,
 }
 
 static COUNTERS: CopyCounters = CopyCounters {
@@ -59,9 +62,10 @@ static COUNTERS: CopyCounters = CopyCounters {
     fuse_request_adaptation: CacheLineCounter::new(),
     container_assembly: CacheLineCounter::new(),
     chunk_fragment_coalescing: CacheLineCounter::new(),
+    compression_region_materialization: CacheLineCounter::new(),
 };
 
-/// Records bytes copied by one of the five named ingest copy classes.
+/// Records bytes copied by one named ingest copy class.
 pub fn record_copy(class: CopyClass, bytes: usize) {
     let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
     match class {
@@ -72,6 +76,9 @@ pub fn record_copy(class: CopyClass, bytes: usize) {
         CopyClass::FuseRequestAdaptation => COUNTERS.fuse_request_adaptation.add(bytes),
         CopyClass::ContainerAssembly => COUNTERS.container_assembly.add(bytes),
         CopyClass::ChunkFragmentCoalescing => COUNTERS.chunk_fragment_coalescing.add(bytes),
+        CopyClass::CompressionRegionMaterialization => {
+            COUNTERS.compression_region_materialization.add(bytes);
+        }
     }
 }
 
@@ -86,6 +93,9 @@ pub fn copy_telemetry() -> CopyTelemetrySnapshot {
         fuse_request_adaptation_bytes: COUNTERS.fuse_request_adaptation.load(),
         container_assembly_bytes: COUNTERS.container_assembly.load(),
         chunk_fragment_coalescing_bytes: COUNTERS.chunk_fragment_coalescing.load(),
+        compression_region_materialization_bytes: COUNTERS
+            .compression_region_materialization
+            .load(),
     }
 }
 
@@ -104,6 +114,7 @@ mod tests {
         record_copy(CopyClass::FuseRequestAdaptation, 3);
         record_copy(CopyClass::ContainerAssembly, 4);
         record_copy(CopyClass::ChunkFragmentCoalescing, 5);
+        record_copy(CopyClass::CompressionRegionMaterialization, 6);
         let after = copy_telemetry();
 
         assert_eq!(
@@ -126,6 +137,11 @@ mod tests {
         assert_eq!(
             after.chunk_fragment_coalescing_bytes - before.chunk_fragment_coalescing_bytes,
             5
+        );
+        assert_eq!(
+            after.compression_region_materialization_bytes
+                - before.compression_region_materialization_bytes,
+            6
         );
     }
 }

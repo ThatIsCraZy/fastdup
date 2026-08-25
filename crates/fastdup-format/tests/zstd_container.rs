@@ -1,7 +1,8 @@
 use std::num::NonZeroUsize;
 
 use fastdup_format::{
-    ChunkId, ContainerId, FormatError, HEADER_BYTES, PrehashedChunk, SealedContainer,
+    ChunkId, ContainerId, FormatError, HEADER_BYTES, IncompressibilityGatePolicy, PrehashedChunk,
+    PrehashedContiguousRegion, SealedContainer,
 };
 
 #[test]
@@ -34,6 +35,46 @@ fn prehashed_adaptive_input_is_byte_identical_to_the_regular_writer() {
 
     assert_eq!(prehashed, regular);
     SealedContainer::decode(&prehashed).expect("prehashed writer output verifies byte exactly");
+}
+
+#[test]
+fn contiguous_prehashed_input_is_byte_identical_without_a_second_join_buffer() {
+    let mut decoded = Vec::new();
+    decoded.extend(std::iter::repeat_n(b'X', 180 * 1_024));
+    decoded.extend(
+        (0..180 * 1_024)
+            .map(|index| u8::try_from((index * 73 + 11) % 251).expect("fixture byte fits u8")),
+    );
+    let boundary = 180 * 1_024;
+    let chunks = [
+        PrehashedChunk::new(ChunkId::of(&decoded[..boundary]), &decoded[..boundary]),
+        PrehashedChunk::new(ChunkId::of(&decoded[boundary..]), &decoded[boundary..]),
+    ];
+    let contiguous = PrehashedContiguousRegion::new(&chunks, &decoded)
+        .expect("Chunk views exactly partition the decoded buffer");
+    let container_id = ContainerId::new([0xC8; 16]).expect("container identity is nonzero");
+
+    let joined = SealedContainer::encode_prehashed_adaptive_regions_parallel_profiled_with_gate(
+        container_id,
+        11,
+        &[&chunks],
+        NonZeroUsize::MIN,
+        IncompressibilityGatePolicy::V1,
+    )
+    .expect("encode ordinary prehashed region")
+    .into_bytes();
+    let borrowed =
+        SealedContainer::encode_prehashed_contiguous_regions_parallel_profiled_with_gate(
+            container_id,
+            11,
+            &[contiguous],
+            NonZeroUsize::MIN,
+            IncompressibilityGatePolicy::V1,
+        )
+        .expect("encode contiguous prehashed region")
+        .into_bytes();
+
+    assert_eq!(borrowed, joined);
 }
 
 #[test]
@@ -190,7 +231,7 @@ fn parallel_adaptive_encoding_is_byte_identical_to_one_worker() {
     assert_eq!(four, one);
     assert_eq!(
         pool.install(|| SealedContainer::container_hash_worker_count(four.len(), four_workers)),
-        four_workers
+        NonZeroUsize::MIN
     );
     let decoded = pool
         .install(|| SealedContainer::decode_with_hash_workers(&four, four_workers))

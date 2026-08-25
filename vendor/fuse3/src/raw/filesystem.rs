@@ -8,6 +8,45 @@ use crate::raw::reply::*;
 use crate::raw::request::Request;
 use crate::{Inode, Result, SetAttr};
 
+/// One write payload that retains ownership of the FUSE request buffer.
+#[derive(Clone, Debug)]
+pub struct OwnedRequestPayload {
+    bytes: Bytes,
+    backing_bytes: usize,
+}
+
+impl OwnedRequestPayload {
+    pub(crate) fn from_request_buffer(
+        buffer: Vec<u8>,
+        payload_start: usize,
+        payload_end: usize,
+    ) -> Self {
+        assert!(
+            payload_start <= payload_end && payload_end <= buffer.len(),
+            "request payload range must lie inside its owned FUSE buffer"
+        );
+        let backing_bytes = buffer.capacity().max(buffer.len());
+        let bytes = Bytes::from(buffer).slice(payload_start..payload_end);
+        Self {
+            bytes,
+            backing_bytes,
+        }
+    }
+
+    /// Returns the immutable request bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes the request payload into its shared byte view and retained
+    /// allocation size.
+    #[must_use]
+    pub fn into_parts(self) -> (Bytes, usize) {
+        (self.bytes, self.backing_bytes)
+    }
+}
+
 #[allow(unused_variables)]
 #[trait_make::make(Send)]
 /// Inode based filesystem trait.
@@ -211,6 +250,37 @@ pub trait Filesystem {
     {
         self.write(req, inode, fh, offset, &data, write_flags, flags)
             .await
+    }
+
+    /// Write data while retaining the complete FUSE receive allocation.
+    ///
+    /// Filesystems that can store shared immutable bytes should override this
+    /// method. The default preserves compatibility with implementations that
+    /// only implement [`Self::write_owned`].
+    #[allow(clippy::too_many_arguments)]
+    async fn write_owned_request(
+        &self,
+        req: Request,
+        inode: Inode,
+        fh: u64,
+        offset: u64,
+        data: OwnedRequestPayload,
+        write_flags: u32,
+        flags: u32,
+    ) -> Result<ReplyWrite>
+    where
+        Self: Sync,
+    {
+        self.write_owned(
+            req,
+            inode,
+            fh,
+            offset,
+            data.as_bytes().to_vec(),
+            write_flags,
+            flags,
+        )
+        .await
     }
 
     /// get filesystem statistics.
@@ -553,4 +623,22 @@ pub trait Filesystem {
     }
 
     // TODO setupmapping and removemapping
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OwnedRequestPayload;
+
+    #[test]
+    fn owned_request_payload_retains_the_receive_allocation_without_copying() {
+        let buffer = vec![0x5a; 4096];
+        let expected = buffer.as_ptr().wrapping_add(128);
+
+        let payload = OwnedRequestPayload::from_request_buffer(buffer, 128, 3072);
+
+        assert_eq!(payload.as_bytes().as_ptr(), expected);
+        assert_eq!(payload.as_bytes(), vec![0x5a; 2944]);
+        let (_, backing_bytes) = payload.into_parts();
+        assert_eq!(backing_bytes, 4096);
+    }
 }

@@ -1,5 +1,6 @@
+#[cfg(test)]
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
@@ -14,7 +15,8 @@ use fastdup_format::{
     ChunkId, CommitRecord, ContainerId, DurableInode, ExactIndexEntry, ExactIndexProfileId,
     ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, IncompressibilityGateMetrics,
     MAX_LOGICAL_CHUNK_BYTES, ManifestExtent, ManifestLeaf, MetadataFormatError, MetadataObjectId,
-    NamespaceEntry, NamespaceRoot, PolicySetId, PrehashedChunk,
+    NamespaceEntry, NamespaceRoot, PolicySetId, PrehashedAdaptiveRegion, PrehashedChunk,
+    PrehashedContiguousRegion,
 };
 use fastdup_posix::{
     CommitInode, CommitRange, CommittedFile, CommittedFileInstall, ExternalizedExtent, InodeId,
@@ -28,7 +30,7 @@ use fastdup_store::{
     ManifestReadError, ManifestSuccessorProof, ManifestTreeSummary, RequiredChunkVerifier,
     SeqCdcConfig, StorageIo, StoreError, SuccessorPredecessor, VerifiedCommittedFile,
     VerifiedManifestFile, VerifiedReadCache, VerifiedReadCacheError, VerifiedReadCacheStatus,
-    seqcdc_cut, seqcdc_cut_scalar,
+    seqcdc_cut, seqcdc_cut_scalar, seqcdc_cut_segmented, seqcdc_cut_segmented_scalar,
 };
 use rayon::prelude::*;
 
@@ -65,10 +67,17 @@ const MAX_RECENT_EXACT_LOCATIONS: usize = 8_192;
 // Combined Active and Frozen 512-MiB generations at SeqCDC-v1's 16-KiB minimum.
 const MAX_ONLINE_DEPENDENCY_PROOFS_V1: usize = 65_536;
 const ACCOUNTED_GENERATION_PROOF_BYTES: usize = 256;
-const WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1: usize = 384 * 1_024 * 1_024;
-const WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1: usize = 16 * 1_024 * 1_024;
+const WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1: usize = 400 * 1_024 * 1_024;
+const WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1: usize = 32 * 1_024 * 1_024;
+const MULTI_STREAM_QUEUE_BUDGET_BYTES_V1: usize = 16 * 1_024 * 1_024;
 const DETACHED_CONTAINER_BUDGET_BYTES_V1: usize = 2 * CONTAINER_PAYLOAD_TARGET_BYTES;
-const WRITE_THROUGH_JOB_MAX_BYTES_V1: usize = 1_024 * 1_024;
+const SINGLE_STREAM_PUBLICATION_WINDOW_V1: usize = 2;
+const WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1: usize = 1_024 * 1_024;
+// Owned request fragments remain separate allocations. The Ingest Ring groups
+// only their immutable views, so sealing a batch never copies payload bytes.
+const SINGLE_STREAM_INGEST_BATCH_BYTES_V1: usize = 4 * 1_024 * 1_024;
+const SINGLE_STREAM_INGEST_RING_SLOTS_V1: usize = 8;
+const INGEST_BATCH_MAXIMUM_AGE_V1: Duration = Duration::from_millis(10);
 const MAX_ACTIVE_INGEST_LANES_V1: usize = (WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1
     - WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1
     - DETACHED_CONTAINER_BUDGET_BYTES_V1)
@@ -171,6 +180,12 @@ pub struct WriteThroughStatus {
     oldest_sealed_age: Option<Duration>,
     hash_batches: u64,
     maximum_hash_workers: u64,
+    ingest_batches: u64,
+    ingest_fragments: u64,
+    maximum_ingest_batch_bytes: u64,
+    minimum_ingest_batch_target_bytes: u64,
+    maximum_ingest_ring_slots: u64,
+    ingest_ring_wait_ns: u64,
     hash_cpu: CpuPhaseStatus,
     encode_cpu: CpuPhaseStatus,
     degraded: bool,
@@ -210,6 +225,36 @@ impl WriteThroughStatus {
     #[must_use]
     pub const fn maximum_hash_workers(self) -> u64 {
         self.maximum_hash_workers
+    }
+
+    #[must_use]
+    pub const fn ingest_batches(self) -> u64 {
+        self.ingest_batches
+    }
+
+    #[must_use]
+    pub const fn ingest_fragments(self) -> u64 {
+        self.ingest_fragments
+    }
+
+    #[must_use]
+    pub const fn maximum_ingest_batch_bytes(self) -> u64 {
+        self.maximum_ingest_batch_bytes
+    }
+
+    #[must_use]
+    pub const fn minimum_ingest_batch_target_bytes(self) -> u64 {
+        self.minimum_ingest_batch_target_bytes
+    }
+
+    #[must_use]
+    pub const fn maximum_ingest_ring_slots(self) -> u64 {
+        self.maximum_ingest_ring_slots
+    }
+
+    #[must_use]
+    pub const fn ingest_ring_wait_ns(self) -> u64 {
+        self.ingest_ring_wait_ns
     }
 
     #[must_use]
@@ -577,11 +622,13 @@ impl GenerationProofSetStatus {
 struct GenerationProofState {
     active: BTreeMap<(ChunkId, u32), GenerationProof>,
     frozen: Option<BTreeMap<(ChunkId, u32), GenerationProof>>,
+    publishing: BTreeSet<(ChunkId, u32)>,
 }
 
 #[derive(Debug)]
 struct OnlineDependencyProofs {
     generation: Mutex<GenerationProofState>,
+    publication_completed: Condvar,
     historical: HistoricalProofCache,
     trace: ProofCacheTraceRecorder,
 }
@@ -597,6 +644,7 @@ impl OnlineDependencyProofs {
     fn new() -> Result<Self, DurableNamespaceError> {
         Ok(Self {
             generation: Mutex::new(GenerationProofState::default()),
+            publication_completed: Condvar::new(),
             historical: HistoricalProofCache::new_system()
                 .map_err(|_| DurableNamespaceError::OutOfMemory)?,
             trace: ProofCacheTraceRecorder::default(),
@@ -791,24 +839,117 @@ impl OnlineDependencyProofs {
         entry
     }
 
-    fn verified_entries(&self, requests: &[(ChunkId, u64)]) -> Vec<Option<ExactIndexEntry>> {
-        let entries = requests
-            .iter()
-            .map(|(chunk_id, logical_length)| {
-                let logical_length = u32::try_from(*logical_length).ok()?;
-                self.generation_entry((*chunk_id, logical_length))
-                    .or_else(|| self.historical.get(*chunk_id, u64::from(logical_length)))
-            })
-            .collect();
-        for (chunk_id, logical_length) in requests {
-            if let Ok(logical_length) = u32::try_from(*logical_length) {
-                self.trace.record(ProofCacheEvent::lookup(ProofKey::new(
-                    *chunk_id,
-                    logical_length,
-                )));
+    /// Claims one missing Chunk for publication or waits for the current
+    /// in-process publisher to install its proof.
+    ///
+    /// Callers claim keys in ascending `(ChunkId, logical_length)` order. That
+    /// ordering prevents two partially overlapping Container batches from
+    /// waiting on each other while retaining disjoint claims.
+    fn claim_publication(&self, chunk_id: ChunkId, logical_length: u32) -> PublicationClaim {
+        let key = (chunk_id, logical_length);
+        let mut state = self
+            .generation
+            .lock()
+            .expect("ASSERT: Generation Proof Set lock poisoned");
+        loop {
+            if let Some(proof) = state.active.get(&key) {
+                assert_entry_matches(proof.entry, chunk_id, logical_length);
+                return PublicationClaim::Existing(proof.entry);
             }
+            if let Some(entry) = state
+                .frozen
+                .as_ref()
+                .and_then(|frozen| frozen.get(&key))
+                .map(|proof| proof.entry)
+            {
+                assert_entry_matches(entry, chunk_id, logical_length);
+                drop(state);
+                self.remember_active(entry, OnlineProofAdmission::Touch);
+                return PublicationClaim::Existing(entry);
+            }
+            if state.publishing.insert(key) {
+                return PublicationClaim::Acquired;
+            }
+            state = self
+                .publication_completed
+                .wait(state)
+                .expect("ASSERT: Generation Proof Set lock poisoned while awaiting publication");
         }
-        entries
+    }
+
+    fn finish_publications(&self, entries: &[ExactIndexEntry], claimed: &[(ChunkId, u32)]) {
+        assert_eq!(
+            entries.len(),
+            claimed.len(),
+            "ASSERT: every publication claim must produce one verified Location"
+        );
+        let mut state = self
+            .generation
+            .lock()
+            .expect("ASSERT: Generation Proof Set lock poisoned");
+        for (entry, key) in entries.iter().zip(claimed) {
+            assert_eq!(
+                entry.transition(),
+                fastdup_format::ExactLocationTransition::Active,
+                "ASSERT: only an ACTIVE verified Location can prove an online dependency"
+            );
+            assert_entry_matches(*entry, key.0, key.1);
+            assert!(
+                state.publishing.contains(key),
+                "ASSERT: completed publication must own its Chunk claim"
+            );
+            assert!(
+                state
+                    .active
+                    .insert(
+                        *key,
+                        GenerationProof {
+                            entry: *entry,
+                            admission: HistoricalProofAdmission::Published,
+                        },
+                    )
+                    .is_none(),
+                "ASSERT: an owned publication claim cannot already have an active proof"
+            );
+        }
+        for key in claimed {
+            assert!(
+                state.publishing.remove(key),
+                "ASSERT: completed publication must release its Chunk claim"
+            );
+        }
+        let frozen_proofs = state.frozen.as_ref().map_or(0, BTreeMap::len);
+        assert!(
+            state
+                .active
+                .len()
+                .checked_add(frozen_proofs)
+                .is_some_and(|total| total <= MAX_ONLINE_DEPENDENCY_PROOFS_V1),
+            "ASSERT: completed publication exceeded the combined Generation Proof budget"
+        );
+        drop(state);
+        self.publication_completed.notify_all();
+        for entry in entries {
+            self.trace.record(ProofCacheEvent::admit_published(
+                ProofKey::new(entry.chunk_id(), entry.logical_length()),
+                entry.location().record_length(),
+            ));
+        }
+    }
+
+    fn abandon_publications(&self, claimed: &[(ChunkId, u32)]) {
+        let mut state = self
+            .generation
+            .lock()
+            .expect("ASSERT: Generation Proof Set lock poisoned");
+        for key in claimed {
+            assert!(
+                state.publishing.remove(key),
+                "ASSERT: failed publication must own its Chunk claim"
+            );
+        }
+        drop(state);
+        self.publication_completed.notify_all();
     }
 
     fn historical_status(&self) -> HistoricalProofCacheStatus {
@@ -830,6 +971,55 @@ impl OnlineDependencyProofs {
             active_proofs,
             frozen_proofs,
             accounted_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PublicationClaim {
+    Existing(ExactIndexEntry),
+    Acquired,
+}
+
+struct PublicationClaims<'a> {
+    proofs: &'a OnlineDependencyProofs,
+    keys: Vec<(ChunkId, u32)>,
+    finished: bool,
+}
+
+impl<'a> PublicationClaims<'a> {
+    fn new(
+        proofs: &'a OnlineDependencyProofs,
+        capacity: usize,
+    ) -> Result<Self, DurableNamespaceError> {
+        let mut keys = Vec::new();
+        keys.try_reserve(capacity)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        Ok(Self {
+            proofs,
+            keys,
+            finished: false,
+        })
+    }
+
+    fn claim(&mut self, chunk_id: ChunkId, logical_length: u32) -> PublicationClaim {
+        let claim = self.proofs.claim_publication(chunk_id, logical_length);
+        if matches!(claim, PublicationClaim::Acquired) {
+            self.keys.push((chunk_id, logical_length));
+        }
+        claim
+    }
+
+    fn finish(mut self, entries: &[ExactIndexEntry]) {
+        self.proofs.finish_publications(entries, &self.keys);
+        self.finished = true;
+    }
+}
+
+impl Drop for PublicationClaims<'_> {
+    fn drop(&mut self) {
+        if !self.finished && !self.keys.is_empty() {
+            self.proofs.abandon_publications(&self.keys);
         }
     }
 }
@@ -936,6 +1126,21 @@ where
             && ChunkId::of(candidate) == self.entry.chunk_id())
     }
 
+    fn matches_complete_segments(&self, segments: &[&[u8]]) -> Result<bool, PosixError> {
+        let mut length = 0_usize;
+        let mut hasher = blake3::Hasher::new();
+        for segment in segments {
+            length = length
+                .checked_add(segment.len())
+                .ok_or(PosixError::FileTooLarge)?;
+            hasher.update(segment);
+        }
+        Ok(length
+            == usize::try_from(self.entry.logical_length())
+                .expect("ASSERT: Exact Index length fits usize")
+            && ChunkId::from_bytes(*hasher.finalize().as_bytes()) == self.entry.chunk_id())
+    }
+
     fn prepared_data_recipe(&self) -> Option<PreparedDataRecipe> {
         Some(PreparedDataRecipe::Chunk {
             chunk_id: self.entry.chunk_id().bytes(),
@@ -983,6 +1188,19 @@ impl CommittedFile for FillCommittedFile {
         )
     }
 
+    fn matches_complete_segments(&self, segments: &[&[u8]]) -> Result<bool, PosixError> {
+        let mut length = 0_u64;
+        for segment in segments {
+            length = length
+                .checked_add(u64::try_from(segment.len()).expect("ASSERT: usize fits u64"))
+                .ok_or(PosixError::FileTooLarge)?;
+            if !segment.iter().all(|byte| *byte == self.value) {
+                return Ok(false);
+            }
+        }
+        Ok(length == self.length)
+    }
+
     fn prepared_data_recipe(&self) -> Option<PreparedDataRecipe> {
         Some(PreparedDataRecipe::Fill { value: self.value })
     }
@@ -995,14 +1213,43 @@ struct PendingWriteThroughChunk {
     bytes: ChunkFragments,
 }
 
+struct CompressionRegionPlan<'a> {
+    chunks: Vec<&'a PendingWriteThroughChunk>,
+    decoded_length: usize,
+    materialized: bool,
+}
+
+struct MaterializedCompressionRegion {
+    decoded: Vec<u8>,
+    chunks: Vec<(ChunkId, Range<usize>)>,
+}
+
+#[derive(Clone, Copy)]
+enum CompressionRegionOrder {
+    Borrowed(usize),
+    Materialized(usize),
+}
+
+struct PreparedCompressionRegions<'a> {
+    borrowed: Vec<Vec<PrehashedChunk<'a>>>,
+    materialized: Vec<MaterializedCompressionRegion>,
+    order: Vec<CompressionRegionOrder>,
+}
+
 #[derive(Debug)]
 struct ChunkFragments {
     parts: Vec<MutationPayload>,
     length: usize,
+    through_sequence: u64,
 }
 
 impl ChunkFragments {
+    #[cfg(test)]
     fn new(parts: Vec<MutationPayload>, length: usize) -> Self {
+        Self::new_through(parts, length, 0)
+    }
+
+    fn new_through(parts: Vec<MutationPayload>, length: usize, through_sequence: u64) -> Self {
         assert!(length != 0, "ASSERT: a SeqCDC Chunk is nonempty");
         let actual = parts.iter().fold(0_usize, |total, part| {
             assert!(!part.is_empty(), "ASSERT: Chunk fragments are nonempty");
@@ -1011,7 +1258,11 @@ impl ChunkFragments {
                 .expect("ASSERT: bounded Chunk fragment sum cannot overflow")
         });
         assert_eq!(actual, length, "ASSERT: Chunk fragment length is exact");
-        Self { parts, length }
+        Self {
+            parts,
+            length,
+            through_sequence,
+        }
     }
 
     const fn len(&self) -> usize {
@@ -1020,6 +1271,10 @@ impl ChunkFragments {
 
     const fn is_empty(&self) -> bool {
         self.length == 0
+    }
+
+    const fn through_sequence(&self) -> u64 {
+        self.through_sequence
     }
 
     fn first_byte(&self) -> u8 {
@@ -1041,6 +1296,7 @@ impl ChunkFragments {
         ChunkId::from_bytes(*hasher.finalize().as_bytes())
     }
 
+    #[cfg(test)]
     fn materialize_new_chunk(&self) -> Result<Cow<'_, [u8]>, DurableNamespaceError> {
         if self.parts.len() == 1 {
             return Ok(Cow::Borrowed(self.parts[0].as_bytes()));
@@ -1061,6 +1317,23 @@ impl ChunkFragments {
         Ok(Cow::Owned(bytes))
     }
 
+    fn append_to_compression_region(&self, decoded: &mut Vec<u8>) {
+        let start = decoded.len();
+        for part in &self.parts {
+            decoded.extend_from_slice(part.as_bytes());
+        }
+        assert_eq!(
+            decoded.len() - start,
+            self.length,
+            "ASSERT: Compression Region materialization preserves the Chunk length"
+        );
+        record_copy(CopyClass::CompressionRegionMaterialization, self.length);
+    }
+
+    fn contiguous_bytes(&self) -> Option<&[u8]> {
+        (self.parts.len() == 1).then(|| self.parts[0].as_bytes())
+    }
+
     #[cfg(test)]
     fn materialize_fixture(&self) -> Vec<u8> {
         self.parts
@@ -1068,6 +1341,103 @@ impl ChunkFragments {
             .flat_map(|part| part.as_bytes().iter().copied())
             .collect()
     }
+}
+
+fn prepare_compression_regions<'a>(
+    new_chunks: &[&'a PendingWriteThroughChunk],
+) -> Result<PreparedCompressionRegions<'a>, DurableNamespaceError> {
+    let mut plans = Vec::<CompressionRegionPlan<'_>>::new();
+    for chunk in new_chunks {
+        let materialized = chunk.bytes.contiguous_bytes().is_none();
+        let needs_region = plans.last().is_none_or(|region| {
+            region.materialized != materialized
+                || region
+                    .decoded_length
+                    .checked_add(chunk.bytes.len())
+                    .is_none_or(|length| length > COMPRESSION_REGION_TARGET_BYTES)
+        });
+        if needs_region {
+            plans
+                .try_reserve(1)
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+            plans.push(CompressionRegionPlan {
+                chunks: Vec::new(),
+                decoded_length: 0,
+                materialized,
+            });
+        }
+        let region = plans
+            .last_mut()
+            .expect("ASSERT: a new Chunk owns one Compression Region");
+        region
+            .chunks
+            .try_reserve(1)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        region.chunks.push(chunk);
+        region.decoded_length = region
+            .decoded_length
+            .checked_add(chunk.bytes.len())
+            .ok_or(DurableNamespaceError::OutOfMemory)?;
+    }
+
+    let mut prepared = PreparedCompressionRegions {
+        borrowed: Vec::new(),
+        materialized: Vec::new(),
+        order: Vec::new(),
+    };
+    prepared
+        .order
+        .try_reserve_exact(plans.len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    for plan in plans {
+        if !plan.materialized {
+            let mut chunks = Vec::new();
+            chunks
+                .try_reserve_exact(plan.chunks.len())
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+            for chunk in plan.chunks {
+                chunks.push(PrehashedChunk::new(
+                    chunk.chunk_id,
+                    chunk
+                        .bytes
+                        .contiguous_bytes()
+                        .expect("ASSERT: a borrowed region contains contiguous Chunks"),
+                ));
+            }
+            let ordinal = prepared.borrowed.len();
+            prepared.borrowed.push(chunks);
+            prepared
+                .order
+                .push(CompressionRegionOrder::Borrowed(ordinal));
+            continue;
+        }
+        let mut decoded = Vec::new();
+        decoded
+            .try_reserve_exact(plan.decoded_length)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        let mut chunks = Vec::new();
+        chunks
+            .try_reserve_exact(plan.chunks.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for chunk in plan.chunks {
+            let start = decoded.len();
+            chunk.bytes.append_to_compression_region(&mut decoded);
+            chunks.push((chunk.chunk_id, start..decoded.len()));
+        }
+        assert_eq!(
+            decoded.len(),
+            plan.decoded_length,
+            "ASSERT: one Compression Region is materialized exactly once"
+        );
+        let ordinal = prepared.materialized.len();
+        prepared
+            .materialized
+            .push(MaterializedCompressionRegion { decoded, chunks });
+        prepared
+            .order
+            .push(CompressionRegionOrder::Materialized(ordinal));
+    }
+    Ok(prepared)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1079,6 +1449,7 @@ enum StableExtraction {
 #[derive(Debug, Default)]
 struct SegmentedIngestTail {
     segments: VecDeque<MutationPayload>,
+    mutation_sequences: VecDeque<u64>,
     length: usize,
     materialized_bytes: usize,
 }
@@ -1094,11 +1465,12 @@ impl SegmentedIngestTail {
 
     fn clear(&mut self) {
         self.segments.clear();
+        self.mutation_sequences.clear();
         self.length = 0;
         self.materialized_bytes = 0;
     }
 
-    fn push(&mut self, payload: MutationPayload) {
+    fn push(&mut self, payload: MutationPayload, mutation_sequence: u64) {
         assert!(
             !payload.is_empty(),
             "ASSERT: an Ingest Tail segment is nonempty"
@@ -1108,6 +1480,7 @@ impl SegmentedIngestTail {
             .checked_add(payload.len())
             .expect("ASSERT: bounded Ingest Tail length cannot overflow");
         self.segments.push_back(payload);
+        self.mutation_sequences.push_back(mutation_sequence);
     }
 
     fn front_bytes(&self) -> &[u8] {
@@ -1134,12 +1507,18 @@ impl SegmentedIngestTail {
             return Err(DurableNamespaceError::FrozenViewMismatch);
         }
         let mut parts = Vec::new();
+        let mut through_sequence = 0_u64;
         let mut remaining = length;
         while remaining != 0 {
             let front = self
                 .segments
                 .pop_front()
                 .expect("ASSERT: accounted Ingest Tail owns a front segment");
+            let mutation_sequence = self
+                .mutation_sequences
+                .pop_front()
+                .expect("ASSERT: every Ingest Tail segment owns one mutation sequence");
+            through_sequence = through_sequence.max(mutation_sequence);
             let consumed = remaining.min(front.len());
             parts
                 .try_reserve(1)
@@ -1155,6 +1534,7 @@ impl SegmentedIngestTail {
                         .checked_slice(consumed, front.len())
                         .expect("ASSERT: retained suffix lies inside front segment"),
                 );
+                self.mutation_sequences.push_front(mutation_sequence);
             }
             remaining -= consumed;
             self.length -= consumed;
@@ -1177,7 +1557,7 @@ impl SegmentedIngestTail {
             parts.push(MutationPayload::from_owned_bytes(compact));
         }
         self.assert_valid();
-        Ok(ChunkFragments::new(parts, length))
+        Ok(ChunkFragments::new_through(parts, length, through_sequence))
     }
 
     #[cfg(test)]
@@ -1204,66 +1584,11 @@ impl SegmentedIngestTail {
             self.is_empty(),
             "ASSERT: Ingest Tail emptiness must match its byte count"
         );
-    }
-}
-
-struct SegmentByteCursor<'a> {
-    segments: &'a VecDeque<MutationPayload>,
-    current: &'a [u8],
-    next_segment_index: usize,
-}
-
-impl<'a> SegmentByteCursor<'a> {
-    fn at(segments: &'a VecDeque<MutationPayload>, mut offset: usize) -> Self {
-        let mut segment_index = 0;
-        while let Some(segment) = segments.get(segment_index) {
-            if offset < segment.len() {
-                return Self {
-                    segments,
-                    current: &segment.as_bytes()[offset..],
-                    next_segment_index: segment_index + 1,
-                };
-            }
-            offset -= segment.len();
-            segment_index += 1;
-        }
-        assert_eq!(offset, 0, "ASSERT: byte cursor offset lies inside its Tail");
-        Self {
-            segments,
-            current: &[],
-            next_segment_index: segment_index,
-        }
-    }
-
-    fn next(&mut self) -> u8 {
-        loop {
-            if let Some((byte, remaining)) = self.current.split_first() {
-                self.current = remaining;
-                return *byte;
-            }
-            let segment = self
-                .segments
-                .get(self.next_segment_index)
-                .expect("ASSERT: SeqCDC byte cursor stays inside its Tail");
-            self.current = segment.as_bytes();
-            self.next_segment_index += 1;
-        }
-    }
-
-    fn skip(&mut self, mut length: usize) {
-        while length != 0 {
-            if length < self.current.len() {
-                self.current = &self.current[length..];
-                return;
-            }
-            length -= self.current.len();
-            let segment = self
-                .segments
-                .get(self.next_segment_index)
-                .expect("ASSERT: byte cursor skip stays inside its Tail");
-            self.current = segment.as_bytes();
-            self.next_segment_index += 1;
-        }
+        assert_eq!(
+            self.segments.len(),
+            self.mutation_sequences.len(),
+            "ASSERT: every Ingest Tail segment has one mutation sequence"
+        );
     }
 }
 
@@ -1279,39 +1604,12 @@ fn segmented_seqcdc_cut(tail: &SegmentedIngestTail) -> usize {
         tail.len() > CDC_MAXIMUM_BYTES,
         "ASSERT: stable SeqCDC scan owns more than one maximum Chunk"
     );
-    let mut cursor = SegmentByteCursor::at(&tail.segments, CDC_MINIMUM_BYTES - 1);
-    let mut previous = cursor.next();
-    let mut position = CDC_MINIMUM_BYTES;
-    let mut opposing_slopes = 0_u16;
-    let mut sequence_length = 0_u16;
-    while position < CDC_MAXIMUM_BYTES {
-        let current = cursor.next();
-        position += 1;
-        if current == previous {
-            previous = current;
-            continue;
-        }
-        if current < previous {
-            opposing_slopes += 1;
-            sequence_length = 0;
-        } else {
-            sequence_length += 1;
-        }
-        previous = current;
-        if sequence_length == SEQCDC_CONFIG_V1.sequence_length {
-            return position - 1;
-        }
-        if opposing_slopes == SEQCDC_CONFIG_V1.skip_trigger {
-            if position.saturating_add(SEQCDC_CONFIG_V1.skip_bytes) >= CDC_MAXIMUM_BYTES {
-                return CDC_MAXIMUM_BYTES;
-            }
-            cursor.skip(SEQCDC_CONFIG_V1.skip_bytes - 1);
-            previous = cursor.next();
-            position += SEQCDC_CONFIG_V1.skip_bytes;
-            opposing_slopes = 0;
-        }
+    let segments = || tail.segments.iter().map(MutationPayload::as_bytes);
+    if seqcdc_force_scalar() {
+        seqcdc_cut_segmented_scalar(segments(), tail.len(), SEQCDC_CONFIG_V1)
+    } else {
+        seqcdc_cut_segmented(segments(), tail.len(), SEQCDC_CONFIG_V1)
     }
-    CDC_MAXIMUM_BYTES
 }
 
 fn take_next_stable_seqcdc_chunk(
@@ -1569,12 +1867,16 @@ struct WriteThroughIngest<C> {
 
 #[derive(Debug)]
 enum IngestJobKind {
-    Write {
-        offset: u64,
-        bytes: MutationPayload,
-        final_for_sequence: bool,
-    },
+    WriteFragment(IngestWriteFragment),
+    WriteBatch { fragments: Vec<IngestWriteFragment> },
     Truncate,
+}
+
+#[derive(Debug)]
+struct IngestWriteFragment {
+    offset: u64,
+    bytes: MutationPayload,
+    mutation_sequence: u64,
 }
 
 #[derive(Debug)]
@@ -1587,17 +1889,39 @@ struct IngestJob {
 impl IngestJob {
     fn buffered_bytes(&self) -> usize {
         match &self.kind {
-            IngestJobKind::Write { bytes, .. } => bytes.len(),
+            IngestJobKind::WriteFragment(fragment) => fragment.bytes.len(),
+            IngestJobKind::WriteBatch { fragments } => {
+                fragments.iter().fold(0_usize, |total, fragment| {
+                    total
+                        .checked_add(fragment.bytes.len())
+                        .expect("ASSERT: bounded Ingest Batch bytes cannot overflow")
+                })
+            }
             IngestJobKind::Truncate => 0,
         }
     }
+}
 
-    fn final_for_sequence(&self) -> bool {
-        match self.kind {
-            IngestJobKind::Write {
-                final_for_sequence, ..
-            } => final_for_sequence,
-            IngestJobKind::Truncate => true,
+#[derive(Debug)]
+struct OpenIngestBatch {
+    opened_at: Instant,
+    fragments: Vec<IngestWriteFragment>,
+    buffered_bytes: usize,
+    last_mutation_sequence: u64,
+}
+
+impl OpenIngestBatch {
+    fn into_job(self, inode: InodeId) -> IngestJob {
+        assert!(
+            !self.fragments.is_empty() && self.buffered_bytes != 0,
+            "ASSERT: only a nonempty Ingest Batch may be sealed"
+        );
+        IngestJob {
+            inode,
+            mutation_sequence: self.last_mutation_sequence,
+            kind: IngestJobKind::WriteBatch {
+                fragments: self.fragments,
+            },
         }
     }
 }
@@ -1605,6 +1929,7 @@ impl IngestJob {
 #[derive(Debug, Default)]
 struct InodeJobQueue {
     pending: VecDeque<IngestJob>,
+    open: Option<OpenIngestBatch>,
     in_flight: bool,
     last_enqueued_sequence: u64,
     completed_sequence: u64,
@@ -1613,9 +1938,27 @@ struct InodeJobQueue {
 #[derive(Debug, Default)]
 struct IngestQueueState {
     inodes: BTreeMap<InodeId, InodeJobQueue>,
+    writable_handles: BTreeMap<InodeId, usize>,
     ready: VecDeque<InodeId>,
     buffered_bytes: usize,
+    ingest_batches: u64,
+    ingest_fragments: u64,
+    maximum_ingest_batch_bytes: usize,
+    minimum_ingest_batch_target_bytes: usize,
+    maximum_ingest_ring_slots: usize,
+    ingest_ring_wait_ns: u64,
     shutdown: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IngestQueueStatus {
+    buffered_bytes: usize,
+    ingest_batches: u64,
+    ingest_fragments: u64,
+    maximum_ingest_batch_bytes: usize,
+    minimum_ingest_batch_target_bytes: usize,
+    maximum_ingest_ring_slots: usize,
+    ingest_ring_wait_ns: u64,
 }
 
 #[derive(Debug)]
@@ -1630,6 +1973,7 @@ struct IngestQueue {
 struct DetachedContainerWork {
     inode: InodeId,
     through_sequence: u64,
+    publication_ordinal: u64,
     chunks: Vec<PendingWriteThroughChunk>,
     payload_bytes: usize,
 }
@@ -1661,6 +2005,7 @@ impl DetachedContainerWork {
         Self {
             inode,
             through_sequence,
+            publication_ordinal: 0,
             chunks,
             payload_bytes,
         }
@@ -1670,8 +2015,11 @@ impl DetachedContainerWork {
 #[derive(Debug, Default)]
 struct InodePublicationQueue {
     pending: VecDeque<DetachedContainerWork>,
-    in_flight_sequence: Option<u64>,
+    in_flight: BTreeMap<u64, u64>,
+    next_publication_ordinal: u64,
+    next_retirement_ordinal: u64,
     last_enqueued_sequence: u64,
+    ready: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1700,7 +2048,7 @@ impl PublicationQueue {
         }
     }
 
-    fn enqueue(&self, work: DetachedContainerWork) {
+    fn enqueue(&self, mut work: DetachedContainerWork) {
         let inode = work.inode;
         let work_bytes = work.payload_bytes;
         let mut state = self
@@ -1730,10 +2078,13 @@ impl PublicationQueue {
             "ASSERT: detached per-inode publication sequence cannot move backwards"
         );
         inode_queue.last_enqueued_sequence = work.through_sequence;
-        let schedule = inode_queue.in_flight_sequence.is_none() && inode_queue.pending.is_empty();
+        work.publication_ordinal = inode_queue.next_publication_ordinal;
+        inode_queue.next_publication_ordinal = inode_queue
+            .next_publication_ordinal
+            .checked_add(1)
+            .expect("ASSERT: detached publication ordinal cannot overflow");
         inode_queue.pending.push_back(work);
-        if schedule {
-            state.ready.push_back(inode);
+        if schedule_publication_inodes(&mut state) {
             self.work_available.notify_one();
         }
     }
@@ -1745,19 +2096,30 @@ impl PublicationQueue {
             .expect("ASSERT: detached publication queue lock poisoned");
         loop {
             if let Some(inode) = state.ready.pop_front() {
+                let per_inode_limit = publication_window(&state);
                 let inode_queue = state
                     .inodes
                     .get_mut(&inode)
                     .expect("ASSERT: ready publication inode must own a queue");
-                assert!(
-                    inode_queue.in_flight_sequence.is_none(),
-                    "ASSERT: one inode cannot publish two Containers concurrently"
-                );
+                inode_queue.ready = false;
+                if inode_queue.pending.is_empty() || inode_queue.in_flight.len() >= per_inode_limit
+                {
+                    continue;
+                }
                 let work = inode_queue
                     .pending
                     .pop_front()
                     .expect("ASSERT: ready publication inode must own pending work");
-                inode_queue.in_flight_sequence = Some(work.through_sequence);
+                assert!(
+                    inode_queue
+                        .in_flight
+                        .insert(work.publication_ordinal, work.through_sequence)
+                        .is_none(),
+                    "ASSERT: detached publication ordinal is unique per inode"
+                );
+                if schedule_publication_inodes(&mut state) {
+                    self.work_available.notify_one();
+                }
                 return Some(work);
             }
             if state.shutdown {
@@ -1767,6 +2129,25 @@ impl PublicationQueue {
                 .work_available
                 .wait(state)
                 .expect("ASSERT: detached publication queue lock poisoned while waiting for work");
+        }
+    }
+
+    fn wait_for_retirement_turn(&self, work: &DetachedContainerWork) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: detached publication queue lock poisoned");
+        loop {
+            let inode_queue = state
+                .inodes
+                .get(&work.inode)
+                .expect("ASSERT: retiring publication inode retains queue state");
+            if inode_queue.next_retirement_ordinal == work.publication_ordinal {
+                return;
+            }
+            state = self.completed.wait(state).expect(
+                "ASSERT: detached publication queue lock poisoned while ordering completion",
+            );
         }
     }
 
@@ -1784,13 +2165,19 @@ impl PublicationQueue {
             .get_mut(&work.inode)
             .expect("ASSERT: completed publication inode must retain queue state");
         assert_eq!(
-            inode_queue.in_flight_sequence,
+            inode_queue.in_flight.remove(&work.publication_ordinal),
             Some(work.through_sequence),
             "ASSERT: completed publication must match the active inode sequence"
         );
-        inode_queue.in_flight_sequence = None;
-        if !inode_queue.pending.is_empty() {
-            state.ready.push_back(work.inode);
+        assert_eq!(
+            inode_queue.next_retirement_ordinal, work.publication_ordinal,
+            "ASSERT: detached publications retire in per-inode order"
+        );
+        inode_queue.next_retirement_ordinal = inode_queue
+            .next_retirement_ordinal
+            .checked_add(1)
+            .expect("ASSERT: detached retirement ordinal cannot overflow");
+        if schedule_publication_inodes(&mut state) {
             self.work_available.notify_one();
         }
         self.space_available.notify_all();
@@ -1805,8 +2192,9 @@ impl PublicationQueue {
         loop {
             let complete = state.inodes.get(&inode).is_none_or(|queue| {
                 queue
-                    .in_flight_sequence
-                    .is_none_or(|sequence| sequence > through_sequence)
+                    .in_flight
+                    .values()
+                    .all(|sequence| *sequence > through_sequence)
                     && queue
                         .pending
                         .front()
@@ -1840,7 +2228,77 @@ impl PublicationQueue {
     }
 }
 
+fn publication_window(state: &PublicationQueueState) -> usize {
+    let active_inodes = state
+        .inodes
+        .values()
+        .filter(|queue| !queue.pending.is_empty() || !queue.in_flight.is_empty())
+        .count();
+    if active_inodes <= 1 {
+        SINGLE_STREAM_PUBLICATION_WINDOW_V1
+    } else {
+        1
+    }
+}
+
+fn schedule_publication_inodes(state: &mut PublicationQueueState) -> bool {
+    let per_inode_limit = publication_window(state);
+    let mut scheduled = false;
+    let inodes = state.inodes.keys().copied().collect::<Vec<_>>();
+    for inode in inodes {
+        let queue = state
+            .inodes
+            .get_mut(&inode)
+            .expect("ASSERT: enumerated publication inode remains present");
+        if !queue.ready && !queue.pending.is_empty() && queue.in_flight.len() < per_inode_limit {
+            queue.ready = true;
+            state.ready.push_back(inode);
+            scheduled = true;
+        }
+    }
+    scheduled
+}
+
 impl IngestQueue {
+    fn opened_write_handle(&self, inode: InodeId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned");
+        let handles = state.writable_handles.entry(inode).or_default();
+        *handles = handles
+            .checked_add(1)
+            .expect("ASSERT: writable handle count cannot overflow");
+        if state.writable_handles.len() >= 2 {
+            let open_inodes = state
+                .inodes
+                .iter()
+                .filter_map(|(open_inode, queue)| queue.open.is_some().then_some(*open_inode))
+                .collect::<Vec<_>>();
+            for open_inode in open_inodes {
+                seal_open_ingest_batch(&mut state, open_inode);
+            }
+            self.work_available.notify_all();
+        }
+    }
+
+    fn released_write_handle(&self, inode: InodeId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned");
+        let handles = state
+            .writable_handles
+            .get_mut(&inode)
+            .expect("ASSERT: released writable handle must be tracked");
+        *handles = handles
+            .checked_sub(1)
+            .expect("ASSERT: writable handle count cannot underflow");
+        if *handles == 0 {
+            state.writable_handles.remove(&inode);
+        }
+    }
+
     fn new() -> Self {
         Self {
             state: Mutex::new(IngestQueueState::default()),
@@ -1850,36 +2308,172 @@ impl IngestQueue {
         }
     }
 
-    fn enqueue(&self, job: IngestJob) {
-        let job_bytes = job.buffered_bytes();
+    fn enqueue_write_fragment(&self, inode: InodeId, fragment: IngestWriteFragment) {
+        let fragment_bytes = fragment.bytes.len();
         assert!(
-            job_bytes <= WRITE_THROUGH_JOB_MAX_BYTES_V1,
-            "ASSERT: one queued ingest job exceeds its byte bound"
+            fragment_bytes <= WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1,
+            "ASSERT: one queued ingest fragment exceeds its byte bound"
         );
-        let inode = job.inode;
         let mut state = self
             .state
             .lock()
             .expect("ASSERT: ingest queue lock poisoned");
-        while state
-            .buffered_bytes
-            .checked_add(job_bytes)
-            .is_none_or(|total| total > WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1)
-        {
-            state = self
-                .space_available
-                .wait(state)
-                .expect("ASSERT: ingest queue lock poisoned while applying backpressure");
+        state.inodes.entry(inode).or_default();
+        if active_ingest_inodes_with_candidate(&state, inode) >= 2 {
+            self.enqueue_unbatched_fragment(state, inode, fragment);
+            return;
         }
+        state = self.wait_for_fragment_admission(state, inode, &fragment);
         assert!(
             !state.shutdown,
             "ASSERT: cannot enqueue after scheduler shutdown"
         );
         state.buffered_bytes = state
             .buffered_bytes
-            .checked_add(job_bytes)
+            .checked_add(fragment_bytes)
             .expect("ASSERT: bounded ingest queue bytes cannot overflow");
+        let batch_target =
+            ingest_batch_target_bytes(active_ingest_inodes_with_candidate(&state, inode));
         let inode_queue = state.inodes.entry(inode).or_default();
+        inode_queue.last_enqueued_sequence = fragment.mutation_sequence;
+        let open = inode_queue.open.get_or_insert_with(|| OpenIngestBatch {
+            opened_at: Instant::now(),
+            fragments: Vec::with_capacity(4),
+            buffered_bytes: 0,
+            last_mutation_sequence: fragment.mutation_sequence,
+        });
+        open.buffered_bytes = open
+            .buffered_bytes
+            .checked_add(fragment_bytes)
+            .expect("ASSERT: bounded open Ingest Batch bytes cannot overflow");
+        open.last_mutation_sequence = fragment.mutation_sequence;
+        open.fragments.push(fragment);
+        if open.buffered_bytes >= batch_target {
+            seal_open_ingest_batch(&mut state, inode);
+        }
+        self.work_available.notify_one();
+    }
+
+    fn enqueue_unbatched_fragment(
+        &self,
+        mut state: std::sync::MutexGuard<'_, IngestQueueState>,
+        inode: InodeId,
+        fragment: IngestWriteFragment,
+    ) {
+        let wait_started = Instant::now();
+        let mut waited = false;
+        while state
+            .buffered_bytes
+            .checked_add(fragment.bytes.len())
+            .is_none_or(|total| total > MULTI_STREAM_QUEUE_BUDGET_BYTES_V1)
+        {
+            waited = true;
+            state = self
+                .space_available
+                .wait(state)
+                .expect("ASSERT: ingest queue lock poisoned while applying backpressure");
+        }
+        if waited {
+            state.ingest_ring_wait_ns = state.ingest_ring_wait_ns.saturating_add(
+                u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+        }
+        record_minimum_ingest_batch_target(&mut state, WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1);
+        state.buffered_bytes = state
+            .buffered_bytes
+            .checked_add(fragment.bytes.len())
+            .expect("ASSERT: bounded ingest queue bytes cannot overflow");
+        let fragment_bytes = fragment.bytes.len();
+        let mutation_sequence = fragment.mutation_sequence;
+        let inode_queue = state
+            .inodes
+            .get_mut(&inode)
+            .expect("ASSERT: admitted inode retains queue state");
+        assert!(
+            mutation_sequence >= inode_queue.last_enqueued_sequence,
+            "ASSERT: per-inode ingest admission sequence cannot move backwards"
+        );
+        inode_queue.last_enqueued_sequence = mutation_sequence;
+        let schedule = !inode_queue.in_flight && inode_queue.pending.is_empty();
+        inode_queue.pending.push_back(IngestJob {
+            inode,
+            mutation_sequence,
+            kind: IngestJobKind::WriteFragment(fragment),
+        });
+        let queue_slots = ingest_ring_slots(inode_queue);
+        state.ingest_batches = state.ingest_batches.saturating_add(1);
+        state.ingest_fragments = state.ingest_fragments.saturating_add(1);
+        state.maximum_ingest_batch_bytes = state.maximum_ingest_batch_bytes.max(fragment_bytes);
+        state.maximum_ingest_ring_slots = state.maximum_ingest_ring_slots.max(queue_slots);
+        if schedule {
+            state.ready.push_back(inode);
+        }
+        self.work_available.notify_one();
+    }
+
+    fn wait_for_fragment_admission<'a>(
+        &self,
+        mut state: std::sync::MutexGuard<'a, IngestQueueState>,
+        inode: InodeId,
+        fragment: &IngestWriteFragment,
+    ) -> std::sync::MutexGuard<'a, IngestQueueState> {
+        let wait_started = Instant::now();
+        let mut waited = false;
+        loop {
+            let active_inodes = active_ingest_inodes_with_candidate(&state, inode);
+            let batch_target = ingest_batch_target_bytes(active_inodes);
+            record_minimum_ingest_batch_target(&mut state, batch_target);
+            if seal_open_batches_at_or_above(&mut state, batch_target) {
+                self.work_available.notify_all();
+            }
+            let inode_queue = state
+                .inodes
+                .get(&inode)
+                .expect("ASSERT: admitted inode retains queue state");
+            assert!(
+                fragment.mutation_sequence >= inode_queue.last_enqueued_sequence,
+                "ASSERT: per-inode ingest admission sequence cannot move backwards"
+            );
+            if !ingest_fragment_extends_batch(inode_queue, fragment, batch_target) {
+                seal_open_ingest_batch(&mut state, inode);
+                self.work_available.notify_one();
+                continue;
+            }
+            let ring_slots = SINGLE_STREAM_INGEST_RING_SLOTS_V1;
+            let has_slot =
+                inode_queue.open.is_some() || ingest_ring_slots(inode_queue) < ring_slots;
+            let has_bytes = state
+                .buffered_bytes
+                .checked_add(fragment.bytes.len())
+                .is_some_and(|total| total <= WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1);
+            if has_slot && has_bytes {
+                if waited {
+                    state.ingest_ring_wait_ns = state.ingest_ring_wait_ns.saturating_add(
+                        u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                }
+                return state;
+            }
+            waited = true;
+            state = self
+                .space_available
+                .wait(state)
+                .expect("ASSERT: ingest queue lock poisoned while applying backpressure");
+        }
+    }
+
+    fn enqueue(&self, job: IngestJob) {
+        let inode = job.inode;
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned");
+        state.inodes.entry(inode).or_default();
+        seal_open_ingest_batch(&mut state, inode);
+        let inode_queue = state
+            .inodes
+            .get_mut(&inode)
+            .expect("ASSERT: admitted inode retains queue state");
         assert!(
             job.mutation_sequence >= inode_queue.last_enqueued_sequence,
             "ASSERT: per-inode ingest admission sequence cannot move backwards"
@@ -1889,8 +2483,8 @@ impl IngestQueue {
         inode_queue.pending.push_back(job);
         if schedule {
             state.ready.push_back(inode);
-            self.work_available.notify_one();
         }
+        self.work_available.notify_one();
     }
 
     fn next_job(&self) -> Option<IngestJob> {
@@ -1899,6 +2493,7 @@ impl IngestQueue {
             .lock()
             .expect("ASSERT: ingest queue lock poisoned");
         loop {
+            seal_expired_ingest_batches(&mut state, Instant::now());
             if let Some(inode) = state.ready.pop_front() {
                 let inode_queue = state
                     .inodes
@@ -1918,10 +2513,18 @@ impl IngestQueue {
             if state.shutdown {
                 return None;
             }
-            state = self
-                .work_available
-                .wait(state)
-                .expect("ASSERT: ingest queue lock poisoned while waiting for work");
+            if let Some(wait) = next_ingest_batch_expiry(&state, Instant::now()) {
+                let (next, _) = self
+                    .work_available
+                    .wait_timeout(state, wait)
+                    .expect("ASSERT: ingest queue lock poisoned while waiting for batch age");
+                state = next;
+            } else {
+                state = self
+                    .work_available
+                    .wait(state)
+                    .expect("ASSERT: ingest queue lock poisoned while waiting for work");
+            }
         }
     }
 
@@ -1943,13 +2546,11 @@ impl IngestQueue {
             "ASSERT: completed ingest job must have been active"
         );
         inode_queue.in_flight = false;
-        if job.final_for_sequence() {
-            assert!(
-                job.mutation_sequence >= inode_queue.completed_sequence,
-                "ASSERT: completed inode sequence cannot move backwards"
-            );
-            inode_queue.completed_sequence = job.mutation_sequence;
-        }
+        assert!(
+            job.mutation_sequence >= inode_queue.completed_sequence,
+            "ASSERT: completed inode sequence cannot move backwards"
+        );
+        inode_queue.completed_sequence = job.mutation_sequence;
         if !inode_queue.pending.is_empty() {
             state.ready.push_back(job.inode);
             self.work_available.notify_one();
@@ -1963,6 +2564,9 @@ impl IngestQueue {
             .state
             .lock()
             .expect("ASSERT: ingest queue lock poisoned");
+        if seal_open_ingest_batch(&mut state, inode) {
+            self.work_available.notify_one();
+        }
         loop {
             let complete = state
                 .inodes
@@ -1978,11 +2582,20 @@ impl IngestQueue {
         }
     }
 
-    fn buffered_bytes(&self) -> usize {
-        self.state
+    fn status(&self) -> IngestQueueStatus {
+        let state = self
+            .state
             .lock()
-            .expect("ASSERT: ingest queue lock poisoned")
-            .buffered_bytes
+            .expect("ASSERT: ingest queue lock poisoned");
+        IngestQueueStatus {
+            buffered_bytes: state.buffered_bytes,
+            ingest_batches: state.ingest_batches,
+            ingest_fragments: state.ingest_fragments,
+            maximum_ingest_batch_bytes: state.maximum_ingest_batch_bytes,
+            minimum_ingest_batch_target_bytes: state.minimum_ingest_batch_target_bytes,
+            maximum_ingest_ring_slots: state.maximum_ingest_ring_slots,
+            ingest_ring_wait_ns: state.ingest_ring_wait_ns,
+        }
     }
 
     fn shutdown(&self) {
@@ -1990,11 +2603,151 @@ impl IngestQueue {
             .state
             .lock()
             .expect("ASSERT: ingest queue lock poisoned during shutdown");
+        let open_inodes = state
+            .inodes
+            .iter()
+            .filter_map(|(inode, queue)| queue.open.as_ref().map(|_| *inode))
+            .collect::<Vec<_>>();
+        for inode in open_inodes {
+            seal_open_ingest_batch(&mut state, inode);
+        }
         state.shutdown = true;
         self.work_available.notify_all();
         self.space_available.notify_all();
         self.completed.notify_all();
     }
+}
+
+fn ingest_ring_slots(queue: &InodeJobQueue) -> usize {
+    queue.pending.len() + usize::from(queue.in_flight) + usize::from(queue.open.is_some())
+}
+
+fn active_ingest_inodes_with_candidate(state: &IngestQueueState, candidate: InodeId) -> usize {
+    if !state.writable_handles.is_empty() {
+        return state.writable_handles.len()
+            + usize::from(!state.writable_handles.contains_key(&candidate));
+    }
+    let active = state
+        .inodes
+        .iter()
+        .filter(|(_, queue)| ingest_ring_slots(queue) != 0)
+        .count();
+    let candidate_active = state
+        .inodes
+        .get(&candidate)
+        .is_some_and(|queue| ingest_ring_slots(queue) != 0);
+    active + usize::from(!candidate_active)
+}
+
+fn ingest_batch_target_bytes(active_inodes: usize) -> usize {
+    match active_inodes {
+        0..=1 => SINGLE_STREAM_INGEST_BATCH_BYTES_V1,
+        _ => WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1,
+    }
+}
+
+fn record_minimum_ingest_batch_target(state: &mut IngestQueueState, target: usize) {
+    if state.minimum_ingest_batch_target_bytes == 0 {
+        state.minimum_ingest_batch_target_bytes = target;
+    } else {
+        state.minimum_ingest_batch_target_bytes =
+            state.minimum_ingest_batch_target_bytes.min(target);
+    }
+}
+
+fn ingest_fragment_extends_batch(
+    queue: &InodeJobQueue,
+    fragment: &IngestWriteFragment,
+    target: usize,
+) -> bool {
+    queue.open.as_ref().is_none_or(|open| {
+        let contiguous = open.fragments.last().is_none_or(|last| {
+            last.offset
+                .checked_add(
+                    u64::try_from(last.bytes.len()).expect("ASSERT: fragment length fits u64"),
+                )
+                .is_some_and(|next| next == fragment.offset)
+                && fragment.mutation_sequence >= last.mutation_sequence
+        });
+        let fits = open
+            .buffered_bytes
+            .checked_add(fragment.bytes.len())
+            .is_some_and(|bytes| bytes <= target);
+        contiguous && fits
+    })
+}
+
+fn seal_open_batches_at_or_above(state: &mut IngestQueueState, target: usize) -> bool {
+    let ready = state
+        .inodes
+        .iter()
+        .filter_map(|(inode, queue)| {
+            queue
+                .open
+                .as_ref()
+                .is_some_and(|open| open.buffered_bytes >= target)
+                .then_some(*inode)
+        })
+        .collect::<Vec<_>>();
+    let mut sealed = false;
+    for inode in ready {
+        sealed |= seal_open_ingest_batch(state, inode);
+    }
+    sealed
+}
+
+fn seal_open_ingest_batch(state: &mut IngestQueueState, inode: InodeId) -> bool {
+    let Some(queue) = state.inodes.get_mut(&inode) else {
+        return false;
+    };
+    let Some(open) = queue.open.take() else {
+        return false;
+    };
+    let fragment_count = open.fragments.len();
+    let batch_bytes = open.buffered_bytes;
+    let schedule = !queue.in_flight && queue.pending.is_empty();
+    queue.pending.push_back(open.into_job(inode));
+    let ring_slots = ingest_ring_slots(queue);
+    state.ingest_batches = state.ingest_batches.saturating_add(1);
+    state.ingest_fragments = state
+        .ingest_fragments
+        .saturating_add(u64::try_from(fragment_count).unwrap_or(u64::MAX));
+    state.maximum_ingest_batch_bytes = state.maximum_ingest_batch_bytes.max(batch_bytes);
+    state.maximum_ingest_ring_slots = state.maximum_ingest_ring_slots.max(ring_slots);
+    if schedule {
+        state.ready.push_back(inode);
+    }
+    true
+}
+
+fn seal_expired_ingest_batches(state: &mut IngestQueueState, now: Instant) -> bool {
+    let expired = state
+        .inodes
+        .iter()
+        .filter_map(|(inode, queue)| {
+            queue.open.as_ref().and_then(|open| {
+                (now.saturating_duration_since(open.opened_at) >= INGEST_BATCH_MAXIMUM_AGE_V1)
+                    .then_some(*inode)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut sealed = false;
+    for inode in expired {
+        sealed |= seal_open_ingest_batch(state, inode);
+    }
+    sealed
+}
+
+fn next_ingest_batch_expiry(state: &IngestQueueState, now: Instant) -> Option<Duration> {
+    state
+        .inodes
+        .values()
+        .filter_map(|queue| queue.open.as_ref())
+        .map(|open| {
+            INGEST_BATCH_MAXIMUM_AGE_V1
+                .saturating_sub(now.saturating_duration_since(open.opened_at))
+        })
+        .min()
 }
 
 struct WorkerPermits {
@@ -2298,10 +3051,11 @@ impl<C> fmt::Debug for WriteThroughIngest<C> {
             .overflow
             .lock()
             .expect("ASSERT: write-through overflow lane lock poisoned");
+        let ingest = self.queue.status();
         let buffered_bytes = buffered_bytes
             .checked_add(overflow.tail.len())
             .and_then(|sum| sum.checked_add(overflow.pending_bytes))
-            .and_then(|sum| sum.checked_add(self.queue.buffered_bytes()))
+            .and_then(|sum| sum.checked_add(ingest.buffered_bytes))
             .and_then(|sum| sum.checked_add(self.publication_queue.buffered_bytes()))
             .expect("ASSERT: bounded write-through bytes cannot overflow");
         assert!(
@@ -2373,7 +3127,11 @@ where
                 .spawn(move || {
                     while let Some(work) = queue.next_work() {
                         if let Some(owner) = owner.upgrade() {
-                            owner.process_detached_container(&work);
+                            let result = owner.publish_detached_container(&work);
+                            queue.wait_for_retirement_turn(&work);
+                            owner.retire_detached_container(&work, result);
+                        } else {
+                            queue.wait_for_retirement_turn(&work);
                         }
                         queue.finish(&work);
                     }
@@ -2393,7 +3151,7 @@ where
         let mut consumed = 0_usize;
         while consumed < bytes.len() {
             let chunk_end = consumed
-                .saturating_add(WRITE_THROUGH_JOB_MAX_BYTES_V1)
+                .saturating_add(WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1)
                 .min(bytes.len());
             let job_offset = offset
                 .checked_add(u64::try_from(consumed).expect("ASSERT: queued offset fits u64"))
@@ -2402,23 +3160,23 @@ where
                 .checked_slice(consumed, chunk_end)
                 .expect("ASSERT: queued write slice lies inside accepted payload");
             consumed = chunk_end;
-            self.queue.enqueue(IngestJob {
+            self.queue.enqueue_write_fragment(
                 inode,
-                mutation_sequence,
-                kind: IngestJobKind::Write {
+                IngestWriteFragment {
                     offset: job_offset,
                     bytes: chunk,
-                    final_for_sequence: consumed == bytes.len(),
+                    mutation_sequence,
                 },
-            });
+            );
         }
     }
 
     fn process_job(&self, job: &IngestJob) {
         let result = match &job.kind {
-            IngestJobKind::Write { offset, bytes, .. } => {
-                self.stage_write(job.inode, *offset, job.mutation_sequence, bytes.clone())
+            IngestJobKind::WriteFragment(fragment) => {
+                self.stage_write_batch(job.inode, std::slice::from_ref(fragment))
             }
+            IngestJobKind::WriteBatch { fragments } => self.stage_write_batch(job.inode, fragments),
             IngestJobKind::Truncate => {
                 self.reset_lane(job.inode);
                 Ok(Vec::new())
@@ -2436,9 +3194,20 @@ where
         }
     }
 
-    fn process_detached_container(&self, work: &DetachedContainerWork) {
+    fn publish_detached_container(
+        &self,
+        work: &DetachedContainerWork,
+    ) -> Result<(Vec<ExternalizedExtent>, bool), DurableNamespaceError> {
         let _active_writer = ActiveWriteThrough::enter(&self.active_writers);
-        match self.publish_chunks(&work.chunks, work.inode, work.through_sequence) {
+        self.publish_chunks(&work.chunks, work.inode, work.through_sequence)
+    }
+
+    fn retire_detached_container(
+        &self,
+        work: &DetachedContainerWork,
+        result: Result<(Vec<ExternalizedExtent>, bool), DurableNamespaceError>,
+    ) {
+        match result {
             Ok((externalized, sealed)) => {
                 if let Some(namespace) = self.namespace.get().and_then(Weak::upgrade) {
                     namespace.externalize_verified_extents(externalized);
@@ -2457,7 +3226,11 @@ where
 
     fn degrade_job(&self, job: &IngestJob, error: &DurableNamespaceError) {
         let (offset, length) = match &job.kind {
-            IngestJobKind::Write { offset, bytes, .. } => (*offset, bytes.len()),
+            IngestJobKind::WriteFragment(fragment) => (fragment.offset, fragment.bytes.len()),
+            IngestJobKind::WriteBatch { fragments } => (
+                fragments.first().map_or(0, |fragment| fragment.offset),
+                job.buffered_bytes(),
+            ),
             IngestJobKind::Truncate => (0, 0),
         };
         eprintln!(
@@ -2533,9 +3306,9 @@ where
             .checked_add(overflow.tail.len())
             .and_then(|sum| sum.checked_add(overflow.pending_bytes))
             .expect("ASSERT: bounded write-through bytes cannot overflow");
-        let queued_bytes = self
-            .queue
-            .buffered_bytes()
+        let ingest = self.queue.status();
+        let queued_bytes = ingest
+            .buffered_bytes
             .checked_add(self.publication_queue.buffered_bytes())
             .expect("ASSERT: bounded scheduler queue bytes cannot overflow");
         let buffered = buffered
@@ -2558,6 +3331,17 @@ where
                 .expect("ASSERT: process hash-batch count fits u64"),
             maximum_hash_workers: u64::try_from(self.maximum_hash_workers.load(Ordering::Relaxed))
                 .expect("ASSERT: process hash-worker count fits u64"),
+            ingest_batches: ingest.ingest_batches,
+            ingest_fragments: ingest.ingest_fragments,
+            maximum_ingest_batch_bytes: u64::try_from(ingest.maximum_ingest_batch_bytes)
+                .expect("ASSERT: bounded Ingest Batch bytes fit u64"),
+            minimum_ingest_batch_target_bytes: u64::try_from(
+                ingest.minimum_ingest_batch_target_bytes,
+            )
+            .expect("ASSERT: bounded Ingest Batch target fits u64"),
+            maximum_ingest_ring_slots: u64::try_from(ingest.maximum_ingest_ring_slots)
+                .expect("ASSERT: bounded Ingest Ring slots fit u64"),
+            ingest_ring_wait_ns: ingest.ingest_ring_wait_ns,
             hash_cpu: self.hash_cpu.status(),
             encode_cpu: self.encode_cpu.status(),
             degraded: snapshot.degraded,
@@ -2598,61 +3382,67 @@ where
         // the write-through path publishes its next Container.
     }
 
-    fn stage_write(
+    fn stage_write_batch(
         &self,
         inode: InodeId,
-        offset: u64,
-        through_sequence: u64,
-        bytes: MutationPayload,
+        fragments: &[IngestWriteFragment],
     ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
+        assert!(
+            !fragments.is_empty(),
+            "ASSERT: an Ingest Batch contains at least one fragment"
+        );
         let _active_writer = ActiveWriteThrough::enter(&self.active_writers);
         let lane = self.lane_for(inode);
         let mut lane = lane
             .lock()
             .expect("ASSERT: write-through lane lock poisoned");
-        let discontinuous = lane.inode != Some(inode)
-            || lane.next_offset != offset
-            || lane
-                .last_mutation_sequence
-                .is_some_and(|previous| through_sequence <= previous);
-        if discontinuous {
-            lane.inode = Some(inode);
-            lane.tail_offset = offset;
-            lane.tail.clear();
-            lane.pending_chunks.clear();
-            lane.pending_bytes = 0;
-        }
-        assert_bounded_write_through_lane(&lane);
-        lane.last_mutation_sequence = Some(through_sequence);
-        lane.next_offset = offset
-            .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize fits u64"))
-            .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
-        lane.tail.push(bytes);
         let mut externalized = Vec::new();
-        loop {
-            externalized.extend(self.extract_stable_chunks(
-                &mut lane,
-                inode,
-                through_sequence,
-                StableExtraction::FillContainer,
-            )?);
-            if lane.pending_bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
-                break;
+        for fragment in fragments {
+            let discontinuous = lane.inode != Some(inode)
+                || lane.next_offset != fragment.offset
+                || lane
+                    .last_mutation_sequence
+                    .is_some_and(|previous| fragment.mutation_sequence <= previous);
+            if discontinuous {
+                lane.inode = Some(inode);
+                lane.tail_offset = fragment.offset;
+                lane.tail.clear();
+                lane.pending_chunks.clear();
+                lane.pending_bytes = 0;
             }
-            assert!(
-                lane.pending_bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
-                "ASSERT: write-through payload exceeded its pre-format Container bound"
-            );
-            let work = DetachedContainerWork::new(
-                inode,
-                through_sequence,
-                std::mem::take(&mut lane.pending_chunks),
-                std::mem::take(&mut lane.pending_bytes),
-            );
-            assert_pending_write_through_state(&lane);
-            self.publication_queue.enqueue(work);
+            assert_bounded_write_through_lane(&lane);
+            lane.last_mutation_sequence = Some(fragment.mutation_sequence);
+            lane.next_offset = fragment
+                .offset
+                .checked_add(u64::try_from(fragment.bytes.len()).expect("ASSERT: usize fits u64"))
+                .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
+            lane.tail
+                .push(fragment.bytes.clone(), fragment.mutation_sequence);
+            loop {
+                externalized.extend(self.extract_stable_chunks(
+                    &mut lane,
+                    inode,
+                    fragment.mutation_sequence,
+                    StableExtraction::FillContainer,
+                )?);
+                if lane.pending_bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
+                    break;
+                }
+                assert!(
+                    lane.pending_bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
+                    "ASSERT: write-through payload exceeded its pre-format Container bound"
+                );
+                let work = DetachedContainerWork::new(
+                    inode,
+                    fragment.mutation_sequence,
+                    std::mem::take(&mut lane.pending_chunks),
+                    std::mem::take(&mut lane.pending_bytes),
+                );
+                assert_pending_write_through_state(&lane);
+                self.publication_queue.enqueue(work);
+            }
+            assert_bounded_write_through_lane(&lane);
         }
-        assert_bounded_write_through_lane(&lane);
         drop(lane);
         Ok(externalized)
     }
@@ -2797,13 +3587,18 @@ where
                 "ASSERT: every stable Chunk has one classification"
             );
             for (chunk, chunk_id) in batch.into_iter().zip(chunk_ids) {
+                let chunk_through_sequence = chunk.bytes.through_sequence();
+                assert!(
+                    chunk_through_sequence <= through_sequence,
+                    "ASSERT: one stable Chunk cannot depend on a future mutation"
+                );
                 let logical_length = u64::try_from(chunk.bytes.len())
                     .expect("ASSERT: bounded SeqCDC Chunk length fits u64");
                 let Some(chunk_id) = chunk_id else {
                     externalized.push(ExternalizedExtent::new(
                         inode,
                         chunk.offset,
-                        through_sequence,
+                        chunk_through_sequence,
                         Arc::new(FillCommittedFile {
                             value: chunk.bytes.first_byte(),
                             length: logical_length,
@@ -2818,7 +3613,7 @@ where
                     externalized.push(self.externalized_location(
                         inode,
                         chunk.offset,
-                        through_sequence,
+                        chunk_through_sequence,
                         entry,
                         OnlineProofAdmission::Touch,
                     )?);
@@ -2831,7 +3626,7 @@ where
                     externalized.push(self.externalized_location(
                         inode,
                         chunk.offset,
-                        through_sequence,
+                        chunk_through_sequence,
                         entry,
                         OnlineProofAdmission::ExactReuse,
                     )?);
@@ -2880,7 +3675,7 @@ where
             !chunks.is_empty(),
             "ASSERT: Container publication requires at least one pending Chunk"
         );
-        let mut locations = BTreeMap::<ChunkId, (ExactIndexEntry, OnlineProofAdmission)>::new();
+        let mut locations = BTreeMap::<ChunkId, ExactIndexEntry>::new();
         let mut candidates = BTreeMap::<ChunkId, (u32, &PendingWriteThroughChunk)>::new();
         let mut new_chunks = Vec::new();
         new_chunks
@@ -2902,63 +3697,25 @@ where
             }
             candidates.insert(chunk_id, (logical_length, chunk));
         }
-        let requests = candidates
-            .iter()
-            .map(|(chunk_id, (logical_length, _))| (*chunk_id, u64::from(*logical_length)))
-            .collect::<Vec<_>>();
-        let mut resolved = self.online_dependency_proofs.verified_entries(&requests);
-        let resolved_from_cache = resolved.iter().map(Option::is_some).collect::<Vec<_>>();
-        let missing_requests = requests
-            .iter()
-            .zip(&resolved)
-            .filter_map(|(request, resolved)| resolved.is_none().then_some(*request))
-            .collect::<Vec<_>>();
-        let mut looked_up = self
-            .index
-            .verified_locations(&self.containers, &missing_requests)
-            .into_iter();
-        for resolved in &mut resolved {
-            if resolved.is_none() {
-                *resolved = looked_up
-                    .next()
-                    .expect("ASSERT: batched Exact lookup returns every missing result");
+        let mut claims = PublicationClaims::new(&self.online_dependency_proofs, candidates.len())?;
+        for (chunk_id, (logical_length, chunk)) in candidates {
+            match claims.claim(chunk_id, logical_length) {
+                PublicationClaim::Existing(entry) => {
+                    assert!(
+                        locations.insert(chunk_id, entry).is_none(),
+                        "ASSERT: one candidate Chunk has one publication result"
+                    );
+                }
+                PublicationClaim::Acquired => new_chunks.push(chunk),
             }
         }
-        assert!(
-            looked_up.next().is_none(),
-            "ASSERT: batched Exact lookup cannot return surplus results"
-        );
-        assert_eq!(
-            resolved.len(),
-            candidates.len(),
-            "ASSERT: batched Exact lookup returns one result per sorted unique request"
-        );
-        for (((chunk_id, (_logical_length, chunk)), location), from_cache) in candidates
-            .into_iter()
-            .zip(resolved)
-            .zip(resolved_from_cache)
-        {
-            if let Some(entry) = location {
-                let admission = if from_cache {
-                    OnlineProofAdmission::Touch
-                } else {
-                    OnlineProofAdmission::ExactReuse
-                };
-                locations.insert(chunk_id, (entry, admission));
-            } else {
-                new_chunks.push(chunk);
-            }
-        }
-        if new_chunks.is_empty() {
-            return self
-                .externalize_chunks(chunks, inode, through_sequence, &locations)
-                .map(|externalized| (externalized, false));
-        }
-        let entries = self.publish_new_chunks(&new_chunks)?;
+        let entries = if new_chunks.is_empty() {
+            Vec::new()
+        } else {
+            self.publish_new_chunks(&new_chunks)?
+        };
         for entry in &entries {
-            if let Some((previous, _)) =
-                locations.insert(entry.chunk_id(), (*entry, OnlineProofAdmission::Published))
-            {
+            if let Some(previous) = locations.insert(entry.chunk_id(), *entry) {
                 assert_eq!(
                     previous.logical_length(),
                     entry.logical_length(),
@@ -2966,9 +3723,17 @@ where
                 );
             }
         }
-        let externalized = self.externalize_chunks(chunks, inode, through_sequence, &locations)?;
+        claims.finish(&entries);
+        let sealed = !entries.is_empty();
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.bytes.through_sequence() <= through_sequence),
+            "ASSERT: detached work sequence covers every published Chunk"
+        );
+        let externalized = self.externalize_chunks(chunks, inode, &locations)?;
         self.index.publish_level_zero(entries);
-        Ok((externalized, true))
+        Ok((externalized, sealed))
     }
 
     fn publish_new_chunks(
@@ -2979,33 +3744,40 @@ where
             !new_chunks.is_empty(),
             "ASSERT: a new-Chunk Container must contain at least one Chunk"
         );
-        let materialized = new_chunks
+        let prepared_regions = prepare_compression_regions(new_chunks)?;
+        let materialized_chunks = prepared_regions
+            .materialized
             .iter()
-            .map(|chunk| chunk.bytes.materialize_new_chunk())
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut regions = Vec::<Vec<PrehashedChunk<'_>>>::new();
-        let mut region_bytes = 0_usize;
-        for (chunk, bytes) in new_chunks.iter().zip(&materialized) {
-            if region_bytes != 0
-                && region_bytes
-                    .checked_add(bytes.len())
-                    .ok_or(DurableNamespaceError::OutOfMemory)?
-                    > COMPRESSION_REGION_TARGET_BYTES
-            {
-                region_bytes = 0;
-            }
-            if region_bytes == 0 {
-                regions.push(Vec::new());
-            }
-            regions
-                .last_mut()
-                .expect("ASSERT: active region exists")
-                .push(PrehashedChunk::new(chunk.chunk_id, bytes));
-            region_bytes = region_bytes
-                .checked_add(bytes.len())
-                .ok_or(DurableNamespaceError::OutOfMemory)?;
-        }
-        let region_refs = regions.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            .map(|region| {
+                region
+                    .chunks
+                    .iter()
+                    .map(|(chunk_id, range)| {
+                        PrehashedChunk::new(*chunk_id, &region.decoded[range.clone()])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let contiguous_regions = materialized_chunks
+            .iter()
+            .zip(&prepared_regions.materialized)
+            .map(|(chunks, region)| {
+                PrehashedContiguousRegion::new(chunks, &region.decoded)
+                    .expect("ASSERT: constructed Chunk views exactly partition their region")
+            })
+            .collect::<Vec<_>>();
+        let regions = prepared_regions
+            .order
+            .iter()
+            .map(|region| match *region {
+                CompressionRegionOrder::Borrowed(ordinal) => {
+                    PrehashedAdaptiveRegion::Borrowed(&prepared_regions.borrowed[ordinal])
+                }
+                CompressionRegionOrder::Materialized(ordinal) => {
+                    PrehashedAdaptiveRegion::Contiguous(contiguous_regions[ordinal])
+                }
+            })
+            .collect::<Vec<_>>();
         let generation = reserve_container_generation(&self.next_generation)?;
         let active_writers = self.active_writers.load(Ordering::Acquire);
         let desired_workers = workers_per_ingest_job(self.worker_budget, active_writers);
@@ -3017,10 +3789,10 @@ where
             workers.get() <= self.worker_budget.get(),
             "ASSERT: one encode job cannot exceed the write-through worker budget"
         );
-        let prepared = ContainerRepository::<C>::prepare_prehashed_adaptive_regions_parallel(
+        let prepared = ContainerRepository::<C>::prepare_mixed_prehashed_adaptive_regions_parallel(
             random_container_id()?,
             generation,
-            &region_refs,
+            &regions,
             workers,
         )?;
         drop(cpu_phase);
@@ -3044,8 +3816,7 @@ where
         &self,
         chunks: &[PendingWriteThroughChunk],
         inode: InodeId,
-        through_sequence: u64,
-        locations: &BTreeMap<ChunkId, (ExactIndexEntry, OnlineProofAdmission)>,
+        locations: &BTreeMap<ChunkId, ExactIndexEntry>,
     ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
         let mut externalized = Vec::new();
         externalized
@@ -3053,7 +3824,7 @@ where
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         for pending in chunks {
             let chunk_id = pending.chunk_id;
-            let (entry, admission) = locations
+            let entry = locations
                 .get(&chunk_id)
                 .copied()
                 .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
@@ -3066,12 +3837,11 @@ where
                     second_length: u64::from(expected_length),
                 });
             }
-            externalized.push(self.externalized_location(
+            externalized.push(self.externalized_proven_location(
                 inode,
                 pending.offset,
-                through_sequence,
+                pending.bytes.through_sequence(),
                 entry,
-                admission,
             )?);
         }
         Ok(externalized)
@@ -3087,6 +3857,16 @@ where
     ) -> Result<ExternalizedExtent, DurableNamespaceError> {
         self.online_dependency_proofs
             .remember_active(entry, admission);
+        self.externalized_proven_location(inode, offset, through_sequence, entry)
+    }
+
+    fn externalized_proven_location(
+        &self,
+        inode: InodeId,
+        offset: u64,
+        through_sequence: u64,
+        entry: ExactIndexEntry,
+    ) -> Result<ExternalizedExtent, DurableNamespaceError> {
         ExternalizedExtent::new(
             inode,
             offset,
@@ -3104,6 +3884,14 @@ impl<C> MutationObserver for WriteThroughIngest<C>
 where
     C: Clone + Send + Sync + StorageIo + 'static,
 {
+    fn opened_write_handle(&self, inode: InodeId) {
+        self.queue.opened_write_handle(inode);
+    }
+
+    fn released_write_handle(&self, inode: InodeId) {
+        self.queue.released_write_handle(inode);
+    }
+
     fn accepted_write(
         &self,
         inode: InodeId,
@@ -3194,11 +3982,6 @@ trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
         chunk_id: ChunkId,
         logical_length: u64,
     ) -> Option<ExactIndexEntry>;
-    fn verified_locations(
-        &self,
-        containers: &ContainerRepository<C>,
-        requests: &[(ChunkId, u64)],
-    ) -> Vec<Option<ExactIndexEntry>>;
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>);
     fn flush_level_zero(&self);
     fn exact_index_degraded(&self) -> bool;
@@ -3232,14 +4015,6 @@ impl<C: StorageIo + 'static> ManifestReaderPolicy<C> for ScanManifestReaders {
         _logical_length: u64,
     ) -> Option<ExactIndexEntry> {
         None
-    }
-
-    fn verified_locations(
-        &self,
-        _containers: &ContainerRepository<C>,
-        requests: &[(ChunkId, u64)],
-    ) -> Vec<Option<ExactIndexEntry>> {
-        vec![None; requests.len()]
     }
 
     fn publish_level_zero(&self, _entries: Vec<ExactIndexEntry>) {}
@@ -3480,38 +4255,6 @@ where
             self.core.degraded.store(true, Ordering::Release);
             None
         }
-    }
-
-    fn verified_locations(
-        &self,
-        containers: &ContainerRepository<C>,
-        requests: &[(ChunkId, u64)],
-    ) -> Vec<Option<ExactIndexEntry>> {
-        let active = self
-            .core
-            .active
-            .read()
-            .expect("ASSERT: active Exact Index reader lock poisoned")
-            .clone();
-        requests
-            .iter()
-            .map(|(chunk_id, logical_length)| {
-                if let Some(recent) = self.core.recent_location(*chunk_id, *logical_length)
-                    && containers.read_verified_location(recent).is_ok()
-                {
-                    return Some(recent);
-                }
-                let active = active.as_ref()?;
-                if let Ok(location) =
-                    containers.find_verified_location_with_index(active, *chunk_id, *logical_length)
-                {
-                    location
-                } else {
-                    self.core.degraded.store(true, Ordering::Release);
-                    None
-                }
-            })
-            .collect()
     }
 
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>) {
@@ -4217,7 +4960,7 @@ where
         next_manifests
             .try_reserve_exact(verified_files.len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for (ordinal, (inode, verified)) in commit.inodes().iter().zip(verified_files).enumerate() {
+        for (inode, verified) in commit.inodes().iter().zip(verified_files) {
             assert_eq!(
                 verified.inode(),
                 inode.inode().get(),
@@ -4230,7 +4973,10 @@ where
             );
             assert_eq!(
                 verified.manifest_root(),
-                Some(root.inodes()[ordinal].manifest_root()),
+                root.inodes()
+                    .binary_search_by_key(&inode.inode().get(), DurableInode::inode)
+                    .ok()
+                    .and_then(|ordinal| root.inodes()[ordinal].file_manifest_root()),
                 "ASSERT: committed DATA proof must retain the published Manifest Root"
             );
             assert_eq!(
@@ -4273,8 +5019,21 @@ where
 
 fn namespace_root_for_commit(
     commit: &NamespaceCommit,
-    durable_inodes: Vec<DurableInode>,
+    mut durable_inodes: Vec<DurableInode>,
 ) -> Result<NamespaceRoot, DurableNamespaceError> {
+    durable_inodes
+        .try_reserve_exact(commit.directories().len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    for directory in commit.directories() {
+        durable_inodes.push(DurableInode::new_directory(
+            directory.inode().get(),
+            directory.mode(),
+            directory.uid(),
+            directory.gid(),
+            directory.link_count(),
+            directory.mutation_sequence(),
+        )?);
+    }
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(commit.entries().len())
@@ -4632,14 +5391,14 @@ fn load_manifest_cache<I: StorageIo>(
     root: &NamespaceRoot,
     files: &[VerifiedCommittedFile<I>],
 ) -> Result<Vec<InstalledManifest>, DurableNamespaceError> {
-    if root.inodes().len() != files.len() {
+    if root.file_inode_count() != files.len() {
         return Err(DurableNamespaceError::FrozenViewMismatch);
     }
     let mut manifests: Vec<InstalledManifest> = Vec::new();
     manifests
-        .try_reserve_exact(root.inodes().len())
+        .try_reserve_exact(root.file_inode_count())
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-    for (inode, file) in root.inodes().iter().zip(files) {
+    for (inode, file) in root.file_inodes().zip(files) {
         if file.inode() != inode.inode()
             || file.manifest_root() != Some(inode.manifest_root())
             || file.logical_size() != inode.logical_size()
@@ -5900,7 +6659,79 @@ impl From<MountError> for DurableNamespaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastdup_format::ExactIndexLocation;
     use fastdup_testkit::MemoryStorageIo;
+
+    #[test]
+    fn completing_one_publication_batch_is_atomic_with_generation_freeze() {
+        const ENTRY_COUNT: usize = 16_384;
+
+        let proofs = Arc::new(OnlineDependencyProofs::new().expect("allocate proof sets"));
+        let container_id = ContainerId::new([0xA7; 16]).expect("fixture ID is nonzero");
+        let mut entries = Vec::with_capacity(ENTRY_COUNT);
+        let mut claimed = Vec::with_capacity(ENTRY_COUNT);
+        for ordinal in 0..ENTRY_COUNT {
+            let mut chunk_bytes = [0_u8; 32];
+            chunk_bytes[..8].copy_from_slice(
+                &u64::try_from(ordinal + 1)
+                    .expect("fixture ordinal fits u64")
+                    .to_le_bytes(),
+            );
+            let chunk_id = ChunkId::from_bytes(chunk_bytes);
+            let logical_length = 1_u32;
+            let record_offset =
+                4_096_u64 + u64::try_from(ordinal).expect("fixture ordinal fits u64") * 256;
+            let location = ExactIndexLocation::raw(
+                container_id,
+                1,
+                record_offset,
+                256,
+                u32::try_from(ordinal).expect("fixture ordinal fits u32"),
+            )
+            .expect("construct fixture RAW location");
+            let entry = ExactIndexEntry::active(chunk_id, logical_length, location)
+                .expect("construct fixture Exact entry");
+            assert!(matches!(
+                proofs.claim_publication(chunk_id, logical_length),
+                PublicationClaim::Acquired
+            ));
+            entries.push(entry);
+            claimed.push((chunk_id, logical_length));
+        }
+
+        let publisher_proofs = Arc::clone(&proofs);
+        let publisher = std::thread::spawn(move || {
+            publisher_proofs.finish_publications(&entries, &claimed);
+        });
+
+        let mut observed_partial_batch = false;
+        loop {
+            let state = proofs
+                .generation
+                .lock()
+                .expect("fixture Generation Proof Set lock remains healthy");
+            if !state.active.is_empty() && !state.publishing.is_empty() {
+                observed_partial_batch = true;
+                drop(state);
+                assert!(proofs.freeze_for_commit());
+                break;
+            }
+            if state.publishing.is_empty() {
+                break;
+            }
+            drop(state);
+            std::thread::yield_now();
+        }
+
+        assert!(
+            publisher.join().is_ok(),
+            "publication completion must not race"
+        );
+        assert!(
+            !observed_partial_batch,
+            "a Generation freeze observed only part of one published Container"
+        );
+    }
 
     #[test]
     fn exact_externalization_consumes_existing_verification_without_second_container_read() {
@@ -5938,9 +6769,13 @@ mod tests {
     #[test]
     fn segmented_ingest_tail_materializes_only_the_selected_prefix() {
         let mut tail = SegmentedIngestTail::default();
-        for bytes in [b"abc".as_slice(), b"defg".as_slice(), b"hijkl".as_slice()] {
+        for (sequence, bytes) in [b"abc".as_slice(), b"defg".as_slice(), b"hijkl".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
             tail.push(
                 MutationPayload::try_copy_from_slice(bytes).expect("allocate fixture segment"),
+                u64::try_from(sequence + 1).expect("fixture sequence fits u64"),
             );
         }
 
@@ -5960,9 +6795,12 @@ mod tests {
         let mut tail = SegmentedIngestTail::default();
         let length = MAX_CHUNK_FRAGMENTS_V1 + 1;
         for ordinal in 0..length {
-            tail.push(MutationPayload::from_owned_bytes(vec![
-                u8::try_from(ordinal % 251).expect("fixture byte fits u8"),
-            ]));
+            tail.push(
+                MutationPayload::from_owned_bytes(vec![
+                    u8::try_from(ordinal % 251).expect("fixture byte fits u8"),
+                ]),
+                u64::try_from(ordinal + 1).expect("fixture sequence fits u64"),
+            );
         }
 
         let chunk = tail
@@ -5973,6 +6811,48 @@ mod tests {
         assert_eq!(chunk.len(), length);
         assert_eq!(chunk.materialize_fixture().len(), length);
         assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn fragmented_chunks_materialize_directly_into_one_compression_region() {
+        let first = ChunkFragments::new(
+            vec![
+                MutationPayload::try_copy_from_slice(b"fragmented ").expect("allocate fixture"),
+                MutationPayload::try_copy_from_slice(b"first chunk").expect("allocate fixture"),
+            ],
+            22,
+        );
+        let second = ChunkFragments::new(
+            vec![
+                MutationPayload::try_copy_from_slice(b" and ").expect("allocate fixture"),
+                MutationPayload::try_copy_from_slice(b"second").expect("allocate fixture"),
+            ],
+            11,
+        );
+        let chunks = [
+            PendingWriteThroughChunk {
+                offset: 0,
+                chunk_id: first.chunk_id(),
+                bytes: first,
+            },
+            PendingWriteThroughChunk {
+                offset: 22,
+                chunk_id: second.chunk_id(),
+                bytes: second,
+            },
+        ];
+        let references = chunks.iter().collect::<Vec<_>>();
+
+        let regions = prepare_compression_regions(&references).expect("prepare fixture regions");
+
+        assert!(regions.borrowed.is_empty());
+        assert_eq!(regions.materialized.len(), 1);
+        assert_eq!(
+            regions.materialized[0].decoded,
+            b"fragmented first chunk and second"
+        );
+        assert_eq!(regions.materialized[0].chunks[0].1, 0..22);
+        assert_eq!(regions.materialized[0].chunks[1].1, 22..33);
     }
 
     #[test]
@@ -6012,6 +6892,7 @@ mod tests {
             tail.push(
                 MutationPayload::try_copy_from_slice(&source[cursor..end])
                     .expect("allocate segmented fixture"),
+                u64::try_from(ordinal + 1).expect("fixture sequence fits u64"),
             );
             cursor = end;
             ordinal += 1;
@@ -6031,9 +6912,10 @@ mod tests {
         );
 
         let mut fragmented = SegmentedIngestTail::default();
-        for bytes in source.chunks(4_096) {
+        for (sequence, bytes) in source.chunks(4_096).enumerate() {
             fragmented.push(
                 MutationPayload::try_copy_from_slice(bytes).expect("allocate fragmented fixture"),
+                u64::try_from(sequence + 1).expect("fixture sequence fits u64"),
             );
         }
         let mut selected_bytes = 0_usize;
@@ -6140,16 +7022,15 @@ mod tests {
     fn ingest_queue_preserves_per_inode_sequence_order() {
         let queue = IngestQueue::new();
         let inode = InodeId::new(2).expect("fixture inode is nonzero");
-        queue.enqueue(IngestJob {
+        queue.enqueue_write_fragment(
             inode,
-            mutation_sequence: 7,
-            kind: IngestJobKind::Write {
+            IngestWriteFragment {
                 offset: 0,
                 bytes: MutationPayload::try_copy_from_slice(&[1])
                     .expect("allocate fixture payload"),
-                final_for_sequence: true,
+                mutation_sequence: 7,
             },
-        });
+        );
         queue.enqueue(IngestJob {
             inode,
             mutation_sequence: 8,
@@ -6268,6 +7149,7 @@ mod tests {
                     + 1
             ])
             .expect("allocate oversized fixture payload"),
+            1,
         );
         let state = WriteThroughStream {
             tail,

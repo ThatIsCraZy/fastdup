@@ -104,9 +104,31 @@ synchronous and 1.542 s Ring. The verifier pool therefore fixes a real
 large-Container serialization bottleneck without pretending to solve the
 remaining small-file Ring overhead.
 
-Therefore the adapter is correct and available but not the default. The FUSE
-daemon selects it only with `FASTDUP_IO_URING=try` (fallback allowed) or
-`FASTDUP_IO_URING=required` (setup must succeed); absent or `off` selects the
-synchronous data tier. The next optimization should target small-Container
-phase and directory-sync overhead without weakening the existing fault matrix
-or publication-byte limit.
+The adapter is correct and available. These measurements originally kept it
+opt-in. ADR 0058 supersedes that implementation and its setup fallback.
+
+## CQE-driven publisher
+
+On 2026-08-24 the worker changed from a phase-wide `submit_and_wait(batch)`
+barrier to one persistent CQE-driven loop. An `eventfd` wakes the ring for new
+commands and completed CPU verification, large verification runs asynchronously
+on the existing Rayon pool, and Container length fixup uses
+`IORING_OP_FTRUNCATE`. The production daemon now requires this adapter.
+
+`SINGLE_ISSUER | DEFER_TASKRUN` was tested first. Removing `DEFER_TASKRUN`
+improved the 1,000-by-128-KiB publisher by 7.3 and 17.8 percent in alternating
+pairs, so the final ring retains only `SINGLE_ISSUER`.
+
+Two final Rocky-ISO SingleStream pairs used opposite order, fresh repositories,
+the same Samba configuration, and zero Swap at admission. Aggregate throughput
+changed by -15.9 and +19.4 percent, a paired median of +1.7 percent. Completed
+write p99 changed by +16.1 and -20.1 percent, a paired median improvement of
+2.0 percent. The long VM series had strong time-order drift, so these numbers
+support throughput neutrality rather than a precise gain.
+
+The two-stream gate also used opposite order. Aggregate throughput and the
+slower stream changed by -2.2 and +33.5 percent, a paired median of +15.6
+percent. Peak verifier activity reached two, every run started and ended with
+zero Swap, and no synchronous fallback was available. The JSON reports are
+`smb-io-uring-final-*.json` and `smb-io-uring-multistream-nodefer-*.json` under
+`.artifacts/benchmarks/`.
