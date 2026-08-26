@@ -1,10 +1,60 @@
 # fastdup
 
-fastdup ist ein experimenteller Single-Node-POSIX-Speicher für Linux. Ein
-FUSE-Dateisystem nimmt normale Dateioperationen an, zerlegt neue Inhalte mit
-SeqCDC-v1 und speichert identische Chunks nur einmal. Dateien werden bytegenau
-aus unveränderlichen, geprüften Containern und versionierten Metadaten
-wiederhergestellt.
+> **Ein experimentelles POSIX-Dateisystem, das Exact Dedup als offen
+> nachvollziehbare Storage-Semantik statt ausschließlich hinter einer
+> Backup-Appliance implementiert.**
+
+## Was fastdup besonders macht
+
+fastdup nimmt normale Linux-Dateioperationen auf einem lebenden, veränderbaren
+Namensraum an und übersetzt sie in unveränderliche, inhaltsidentifizierte
+Container, hierarchische Manifeste und atomar ausgewählte Commit-Generationen.
+Identische Logical Chunks werden nur einmal gespeichert. Trotzdem bleibt eine
+Datei eine bytegenaue POSIX-Datei mit Random Writes, Sparse Extents, Hardlinks,
+xattrs und offenen, bereits gelöschten Inodes.
+
+Der entscheidende Unterschied ist die Trennung von Wahrheit und
+Beschleunigung: Manifeste und geprüfte Container tragen die Inhalte; Exact
+Index, Bloom-Filter und Read Caches dürfen vollständig verloren gehen und neu
+aufgebaut werden. Writer, Recovery und Offline-Scrub prüfen dieselben
+dauerhaften Invarianten. Crash-Grenzen, Format-Epochen, GC-Beweise und
+Generation-Reservierungen sind als versionierte Formate, ADRs und
+Fault-Injection-Tests im Apache-2.0-lizenzierten Quellcode nachvollziehbar.
+
+### Abgrenzung zu Data Domain und StoreOnce
+
+fastdup ist kein kleinerer Nachbau von Dell PowerProtect Data Domain oder HPE
+StoreOnce. Die Produkte lösen überlappende Probleme, setzen ihre primäre
+Abstraktion aber an einer anderen Stelle:
+
+| Aspekt | fastdup | Dell PowerProtect Data Domain / HPE StoreOnce |
+| --- | --- | --- |
+| Primäre Aufgabe | Experimenteller, direkt mutierbarer Single-Node-POSIX-Speicher mit transparenter Exact Dedup | Ausgereifte Protection-Storage-Plattformen für Backup, Restore, Retention und Cyber Resilience |
+| Frontdoor | Linux FUSE und optional Samba; die Anwendung sieht Dateien und Verzeichnisse | Backup-optimierte Integrationen wie DD Boost beziehungsweise StoreOnce Catalyst, zusätzlich je nach Produkt NFS/SMB und VTL |
+| Technischer Schwerpunkt | Bytegenaue POSIX-Semantik, explizite Crash-Generationen, öffentlich spezifizierte Formate und neu aufbaubare Beschleunigungsindizes | Backup-Fenster, Restore-SLAs, Backup-Software-Ökosysteme, Replikation, Cloud-Tiering und zentraler Betrieb |
+| Schutzumfang heute | Prozess-/Power-Loss auf funktionierendem Stable Storage; kein eigener Schutz gegen Geräteverlust, keine WORM-/Vault-Garantie | Herstellerfunktionen für Immutability, Verschlüsselung, Replikation und isolierte beziehungsweise Cloud-basierte Recovery-Kopien |
+| Reifegrad | Forschungsprototyp mit reproduzierbaren Tests und Benchmarks, ohne Support- oder Kapazitätszusage | Kommerzielle Appliances und virtuelle Angebote mit dokumentierten Modell-, Support- und Integrationsgrenzen |
+
+Dell beschreibt Data Domain als Purpose-Built Backup Appliance mit breitem
+Backup-Software-Ökosystem, DD Boost, Replikation, Cloud Tier und
+Security-/Immutability-Funktionen; DD OS unterstützt außerdem NFS, CIFS und VTL.
+HPE positioniert StoreOnce ebenfalls als Purpose-Built Data-Protection-Plattform
+mit Catalyst, NAS-/VTL-Zielen, Catalyst Copy, Cloud Bank und integrierten
+Cyber-Resilience-Funktionen. Maßgeblich sind die aktuellen
+[Dell-Produktinformationen](https://www.dell.com/en-us/shop/powerprotect-data-domain/sf/powerprotect-data-domain),
+die [Dell-Protokolldokumentation](https://www.dell.com/support/manuals/en-ca/dd-os-7.10/dd_p_ddos_7.10.1.70_ag/data-access-by-protocol?guid=guid-ff3483b7-d324-4cc5-8814-877818407dfd&lang=en-us)
+und die [HPE-Produktinformationen](https://www.hpe.com/us/en/storage/storeonce.html).
+Die belegten Einzelmerkmale und bewusst vermiedenen Vergleichsbehauptungen
+stehen in der
+[Recherchegrundlage](docs/research/commercial-backup-appliance-comparison.md).
+
+Das ist kein Überlegenheitsversprechen: Wer heute zertifizierte
+Backup-Integrationen, Hersteller-Support, Replikation, Immutability oder
+Cyber-Recovery benötigt, braucht ein entsprechend ausgereiftes Produkt.
+fastdup ist interessant, wenn ein offener POSIX-Speicherkern untersucht,
+erweitert und gegen explizite Crash- und Integritätsinvarianten geprüft werden
+soll. Herstellerangaben zu Datenreduktion oder Durchsatz sind nicht direkt mit
+den fastdup-Benchmarks vergleichbar.
 
 Das Repository ist ein Prototyp und noch kein Backup-Produkt. Der dauerhafte
 Pfad umfasst Exact Dedup, RAW/Zstd-Encoding, sparse Dateien, Checkpoints,
@@ -42,8 +92,9 @@ Crash-Konformitätsmatrix sind noch offen. Der verbleibende Umfang ist in der
 
 ## Aktueller Projektstand
 
-Die zuletzt abgeschlossenen Abschnitte haben Online-/Metadata-GC, den
-Haltbarkeitspfad bei ausbleibendem I/O-Fortschritt und zwei repositoryweite
+Die zuletzt abgeschlossenen Abschnitte haben Kernel- und Userspace-Caches,
+Memory-/Swap-Containment, Online-/Metadata-GC, den Haltbarkeitspfad bei
+ausbleibendem I/O-Fortschritt und zwei repositoryweite
 Upgrade-/Allocator-Grenzen geschlossen:
 
 - Online GC beweist Kandidaten gegen die aktuelle und vorherige Commit-
@@ -82,6 +133,16 @@ Upgrade-/Allocator-Grenzen geschlossen:
   überspringen den redundanten Kernel-Notify. Der reale Mount-Test deckt
   mehrere Handles, Seitengrenzen, Hole/Zero, Truncate sowie kohärentes
   Read-only-`mmap` und die Ablehnung von Shared-writable-`mmap` ab.
+- Ein prozessweiter `MemoryBudgetGovernor` liefert allen rebuildbaren Caches
+  höchstens alle 250 ms denselben fail-closed Host-/cgroup-Snapshot. Bereits
+  belegter Host-Swap anderer cgroups schaltet fastdup nicht mehr ab; nur
+  `memory.swap.current` der eigenen, im Produktionsbetrieb dedizierten cgroup
+  schließt Cache Admission. `MemorySwapMax=0` plus die Startprüfung
+  `FASTDUP_REQUIRE_CGROUP_NO_SWAP=1` bilden die harte Kernel-Grenze.
+- Langlebige, dichte Dedup-Bloom-Tabellen ab 2 MiB liegen in eigenen anonymen
+  `MADV_HUGEPAGE`-Mappings. Kleine Tabellen bleiben auf dem Heap. Die
+  Bloom-Probe-Hot-Loop erhält dadurch weder Sampling noch Locks noch eine
+  Heap-/Mmap-Fallunterscheidung.
 - Der Supervisor, die Latch-I/O und deren Synchronisation liegen ausschließlich
   im Daemon-/Maintenance-Kontrollpfad. Auch Epoch-Prüfung und High-Water-I/O
   liegen an Repository-Open, Commit, Container-Publikation und Scrub. Die
@@ -256,10 +317,11 @@ cargo build --release -p fastdup-appliance
 
 ## Lokalen Mount starten
 
-Mountpunkt, Metadatenwurzel und Containerwurzel müssen bestehende
-Verzeichnisse sein. Metadaten und Container dürfen nicht dasselbe Verzeichnis
-sein. Für einen lokalen Funktionstest reichen getrennte Unterverzeichnisse;
-repräsentative Messungen sollten getrennte Metadata- und DATA-Geräte nutzen.
+Der Mountpunkt muss als Verzeichnis bestehen; fehlende Metadata- und
+Containerwurzeln legt der Daemon nach erfolgreicher Start-Policy-Prüfung an.
+Metadata und DATA dürfen nicht dasselbe Verzeichnis sein. Für einen lokalen
+Funktionstest reichen getrennte Unterverzeichnisse; repräsentative Messungen
+sollten getrennte Metadata- und DATA-Geräte nutzen.
 
 ```bash
 mkdir -p \
@@ -340,7 +402,7 @@ sh samba/vfs_fastdup/tests/run.sh
 | --- | --- |
 | `fastdup-format` | Versionierte Container-, Manifest-, Commit- und Exact-Index-Bytes |
 | `fastdup-store` | SeqCDC, Reduktion, Container, Exact Index, Scrub und GC |
-| `fastdup-io-uring` | Linux-`io_uring`-Pfad für Container-I/O mit geprüftem Fallback |
+| `fastdup-io-uring` | Erforderlicher Linux-`io_uring`-Pfad für begrenzte parallele Container-I/O |
 | `fastdup-posix` | POSIX-Modell, Live-Dirty-Overlay und Low-Level-FUSE-Adapter |
 | `fastdup-appliance` | Ingest, Checkpoints, Recovery und ausführbare Programme |
 | `fastdup-copy-metrics` | Günstige Hot-Path- und Kopiertelemetrie |
