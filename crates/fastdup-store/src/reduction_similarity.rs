@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 
 use fastdup_format::ChunkId;
 
 pub(crate) const SIMILARITY_PROFILE_V1: u16 = 1;
 pub(crate) const MAX_SIMILARITY_CANDIDATES: usize = 16;
-const SIMILARITY_BUCKET_PROFILE_V1: u16 = 1;
+pub(crate) const SIMILARITY_BUCKET_PROFILE_V1: u16 = 1;
 const MAX_BUCKET_REPRESENTATIVES_V1: usize = 64;
 const SUPERFEATURE_SLOTS_V1: usize = 4;
 const MAX_QUERY_REPRESENTATIVES_EXAMINED_V1: usize =
@@ -92,16 +92,43 @@ impl SimilarityFingerprint {
         (self.superfeatures, self.sketch)
     }
 
+    #[must_use]
+    pub(crate) const fn profile(self) -> u16 {
+        self.profile
+    }
+
+    #[must_use]
+    pub(crate) const fn superfeatures(self) -> [u64; 4] {
+        self.superfeatures
+    }
+
+    #[must_use]
+    pub(crate) const fn sketch(self) -> [u64; 8] {
+        self.sketch
+    }
+
     /// Returns the scalar XOR plus POPCNT distance in the inclusive range
     /// `0..=512`.
+    #[cfg(test)]
     fn distance(self, other: Self) -> Result<u16, SimilarityError> {
         if self.profile != other.profile {
+            return Err(SimilarityError::ProfileMismatch);
+        }
+        self.distance_from_sketch(other.profile, other.sketch)
+    }
+
+    pub(crate) fn distance_from_sketch(
+        self,
+        profile: u16,
+        sketch: [u64; 8],
+    ) -> Result<u16, SimilarityError> {
+        if self.profile != profile {
             return Err(SimilarityError::ProfileMismatch);
         }
         let distance = self
             .sketch
             .iter()
-            .zip(other.sketch)
+            .zip(sketch)
             .map(|(left, right)| (left ^ right).count_ones())
             .sum::<u32>();
         u16::try_from(distance).map_err(|_| SimilarityError::ArithmeticOverflow)
@@ -207,13 +234,157 @@ impl SimilarityCandidate {
     }
 }
 
+type RepresentativeOrdinal = u32;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SimilarityEntry {
+struct ResidentMeta {
+    chunk_id: ChunkId,
     logical_length: u32,
-    fingerprint: SimilarityFingerprint,
+    profile: u16,
+    bucket_references: u8,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+impl ResidentMeta {
+    const EMPTY: Self = Self {
+        chunk_id: ChunkId::from_bytes([0; 32]),
+        logical_length: 0,
+        profile: 0,
+        bucket_references: 0,
+    };
+}
+
+/// Exactly one cache line containing only the ranking Sketch.
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidentSketch([u64; 8]);
+
+const _: () = assert!(std::mem::size_of::<ResidentSketch>() == 64);
+const _: () = assert!(std::mem::align_of::<ResidentSketch>() == 64);
+const _: () = assert!(std::mem::size_of::<ResidentMeta>() == 40);
+const _: () = assert!(std::mem::size_of::<RepresentativeOrdinal>() == 4);
+
+#[derive(Debug, Default)]
+struct ResidentArena {
+    metadata: Vec<ResidentMeta>,
+    superfeatures: Vec<[u64; 4]>,
+    sketches: Vec<ResidentSketch>,
+    active: Vec<u8>,
+    free: Vec<RepresentativeOrdinal>,
+    active_count: usize,
+}
+
+impl ResidentArena {
+    fn allocate(
+        &mut self,
+        chunk_id: ChunkId,
+        logical_length: u32,
+        fingerprint: SimilarityFingerprint,
+    ) -> Result<RepresentativeOrdinal, SimilarityError> {
+        let metadata = ResidentMeta {
+            chunk_id,
+            logical_length,
+            profile: fingerprint.profile,
+            bucket_references: 0,
+        };
+        let sketch = ResidentSketch(fingerprint.sketch);
+        let ordinal = if let Some(ordinal) = self.free.pop() {
+            let index = usize::try_from(ordinal).map_err(|_| SimilarityError::IndexCorruption)?;
+            if self.active.get(index).copied() != Some(0) {
+                return Err(SimilarityError::IndexCorruption);
+            }
+            self.metadata[index] = metadata;
+            self.superfeatures[index] = fingerprint.superfeatures;
+            self.sketches[index] = sketch;
+            self.active[index] = 1;
+            ordinal
+        } else {
+            let ordinal = u32::try_from(self.metadata.len())
+                .map_err(|_| SimilarityError::ArithmeticOverflow)?;
+            self.metadata.push(metadata);
+            self.superfeatures.push(fingerprint.superfeatures);
+            self.sketches.push(sketch);
+            self.active.push(1);
+            ordinal
+        };
+        self.active_count = self
+            .active_count
+            .checked_add(1)
+            .ok_or(SimilarityError::ArithmeticOverflow)?;
+        Ok(ordinal)
+    }
+
+    fn metadata(&self, ordinal: RepresentativeOrdinal) -> Result<ResidentMeta, SimilarityError> {
+        let index = usize::try_from(ordinal).map_err(|_| SimilarityError::IndexCorruption)?;
+        if self.active.get(index).copied() != Some(1) {
+            return Err(SimilarityError::IndexCorruption);
+        }
+        self.metadata
+            .get(index)
+            .copied()
+            .ok_or(SimilarityError::IndexCorruption)
+    }
+
+    fn metadata_mut(
+        &mut self,
+        ordinal: RepresentativeOrdinal,
+    ) -> Result<&mut ResidentMeta, SimilarityError> {
+        let index = usize::try_from(ordinal).map_err(|_| SimilarityError::IndexCorruption)?;
+        if self.active.get(index).copied() != Some(1) {
+            return Err(SimilarityError::IndexCorruption);
+        }
+        self.metadata
+            .get_mut(index)
+            .ok_or(SimilarityError::IndexCorruption)
+    }
+
+    fn sketch(&self, ordinal: RepresentativeOrdinal) -> Result<[u64; 8], SimilarityError> {
+        let index = usize::try_from(ordinal).map_err(|_| SimilarityError::IndexCorruption)?;
+        if self.active.get(index).copied() != Some(1) {
+            return Err(SimilarityError::IndexCorruption);
+        }
+        self.sketches
+            .get(index)
+            .map(|sketch| sketch.0)
+            .ok_or(SimilarityError::IndexCorruption)
+    }
+
+    fn superfeatures(&self, ordinal: RepresentativeOrdinal) -> Result<[u64; 4], SimilarityError> {
+        let index = usize::try_from(ordinal).map_err(|_| SimilarityError::IndexCorruption)?;
+        if self.active.get(index).copied() != Some(1) {
+            return Err(SimilarityError::IndexCorruption);
+        }
+        self.superfeatures
+            .get(index)
+            .copied()
+            .ok_or(SimilarityError::IndexCorruption)
+    }
+
+    fn chunk_id_assert(&self, ordinal: RepresentativeOrdinal) -> ChunkId {
+        self.metadata(ordinal)
+            .expect("ASSERT: a bucket ordinal names an active Similarity resident")
+            .chunk_id
+    }
+
+    fn release(&mut self, ordinal: RepresentativeOrdinal) -> Result<(), SimilarityError> {
+        let index = usize::try_from(ordinal).map_err(|_| SimilarityError::IndexCorruption)?;
+        let metadata = self.metadata(ordinal)?;
+        if metadata.bucket_references != 0 {
+            return Err(SimilarityError::IndexCorruption);
+        }
+        self.active[index] = 0;
+        self.metadata[index] = ResidentMeta::EMPTY;
+        self.superfeatures[index] = [0; 4];
+        self.sketches[index] = ResidentSketch([0; 8]);
+        self.free.push(ordinal);
+        self.active_count = self
+            .active_count
+            .checked_sub(1)
+            .ok_or(SimilarityError::IndexCorruption)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct BucketKey {
     profile: u16,
     slot: u8,
@@ -228,39 +399,51 @@ struct BucketKey {
 /// cache-local during lookup, and independent of map iteration order.
 #[derive(Debug, Default, Eq, PartialEq)]
 struct SimilarityBucketV1 {
-    representatives: Vec<ChunkId>,
+    representatives: Vec<RepresentativeOrdinal>,
 }
 
 impl SimilarityBucketV1 {
-    fn insert(&mut self, chunk_id: ChunkId) {
-        let Err(position) = self.representatives.binary_search(&chunk_id) else {
-            return;
+    fn insert(&mut self, ordinal: RepresentativeOrdinal, arena: &ResidentArena) -> BucketInsertion {
+        let chunk_id = arena.chunk_id_assert(ordinal);
+        let Err(position) = self
+            .representatives
+            .binary_search_by_key(&chunk_id, |existing| arena.chunk_id_assert(*existing))
+        else {
+            return BucketInsertion::AlreadyPresent;
         };
         if position >= MAX_BUCKET_REPRESENTATIVES_V1 {
-            return;
+            return BucketInsertion::Rejected;
         }
 
-        self.representatives.insert(position, chunk_id);
-        if self.representatives.len() > MAX_BUCKET_REPRESENTATIVES_V1 {
-            let removed = self.representatives.pop();
-            assert!(
-                removed.is_some(),
-                "ASSERT: overflowing a nonempty bounded similarity bucket removes one tail"
-            );
-        }
+        self.representatives.insert(position, ordinal);
+        let evicted = (self.representatives.len() > MAX_BUCKET_REPRESENTATIVES_V1).then(|| {
+            self.representatives
+                .pop()
+                .expect("ASSERT: an overflowing similarity bucket has a tail")
+        });
         assert!(
             self.representatives.len() <= MAX_BUCKET_REPRESENTATIVES_V1,
             "ASSERT: v1 similarity bucket exceeds its representative bound"
         );
+        BucketInsertion::Inserted { evicted }
     }
 
-    fn representatives(&self) -> &[ChunkId] {
+    fn representatives(&self) -> &[RepresentativeOrdinal] {
         assert!(
             self.representatives.len() <= MAX_BUCKET_REPRESENTATIVES_V1,
             "ASSERT: queried v1 similarity bucket exceeds its representative bound"
         );
         &self.representatives
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BucketInsertion {
+    AlreadyPresent,
+    Rejected,
+    Inserted {
+        evicted: Option<RepresentativeOrdinal>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,65 +469,139 @@ struct SimilarityBucketSelection<'a> {
 
 /// A deterministic bounded in-memory reference index.
 ///
-/// `BTreeMap` plus sorted bounded representative vectors intentionally avoid
-/// hash-map iteration order. Query results are ordered by Sketch distance and
-/// then full Chunk ID, so insertion order and worker scheduling cannot change
-/// the selected prefix.
+/// `SwissTable` maps address mutable hot keys while bucket payloads store
+/// snapshot-local `u32` ordinals into a dense arena. Hash iteration order is
+/// irrelevant: every bucket remains sorted by full Chunk ID and final results
+/// are ordered by Sketch distance then Chunk ID.
 #[derive(Debug, Default)]
 pub(crate) struct SimilarityIndex {
-    entries: BTreeMap<ChunkId, SimilarityEntry>,
-    buckets: BTreeMap<BucketKey, SimilarityBucketV1>,
+    resident_by_id: HashMap<ChunkId, RepresentativeOrdinal>,
+    arena: ResidentArena,
+    buckets: HashMap<BucketKey, SimilarityBucketV1>,
 }
 
 impl SimilarityIndex {
     #[must_use]
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            entries: BTreeMap::new(),
-            buckets: BTreeMap::new(),
+            resident_by_id: HashMap::new(),
+            arena: ResidentArena::default(),
+            buckets: HashMap::new(),
         }
     }
 
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.resident_by_id.is_empty()
     }
 
-    /// Rebuilds the bounded representative map from complete entries and
-    /// verifies byte-for-byte equality with the live acceleration state.
+    /// Verifies every bounded bucket reference and its resident fingerprint.
     ///
     /// This is an expensive offline `AUDIT`, not a query-path check.
     pub(crate) fn audit(&self) -> Result<(), SimilarityError> {
-        let mut rebuilt = BTreeMap::<BucketKey, SimilarityBucketV1>::new();
-        for (&chunk_id, entry) in &self.entries {
-            validate_logical_length(entry.logical_length)?;
-            if entry.fingerprint.profile != SIMILARITY_PROFILE_V1 {
+        if self.arena.metadata.len() != self.arena.superfeatures.len()
+            || self.arena.metadata.len() != self.arena.sketches.len()
+            || self.arena.metadata.len() != self.arena.active.len()
+            || self.arena.active_count != self.resident_by_id.len()
+        {
+            return Err(SimilarityError::IndexCorruption);
+        }
+
+        let mut observed_references = vec![0_u8; self.arena.metadata.len()];
+        for (key, bucket) in &self.buckets {
+            if bucket.representatives.is_empty()
+                || bucket.representatives.len() > MAX_BUCKET_REPRESENTATIVES_V1
+            {
                 return Err(SimilarityError::IndexCorruption);
             }
-            for (slot, superfeature) in entry.fingerprint.superfeatures.into_iter().enumerate() {
-                let slot = u8::try_from(slot).map_err(|_| SimilarityError::ArithmeticOverflow)?;
-                rebuilt
-                    .entry(BucketKey {
-                        profile: entry.fingerprint.profile,
-                        slot,
-                        logical_length: entry.logical_length,
-                        superfeature,
-                    })
-                    .or_default()
-                    .insert(chunk_id);
+            let mut previous_id = None;
+            for &ordinal in &bucket.representatives {
+                let resident = self.arena.metadata(ordinal)?;
+                if previous_id.is_some_and(|previous| previous >= resident.chunk_id) {
+                    return Err(SimilarityError::IndexCorruption);
+                }
+                previous_id = Some(resident.chunk_id);
+                validate_logical_length(resident.logical_length)?;
+                let slot = usize::from(key.slot);
+                if key.profile != resident.profile
+                    || key.logical_length != resident.logical_length
+                    || resident.profile != SIMILARITY_PROFILE_V1
+                    || self.arena.superfeatures(ordinal)?.get(slot) != Some(&key.superfeature)
+                {
+                    return Err(SimilarityError::IndexCorruption);
+                }
+                let index =
+                    usize::try_from(ordinal).map_err(|_| SimilarityError::IndexCorruption)?;
+                let count = observed_references
+                    .get_mut(index)
+                    .ok_or(SimilarityError::IndexCorruption)?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or(SimilarityError::ArithmeticOverflow)?;
             }
         }
-        if rebuilt != self.buckets {
+
+        let mut free_slots = vec![false; self.arena.metadata.len()];
+        for &ordinal in &self.arena.free {
+            let index = usize::try_from(ordinal).map_err(|_| SimilarityError::IndexCorruption)?;
+            let free = free_slots
+                .get_mut(index)
+                .ok_or(SimilarityError::IndexCorruption)?;
+            if *free {
+                return Err(SimilarityError::IndexCorruption);
+            }
+            *free = true;
+        }
+
+        let mut active_count = 0_usize;
+        for (index, &active) in self.arena.active.iter().enumerate() {
+            match active {
+                0 => {
+                    if !free_slots[index]
+                        || observed_references[index] != 0
+                        || self.arena.metadata[index] != ResidentMeta::EMPTY
+                        || self.arena.superfeatures[index] != [0; 4]
+                        || self.arena.sketches[index] != ResidentSketch([0; 8])
+                    {
+                        return Err(SimilarityError::IndexCorruption);
+                    }
+                }
+                1 => {
+                    active_count = active_count
+                        .checked_add(1)
+                        .ok_or(SimilarityError::ArithmeticOverflow)?;
+                    let ordinal =
+                        u32::try_from(index).map_err(|_| SimilarityError::IndexCorruption)?;
+                    let resident = self.arena.metadata[index];
+                    if free_slots[index]
+                        || resident.bucket_references == 0
+                        || usize::from(resident.bucket_references) > SUPERFEATURE_SLOTS_V1
+                        || observed_references[index] != resident.bucket_references
+                        || self.resident_by_id.get(&resident.chunk_id) != Some(&ordinal)
+                    {
+                        return Err(SimilarityError::IndexCorruption);
+                    }
+                }
+                _ => return Err(SimilarityError::IndexCorruption),
+            }
+        }
+        if active_count != self.arena.active_count {
             return Err(SimilarityError::IndexCorruption);
+        }
+        for (chunk_id, &ordinal) in &self.resident_by_id {
+            if self.arena.metadata(ordinal)?.chunk_id != *chunk_id {
+                return Err(SimilarityError::IndexCorruption);
+            }
         }
         Ok(())
     }
 
     /// Inserts derived similarity state without storing content bytes.
     ///
-    /// Re-inserting the same logical identity is idempotent only when length
-    /// and fingerprint agree. A Chunk ID length disagreement is Corruption,
-    /// consistent with the Exact Index invariant.
+    /// Re-inserting a resident logical identity is idempotent only when length
+    /// and fingerprint agree. The durable Similarity writer rejects duplicate
+    /// Chunk IDs before rebuild; the Exact Index remains the authority for
+    /// identity and liveness outside this bounded cache.
     pub(crate) fn insert(
         &mut self,
         chunk_id: ChunkId,
@@ -355,26 +612,27 @@ impl SimilarityIndex {
         if fingerprint.profile != SIMILARITY_PROFILE_V1 {
             return Err(SimilarityError::ProfileMismatch);
         }
-        if let Some(existing) = self.entries.get(&chunk_id) {
+        if let Some(&ordinal) = self.resident_by_id.get(&chunk_id) {
+            let existing = self.arena.metadata(ordinal)?;
             if existing.logical_length != logical_length {
                 return Err(SimilarityError::ChunkIdentityLengthMismatch);
             }
-            if existing.fingerprint != fingerprint {
+            if existing.profile != fingerprint.profile
+                || self.arena.superfeatures(ordinal)? != fingerprint.superfeatures
+                || self.arena.sketch(ordinal)? != fingerprint.sketch
+            {
                 return Err(SimilarityError::FingerprintMismatch);
             }
             return Ok(());
         }
 
-        self.entries.insert(
-            chunk_id,
-            SimilarityEntry {
-                logical_length,
-                fingerprint,
-            },
-        );
+        let ordinal = self.arena.allocate(chunk_id, logical_length, fingerprint)?;
+        let mut inserted_references = 0_u8;
+        let mut evicted = [None; SUPERFEATURE_SLOTS_V1];
         for (slot, superfeature) in fingerprint.superfeatures.into_iter().enumerate() {
             let slot = u8::try_from(slot).map_err(|_| SimilarityError::ArithmeticOverflow)?;
-            self.buckets
+            let insertion = self
+                .buckets
                 .entry(BucketKey {
                     profile: fingerprint.profile,
                     slot,
@@ -382,7 +640,48 @@ impl SimilarityIndex {
                     superfeature,
                 })
                 .or_default()
-                .insert(chunk_id);
+                .insert(ordinal, &self.arena);
+            match insertion {
+                BucketInsertion::Inserted { evicted: removed } => {
+                    inserted_references = inserted_references
+                        .checked_add(1)
+                        .ok_or(SimilarityError::ArithmeticOverflow)?;
+                    evicted[usize::from(slot)] = removed;
+                }
+                BucketInsertion::AlreadyPresent => {
+                    return Err(SimilarityError::IndexCorruption);
+                }
+                BucketInsertion::Rejected => {}
+            }
+        }
+        if inserted_references != 0 {
+            self.arena.metadata_mut(ordinal)?.bucket_references = inserted_references;
+            let previous = self.resident_by_id.insert(chunk_id, ordinal);
+            assert!(
+                previous.is_none(),
+                "ASSERT: a new Similarity resident has no previous ordinal"
+            );
+        } else {
+            self.arena.release(ordinal)?;
+        }
+        for removed_ordinal in evicted.into_iter().flatten() {
+            let removed_id;
+            let remove_resident = {
+                let resident = self.arena.metadata_mut(removed_ordinal)?;
+                removed_id = resident.chunk_id;
+                resident.bucket_references = resident
+                    .bucket_references
+                    .checked_sub(1)
+                    .ok_or(SimilarityError::IndexCorruption)?;
+                resident.bucket_references == 0
+            };
+            if remove_resident {
+                let mapped_ordinal = self.resident_by_id.remove(&removed_id);
+                if mapped_ordinal != Some(removed_ordinal) {
+                    return Err(SimilarityError::IndexCorruption);
+                }
+                self.arena.release(removed_ordinal)?;
+            }
         }
         Ok(())
     }
@@ -459,7 +758,7 @@ impl SimilarityIndex {
         let mut distinct_representatives_visited = 0_usize;
         let mut candidates: Vec<SimilarityCandidate> = Vec::with_capacity(limit);
         loop {
-            let next_id = selection
+            let next_ordinal = selection
                 .buckets
                 .iter()
                 .zip(cursors)
@@ -468,21 +767,25 @@ impl SimilarityIndex {
                         .and_then(|bucket| bucket.representatives().get(cursor))
                         .copied()
                 })
-                .min();
-            let Some(chunk_id) = next_id else {
+                .min_by_key(|ordinal| self.arena.chunk_id_assert(*ordinal));
+            let Some(ordinal) = next_ordinal else {
                 break;
             };
+            let chunk_id = self.arena.chunk_id_assert(ordinal);
 
             for (bucket, cursor) in selection.buckets.iter().zip(&mut cursors) {
                 let Some(bucket) = bucket else {
                     continue;
                 };
-                let representative = bucket.representatives().get(*cursor);
-                if representative == Some(&chunk_id) {
+                let representative_id = bucket
+                    .representatives()
+                    .get(*cursor)
+                    .map(|ordinal| self.arena.chunk_id_assert(*ordinal));
+                if representative_id == Some(chunk_id) {
                     *cursor += 1;
                 } else {
                     assert!(
-                        representative.is_none_or(|candidate| *candidate > chunk_id),
+                        representative_id.is_none_or(|candidate| candidate > chunk_id),
                         "ASSERT: v1 bucket representatives are not strictly sorted"
                     );
                 }
@@ -497,17 +800,15 @@ impl SimilarityIndex {
             if chunk_id == target_id {
                 continue;
             }
-            let entry = self
-                .entries
-                .get(&chunk_id)
-                .ok_or(SimilarityError::IndexCorruption)?;
+            let entry = self.arena.metadata(ordinal)?;
             if entry.logical_length != logical_length {
                 continue;
             }
             let candidate = SimilarityCandidate {
                 chunk_id,
                 logical_length: entry.logical_length,
-                sketch_distance: target.distance(entry.fingerprint)?,
+                sketch_distance: target
+                    .distance_from_sketch(entry.profile, self.arena.sketch(ordinal)?)?,
             };
             insert_ranked_candidate(&mut candidates, candidate, limit);
         }
@@ -1177,6 +1478,54 @@ mod tests {
             forward_query.stats.distinct_representatives_visited
                 <= MAX_QUERY_REPRESENTATIVES_EXAMINED_V1
         );
+    }
+
+    #[test]
+    fn resident_arena_layout_is_dense_aligned_and_auditable() {
+        assert_eq!(std::mem::size_of::<RepresentativeOrdinal>(), 4);
+        assert_eq!(std::mem::size_of::<ResidentMeta>(), 40);
+        assert_eq!(std::mem::size_of::<ResidentSketch>(), 64);
+        assert_eq!(std::mem::align_of::<ResidentSketch>(), 64);
+        assert_eq!(MAX_BUCKET_REPRESENTATIVES_V1 * 4, 256);
+
+        let fingerprint = controlled_fingerprint([17, 18, 19, 20], [21; 8]);
+        let mut index = SimilarityIndex::new();
+        for ordinal in 0_u64..96 {
+            index
+                .insert(fixture_id(ordinal), 64 * 1_024, fingerprint)
+                .expect("arena insertion succeeds");
+        }
+
+        assert_eq!(index.audit(), Ok(()));
+        assert_eq!(
+            index.arena.sketches.as_ptr().addr() % std::mem::align_of::<ResidentSketch>(),
+            0
+        );
+        assert!(
+            index
+                .buckets
+                .values()
+                .all(|bucket| std::mem::size_of_val(bucket.representatives()) <= 256)
+        );
+
+        let bucket_key = *index
+            .buckets
+            .keys()
+            .next()
+            .expect("fixture creates buckets");
+        let bucket = index
+            .buckets
+            .get_mut(&bucket_key)
+            .expect("selected bucket exists");
+        let original = bucket.representatives[0];
+        bucket.representatives[0] = u32::MAX;
+        assert_eq!(index.audit(), Err(SimilarityError::IndexCorruption));
+        index
+            .buckets
+            .get_mut(&bucket_key)
+            .expect("fixture retains buckets")
+            .representatives[0] = original;
+        assert_eq!(index.audit(), Ok(()));
     }
 
     #[test]

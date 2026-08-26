@@ -2,7 +2,10 @@ use crate::manifest_tree::{
     ManifestRangeExtent, ManifestTreeError, ManifestTreeSummary,
     allocated_bytes_in_manifest_tree_range, read_manifest_tree_range,
 };
-use crate::{ActivatedExactIndex, ContainerRepository, StorageIo, StoreError, VerifiedReadCache};
+use crate::{
+    ActivatedExactIndex, ContainerRepository, ExactIndexGenerationPin, StorageIo, StoreError,
+    VerifiedReadCache,
+};
 use fastdup_format::{
     ChunkId, MAX_METADATA_OBJECT_BYTES, ManifestExtent, ManifestLeaf, MetadataObjectId,
 };
@@ -174,7 +177,7 @@ trait VerifiedChunkReader: fmt::Debug + Send + Sync {
 
 struct ActiveIndexChunkReader<I, J> {
     containers: ContainerRepository<I>,
-    index: Arc<ActivatedExactIndex<J>>,
+    index: ExactIndexGenerationPin<J>,
 }
 
 impl<I, J> fmt::Debug for ActiveIndexChunkReader<I, J> {
@@ -195,11 +198,8 @@ where
         chunk_id: ChunkId,
         logical_length: u64,
     ) -> Result<Vec<u8>, StoreError> {
-        self.containers.read_verified_chunk_with_index(
-            self.index.as_ref(),
-            chunk_id,
-            logical_length,
-        )
+        self.containers
+            .read_verified_chunk_with_index(&self.index, chunk_id, logical_length)
     }
 }
 
@@ -283,7 +283,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
     /// physical-location view halfway through a file read. The index remains
     /// acceleration state and does not extend the lifetime of DATA objects.
     #[must_use]
-    pub fn with_active_index<J>(mut self, index: Arc<ActivatedExactIndex<J>>) -> Self
+    pub fn with_active_index<J>(mut self, index: ExactIndexGenerationPin<J>) -> Self
     where
         I: Clone + Send + Sync + 'static,
         J: Send + Sync + StorageIo + 'static,

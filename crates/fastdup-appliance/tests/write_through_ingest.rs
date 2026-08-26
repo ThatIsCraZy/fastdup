@@ -1,12 +1,17 @@
-use fastdup_appliance::{DurableNamespace, checkpoint_policy_set_v1, recover_mount};
+use fastdup_appliance::{
+    DurableNamespace, checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1, recover_mount,
+};
+use fastdup_format::ChunkId;
 use fastdup_posix::{
     HandleId, InodeId, MutationPayload, Namespace, NamespaceConfig, OpenOptions, Operation,
     ROOT_INODE, Reply, RequestContext,
 };
 use fastdup_store::{
-    ContainerRepository, ExactIndexRunRepository, GenerationRepository, StorageIo,
+    ContainerRepository, ExactIndexRunRepository, GenerationRepository, MaintenanceRepository,
+    SeqCdcConfig, SimilarityIndexRepository, StorageIo, seqcdc_cut,
 };
 use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
+use std::ops::Range;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::Duration;
 
@@ -53,6 +58,155 @@ fn open_appliance_with_paused_containers(
         32,
     )
     .expect("open write-through appliance with paused data tier")
+}
+
+fn pseudo_random_bytes(length: usize) -> Vec<u8> {
+    let mut bytes = vec![0_u8; length];
+    let mut state = 0x8f31_a7c5_19d2_4e6b_u64;
+    for byte in &mut bytes {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state.to_le_bytes()[0];
+    }
+    bytes
+}
+
+fn mutate_preserving_seqcdc(base: Vec<u8>) -> (Vec<u8>, Range<usize>, usize) {
+    let base_ranges = seqcdc_ranges(&base);
+    let changed_range = base_ranges[1].clone();
+    let mut target = base;
+    for offset in changed_range.start + 64..changed_range.end.saturating_sub(64) {
+        target[offset] ^= 0x5a;
+        if seqcdc_ranges(&target) == base_ranges {
+            return (target, changed_range, offset);
+        }
+        target[offset] ^= 0x5a;
+    }
+    panic!("fixture must contain a local edit preserving SeqCDC boundaries");
+}
+
+fn rebuild_pool_indexes(
+    metadata: &MemoryStorageIo,
+    data: &MemoryStorageIo,
+    exact: &ExactIndexRunRepository<MemoryStorageIo>,
+    similarity: &SimilarityIndexRepository<MemoryStorageIo>,
+) {
+    MaintenanceRepository::new(
+        GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1()),
+        ContainerRepository::new(data.clone()),
+        exact.clone(),
+        checkpoint_exact_index_profile_v1(),
+    )
+    .rebuild_pool_indexes(similarity)
+    .expect("build coherent Exact/Similarity pair");
+}
+
+#[test]
+fn pool_wide_similarity_emits_depth_one_prefix_in_write_through() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let exact_storage = MemoryStorageIo::new();
+    let similarity_storage = MemoryStorageIo::new();
+    let base = pseudo_random_bytes(1_024 * 1_024);
+
+    {
+        let appliance = open_appliance_on(metadata.clone(), data.clone(), exact_storage.clone());
+        let (inode, handle) = create_file(&appliance, b"prefix-base");
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset: 0,
+                    data: &base,
+                },
+            )
+            .expect("write independent Base Chunk");
+        appliance
+            .checkpoint()
+            .expect("commit Base Chunk")
+            .expect("Base write creates a generation");
+    }
+
+    let exact = ExactIndexRunRepository::new(exact_storage.clone());
+    let similarity = SimilarityIndexRepository::new(similarity_storage.clone());
+    rebuild_pool_indexes(&metadata, &data, &exact, &similarity);
+
+    let (target, changed_range, changed_offset) = mutate_preserving_seqcdc(base);
+    let rebuilt_exact = exact
+        .recover_active()
+        .expect("recover rebuilt Exact")
+        .expect("rebuilt Exact exists");
+    let rebuilt_id = rebuilt_exact
+        .run_set()
+        .id()
+        .expect("identify rebuilt Exact");
+    let rebuilt_similarity = similarity
+        .recover_latest_for_exact(rebuilt_id)
+        .expect("recover rebuilt Similarity")
+        .expect("rebuilt Similarity exists");
+    assert!(
+        !rebuilt_similarity
+            .candidates(&target[changed_range.clone()])
+            .expect("query changed target Chunk candidates")
+            .is_empty(),
+        "the selected local edit must retain a pool-wide Similarity candidate"
+    );
+
+    let appliance = DurableNamespace::open_with_reduction_indexes(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        ContainerRepository::new(data),
+        &exact,
+        &similarity,
+        32,
+    )
+    .expect("open advanced write-through appliance");
+    let (inode, handle) = create_file(&appliance, b"prefix-target");
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 0,
+                data: &target,
+            },
+        )
+        .expect("write similar target Chunk");
+    appliance
+        .checkpoint()
+        .expect("commit Prefix target")
+        .expect("target write creates a generation");
+
+    let active = exact
+        .recover_active()
+        .expect("recover post-write Exact index")
+        .expect("post-write Exact index is active");
+    let target_ranges = seqcdc_ranges(&target);
+    assert!(
+        target_ranges.iter().any(|range| {
+            let chunk = &target[range.clone()];
+            active
+                .lookup_transitions(
+                    ChunkId::of(chunk),
+                    u32::try_from(chunk.len()).expect("fixture Chunk length fits u32"),
+                )
+                .is_ok_and(|lookup| {
+                    lookup
+                        .candidates()
+                        .iter()
+                        .any(|entry| entry.location().dependency_id() != [0; 32])
+                })
+        }),
+        "write-through must publish the accepted target as codec-3 Depth-1 Prefix"
+    );
+    assert!(changed_range.contains(&changed_offset));
+    assert_eq!(read_named(appliance.namespace(), b"prefix-target"), target);
 }
 
 #[test]
@@ -585,6 +739,24 @@ fn fixture_block() -> Vec<u8> {
                 .expect("fixture byte is bounded")
         })
         .collect()
+}
+
+fn seqcdc_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
+    let config = SeqCdcConfig {
+        sequence_length: 6,
+        skip_trigger: 50,
+        skip_bytes: 1_024,
+        minimum_bytes: 16 * 1_024,
+        maximum_bytes: 256 * 1_024,
+    };
+    let mut ranges = Vec::new();
+    let mut start = 0_usize;
+    while start < bytes.len() {
+        let length = seqcdc_cut(&bytes[start..], config);
+        ranges.push(start..start + length);
+        start += length;
+    }
+    ranges
 }
 
 fn write_fixture<M, C>(

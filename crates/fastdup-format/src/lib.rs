@@ -7,10 +7,13 @@ mod container;
 mod exact_index;
 mod exact_index_activation;
 mod exact_index_run_set;
+mod gc_candidate_catalog;
 mod manifest;
 mod manifest_inner;
 mod metadata;
 mod namespace;
+mod similarity_index;
+mod similarity_index_family;
 
 fn crc32c_with_zeroed_u32(bytes: &[u8], field_offset: usize) -> u32 {
     let field_end = field_offset
@@ -30,11 +33,12 @@ pub use commit::{
 };
 pub use container::{
     AdaptiveContainerEncoding, BuildingContainerHeader, ChunkId, ContainerHeader, ContainerId,
-    ContainerLayout, ContainerRecordRange, FOOTER_BYTES, FormatError, HEADER_BYTES,
-    IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
+    ContainerIntrinsicSummary, ContainerLayout, ContainerRecordRange, FOOTER_BYTES, FormatError,
+    HEADER_BYTES, IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
     MAX_LOGICAL_CHUNK_BYTES, PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
-    RECORD_HEADER_BYTES, RawRecord, SealedContainer, SealedContainerDescriptor,
-    VerifiedChunkLocation, VerifiedContainerPublication, VerifiedRawLocation,
+    PreparedIndependentRecord, PreparedZstdPrefixRecord, RECORD_HEADER_BYTES, RawRecord,
+    SealedContainer, SealedContainerDescriptor, VerifiedChunkLocation,
+    VerifiedContainerPublication, VerifiedRawLocation, ZstdPrefixDependency, ZstdPrefixRecord,
 };
 pub use exact_index::{
     EXACT_INDEX_ENTRY_BYTES, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES, ExactIndexEntry,
@@ -49,6 +53,12 @@ pub use exact_index_activation::{
 pub use exact_index_run_set::{
     ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError, ExactIndexRunSetId,
 };
+pub use gc_candidate_catalog::{
+    GC_CANDIDATE_CATALOG_HEADER_BYTES, GC_CANDIDATE_CATALOG_ROW_BYTES, GcCandidateCatalog,
+    GcCandidateCatalogAudit, GcCandidateCatalogDescriptor, GcCandidateCatalogError,
+    GcCandidateCatalogRow, GcCandidateCatalogStreamEncoder, GcCandidateLivenessEstimate,
+    GcCandidateLocationState, GcDependencyEstimate, GcRecordLivenessEstimate,
+};
 pub use manifest::{MANIFEST_HEADER_BYTES, ManifestExtent, ManifestLeaf};
 pub use manifest_inner::{
     MANIFEST_CHILD_RANGE_BYTES, MANIFEST_INNER_HEADER_BYTES, ManifestChildRange, ManifestInnerNode,
@@ -61,6 +71,18 @@ pub use metadata::{
 pub use namespace::{
     DurableInode, DurableInodeKind, DurableRootMetadata, DurableTimes, DurableTimestamp,
     DurableXattr, NAMESPACE_ROOT_HEADER_BYTES, NamespaceEntry, NamespaceRoot,
+};
+pub use similarity_index::{
+    SIMILARITY_BUCKET_REFERENCE_BYTES, SIMILARITY_BUCKET_REFERENCES_PER_PAGE,
+    SIMILARITY_INDEX_ENTRIES_PER_PAGE, SIMILARITY_INDEX_ENTRY_BYTES, SIMILARITY_INDEX_HEADER_BYTES,
+    SIMILARITY_INDEX_PAGE_BYTES, SimilarityBucketKey, SimilarityBucketPage,
+    SimilarityBucketReference, SimilarityIndexEntry, SimilarityIndexFormatError,
+    SimilarityIndexPage, SimilarityIndexRun, SimilarityIndexRunDescriptor,
+    SimilarityIndexRunHashAudit, SimilarityIndexRunLayout, SimilarityIndexRunStreamEncoder,
+};
+pub use similarity_index_family::{
+    SIMILARITY_FAMILY_HEADER_BYTES, SIMILARITY_FAMILY_PARTITION_BYTES, SimilarityIndexFamilyError,
+    SimilarityIndexPartitionRef, SimilarityIndexRunFamily,
 };
 
 #[cfg(test)]

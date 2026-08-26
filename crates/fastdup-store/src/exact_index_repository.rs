@@ -1,18 +1,20 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 use std::io;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 use fastdup_format::{
-    ChunkId, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES, ExactIndexActivationError,
-    ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError, ExactIndexPage,
-    ExactIndexPagePosition, ExactIndexProfileId, ExactIndexRun, ExactIndexRunDescriptor,
-    ExactIndexRunHashAudit, ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError,
-    ExactIndexRunSetId, ExactIndexRunStreamEncoder, MAX_METADATA_OBJECT_BYTES,
+    ChunkId, ContainerId, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES,
+    ExactIndexActivationError, ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError,
+    ExactIndexPage, ExactIndexPagePosition, ExactIndexProfileId, ExactIndexRun,
+    ExactIndexRunDescriptor, ExactIndexRunHashAudit, ExactIndexRunRef, ExactIndexRunSet,
+    ExactIndexRunSetError, ExactIndexRunSetId, ExactIndexRunStreamEncoder, ExactLocationTransition,
+    MAX_METADATA_OBJECT_BYTES,
 };
 
 use crate::exact_activation_log::{ExactActivationLog, ExactActivationLogError};
@@ -24,6 +26,7 @@ use crate::{ContainerRepository, StorageIo, StoreError};
 
 pub const MAX_EXACT_LOOKUP_CANDIDATES: usize = 64;
 pub const MAX_ACTIVE_EXACT_INDEX_FAMILIES: usize = 64;
+const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
 const EXACT_INDEX_PAGE_CACHE_FALLBACK_SLOTS: usize = 256;
 const EXACT_INDEX_PAGE_CACHE_MINIMUM_BYTES: u64 = 1_024 * 1_024;
 const EXACT_INDEX_PAGE_CACHE_MAXIMUM_BYTES: u64 = 256 * 1_024 * 1_024;
@@ -94,9 +97,234 @@ struct CompactionInputFamily {
 pub struct ExactIndexRunRepository<I> {
     storage: I,
     publish_lock: Arc<Mutex<()>>,
+    generation_publish_lock: Arc<Mutex<()>>,
+    active_generation: Arc<RwLock<Option<Arc<ExactIndexGenerationState<I>>>>>,
+    retired_generations: Arc<Mutex<Vec<Weak<ExactIndexGenerationState<I>>>>>,
     page_cache: Arc<ExactIndexPageCache>,
     fixed_membership_snapshot: Option<MemoryPressureSnapshot>,
     membership_counters: Arc<ExactRunMembershipCounters>,
+}
+
+#[derive(Debug)]
+struct ExactIndexGenerationState<I> {
+    index: ActivatedExactIndex<I>,
+    pins: ExactIndexPinState,
+}
+
+#[repr(align(64))]
+#[derive(Debug)]
+struct ExactIndexPinState {
+    active: AtomicUsize,
+    accepting: AtomicBool,
+    wait: Mutex<()>,
+    drained: Condvar,
+}
+
+const _: () = assert!(std::mem::align_of::<ExactIndexPinState>() == 64);
+
+/// Process-local lease for one immutable activated Exact Index generation.
+///
+/// A pin permits reads through that exact generation after a newer generation
+/// marks one of its Locations RETIRING. Physical deletion must wait for the
+/// corresponding [`ExactIndexGenerationDrain`] to complete.
+pub struct ExactIndexGenerationPin<I> {
+    state: Arc<ExactIndexGenerationState<I>>,
+}
+
+impl<I> Clone for ExactIndexGenerationPin<I> {
+    fn clone(&self) -> Self {
+        self.state
+            .pins
+            .active
+            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |active| {
+                active.checked_add(1)
+            })
+            .expect("ASSERT: Exact generation pin count cannot overflow");
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<I> Deref for ExactIndexGenerationPin<I> {
+    type Target = ActivatedExactIndex<I>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state.index
+    }
+}
+
+impl<I> fmt::Debug for ExactIndexGenerationPin<I>
+where
+    ActivatedExactIndex<I>: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExactIndexGenerationPin")
+            .field("activation", &self.state.index.record())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I> Drop for ExactIndexGenerationPin<I> {
+    fn drop(&mut self) {
+        let previous = self.state.pins.active.fetch_sub(1, AtomicOrdering::Release);
+        assert!(
+            previous != 0,
+            "ASSERT: Exact generation pin release has a matching acquisition"
+        );
+        if previous == 1 {
+            let _wait = self
+                .state
+                .pins
+                .wait
+                .lock()
+                .expect("ASSERT: Exact generation drain wait lock poisoned during release");
+            self.state.pins.drained.notify_all();
+        }
+    }
+}
+
+impl<I> ExactIndexGenerationPin<I> {
+    /// Creates an uncounted immutable snapshot handle. New work must call
+    /// [`ExactIndexGenerationSnapshot::try_pin`]; once RETIRING activation
+    /// closes the generation, that admission fails without touching DATA.
+    #[must_use]
+    pub fn snapshot(&self) -> ExactIndexGenerationSnapshot<I> {
+        ExactIndexGenerationSnapshot {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+/// Immutable generation reference that admits only work started before its
+/// retirement barrier.
+pub struct ExactIndexGenerationSnapshot<I> {
+    state: Arc<ExactIndexGenerationState<I>>,
+}
+
+impl<I> ExactIndexGenerationSnapshot<I> {
+    #[must_use]
+    pub fn activation(&self) -> ExactIndexActivationRecord {
+        self.state.index.record()
+    }
+
+    /// Pins one operation unless a newer activation already closed admission.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process-local pin count overflows. That is an impossible
+    /// production `ASSERT`, not a recoverable resource condition.
+    #[must_use]
+    pub fn try_pin(&self) -> Option<ExactIndexGenerationPin<I>> {
+        if !self.state.pins.accepting.load(AtomicOrdering::Acquire) {
+            return None;
+        }
+        self.state
+            .pins
+            .active
+            .fetch_update(AtomicOrdering::Acquire, AtomicOrdering::Relaxed, |active| {
+                active.checked_add(1)
+            })
+            .expect("ASSERT: Exact generation pin count cannot overflow");
+        if !self.state.pins.accepting.load(AtomicOrdering::Acquire) {
+            drop(ExactIndexGenerationPin {
+                state: Arc::clone(&self.state),
+            });
+            return None;
+        }
+        Some(ExactIndexGenerationPin {
+            state: Arc::clone(&self.state),
+        })
+    }
+}
+
+impl<I> fmt::Debug for ExactIndexGenerationSnapshot<I>
+where
+    ActivatedExactIndex<I>: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExactIndexGenerationSnapshot")
+            .field("activation", &self.state.index.record())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Wait capability for the exact generation displaced by one activation.
+#[derive(Debug)]
+pub struct ExactIndexGenerationDrain<I> {
+    states: Vec<Arc<ExactIndexGenerationState<I>>>,
+}
+
+impl<I> ExactIndexGenerationDrain<I> {
+    #[must_use]
+    pub fn is_drained(&self) -> bool {
+        self.states
+            .iter()
+            .all(|state| state.pins.active.load(AtomicOrdering::Acquire) == 0)
+    }
+
+    /// Waits until every reader, writer, and reduction-snapshot pin on the
+    /// displaced generation has been released.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another thread poisoned the generation-drain wait lock.
+    pub fn wait(self) {
+        for state in self.states {
+            let mut wait = state
+                .pins
+                .wait
+                .lock()
+                .expect("ASSERT: Exact generation drain lock poisoned while waiting");
+            while state.pins.active.load(AtomicOrdering::Acquire) != 0 {
+                wait = state
+                    .pins
+                    .drained
+                    .wait(wait)
+                    .expect("ASSERT: Exact generation drain lock poisoned after wake");
+            }
+        }
+    }
+}
+
+/// Result of one atomic Exact generation activation.
+#[derive(Debug)]
+pub struct ExactIndexGenerationTransition<I> {
+    current: ExactIndexGenerationPin<I>,
+    retired: Option<ExactIndexGenerationDrain<I>>,
+}
+
+impl<I> ExactIndexGenerationTransition<I> {
+    #[must_use]
+    pub const fn current(&self) -> &ExactIndexGenerationPin<I> {
+        &self.current
+    }
+
+    #[must_use]
+    pub fn into_retired(self) -> Option<ExactIndexGenerationDrain<I>> {
+        self.retired
+    }
+}
+
+fn pin_exact_generation<I>(
+    state: &Arc<ExactIndexGenerationState<I>>,
+) -> ExactIndexGenerationPin<I> {
+    assert!(
+        state.pins.accepting.load(AtomicOrdering::Acquire),
+        "ASSERT: current Exact generation accepts new pins"
+    );
+    state
+        .pins
+        .active
+        .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |active| {
+            active.checked_add(1)
+        })
+        .expect("ASSERT: Exact generation pin count cannot overflow");
+    ExactIndexGenerationPin {
+        state: Arc::clone(state),
+    }
 }
 
 /// Fixed-capacity Exact-Index hot-page cache evidence.
@@ -254,6 +482,9 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         Self {
             storage,
             publish_lock: Arc::new(Mutex::new(())),
+            generation_publish_lock: Arc::new(Mutex::new(())),
+            active_generation: Arc::new(RwLock::new(None)),
+            retired_generations: Arc::new(Mutex::new(Vec::new())),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, true)),
             fixed_membership_snapshot: None,
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
@@ -271,6 +502,9 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         Self {
             storage,
             publish_lock: Arc::new(Mutex::new(())),
+            generation_publish_lock: Arc::new(Mutex::new(())),
+            active_generation: Arc::new(RwLock::new(None)),
+            retired_generations: Arc::new(Mutex::new(Vec::new())),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, false)),
             fixed_membership_snapshot: Some(snapshot),
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
@@ -596,6 +830,269 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         self.open_activated_record(record).map(Some)
     }
 
+    /// Recovers the durable active generation and installs it behind the
+    /// process-local pin seam.
+    ///
+    /// Repeated recovery of the already installed activation returns another
+    /// pin instead of displacing the same generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same recovery and dependency errors as [`Self::recover_active`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process-local generation publication lock is poisoned or
+    /// its pin count overflows.
+    pub fn recover_active_generation(
+        &self,
+    ) -> Result<Option<ExactIndexGenerationPin<I>>, ExactIndexStoreError> {
+        let _generation = self
+            .generation_publish_lock
+            .lock()
+            .expect("ASSERT: Exact generation publication lock poisoned");
+        let Some(active) = self.recover_active()? else {
+            return Ok(None);
+        };
+        if let Some(current) = self.pin_matching_generation(active.record()) {
+            return Ok(Some(current));
+        }
+        let transition = self.install_active_generation(active);
+        Ok(Some(transition.current))
+    }
+
+    /// Pins the currently installed process-local Exact generation.
+    ///
+    /// This performs no storage I/O. `None` means recovery has not installed a
+    /// usable generation or the appliance deliberately runs in scan fallback.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process-local active-generation lock is poisoned or its
+    /// pin count overflows.
+    #[must_use]
+    pub fn pin_active_generation(&self) -> Option<ExactIndexGenerationPin<I>> {
+        let active = self
+            .active_generation
+            .read()
+            .expect("ASSERT: active Exact generation lock poisoned");
+        active.as_ref().map(|state| pin_exact_generation(state))
+    }
+
+    /// Derives the effective RETIRING Container set from one fully opened
+    /// immutable generation. Older ACTIVE occurrences of the same physical
+    /// Location are shadowed before Container identities are returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns touched-page integrity, I/O, allocation, or merge failures.
+    pub fn retiring_containers(
+        &self,
+        generation: &ExactIndexGenerationPin<I>,
+    ) -> Result<BTreeMap<[u8; 16], ContainerId>, ExactIndexStoreError> {
+        let mut containers = BTreeMap::new();
+        for entry in self.retiring_entries(generation)? {
+            let container_id = entry.location().container_id();
+            containers.insert(container_id.bytes(), container_id);
+        }
+        Ok(containers)
+    }
+
+    /// Returns every effective RETIRING physical Location in one fully opened
+    /// immutable generation.
+    ///
+    /// The result is recovery authority rather than a candidate hint: the
+    /// generation merge shadows older ACTIVE and already-REMOVED occurrences
+    /// of the same physical Location before returning entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns touched-page integrity, I/O, allocation, or merge failures.
+    pub fn retiring_entries(
+        &self,
+        generation: &ExactIndexGenerationPin<I>,
+    ) -> Result<Vec<ExactIndexEntry>, ExactIndexStoreError> {
+        let families = compaction_families_from_run_set(generation.run_set())?;
+        let mut entries = Vec::new();
+        self.merge_compaction_families(&families, |entry| {
+            if entry.transition() == fastdup_format::ExactLocationTransition::Retiring {
+                entries
+                    .try_reserve(1)
+                    .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+                entries.push(entry);
+            }
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+
+    /// Publishes one immutable level-zero transition family and atomically
+    /// activates it on top of the latest durable Run Set.
+    ///
+    /// All repository clones serialize the complete read/publish/compact/
+    /// activate transaction. The newest transition for a repeated physical
+    /// Location therefore cannot be lost by a concurrent ordinary L0 append.
+    /// The returned drain names the generation displaced at the activation
+    /// commit point.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty entries, profile mismatch, generation exhaustion,
+    /// invalid transitions, compaction failure, or publication/activation I/O.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shared publication lock is poisoned or an already verified
+    /// format invariant is violated by its writer.
+    pub fn append_level_zero(
+        &self,
+        profile: ExactIndexProfileId,
+        entries: Vec<ExactIndexEntry>,
+    ) -> Result<ExactIndexGenerationTransition<I>, ExactIndexStoreError> {
+        if entries.is_empty() {
+            return Err(ExactIndexStoreError::InvalidCompactionInput);
+        }
+        let _generation = self
+            .generation_publish_lock
+            .lock()
+            .expect("ASSERT: Exact generation publication lock poisoned");
+        let previous = self.recover_active()?;
+        self.append_level_zero_from(profile, entries, previous.as_ref())
+    }
+
+    /// Appends one L0 family only if the named Exact activation is still the
+    /// durable predecessor at the serialized generation commit point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExactIndexStoreError::ActivationChanged`] when another L0
+    /// publisher won the race, plus the ordinary append errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shared publication lock is poisoned or an already verified
+    /// format invariant is violated by its writer.
+    pub fn append_level_zero_if_active(
+        &self,
+        profile: ExactIndexProfileId,
+        expected: ExactIndexActivationRecord,
+        entries: Vec<ExactIndexEntry>,
+    ) -> Result<ExactIndexGenerationTransition<I>, ExactIndexStoreError> {
+        if entries.is_empty() {
+            return Err(ExactIndexStoreError::InvalidCompactionInput);
+        }
+        let _generation = self
+            .generation_publish_lock
+            .lock()
+            .expect("ASSERT: Exact generation publication lock poisoned");
+        let previous = self.recover_active()?;
+        if previous.as_ref().map(ActivatedExactIndex::record) != Some(expected) {
+            return Err(ExactIndexStoreError::ActivationChanged);
+        }
+        self.append_level_zero_from(profile, entries, previous.as_ref())
+    }
+
+    fn append_level_zero_from(
+        &self,
+        profile: ExactIndexProfileId,
+        entries: Vec<ExactIndexEntry>,
+        previous: Option<&ActivatedExactIndex<I>>,
+    ) -> Result<ExactIndexGenerationTransition<I>, ExactIndexStoreError> {
+        if previous.is_some_and(|active| active.run_set().profile() != profile) {
+            return Err(ExactIndexStoreError::DependencyMismatch);
+        }
+        validate_level_zero_transitions(previous, &entries)?;
+        let mut newest_run_generation = self
+            .discover_run_generation_high_water(profile)?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
+        let run = ExactIndexRun::new(profile, newest_run_generation, entries)?;
+        let descriptor = self.publish(&run)?;
+        let mut run_refs =
+            previous.map_or_else(Vec::new, |active| active.run_set().runs().to_vec());
+        run_refs
+            .try_reserve(1)
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        run_refs.push(ExactIndexRunRef::new(0, descriptor)?);
+        while let Some((source_level, inputs)) = select_level_zero_compaction(&run_refs) {
+            let first_output_generation = newest_run_generation
+                .checked_add(1)
+                .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
+            let target_level = source_level
+                .checked_add(1)
+                .ok_or(ExactIndexStoreError::InvalidCompactionInput)?;
+            let compacted = self.compact_family(&inputs, target_level, first_output_generation)?;
+            newest_run_generation = compacted.last_generation();
+            run_refs.retain(|run| {
+                !inputs
+                    .iter()
+                    .any(|input| input.generation() == run.generation())
+            });
+            run_refs
+                .try_reserve(compacted.runs().len())
+                .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+            run_refs.extend_from_slice(compacted.runs());
+        }
+        let run_set_generation = previous.map_or(Ok(1), |active| {
+            active
+                .run_set()
+                .generation()
+                .checked_add(1)
+                .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)
+        })?;
+        let run_set = ExactIndexRunSet::new(profile, run_set_generation, run_refs)?;
+        let active = self.activate(&run_set)?;
+        Ok(self.install_active_generation(active))
+    }
+
+    fn pin_matching_generation(
+        &self,
+        record: ExactIndexActivationRecord,
+    ) -> Option<ExactIndexGenerationPin<I>> {
+        let active = self
+            .active_generation
+            .read()
+            .expect("ASSERT: active Exact generation lock poisoned");
+        active
+            .as_ref()
+            .filter(|state| state.index.record() == record)
+            .map(pin_exact_generation)
+    }
+
+    fn install_active_generation(
+        &self,
+        active: ActivatedExactIndex<I>,
+    ) -> ExactIndexGenerationTransition<I> {
+        let state = Arc::new(ExactIndexGenerationState {
+            index: active,
+            pins: ExactIndexPinState {
+                active: AtomicUsize::new(0),
+                accepting: AtomicBool::new(true),
+                wait: Mutex::new(()),
+                drained: Condvar::new(),
+            },
+        });
+        let current = pin_exact_generation(&state);
+        let mut installed = self
+            .active_generation
+            .write()
+            .expect("ASSERT: active Exact generation lock poisoned during activation");
+        let retired = installed.take().map(|state| {
+            state.pins.accepting.store(false, AtomicOrdering::Release);
+            let mut retired = self
+                .retired_generations
+                .lock()
+                .expect("ASSERT: retired Exact generation registry lock poisoned");
+            retired.retain(|generation| generation.strong_count() != 0);
+            retired.push(Arc::downgrade(&state));
+            let states = retired.iter().filter_map(Weak::upgrade).collect();
+            ExactIndexGenerationDrain { states }
+        });
+        *installed = Some(state);
+        ExactIndexGenerationTransition { current, retired }
+    }
+
     /// Audits both bounded Activation-Log slots and the selected immutable
     /// Run-Set dependency graph without changing activation state.
     ///
@@ -651,7 +1148,9 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         };
         let active = self.open_activated_record(record)?;
         self.audit_run_set_global_invariants(active.run_set())?;
-        let mut active_locations = 0_u64;
+        // Membership hints cover every persisted transition, including
+        // tombstones. Check their no-false-negative invariant independently
+        // from effective Location selection.
         for reader in &active.readers {
             for page_ordinal in 0..reader.descriptor.page_count() {
                 let page = reader.read_page(page_ordinal)?;
@@ -665,16 +1164,33 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                     }) {
                         return Err(ExactIndexStoreError::MembershipFalseNegative);
                     }
-                    if entry.transition() != fastdup_format::ExactLocationTransition::Active {
-                        continue;
-                    }
-                    containers.read_verified_location(*entry)?;
-                    active_locations = active_locations
-                        .checked_add(1)
-                        .ok_or(ExactIndexStoreError::CounterOverflow)?;
                 }
             }
         }
+        let families = compaction_families_from_run_set(active.run_set())?;
+        let mut active_locations = 0_u64;
+        self.merge_compaction_families(&families, |entry| {
+            if entry.transition() != fastdup_format::ExactLocationTransition::Active {
+                return Ok(());
+            }
+            if entry.location().dependency_id() == [0; 32] {
+                containers.read_verified_location(entry)?;
+            } else {
+                let base_id = fastdup_format::ChunkId::from_bytes(entry.location().dependency_id());
+                let base = containers
+                    .find_verified_independent_base_with_index(
+                        &active,
+                        base_id,
+                        entry.logical_length(),
+                    )
+                    .ok_or(ExactIndexStoreError::DependencyMismatch)?;
+                containers.read_verified_zstd_prefix_location(entry, &base)?;
+            }
+            active_locations = active_locations
+                .checked_add(1)
+                .ok_or(ExactIndexStoreError::CounterOverflow)?;
+            Ok(())
+        })?;
         Ok(Some(ExactIndexLocationAudit {
             activation: record,
             active_locations,
@@ -698,24 +1214,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         if run_set.runs().is_empty() {
             return Ok(());
         }
-        let mut grouped = std::collections::BTreeMap::<(u16, u64), Vec<ExactIndexRunRef>>::new();
-        for run in run_set.runs().iter().copied() {
-            grouped
-                .entry((run.level(), run.family_generation()))
-                .or_default()
-                .push(run);
-        }
-        let mut families = Vec::new();
-        families
-            .try_reserve_exact(grouped.len())
-            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
-        for ((_, family_generation), mut refs) in grouped {
-            refs.sort_unstable_by_key(|run| run.partition_ordinal());
-            families.push(CompactionInputFamily {
-                refs,
-                family_generation,
-            });
-        }
+        let families = compaction_families_from_run_set(run_set)?;
         self.merge_compaction_families(&families, |_| Ok(()))?;
         Ok(())
     }
@@ -1442,6 +1941,35 @@ impl<I> ActivatedExactIndex<I> {
 }
 
 impl<I: StorageIo> ActivatedExactIndex<I> {
+    /// Checks whether one unpublished ACTIVE overlay Location remains
+    /// selectable in this generation.
+    ///
+    /// A newer RETIRING/REMOVED transition for the same physical Location
+    /// rejects the overlay. A location absent from a complete lookup is a new
+    /// publication and remains selectable. An incomplete negative is rejected
+    /// conservatively.
+    ///
+    /// # Errors
+    ///
+    /// Returns touched-page I/O, integrity, or bounded-allocation failures.
+    pub fn permits_active_overlay(
+        &self,
+        candidate: ExactIndexEntry,
+    ) -> Result<bool, ExactIndexStoreError> {
+        if candidate.transition() != ExactLocationTransition::Active {
+            return Ok(false);
+        }
+        let lookup = self.lookup_transitions(candidate.chunk_id(), candidate.logical_length())?;
+        if let Some(current) = lookup
+            .candidates()
+            .iter()
+            .find(|current| current.location() == candidate.location())
+        {
+            return Ok(current.transition() == ExactLocationTransition::Active);
+        }
+        Ok(lookup.complete())
+    }
+
     /// Returns a newest-Run-first bounded transition prefix across the active
     /// Run Set. Callers must merge transitions by complete physical Location
     /// identity and verify any selected ACTIVE candidate against its Container.
@@ -1864,6 +2392,54 @@ fn verify_compaction_output_pair(
         return Err(ExactIndexFormatError::NonCanonicalOrder.into());
     }
     Ok(())
+}
+
+fn select_level_zero_compaction(runs: &[ExactIndexRunRef]) -> Option<(u16, Vec<ExactIndexRunRef>)> {
+    let mut by_level = BTreeMap::<u16, BTreeMap<u64, Vec<ExactIndexRunRef>>>::new();
+    for run in runs.iter().copied() {
+        by_level
+            .entry(run.level())
+            .or_default()
+            .entry(run.family_generation())
+            .or_default()
+            .push(run);
+    }
+    for (level, families) in by_level {
+        if families.len() < EXACT_INDEX_COMPACTION_FANIN {
+            continue;
+        }
+        let mut candidates = Vec::new();
+        for (_, mut family) in families.into_iter().take(EXACT_INDEX_COMPACTION_FANIN) {
+            family.sort_unstable_by_key(|run| run.partition_ordinal());
+            candidates.extend(family);
+        }
+        return Some((level, candidates));
+    }
+    None
+}
+
+fn compaction_families_from_run_set(
+    run_set: &ExactIndexRunSet,
+) -> Result<Vec<CompactionInputFamily>, ExactIndexStoreError> {
+    let mut grouped = BTreeMap::<(u16, u64), Vec<ExactIndexRunRef>>::new();
+    for run in run_set.runs().iter().copied() {
+        grouped
+            .entry((run.level(), run.family_generation()))
+            .or_default()
+            .push(run);
+    }
+    let mut families = Vec::new();
+    families
+        .try_reserve_exact(grouped.len())
+        .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+    for ((_, family_generation), mut refs) in grouped {
+        refs.sort_unstable_by_key(|run| run.partition_ordinal());
+        families.push(CompactionInputFamily {
+            refs,
+            family_generation,
+        });
+    }
+    Ok(families)
 }
 
 fn validate_family_compaction_inputs(
@@ -2424,8 +3000,104 @@ pub enum ExactIndexStoreError {
     TooManyActiveRuns,
     TooManyRunPartitions,
     InvalidCompactionInput,
+    InvalidLocationTransition,
+    ActivationChanged,
     CounterOverflow,
     MembershipFalseNegative,
+}
+
+fn validate_level_zero_transitions<I: StorageIo>(
+    previous: Option<&ActivatedExactIndex<I>>,
+    entries: &[ExactIndexEntry],
+) -> Result<(), ExactIndexStoreError> {
+    let mut locations = BTreeMap::new();
+    for entry in entries {
+        let location_key = exact_location_identity(*entry);
+        if locations.insert(location_key, entry.transition()).is_some() {
+            return Err(ExactIndexStoreError::InvalidLocationTransition);
+        }
+        let Some(previous) = previous else {
+            if entry.transition() != ExactLocationTransition::Active {
+                return Err(ExactIndexStoreError::InvalidLocationTransition);
+            }
+            continue;
+        };
+        let lookup = previous.lookup_transitions(entry.chunk_id(), entry.logical_length())?;
+        let current = lookup
+            .candidates()
+            .iter()
+            .find(|current| current.location() == entry.location())
+            .map(ExactIndexEntry::transition);
+        if current.is_none() && !lookup.complete() {
+            return Err(ExactIndexStoreError::InvalidLocationTransition);
+        }
+        if !valid_location_transition(current, entry.transition()) {
+            return Err(ExactIndexStoreError::InvalidLocationTransition);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ExactLocationIdentity {
+    chunk_id: ChunkId,
+    logical_length: u32,
+    container_id: [u8; 16],
+    container_generation: u64,
+    record_offset: u64,
+    record_length: u32,
+    chunk_ordinal: u32,
+    decoded_offset: u32,
+    record_crc32c: u32,
+    record_decoded_length: u32,
+    record_payload_length: u32,
+    codec_id: u16,
+    dependency_id: [u8; 32],
+}
+
+fn exact_location_identity(entry: ExactIndexEntry) -> ExactLocationIdentity {
+    let location = entry.location();
+    ExactLocationIdentity {
+        chunk_id: entry.chunk_id(),
+        logical_length: entry.logical_length(),
+        container_id: location.container_id().bytes(),
+        container_generation: location.container_generation(),
+        record_offset: location.record_offset(),
+        record_length: location.record_length(),
+        chunk_ordinal: location.chunk_ordinal(),
+        decoded_offset: location.decoded_offset(),
+        record_crc32c: location.record_crc32c(),
+        record_decoded_length: location.record_decoded_length(),
+        record_payload_length: location.record_payload_length(),
+        codec_id: location.codec_id(),
+        dependency_id: location.dependency_id(),
+    }
+}
+
+const fn valid_location_transition(
+    current: Option<ExactLocationTransition>,
+    proposed: ExactLocationTransition,
+) -> bool {
+    matches!(
+        (current, proposed),
+        (
+            None | Some(ExactLocationTransition::Active),
+            ExactLocationTransition::Active
+        ) | (
+            Some(ExactLocationTransition::Active | ExactLocationTransition::Retiring),
+            ExactLocationTransition::Retiring
+        ) | (
+            Some(ExactLocationTransition::Active | ExactLocationTransition::Quarantined),
+            ExactLocationTransition::Quarantined
+        ) | (
+            Some(
+                ExactLocationTransition::Retiring
+                    | ExactLocationTransition::Quarantined
+                    | ExactLocationTransition::Removed
+            ),
+            ExactLocationTransition::Removed
+        )
+    )
 }
 
 impl fmt::Display for ExactIndexStoreError {

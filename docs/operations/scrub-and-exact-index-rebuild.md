@@ -23,6 +23,13 @@ cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
 
 cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
   --offline scrub-gc METADATA_ROOT CONTAINER_ROOT
+
+cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
+  --offline gc-now METADATA_ROOT CONTAINER_ROOT
+
+# Against the currently mounted writable appliance:
+cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
+  --online gc-now METADATA_ROOT
 ```
 
 `scrub` is read-only. It fails closed on a torn or invalid Commit-Log tail and
@@ -51,12 +58,22 @@ The active-index Location pass intentionally performs random Container reads;
 it is an offline integrity operation, not a mount-time path.
 
 `scrub-gc` starts the Scrub on a dedicated asynchronous maintenance thread.
-Below 90% Data Pool occupancy the thread runs at Unix nice +10; at or above the
-inclusive 90% threshold it runs at normal priority. A completed Scrub produces
+All adaptive maintenance threads run in Linux's work-conserving idle I/O class:
+they receive device service only when the block scheduler has no higher-class
+frontend request. This protection adds no observation, atomic operation, lock,
+or branch to the write hot loop. Below 90% Data Pool occupancy the thread also
+runs at Unix nice +10; at or above the inclusive 90% threshold it runs at normal
+CPU priority while retaining idle I/O priority. A completed Scrub produces
 an opaque plan bound to the exact current and previous online Commit Records.
-GC is promoted to normal priority when either pool occupancy is at least 90% or
-immediately reclaimable Container bytes are more than 20% of all Container file
-bytes. Exactly 20% remains a nice +10 background phase.
+GC CPU scheduling is promoted to normal priority when either pool occupancy is
+at least 90% or immediately reclaimable Container bytes are more than 20% of all
+Container file bytes. Exactly 20% remains a nice +10 background phase.
+
+`gc-now` starts the same verified Scrub/GC protocol immediately with full CPU
+and ordinary I/O scheduling priority. It performs no maintenance demotion and
+is intended for an operator-selected maintenance window. Like every current
+destructive command it requires `--offline`; do not use it while the appliance
+is mounted. The command reports `mode=FullSpeed` at admission.
 
 GC inventory classification reuses the payload-free live Chunk identities
 collected while each Container is decoded. Mixed-victim selection therefore
@@ -85,8 +102,44 @@ command prints `gc_ok=true` only after the directory sync.
 
 The destructive phase still requires `--offline`. The asynchronous job shape
 prevents the control plane from executing Scrub inline, but it is not authority
-to race a writable mount before the Appliance Lease, RETIRING transitions, and
-reader/writer pin drain are implemented.
+for this separate CLI process to race a writable mount before the Appliance
+Lease is implemented.
+
+The shared in-process store API now provides the safe online execution core for
+a locally constructed `GcCandidateProof`. It publishes replacement `ACTIVE`
+and victim `RETIRING` Locations in one Exact L0 activation, closes new admission
+to the displaced Exact generation, drains existing reader/write-through/
+reduction pins from every still-live predecessor generation, unlinks verified
+victim identities, synchronizes DATA, and then appends `REMOVED`. The
+scan-selection barrier rolls back if Exact activation fails and is released
+after `REMOVED`. Before the writable FUSE mount admits frontend I/O, its Online
+GC recovery finalizer derives every effective `RETIRING` Location, fully
+verifies each still-present victim against that complete Location set, finishes
+the DATA unlink/directory sync, and activates `REMOVED`. Already absent victims
+are accepted so a crash after durable unlink but before Exact publication is
+idempotently resumable. Failure aborts writable mount startup.
+
+Candidate discovery and bounded execution are wired to the writable daemon's
+adaptive scheduler. Continuing frontend io_uring submissions permit one small
+background quantum every fifteen minutes. After thirty seconds without a new
+frontend submission, the daemon may run one larger quantum per minute. At or
+above 90% physical Data Pool occupancy, it may run an urgent larger quantum
+every thirty seconds. All three remain in Linux idle I/O class.
+
+`--online gc-now METADATA_ROOT` sends one request over the daemon-owned
+mode-0600 Unix socket in the Metadata root. It starts an urgent quantum
+immediately with normal CPU priority, waits for its result, and prints a single
+`online_gc_ok=...` status line. The CLI never opens either storage repository.
+It can therefore be used while mounted without creating a second owner. This
+is intentionally different from `--offline gc-now`, which remains the only
+ordinary-I/O full-speed mode.
+
+Online DATA reads, relocation writes, verification, unlink, and directory sync
+use a synchronous maintenance storage view on the idle-prioritized worker. It
+shares RETIRING state and descriptor cache with the frontend Container
+repository, while bypassing the frontend io_uring ring and inflight-byte
+budget. Candidate bootstrap streams rows from bounded Header/Footer reads; it
+does not read Container payload and does not retain a pool-sized catalog map.
 
 `rebuild-exact` scans and fully decodes one Container at a time. Verified
 Locations immediately become hidden immutable level-zero Runs. Four complete
@@ -110,7 +163,17 @@ index or the complete new generation. Additional tests cover corruption of a
 Container and active Run page, cross-Run Chunk-length conflict, orphan retry,
 repeat rebuild generations, and multi-level compaction across 17 Containers.
 
+The library also exposes a paired pool-index rebuild for advanced reduction.
+It feeds Exact and Similarity builders from the same verified Container read,
+audits both hidden outputs, activates Exact first, and publishes the Similarity
+family manifest last. The family authenticates the active Exact Run Set ID;
+paired recovery and offline audit do not select a different or unbound identity. Empty
+pools publish a bound empty Similarity tombstone, and retry allocates after the
+generation of any orphan Similarity partition. The metadata fault matrix proves
+that crash recovery never exposes a Similarity family without its bound Exact
+Run Set. A maintenance CLI command for this paired operation is still pending.
+
 Remaining production gates are an Appliance Lease/multi-process exclusion,
-online RETIRING/relocation and pin drain, real block-device power-cut campaigns,
-streaming directory enumeration, measured large-store scrub/rebuild/GC
-throughput, and Metadata-object collection.
+real block-device power-cut campaigns, streaming directory enumeration,
+measured large-store scrub/rebuild/GC throughput, configurable maintenance
+windows, and Metadata-object collection.

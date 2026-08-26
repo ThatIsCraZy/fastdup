@@ -38,6 +38,95 @@ fn entry_with_crc(ordinal: u8, record_crc32c: u32) -> ExactIndexEntry {
 }
 
 #[test]
+fn atomic_transition_activation_excludes_the_old_location_and_drains_its_pins() {
+    let root = test_root("retiring-generation-drain");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xE4; 32]).expect("profile identity is nonzero");
+    let repository = ExactIndexRunRepository::new(
+        FsStorageIo::open(&root).expect("open workspace-local transition repository"),
+    );
+    let active_entry = entry(9);
+    let first = repository
+        .append_level_zero(profile, vec![active_entry])
+        .expect("activate the first exact generation");
+    assert!(first.into_retired().is_none());
+    let old_pin = repository
+        .pin_active_generation()
+        .expect("the first generation is installed");
+    let old_snapshot = old_pin.snapshot();
+    assert!(old_snapshot.try_pin().is_some());
+    repository
+        .append_level_zero(profile, vec![entry(11)])
+        .expect("an unrelated L0 generation may advance while the old reader remains pinned");
+
+    let retiring = ExactIndexEntry::retiring(active_entry).expect("ACTIVE may retire");
+    let second = repository
+        .append_level_zero(profile, vec![retiring])
+        .expect("activate the RETIRING barrier");
+    let current = second.current().clone();
+    let lookup = current
+        .lookup_transitions(active_entry.chunk_id(), active_entry.logical_length())
+        .expect("lookup the transitioned physical Location");
+    assert_eq!(lookup.candidates()[0], retiring);
+    assert_eq!(lookup.candidates()[1], active_entry);
+    let drain = second
+        .into_retired()
+        .expect("the first generation was displaced");
+    assert!(
+        old_snapshot.try_pin().is_none(),
+        "displaced reduction snapshots cannot start new DATA reads"
+    );
+    assert!(!drain.is_drained());
+
+    let waiter = std::thread::spawn(move || drain.wait());
+    assert!(!waiter.is_finished());
+    drop(old_pin);
+    waiter.join().expect("pin drain worker does not panic");
+}
+
+#[test]
+fn level_zero_append_rejects_resurrection_and_skipped_retirement_states() {
+    let root = test_root("transition-state-machine");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xE6; 32]).expect("profile identity is nonzero");
+    let repository = ExactIndexRunRepository::new(
+        FsStorageIo::open(&root).expect("open workspace-local transition repository"),
+    );
+    let active = entry(10);
+    repository
+        .append_level_zero(profile, vec![active])
+        .expect("activate the physical Location");
+    let initial_activation = repository
+        .pin_active_generation()
+        .expect("the physical Location has an activation")
+        .record();
+    let retiring = ExactIndexEntry::retiring(active).expect("ACTIVE may retire");
+    let removed = ExactIndexEntry::removed(retiring).expect("RETIRING may be removed");
+    assert!(matches!(
+        repository.append_level_zero(profile, vec![removed]),
+        Err(ExactIndexStoreError::InvalidLocationTransition)
+    ));
+    repository
+        .append_level_zero_if_active(profile, initial_activation, vec![retiring])
+        .expect("activate the retirement barrier");
+    assert!(matches!(
+        repository.append_level_zero_if_active(profile, initial_activation, vec![retiring]),
+        Err(ExactIndexStoreError::ActivationChanged)
+    ));
+    assert!(matches!(
+        repository.append_level_zero(profile, vec![active]),
+        Err(ExactIndexStoreError::InvalidLocationTransition)
+    ));
+    repository
+        .append_level_zero(profile, vec![removed])
+        .expect("RETIRING may advance to REMOVED");
+}
+
+#[test]
 fn family_compaction_uses_family_precedence_and_opens_one_partition_at_a_time() {
     let root = test_root("compact-partitioned-input-family");
     if root.exists() {

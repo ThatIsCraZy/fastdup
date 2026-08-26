@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::container::{
     MAX_DECODED_RECORD_BYTES, MAX_RECORD_BYTES, RAW_CODEC, VerifiedChunkLocation,
-    VerifiedRawLocation, ZSTD_CODEC,
+    VerifiedRawLocation, ZSTD_CODEC, ZSTD_PREFIX_CODEC,
 };
 use crate::{ChunkId, ContainerId, MAX_CONTAINER_BYTES, MAX_LOGICAL_CHUNK_BYTES};
 
@@ -210,9 +210,9 @@ impl ExactIndexEntry {
             record_decoded_length: verified.record_decoded_length(),
             record_payload_length: verified.record_payload_length(),
             codec_id: verified.codec_id(),
-            dependency_id: [0; 32],
+            dependency_id: verified.dependency_id(),
         };
-        if !valid_independent_location(verified.logical_length(), location) {
+        if !valid_location(verified.logical_length(), location) {
             return Err(ExactIndexFormatError::InvalidEntry);
         }
         Ok(Self {
@@ -264,6 +264,40 @@ impl ExactIndexEntry {
             logical_length,
             transition: ExactLocationTransition::Active,
             location,
+        })
+    }
+
+    /// Converts one verified ACTIVE physical Location into its RETIRING
+    /// transition without allowing any physical coordinate to change.
+    ///
+    /// The returned entry is acceleration state only. It becomes the durable
+    /// selection barrier after a newer Run Set containing it is activated.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a source that is not ACTIVE.
+    pub fn retiring(active: Self) -> Result<Self, ExactIndexFormatError> {
+        if active.transition != ExactLocationTransition::Active {
+            return Err(ExactIndexFormatError::InvalidEntry);
+        }
+        Ok(Self {
+            transition: ExactLocationTransition::Retiring,
+            ..active
+        })
+    }
+
+    /// Converts one RETIRING physical Location into its REMOVED tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a source that is not RETIRING.
+    pub fn removed(retiring: Self) -> Result<Self, ExactIndexFormatError> {
+        if retiring.transition != ExactLocationTransition::Retiring {
+            return Err(ExactIndexFormatError::InvalidEntry);
+        }
+        Ok(Self {
+            transition: ExactLocationTransition::Removed,
+            ..retiring
         })
     }
 
@@ -344,7 +378,7 @@ impl ExactIndexEntry {
                     .expect("ASSERT: a fixed Exact Index dependency field has 32 bytes"),
             },
         };
-        if !valid_independent_location(entry.logical_length, entry.location) {
+        if !valid_location(entry.logical_length, entry.location) {
             return Err(ExactIndexFormatError::InvalidEntry);
         }
         Ok(entry)
@@ -1277,25 +1311,26 @@ fn valid_raw_location(record_offset: u64, record_length: u32) -> bool {
             .is_some_and(|end| end <= MAX_CONTAINER_BYTES)
 }
 
-fn valid_independent_location(logical_length: u32, location: ExactIndexLocation) -> bool {
+fn valid_location(logical_length: u32, location: ExactIndexLocation) -> bool {
     if logical_length == 0
         || usize::try_from(logical_length).map_or(true, |length| length > MAX_LOGICAL_CHUNK_BYTES)
         || !valid_raw_location(location.record_offset, location.record_length)
         || location.container_generation == 0
-        || location.dependency_id != [0; 32]
     {
         return false;
     }
     match location.codec_id {
         RAW_CODEC => {
-            location.chunk_ordinal == 0
+            location.dependency_id == [0; 32]
+                && location.chunk_ordinal == 0
                 && location.decoded_offset == 0
                 && location.record_decoded_length == logical_length
                 && location.record_payload_length == logical_length
                 && expected_raw_record_length(logical_length) == Some(location.record_length)
         }
         ZSTD_CODEC => {
-            location.record_decoded_length > 0
+            location.dependency_id == [0; 32]
+                && location.record_decoded_length > 0
                 && usize::try_from(location.record_decoded_length)
                     .is_ok_and(|length| length <= MAX_DECODED_RECORD_BYTES)
                 && location.record_payload_length > 0
@@ -1304,6 +1339,14 @@ fn valid_independent_location(logical_length: u32, location: ExactIndexLocation)
                     .decoded_offset
                     .checked_add(logical_length)
                     .is_some_and(|end| end <= location.record_decoded_length)
+        }
+        ZSTD_PREFIX_CODEC => {
+            location.dependency_id != [0; 32]
+                && location.chunk_ordinal == 0
+                && location.decoded_offset == 0
+                && location.record_decoded_length == logical_length
+                && location.record_payload_length > 0
+                && location.record_payload_length < location.record_length
         }
         _ => false,
     }

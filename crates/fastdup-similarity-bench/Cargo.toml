@@ -1,0 +1,21 @@
+[package]
+name = "fastdup-similarity-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fastdup-format.workspace = true
+memmap2.workspace = true
+
+[[bin]]
+name = "fastdup-similarity-page-bench"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

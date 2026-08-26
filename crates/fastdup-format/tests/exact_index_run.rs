@@ -2,7 +2,7 @@ use fastdup_format::{
     ChunkId, ContainerId, EXACT_INDEX_ENTRY_BYTES, EXACT_INDEX_HEADER_BYTES,
     EXACT_INDEX_PAGE_BYTES, ExactIndexEntry, ExactIndexFormatError, ExactIndexLocation,
     ExactIndexPagePosition, ExactIndexProfileId, ExactIndexRun, ExactIndexRunDescriptor,
-    ExactIndexRunStreamEncoder, MAX_CONTAINER_BYTES, SealedContainer,
+    ExactIndexRunStreamEncoder, ExactLocationTransition, MAX_CONTAINER_BYTES, SealedContainer,
 };
 
 fn entry(ordinal: u8, logical_length: u32) -> ExactIndexEntry {
@@ -21,6 +21,20 @@ fn entry(ordinal: u8, logical_length: u32) -> ExactIndexEntry {
     .expect("worked RAW location is valid");
     ExactIndexEntry::active(ChunkId::from_bytes([ordinal; 32]), logical_length, location)
         .expect("worked active entry is valid")
+}
+
+#[test]
+fn location_lifecycle_preserves_coordinates_and_rejects_skipped_states() {
+    let active = entry(7, 16_391);
+    let retiring = ExactIndexEntry::retiring(active).expect("ACTIVE may become RETIRING");
+    assert_eq!(retiring.transition(), ExactLocationTransition::Retiring);
+    assert_eq!(retiring.location(), active.location());
+    assert!(ExactIndexEntry::retiring(retiring).is_err());
+
+    let removed = ExactIndexEntry::removed(retiring).expect("RETIRING may become REMOVED");
+    assert_eq!(removed.transition(), ExactLocationTransition::Removed);
+    assert_eq!(removed.location(), active.location());
+    assert!(ExactIndexEntry::removed(active).is_err());
 }
 
 fn worked_run() -> ExactIndexRun {

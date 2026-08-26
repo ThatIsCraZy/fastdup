@@ -5,40 +5,60 @@
 mod container_descriptor_cache;
 mod exact_activation_log;
 mod exact_index_repository;
+mod gc_candidate_catalog;
+mod gc_candidate_mmap;
 mod generation;
 mod generation_log;
 mod manifest_reader;
 mod manifest_tree;
 pub use manifest_tree::{ManifestRangeExtent, ManifestTreeSummary};
 mod maintenance;
+mod maintenance_ioprio;
+mod persistent_reduction;
 mod read_cache;
 mod reduction;
 mod reduction_codec;
 mod reduction_dictionary;
 mod reduction_filter;
+mod reduction_prefix;
 mod reduction_similarity;
 mod seqcdc;
+mod similarity_external_sort;
+mod similarity_index_repository;
+mod similarity_mmap;
+pub use fastdup_format::{SimilarityIndexPartitionRef, SimilarityIndexRunFamily};
+pub use similarity_external_sort::SIMILARITY_PARTITION_TARGET_REFERENCES;
 
 pub use container_descriptor_cache::ContainerDescriptorCacheStatus;
 pub use exact_index_repository::{
-    ActivatedExactIndex, EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES, ExactIndexLocationAudit,
-    ExactIndexLookup, ExactIndexPageCacheStatus, ExactIndexRunFamily, ExactIndexRunReader,
-    ExactIndexRunRepository, ExactIndexStoreError, ExactRunMembershipStatus,
+    ActivatedExactIndex, EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES, ExactIndexGenerationDrain,
+    ExactIndexGenerationPin, ExactIndexGenerationSnapshot, ExactIndexGenerationTransition,
+    ExactIndexLocationAudit, ExactIndexLookup, ExactIndexPageCacheStatus, ExactIndexRunFamily,
+    ExactIndexRunReader, ExactIndexRunRepository, ExactIndexStoreError, ExactRunMembershipStatus,
     MAX_ACTIVE_EXACT_INDEX_FAMILIES, MAX_ACTIVE_EXACT_INDEX_RUNS, MAX_EXACT_LOOKUP_CANDIDATES,
 };
+pub use gc_candidate_catalog::{
+    GcCandidateCatalogRepository, GcCandidateCatalogSnapshot, GcCandidateCatalogStoreError,
+    GcCandidateSelectionMode, GcCandidateShortlist, gc_candidate_row_from_publication,
+};
 pub use generation::{
-    CommittedDataGeneration, GenerationError, GenerationRepository, GenerationScrubSummary,
-    IndexedRequiredChunkVerifier, ManifestSuccessorProof, RecoveredDataGeneration,
-    RecoveredGeneration, RequiredChunkVerifier, SuccessorPredecessor, VerifiedCommittedFile,
-    WalTail,
+    CommittedDataGeneration, GenerationError, GenerationLivenessDelta, GenerationRepository,
+    GenerationScrubSummary, IndexedRequiredChunkVerifier, ManifestSuccessorProof,
+    RecoveredDataGeneration, RecoveredGeneration, RequiredChunkVerifier, SuccessorPredecessor,
+    VerifiedCommittedFile, WalTail,
 };
 pub use maintenance::{
     BackgroundMaintenanceJob, BackgroundMaintenanceReport, DataPoolUsage, DataPoolUsageError,
     EndToEndScrubReport, ExactIndexRebuildReport, GarbageCollectionPlan, GarbageCollectionReport,
-    MaintenanceError, MaintenancePriority, MaintenanceRepository,
+    GcCandidateProof, MaintenanceError, MaintenanceExecutionMode, MaintenancePriority,
+    MaintenanceRepository, OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport,
+    OnlineGcRetirement, OnlineGcRunMode, PoolIndexRebuildReport,
 };
 pub use manifest_reader::{MAX_MANIFEST_READ_BYTES, ManifestReadError, VerifiedManifestFile};
 pub use manifest_tree::ManifestTreeError;
+pub use persistent_reduction::{
+    PersistentChunkPlan, PersistentReductionError, PersistentReductionIndex,
+};
 pub use read_cache::{
     MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig, VerifiedReadCacheError,
     VerifiedReadCacheStatus, shared_cache_reserve_bytes,
@@ -52,8 +72,18 @@ pub use reduction_filter::{
     BlockedBloomHint, BloomLookupHint, HintStructureError, PerWorkerLocationHintCache,
     UnverifiedLocationHint,
 };
+pub use reduction_prefix::{
+    BaseChunkRef, VerifiedBaseChunk, ZstdPrefixCodec, ZstdPrefixEncoding, ZstdPrefixError,
+    ZstdPrefixTrial,
+};
 pub use seqcdc::{
     SeqCdcConfig, seqcdc_cut, seqcdc_cut_scalar, seqcdc_cut_segmented, seqcdc_cut_segmented_scalar,
+};
+pub use similarity_index_repository::{
+    RecoveredSimilarityIndex, SIMILARITY_FINGERPRINT_PROFILE_V1,
+    SIMILARITY_REPRESENTATIVE_PROFILE_V1, SimilarityBaseCandidate, SimilarityIndexAuditStatus,
+    SimilarityIndexReadMode, SimilarityIndexRebuildStatus, SimilarityIndexRepository,
+    SimilarityIndexStoreError, similarity_index_entry_v1,
 };
 
 use std::collections::BTreeMap;
@@ -63,15 +93,15 @@ use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use fastdup_format::{
-    BuildingContainerHeader, ContainerId, ExactIndexEntry, ExactIndexLocation,
-    ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
-    IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, PrehashedAdaptiveRegion, PrehashedChunk,
-    PrehashedContiguousRegion, SealedContainer, SealedContainerDescriptor,
-    VerifiedContainerPublication,
+    BuildingContainerHeader, ContainerId, ContainerIntrinsicSummary, ExactIndexEntry,
+    ExactIndexLocation, ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES,
+    IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
+    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, SealedContainer,
+    SealedContainerDescriptor, VerifiedContainerPublication,
 };
 use rayon::prelude::*;
 
@@ -586,6 +616,24 @@ pub trait StorageIo {
     /// Returns the backend's directory durability error.
     fn sync_root(&self) -> io::Result<()>;
 
+    /// Pins one immutable object for zero-copy reads when the adapter can
+    /// prevent in-process writes, truncation, replacement, and removal for the
+    /// lifetime of the returned lease.
+    ///
+    /// Adapters without that guarantee return `None`; callers retain their
+    /// bounded [`Self::read_exact_at`] path.
+    ///
+    /// # Errors
+    ///
+    /// Returns lookup, metadata, length, or lease-acquisition errors.
+    fn lease_immutable_file(
+        &self,
+        _name: &str,
+        _expected_length: u64,
+    ) -> io::Result<Option<ImmutableFileLease>> {
+        Ok(None)
+    }
+
     /// Consumes one complete Container image and runs the ordered publication
     /// protocol. Adapters may keep many owned publications in flight, but may
     /// return only after the captured root-sync cohort is durable.
@@ -601,10 +649,108 @@ pub trait StorageIo {
     }
 }
 
+type ImmutableLeaseCounts = BTreeMap<String, usize>;
+type SharedImmutableLeaseCounts = Arc<Mutex<ImmutableLeaseCounts>>;
+
+/// An opaque read-only file capability whose lifetime prevents cooperating
+/// [`FsStorageIo`] adapters from mutating the same published name.
+pub struct ImmutableFileLease {
+    file: File,
+    name: String,
+    counts: SharedImmutableLeaseCounts,
+}
+
+impl ImmutableFileLease {
+    pub(crate) const fn file(&self) -> &File {
+        &self.file
+    }
+}
+
+impl fmt::Debug for ImmutableFileLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ImmutableFileLease")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ImmutableFileLease {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.counts.lock() else {
+            return;
+        };
+        let remove = match counts.get_mut(&self.name) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => true,
+            None => {
+                debug_assert!(
+                    false,
+                    "ASSERT: immutable file lease count exists until drop"
+                );
+                false
+            }
+        };
+        if remove {
+            counts.remove(&self.name);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ContainerRepository<I> {
     storage: I,
     descriptors: Arc<container_descriptor_cache::ContainerDescriptorCache>,
+    retiring: Arc<RwLock<BTreeMap<[u8; 16], usize>>>,
+}
+
+struct RetiringSelectionBarrier {
+    retiring: Arc<RwLock<BTreeMap<[u8; 16], usize>>>,
+    containers: Vec<[u8; 16]>,
+    committed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RecoveredRetiringRemoval {
+    containers_removed: u64,
+    containers_already_absent: u64,
+    bytes_removed: u64,
+}
+
+impl RetiringSelectionBarrier {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RetiringSelectionBarrier {
+    fn drop(&mut self) {
+        if self.committed || self.containers.is_empty() {
+            return;
+        }
+        let mut retiring = self
+            .retiring
+            .write()
+            .expect("ASSERT: retiring Container rollback lock poisoned");
+        for container_id in &self.containers {
+            let remove = match retiring.get_mut(container_id) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(_) => true,
+                None => panic!(
+                    "ASSERT: an uncommitted selection barrier retains every prepared Container"
+                ),
+            };
+            if remove {
+                retiring.remove(container_id);
+            }
+        }
+    }
 }
 
 impl<I: StorageIo> ContainerRepository<I> {
@@ -615,6 +761,24 @@ impl<I: StorageIo> ContainerRepository<I> {
             descriptors: Arc::new(
                 container_descriptor_cache::ContainerDescriptorCache::new_system(),
             ),
+            retiring: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    /// Creates a maintenance I/O view over the same process-local Container
+    /// lifecycle state.
+    ///
+    /// The supplied adapter must address the same DATA publication directory.
+    /// This seam lets online maintenance use an independently scheduled I/O
+    /// path while sharing RETIRING barriers and descriptor-cache state with
+    /// frontend repositories. No routing branch or maintenance observation is
+    /// added to ordinary Container operations.
+    #[must_use]
+    pub fn with_maintenance_storage<J: StorageIo>(&self, storage: J) -> ContainerRepository<J> {
+        ContainerRepository {
+            storage,
+            descriptors: Arc::clone(&self.descriptors),
+            retiring: Arc::clone(&self.retiring),
         }
     }
 
@@ -633,6 +797,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             descriptors: Arc::new(
                 container_descriptor_cache::ContainerDescriptorCache::new_with_snapshot(snapshot),
             ),
+            retiring: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -640,6 +805,70 @@ impl<I: StorageIo> ContainerRepository<I> {
     #[must_use]
     pub fn descriptor_cache_status(&self) -> ContainerDescriptorCacheStatus {
         self.descriptors.status()
+    }
+
+    /// Excludes RETIRING Containers from directory-scan selection fallbacks.
+    ///
+    /// Exact-generation pins may still read a physical Location selected
+    /// before the retirement barrier. Recovery and Scrub continue to inspect
+    /// every published Container regardless of this process-local set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process-local selection-barrier lock is poisoned.
+    pub fn install_retiring_selection_barrier(&self, containers: &BTreeMap<[u8; 16], ContainerId>) {
+        let mut retiring = self
+            .retiring
+            .write()
+            .expect("ASSERT: retiring Container selection lock poisoned");
+        for container_id in containers.keys().copied() {
+            retiring.entry(container_id).or_insert(1);
+        }
+    }
+
+    fn prepare_retiring_selection_barrier(
+        &self,
+        containers: &BTreeMap<[u8; 16], ContainerId>,
+    ) -> Result<RetiringSelectionBarrier, crate::maintenance::MaintenanceError> {
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(containers.len())
+            .map_err(|_| crate::maintenance::MaintenanceError::OutOfMemory)?;
+        let mut retiring = self
+            .retiring
+            .write()
+            .expect("ASSERT: retiring Container selection lock poisoned");
+        for container_id in containers.keys().copied() {
+            let count = retiring.entry(container_id).or_insert(0);
+            *count = count
+                .checked_add(1)
+                .expect("ASSERT: retiring selection-barrier references cannot overflow");
+            prepared.push(container_id);
+        }
+        drop(retiring);
+        Ok(RetiringSelectionBarrier {
+            retiring: Arc::clone(&self.retiring),
+            containers: prepared,
+            committed: false,
+        })
+    }
+
+    fn remove_retiring_selection_barrier(&self, containers: &BTreeMap<[u8; 16], ContainerId>) {
+        let mut retiring = self
+            .retiring
+            .write()
+            .expect("ASSERT: retiring Container removal lock poisoned");
+        for container_id in containers.keys() {
+            retiring.remove(container_id);
+        }
+    }
+
+    fn selectable_container(&self, container_id: ContainerId) -> bool {
+        !self
+            .retiring
+            .read()
+            .expect("ASSERT: retiring Container selection lock poisoned")
+            .contains_key(&container_id.bytes())
     }
 
     /// Runs the format writer and ordered durable publication protocol.
@@ -667,6 +896,28 @@ impl<I: StorageIo> ContainerRepository<I> {
         let (sealed, publication) = encoded.into_publication_parts();
         self.publish_sealed(container_id, container_generation, sealed, publication)
             .map(drop)
+    }
+
+    /// Publishes codec-3 targets whose named Base Chunks are already durable.
+    ///
+    /// This writer does not publish or discover Bases. The caller must obtain
+    /// each Base through independent verified storage and keep its Exact Index
+    /// Location live before making the dependent Container reachable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first Prefix format, backend I/O, sampling, or durability
+    /// error. Existing published IDs are never replaced.
+    pub fn publish_zstd_prefix_pairs_verified(
+        &self,
+        container_id: ContainerId,
+        container_generation: u64,
+        pairs: &[(&[u8], &[u8])],
+    ) -> Result<VerifiedContainerPublication, StoreError> {
+        let encoded =
+            SealedContainer::encode_zstd_prefix_pairs(container_id, container_generation, pairs)?;
+        let (sealed, publication) = encoded.into_publication_parts();
+        self.publish_sealed(container_id, container_generation, sealed, publication)
     }
 
     /// Runs adaptive RAW/Zstd region encoding and the same ordered durable
@@ -961,6 +1212,50 @@ impl<I: StorageIo> ContainerRepository<I> {
         })
     }
 
+    /// Encodes ordinary adaptive regions and already-trialled independent or
+    /// Prefix records into one immutable Container image.
+    ///
+    /// Each prepared record is consumed. No candidate target is compressed a
+    /// second time after the v1 cost decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded format, compression, allocation, or worker failures.
+    pub fn prepare_mixed_prehashed_reduction_parallel(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[PrehashedAdaptiveRegion<'_>],
+        independent: Vec<fastdup_format::PreparedIndependentRecord>,
+        prefixes: Vec<fastdup_format::PreparedZstdPrefixRecord>,
+        workers: NonZeroUsize,
+    ) -> Result<PreparedAdaptiveContainer, StoreError> {
+        let encode_wall_started = Instant::now();
+        let encode_cpu_started = process_cpu_time();
+        let encoded =
+            SealedContainer::encode_mixed_prehashed_reduction_parallel_profiled_with_gate(
+                container_id,
+                container_generation,
+                regions,
+                independent,
+                prefixes,
+                workers,
+                IncompressibilityGatePolicy::Off,
+            )?;
+        let encode_wall = encode_wall_started.elapsed();
+        let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
+        let incompressibility_gate = encoded.metrics();
+        let (sealed, publication) = encoded.into_publication_parts();
+        Ok(PreparedAdaptiveContainer {
+            container_id,
+            container_generation,
+            sealed,
+            publication,
+            encode_wall,
+            encode_process_cpu,
+            incompressibility_gate,
+        })
+    }
+
     /// Durably publishes one prepared adaptive Container and returns complete
     /// writer-image evidence plus storage-sampling phase metrics.
     ///
@@ -1105,12 +1400,92 @@ impl<I: StorageIo> ContainerRepository<I> {
     /// Returns the backend read error or any container integrity failure.
     pub fn read(&self, container_id: ContainerId) -> Result<SealedContainer, StoreError> {
         let bytes = self.storage.read(&published_name(container_id))?;
-        let container = SealedContainer::decode(&bytes)?;
+        self.decode_published_bytes(container_id, &bytes)
+    }
+
+    fn decode_published_bytes(
+        &self,
+        expected_id: ContainerId,
+        bytes: &[u8],
+    ) -> Result<SealedContainer, StoreError> {
+        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| {
+            self.read_verified_independent_chunk(dependency.chunk_id(), dependency.logical_length())
+                .map_err(|_| FormatError::ZstdPrefixBaseRequired)
+        };
+        let container = SealedContainer::decode_with_zstd_prefix_resolver(bytes, &mut resolve)?;
         let embedded_id = container.header().container_id();
-        if embedded_id != container_id {
+        if embedded_id != expected_id {
+            return Err(StoreError::PublishedIdentityMismatch {
+                name: expected_id,
+                header: embedded_id,
+            });
+        }
+        Ok(container)
+    }
+
+    fn read_verified_independent_chunk(
+        &self,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u32,
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut names = self.storage.list_names()?;
+        names.sort_unstable();
+        for name in names {
+            let Some(expected_id) = parse_published_name(&name)? else {
+                continue;
+            };
+            if !self.selectable_container(expected_id) {
+                continue;
+            }
+            let bytes = self.storage.read(&name)?;
+            let (embedded_id, found) =
+                SealedContainer::find_verified_independent_chunk(&bytes, chunk_id, logical_length)?;
+            if embedded_id != expected_id {
+                return Err(StoreError::PublishedIdentityMismatch {
+                    name: expected_id,
+                    header: embedded_id,
+                });
+            }
+            if let Some(bytes) = found {
+                return Ok(bytes);
+            }
+        }
+        Err(StoreError::MissingVerifiedChunk {
+            chunk_id,
+            logical_length: u64::from(logical_length),
+        })
+    }
+
+    /// Reads one Container while resolving codec-3 Bases through the active
+    /// persistent Exact Index.
+    ///
+    /// Base lookup accepts only dependency-free RAW or Zstd Locations. This
+    /// enforces Depth 1 even if the index also contains dependent copies of the
+    /// same logical Base Chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns Container, index, Base-resolution, or identity failures.
+    pub fn read_with_index<J: StorageIo>(
+        &self,
+        container_id: ContainerId,
+        index: &ActivatedExactIndex<J>,
+    ) -> Result<SealedContainer, StoreError> {
+        let name = published_name(container_id);
+        let bytes = self.storage.read(&name)?;
+        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| {
+            self.find_verified_independent_base_with_index(
+                index,
+                dependency.chunk_id(),
+                dependency.logical_length(),
+            )
+            .ok_or(FormatError::ZstdPrefixBaseRequired)
+        };
+        let container = SealedContainer::decode_with_zstd_prefix_resolver(&bytes, &mut resolve)?;
+        if container.header().container_id() != container_id {
             return Err(StoreError::PublishedIdentityMismatch {
                 name: container_id,
-                header: embedded_id,
+                header: container.header().container_id(),
             });
         }
         Ok(container)
@@ -1138,15 +1513,11 @@ impl<I: StorageIo> ContainerRepository<I> {
             let Some(expected_id) = parse_published_name(&name)? else {
                 continue;
             };
-            let bytes = self.storage.read(&name)?;
-            let container = SealedContainer::decode(&bytes)?;
-            let embedded_id = container.header().container_id();
-            if embedded_id != expected_id {
-                return Err(StoreError::PublishedIdentityMismatch {
-                    name: expected_id,
-                    header: embedded_id,
-                });
+            if !self.selectable_container(expected_id) {
+                continue;
             }
+            let bytes = self.storage.read(&name)?;
+            let container = self.decode_published_bytes(expected_id, &bytes)?;
             let Some(payload) = container.chunk(chunk_id) else {
                 continue;
             };
@@ -1178,6 +1549,41 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         candidate: ExactIndexEntry,
     ) -> Result<Vec<u8>, StoreError> {
+        let (descriptor, encoded_record) = self.read_candidate_record(candidate)?;
+        let record = descriptor
+            .decode_candidate(candidate, &encoded_record)
+            .map_err(map_exact_location_error)?;
+        Ok(record.payload().to_vec())
+    }
+
+    /// Resolves one codec-3 target after its named Base was independently
+    /// decoded and verified by the caller.
+    ///
+    /// The target record and Exact coordinates are paired again here. A wrong
+    /// Base identity, a stale target Location, or any reconstruction mismatch
+    /// returns no bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns Container I/O/integrity failures or
+    /// [`StoreError::ExactLocationMismatch`] for any unpaired dependency or
+    /// physical coordinate.
+    pub fn read_verified_zstd_prefix_location(
+        &self,
+        candidate: ExactIndexEntry,
+        verified_base: &[u8],
+    ) -> Result<Vec<u8>, StoreError> {
+        let (descriptor, encoded_record) = self.read_candidate_record(candidate)?;
+        let record = descriptor
+            .decode_zstd_prefix_candidate(candidate, &encoded_record, verified_base)
+            .map_err(map_exact_location_error)?;
+        Ok(record.payload().to_vec())
+    }
+
+    fn read_candidate_record(
+        &self,
+        candidate: ExactIndexEntry,
+    ) -> Result<(SealedContainerDescriptor, Vec<u8>), StoreError> {
         if candidate.transition() != ExactLocationTransition::Active {
             return Err(StoreError::ExactLocationMismatch);
         }
@@ -1218,10 +1624,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         let encoded_record = self
             .storage
             .read_exact_at(&name, range.offset(), range.length())?;
-        let record = descriptor
-            .decode_candidate(candidate, &encoded_record)
-            .map_err(map_exact_location_error)?;
-        Ok(record.payload().to_vec())
+        Ok((descriptor, encoded_record))
     }
 
     /// Attempts one bounded persistent Exact-Index lookup without falling back
@@ -1323,8 +1726,67 @@ impl<I: StorageIo> ContainerRepository<I> {
                 break;
             }
             attempted += 1;
-            if let Ok(bytes) = self.read_verified_location(candidate) {
+            let verified = if location.dependency_id() == [0; 32] {
+                self.read_verified_location(candidate)
+            } else {
+                let base_id = fastdup_format::ChunkId::from_bytes(location.dependency_id());
+                let Some(base) =
+                    self.find_verified_independent_base_with_index(index, base_id, index_length)
+                else {
+                    continue;
+                };
+                self.read_verified_zstd_prefix_location(candidate, &base)
+            };
+            if let Ok(bytes) = verified {
                 return Some((candidate, bytes));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn find_verified_independent_base_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u32,
+    ) -> Option<Vec<u8>> {
+        let lookup = index.lookup_transitions(chunk_id, logical_length).ok()?;
+        let mut seen_locations: [Option<ExactIndexLocation>; MAX_EXACT_LOOKUP_CANDIDATES] =
+            [None; MAX_EXACT_LOOKUP_CANDIDATES];
+        let mut seen_count = 0_usize;
+        let mut attempted = 0_u8;
+        for candidate in lookup.candidates().iter().copied() {
+            assert_eq!(
+                candidate.chunk_id(),
+                chunk_id,
+                "ASSERT: Base Exact lookup returned a different Chunk ID"
+            );
+            assert_eq!(
+                candidate.logical_length(),
+                logical_length,
+                "ASSERT: Base Exact lookup returned a different logical length"
+            );
+            let location = candidate.location();
+            if seen_locations[..seen_count].contains(&Some(location)) {
+                continue;
+            }
+            assert!(
+                seen_count < seen_locations.len(),
+                "ASSERT: bounded Base lookup returned more candidates than its hard limit"
+            );
+            seen_locations[seen_count] = Some(location);
+            seen_count += 1;
+            if candidate.transition() != ExactLocationTransition::Active
+                || location.dependency_id() != [0; 32]
+            {
+                continue;
+            }
+            if attempted == 2 {
+                break;
+            }
+            attempted += 1;
+            if let Ok(bytes) = self.read_verified_location(candidate) {
+                return Some(bytes);
             }
         }
         None
@@ -1375,15 +1837,31 @@ impl<I: StorageIo> ContainerRepository<I> {
                 continue;
             };
             let bytes = self.storage.read(&name)?;
-            let container = SealedContainer::decode(&bytes)?;
-            let embedded_id = container.header().container_id();
-            if embedded_id != expected_id {
-                return Err(StoreError::PublishedIdentityMismatch {
-                    name: expected_id,
-                    header: embedded_id,
-                });
-            }
+            let container = self.decode_published_bytes(expected_id, &bytes)?;
             recovered.push(container);
+        }
+        Ok(recovered)
+    }
+
+    /// Discovers and fully verifies all published Containers with bounded
+    /// Depth-1 Base resolution through an activated Exact Index.
+    ///
+    /// # Errors
+    ///
+    /// Returns namespace, naming, Container, Exact-Index, Base, or identity
+    /// failures. A dependent Base Location is never accepted as another Base.
+    pub fn recover_published_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+    ) -> Result<Vec<SealedContainer>, StoreError> {
+        let mut names = self.storage.list_names()?;
+        names.sort_unstable();
+        let mut recovered = Vec::new();
+        for name in names {
+            let Some(expected_id) = parse_published_name(&name)? else {
+                continue;
+            };
+            recovered.push(self.read_with_index(expected_id, index)?);
         }
         Ok(recovered)
     }
@@ -1444,6 +1922,79 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(high_water)
     }
 
+    pub(crate) fn published_container_count(&self) -> Result<u64, StoreError> {
+        let mut count = 0_u64;
+        for name in self.storage.list_names()? {
+            if parse_published_name(&name)?.is_some() {
+                count = count.checked_add(1).ok_or_else(audit_counter_overflow)?;
+            }
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn visit_published_intrinsic_summaries<E, F>(&self, mut visitor: F) -> Result<(), E>
+    where
+        E: From<StoreError>,
+        F: FnMut(ContainerId, u64, u64, ContainerIntrinsicSummary) -> Result<(), E>,
+    {
+        let mut names = self.storage.list_names().map_err(StoreError::from)?;
+        names.sort_unstable();
+        for name in names {
+            let Some(expected_id) = parse_published_name(&name).map_err(E::from)? else {
+                continue;
+            };
+            let actual_length = self.storage.object_len(&name).map_err(StoreError::from)?;
+            let minimum_length = u64::try_from(HEADER_BYTES)
+                .map_err(|_| StoreError::Format(FormatError::ArithmeticOverflow))?
+                .checked_add(FOOTER_BYTES)
+                .ok_or(StoreError::Format(FormatError::ArithmeticOverflow))?;
+            if actual_length < minimum_length || actual_length > MAX_CONTAINER_BYTES {
+                return Err(E::from(StoreError::Format(
+                    FormatError::InvalidContainerLength(
+                        usize::try_from(actual_length).unwrap_or(usize::MAX),
+                    ),
+                )));
+            }
+            let footer_offset = actual_length
+                .checked_sub(FOOTER_BYTES)
+                .ok_or(StoreError::Format(FormatError::ArithmeticOverflow))?;
+            let header = self
+                .storage
+                .read_exact_at(&name, 0, HEADER_BYTES)
+                .map_err(StoreError::from)?;
+            let footer = self
+                .storage
+                .read_exact_at(
+                    &name,
+                    footer_offset,
+                    usize::try_from(FOOTER_BYTES)
+                        .map_err(|_| StoreError::Format(FormatError::ArithmeticOverflow))?,
+                )
+                .map_err(StoreError::from)?;
+            let descriptor = SealedContainerDescriptor::decode(&header, &footer, actual_length)
+                .map_err(StoreError::from)?;
+            if descriptor.container_id() != expected_id {
+                return Err(E::from(StoreError::PublishedIdentityMismatch {
+                    name: expected_id,
+                    header: descriptor.container_id(),
+                }));
+            }
+            let summary = SealedContainerDescriptor::decode_intrinsic_summary(
+                &header,
+                &footer,
+                actual_length,
+            )
+            .map_err(StoreError::from)?;
+            visitor(
+                expected_id,
+                descriptor.container_generation(),
+                actual_length,
+                summary,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Fully verifies published objects one at a time and retains no payloads.
     ///
     /// # Errors
@@ -1458,15 +2009,9 @@ impl<I: StorageIo> ContainerRepository<I> {
                 continue;
             };
             let bytes = self.storage.read(&name)?;
-            let container = SealedContainer::decode(&bytes)?;
+            let container = self.decode_published_bytes(expected_id, &bytes)?;
             let header = container.header();
             let embedded_id = header.container_id();
-            if embedded_id != expected_id {
-                return Err(StoreError::PublishedIdentityMismatch {
-                    name: expected_id,
-                    header: embedded_id,
-                });
-            }
             verified.push(PublishedContainerSummary {
                 container_id: embedded_id,
                 container_generation: header.container_generation(),
@@ -1486,7 +2031,10 @@ impl<I: StorageIo> ContainerRepository<I> {
     ///
     /// Returns the first namespace, naming, format, identity, or counter
     /// overflow failure.
-    pub fn audit_published(&self) -> Result<ContainerAuditSummary, StoreError> {
+    pub fn audit_published(&self) -> Result<ContainerAuditSummary, StoreError>
+    where
+        I: Sync,
+    {
         self.visit_verified_published_pipelined::<StoreError, _>(|_| Ok(()))
     }
 
@@ -1495,19 +2043,20 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_ids: &BTreeMap<[u8; 16], ContainerId>,
     ) -> Result<u64, StoreError> {
         let mut removed_bytes = 0_u64;
+        let mut verified_removals = Vec::new();
+        verified_removals
+            .try_reserve_exact(container_ids.len())
+            .map_err(|_| StoreError::Io(io::Error::from(io::ErrorKind::OutOfMemory)))?;
         for container_id in container_ids.values().copied() {
             let name = published_name(container_id);
             let bytes = self.storage.read(&name)?;
-            let container = SealedContainer::decode(&bytes)?;
-            if container.header().container_id() != container_id {
-                return Err(StoreError::PublishedIdentityMismatch {
-                    name: container_id,
-                    header: container.header().container_id(),
-                });
-            }
+            let container = self.decode_published_bytes(container_id, &bytes)?;
             removed_bytes = removed_bytes
                 .checked_add(container.header().layout().file_length)
                 .ok_or_else(audit_counter_overflow)?;
+            verified_removals.push(name);
+        }
+        for name in verified_removals {
             self.storage.remove_file(&name)?;
         }
         if !container_ids.is_empty() {
@@ -1516,11 +2065,90 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(removed_bytes)
     }
 
+    /// Idempotently removes Containers named by effective durable RETIRING
+    /// entries after process restart.
+    ///
+    /// Every still-present Container is fully verified and must reproduce the
+    /// complete RETIRING Location set before unlink. An absent canonical name
+    /// is accepted because an earlier attempt may have synchronized its
+    /// deletion before crashing ahead of the REMOVED Exact transition.
+    pub(crate) fn remove_recovered_retiring(
+        &self,
+        retiring_entries: &[ExactIndexEntry],
+    ) -> Result<RecoveredRetiringRemoval, StoreError> {
+        let mut victims = BTreeMap::<[u8; 16], (ContainerId, Vec<ExactIndexEntry>)>::new();
+        for entry in retiring_entries.iter().copied() {
+            if entry.transition() != ExactLocationTransition::Retiring {
+                return Err(StoreError::ExactLocationMismatch);
+            }
+            let container_id = entry.location().container_id();
+            let (_, entries) = victims
+                .entry(container_id.bytes())
+                .or_insert_with(|| (container_id, Vec::new()));
+            entries
+                .try_reserve(1)
+                .map_err(|_| StoreError::Io(io::Error::from(io::ErrorKind::OutOfMemory)))?;
+            entries.push(entry);
+        }
+
+        let mut report = RecoveredRetiringRemoval::default();
+        let mut verified_removals = Vec::new();
+        verified_removals
+            .try_reserve_exact(victims.len())
+            .map_err(|_| StoreError::Io(io::Error::from(io::ErrorKind::OutOfMemory)))?;
+        for (container_id, mut expected) in victims.into_values() {
+            let name = published_name(container_id);
+            if !self.storage.exists(&name)? {
+                report.containers_already_absent = report
+                    .containers_already_absent
+                    .checked_add(1)
+                    .ok_or_else(audit_counter_overflow)?;
+                continue;
+            }
+            let bytes = self.storage.read(&name)?;
+            let container = self.decode_published_bytes(container_id, &bytes)?;
+            let mut observed = Vec::new();
+            observed
+                .try_reserve_exact(container.locations().len())
+                .map_err(|_| StoreError::Io(io::Error::from(io::ErrorKind::OutOfMemory)))?;
+            for location in container.locations().iter().copied() {
+                let active = ExactIndexEntry::from_verified(location)
+                    .map_err(|_| StoreError::ExactLocationMismatch)?;
+                observed.push(
+                    ExactIndexEntry::retiring(active)
+                        .map_err(|_| StoreError::ExactLocationMismatch)?,
+                );
+            }
+            expected.sort_unstable_by(exact_entry_location_order);
+            observed.sort_unstable_by(exact_entry_location_order);
+            if observed != expected {
+                return Err(StoreError::ExactLocationMismatch);
+            }
+            verified_removals.push((name, container.header().layout().file_length));
+        }
+        for (name, file_length) in verified_removals {
+            self.storage.remove_file(&name)?;
+            report.bytes_removed = report
+                .bytes_removed
+                .checked_add(file_length)
+                .ok_or_else(audit_counter_overflow)?;
+            report.containers_removed = report
+                .containers_removed
+                .checked_add(1)
+                .ok_or_else(audit_counter_overflow)?;
+        }
+        if report.containers_removed != 0 {
+            self.storage.sync_root()?;
+        }
+        Ok(report)
+    }
+
     pub(crate) fn visit_verified_published_pipelined<E, F>(
         &self,
         mut visitor: F,
     ) -> Result<ContainerAuditSummary, E>
     where
+        I: Sync,
         E: From<StoreError>,
         F: FnMut(&SealedContainer) -> Result<(), E>,
     {
@@ -1576,17 +2204,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             );
             let decoded = encoded
                 .into_par_iter()
-                .map(|(expected_id, bytes)| {
-                    let container = SealedContainer::decode(&bytes).map_err(StoreError::from)?;
-                    let embedded_id = container.header().container_id();
-                    if embedded_id != expected_id {
-                        return Err(StoreError::PublishedIdentityMismatch {
-                            name: expected_id,
-                            header: embedded_id,
-                        });
-                    }
-                    Ok(container)
-                })
+                .map(|(expected_id, bytes)| self.decode_published_bytes(expected_id, &bytes))
                 .collect::<Result<Vec<_>, StoreError>>()
                 .map_err(E::from)?;
             for container in decoded {
@@ -1611,15 +2229,11 @@ impl<I: StorageIo> ContainerRepository<I> {
             let Some(expected_id) = parse_published_name(&name)? else {
                 continue;
             };
-            let bytes = self.storage.read(&name)?;
-            let container = SealedContainer::decode(&bytes)?;
-            let embedded_id = container.header().container_id();
-            if embedded_id != expected_id {
-                return Err(StoreError::PublishedIdentityMismatch {
-                    name: expected_id,
-                    header: embedded_id,
-                });
+            if !self.selectable_container(expected_id) {
+                continue;
             }
+            let bytes = self.storage.read(&name)?;
+            let container = self.decode_published_bytes(expected_id, &bytes)?;
             for record in container.records() {
                 let chunk_id = record.chunk_id();
                 let Some(required_length) = missing.get(&chunk_id).copied() else {
@@ -1704,9 +2318,14 @@ fn publish_owned_container_synchronously<I: StorageIo + ?Sized>(
     Ok(verified)
 }
 
+static FS_IMMUTABLE_LEASE_REGISTRIES: OnceLock<
+    Mutex<BTreeMap<PathBuf, Weak<Mutex<ImmutableLeaseCounts>>>>,
+> = OnceLock::new();
+
 #[derive(Clone, Debug)]
 pub struct FsStorageIo {
     root: PathBuf,
+    immutable_leases: SharedImmutableLeaseCounts,
 }
 
 impl FsStorageIo {
@@ -1717,8 +2336,22 @@ impl FsStorageIo {
     /// Returns an I/O error if the root cannot be initialized.
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         std::fs::create_dir_all(root.as_ref())?;
+        let root = std::fs::canonicalize(root.as_ref())?;
+        let registries = FS_IMMUTABLE_LEASE_REGISTRIES.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut registries = registries
+            .lock()
+            .map_err(|_| io::Error::other("immutable lease registry is poisoned"))?;
+        let immutable_leases = registries
+            .get(&root)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let counts = Arc::new(Mutex::new(BTreeMap::new()));
+                registries.insert(root.clone(), Arc::downgrade(&counts));
+                counts
+            });
         Ok(Self {
-            root: root.as_ref().to_path_buf(),
+            root,
+            immutable_leases,
         })
     }
 
@@ -1735,6 +2368,22 @@ impl FsStorageIo {
             ));
         }
         Ok(self.root.join(name))
+    }
+
+    fn immutable_lease_guard(&self) -> io::Result<std::sync::MutexGuard<'_, ImmutableLeaseCounts>> {
+        self.immutable_leases
+            .lock()
+            .map_err(|_| io::Error::other("immutable lease registry is poisoned"))
+    }
+
+    fn reject_leased(counts: &ImmutableLeaseCounts, name: &str) -> io::Result<()> {
+        if counts.get(name).copied().unwrap_or(0) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "published object has active immutable readers",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1753,6 +2402,8 @@ impl StorageIo for FsStorageIo {
     }
 
     fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        let leases = self.immutable_lease_guard()?;
+        Self::reject_leased(&leases, name)?;
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -1824,6 +2475,8 @@ impl StorageIo for FsStorageIo {
     }
 
     fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
+        let leases = self.immutable_lease_guard()?;
+        Self::reject_leased(&leases, name)?;
         OpenOptions::new()
             .write(true)
             .open(self.path(name)?)?
@@ -1837,6 +2490,9 @@ impl StorageIo for FsStorageIo {
     fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
         self.path(temporary_name)?;
         self.path(published_name)?;
+        let leases = self.immutable_lease_guard()?;
+        Self::reject_leased(&leases, temporary_name)?;
+        Self::reject_leased(&leases, published_name)?;
         let directory = File::open(&self.root)?;
         rustix::fs::renameat_with(
             &directory,
@@ -1849,11 +2505,40 @@ impl StorageIo for FsStorageIo {
     }
 
     fn remove_file(&self, name: &str) -> io::Result<()> {
+        let leases = self.immutable_lease_guard()?;
+        Self::reject_leased(&leases, name)?;
         std::fs::remove_file(self.path(name)?)
     }
 
     fn sync_root(&self) -> io::Result<()> {
         File::open(&self.root)?.sync_all()
+    }
+
+    fn lease_immutable_file(
+        &self,
+        name: &str,
+        expected_length: u64,
+    ) -> io::Result<Option<ImmutableFileLease>> {
+        let path = self.path(name)?;
+        let mut counts = self.immutable_lease_guard()?;
+        let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() != expected_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "immutable object identity or length changed before lease acquisition",
+            ));
+        }
+        let count = counts.entry(name.to_owned()).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("immutable lease count overflow"))?;
+        drop(counts);
+        Ok(Some(ImmutableFileLease {
+            file,
+            name: name.to_owned(),
+            counts: Arc::clone(&self.immutable_leases),
+        }))
     }
 }
 
@@ -2033,6 +2718,38 @@ fn add_container_to_audit_summary(
 
 fn audit_counter_overflow() -> StoreError {
     StoreError::Io(io::Error::other("Container audit counter overflow"))
+}
+
+fn exact_entry_location_order(
+    left: &ExactIndexEntry,
+    right: &ExactIndexEntry,
+) -> std::cmp::Ordering {
+    let left_location = left.location();
+    let right_location = right.location();
+    left.chunk_id()
+        .cmp(&right.chunk_id())
+        .then_with(|| left.logical_length().cmp(&right.logical_length()))
+        .then_with(|| {
+            left_location
+                .container_id()
+                .bytes()
+                .cmp(&right_location.container_id().bytes())
+        })
+        .then_with(|| {
+            left_location
+                .container_generation()
+                .cmp(&right_location.container_generation())
+        })
+        .then_with(|| {
+            left_location
+                .record_offset()
+                .cmp(&right_location.record_offset())
+        })
+        .then_with(|| {
+            left_location
+                .chunk_ordinal()
+                .cmp(&right_location.chunk_ordinal())
+        })
 }
 
 fn map_exact_location_error(error: FormatError) -> StoreError {

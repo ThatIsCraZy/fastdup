@@ -16,6 +16,7 @@ fn version_one_policy_exposes_every_independently_benchmarkable_stage() {
         ReductionFeatures::SIMILARITY,
         ReductionFeatures::DELTA,
         ReductionFeatures::REORDER,
+        ReductionFeatures::ZSTD_PREFIX,
     ] {
         assert!(policy.features().contains(feature));
     }
@@ -34,6 +35,10 @@ fn policy_rejects_dependent_encoding_without_candidate_search() {
     let invalid = ReductionFeatures::RAW | ReductionFeatures::DELTA;
 
     assert!(ReductionPolicy::v1(invalid).is_err());
+
+    let prefix_without_delta =
+        ReductionFeatures::RAW | ReductionFeatures::SIMILARITY | ReductionFeatures::ZSTD_PREFIX;
+    assert!(ReductionPolicy::v1(prefix_without_delta).is_err());
 }
 
 #[test]
@@ -205,6 +210,42 @@ fn similar_mutated_chunks_use_only_bounded_depth_one_delta_trials() {
     assert_eq!(audit.logical_bytes_verified(), 8 * 1_024 * 1_024);
     assert!(audit.records_verified() >= 64);
     assert!(audit.chunks_verified() >= 64);
+}
+
+#[test]
+fn shifted_incompressible_chunk_selects_zstd_prefix_over_sparse_xor() {
+    let policy = ReductionPolicy::v1(
+        ReductionFeatures::RAW
+            | ReductionFeatures::EXACT
+            | ReductionFeatures::SIMILARITY
+            | ReductionFeatures::DELTA
+            | ReductionFeatures::ZSTD_PREFIX,
+    )
+    .expect("Zstd Prefix plus an independent RAW Base is valid");
+    let runtime = ReductionRuntime::new(
+        NonZeroUsize::new(2).expect("fixture worker count is nonzero"),
+        4 * 1_024 * 1_024,
+    )
+    .expect("fixture memory budget is valid");
+    let mut engine = ReductionEngine::new(policy, runtime);
+    let original = deterministic_bytes(64 * 1_024);
+    engine.ingest(&original).expect("Base ingest succeeds");
+
+    let mut shifted = original.clone();
+    shifted.rotate_left(1);
+    let object = engine.ingest(&shifted).expect("Prefix ingest succeeds");
+
+    assert_eq!(
+        engine.restore(object).expect("Prefix restore succeeds"),
+        shifted
+    );
+    let report = engine.report(object).expect("Prefix report exists");
+    assert_eq!(report.logical_chunks(), 1);
+    assert_eq!(report.delta_chunks(), 1);
+    assert_eq!(report.zstd_prefix_chunks(), 1);
+    assert_eq!(report.maximum_delta_depth(), 1);
+    assert!(report.delta_trials() <= usize::from(policy.maximum_trial_encodes()));
+    engine.audit().expect("Prefix archive AUDIT succeeds");
 }
 
 fn deterministic_bytes(length: usize) -> Vec<u8> {

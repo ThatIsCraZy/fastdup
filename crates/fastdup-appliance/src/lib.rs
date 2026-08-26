@@ -5,6 +5,7 @@
 mod checkpoint;
 mod checkpoint_trigger;
 mod historical_proof_cache;
+mod online_gc;
 mod proof_cache_trace;
 mod statfs;
 
@@ -19,6 +20,10 @@ pub use checkpoint_trigger::{
     checkpoint_action,
 };
 pub use historical_proof_cache::HistoricalProofCacheStatus;
+pub use online_gc::{
+    ONLINE_GC_CONTROL_REQUEST, ONLINE_GC_CONTROL_SOCKET_NAME, OnlineGcScheduler,
+    online_gc_control_path, remove_stale_online_gc_socket, request_online_gc_now,
+};
 pub use proof_cache_trace::{
     ProofCacheEvent, ProofCachePolicy, ProofCacheReplayError, ProofCacheReplayReport,
     ProofCacheTrace, ProofKey, replay_proof_cache_trace,
@@ -107,10 +112,20 @@ where
     C: Clone + Send + Sync + StorageIo + 'static,
     X: Clone + Send + Sync + StorageIo + 'static,
 {
-    let active = indexes.recover_active().ok().flatten().map(Arc::new);
+    let active = indexes
+        .recover_active_generation()
+        .and_then(|active| {
+            if let Some(index) = &active {
+                let retiring = indexes.retiring_containers(index)?;
+                containers.install_retiring_selection_barrier(&retiring);
+            }
+            Ok(active)
+        })
+        .ok()
+        .flatten();
     let recovered = match &active {
         Some(index) => {
-            let verifier = IndexedRequiredChunkVerifier::new(containers.clone(), Arc::clone(index));
+            let verifier = IndexedRequiredChunkVerifier::new(containers.clone(), index.clone());
             generations.recover_latest_with_verified_files_using(containers, &verifier)?
         }
         None => generations.recover_latest_with_verified_files(containers)?,
@@ -119,7 +134,7 @@ where
         return Ok(None);
     };
     mount_recovered(config, recovered, |file| match &active {
-        Some(index) => file.with_active_index(Arc::clone(index)),
+        Some(index) => file.with_active_index(index.clone()),
         None => file,
     })
     .map(Some)

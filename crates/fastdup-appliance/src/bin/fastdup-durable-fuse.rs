@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,64 +8,96 @@ use std::time::{Duration, Instant};
 
 use fastdup_appliance::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction, CheckpointPressure, DurableNamespace,
-    MUTATION_COMMIT_TARGET, ProfiledCheckpoint, STATFS_RESERVE_BASIS_POINTS, StatFsOverride,
-    TieredStatFsSource, checkpoint_action, checkpoint_policy_set_v1,
+    MUTATION_COMMIT_TARGET, ONLINE_GC_CONTROL_REQUEST, OnlineGcScheduler, ProfiledCheckpoint,
+    STATFS_RESERVE_BASIS_POINTS, StatFsOverride, TieredStatFsSource, checkpoint_action,
+    checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1, online_gc_control_path,
+    remove_stale_online_gc_socket,
 };
 use fastdup_copy_metrics::copy_telemetry;
 use fastdup_format::{HEADER_BYTES, VerifiedContainerPublication};
 use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo};
 use fastdup_posix::{FuseFilesystem, NamespaceConfig, volatile_mount_options};
 use fastdup_store::{
-    ContainerRepository, ExactIndexRunRepository, FsStorageIo, GenerationRepository,
+    ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo,
+    GcCandidateCatalogRepository, GenerationRepository, MaintenanceRepository,
+    OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport, OnlineGcRunMode,
     OwnedContainerPublication, StorageIo, StoreError, publication_sample_ranges,
 };
 use fuse3::raw::Session;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 
 const SCHEDULER_RESOLUTION: Duration = Duration::from_millis(50);
 const CHECKPOINT_WARNING: Duration = Duration::from_secs(5);
+const ONLINE_GC_SCHEDULER_RESOLUTION: Duration = Duration::from_secs(5);
 const INODE_RESERVATION_SPAN: u64 = 4_096;
 
 type FsAppliance = DurableNamespace<FsStorageIo, TelemetryStorageIo>;
+type FsOnlineMaintenance = MaintenanceRepository<FsStorageIo, FsStorageIo, FsStorageIo>;
+type FsGcCatalog = GcCandidateCatalogRepository<FsStorageIo>;
+
+struct RecoveredAppliance {
+    appliance: FsAppliance,
+    online_gc_recovery: OnlineGcRecoveryReport,
+    online_maintenance: FsOnlineMaintenance,
+    gc_catalog: FsGcCatalog,
+}
+
+struct OnlineGcControlRequest {
+    response: oneshot::Sender<String>,
+}
+
+struct OnlineGcSocketGuard {
+    path: PathBuf,
+}
+
+struct OnlineGcRuntimeHandle {
+    requests: mpsc::Sender<OnlineGcControlRequest>,
+    shutdown: watch::Sender<bool>,
+    worker: JoinHandle<Result<(), String>>,
+}
+
+impl OnlineGcRuntimeHandle {
+    async fn stop(self) -> Result<(), String> {
+        self.shutdown
+            .send(true)
+            .map_err(|_| "Online-GC runtime stopped before shutdown".to_owned())?;
+        self.worker
+            .await
+            .map_err(|error| format!("Online-GC runtime join failed: {error}"))?
+    }
+}
+
+impl Drop for OnlineGcSocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut arguments = std::env::args_os().skip(1).map(PathBuf::from);
-    let mount_path = arguments
-        .next()
-        .ok_or("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT")?;
-    let metadata_root = arguments
-        .next()
-        .ok_or("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT")?;
-    let container_root = arguments
-        .next()
-        .ok_or("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT")?;
-    if arguments.next().is_some() {
-        return Err("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT".into());
-    }
-    if !mount_path.is_dir() {
-        return Err(format!("mount path is not a directory: {}", mount_path.display()).into());
-    }
-    if metadata_root == container_root {
-        return Err("metadata and container roots must be distinct".into());
-    }
+    let (mount_path, metadata_root, container_root) = parse_mount_arguments()?;
     let statfs_override = statfs_override_from_environment()?;
+    let (control_listener, _control_guard) = bind_online_gc_control(&metadata_root)?;
 
-    let policy = checkpoint_policy_set_v1();
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
     let data_storage = open_data_storage(&container_root, io_telemetry_enabled)?;
-    let appliance = Arc::new(DurableNamespace::open_with_index(
-        NamespaceConfig::default(),
-        GenerationRepository::new(FsStorageIo::open(&metadata_root)?, policy),
-        ContainerRepository::new(data_storage.clone()),
-        &ExactIndexRunRepository::new(FsStorageIo::open(&metadata_root)?),
-        INODE_RESERVATION_SPAN,
-    )?);
+    let recovered = recover_appliance(&metadata_root, &data_storage)?;
+    emit_online_gc_recovery(recovered.online_gc_recovery);
+    let appliance = Arc::new(recovered.appliance);
     let filesystem =
         configured_filesystem(&appliance, &container_root, &metadata_root, statfs_override)?;
     let session = Session::new(volatile_mount_options());
     let mount = session.mount(filesystem, &mount_path).await?;
+    let gc_runtime = start_online_gc_runtime(
+        recovered.online_maintenance,
+        recovered.gc_catalog,
+        data_storage.clone(),
+        container_root.clone(),
+    );
     emit_mount_state(
         &appliance,
         &mount_path,
@@ -119,10 +152,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 last_checkpoint_attempt = Instant::now();
             }
+            accepted = control_listener.accept() => {
+                let (stream, _) = accepted?;
+                let requests = gc_runtime.requests.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_online_gc_control(stream, requests).await {
+                        eprintln!("online_gc_control_error={error}");
+                    }
+                });
+            }
         }
     }
 
     appliance.namespace().pause_mutation_admission();
+    gc_runtime.stop().await?;
     if let Err(error) = catch_up(Arc::clone(&appliance)).await {
         eprintln!("CRITICAL: final checkpoint failed during shutdown: {error}");
     }
@@ -131,6 +174,288 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     data_storage.emit();
     emit_io_uring_state(&data_storage);
     Ok(())
+}
+
+fn parse_mount_arguments() -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let mut arguments = std::env::args_os().skip(1).map(PathBuf::from);
+    let mount_path = arguments
+        .next()
+        .ok_or("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT")?;
+    let metadata_root = arguments
+        .next()
+        .ok_or("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT")?;
+    let container_root = arguments
+        .next()
+        .ok_or("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT")?;
+    if arguments.next().is_some() {
+        return Err("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT".into());
+    }
+    if !mount_path.is_dir() {
+        return Err(format!("mount path is not a directory: {}", mount_path.display()).into());
+    }
+    if metadata_root == container_root {
+        return Err("metadata and container roots must be distinct".into());
+    }
+    Ok((mount_path, metadata_root, container_root))
+}
+
+fn recover_appliance(
+    metadata_root: &std::path::Path,
+    data_storage: &TelemetryStorageIo,
+) -> Result<RecoveredAppliance, Box<dyn std::error::Error>> {
+    let metadata_storage = FsStorageIo::open(metadata_root)?;
+    let generations =
+        GenerationRepository::new(metadata_storage.clone(), checkpoint_policy_set_v1());
+    let containers = ContainerRepository::new(data_storage.clone());
+    let indexes = ExactIndexRunRepository::new(metadata_storage);
+    let maintenance_containers =
+        containers.with_maintenance_storage(FsStorageIo::open(data_storage.inner.root())?);
+    let online_maintenance = MaintenanceRepository::new(
+        generations.clone(),
+        maintenance_containers,
+        indexes.clone(),
+        checkpoint_exact_index_profile_v1(),
+    );
+    let online_gc_recovery = online_maintenance.finalize_recovered_online_gc()?;
+    let gc_catalog = GcCandidateCatalogRepository::new(FsStorageIo::open(metadata_root)?);
+    let appliance = DurableNamespace::open_with_index(
+        NamespaceConfig::default(),
+        generations,
+        containers,
+        &indexes,
+        INODE_RESERVATION_SPAN,
+    )?;
+    Ok(RecoveredAppliance {
+        appliance,
+        online_gc_recovery,
+        online_maintenance,
+        gc_catalog,
+    })
+}
+
+fn emit_online_gc_recovery(report: OnlineGcRecoveryReport) {
+    if report.retiring_containers() == 0 {
+        return;
+    }
+    eprintln!(
+        "online_gc_recovery_ok=true retiring_containers={} containers_removed={} containers_already_absent={} bytes_removed={} retiring_locations_finalized={} activation_generation={}",
+        report.retiring_containers(),
+        report.containers_removed(),
+        report.containers_already_absent(),
+        report.bytes_removed(),
+        report.retiring_locations_finalized(),
+        report
+            .activation_generation()
+            .expect("ASSERT: nonempty recovery publishes one Exact activation"),
+    );
+}
+
+fn bind_online_gc_control(
+    metadata_root: &std::path::Path,
+) -> io::Result<(UnixListener, OnlineGcSocketGuard)> {
+    let path = online_gc_control_path(metadata_root);
+    remove_stale_online_gc_socket(&path)?;
+    let listener = UnixListener::bind(&path)?;
+    let guard = OnlineGcSocketGuard { path: path.clone() };
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok((listener, guard))
+}
+
+async fn handle_online_gc_control(
+    mut stream: UnixStream,
+    requests: mpsc::Sender<OnlineGcControlRequest>,
+) -> Result<(), String> {
+    let mut request = Vec::new();
+    timeout(
+        Duration::from_secs(5),
+        (&mut stream).take(65).read_to_end(&mut request),
+    )
+    .await
+    .map_err(|_| "control request timed out".to_owned())?
+    .map_err(|error| format!("control request read failed: {error}"))?;
+    if request.as_slice() != ONLINE_GC_CONTROL_REQUEST {
+        stream
+            .write_all(b"online_gc_ok=false error=invalid_request\n")
+            .await
+            .map_err(|error| format!("control rejection write failed: {error}"))?;
+        return Ok(());
+    }
+    let (response_tx, response_rx) = oneshot::channel();
+    if let Err(error) = requests.try_send(OnlineGcControlRequest {
+        response: response_tx,
+    }) {
+        let status = match error {
+            mpsc::error::TrySendError::Full(_) => "busy",
+            mpsc::error::TrySendError::Closed(_) => "unavailable",
+        };
+        stream
+            .write_all(format!("online_gc_ok=false error={status}\n").as_bytes())
+            .await
+            .map_err(|error| format!("control busy response failed: {error}"))?;
+        return Ok(());
+    }
+    let response = response_rx
+        .await
+        .map_err(|_| "Online-GC runtime dropped its response".to_owned())?;
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|error| format!("control response write failed: {error}"))?;
+    Ok(())
+}
+
+fn start_online_gc_runtime(
+    maintenance: FsOnlineMaintenance,
+    catalog: FsGcCatalog,
+    frontend_storage: TelemetryStorageIo,
+    container_root: PathBuf,
+) -> OnlineGcRuntimeHandle {
+    let (requests, control) = mpsc::channel(1);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let worker = tokio::spawn(run_online_gc_runtime(
+        maintenance,
+        catalog,
+        frontend_storage,
+        container_root,
+        control,
+        shutdown_rx,
+    ));
+    OnlineGcRuntimeHandle {
+        requests,
+        shutdown,
+        worker,
+    }
+}
+
+async fn run_online_gc_runtime(
+    maintenance: FsOnlineMaintenance,
+    catalog: FsGcCatalog,
+    frontend_storage: TelemetryStorageIo,
+    container_root: PathBuf,
+    mut control: mpsc::Receiver<OnlineGcControlRequest>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let now = Instant::now();
+    let mut scheduler =
+        OnlineGcScheduler::new(now, frontend_storage.inner.status().submitted_operations());
+    let mut ticks = interval(ONLINE_GC_SCHEDULER_RESOLUTION);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                changed.map_err(|_| "Online-GC shutdown channel closed".to_owned())?;
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            request = control.recv() => {
+                let Some(request) = request else {
+                    return Ok(());
+                };
+                scheduler.record_immediate_start(Instant::now());
+                let response = run_online_gc_quantum(
+                    maintenance.clone(),
+                    catalog.clone(),
+                    data_pool_usage(&container_root).map_err(|error| error.to_string()),
+                    OnlineGcRunMode::Urgent,
+                    "control",
+                ).await;
+                let _ = request.response.send(response);
+            }
+            _ = ticks.tick() => {
+                let usage = match data_pool_usage(&container_root) {
+                    Ok(usage) => usage,
+                    Err(error) => {
+                        eprintln!("online_gc_scheduler_error={error}");
+                        continue;
+                    }
+                };
+                let operations = frontend_storage.inner.status().submitted_operations();
+                if let Some(mode) = scheduler.poll(Instant::now(), operations, usage) {
+                    let status = run_online_gc_quantum(
+                        maintenance.clone(),
+                        catalog.clone(),
+                        Ok(usage),
+                        mode,
+                        "scheduler",
+                    ).await;
+                    eprint!("{status}");
+                }
+            }
+        }
+    }
+}
+
+async fn run_online_gc_quantum(
+    maintenance: FsOnlineMaintenance,
+    catalog: FsGcCatalog,
+    usage: Result<DataPoolUsage, String>,
+    mode: OnlineGcRunMode,
+    source: &'static str,
+) -> String {
+    let result = match usage {
+        Ok(usage) => tokio::task::spawn_blocking(move || {
+            maintenance.run_adaptive_online_gc_cycle(&catalog, usage, mode)
+        })
+        .await
+        .map_err(|error| format!("worker_join_failed:{error}"))
+        .and_then(|result| result.map_err(|error| format!("{error}"))),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(report) => online_gc_status_line(source, mode, report),
+        Err(error) => format!(
+            "online_gc_ok=false source={source} mode={mode:?} error={}\n",
+            error.replace(['\n', '\r'], " ")
+        ),
+    }
+}
+
+fn online_gc_status_line(
+    source: &str,
+    mode: OnlineGcRunMode,
+    report: OnlineGcCycleReport,
+) -> String {
+    let catalog_generation = report.catalog().generation();
+    match report.outcome() {
+        OnlineGcCycleOutcome::NoCandidates => format!(
+            "online_gc_ok=true source={source} mode={mode:?} outcome=no_candidates catalog_generation={catalog_generation}\n"
+        ),
+        OnlineGcCycleOutcome::NoProfitableCandidates => format!(
+            "online_gc_ok=true source={source} mode={mode:?} outcome=no_profitable_candidates catalog_generation={catalog_generation}\n"
+        ),
+        OnlineGcCycleOutcome::CatalogRebuilt => format!(
+            "online_gc_ok=true source={source} mode={mode:?} outcome=catalog_rebuilt catalog_generation={catalog_generation}\n"
+        ),
+        OnlineGcCycleOutcome::Collected(gc) => format!(
+            "online_gc_ok=true source={source} mode={mode:?} outcome=collected catalog_generation={catalog_generation} containers_removed={} bytes_removed={} replacement_containers={} replacement_bytes={} chunks_relocated={} bytes_reclaimed={}\n",
+            gc.containers_removed(),
+            gc.bytes_removed(),
+            gc.replacement_containers(),
+            gc.replacement_bytes(),
+            gc.chunks_relocated(),
+            gc.bytes_reclaimed(),
+        ),
+    }
+}
+
+fn data_pool_usage(path: &std::path::Path) -> io::Result<DataPoolUsage> {
+    let statistics = rustix::fs::statvfs(path)?;
+    let fragment_bytes = statistics.f_frsize.max(1);
+    let capacity = statistics
+        .f_blocks
+        .checked_mul(fragment_bytes)
+        .ok_or_else(|| io::Error::other("data-pool capacity overflows u64"))?;
+    let available = statistics
+        .f_bavail
+        .checked_mul(fragment_bytes)
+        .ok_or_else(|| io::Error::other("data-pool availability overflows u64"))?;
+    let used = capacity
+        .checked_sub(available)
+        .ok_or_else(|| io::Error::other("data-pool availability exceeds capacity"))?;
+    DataPoolUsage::new(used, capacity)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -843,6 +1168,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::num::NonZeroUsize;
 
+    use fastdup_appliance::request_online_gc_now;
     use fastdup_format::ContainerId;
 
     use super::*;
@@ -934,5 +1260,44 @@ mod tests {
         drop(repository);
         drop(storage);
         std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[tokio::test]
+    async fn local_control_socket_admits_one_bounded_gc_now_request() {
+        let root = PathBuf::from(
+            std::env::var_os("TMPDIR").expect("workspace test TMPDIR must be configured"),
+        )
+        .join(format!("fastdup-online-gc-control-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("create unique control root");
+        let (listener, guard) = bind_online_gc_control(&root).expect("bind control socket");
+        let mode = std::fs::metadata(online_gc_control_path(&root))
+            .expect("read socket metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let (requests, mut received) = mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept control client");
+            handle_online_gc_control(stream, requests)
+                .await
+                .expect("serve control request");
+        });
+        let responder = tokio::spawn(async move {
+            let request = received.recv().await.expect("receive GC request");
+            request
+                .response
+                .send("online_gc_ok=true outcome=no_candidates\n".to_owned())
+                .expect("return GC response");
+        });
+        let client_root = root.clone();
+        let response = tokio::task::spawn_blocking(move || request_online_gc_now(&client_root))
+            .await
+            .expect("join control client")
+            .expect("control request succeeds");
+        assert_eq!(response, "online_gc_ok=true outcome=no_candidates\n");
+        server.await.expect("join control server");
+        responder.await.expect("join control responder");
+        drop(guard);
+        std::fs::remove_dir(root).expect("remove control root");
     }
 }

@@ -5,9 +5,7 @@ use crate::manifest_tree::{
     rewrite_manifest_tree_range, rewrite_manifest_tree_range_successor, scan_manifest_tree,
     splice_manifest_tree, truncate_manifest_tree,
 };
-use crate::{
-    ActivatedExactIndex, ContainerRepository, StorageIo, StoreError, VerifiedManifestFile,
-};
+use crate::{ContainerRepository, StorageIo, StoreError, VerifiedManifestFile};
 use fastdup_format::{
     CommitFormatError, CommitRecord, CommitRecordHash, MAX_METADATA_OBJECT_BYTES, ManifestExtent,
     ManifestLeaf, MetadataFormatError, MetadataObjectId, NamespaceRoot, PolicySetId,
@@ -112,14 +110,14 @@ impl<I: StorageIo> RequiredChunkVerifier for ContainerRepository<I> {
 #[derive(Clone, Debug)]
 pub struct IndexedRequiredChunkVerifier<C, X> {
     containers: ContainerRepository<C>,
-    index: Arc<ActivatedExactIndex<X>>,
+    index: crate::ExactIndexGenerationPin<X>,
 }
 
 impl<C, X> IndexedRequiredChunkVerifier<C, X> {
     #[must_use]
     pub const fn new(
         containers: ContainerRepository<C>,
-        index: Arc<ActivatedExactIndex<X>>,
+        index: crate::ExactIndexGenerationPin<X>,
     ) -> Self {
         Self { containers, index }
     }
@@ -758,35 +756,40 @@ impl<I: StorageIo> GenerationRepository<I> {
     pub(crate) fn scrub_all_for_gc<J: StorageIo>(
         &self,
         containers: &ContainerRepository<J>,
-    ) -> Result<GenerationGcScrubProof, GenerationError> {
-        let records = {
-            let _guard = self
-                .commit_lock
-                .lock()
-                .expect("ASSERT: generation scrub lock poisoned");
-            let Some(snapshot) = GenerationLog::new(&self.storage)
-                .load_for_recovery()
-                .map_err(map_log_error)?
-            else {
-                return Ok(GenerationGcScrubProof::default());
-            };
-            if snapshot.tail() != &WalTail::Clean {
-                return Err(GenerationError::WalNeedsRepair(snapshot.tail().clone()));
-            }
-            let valid = self.validate_recovery_transition_prefix(snapshot.records())?;
-            if valid.len() != snapshot.records().len() {
-                return Err(GenerationError::NoRecoverableGeneration);
-            }
-            valid
-        };
+    ) -> Result<GenerationLivenessProof, GenerationError> {
+        let proof = self.scan_generation_liveness(true)?;
+        containers.verify_required_chunks(proof.online_chunks())?;
+        Ok(proof)
+    }
+
+    /// Proves the current logical liveness set from Metadata only.
+    ///
+    /// This deliberately performs no DATA-Container scan. Online GC can use
+    /// the opaque result to shortlist and locally verify a bounded victim set;
+    /// the complete scrub path above additionally verifies every required
+    /// Chunk before returning the same generation binding.
+    pub(crate) fn scan_online_liveness(&self) -> Result<GenerationLivenessProof, GenerationError> {
+        self.scan_generation_liveness(false)
+    }
+
+    fn scan_generation_liveness(
+        &self,
+        audit_retained_history: bool,
+    ) -> Result<GenerationLivenessProof, GenerationError> {
+        let records = self.load_complete_commit_records()?;
         if records.is_empty() {
-            return Ok(GenerationGcScrubProof::default());
+            return Ok(GenerationLivenessProof::default());
         }
         let mut latest_namespace_inodes = 0_usize;
         let mut latest_manifest_files = 0_usize;
         let mut online_chunks = BTreeMap::new();
         let first_online = records.len().saturating_sub(2);
-        for (ordinal, record) in records.iter().copied().enumerate() {
+        let scan_start = if audit_retained_history {
+            0
+        } else {
+            first_online
+        };
+        for (ordinal, record) in records.iter().copied().enumerate().skip(scan_start) {
             let root = self.read_namespace_root(record.namespace_root())?;
             if !record_matches_namespace_root(record, &root) {
                 return Err(GenerationError::PreviousGenerationRecordMismatch);
@@ -810,7 +813,6 @@ impl<I: StorageIo> GenerationRepository<I> {
                 latest_manifest_files = manifests.len();
             }
         }
-        containers.verify_required_chunks(&online_chunks)?;
         let summary = GenerationScrubSummary {
             generations: records.len(),
             first_generation: records.first().copied().map(CommitRecord::generation),
@@ -819,16 +821,143 @@ impl<I: StorageIo> GenerationRepository<I> {
             latest_manifest_files,
         };
         let online_records = records[first_online..].to_vec();
-        Ok(GenerationGcScrubProof {
+        Ok(GenerationLivenessProof {
             summary,
             online_records,
             online_chunks,
         })
     }
 
+    /// Computes the logical reachability changes between one previously
+    /// incorporated Commit generation and the current protected online pair.
+    ///
+    /// This scans immutable Namespace/Manifest metadata only. The result is a
+    /// non-authoritative catalog update input; it cannot authorize physical
+    /// retirement or deletion.
+    ///
+    /// Passing `None` uses the empty set as the base and therefore emits one
+    /// complete initial liveness population. A nonzero base must still be
+    /// present in the bounded Commit WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns WAL, Namespace, Manifest, unavailable-base, length-conflict, or
+    /// bounded-allocation failures.
+    pub fn liveness_delta_since(
+        &self,
+        base_generation: Option<u64>,
+    ) -> Result<GenerationLivenessDelta, GenerationError> {
+        let records = self.load_complete_commit_records()?;
+        let latest_generation = records.last().copied().map(CommitRecord::generation);
+        if records.is_empty() {
+            if base_generation.is_some() {
+                return Err(GenerationError::LivenessDeltaBaseUnavailable {
+                    requested: base_generation,
+                    latest: None,
+                });
+            }
+            return Ok(GenerationLivenessDelta::default());
+        }
+        let current_start = records.len().saturating_sub(2);
+        let current_chunks = self.scan_protected_chunks(&records[current_start..])?;
+        let base_chunks = match base_generation {
+            None => BTreeMap::new(),
+            Some(generation) => {
+                let Some(end) = records
+                    .iter()
+                    .position(|record| record.generation() == generation)
+                    .map(|ordinal| ordinal + 1)
+                else {
+                    return Err(GenerationError::LivenessDeltaBaseUnavailable {
+                        requested: Some(generation),
+                        latest: latest_generation,
+                    });
+                };
+                let start = end.saturating_sub(2);
+                self.scan_protected_chunks(&records[start..end])?
+            }
+        };
+        let mut added = BTreeMap::new();
+        let mut removed = BTreeMap::new();
+        for (chunk_id, logical_length) in &current_chunks {
+            match base_chunks.get(chunk_id) {
+                None => {
+                    added.insert(*chunk_id, *logical_length);
+                }
+                Some(previous_length) if previous_length != logical_length => {
+                    return Err(GenerationError::ManifestChunkLengthConflict {
+                        chunk_id: *chunk_id,
+                        first_length: *previous_length,
+                        second_length: *logical_length,
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for (chunk_id, logical_length) in base_chunks {
+            if !current_chunks.contains_key(&chunk_id) {
+                removed.insert(chunk_id, logical_length);
+            }
+        }
+        Ok(GenerationLivenessDelta {
+            base_generation,
+            latest_generation,
+            added,
+            removed,
+            protected_chunk_count: current_chunks.len(),
+        })
+    }
+
+    fn load_complete_commit_records(&self) -> Result<Vec<CommitRecord>, GenerationError> {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: generation liveness lock poisoned");
+        let Some(snapshot) = GenerationLog::new(&self.storage)
+            .load_for_recovery()
+            .map_err(map_log_error)?
+        else {
+            return Ok(Vec::new());
+        };
+        if snapshot.tail() != &WalTail::Clean {
+            return Err(GenerationError::WalNeedsRepair(snapshot.tail().clone()));
+        }
+        let valid = self.validate_recovery_transition_prefix(snapshot.records())?;
+        if valid.len() != snapshot.records().len() {
+            return Err(GenerationError::NoRecoverableGeneration);
+        }
+        Ok(valid)
+    }
+
+    fn scan_protected_chunks(
+        &self,
+        records: &[CommitRecord],
+    ) -> Result<BTreeMap<fastdup_format::ChunkId, u64>, GenerationError> {
+        let mut chunks = BTreeMap::new();
+        for record in records.iter().copied() {
+            let root = self.read_namespace_root(record.namespace_root())?;
+            if !record_matches_namespace_root(record, &root) {
+                return Err(GenerationError::PreviousGenerationRecordMismatch);
+            }
+            let (_, required) = self.scan_manifest_graph_with_required(&root)?;
+            for (chunk_id, logical_length) in required {
+                if let Some(previous) = chunks.insert(chunk_id, logical_length)
+                    && previous != logical_length
+                {
+                    return Err(GenerationError::ManifestChunkLengthConflict {
+                        chunk_id,
+                        first_length: previous,
+                        second_length: logical_length,
+                    });
+                }
+            }
+        }
+        Ok(chunks)
+    }
+
     pub(crate) fn gc_proof_is_current(
         &self,
-        proof: &GenerationGcScrubProof,
+        proof: &GenerationLivenessProof,
     ) -> Result<bool, GenerationError> {
         let _guard = self
             .commit_lock
@@ -1617,13 +1746,51 @@ pub struct GenerationScrubSummary {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct GenerationGcScrubProof {
+pub(crate) struct GenerationLivenessProof {
     summary: GenerationScrubSummary,
     online_records: Vec<CommitRecord>,
     online_chunks: BTreeMap<fastdup_format::ChunkId, u64>,
 }
 
-impl GenerationGcScrubProof {
+/// Metadata-only reachability changes for the current and previous protected
+/// Commit generations.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GenerationLivenessDelta {
+    base_generation: Option<u64>,
+    latest_generation: Option<u64>,
+    added: BTreeMap<fastdup_format::ChunkId, u64>,
+    removed: BTreeMap<fastdup_format::ChunkId, u64>,
+    protected_chunk_count: usize,
+}
+
+impl GenerationLivenessDelta {
+    #[must_use]
+    pub const fn base_generation(&self) -> Option<u64> {
+        self.base_generation
+    }
+
+    #[must_use]
+    pub const fn latest_generation(&self) -> Option<u64> {
+        self.latest_generation
+    }
+
+    #[must_use]
+    pub fn added(&self) -> &BTreeMap<fastdup_format::ChunkId, u64> {
+        &self.added
+    }
+
+    #[must_use]
+    pub fn removed(&self) -> &BTreeMap<fastdup_format::ChunkId, u64> {
+        &self.removed
+    }
+
+    #[must_use]
+    pub const fn protected_chunk_count(&self) -> usize {
+        self.protected_chunk_count
+    }
+}
+
+impl GenerationLivenessProof {
     pub(crate) const fn summary(&self) -> GenerationScrubSummary {
         self.summary
     }
@@ -1933,6 +2100,10 @@ pub enum GenerationError {
         first_length: u64,
         second_length: u64,
     },
+    LivenessDeltaBaseUnavailable {
+        requested: Option<u64>,
+        latest: Option<u64>,
+    },
     RetainedManifestNotInPredecessor(MetadataObjectId),
     RetainedManifestRangeInvalid {
         root: MetadataObjectId,
@@ -1969,6 +2140,7 @@ impl GenerationError {
             | Self::MetadataIdentityCollision(_)
             | Self::ManifestLengthMismatch { .. }
             | Self::ManifestChunkLengthConflict { .. }
+            | Self::LivenessDeltaBaseUnavailable { .. }
             | Self::Store(
                 StoreError::Format(_)
                 | StoreError::InvalidPublishedName(_)

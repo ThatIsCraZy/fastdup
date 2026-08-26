@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 use fastdup_copy_metrics::{CopyClass, record_copy};
 use fastdup_format::{
     ChunkId, CommitRecord, ContainerId, DurableInode, DurableRootMetadata, DurableTimes,
-    DurableTimestamp, DurableXattr, ExactIndexEntry, ExactIndexProfileId, ExactIndexRun,
-    ExactIndexRunRef, ExactIndexRunSet, IncompressibilityGateMetrics, MAX_LOGICAL_CHUNK_BYTES,
-    ManifestExtent, ManifestLeaf, MetadataFormatError, MetadataObjectId, NamespaceEntry,
-    NamespaceRoot, PolicySetId, PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
+    DurableTimestamp, DurableXattr, ExactIndexEntry, ExactIndexProfileId,
+    IncompressibilityGateMetrics, MAX_LOGICAL_CHUNK_BYTES, ManifestExtent, ManifestLeaf,
+    MetadataFormatError, MetadataObjectId, NamespaceEntry, NamespaceRoot, PolicySetId,
+    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, PreparedIndependentRecord,
+    PreparedZstdPrefixRecord,
 };
 use fastdup_posix::{
     CommitInode, CommitRange, CommittedFile, CommittedFileInstall, ExternalizedExtent, InodeId,
@@ -24,13 +25,14 @@ use fastdup_posix::{
     PreparedCommitExtent, PreparedDataRecipe,
 };
 use fastdup_store::{
-    ActivatedExactIndex, AdaptiveContainerPublishMetrics, ContainerDescriptorCacheStatus,
-    ContainerRepository, ExactIndexPageCacheStatus, ExactIndexRunRepository,
-    ExactRunMembershipStatus, GenerationError, GenerationRepository, IndexedRequiredChunkVerifier,
-    ManifestReadError, ManifestSuccessorProof, ManifestTreeSummary, RequiredChunkVerifier,
-    SeqCdcConfig, StorageIo, StoreError, SuccessorPredecessor, VerifiedCommittedFile,
-    VerifiedManifestFile, VerifiedReadCache, VerifiedReadCacheError, VerifiedReadCacheStatus,
-    seqcdc_cut, seqcdc_cut_scalar, seqcdc_cut_segmented, seqcdc_cut_segmented_scalar,
+    AdaptiveContainerPublishMetrics, ContainerDescriptorCacheStatus, ContainerRepository,
+    ExactIndexPageCacheStatus, ExactIndexRunRepository, ExactRunMembershipStatus, GenerationError,
+    GenerationRepository, IndexedRequiredChunkVerifier, ManifestReadError, ManifestSuccessorProof,
+    ManifestTreeSummary, PersistentChunkPlan, PersistentReductionIndex, RequiredChunkVerifier,
+    SeqCdcConfig, SimilarityIndexRepository, StorageIo, StoreError, SuccessorPredecessor,
+    VerifiedCommittedFile, VerifiedManifestFile, VerifiedReadCache, VerifiedReadCacheError,
+    VerifiedReadCacheStatus, seqcdc_cut, seqcdc_cut_scalar, seqcdc_cut_segmented,
+    seqcdc_cut_segmented_scalar,
 };
 use rayon::prelude::*;
 
@@ -61,7 +63,6 @@ type AdaptiveCommitFinish = (
     CheckpointReductionMetrics,
     RetainedManifestRanges,
 );
-const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
 const EXACT_PUBLICATION_QUEUE_BATCHES: usize = 8;
 const MAX_RECENT_EXACT_LOCATIONS: usize = 8_192;
 // Combined Active and Frozen 512-MiB generations at SeqCDC-v1's 16-KiB minimum.
@@ -1234,6 +1235,12 @@ struct PreparedCompressionRegions<'a> {
     borrowed: Vec<Vec<PrehashedChunk<'a>>>,
     materialized: Vec<MaterializedCompressionRegion>,
     order: Vec<CompressionRegionOrder>,
+}
+
+struct PreparedWriteThroughReduction<'a> {
+    ordinary_chunks: Vec<&'a PendingWriteThroughChunk>,
+    independent: Vec<PreparedIndependentRecord>,
+    prefixes: Vec<PreparedZstdPrefixRecord>,
 }
 
 #[derive(Debug)]
@@ -3675,8 +3682,11 @@ where
             !chunks.is_empty(),
             "ASSERT: Container publication requires at least one pending Chunk"
         );
-        let mut locations = BTreeMap::<ChunkId, ExactIndexEntry>::new();
-        let mut candidates = BTreeMap::<ChunkId, (u32, &PendingWriteThroughChunk)>::new();
+        let mut locations = Vec::<ExactIndexEntry>::new();
+        let mut candidates = Vec::<(ChunkId, u32, &PendingWriteThroughChunk)>::new();
+        candidates
+            .try_reserve_exact(chunks.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         let mut new_chunks = Vec::new();
         new_chunks
             .try_reserve(chunks.len())
@@ -3685,7 +3695,17 @@ where
             let chunk_id = chunk.chunk_id;
             let logical_length = u32::try_from(chunk.bytes.len())
                 .map_err(|_| DurableNamespaceError::FrozenViewMismatch)?;
-            if let Some((previous_length, _)) = candidates.get(&chunk_id).copied() {
+            candidates.push((chunk_id, logical_length, chunk));
+        }
+        candidates.sort_unstable_by_key(|(chunk_id, _, _)| *chunk_id);
+        let mut unique_candidates = Vec::new();
+        unique_candidates
+            .try_reserve_exact(candidates.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for (chunk_id, logical_length, chunk) in candidates {
+            if let Some((previous_id, previous_length, _)) = unique_candidates.last().copied()
+                && previous_id == chunk_id
+            {
                 if previous_length != logical_length {
                     return Err(DurableNamespaceError::ChunkLengthConflict {
                         chunk_id,
@@ -3695,16 +3715,14 @@ where
                 }
                 continue;
             }
-            candidates.insert(chunk_id, (logical_length, chunk));
+            unique_candidates.push((chunk_id, logical_length, chunk));
         }
-        let mut claims = PublicationClaims::new(&self.online_dependency_proofs, candidates.len())?;
-        for (chunk_id, (logical_length, chunk)) in candidates {
+        let mut claims =
+            PublicationClaims::new(&self.online_dependency_proofs, unique_candidates.len())?;
+        for (chunk_id, logical_length, chunk) in unique_candidates {
             match claims.claim(chunk_id, logical_length) {
                 PublicationClaim::Existing(entry) => {
-                    assert!(
-                        locations.insert(chunk_id, entry).is_none(),
-                        "ASSERT: one candidate Chunk has one publication result"
-                    );
+                    locations.push(entry);
                 }
                 PublicationClaim::Acquired => new_chunks.push(chunk),
             }
@@ -3714,15 +3732,14 @@ where
         } else {
             self.publish_new_chunks(&new_chunks)?
         };
-        for entry in &entries {
-            if let Some(previous) = locations.insert(entry.chunk_id(), *entry) {
-                assert_eq!(
-                    previous.logical_length(),
-                    entry.logical_length(),
-                    "ASSERT: one Chunk ID cannot identify two logical lengths"
-                );
-            }
-        }
+        locations.extend(entries.iter().copied());
+        locations.sort_unstable_by_key(ExactIndexEntry::chunk_id);
+        assert!(
+            locations
+                .windows(2)
+                .all(|pair| pair[0].chunk_id() < pair[1].chunk_id()),
+            "ASSERT: one unique candidate Chunk has exactly one publication result"
+        );
         claims.finish(&entries);
         let sealed = !entries.is_empty();
         assert!(
@@ -3744,7 +3761,12 @@ where
             !new_chunks.is_empty(),
             "ASSERT: a new-Chunk Container must contain at least one Chunk"
         );
-        let prepared_regions = prepare_compression_regions(new_chunks)?;
+        let PreparedWriteThroughReduction {
+            ordinary_chunks,
+            independent,
+            prefixes,
+        } = self.plan_new_chunk_encodings(new_chunks)?;
+        let prepared_regions = prepare_compression_regions(&ordinary_chunks)?;
         let materialized_chunks = prepared_regions
             .materialized
             .iter()
@@ -3789,10 +3811,12 @@ where
             workers.get() <= self.worker_budget.get(),
             "ASSERT: one encode job cannot exceed the write-through worker budget"
         );
-        let prepared = ContainerRepository::<C>::prepare_mixed_prehashed_adaptive_regions_parallel(
+        let prepared = ContainerRepository::<C>::prepare_mixed_prehashed_reduction_parallel(
             random_container_id()?,
             generation,
             &regions,
+            independent,
+            prefixes,
             workers,
         )?;
         drop(cpu_phase);
@@ -3812,11 +3836,71 @@ where
         Ok(entries)
     }
 
+    fn plan_new_chunk_encodings<'a>(
+        &self,
+        new_chunks: &[&'a PendingWriteThroughChunk],
+    ) -> Result<PreparedWriteThroughReduction<'a>, DurableNamespaceError> {
+        let mut planned = PreparedWriteThroughReduction {
+            ordinary_chunks: Vec::new(),
+            independent: Vec::new(),
+            prefixes: Vec::new(),
+        };
+        planned
+            .ordinary_chunks
+            .try_reserve_exact(new_chunks.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        planned
+            .independent
+            .try_reserve_exact(new_chunks.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        planned
+            .prefixes
+            .try_reserve_exact(new_chunks.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for chunk in new_chunks {
+            let Some(target) = chunk.bytes.contiguous_bytes() else {
+                // Segmented fingerprinting needs its own scalar-equivalent
+                // implementation. Until then, fragmented Chunks retain the
+                // existing single-materialization adaptive path.
+                planned.ordinary_chunks.push(*chunk);
+                continue;
+            };
+            match self
+                .index
+                .plan_similarity_chunk(&self.containers, chunk.chunk_id, target)
+            {
+                PersistentChunkPlan::NoCandidates => planned.ordinary_chunks.push(*chunk),
+                PersistentChunkPlan::Independent(record) => {
+                    assert_eq!(
+                        record.target_id(),
+                        chunk.chunk_id,
+                        "ASSERT: prepared independent fallback retains its target identity"
+                    );
+                    planned.independent.push(record);
+                }
+                PersistentChunkPlan::ZstdPrefix(record) => {
+                    assert_eq!(
+                        record.target_id(),
+                        chunk.chunk_id,
+                        "ASSERT: prepared Prefix record retains its target identity"
+                    );
+                    planned.prefixes.push(record);
+                }
+            }
+        }
+        assert_eq!(
+            planned.ordinary_chunks.len() + planned.independent.len() + planned.prefixes.len(),
+            new_chunks.len(),
+            "ASSERT: every unique new Chunk has exactly one encoding plan"
+        );
+        Ok(planned)
+    }
+
     fn externalize_chunks(
         &self,
         chunks: &[PendingWriteThroughChunk],
         inode: InodeId,
-        locations: &BTreeMap<ChunkId, ExactIndexEntry>,
+        locations: &[ExactIndexEntry],
     ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
         let mut externalized = Vec::new();
         externalized
@@ -3825,7 +3909,9 @@ where
         for pending in chunks {
             let chunk_id = pending.chunk_id;
             let entry = locations
-                .get(&chunk_id)
+                .binary_search_by_key(&chunk_id, ExactIndexEntry::chunk_id)
+                .ok()
+                .and_then(|ordinal| locations.get(ordinal))
                 .copied()
                 .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
             let expected_length = u32::try_from(pending.bytes.len())
@@ -3982,6 +4068,12 @@ trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
         chunk_id: ChunkId,
         logical_length: u64,
     ) -> Option<ExactIndexEntry>;
+    fn plan_similarity_chunk(
+        &self,
+        containers: &ContainerRepository<C>,
+        target_id: ChunkId,
+        target: &[u8],
+    ) -> PersistentChunkPlan;
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>);
     fn flush_level_zero(&self);
     fn exact_index_degraded(&self) -> bool;
@@ -4017,6 +4109,15 @@ impl<C: StorageIo + 'static> ManifestReaderPolicy<C> for ScanManifestReaders {
         None
     }
 
+    fn plan_similarity_chunk(
+        &self,
+        _containers: &ContainerRepository<C>,
+        _target_id: ChunkId,
+        _target: &[u8],
+    ) -> PersistentChunkPlan {
+        PersistentChunkPlan::NoCandidates
+    }
+
     fn publish_level_zero(&self, _entries: Vec<ExactIndexEntry>) {}
 
     fn flush_level_zero(&self) {}
@@ -4042,13 +4143,12 @@ struct IndexedManifestReaders<X> {
     core: Arc<ExactPublisherCore<X>>,
     publisher: ExactPublicationQueue,
     read_cache: Arc<VerifiedReadCache>,
+    reduction: Option<Arc<PersistentReductionIndex<X>>>,
 }
 
 struct ExactPublisherCore<X> {
     repository: ExactIndexRunRepository<X>,
     profile: ExactIndexProfileId,
-    active: RwLock<Option<Arc<ActivatedExactIndex<X>>>>,
-    publish_lock: Mutex<()>,
     degraded: AtomicBool,
     recent: RwLock<BTreeMap<(ChunkId, u32), ExactIndexEntry>>,
 }
@@ -4064,7 +4164,7 @@ struct ExactPublicationQueue {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-impl<X> fmt::Debug for IndexedManifestReaders<X> {
+impl<X: Clone + StorageIo> fmt::Debug for IndexedManifestReaders<X> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("IndexedManifestReaders")
@@ -4074,14 +4174,13 @@ impl<X> fmt::Debug for IndexedManifestReaders<X> {
     }
 }
 
-impl<X> IndexedManifestReaders<X> {
+impl<X: Clone + StorageIo> IndexedManifestReaders<X> {
     fn run_count(&self) -> usize {
         self.core
-            .active
-            .read()
-            .expect("ASSERT: active Exact Index reader lock poisoned")
-            .as_ref()
-            .map_or(0, |active| active.run_count())
+            .repository
+            .pin_active_generation()
+            .as_deref()
+            .map_or(0, fastdup_store::ActivatedExactIndex::run_count)
     }
 }
 
@@ -4097,20 +4196,10 @@ impl ExactPublicationQueue {
                 while let Ok(command) = receiver.recv() {
                     match command {
                         ExactPublicationCommand::Publish(entries) => {
-                            if core.try_publish_level_zero(entries.clone()).is_ok() {
-                                let mut recent = core
-                                    .recent
-                                    .write()
-                                    .expect("ASSERT: recent Exact Location lock poisoned");
-                                for entry in entries {
-                                    let key = (entry.chunk_id(), entry.logical_length());
-                                    if recent.get(&key) == Some(&entry) {
-                                        recent.remove(&key);
-                                    }
-                                }
-                            } else {
+                            if core.try_publish_level_zero(entries.clone()).is_err() {
                                 core.degraded.store(true, Ordering::Release);
                             }
+                            core.forget_recent(&entries);
                         }
                         ExactPublicationCommand::Flush(reply) => {
                             let _ = reply.send(());
@@ -4191,6 +4280,19 @@ where
             .get(&(chunk_id, length))
             .copied()
     }
+
+    fn forget_recent(&self, entries: &[ExactIndexEntry]) {
+        let mut recent = self
+            .recent
+            .write()
+            .expect("ASSERT: recent Exact Location lock poisoned");
+        for entry in entries {
+            let key = (entry.chunk_id(), entry.logical_length());
+            if recent.get(&key) == Some(entry) {
+                recent.remove(&key);
+            }
+        }
+    }
 }
 
 impl<C, X> ManifestReaderPolicy<C> for IndexedManifestReaders<X>
@@ -4199,26 +4301,15 @@ where
     X: Clone + Send + Sync + StorageIo + 'static,
 {
     fn prepare(&self, file: VerifiedManifestFile<C>) -> VerifiedManifestFile<C> {
-        let file = match self
-            .core
-            .active
-            .read()
-            .expect("ASSERT: active Exact Index reader lock poisoned")
-            .as_ref()
-        {
-            Some(active) => file.with_active_index(Arc::clone(active)),
+        let file = match self.core.repository.pin_active_generation() {
+            Some(active) => file.with_active_index(active),
             None => file,
         };
         file.with_verified_read_cache(Arc::clone(&self.read_cache))
     }
 
     fn graph_verifier(&self, containers: ContainerRepository<C>) -> Box<dyn RequiredChunkVerifier> {
-        let active = self
-            .core
-            .active
-            .read()
-            .expect("ASSERT: active Exact Index reader lock poisoned")
-            .clone();
+        let active = self.core.repository.pin_active_generation();
         match active {
             Some(index) => Box::new(IndexedRequiredChunkVerifier::new(containers, index)),
             None => Box::new(containers),
@@ -4235,17 +4326,15 @@ where
         chunk_id: ChunkId,
         logical_length: u64,
     ) -> Option<ExactIndexEntry> {
+        let active = self.core.repository.pin_active_generation();
         if let Some(recent) = self.core.recent_location(chunk_id, logical_length)
+            && active
+                .as_deref()
+                .is_none_or(|index| index.permits_active_overlay(recent).unwrap_or(false))
             && containers.read_verified_location(recent).is_ok()
         {
             return Some(recent);
         }
-        let active = self
-            .core
-            .active
-            .read()
-            .expect("ASSERT: active Exact Index reader lock poisoned")
-            .clone();
         let active = active?;
         if let Ok(location) =
             containers.find_verified_location_with_index(&active, chunk_id, logical_length)
@@ -4255,6 +4344,18 @@ where
             self.core.degraded.store(true, Ordering::Release);
             None
         }
+    }
+
+    fn plan_similarity_chunk(
+        &self,
+        containers: &ContainerRepository<C>,
+        target_id: ChunkId,
+        target: &[u8],
+    ) -> PersistentChunkPlan {
+        self.reduction
+            .as_ref()
+            .and_then(|reduction| reduction.plan_chunk(containers, target_id, target).ok())
+            .unwrap_or(PersistentChunkPlan::NoCandidates)
     }
 
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>) {
@@ -4279,10 +4380,9 @@ where
 
     fn exact_run_membership_status(&self) -> ExactRunMembershipStatus {
         self.core
-            .active
-            .read()
-            .expect("ASSERT: active Exact Index reader lock poisoned")
-            .as_ref()
+            .repository
+            .pin_active_generation()
+            .as_deref()
             .map_or_else(ExactRunMembershipStatus::default, |active| {
                 active.membership_status()
             })
@@ -4301,96 +4401,10 @@ where
         &self,
         entries: Vec<ExactIndexEntry>,
     ) -> Result<(), fastdup_store::ExactIndexStoreError> {
-        let _publisher = self
-            .publish_lock
-            .lock()
-            .expect("ASSERT: Exact Index generation publisher lock poisoned");
-        let previous = self
-            .active
-            .read()
-            .expect("ASSERT: active Exact Index reader lock poisoned")
-            .clone();
-        let run_generation = previous
-            .as_ref()
-            .and_then(|active| {
-                active
-                    .run_set()
-                    .runs()
-                    .iter()
-                    .map(|run| run.generation())
-                    .max()
-            })
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(fastdup_store::ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
-        let run = ExactIndexRun::new(self.profile, run_generation, entries)?;
-        let descriptor = self.repository.publish(&run)?;
-        let mut run_refs = previous
-            .as_ref()
-            .map_or_else(Vec::new, |active| active.run_set().runs().to_vec());
-        run_refs
-            .try_reserve(1)
-            .map_err(|_| fastdup_store::ExactIndexStoreError::OutOfMemory)?;
-        run_refs.push(ExactIndexRunRef::new(0, descriptor)?);
-        let mut newest_run_generation = run_generation;
-        while let Some((source_level, inputs)) = select_compaction_inputs(&run_refs) {
-            let first_output_generation = newest_run_generation
-                .checked_add(1)
-                .ok_or(fastdup_store::ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
-            let target_level = source_level
-                .checked_add(1)
-                .ok_or(fastdup_store::ExactIndexStoreError::InvalidCompactionInput)?;
-            let compacted =
-                self.repository
-                    .compact_family(&inputs, target_level, first_output_generation)?;
-            newest_run_generation = compacted.last_generation();
-            run_refs.retain(|run| {
-                !inputs
-                    .iter()
-                    .any(|input| input.generation() == run.generation())
-            });
-            run_refs.extend_from_slice(compacted.runs());
-        }
-        let run_set_generation = previous.as_ref().map_or(Ok(1), |active| {
-            active
-                .run_set()
-                .generation()
-                .checked_add(1)
-                .ok_or(fastdup_store::ExactIndexStoreError::NonMonotonicRunSetGeneration)
-        })?;
-        let run_set = ExactIndexRunSet::new(self.profile, run_set_generation, run_refs)?;
-        let active = Arc::new(self.repository.activate(&run_set)?);
-        *self
-            .active
-            .write()
-            .expect("ASSERT: active Exact Index writer lock poisoned") = Some(active);
+        self.repository.append_level_zero(self.profile, entries)?;
         self.degraded.store(false, Ordering::Release);
         Ok(())
     }
-}
-
-fn select_compaction_inputs(runs: &[ExactIndexRunRef]) -> Option<(u16, Vec<ExactIndexRunRef>)> {
-    let mut by_level = BTreeMap::<u16, BTreeMap<u64, Vec<ExactIndexRunRef>>>::new();
-    for run in runs.iter().copied() {
-        by_level
-            .entry(run.level())
-            .or_default()
-            .entry(run.family_generation())
-            .or_default()
-            .push(run);
-    }
-    for (level, families) in by_level {
-        if families.len() < EXACT_INDEX_COMPACTION_FANIN {
-            continue;
-        }
-        let mut candidates = Vec::new();
-        for (_, mut family) in families.into_iter().take(EXACT_INDEX_COMPACTION_FANIN) {
-            family.sort_unstable_by_key(|run| run.partition_ordinal());
-            candidates.extend(family);
-        }
-        return Some((level, candidates));
-    }
-    None
 }
 
 impl<M, C> DurableNamespace<M, C>
@@ -4450,10 +4464,80 @@ where
     where
         X: Clone + Send + Sync + StorageIo + 'static,
     {
+        Self::open_with_optional_reduction_index(
+            config,
+            generations,
+            containers,
+            indexes,
+            None,
+            inode_reservation_span,
+        )
+    }
+
+    /// Opens a writable namespace with one immutable pool-wide
+    /// Exact/Similarity pair pinned for bounded write-through Prefix trials.
+    ///
+    /// A missing, stale, or corrupt Similarity snapshot disables advanced
+    /// reduction without affecting Exact reuse or data availability.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same recovery, reservation, graph, durability, and
+    /// namespace-construction failures as [`Self::open`]. Exact or Similarity
+    /// Index recovery failure only disables the affected acceleration path.
+    pub fn open_with_reduction_indexes<X>(
+        config: NamespaceConfig,
+        generations: GenerationRepository<M>,
+        containers: ContainerRepository<C>,
+        indexes: &ExactIndexRunRepository<X>,
+        similarities: &SimilarityIndexRepository<X>,
+        inode_reservation_span: u64,
+    ) -> Result<Self, DurableNamespaceError>
+    where
+        X: Clone + Send + Sync + StorageIo + 'static,
+    {
+        Self::open_with_optional_reduction_index(
+            config,
+            generations,
+            containers,
+            indexes,
+            Some(similarities),
+            inode_reservation_span,
+        )
+    }
+
+    fn open_with_optional_reduction_index<X>(
+        config: NamespaceConfig,
+        generations: GenerationRepository<M>,
+        containers: ContainerRepository<C>,
+        indexes: &ExactIndexRunRepository<X>,
+        similarities: Option<&SimilarityIndexRepository<X>>,
+        inode_reservation_span: u64,
+    ) -> Result<Self, DurableNamespaceError>
+    where
+        X: Clone + Send + Sync + StorageIo + 'static,
+    {
         let read_cache = Arc::new(VerifiedReadCache::new_system()?);
-        let recovered = indexes.recover_active();
+        let recovered = indexes.recover_active_generation().and_then(|active| {
+            if let Some(index) = &active {
+                let retiring = indexes.retiring_containers(index)?;
+                containers.install_retiring_selection_barrier(&retiring);
+            }
+            Ok(active)
+        });
         let initially_degraded = recovered.is_err();
-        let active = recovered.ok().flatten().map(Arc::new);
+        let active = recovered.ok().flatten();
+        let reduction = active.as_ref().and_then(|exact| {
+            let exact_id = exact.run_set().id().ok()?;
+            let similarity = similarities?
+                .recover_latest_for_exact(exact_id)
+                .ok()
+                .flatten()
+                .map(Arc::new)?;
+            PersistentReductionIndex::new(exact, similarity)
+                .ok()
+                .map(Arc::new)
+        });
         let profile = active
             .as_ref()
             .map_or_else(checkpoint_exact_index_profile_v1, |index| {
@@ -4462,8 +4546,6 @@ where
         let core = Arc::new(ExactPublisherCore {
             repository: indexes.clone(),
             profile,
-            active: RwLock::new(active),
-            publish_lock: Mutex::new(()),
             degraded: AtomicBool::new(initially_degraded),
             recent: RwLock::new(BTreeMap::new()),
         });
@@ -4472,6 +4554,7 @@ where
             core,
             publisher,
             read_cache,
+            reduction,
         });
         Self::open_using(
             config,

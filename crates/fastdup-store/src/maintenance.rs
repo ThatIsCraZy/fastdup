@@ -8,15 +8,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use fastdup_format::{
-    ChunkId, ContainerId, ExactIndexEntry, ExactIndexFormatError, ExactIndexProfileId,
-    ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError,
-    MAX_LOGICAL_CHUNK_BYTES, SealedContainer,
+    ChunkId, ContainerId, ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError,
+    ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError,
+    GcCandidateCatalogDescriptor, GcCandidateCatalogRow, MAX_LOGICAL_CHUNK_BYTES, SealedContainer,
 };
 
-use crate::generation::GenerationGcScrubProof;
+use crate::generation::GenerationLivenessProof;
+use crate::maintenance_ioprio;
+use crate::similarity_index_repository::similarity_index_entry_v1_from_verified;
 use crate::{
-    ContainerAuditSummary, ContainerRepository, ExactIndexRunRepository, ExactIndexStoreError,
-    GenerationError, GenerationRepository, StorageIo, StoreError,
+    ContainerAuditSummary, ContainerRepository, ExactIndexGenerationDrain, ExactIndexRunRepository,
+    ExactIndexStoreError, GcCandidateCatalogRepository, GcCandidateCatalogStoreError,
+    GcCandidateSelectionMode, GcCandidateShortlist, GenerationError, GenerationRepository,
+    SimilarityIndexRepository, SimilarityIndexStoreError, StorageIo, StoreError,
 };
 
 const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
@@ -28,12 +32,73 @@ const GC_REPLACEMENT_CHUNK_LIMIT: usize = 32_768;
 const GC_COMPRESSION_REGION_BYTES: usize = 512 * 1_024;
 const GC_RAW_CHUNK_PHYSICAL_OVERHEAD_UPPER_BYTES: u64 = 383;
 const GC_CONTAINER_FIXED_PHYSICAL_OVERHEAD_UPPER_BYTES: u64 = 12_351;
+const GC_CANDIDATE_PROOF_MAX_VICTIMS: usize = 64;
+const GC_CANDIDATE_PROOF_MAX_RAW_REPLACEMENT_BYTES: u64 = 64 * 1_024 * 1_024;
+const ONLINE_GC_BACKGROUND_SHORTLIST: usize = 16;
+const ONLINE_GC_URGENT_SHORTLIST: usize = 64;
 
 /// Scheduling class for one maintenance phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaintenancePriority {
     Background,
     Normal,
+}
+
+/// Resource policy for one explicitly started maintenance cycle.
+///
+/// `Adaptive` protects frontend I/O without adding observations, atomics, or
+/// locks to the write hot loop: every maintenance phase executes in Linux's
+/// work-conserving idle I/O class. `FullSpeed` performs no CPU or I/O priority
+/// demotion and is therefore restricted by the appliance CLI to acknowledged
+/// exclusive offline operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MaintenanceExecutionMode {
+    #[default]
+    Adaptive,
+    FullSpeed,
+}
+
+/// Bounded work quantum selected by the operational Online-GC scheduler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OnlineGcRunMode {
+    /// Small nice+10 quantum while frontend I/O remains active.
+    Background,
+    /// Larger normal-CPU quantum after the frontend has remained quiet.
+    Idle,
+    /// Immediate larger quantum requested by pressure or the local control path.
+    Urgent,
+}
+
+impl OnlineGcRunMode {
+    const fn shortlist_limit(self) -> usize {
+        match self {
+            Self::Background => ONLINE_GC_BACKGROUND_SHORTLIST,
+            Self::Idle | Self::Urgent => ONLINE_GC_URGENT_SHORTLIST,
+        }
+    }
+
+    const fn selection_mode(self) -> GcCandidateSelectionMode {
+        match self {
+            Self::Background | Self::Idle => GcCandidateSelectionMode::Background,
+            Self::Urgent => GcCandidateSelectionMode::Urgent,
+        }
+    }
+
+    const fn priority(self) -> MaintenancePriority {
+        match self {
+            Self::Background => MaintenancePriority::Background,
+            Self::Idle | Self::Urgent => MaintenancePriority::Normal,
+        }
+    }
+}
+
+impl MaintenanceExecutionMode {
+    const fn effective_priority(self, adaptive: MaintenancePriority) -> MaintenancePriority {
+        match self {
+            Self::Adaptive => adaptive,
+            Self::FullSpeed => MaintenancePriority::Normal,
+        }
+    }
 }
 
 /// Exact pool occupancy observation used for maintenance scheduling.
@@ -116,6 +181,24 @@ fn percentage_greater_than(numerator: u64, denominator: u64, percent: u64) -> bo
     u128::from(numerator) * 100 > u128::from(denominator) * u128::from(percent)
 }
 
+fn next_gc_catalog_generation<G: Clone + StorageIo>(
+    catalog: &GcCandidateCatalogRepository<G>,
+) -> Result<u64, MaintenanceError> {
+    catalog
+        .discover_generation_high_water()?
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(MaintenanceError::ArithmeticOverflow)
+}
+
+fn gc_candidate_catalog_is_stale(error: &MaintenanceError) -> bool {
+    match error {
+        MaintenanceError::GcCandidateIdentityMismatch => true,
+        MaintenanceError::Store(StoreError::Io(error)) => error.kind() == io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
 /// One maintenance owner over the Namespace, DATA, and Exact-Index stores.
 ///
 /// Scrub is read-only. Rebuild methods use Redirect-on-Write publication and
@@ -173,18 +256,44 @@ where
         C: Send + 'static,
         X: Send + Sync + 'static,
     {
+        self.start_scrub_and_gc_with_mode(pool_usage, MaintenanceExecutionMode::Adaptive)
+    }
+
+    /// Starts Scrub and subsequent GC using an explicit resource policy.
+    ///
+    /// Adaptive workers always use Linux idle-class I/O, even when space
+    /// pressure promotes their CPU priority. This keeps maintenance requests
+    /// out of the frontend's scheduling class without placing any accounting
+    /// in the frontend hot loop. Full-speed mode skips both CPU and I/O
+    /// demotion and must only be admitted by a caller holding exclusive offline
+    /// ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns a thread-creation failure before any maintenance work starts.
+    pub fn start_scrub_and_gc_with_mode(
+        &self,
+        pool_usage: DataPoolUsage,
+        mode: MaintenanceExecutionMode,
+    ) -> Result<BackgroundMaintenanceJob, MaintenanceError>
+    where
+        M: Send + 'static,
+        C: Send + 'static,
+        X: Send + Sync + 'static,
+    {
         let repository = self.clone();
-        let scrub_priority = pool_usage.scrub_priority();
+        let scrub_priority = mode.effective_priority(pool_usage.scrub_priority());
         let worker = thread::Builder::new()
             .name("fastdup-maintenance".to_owned())
             .spawn(move || {
                 let scrub_repository = repository.clone();
-                let plan = run_at_priority(scrub_priority, "fastdup-scrub", move || {
+                let mut plan = run_at_priority(scrub_priority, mode, "fastdup-scrub", move || {
                     scrub_repository.scrub_for_gc(pool_usage)
                 })?;
                 let scrub = plan.scrub_report();
-                let gc_priority = plan.gc_priority();
-                let gc = run_at_priority(gc_priority, "fastdup-gc", move || {
+                let gc_priority = mode.effective_priority(plan.gc_priority());
+                plan.gc_priority = gc_priority;
+                let gc = run_at_priority(gc_priority, mode, "fastdup-gc", move || {
                     repository.garbage_collect(plan)
                 })?;
                 Ok(BackgroundMaintenanceReport {
@@ -277,6 +386,616 @@ where
             pool_usage,
             gc_priority,
         })
+    }
+
+    /// Builds bounded deletion evidence from a catalog shortlist without a
+    /// preceding complete End-to-End Scrub or complete Container-pool scan.
+    ///
+    /// Version 1 deliberately over-preserves every logical Chunk found in a
+    /// selected victim, including apparently dead Chunks. This closes unknown
+    /// incoming Base dependencies without trusting an Exact-Index miss or a
+    /// catalog fanout estimate. The proof is accepted only when the
+    /// independent-RAW replacement upper bound still leaves positive physical
+    /// gain.
+    ///
+    /// The returned capability binds the current/previous Commit Records, the
+    /// active Exact generation, the catalog generation, and fully verified
+    /// victim identities. It does not retain payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns missing/stale Exact state, victim verification, identity,
+    /// bounded-proof, unprofitable-set, or checked-arithmetic failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an audited catalog shortlist contains the same
+    /// Container identity twice.
+    pub fn prove_gc_candidates(
+        &self,
+        shortlist: &GcCandidateShortlist,
+        pool_usage: DataPoolUsage,
+    ) -> Result<GcCandidateProof, MaintenanceError> {
+        let exact = self
+            .indexes
+            .recover_active()?
+            .ok_or(MaintenanceError::GcProofRequiresActiveExactIndex)?;
+        if exact.record().profile() != self.exact_profile {
+            return Err(MaintenanceError::ExactProfileMismatch);
+        }
+        let generation_proof = self.generations.scan_online_liveness()?;
+        let mut victims = BTreeMap::new();
+        let mut replacement_chunks = BTreeMap::new();
+        let mut victim_bytes = 0_u64;
+        let mut raw_bound = 0_u64;
+        let mut reachable_victim_chunks = BTreeSet::new();
+
+        for row in shortlist
+            .rows()
+            .iter()
+            .copied()
+            .take(GC_CANDIDATE_PROOF_MAX_VICTIMS)
+        {
+            let projected = raw_bound
+                .checked_add(row.raw_replacement_upper_bound())
+                .ok_or(MaintenanceError::ArithmeticOverflow)?;
+            if projected > GC_CANDIDATE_PROOF_MAX_RAW_REPLACEMENT_BYTES {
+                if victims.is_empty() {
+                    return Err(MaintenanceError::GcCandidateProofBudgetExceeded);
+                }
+                break;
+            }
+            let container = self
+                .containers
+                .read_with_index(row.container_id(), &exact)?;
+            if container.header().container_generation() != row.container_generation()
+                || container.header().layout().file_length != row.physical_bytes()
+            {
+                return Err(MaintenanceError::GcCandidateIdentityMismatch);
+            }
+            for record in container.records() {
+                let logical_length = u64::try_from(record.payload().len())
+                    .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+                if let Some(previous) = replacement_chunks.insert(record.chunk_id(), logical_length)
+                    && previous != logical_length
+                {
+                    return Err(MaintenanceError::OnlineChunkLengthMismatch {
+                        chunk_id: record.chunk_id(),
+                        expected: previous,
+                        observed: logical_length,
+                    });
+                }
+                if generation_proof
+                    .online_chunks()
+                    .contains_key(&record.chunk_id())
+                {
+                    reachable_victim_chunks.insert(record.chunk_id());
+                }
+            }
+            let previous = victims.insert(row.container_id().bytes(), row.container_id());
+            assert!(
+                previous.is_none(),
+                "ASSERT: a canonical catalog shortlist contains each Container once"
+            );
+            victim_bytes = victim_bytes
+                .checked_add(row.physical_bytes())
+                .ok_or(MaintenanceError::ArithmeticOverflow)?;
+            raw_bound = projected;
+        }
+        if victims.is_empty() {
+            return Err(MaintenanceError::EmptyGcCandidateProof);
+        }
+        let replacement_upper = replacement_file_bytes_upper_bound(&replacement_chunks)?;
+        if replacement_upper >= victim_bytes {
+            return Err(MaintenanceError::UnprofitableGcCandidateProof {
+                victim_bytes,
+                replacement_upper,
+            });
+        }
+        let estimated_reclaimable_bytes = victim_bytes - replacement_upper;
+        let priority = pool_usage.gc_priority(estimated_reclaimable_bytes, victim_bytes);
+        Ok(GcCandidateProof {
+            catalog: shortlist.descriptor(),
+            generation_proof,
+            exact_activation: exact.record(),
+            exact_profile: self.exact_profile,
+            victims,
+            victim_bytes,
+            replacement_chunks,
+            replacement_upper,
+            reachable_victim_chunks: reachable_victim_chunks.len(),
+            priority,
+        })
+    }
+
+    /// Advances an existing publication-seeded GC catalog to the current
+    /// protected Commit pair in one generation-bound operation.
+    ///
+    /// The module derives the Metadata delta, pins the current Exact
+    /// generation for physical attribution, applies only affected Container
+    /// rows, and publishes one immutable successor. Callers need not assemble
+    /// or interpret the delta themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns missing seed catalog, Metadata delta, active Exact, catalog
+    /// freshness/publication, or storage failures.
+    pub fn refresh_gc_candidate_catalog<G: Clone + StorageIo>(
+        &self,
+        catalog: &GcCandidateCatalogRepository<G>,
+        catalog_generation: u64,
+    ) -> Result<GcCandidateCatalogDescriptor, MaintenanceError> {
+        let previous = catalog
+            .recover_latest()?
+            .ok_or(MaintenanceError::MissingGcCandidateCatalog)?;
+        let incorporated = previous.descriptor().incorporated_commit_generation();
+        let delta = self
+            .generations
+            .liveness_delta_since((incorporated != 0).then_some(incorporated))?;
+        if delta.latest_generation().unwrap_or(0) == incorporated {
+            return Ok(previous.descriptor());
+        }
+        let exact = self
+            .indexes
+            .recover_active()?
+            .ok_or(MaintenanceError::GcProofRequiresActiveExactIndex)?;
+        if exact.record().profile() != self.exact_profile {
+            return Err(MaintenanceError::ExactProfileMismatch);
+        }
+        Ok(catalog.publish_liveness_delta(&previous, catalog_generation, &delta, &exact)?)
+    }
+
+    /// Bootstraps one complete GC candidate hint generation from immutable
+    /// Container envelopes without reading record payloads or retaining a
+    /// pool-sized row map.
+    ///
+    /// Header/Footer summaries are sufficient because the catalog has no
+    /// deletion authority. Candidate proof later fully verifies only the
+    /// bounded shortlist. Rows begin with unknown liveness and are advanced by
+    /// [`Self::refresh_gc_candidate_catalog`].
+    ///
+    /// # Errors
+    ///
+    /// Returns directory, naming, envelope, row, publication, allocation, or
+    /// checked-accounting failures.
+    pub fn rebuild_gc_candidate_catalog<G: Clone + StorageIo>(
+        &self,
+        catalog: &GcCandidateCatalogRepository<G>,
+        catalog_generation: u64,
+    ) -> Result<GcCandidateCatalogDescriptor, MaintenanceError> {
+        let row_count = self.containers.published_container_count()?;
+        Ok(
+            catalog.publish_generated(catalog_generation, 0, 0, row_count, |emit| {
+                self.containers
+                    .visit_published_intrinsic_summaries::<GcCandidateCatalogStoreError, _>(
+                        |container_id, container_generation, physical_bytes, summary| {
+                            emit(GcCandidateCatalogRow::from_intrinsic_summary(
+                                container_id,
+                                container_generation,
+                                physical_bytes,
+                                summary,
+                            )?)
+                        },
+                    )
+            })?,
+        )
+    }
+
+    /// Runs one bounded Online-GC quantum in the adaptive maintenance I/O
+    /// class selected by the scheduler.
+    ///
+    /// The method bootstraps the hint catalog when absent, advances Metadata
+    /// liveness incrementally, proves only a bounded shortlist, executes the
+    /// RETIRING/pin-drain protocol, and rebuilds hint rows after physical
+    /// relocation. `Urgent` changes CPU priority and candidate ordering but
+    /// never leaves Linux idle I/O class.
+    ///
+    /// # Errors
+    ///
+    /// Returns worker setup, catalog, proof, relocation, transition, or
+    /// recovery failures. Expected empty or unprofitable shortlists are
+    /// successful outcomes rather than errors.
+    pub fn run_adaptive_online_gc_cycle<G>(
+        &self,
+        catalog: &GcCandidateCatalogRepository<G>,
+        pool_usage: DataPoolUsage,
+        mode: OnlineGcRunMode,
+    ) -> Result<OnlineGcCycleReport, MaintenanceError>
+    where
+        M: Send + 'static,
+        C: Send + 'static,
+        X: Send + Sync + 'static,
+        G: Clone + Send + Sync + StorageIo + 'static,
+    {
+        let repository = self.clone();
+        let catalog = catalog.clone();
+        run_at_priority(
+            mode.priority(),
+            MaintenanceExecutionMode::Adaptive,
+            "fastdup-online-gc",
+            move || repository.run_online_gc_cycle(&catalog, pool_usage, mode),
+        )
+    }
+
+    fn run_online_gc_cycle<G: Clone + StorageIo>(
+        &self,
+        catalog: &GcCandidateCatalogRepository<G>,
+        pool_usage: DataPoolUsage,
+        mode: OnlineGcRunMode,
+    ) -> Result<OnlineGcCycleReport, MaintenanceError>
+    where
+        X: Send + Sync + 'static,
+    {
+        self.finalize_recovered_online_gc()?;
+        if catalog.recover_latest()?.is_none() {
+            self.rebuild_gc_candidate_catalog(catalog, next_gc_catalog_generation(catalog)?)?;
+        }
+        let mut next_generation = next_gc_catalog_generation(catalog)?;
+        match self.refresh_gc_candidate_catalog(catalog, next_generation) {
+            Ok(_) => {}
+            Err(MaintenanceError::Generation(GenerationError::LivenessDeltaBaseUnavailable {
+                ..
+            })) => {
+                self.rebuild_gc_candidate_catalog(catalog, next_generation)?;
+                next_generation = next_gc_catalog_generation(catalog)?;
+                self.refresh_gc_candidate_catalog(catalog, next_generation)?;
+            }
+            Err(error) => return Err(error),
+        }
+        let snapshot = catalog
+            .recover_latest()?
+            .ok_or(MaintenanceError::MissingGcCandidateCatalog)?;
+        let shortlist =
+            snapshot.shortlist(mode.selection_mode(), mode.shortlist_limit(), u64::MAX)?;
+        if shortlist.rows().is_empty() {
+            return Ok(OnlineGcCycleReport {
+                outcome: OnlineGcCycleOutcome::NoCandidates,
+                catalog: snapshot.descriptor(),
+            });
+        }
+        let proof = match self.prove_gc_candidates(&shortlist, pool_usage) {
+            Ok(proof) => proof,
+            Err(
+                MaintenanceError::EmptyGcCandidateProof
+                | MaintenanceError::GcCandidateProofBudgetExceeded
+                | MaintenanceError::UnprofitableGcCandidateProof { .. },
+            ) => {
+                return Ok(OnlineGcCycleReport {
+                    outcome: OnlineGcCycleOutcome::NoProfitableCandidates,
+                    catalog: snapshot.descriptor(),
+                });
+            }
+            Err(error) if gc_candidate_catalog_is_stale(&error) => {
+                let generation = next_gc_catalog_generation(catalog)?;
+                let catalog = self.rebuild_gc_candidate_catalog(catalog, generation)?;
+                return Ok(OnlineGcCycleReport {
+                    outcome: OnlineGcCycleOutcome::CatalogRebuilt,
+                    catalog,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let retirement = self.begin_online_gc_retirement(proof)?;
+        let collected = self.finish_online_gc_retirement(retirement)?;
+        let generation = next_gc_catalog_generation(catalog)?;
+        let catalog = self.rebuild_gc_candidate_catalog(catalog, generation)?;
+        Ok(OnlineGcCycleReport {
+            outcome: OnlineGcCycleOutcome::Collected(collected),
+            catalog,
+        })
+    }
+
+    /// Executes one locally proved candidate compaction under the existing
+    /// exclusive maintenance-ownership rule.
+    ///
+    /// Every victim Chunk is republished first, so unknown incoming Base
+    /// dependencies remain covered. The protected Commit pair and selected
+    /// Exact generation are revalidated before and after replacement
+    /// publication. The rebuilt Exact Index is activated before any victim is
+    /// unlinked.
+    ///
+    /// # Errors
+    ///
+    /// Returns stale proof bindings, replacement/rebuild/storage failures, or
+    /// checked-accounting failures. No deletion precedes replacement and index
+    /// activation.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a fully verified immutable victim changes physical
+    /// length between proof and deletion reread.
+    pub fn garbage_collect_proved_candidates(
+        &self,
+        proof: GcCandidateProof,
+    ) -> Result<GarbageCollectionReport, MaintenanceError> {
+        let GcCandidateProof {
+            generation_proof,
+            exact_activation,
+            exact_profile,
+            victims,
+            victim_bytes,
+            replacement_chunks,
+            priority,
+            ..
+        } = proof;
+        if exact_profile != self.exact_profile {
+            return Err(MaintenanceError::GcPlanProfileMismatch);
+        }
+        if !self.generations.gc_proof_is_current(&generation_proof)? {
+            return Err(MaintenanceError::StaleGcPlan);
+        }
+        let exact = self
+            .indexes
+            .recover_active()?
+            .filter(|active| active.record() == exact_activation)
+            .ok_or(MaintenanceError::StaleGcPlan)?;
+        let first_replacement_generation = self
+            .containers
+            .discover_container_generation_high_water()?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(MaintenanceError::ArithmeticOverflow)?;
+        let replacements = self.publish_gc_replacements_using(
+            &victims,
+            &replacement_chunks,
+            first_replacement_generation,
+            |container_id| Ok(self.containers.read_with_index(container_id, &exact)?),
+        )?;
+        if !self.generations.gc_proof_is_current(&generation_proof)?
+            || !self.gc_exact_binding_is_current(exact_activation)?
+        {
+            return Err(MaintenanceError::StaleGcPlan);
+        }
+        self.rebuild_exact_index_excluding(&victims)?;
+        if !self.generations.gc_proof_is_current(&generation_proof)? {
+            return Err(MaintenanceError::StaleGcPlan);
+        }
+        let bytes_removed = self.containers.remove_verified_published(&victims)?;
+        assert_eq!(
+            bytes_removed, victim_bytes,
+            "ASSERT: proved victim identities retain their immutable lengths"
+        );
+        Ok(GarbageCollectionReport {
+            containers_removed: u64::try_from(victims.len())
+                .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
+            bytes_removed,
+            replacement_containers: replacements.containers,
+            replacement_bytes: replacements.bytes,
+            chunks_relocated: replacements.chunks,
+            priority,
+        })
+    }
+
+    /// Publishes complete replacement coverage and commits one durable
+    /// RETIRING barrier for a locally proved victim set.
+    ///
+    /// The barrier contains ACTIVE replacement Locations and RETIRING victim
+    /// Locations in the same newly activated L0 generation. Directory-scan
+    /// fallbacks are excluded before activation. Dropping the returned value
+    /// leaves a safe, resumable RETIRING generation and never deletes DATA.
+    ///
+    /// # Errors
+    ///
+    /// Returns stale proof bindings, victim/replacement verification,
+    /// transition publication, or allocation failures. No victim is removed.
+    pub fn begin_online_gc_retirement(
+        &self,
+        proof: GcCandidateProof,
+    ) -> Result<OnlineGcRetirement<X>, MaintenanceError>
+    where
+        X: Send + Sync + 'static,
+    {
+        let GcCandidateProof {
+            generation_proof,
+            exact_activation,
+            exact_profile,
+            victims,
+            victim_bytes,
+            replacement_chunks,
+            priority,
+            ..
+        } = proof;
+        if exact_profile != self.exact_profile {
+            return Err(MaintenanceError::GcPlanProfileMismatch);
+        }
+        if !self.generations.gc_proof_is_current(&generation_proof)? {
+            return Err(MaintenanceError::StaleGcPlan);
+        }
+        let exact = self
+            .indexes
+            .recover_active_generation()?
+            .filter(|active| active.record() == exact_activation)
+            .ok_or(MaintenanceError::StaleGcPlan)?;
+        let first_replacement_generation = self
+            .containers
+            .discover_container_generation_high_water()?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(MaintenanceError::ArithmeticOverflow)?;
+        let mut retiring_entries = Vec::new();
+        let mut replacements = self.publish_gc_replacements_using(
+            &victims,
+            &replacement_chunks,
+            first_replacement_generation,
+            |container_id| {
+                let container = self.containers.read_with_index(container_id, &exact)?;
+                retiring_entries
+                    .try_reserve(container.locations().len())
+                    .map_err(|_| MaintenanceError::OutOfMemory)?;
+                for location in container.locations().iter().copied() {
+                    let active = ExactIndexEntry::from_verified(location)?;
+                    let retiring = ExactIndexEntry::retiring(active)?;
+                    retiring_entries.push(retiring);
+                }
+                Ok(container)
+            },
+        )?;
+        if !self.generations.gc_proof_is_current(&generation_proof)?
+            || !self.gc_exact_binding_is_current(exact_activation)?
+        {
+            return Err(MaintenanceError::StaleGcPlan);
+        }
+        let selection_barrier = self
+            .containers
+            .prepare_retiring_selection_barrier(&victims)?;
+        let mut transitions = std::mem::take(&mut replacements.locations);
+        transitions
+            .try_reserve(retiring_entries.len())
+            .map_err(|_| MaintenanceError::OutOfMemory)?;
+        transitions.extend(retiring_entries.iter().copied());
+        let transition = match self.indexes.append_level_zero_if_active(
+            self.exact_profile,
+            exact_activation,
+            transitions,
+        ) {
+            Ok(transition) => transition,
+            Err(ExactIndexStoreError::ActivationChanged) => {
+                return Err(MaintenanceError::StaleGcPlan);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        selection_barrier.commit();
+        let drain = transition
+            .into_retired()
+            .ok_or(MaintenanceError::GcRetirementMissingPreviousGeneration)?;
+        Ok(OnlineGcRetirement {
+            victims,
+            victim_bytes,
+            replacements,
+            retiring_entries,
+            drain,
+            priority,
+        })
+    }
+
+    /// Waits for every displaced Exact generation pin, unlinks the exact
+    /// victim identities, synchronizes DATA, and appends REMOVED tombstones.
+    ///
+    /// # Errors
+    ///
+    /// Returns victim identity, unlink/directory-sync, or final transition
+    /// publication failures. The RETIRING generation remains safe and
+    /// recoverable if completion is interrupted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a generation-drain lock is poisoned or immutable victim byte
+    /// accounting changes between proof and unlink.
+    pub fn finish_online_gc_retirement(
+        &self,
+        retirement: OnlineGcRetirement<X>,
+    ) -> Result<GarbageCollectionReport, MaintenanceError>
+    where
+        X: Send + Sync + 'static,
+    {
+        let OnlineGcRetirement {
+            victims,
+            victim_bytes,
+            replacements,
+            retiring_entries,
+            drain,
+            priority,
+        } = retirement;
+        drain.wait();
+        let bytes_removed = self.containers.remove_verified_published(&victims)?;
+        assert_eq!(
+            bytes_removed, victim_bytes,
+            "ASSERT: online GC victim identities retain their immutable lengths"
+        );
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(retiring_entries.len())
+            .map_err(|_| MaintenanceError::OutOfMemory)?;
+        for retiring in retiring_entries {
+            removed.push(ExactIndexEntry::removed(retiring)?);
+        }
+        self.indexes
+            .append_level_zero(self.exact_profile, removed)?;
+        self.containers.remove_retiring_selection_barrier(&victims);
+        Ok(GarbageCollectionReport {
+            containers_removed: u64::try_from(victims.len())
+                .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
+            bytes_removed,
+            replacement_containers: replacements.containers,
+            replacement_bytes: replacements.bytes,
+            chunks_relocated: replacements.chunks,
+            priority,
+        })
+    }
+
+    /// Finalizes durable RETIRING work left by a terminated process.
+    ///
+    /// Restart has no surviving predecessor-generation pins. The active Exact
+    /// generation is therefore sufficient recovery authority: effective
+    /// RETIRING entries install the scan-selection barrier, every still-present
+    /// victim must reproduce its complete Location set before unlink, and an
+    /// already-absent victim is treated as an interrupted post-sync attempt.
+    /// REMOVED tombstones are activated only after the DATA directory sync.
+    ///
+    /// This operation is idempotent. A generation without effective RETIRING
+    /// entries returns an empty report and publishes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns Exact recovery, victim verification, unlink/directory-sync, or
+    /// REMOVED publication failures. Failure leaves the durable RETIRING
+    /// selection barrier in force.
+    pub fn finalize_recovered_online_gc(&self) -> Result<OnlineGcRecoveryReport, MaintenanceError>
+    where
+        X: Send + Sync + 'static,
+    {
+        let Some(active) = self.indexes.recover_active_generation()? else {
+            return Ok(OnlineGcRecoveryReport::default());
+        };
+        if active.record().profile() != self.exact_profile {
+            return Err(MaintenanceError::ExactProfileMismatch);
+        }
+        let retiring_entries = self.indexes.retiring_entries(&active)?;
+        if retiring_entries.is_empty() {
+            return Ok(OnlineGcRecoveryReport::default());
+        }
+        let mut victims = BTreeMap::new();
+        for entry in &retiring_entries {
+            let container_id = entry.location().container_id();
+            victims.insert(container_id.bytes(), container_id);
+        }
+        self.containers.install_retiring_selection_barrier(&victims);
+        let removal = self
+            .containers
+            .remove_recovered_retiring(&retiring_entries)?;
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(retiring_entries.len())
+            .map_err(|_| MaintenanceError::OutOfMemory)?;
+        for retiring in retiring_entries {
+            removed.push(ExactIndexEntry::removed(retiring)?);
+        }
+        let retiring_locations_finalized =
+            u64::try_from(removed.len()).map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+        let transition = self
+            .indexes
+            .append_level_zero(self.exact_profile, removed)?;
+        let activation_generation = transition.current().record().generation();
+        self.containers.remove_retiring_selection_barrier(&victims);
+        Ok(OnlineGcRecoveryReport {
+            retiring_containers: u64::try_from(victims.len())
+                .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
+            containers_removed: removal.containers_removed,
+            containers_already_absent: removal.containers_already_absent,
+            bytes_removed: removal.bytes_removed,
+            retiring_locations_finalized,
+            activation_generation: Some(activation_generation),
+        })
+    }
+
+    fn gc_exact_binding_is_current(
+        &self,
+        expected: ExactIndexActivationRecord,
+    ) -> Result<bool, MaintenanceError> {
+        Ok(self
+            .indexes
+            .recover_active()?
+            .is_some_and(|active| active.record() == expected))
     }
 
     fn plan_container_gc(
@@ -436,6 +1155,18 @@ where
         required: &BTreeMap<ChunkId, u64>,
         first_generation: u64,
     ) -> Result<ReplacementPublication, MaintenanceError> {
+        self.publish_gc_replacements_using(victims, required, first_generation, |container_id| {
+            Ok(self.containers.read(container_id)?)
+        })
+    }
+
+    fn publish_gc_replacements_using(
+        &self,
+        victims: &BTreeMap<[u8; 16], ContainerId>,
+        required: &BTreeMap<ChunkId, u64>,
+        first_generation: u64,
+        mut read_victim: impl FnMut(ContainerId) -> Result<SealedContainer, MaintenanceError>,
+    ) -> Result<ReplacementPublication, MaintenanceError> {
         if required.is_empty() {
             return Ok(ReplacementPublication::default());
         }
@@ -445,7 +1176,7 @@ where
         let mut generation = first_generation;
         let mut published = ReplacementPublication::default();
         for container_id in victims.values().copied() {
-            let container = self.containers.read(container_id)?;
+            let container = read_victim(container_id)?;
             for record in container.records() {
                 let chunk_id = record.chunk_id();
                 let Some(expected_length) = required.get(&chunk_id).copied() else {
@@ -539,11 +1270,19 @@ where
             chunks.len(),
             "ASSERT: replacement writer reread must cover the planned Chunk batch"
         );
+        let mut locations = Vec::new();
+        locations
+            .try_reserve_exact(verified.locations().len())
+            .map_err(|_| MaintenanceError::OutOfMemory)?;
+        for location in verified.locations().iter().copied() {
+            locations.push(ExactIndexEntry::from_verified(location)?);
+        }
         Ok(ReplacementPublication {
             containers: 1,
             bytes: verified.header().layout().file_length,
             chunks: u64::try_from(chunks.len())
                 .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
+            locations,
         })
     }
 
@@ -569,6 +1308,87 @@ where
         self.rebuild_exact_index_excluding(&BTreeMap::new())
     }
 
+    /// Rebuilds Exact and Similarity indexes from one verified Container scan.
+    ///
+    /// Similarity partitions remain hidden while the Exact Run Set is staged.
+    /// Exact activation happens first; the bound Similarity family manifest is
+    /// the final advanced-reduction commit point.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first Container verification, index staging, audit,
+    /// activation, I/O, allocation, or checked-arithmetic failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a prior invariant panic poisoned the process-local rebuild
+    /// lock, or if an activated family loses its staged Exact binding.
+    pub fn rebuild_pool_indexes<S>(
+        &self,
+        similarities: &SimilarityIndexRepository<S>,
+    ) -> Result<PoolIndexRebuildReport, MaintenanceError>
+    where
+        S: Clone + StorageIo,
+    {
+        let _guard = self
+            .rebuild_lock
+            .lock()
+            .expect("ASSERT: pool-index rebuild lock poisoned");
+        let exact_generation = self.next_exact_run_set_generation()?;
+        let similarity_generation = similarities
+            .discover_generation_high_water()?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(MaintenanceError::ArithmeticOverflow)?;
+        let mut similarity_stager = similarities.entry_stager(similarity_generation);
+        let staged_exact =
+            self.stage_exact_index_excluding(exact_generation, &BTreeMap::new(), |container| {
+                if container.records().len() != container.locations().len() {
+                    return Err(MaintenanceError::ContainerRecordLocationMismatch);
+                }
+                for (record, location) in container.records().iter().zip(container.locations()) {
+                    let logical_length = u32::try_from(record.payload().len())
+                        .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+                    if record.chunk_id() != location.chunk_id()
+                        || logical_length != location.logical_length()
+                    {
+                        return Err(MaintenanceError::ContainerRecordLocationMismatch);
+                    }
+                    if location.dependency_id() != [0; 32] {
+                        // A dependent target may be indexed exactly, but it
+                        // must never become a Depth-1 Base candidate.
+                        continue;
+                    }
+                    similarity_stager.push(similarity_index_entry_v1_from_verified(
+                        record.chunk_id(),
+                        record.payload(),
+                    )?)?;
+                }
+                Ok(())
+            })?;
+        let exact_run_set_id = staged_exact.run_set.id()?;
+        let staged_similarity = similarities.finish_staged_entries(
+            similarity_generation,
+            similarity_stager,
+            exact_run_set_id,
+        )?;
+        let similarity_entries = staged_similarity.family().logical_entry_count();
+        let similarity_partitions = staged_similarity.family().partitions().len();
+        let exact = self.activate_staged_exact(&staged_exact)?;
+        let family = similarities.activate_staged_family(staged_similarity)?;
+        assert_eq!(
+            family.source_exact_run_set_id(),
+            Some(exact_run_set_id),
+            "ASSERT: activated Similarity family remains bound to staged Exact Run Set"
+        );
+        Ok(PoolIndexRebuildReport {
+            exact,
+            similarity_generation,
+            similarity_entries,
+            similarity_partitions,
+        })
+    }
+
     fn rebuild_exact_index_excluding(
         &self,
         excluded: &BTreeMap<[u8; 16], ContainerId>,
@@ -577,6 +1397,12 @@ where
             .rebuild_lock
             .lock()
             .expect("ASSERT: Exact-Index rebuild lock poisoned");
+        let run_set_generation = self.next_exact_run_set_generation()?;
+        let staged = self.stage_exact_index_excluding(run_set_generation, excluded, |_| Ok(()))?;
+        self.activate_staged_exact(&staged)
+    }
+
+    fn next_exact_run_set_generation(&self) -> Result<u64, MaintenanceError> {
         let previous = self.indexes.recover_active()?;
         if previous
             .as_ref()
@@ -584,13 +1410,24 @@ where
         {
             return Err(MaintenanceError::ExactProfileMismatch);
         }
-        let run_set_generation = previous.as_ref().map_or(Ok(1), |active| {
+        previous.as_ref().map_or(Ok(1), |active| {
             active
                 .run_set()
                 .generation()
                 .checked_add(1)
                 .ok_or(MaintenanceError::ArithmeticOverflow)
-        })?;
+        })
+    }
+
+    fn stage_exact_index_excluding<F>(
+        &self,
+        run_set_generation: u64,
+        excluded: &BTreeMap<[u8; 16], ContainerId>,
+        mut visit_for_similarity: F,
+    ) -> Result<StagedExactIndexRebuild, MaintenanceError>
+    where
+        F: FnMut(&SealedContainer) -> Result<(), MaintenanceError>,
+    {
         let mut newest_run_generation = self
             .indexes
             .discover_run_generation_high_water(self.exact_profile)?
@@ -603,6 +1440,7 @@ where
                 if excluded.contains_key(&container.header().container_id().bytes()) {
                     return Ok(());
                 }
+                visit_for_similarity(container)?;
                 let mut entries = Vec::new();
                 entries
                     .try_reserve_exact(container.locations().len())
@@ -657,12 +1495,26 @@ where
         self.indexes.audit_run_set_global_invariants(&run_set)?;
         let physical_runs = run_set.runs().len();
         let run_families = run_set.family_count();
-        let active = self.indexes.activate(&run_set)?;
-        Ok(ExactIndexRebuildReport {
+        Ok(StagedExactIndexRebuild {
             containers_scanned: containers.containers(),
             entries_rebuilt,
             run_families,
             physical_runs,
+            run_set,
+        })
+    }
+
+    fn activate_staged_exact(
+        &self,
+        staged: &StagedExactIndexRebuild,
+    ) -> Result<ExactIndexRebuildReport, MaintenanceError> {
+        let run_set_generation = staged.run_set.generation();
+        let active = self.indexes.activate(&staged.run_set)?;
+        Ok(ExactIndexRebuildReport {
+            containers_scanned: staged.containers_scanned,
+            entries_rebuilt: staged.entries_rebuilt,
+            run_families: staged.run_families,
+            physical_runs: staged.physical_runs,
             run_set_generation,
             activation_generation: active.record().generation(),
         })
@@ -736,11 +1588,12 @@ fn classify_container(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ReplacementPublication {
     containers: u64,
     bytes: u64,
     chunks: u64,
+    locations: Vec<ExactIndexEntry>,
 }
 
 impl ReplacementPublication {
@@ -757,6 +1610,10 @@ impl ReplacementPublication {
             .chunks
             .checked_add(other.chunks)
             .ok_or(MaintenanceError::ArithmeticOverflow)?;
+        self.locations
+            .try_reserve(other.locations.len())
+            .map_err(|_| MaintenanceError::OutOfMemory)?;
+        self.locations.extend(other.locations);
         Ok(())
     }
 }
@@ -871,6 +1728,7 @@ fn gc_compression_regions(chunks: &[Vec<u8>]) -> Result<Vec<Vec<&[u8]>>, Mainten
 
 fn run_at_priority<R, F>(
     priority: MaintenancePriority,
+    mode: MaintenanceExecutionMode,
     name: &str,
     work: F,
 ) -> Result<R, MaintenanceError>
@@ -878,14 +1736,19 @@ where
     R: Send + 'static,
     F: FnOnce() -> Result<R, MaintenanceError> + Send + 'static,
 {
-    if priority == MaintenancePriority::Normal {
+    if mode == MaintenanceExecutionMode::FullSpeed {
         return work();
     }
     thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
-            rustix::process::nice(BACKGROUND_NICE_INCREMENT)
-                .map_err(|error| MaintenanceError::BackgroundPriority(io::Error::from(error)))?;
+            maintenance_ioprio::set_current_thread_idle()
+                .map_err(MaintenanceError::MaintenanceIoPriority)?;
+            if priority == MaintenancePriority::Background {
+                rustix::process::nice(BACKGROUND_NICE_INCREMENT).map_err(|error| {
+                    MaintenanceError::BackgroundPriority(io::Error::from(error))
+                })?;
+            }
             work()
         })
         .map_err(MaintenanceError::MaintenanceThread)?
@@ -915,6 +1778,14 @@ fn select_compaction_inputs(runs: &[ExactIndexRunRef]) -> Option<(u16, Vec<Exact
         return Some((level, candidates));
     }
     None
+}
+
+struct StagedExactIndexRebuild {
+    containers_scanned: u64,
+    entries_rebuilt: u64,
+    run_families: usize,
+    physical_runs: usize,
+    run_set: ExactIndexRunSet,
 }
 
 /// Compact evidence from one successful full Exact-Index rebuild.
@@ -957,6 +1828,37 @@ impl ExactIndexRebuildReport {
     #[must_use]
     pub const fn activation_generation(self) -> u64 {
         self.activation_generation
+    }
+}
+
+/// Compact evidence from one successful paired Exact/Similarity rebuild.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolIndexRebuildReport {
+    exact: ExactIndexRebuildReport,
+    similarity_generation: u64,
+    similarity_entries: u64,
+    similarity_partitions: usize,
+}
+
+impl PoolIndexRebuildReport {
+    #[must_use]
+    pub const fn exact(self) -> ExactIndexRebuildReport {
+        self.exact
+    }
+
+    #[must_use]
+    pub const fn similarity_generation(self) -> u64 {
+        self.similarity_generation
+    }
+
+    #[must_use]
+    pub const fn similarity_entries(self) -> u64 {
+        self.similarity_entries
+    }
+
+    #[must_use]
+    pub const fn similarity_partitions(self) -> usize {
+        self.similarity_partitions
     }
 }
 
@@ -1023,7 +1925,7 @@ impl EndToEndScrubReport {
 #[derive(Debug)]
 pub struct GarbageCollectionPlan {
     scrub: EndToEndScrubReport,
-    generation_proof: GenerationGcScrubProof,
+    generation_proof: GenerationLivenessProof,
     exact_profile: ExactIndexProfileId,
     reclaimable: BTreeMap<[u8; 16], ContainerId>,
     reclaimable_bytes: u64,
@@ -1034,6 +1936,97 @@ pub struct GarbageCollectionPlan {
     partially_live_containers: u64,
     pool_usage: DataPoolUsage,
     gc_priority: MaintenancePriority,
+}
+
+/// Opaque bounded authority for one candidate-local conservative compaction.
+/// Construction fully verifies only the selected victims and over-preserves
+/// every victim Chunk to close unknown incoming dependency edges.
+#[derive(Debug)]
+pub struct GcCandidateProof {
+    catalog: GcCandidateCatalogDescriptor,
+    generation_proof: GenerationLivenessProof,
+    exact_activation: ExactIndexActivationRecord,
+    exact_profile: ExactIndexProfileId,
+    victims: BTreeMap<[u8; 16], ContainerId>,
+    victim_bytes: u64,
+    replacement_chunks: BTreeMap<ChunkId, u64>,
+    replacement_upper: u64,
+    reachable_victim_chunks: usize,
+    priority: MaintenancePriority,
+}
+
+/// Opaque post-activation authority for one online GC victim set.
+///
+/// Construction proves that replacements are durable and the RETIRING barrier
+/// is active. Only [`MaintenanceRepository::finish_online_gc_retirement`] may
+/// consume it to wait for pins and remove physical Containers.
+#[derive(Debug)]
+pub struct OnlineGcRetirement<X> {
+    victims: BTreeMap<[u8; 16], ContainerId>,
+    victim_bytes: u64,
+    replacements: ReplacementPublication,
+    retiring_entries: Vec<ExactIndexEntry>,
+    drain: ExactIndexGenerationDrain<X>,
+    priority: MaintenancePriority,
+}
+
+impl<X> OnlineGcRetirement<X> {
+    #[must_use]
+    pub fn victim_containers(&self) -> usize {
+        self.victims.len()
+    }
+
+    #[must_use]
+    pub const fn victim_bytes(&self) -> u64 {
+        self.victim_bytes
+    }
+
+    #[must_use]
+    pub fn pins_drained(&self) -> bool {
+        self.drain.is_drained()
+    }
+}
+
+impl GcCandidateProof {
+    #[must_use]
+    pub const fn catalog(&self) -> GcCandidateCatalogDescriptor {
+        self.catalog
+    }
+
+    #[must_use]
+    pub fn victim_containers(&self) -> usize {
+        self.victims.len()
+    }
+
+    #[must_use]
+    pub const fn victim_bytes(&self) -> u64 {
+        self.victim_bytes
+    }
+
+    #[must_use]
+    pub fn replacement_chunks(&self) -> usize {
+        self.replacement_chunks.len()
+    }
+
+    #[must_use]
+    pub const fn replacement_upper_bound(&self) -> u64 {
+        self.replacement_upper
+    }
+
+    #[must_use]
+    pub const fn reachable_victim_chunks(&self) -> usize {
+        self.reachable_victim_chunks
+    }
+
+    #[must_use]
+    pub const fn exact_activation(&self) -> ExactIndexActivationRecord {
+        self.exact_activation
+    }
+
+    #[must_use]
+    pub const fn priority(&self) -> MaintenancePriority {
+        self.priority
+    }
 }
 
 impl GarbageCollectionPlan {
@@ -1178,6 +2171,76 @@ pub struct BackgroundMaintenanceReport {
     gc: GarbageCollectionReport,
 }
 
+/// Evidence from idempotently finalizing one recovered RETIRING generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OnlineGcRecoveryReport {
+    retiring_containers: u64,
+    containers_removed: u64,
+    containers_already_absent: u64,
+    bytes_removed: u64,
+    retiring_locations_finalized: u64,
+    activation_generation: Option<u64>,
+}
+
+/// Result of one bounded adaptive Online-GC scheduler quantum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnlineGcCycleReport {
+    outcome: OnlineGcCycleOutcome,
+    catalog: GcCandidateCatalogDescriptor,
+}
+
+impl OnlineGcCycleReport {
+    #[must_use]
+    pub const fn outcome(self) -> OnlineGcCycleOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn catalog(self) -> GcCandidateCatalogDescriptor {
+        self.catalog
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OnlineGcCycleOutcome {
+    NoCandidates,
+    NoProfitableCandidates,
+    CatalogRebuilt,
+    Collected(GarbageCollectionReport),
+}
+
+impl OnlineGcRecoveryReport {
+    #[must_use]
+    pub const fn retiring_containers(self) -> u64 {
+        self.retiring_containers
+    }
+
+    #[must_use]
+    pub const fn containers_removed(self) -> u64 {
+        self.containers_removed
+    }
+
+    #[must_use]
+    pub const fn containers_already_absent(self) -> u64 {
+        self.containers_already_absent
+    }
+
+    #[must_use]
+    pub const fn bytes_removed(self) -> u64 {
+        self.bytes_removed
+    }
+
+    #[must_use]
+    pub const fn retiring_locations_finalized(self) -> u64 {
+        self.retiring_locations_finalized
+    }
+
+    #[must_use]
+    pub const fn activation_generation(self) -> Option<u64> {
+        self.activation_generation
+    }
+}
+
 impl BackgroundMaintenanceReport {
     #[must_use]
     pub const fn scrub(self) -> EndToEndScrubReport {
@@ -1200,10 +2263,23 @@ pub enum MaintenanceError {
     Store(StoreError),
     Generation(GenerationError),
     ExactIndex(ExactIndexStoreError),
+    SimilarityIndex(SimilarityIndexStoreError),
+    GcCandidateCatalog(GcCandidateCatalogStoreError),
     ExactProfileMismatch,
     GcPlanProfileMismatch,
     StaleGcPlan,
+    GcProofRequiresActiveExactIndex,
+    MissingGcCandidateCatalog,
+    GcCandidateProofBudgetExceeded,
+    GcCandidateIdentityMismatch,
+    GcRetirementMissingPreviousGeneration,
+    EmptyGcCandidateProof,
+    UnprofitableGcCandidateProof {
+        victim_bytes: u64,
+        replacement_upper: u64,
+    },
     BackgroundPriority(io::Error),
+    MaintenanceIoPriority(io::Error),
     MaintenanceThread(io::Error),
     MaintenanceThreadPanicked,
     OnlineChunkLengthMismatch {
@@ -1213,6 +2289,7 @@ pub enum MaintenanceError {
     },
     MissingReplacementChunk,
     ReplacementIdentity,
+    ContainerRecordLocationMismatch,
     ArithmeticOverflow,
     OutOfMemory,
 }
@@ -1240,6 +2317,18 @@ impl From<GenerationError> for MaintenanceError {
 impl From<ExactIndexStoreError> for MaintenanceError {
     fn from(error: ExactIndexStoreError) -> Self {
         Self::ExactIndex(error)
+    }
+}
+
+impl From<SimilarityIndexStoreError> for MaintenanceError {
+    fn from(error: SimilarityIndexStoreError) -> Self {
+        Self::SimilarityIndex(error)
+    }
+}
+
+impl From<GcCandidateCatalogStoreError> for MaintenanceError {
+    fn from(error: GcCandidateCatalogStoreError) -> Self {
+        Self::GcCandidateCatalog(error)
     }
 }
 

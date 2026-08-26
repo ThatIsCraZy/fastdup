@@ -1,12 +1,15 @@
+use std::collections::BTreeMap;
+
 use fastdup_format::{
     ChunkId, ContainerId, DurableInode, ExactIndexEntry, ExactIndexFormatError, ExactIndexLocation,
-    ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, ManifestExtent,
-    ManifestLeaf, NamespaceEntry, NamespaceRoot, PolicySetId,
+    ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, GcCandidateCatalogRow,
+    ManifestExtent, ManifestLeaf, NamespaceEntry, NamespaceRoot, PolicySetId, SealedContainer,
 };
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, ExactIndexStoreError,
-    GenerationRepository, MaintenanceError, MaintenancePriority, MaintenanceRepository, StorageIo,
-    StoreError,
+    GcCandidateCatalogRepository, GcCandidateSelectionMode, GenerationRepository, MaintenanceError,
+    MaintenanceExecutionMode, MaintenancePriority, MaintenanceRepository, OnlineGcCycleOutcome,
+    OnlineGcRunMode, SimilarityIndexRepository, StorageIo, StoreError,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
@@ -85,6 +88,90 @@ fn seeded_repositories_using(
         .expect("commit fixture DATA generation");
 
     (generations, containers, indexes, profile)
+}
+
+fn recoverable_retiring_fixture(
+    metadata: MemoryStorageIo,
+    data: MemoryStorageIo,
+) -> (
+    MaintenanceRepository<MemoryStorageIo, MemoryStorageIo, MemoryStorageIo>,
+    ContainerRepository<MemoryStorageIo>,
+    ExactIndexRunRepository<MemoryStorageIo>,
+) {
+    let policy = PolicySetId::new([0xC1; 32]).expect("fixture policy ID is nonzero");
+    let profile = ExactIndexProfileId::new([0xC2; 32]).expect("fixture profile ID is nonzero");
+    let generations = GenerationRepository::new(metadata.clone(), policy);
+    let containers = ContainerRepository::new(data);
+    let indexes = ExactIndexRunRepository::new(metadata);
+    for (id, generation, chunks) in [
+        (
+            [0xC3; 16],
+            1_u64,
+            [
+                b"recovery-victim-one-a".as_slice(),
+                b"recovery-victim-one-b".as_slice(),
+            ],
+        ),
+        (
+            [0xC4; 16],
+            2_u64,
+            [
+                b"recovery-victim-two-a".as_slice(),
+                b"recovery-victim-two-b".as_slice(),
+            ],
+        ),
+    ] {
+        containers
+            .publish_raw(
+                ContainerId::new(id).expect("fixture Container ID is nonzero"),
+                generation,
+                &chunks,
+            )
+            .expect("publish recovery victim");
+    }
+    let maintenance =
+        MaintenanceRepository::new(generations, containers.clone(), indexes.clone(), profile);
+    maintenance
+        .rebuild_exact_index()
+        .expect("publish initial ACTIVE Exact generation");
+    let mut retiring = Vec::new();
+    for id in [[0xC3; 16], [0xC4; 16]] {
+        let container = containers
+            .read(ContainerId::new(id).expect("fixture Container ID is nonzero"))
+            .expect("reread recovery victim");
+        for location in container.locations().iter().copied() {
+            let active = ExactIndexEntry::from_verified(location)
+                .expect("verified Container Location is an Exact Location");
+            retiring.push(
+                ExactIndexEntry::retiring(active).expect("ACTIVE fixture Location may retire"),
+            );
+        }
+    }
+    indexes
+        .append_level_zero(profile, retiring)
+        .expect("activate durable RETIRING fixture");
+    (maintenance, containers, indexes)
+}
+
+fn recoverable_repositories_for_existing_retirement(
+    metadata: MemoryStorageIo,
+    data: MemoryStorageIo,
+) -> (
+    MaintenanceRepository<MemoryStorageIo, MemoryStorageIo, MemoryStorageIo>,
+    ContainerRepository<MemoryStorageIo>,
+    ExactIndexRunRepository<MemoryStorageIo>,
+) {
+    let policy = PolicySetId::new([0xC1; 32]).expect("fixture policy ID is nonzero");
+    let profile = ExactIndexProfileId::new([0xC2; 32]).expect("fixture profile ID is nonzero");
+    let containers = ContainerRepository::new(data);
+    let indexes = ExactIndexRunRepository::new(metadata.clone());
+    let maintenance = MaintenanceRepository::new(
+        GenerationRepository::new(metadata, policy),
+        containers.clone(),
+        indexes.clone(),
+        profile,
+    );
+    (maintenance, containers, indexes)
 }
 
 fn seeded_mixed_repositories_using(
@@ -613,6 +700,476 @@ fn maintenance_priority_thresholds_are_inclusive() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scrub() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let restart_metadata = metadata.clone();
+    let (generations, containers, indexes, profile) =
+        seeded_mixed_repositories_using(metadata.clone(), data.clone());
+
+    let initial = generations
+        .liveness_delta_since(None)
+        .expect("initial delta scans protected Metadata only");
+    assert_eq!(initial.base_generation(), None);
+    assert_eq!(initial.latest_generation(), Some(3));
+    assert_eq!(initial.protected_chunk_count(), 2);
+    assert_eq!(initial.added().len(), 2);
+    assert!(initial.removed().is_empty());
+    let from_first_data = generations
+        .liveness_delta_since(Some(2))
+        .expect("retained WAL generation supplies an incremental base");
+    assert_eq!(
+        from_first_data.added(),
+        &BTreeMap::from([(
+            ChunkId::of(b"maintenance-third-live-chunk"),
+            u64::try_from(b"maintenance-third-live-chunk".len()).expect("fixture length fits u64"),
+        )])
+    );
+    assert!(from_first_data.removed().is_empty());
+
+    let maintenance_containers = containers.with_maintenance_storage(data.clone());
+    let maintenance = MaintenanceRepository::new(
+        generations.clone(),
+        maintenance_containers,
+        indexes.clone(),
+        profile,
+    );
+    maintenance
+        .rebuild_exact_index()
+        .expect("activate complete Exact generation for delta attribution");
+    let catalog = GcCandidateCatalogRepository::new(metadata);
+    let rows = [
+        candidate_row(
+            [0x83; 16],
+            1,
+            &[
+                b"maintenance-first-chunk".as_slice(),
+                b"maintenance-second-chunk".as_slice(),
+            ],
+        ),
+        candidate_row(
+            [0x88; 16],
+            2,
+            &[
+                b"maintenance-third-live-chunk".as_slice(),
+                b"maintenance-fourth-dead-chunk".as_slice(),
+            ],
+        ),
+    ];
+    catalog
+        .publish_rows(1, 0, 0, 2, rows)
+        .expect("publish publication-only catalog");
+    maintenance
+        .refresh_gc_candidate_catalog(&catalog, 2)
+        .expect("derive and publish Metadata delta successor");
+    let current = catalog
+        .recover_latest()
+        .expect("recover liveness successor")
+        .expect("liveness successor exists");
+    for row in &rows {
+        let observed = current
+            .find_row(row.container_id())
+            .expect("binary catalog lookup succeeds")
+            .expect("fixture row remains present");
+        assert!(observed.estimate_known());
+        assert_eq!(observed.reachable_target_count(), 1);
+    }
+    let shortlist = current
+        .shortlist(GcCandidateSelectionMode::Background, 2, 3)
+        .expect("rank bounded victims");
+
+    let baseline = data.operation_count();
+    let proof = maintenance
+        .prove_gc_candidates(
+            &shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+        )
+        .expect("candidate-local proof preserves every victim Chunk");
+    assert_eq!(proof.victim_containers(), 2);
+    assert_eq!(proof.replacement_chunks(), 4);
+    assert_eq!(proof.reachable_victim_chunks(), 2);
+    assert!(proof.replacement_upper_bound() < proof.victim_bytes());
+    let proof_operations = &data.operations()[baseline..];
+    assert_eq!(
+        proof_operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::Read)
+            .count(),
+        2,
+        "proof reads only the two selected victim Containers"
+    );
+    assert_eq!(
+        proof_operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ListNames)
+            .count(),
+        0,
+        "candidate-local proof never scans the DATA pool directory"
+    );
+
+    let current_generation = generations
+        .recover_latest_with_data(&containers)
+        .expect("recover current generation")
+        .expect("fixture generation exists");
+    generations
+        .commit_namespace_with_data(current_generation.namespace_root(), &containers)
+        .expect("advance protected Commit pair after proof construction");
+    assert!(matches!(
+        maintenance.garbage_collect_proved_candidates(proof),
+        Err(MaintenanceError::StaleGcPlan)
+    ));
+    let current_shortlist = current
+        .shortlist(GcCandidateSelectionMode::Background, 2, 4)
+        .expect("stale hints remain safe proof inputs");
+    let exact_stale_proof = maintenance
+        .prove_gc_candidates(
+            &current_shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+        )
+        .expect("fresh proof binds the advanced Commit pair");
+    maintenance
+        .rebuild_exact_index()
+        .expect("advance the active Exact generation after proof construction");
+    assert!(matches!(
+        maintenance.garbage_collect_proved_candidates(exact_stale_proof),
+        Err(MaintenanceError::StaleGcPlan)
+    ));
+    let current_proof = maintenance
+        .prove_gc_candidates(
+            &current_shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+        )
+        .expect("final proof binds Commit pair and new Exact generation");
+    let held_generation = indexes
+        .recover_active_generation()
+        .expect("install the proof's Exact generation")
+        .expect("the proof has an active Exact generation");
+    let retirement = maintenance
+        .begin_online_gc_retirement(current_proof)
+        .expect("replacement and RETIRING transition activate atomically");
+    assert_eq!(retirement.victim_containers(), 2);
+    assert!(!retirement.pins_drained());
+    let restarted_indexes = ExactIndexRunRepository::new(restart_metadata);
+    let restarted_generation = restarted_indexes
+        .recover_active_generation()
+        .expect("restart recovers the complete RETIRING activation")
+        .expect("RETIRING activation exists after restart");
+    let restarted_retiring = restarted_indexes
+        .retiring_containers(&restarted_generation)
+        .expect("restart derives the effective retiring selection set");
+    assert_eq!(restarted_retiring.len(), 2);
+    let restarted_containers = ContainerRepository::new(data.clone());
+    restarted_containers.install_retiring_selection_barrier(&restarted_retiring);
+    let replacement = restarted_containers
+        .find_verified_location_with_index(
+            &restarted_generation,
+            ChunkId::of(b"maintenance-first-chunk"),
+            u64::try_from(b"maintenance-first-chunk".len()).expect("fixture length fits u64"),
+        )
+        .expect("restart Exact lookup remains available")
+        .expect("replacement ACTIVE Location is selected");
+    assert!(
+        !restarted_retiring.contains_key(&replacement.location().container_id().bytes()),
+        "restart never selects a shadowed RETIRING victim"
+    );
+    drop(restarted_generation);
+    drop(held_generation);
+    let report = maintenance
+        .finish_online_gc_retirement(retirement)
+        .expect("pin drain precedes victim deletion and REMOVED transition");
+    assert_eq!(report.containers_removed(), 2);
+    assert_eq!(report.replacement_containers(), 1);
+    assert_eq!(report.chunks_relocated(), 4);
+    assert_eq!(
+        containers
+            .audit_published()
+            .expect("one complete replacement remains")
+            .containers(),
+        1
+    );
+    maintenance
+        .scrub()
+        .expect("post-collection full audit remains clean");
+}
+
+#[test]
+fn recovered_online_gc_finalizer_is_idempotent_after_durable_partial_unlink() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let restart_metadata = metadata.clone();
+    let restart_data = data.clone();
+    let (_maintenance, containers, _indexes) = recoverable_retiring_fixture(metadata, data.clone());
+
+    let mut published = data.list_names().expect("list recovery victim names");
+    published.sort_unstable();
+    assert_eq!(published.len(), 2);
+    data.remove_file(&published[0])
+        .expect("model an earlier victim unlink");
+    data.sync_root()
+        .expect("model its DATA directory sync before process loss");
+    drop(containers);
+
+    let (restarted, restarted_containers, restarted_indexes) =
+        recoverable_repositories_for_existing_retirement(restart_metadata, restart_data);
+    let report = restarted
+        .finalize_recovered_online_gc()
+        .expect("restart finalizes the durable RETIRING generation");
+    assert_eq!(report.retiring_containers(), 2);
+    assert_eq!(report.containers_removed(), 1);
+    assert_eq!(report.containers_already_absent(), 1);
+    assert_eq!(report.retiring_locations_finalized(), 4);
+    assert!(report.bytes_removed() != 0);
+    assert!(report.activation_generation().is_some());
+    assert_eq!(
+        restarted_containers
+            .audit_published()
+            .expect("all victims are gone")
+            .containers(),
+        0
+    );
+    let active = restarted_indexes
+        .recover_active_generation()
+        .expect("recover finalized Exact generation")
+        .expect("finalized Exact generation exists");
+    assert!(
+        restarted_indexes
+            .retiring_entries(&active)
+            .expect("read effective transitions")
+            .is_empty()
+    );
+    assert_eq!(
+        restarted
+            .finalize_recovered_online_gc()
+            .expect("a repeated finalizer is a no-op"),
+        fastdup_store::OnlineGcRecoveryReport::default()
+    );
+}
+
+#[test]
+fn recovered_online_gc_retries_after_crash_during_unlink_batch() {
+    let control_data = MemoryStorageIo::new();
+    let (control, _containers, _indexes) =
+        recoverable_retiring_fixture(MemoryStorageIo::new(), control_data.clone());
+    let control_baseline = control_data.operation_count();
+    control
+        .finalize_recovered_online_gc()
+        .expect("control finalizer succeeds");
+    let first_remove = control_data.operations()[control_baseline..]
+        .iter()
+        .position(|operation| *operation == StorageOperation::RemoveFile)
+        .and_then(|relative| control_baseline.checked_add(relative))
+        .expect("control finalizer unlinks at least one victim");
+
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::with_fail_after(first_remove);
+    let restart_metadata = metadata.clone();
+    let restart_data = data.clone();
+    let (maintenance, _containers, _indexes) = recoverable_retiring_fixture(metadata, data.clone());
+    assert!(matches!(
+        maintenance.finalize_recovered_online_gc(),
+        Err(MaintenanceError::Store(StoreError::Io(_)))
+    ));
+    data.crash();
+
+    let (restarted, restarted_containers, restarted_indexes) =
+        recoverable_repositories_for_existing_retirement(restart_metadata, restart_data);
+    let report = restarted
+        .finalize_recovered_online_gc()
+        .expect("restart safely retries the interrupted unlink batch");
+    assert_eq!(report.containers_removed(), 2);
+    assert_eq!(report.containers_already_absent(), 0);
+    assert_eq!(
+        restarted_containers
+            .audit_published()
+            .expect("retry removes both victims")
+            .containers(),
+        0
+    );
+    let active = restarted_indexes
+        .recover_active_generation()
+        .expect("recover retry result")
+        .expect("retry publishes an Exact generation");
+    assert!(
+        restarted_indexes
+            .retiring_entries(&active)
+            .expect("read retry transitions")
+            .is_empty()
+    );
+}
+
+#[test]
+fn adaptive_online_gc_cycle_bootstraps_hints_and_collects_one_bounded_quantum() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_mixed_repositories_using(metadata.clone(), data.clone());
+    let maintenance = MaintenanceRepository::new(generations, containers.clone(), indexes, profile);
+    maintenance
+        .rebuild_exact_index()
+        .expect("online scheduler requires one active Exact generation");
+    let catalog = GcCandidateCatalogRepository::new(metadata);
+    let baseline = data.operation_count();
+
+    let cycle = maintenance
+        .run_adaptive_online_gc_cycle(
+            &catalog,
+            DataPoolUsage::new(50, 100).expect("fixture pool usage is valid"),
+            OnlineGcRunMode::Idle,
+        )
+        .expect("idle scheduler quantum succeeds");
+    let OnlineGcCycleOutcome::Collected(collected) = cycle.outcome() else {
+        panic!("ASSERT: fixture must produce one profitable Online-GC cycle");
+    };
+    assert_eq!(collected.containers_removed(), 2);
+    assert_eq!(collected.replacement_containers(), 1);
+    assert_eq!(
+        containers
+            .audit_published()
+            .expect("replacement is the only remaining Container")
+            .containers(),
+        1
+    );
+    assert_eq!(cycle.catalog().row_count(), 1);
+    assert!(
+        data.operations()[baseline..]
+            .iter()
+            .any(|operation| *operation == StorageOperation::ReadExactAt),
+        "catalog bootstrap reads only bounded Header/Footer ranges"
+    );
+}
+
+#[test]
+fn liveness_delta_waits_for_previous_generation_drain_before_removal() {
+    let (generations, containers, _indexes, _profile) = seeded_repositories();
+    let empty = NamespaceRoot::new(1_024, 3, 2, Vec::new(), Vec::new())
+        .expect("empty successor Namespace is valid");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("first empty generation commits");
+    let still_pinned = generations
+        .liveness_delta_since(Some(2))
+        .expect("base generation remains retained");
+    assert!(still_pinned.added().is_empty());
+    assert!(
+        still_pinned.removed().is_empty(),
+        "generation two remains protected as the previous online generation"
+    );
+
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("second empty generation drains the old predecessor");
+    let drained = generations
+        .liveness_delta_since(Some(2))
+        .expect("retained base compares against the new protected pair");
+    assert_eq!(
+        drained.removed(),
+        &BTreeMap::from([(
+            ChunkId::of(b"maintenance-first-chunk"),
+            u64::try_from(b"maintenance-first-chunk".len()).expect("fixture length fits u64"),
+        )])
+    );
+}
+
+fn candidate_row(id: [u8; 16], generation: u64, chunks: &[&[u8]]) -> GcCandidateCatalogRow {
+    let id = ContainerId::new(id).expect("fixture identity is nonzero");
+    let (image, publication) = SealedContainer::encode_with_writer_evidence(id, generation, chunks)
+        .expect("fixture Container encodes")
+        .into_publication_parts();
+    GcCandidateCatalogRow::from_intrinsic_summary(
+        id,
+        generation,
+        u64::try_from(image.len()).expect("fixture length fits u64"),
+        publication
+            .intrinsic_summary()
+            .expect("publication reconstructs intrinsic summary"),
+    )
+    .expect("candidate row is valid")
+}
+
+#[test]
+fn local_proof_over_preserves_unknown_prefix_base_dependency() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
+    let base = b"maintenance-first-chunk";
+    let mut target = base.to_vec();
+    target[7] ^= 0x5a;
+    let dependent_id = ContainerId::new([0xa3; 16]).expect("dependent ID is nonzero");
+    let dependent = containers
+        .publish_zstd_prefix_pairs_verified(dependent_id, 2, &[(base, target.as_slice())])
+        .expect("publish dependent target");
+    let dependent_row = GcCandidateCatalogRow::from_intrinsic_summary(
+        dependent_id,
+        2,
+        dependent.header().layout().file_length,
+        dependent
+            .intrinsic_summary()
+            .expect("dependent publication exposes its intrinsic summary"),
+    )
+    .expect("dependent candidate row is valid");
+    let maintenance =
+        MaintenanceRepository::new(generations, containers.clone(), indexes.clone(), profile);
+    maintenance
+        .rebuild_exact_index()
+        .expect("active Exact generation resolves the dependent victim");
+
+    let catalog = GcCandidateCatalogRepository::new(metadata);
+    catalog
+        .publish_rows(
+            1,
+            0,
+            0,
+            2,
+            [
+                candidate_row(
+                    [0x83; 16],
+                    1,
+                    &[base.as_slice(), b"maintenance-second-chunk".as_slice()],
+                ),
+                dependent_row,
+            ],
+        )
+        .expect("publish dependency test catalog");
+    let snapshot = catalog
+        .recover_latest()
+        .expect("recover dependency catalog")
+        .expect("dependency catalog exists");
+    let shortlist = snapshot
+        .shortlist(GcCandidateSelectionMode::Urgent, 2, 3)
+        .expect("select both underfilled victims");
+    let proof = maintenance
+        .prove_gc_candidates(
+            &shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+        )
+        .expect("proof resolves PREFIX and preserves every victim Chunk");
+    assert_eq!(proof.reachable_victim_chunks(), 1);
+    assert_eq!(proof.replacement_chunks(), 3);
+    maintenance
+        .garbage_collect_proved_candidates(proof)
+        .expect("replacement closes unknown dependency before deletion");
+
+    let active = indexes
+        .recover_active()
+        .expect("recover replacement Exact generation")
+        .expect("replacement Exact generation exists");
+    assert_eq!(
+        containers
+            .read_verified_chunk_with_index(
+                &active,
+                ChunkId::of(&target),
+                u64::try_from(target.len()).expect("fixture length fits u64"),
+            )
+            .expect("formerly dependent target remains byte exact"),
+        target
+    );
+    maintenance
+        .scrub()
+        .expect("post-replacement scrub verifies the dependency closure");
+}
+
+#[test]
 fn asynchronous_job_runs_scrub_in_background_and_escalates_large_gc() {
     let (generations, containers, indexes, profile) = seeded_repositories();
     containers
@@ -643,6 +1200,24 @@ fn asynchronous_job_runs_scrub_in_background_and_escalates_large_gc() {
             .containers(),
         1
     );
+}
+
+#[test]
+fn full_speed_gc_now_overrides_background_cpu_and_io_scheduling() {
+    let (generations, containers, indexes, profile) = seeded_repositories();
+    let maintenance = MaintenanceRepository::new(generations, containers, indexes, profile);
+
+    let job = maintenance
+        .start_scrub_and_gc_with_mode(
+            DataPoolUsage::new(10, 100).expect("worked pool usage is valid"),
+            MaintenanceExecutionMode::FullSpeed,
+        )
+        .expect("full-speed maintenance coordinator starts");
+    assert_eq!(job.scrub_priority(), MaintenancePriority::Normal);
+
+    let report = job.wait().expect("full-speed scrub and GC complete");
+    assert_eq!(report.scrub_priority(), MaintenancePriority::Normal);
+    assert_eq!(report.gc().priority(), MaintenancePriority::Normal);
 }
 
 #[test]
@@ -802,6 +1377,281 @@ fn rebuild_publishes_and_activates_one_new_exact_index_generation() {
         .expect("post-rebuild end-to-end scrub succeeds");
     assert_eq!(scrubbed.exact_activation_generation(), Some(1));
     assert_eq!(scrubbed.exact_active_locations_verified(), 2);
+}
+
+#[test]
+fn paired_rebuild_scans_data_once_and_binds_similarity_to_exact() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), data.clone());
+    let exact_lookup = indexes.clone();
+    let similarities = SimilarityIndexRepository::new(metadata);
+    let maintenance = MaintenanceRepository::new(generations, containers, indexes, profile);
+    let data_baseline = data.operation_count();
+
+    let rebuilt = maintenance
+        .rebuild_pool_indexes(&similarities)
+        .expect("paired pool-index rebuild succeeds");
+
+    assert_eq!(rebuilt.exact().containers_scanned(), 1);
+    assert_eq!(rebuilt.exact().entries_rebuilt(), 2);
+    assert_eq!(rebuilt.similarity_entries(), 2);
+    assert_eq!(rebuilt.similarity_partitions(), 1);
+    assert_eq!(
+        data.operations()[data_baseline..]
+            .iter()
+            .filter(|operation| **operation == StorageOperation::Read)
+            .count(),
+        1,
+        "one verified Container read feeds both index builders"
+    );
+
+    let active = exact_lookup
+        .recover_active()
+        .expect("recover paired Exact index")
+        .expect("paired Exact index is active");
+    let exact_id = active
+        .run_set()
+        .id()
+        .expect("identify active Exact Run Set");
+    let recovered = similarities
+        .recover_latest_for_exact(exact_id)
+        .expect("recover paired Similarity index")
+        .expect("paired Similarity index is active");
+    assert_eq!(recovered.status().source_exact_run_set_id(), Some(exact_id));
+    assert_eq!(
+        similarities
+            .audit_latest_for_exact(exact_id)
+            .expect("offline audit accepts the paired identity")
+            .expect("paired Similarity audit exists")
+            .entries_verified(),
+        2
+    );
+}
+
+#[test]
+fn paired_rebuild_keeps_dependent_targets_out_of_similarity_bases() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), data);
+    let base = b"maintenance-first-chunk";
+    let mut target = base.to_vec();
+    target[8] ^= 0x31;
+    containers
+        .publish_zstd_prefix_pairs_verified(
+            ContainerId::new([0xa3; 16]).expect("dependent Container ID is nonzero"),
+            2,
+            &[(base, target.as_slice())],
+        )
+        .expect("publish dependent target fixture");
+    let similarities = SimilarityIndexRepository::new(metadata);
+    let maintenance = MaintenanceRepository::new(generations, containers, indexes.clone(), profile);
+
+    let rebuilt = maintenance
+        .rebuild_pool_indexes(&similarities)
+        .expect("rebuild indexes with one dependent target");
+
+    assert_eq!(rebuilt.exact().entries_rebuilt(), 3);
+    assert_eq!(
+        rebuilt.similarity_entries(),
+        2,
+        "only the two independently decodable fixture Chunks may become Bases"
+    );
+    let active = indexes
+        .recover_active()
+        .expect("recover rebuilt Exact")
+        .expect("rebuilt Exact exists");
+    let lookup = active
+        .lookup_transitions(
+            ChunkId::of(&target),
+            u32::try_from(target.len()).expect("fixture length fits u32"),
+        )
+        .expect("dependent target remains exactly addressable");
+    assert!(
+        lookup
+            .candidates()
+            .iter()
+            .any(|entry| entry.location().dependency_id() == ChunkId::of(base).bytes())
+    );
+}
+
+#[test]
+fn paired_rebuild_publishes_an_empty_tombstone_for_an_empty_pool() {
+    let metadata = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0x91; 32]).expect("nonzero fixture policy");
+    let profile = ExactIndexProfileId::new([0x92; 32]).expect("nonzero fixture profile");
+    let indexes = ExactIndexRunRepository::new(metadata.clone());
+    let similarities = SimilarityIndexRepository::new(metadata.clone());
+    let maintenance = MaintenanceRepository::new(
+        GenerationRepository::new(metadata, policy),
+        ContainerRepository::new(MemoryStorageIo::new()),
+        indexes.clone(),
+        profile,
+    );
+
+    let rebuilt = maintenance
+        .rebuild_pool_indexes(&similarities)
+        .expect("empty pool rebuild succeeds");
+    assert_eq!(rebuilt.exact().entries_rebuilt(), 0);
+    assert_eq!(rebuilt.similarity_entries(), 0);
+    assert_eq!(rebuilt.similarity_partitions(), 0);
+
+    let active = indexes
+        .recover_active()
+        .expect("recover empty Exact Run Set")
+        .expect("empty Exact Run Set is active");
+    let recovered = similarities
+        .recover_latest_for_exact(active.run_set().id().expect("identify empty Exact Run Set"))
+        .expect("recover bound empty Similarity family")
+        .expect("empty Similarity family is active");
+    assert_eq!(recovered.status().entries_streamed(), 0);
+    assert_eq!(recovered.status().buckets(), 0);
+}
+
+#[test]
+fn paired_rebuild_skips_orphan_similarity_partition_generations() {
+    let metadata = MemoryStorageIo::new();
+    let orphan = "similarity-part.0001.0001.0000000000000009.0000.fds";
+    metadata
+        .create_new(orphan)
+        .expect("create orphan partition name");
+    metadata.sync_root().expect("persist orphan partition name");
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
+    let similarities = SimilarityIndexRepository::new(metadata);
+    let maintenance = MaintenanceRepository::new(generations, containers, indexes, profile);
+
+    assert_eq!(
+        maintenance
+            .rebuild_pool_indexes(&similarities)
+            .expect("rebuild allocates after orphan")
+            .similarity_generation(),
+        10
+    );
+}
+
+#[test]
+fn every_paired_rebuild_fault_exposes_only_a_bound_similarity_family() {
+    let probe_metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(probe_metadata.clone(), MemoryStorageIo::new());
+    let probe_similarity = SimilarityIndexRepository::new(probe_metadata.clone());
+    let probe = MaintenanceRepository::new(generations, containers, indexes, profile);
+    let baseline = probe_metadata.operation_count();
+    probe
+        .rebuild_pool_indexes(&probe_similarity)
+        .expect("probe paired rebuild succeeds");
+    let operations = probe_metadata.operations()[baseline..].to_vec();
+
+    for (relative, operation) in operations.iter().copied().enumerate() {
+        for fail_after in [false, true] {
+            let absolute = baseline + relative;
+            let metadata = if fail_after {
+                MemoryStorageIo::with_fail_after(absolute)
+            } else {
+                MemoryStorageIo::with_fail_before(absolute)
+            };
+            let (generations, containers, indexes, profile) =
+                seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
+            let similarities = SimilarityIndexRepository::new(metadata.clone());
+            let maintenance =
+                MaintenanceRepository::new(generations, containers, indexes.clone(), profile);
+            let outcome = maintenance.rebuild_pool_indexes(&similarities);
+            metadata.crash();
+
+            let active = indexes
+                .recover_active()
+                .expect("Exact recovery remains structurally valid");
+            let recovered_similarity = similarities
+                .recover_latest()
+                .expect("Similarity recovery remains structurally valid");
+            if let Some(similarity) = recovered_similarity {
+                let active = active.as_ref().expect(
+                    "a visible Similarity family always has its Exact Run Set active first",
+                );
+                assert_eq!(
+                    similarity.status().source_exact_run_set_id(),
+                    Some(
+                        active
+                            .run_set()
+                            .id()
+                            .expect("identify recovered Exact Run Set")
+                    ),
+                    "fault at {relative} ({operation:?}), fail_after={fail_after}"
+                );
+            }
+            if outcome.is_ok() {
+                assert!(active.is_some());
+                assert!(
+                    similarities
+                        .recover_latest()
+                        .expect("acknowledged Similarity recovery succeeds")
+                        .is_some()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn replacement_fault_never_selects_the_old_similarity_for_the_new_exact_set() {
+    let probe_metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(probe_metadata.clone(), MemoryStorageIo::new());
+    let probe_similarity = SimilarityIndexRepository::new(probe_metadata.clone());
+    let probe = MaintenanceRepository::new(generations, containers, indexes, profile);
+    probe
+        .rebuild_pool_indexes(&probe_similarity)
+        .expect("seed probe pair");
+    let second_baseline = probe_metadata.operation_count();
+    probe
+        .rebuild_pool_indexes(&probe_similarity)
+        .expect("probe replacement pair succeeds");
+    let operations = probe_metadata.operations()[second_baseline..].to_vec();
+
+    for (relative, operation) in operations.iter().copied().enumerate() {
+        for fail_after in [false, true] {
+            let absolute = second_baseline + relative;
+            let metadata = if fail_after {
+                MemoryStorageIo::with_fail_after(absolute)
+            } else {
+                MemoryStorageIo::with_fail_before(absolute)
+            };
+            let (generations, containers, indexes, profile) =
+                seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
+            let similarities = SimilarityIndexRepository::new(metadata.clone());
+            let maintenance =
+                MaintenanceRepository::new(generations, containers, indexes.clone(), profile);
+            maintenance
+                .rebuild_pool_indexes(&similarities)
+                .expect("fault is positioned in the replacement rebuild");
+            let outcome = maintenance.rebuild_pool_indexes(&similarities);
+            metadata.crash();
+
+            let active = indexes
+                .recover_active()
+                .expect("replacement Exact recovery is valid")
+                .expect("the initial Exact pair remains available");
+            let exact_id = active
+                .run_set()
+                .id()
+                .expect("identify selected replacement Exact Run Set");
+            let paired = similarities
+                .recover_latest_for_exact(exact_id)
+                .expect("paired selection treats an older family as unavailable");
+            if let Some(index) = paired.as_ref() {
+                assert_eq!(index.status().source_exact_run_set_id(), Some(exact_id));
+            }
+            if outcome.is_ok() {
+                assert!(
+                    paired.is_some(),
+                    "acknowledged replacement at {relative} ({operation:?}), fail_after={fail_after} must expose its pair"
+                );
+            }
+        }
+    }
 }
 
 #[test]

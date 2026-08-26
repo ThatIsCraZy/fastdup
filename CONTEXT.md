@@ -297,7 +297,44 @@ _Avoid_: Garbage collection, rebuild
 **GC scrub plan**:
 Opaque, generation-bound evidence from one successful Scrub that names verified
 physical garbage without making an Exact Index or reference count authoritative.
+It is one complete proof source, not a prerequisite for every candidate search.
 _Avoid_: Refcount snapshot, deletion list
+
+**Container intrinsic summary**:
+Immutable exact facts about one Container's physical and logical shape. It can
+rank GC work but never describes current reachability or authorizes deletion.
+_Avoid_: Live-byte counter, GC score, Container reference count
+
+**GC candidate catalog**:
+Rebuildable, generation-lagging estimates used to find Containers worth proving
+or relocating. Stale entries may waste work but can never authorize retirement.
+_Avoid_: GC truth, Location set, deletion list
+
+**GC candidate proof**:
+Generation-bound evidence that proves reachability and dependency closure for a
+bounded victim set and verifies its replacement coverage before retirement.
+_Avoid_: GC hint, reference count, complete pool scrub
+
+**Online GC recovery finalizer**:
+The idempotent startup operation that derives effective `RETIRING` Locations
+from the active Exact generation, completes any remaining verified victim
+unlinks, and records `REMOVED` after the DATA directory is durable. A missing
+victim is expected evidence of an interrupted earlier finalization, not proof
+of corruption by itself.
+_Avoid_: GC retry, scrub repair, candidate proof
+
+**Adaptive Online GC quantum**:
+A bounded maintenance attempt whose pace depends on Data Pool pressure and
+recent frontend activity. Background, idle, and urgent pace change admission
+frequency, CPU priority, and candidate count; none grants deletion authority or
+permission to compete in the frontend I/O class.
+_Avoid_: Full GC, scrub cycle, frontend throttle
+
+**Online GC request**:
+An operator request delivered to the currently writable appliance to start one
+urgent Adaptive Online GC quantum. It does not create a second storage owner
+and does not mean exclusive full-speed maintenance.
+_Avoid_: Offline gc-now, scheduled GC, Appliance Lease
 
 **Reclaimable container**:
 A verified Container with no Chunk reachable from any currently pinned online
@@ -475,6 +512,13 @@ _Avoid_: Exact-Index authority, cache hit, partial verification
 A temporary liveness root retained for readers, normal rollback, or data-tier
 recovery. Historical existence alone does not make an old generation live.
 _Avoid_: Snapshot, reference count
+
+**Exact Index generation pin**:
+A temporary authorization to select and read physical Locations through one
+immutable Exact Index generation. A retiring generation admits no new pins;
+pins from every still-live predecessor generation must drain before any
+shadowed Container is removed.
+_Avoid_: Exact Index reference, Container reference count
 
 **Corruption**:
 A state in which stored bytes or metadata fail their integrity contract. Corrupt

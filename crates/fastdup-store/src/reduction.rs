@@ -11,6 +11,7 @@ use crate::reduction_codec::{
     IndependentEncoding, PreparedDictionary, WorkerCodec, accept_zstd_v1,
 };
 use crate::reduction_filter::{BlockedBloomHint, BloomLookupHint};
+use crate::reduction_prefix::{VerifiedBaseChunk, ZstdPrefixCodec, ZstdPrefixEncoding};
 use crate::reduction_similarity::{
     IndependentBaseRef, SimilarityCandidate, SimilarityError, SimilarityFingerprint,
     SimilarityIndex, SparseXorDelta,
@@ -74,7 +75,8 @@ impl ReductionFeatures {
     pub const SIMILARITY: Self = Self(1 << 5);
     pub const DELTA: Self = Self(1 << 6);
     pub const REORDER: Self = Self(1 << 7);
-    pub const ALL: Self = Self(0xff);
+    pub const ZSTD_PREFIX: Self = Self(1 << 8);
+    pub const ALL: Self = Self(0x1ff);
 
     #[must_use]
     pub const fn contains(self, feature: Self) -> bool {
@@ -110,6 +112,11 @@ impl ReductionPolicy {
             return Err(ReductionError::InvalidPolicy(
                 "DELTA requires SIMILARITY candidate search",
             ));
+        }
+        if features.contains(ReductionFeatures::ZSTD_PREFIX)
+            && !features.contains(ReductionFeatures::DELTA)
+        {
+            return Err(ReductionError::InvalidPolicy("ZSTD_PREFIX requires DELTA"));
         }
         if features.contains(ReductionFeatures::GROUPING)
             && !features.contains(ReductionFeatures::COMPRESSION)
@@ -252,6 +259,7 @@ pub struct ReductionReport {
     zstd_regions: usize,
     zstd_dictionary_regions: usize,
     delta_chunks: usize,
+    zstd_prefix_chunks: usize,
     similarity_candidates: usize,
     delta_trials: usize,
     delta_logical_bytes: u64,
@@ -315,6 +323,11 @@ impl ReductionReport {
     #[must_use]
     pub const fn delta_chunks(self) -> usize {
         self.delta_chunks
+    }
+
+    #[must_use]
+    pub const fn zstd_prefix_chunks(self) -> usize {
+        self.zstd_prefix_chunks
     }
 
     #[must_use]
@@ -423,7 +436,7 @@ pub struct ReductionEngine {
 
 impl ReductionEngine {
     #[must_use]
-    pub const fn new(policy: ReductionPolicy, runtime: ReductionRuntime) -> Self {
+    pub fn new(policy: ReductionPolicy, runtime: ReductionRuntime) -> Self {
         Self {
             policy,
             runtime,
@@ -649,6 +662,7 @@ impl ReductionEngine {
             zstd_regions: encoded_stats.zstd_regions,
             zstd_dictionary_regions: encoded_stats.zstd_dictionary_regions,
             delta_chunks: encoded_stats.delta_chunks,
+            zstd_prefix_chunks: encoded_stats.zstd_prefix_chunks,
             similarity_candidates: similarity_stats.candidates,
             delta_trials: similarity_stats.trials,
             delta_logical_bytes: encoded_stats.delta_logical_bytes,
@@ -858,27 +872,25 @@ impl ReductionEngine {
                     .map_err(|_| ReductionError::Corruption("record codec decode failed"))
             }
             RecordEncoding::Delta { encoding, .. } => {
-                let base = encoding.base();
-                let base_length = usize::try_from(base.logical_length()).map_err(|_| {
-                    ReductionError::Corruption("Delta Base length does not fit memory")
-                })?;
-                let location = self
-                    .independent_index
-                    .lookup(base.chunk_id(), base_length)?
-                    .ok_or(ReductionError::Corruption(
+                let base_id = encoding.base_chunk_id();
+                let base_length =
+                    usize::try_from(encoding.base_logical_length()).map_err(|_| {
+                        ReductionError::Corruption("Delta Base length does not fit memory")
+                    })?;
+                let location = self.independent_index.lookup(base_id, base_length)?.ok_or(
+                    ReductionError::Corruption(
                         "Delta Base has no independently decodable Location",
-                    ))?;
+                    ),
+                )?;
                 let base = decode_independent_location(
                     codec,
                     &self.records,
-                    base.chunk_id(),
+                    base_id,
                     base_length,
                     location,
                     self.dictionary.as_ref(),
                 )?;
-                encoding
-                    .decode(&base.bytes)
-                    .map_err(|_| ReductionError::Corruption("Delta reconstruction failed"))
+                encoding.decode(&base.bytes)
             }
         }
     }
@@ -1349,6 +1361,10 @@ impl ReductionEngine {
             .min(jobs.len());
         let records = &self.records;
         let dictionary = self.dictionary.as_ref();
+        let zstd_prefix_enabled = self
+            .policy
+            .features
+            .contains(ReductionFeatures::ZSTD_PREFIX);
         let worker_results = (0..worker_count)
             .into_par_iter()
             .map(|worker_ordinal| {
@@ -1366,12 +1382,18 @@ impl ReductionEngine {
                         let target = input
                             .get(job.target_input_offset..target_end)
                             .expect("ASSERT: a scheduled Delta target lies inside the input");
-                        let mut best = None;
-                        for base in job.bases.iter().take(usize::from(MAXIMUM_TRIAL_ENCODINGS)) {
+                        let target_id = ChunkId::of(target);
+                        let mut best: Option<(u32, DependentEncoding)> = None;
+                        let mut remaining_trials = usize::from(MAXIMUM_TRIAL_ENCODINGS);
+                        for base in &job.bases {
+                            if remaining_trials == 0 {
+                                break;
+                            }
                             worker_stats.trials = worker_stats
                                 .trials
                                 .checked_add(1)
                                 .expect("ASSERT: Delta Trials cannot overflow for one input");
+                            remaining_trials -= 1;
                             let decoded_base = decode_independent_location(
                                 codec,
                                 records,
@@ -1402,7 +1424,7 @@ impl ReductionEngine {
                             )
                             .map_err(similarity_writer_error)?;
                             let trial_cost = trial.cost();
-                            if trial.encoding().target_id() != ChunkId::of(target)
+                            if trial.encoding().target_id() != target_id
                                 || usize::try_from(trial_cost.target_bytes()).map_err(|_| {
                                     ReductionError::InvalidInput(
                                         "Delta Trial target length does not fit memory",
@@ -1415,10 +1437,73 @@ impl ReductionEngine {
                                 ));
                             }
                             let trial_bytes = trial_cost.encoded_payload_bytes();
-                            if best.as_ref().is_none_or(
-                                |(best_bytes, _): &(u32, SparseXorDelta)| trial_bytes < *best_bytes,
-                            ) {
-                                best = Some((trial_bytes, trial.into_encoding()));
+                            if best
+                                .as_ref()
+                                .is_none_or(|(best_bytes, _)| trial_bytes < *best_bytes)
+                            {
+                                best = Some((
+                                    trial_bytes,
+                                    DependentEncoding::SparseXor(trial.into_encoding()),
+                                ));
+                            }
+
+                            if zstd_prefix_enabled && remaining_trials != 0 {
+                                worker_stats.trials = worker_stats
+                                    .trials
+                                    .checked_add(1)
+                                    .expect("ASSERT: Delta Trials cannot overflow for one input");
+                                remaining_trials -= 1;
+                                let verified_base =
+                                    VerifiedBaseChunk::from_bytes(&decoded_base.bytes)
+                                        .map_err(zstd_prefix_writer_error)?;
+                                if verified_base.reference().chunk_id()
+                                    != base.candidate.chunk_id()
+                                    || verified_base.reference().logical_length()
+                                        != base.candidate.logical_length()
+                                {
+                                    return Err(ReductionError::Corruption(
+                                        "verified Prefix Base disagrees with its Similarity Candidate",
+                                    ));
+                                }
+                                let maximum_payload_bytes = usize::try_from(
+                                    job.independent_payload_bytes,
+                                )
+                                .map_err(|_| {
+                                    ReductionError::InvalidInput(
+                                        "independent payload length does not fit memory",
+                                    )
+                                })?;
+                                if let Some(prefix) = ZstdPrefixCodec::encode_trial(
+                                    verified_base,
+                                    target,
+                                    maximum_payload_bytes,
+                                )
+                                .map_err(zstd_prefix_writer_error)?
+                                {
+                                    if prefix.encoding().target_id() != target_id
+                                        || prefix.encoding().logical_length()
+                                            != u32::try_from(target.len()).map_err(|_| {
+                                                ReductionError::InvalidInput(
+                                                    "Prefix target length does not fit u32",
+                                                )
+                                            })?
+                                    {
+                                        return Err(ReductionError::Corruption(
+                                            "Zstd Prefix Trial disagrees with its target",
+                                        ));
+                                    }
+                                    let prefix_bytes = prefix.encoded_payload_bytes();
+                                    if best.as_ref().is_none_or(|(best_bytes, _)| {
+                                        prefix_bytes < *best_bytes
+                                    }) {
+                                        best = Some((
+                                            prefix_bytes,
+                                            DependentEncoding::ZstdPrefix(
+                                                prefix.into_encoding(),
+                                            ),
+                                        ));
+                                    }
+                                }
                             }
                         }
                         let accepted = best.and_then(|(payload_bytes, encoding)| {
@@ -1593,9 +1678,64 @@ struct EncodingRecord {
 enum RecordEncoding {
     Independent(IndependentEncoding),
     Delta {
-        encoding: SparseXorDelta,
+        encoding: DependentEncoding,
         payload_bytes: usize,
     },
+}
+
+#[derive(Debug)]
+enum DependentEncoding {
+    SparseXor(SparseXorDelta),
+    ZstdPrefix(ZstdPrefixEncoding),
+}
+
+impl DependentEncoding {
+    const fn base_chunk_id(&self) -> ChunkId {
+        match self {
+            Self::SparseXor(encoding) => encoding.base().chunk_id(),
+            Self::ZstdPrefix(encoding) => encoding.base().chunk_id(),
+        }
+    }
+
+    const fn base_logical_length(&self) -> u32 {
+        match self {
+            Self::SparseXor(encoding) => encoding.base().logical_length(),
+            Self::ZstdPrefix(encoding) => encoding.base().logical_length(),
+        }
+    }
+
+    const fn target_id(&self) -> ChunkId {
+        match self {
+            Self::SparseXor(encoding) => encoding.target_id(),
+            Self::ZstdPrefix(encoding) => encoding.target_id(),
+        }
+    }
+
+    const fn logical_length(&self) -> u32 {
+        match self {
+            Self::SparseXor(encoding) => encoding.logical_length(),
+            Self::ZstdPrefix(encoding) => encoding.logical_length(),
+        }
+    }
+
+    fn decode(&self, base_bytes: &[u8]) -> Result<Vec<u8>, ReductionError> {
+        match self {
+            Self::SparseXor(encoding) => encoding
+                .decode(base_bytes)
+                .map_err(|_| ReductionError::Corruption("Sparse-XOR reconstruction failed")),
+            Self::ZstdPrefix(encoding) => {
+                let base = VerifiedBaseChunk::from_expected(encoding.base(), base_bytes)
+                    .map_err(|_| ReductionError::Corruption("Zstd Prefix Base proof failed"))?;
+                encoding
+                    .decode(base)
+                    .map_err(|_| ReductionError::Corruption("Zstd Prefix reconstruction failed"))
+            }
+        }
+    }
+
+    const fn is_zstd_prefix(&self) -> bool {
+        matches!(self, Self::ZstdPrefix(_))
+    }
 }
 
 impl RecordEncoding {
@@ -1729,7 +1869,7 @@ struct BaseCandidate {
 #[derive(Debug)]
 struct DeltaDecision {
     region_ordinal: usize,
-    accepted: Option<(SparseXorDelta, u32)>,
+    accepted: Option<(DependentEncoding, u32)>,
 }
 
 #[derive(Debug)]
@@ -2047,6 +2187,7 @@ struct WorkerStats {
     zstd_regions: usize,
     zstd_dictionary_regions: usize,
     delta_chunks: usize,
+    zstd_prefix_chunks: usize,
     delta_logical_bytes: u64,
     delta_payload_bytes: u64,
     physical_payload_bytes: u64,
@@ -2087,7 +2228,10 @@ impl WorkerStats {
                         .expect("ASSERT: dictionary regions cannot exceed Zstd regions");
                 }
             }
-            RecordEncoding::Delta { payload_bytes, .. } => {
+            RecordEncoding::Delta {
+                encoding,
+                payload_bytes,
+            } => {
                 assert_eq!(
                     record.chunks.len(),
                     1,
@@ -2097,6 +2241,12 @@ impl WorkerStats {
                     .delta_chunks
                     .checked_add(1)
                     .expect("ASSERT: Delta chunks cannot exceed logical chunks");
+                if encoding.is_zstd_prefix() {
+                    self.zstd_prefix_chunks = self
+                        .zstd_prefix_chunks
+                        .checked_add(1)
+                        .expect("ASSERT: Prefix chunks cannot exceed Delta chunks");
+                }
                 self.delta_logical_bytes = self
                     .delta_logical_bytes
                     .checked_add(
@@ -2123,6 +2273,7 @@ struct AggregateStats {
     zstd_regions: usize,
     zstd_dictionary_regions: usize,
     delta_chunks: usize,
+    zstd_prefix_chunks: usize,
     delta_logical_bytes: u64,
     delta_payload_bytes: u64,
     physical_payload_bytes: u64,
@@ -2148,6 +2299,10 @@ impl AggregateStats {
             .delta_chunks
             .checked_add(worker.delta_chunks)
             .expect("ASSERT: Delta chunks cannot exceed logical chunks");
+        self.zstd_prefix_chunks = self
+            .zstd_prefix_chunks
+            .checked_add(worker.zstd_prefix_chunks)
+            .expect("ASSERT: Prefix chunks cannot exceed Delta chunks");
         self.delta_logical_bytes = self
             .delta_logical_bytes
             .checked_add(worker.delta_logical_bytes)
@@ -2569,6 +2724,18 @@ fn similarity_writer_error(error: SimilarityError) -> ReductionError {
         return ReductionError::Corruption("Similarity Index or Base identity mismatch");
     }
     ReductionError::Similarity(error.to_string())
+}
+
+fn zstd_prefix_writer_error(error: crate::ZstdPrefixError) -> ReductionError {
+    if matches!(
+        error,
+        crate::ZstdPrefixError::BaseLengthMismatch
+            | crate::ZstdPrefixError::BaseIdentityMismatch
+            | crate::ZstdPrefixError::TargetIdentityMismatch
+    ) {
+        return ReductionError::Corruption("Zstd Prefix identity mismatch");
+    }
+    ReductionError::Codec(error.to_string())
 }
 
 fn codec_error(error: &crate::reduction_codec::CodecError) -> ReductionError {
