@@ -8,9 +8,9 @@ wiederhergestellt.
 
 Das Repository ist ein Prototyp und noch kein Backup-Produkt. Der dauerhafte
 Pfad umfasst Exact Dedup, RAW/Zstd-Encoding, sparse Dateien, Checkpoints,
-Recovery, Scrub und einen neu aufbaubaren Exact Index. Similarity, Delta,
-Dictionary und Reorder sind Forschungs- oder Referenzpfade und noch nicht Teil
-des dauerhaften FUSE-Formats.
+Recovery, Scrub, einen neu aufbaubaren Exact Index sowie adaptives DATA- und
+Metadata-GC. Similarity, Delta, Dictionary und Reorder sind Forschungs- oder
+Referenzpfade und noch nicht Teil des dauerhaften FUSE-Formats.
 
 Die verbindlichen Begriffe stehen in [CONTEXT.md](CONTEXT.md). Entscheidungen
 über Haltbarkeit und Formate stehen in den [ADRs](docs/adr/).
@@ -36,6 +36,54 @@ Der Adapter bildet noch nicht den gesamten POSIX-Umfang ab. Insbesondere BSD
 `flock`, mmap-/Kernel-Cache-Verhalten und die breite Client- und
 Crash-Konformitätsmatrix sind noch offen. Der verbleibende Umfang ist in der
 [POSIX-Testplanung](docs/testing/posix-conformance.md) erfasst.
+
+## Aktueller Projektstand
+
+Der zuletzt abgeschlossene Wartungsabschnitt hat die Online- und
+Metadata-GC-Pfade bis an die produktiven Publikationsgrenzen geschlossen:
+
+- Online GC beweist Kandidaten gegen die aktuelle und vorherige Commit-
+  Generation, alle aktiven Metadata Root Pins und die aktive Exact-Index-
+  Generation. Vor `RETIRING` werden diese Bindungen unter der gemeinsamen
+  Publikationsbarriere erneut geprüft.
+- Metadata GC markiert alle dauerhaften und prozesslokal gepinnten Graphen.
+  Persistente Snapshot-/Addition-Kataloge beschleunigen unveränderte oder rein
+  additive Läufe, erhalten aber nur nach einem exakten Mark Löschbefugnis.
+- Ein kernelgestützter Appliance Lease schließt einen zweiten Writer und
+  gleichzeitige Offline-Wartung aus. Ungültige Start-Policies scheitern, bevor
+  das Repository geöffnet oder verändert wird.
+- Workspace-, Fault-, 16.400-Commit- und reale SIGKILL/FUSE-Remount-Tests sind
+  für diesen Stand grün. Der reale Remount-Test belegt vollständige Präfixe und
+  die akzeptierte Zehn-Sekunden-Grenze auf einem funktionierenden Storage-
+  Stack; er simuliert noch keinen dauerhaft blockierten oder lügenden
+  Blockspeicher.
+
+## Empfohlener nächster Entwicklungsabschnitt
+
+Als Nächstes sollte der Haltbarkeits- und Admission-Pfad unter absichtlich
+festgefahrener Storage-I/O deterministisch geprüft und geschlossen werden. Das
+ist derzeit die größte Lücke im zentralen Zehn-Sekunden-Vertrag: Der reale
+SIGKILL-Test beweist Recovery bei normal fortschreitender I/O, aber noch nicht,
+dass fastdup neue Mutationen rechtzeitig sperrt, wenn ein Commit seine Deadline
+nicht mehr sicher erreichen kann.
+
+Der Abschnitt ist abgeschlossen, wenn:
+
+1. eine Fake Clock Commit-Alter und Deadline ohne echte Wartezeiten steuert;
+2. gezielt blockierbare Metadata- und DATA-Syncs jede relevante
+   Publikationsphase anhalten können;
+3. bereits angenommene Mutationen Vorrang behalten, während spätere Mutationen
+   vor einer nicht mehr erfüllbaren Deadline blockiert oder abgewiesen werden;
+4. der ungesunde Admission-Zustand einen Neustart konservativ übersteht;
+5. Kill-/Recovery-Fälle an jeder Grenze ausschließlich den vorherigen oder den
+   vollständigen nächsten Commit sichtbar machen; und
+6. Writer, Recovery, Offline-Scrub und Fault Injection dieselbe neue dauerhafte
+   Invariante prüfen.
+
+Danach folgen in dieser Reihenfolge ein stabiler Format-/Downgrade-Epoch samt
+dauerhaftem Container-Generation-High-Water, breitere randomisierte
+Process-Kill- und Blockgeräte-Power-Cut-Kampagnen und anschließend die noch
+offenen POSIX-/Samba-Kompatibilitätsmatrizen.
 
 ## Ingest-Pipeline
 
@@ -205,6 +253,7 @@ META=/source/fastdup/.artifacts/repository/metadata
 DATA=/source/fastdup/.artifacts/repository/containers
 
 "$BIN" --offline scrub "$META" "$DATA"
+"$BIN" --offline metadata-gc "$META" "$DATA"
 "$BIN" --offline rebuild-exact "$META" "$DATA"
 "$BIN" --offline scrub-gc "$META" "$DATA"
 ```
@@ -212,6 +261,16 @@ DATA=/source/fastdup/.artifacts/repository/containers
 `scrub-gc` koppelt Garbage Collection an einen erfolgreichen Scrub und den
 beobachteten Füllstand des DATA-Geräts. Ablauf und Ausgaben beschreibt die
 [Wartungsanleitung](docs/operations/scrub-and-exact-index-rebuild.md).
+
+Bei laufendem Daemon kann ein sofortiger, vollständig vom Daemon koordinierter
+Online-GC-Durchlauf angefordert werden:
+
+```bash
+"$BIN" --online gc-now "$META"
+```
+
+Der Appliance Lease verhindert, dass derselbe Repository-Stand gleichzeitig
+über den Offline-Pfad geöffnet wird.
 
 ## SMB und Samba
 
@@ -248,6 +307,7 @@ sh samba/vfs_fastdup/tests/run.sh
 Vor einem produktiven Einsatz fehlen insbesondere:
 
 - vollständige POSIX-Abdeckung und breitere Client-Kompatibilität
+- deterministische Fake-Clock-/Stalled-I/O-Beweise für Deadline und Admission
 - ein stabiler Downgrade-/Format-Epoch-Zaun
 - Schutz vor Geräteverlust
 - Langzeit-, Zufalls-Kill- und echte Stromausfalltests auf Blockgeräten
