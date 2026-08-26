@@ -122,6 +122,12 @@ A monotonic appliance-local creation order for containers. It is recoverable
 from durable containers and is not a logical content identity.
 _Avoid_: Container ID, commit generation
 
+**Container generation reservation**:
+A durably reserved monotonic range whose generations may be assigned to new
+Containers. Recovery skips the unused suffix after a crash so an acknowledged
+or ambiguous publication generation is never reused.
+_Avoid_: Container count, next generation, Commit reservation
+
 **Container envelope proof**:
 The paired, checksummed Container Header and Footer plus physical length and
 canonical filename. It proves structural identity, layout, and generation for
@@ -576,6 +582,12 @@ The explicit health state controlling whether new mutations may be admitted.
 Background activities such as scrub are flags rather than mutually exclusive
 health states.
 _Avoid_: Metric, process status
+
+**Repository format epoch**:
+A monotonic compatibility fence carried by the authoritative Commit chain. It
+states which repository-wide writer semantics may have been used and prevents
+an older writer from silently advancing a newer repository.
+_Avoid_: Object version, software version, Policy Set
 
 **Appliance recovery latch**:
 A durable marker requiring the next appliance owner to complete recovery or

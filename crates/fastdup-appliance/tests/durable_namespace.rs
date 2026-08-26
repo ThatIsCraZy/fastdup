@@ -2426,8 +2426,9 @@ fn checkpoint_consumes_writer_verified_dependencies_without_record_reread() {
         .filter(|operation| **operation == StorageOperation::ReadExactAt)
         .count();
     assert_eq!(
-        data_range_reads, publication_sample_reads,
-        "the online successor commit may sample each new Container but must not reread DATA Records"
+        data_range_reads,
+        publication_sample_reads + 1,
+        "the first durable generation range adds one fixed allocator-record reread, while the online successor commit must not reread DATA Records"
     );
 }
 

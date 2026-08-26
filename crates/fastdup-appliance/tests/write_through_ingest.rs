@@ -50,14 +50,17 @@ fn open_appliance_on(
 fn open_appliance_with_paused_containers(
     containers: PausedStorageIo,
 ) -> DurableNamespace<MemoryStorageIo, PausedStorageIo> {
-    DurableNamespace::open_with_index(
+    let pause = containers.clone();
+    let appliance = DurableNamespace::open_with_index(
         NamespaceConfig::default(),
         GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set_v1()),
         ContainerRepository::new(containers),
         &ExactIndexRunRepository::new(MemoryStorageIo::new()),
         32,
     )
-    .expect("open write-through appliance with paused data tier")
+    .expect("open write-through appliance with paused data tier");
+    pause.arm();
+    appliance
 }
 
 fn pseudo_random_bytes(length: usize) -> Vec<u8> {
@@ -211,7 +214,11 @@ fn pool_wide_similarity_emits_depth_one_prefix_in_write_through() {
 
 #[test]
 fn write_returns_and_is_live_while_container_durability_is_blocked() {
-    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"async-write");
     let block = fixture_block();
@@ -244,7 +251,11 @@ fn write_returns_and_is_live_while_container_durability_is_blocked() {
 
 #[test]
 fn one_stream_chunks_a_second_container_while_the_first_waits_for_durability() {
-    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"same-inode-overlap");
     let block = fixture_block();
@@ -306,7 +317,11 @@ fn one_stream_chunks_a_second_container_while_the_first_waits_for_durability() {
 
 #[test]
 fn one_stream_reaches_two_container_durability_barriers_in_parallel() {
-    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"same-inode-publication-window");
     let mut block = fixture_block();
@@ -459,7 +474,11 @@ fn releasing_the_competing_writer_restores_single_stream_coalescing() {
 
 #[test]
 fn release_waits_for_its_last_queued_write_without_blocking_write_admission() {
-    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"close-fence");
     let block = fixture_block();
@@ -494,7 +513,11 @@ fn release_waits_for_its_last_queued_write_without_blocking_write_admission() {
 
 #[test]
 fn different_files_reach_container_durability_in_parallel() {
-    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode_a, handle_a) = create_file(&appliance, b"parallel-sync-a");
     let (inode_b, handle_b) = create_file(&appliance, b"parallel-sync-b");
@@ -533,7 +556,11 @@ fn different_files_reach_container_durability_in_parallel() {
 
 #[test]
 fn identical_parallel_files_share_one_inflight_chunk_publication() {
-    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode_a, handle_a) = create_file(&appliance, b"singleflight-a");
     let (inode_b, handle_b) = create_file(&appliance, b"singleflight-b");
@@ -579,7 +606,11 @@ fn identical_parallel_files_share_one_inflight_chunk_publication() {
 
 #[test]
 fn admission_blocks_only_after_the_bounded_ingest_queue_fills() {
-    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"queue-pressure");
     let block = fixture_block();
@@ -611,7 +642,11 @@ fn admission_blocks_only_after_the_bounded_ingest_queue_fills() {
 
 #[test]
 fn status_does_not_deadlock_a_full_single_stream_publication_queue() {
-    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"status-under-queue-pressure");
     let block = fixture_block();
@@ -660,7 +695,11 @@ fn status_does_not_deadlock_a_full_single_stream_publication_queue() {
 
 #[test]
 fn unlink_sequence_barrier_allows_release_to_finish_after_queued_writes() {
-    let paused = PausedStorageIo::before(MemoryStorageIo::new(), StorageOperation::SyncFile);
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"unlinked-while-reducing");
     let block = fixture_block();

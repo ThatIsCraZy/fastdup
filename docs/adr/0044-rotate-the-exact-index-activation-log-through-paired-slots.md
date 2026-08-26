@@ -120,8 +120,9 @@ For migration only, `exact-index.activation.wal` may contain the former valid
 single-file chain up to its 64-MiB limit. The first subsequent activation copies
 its last record into the second slot and appends the successor. Every later
 selected slot is bounded. Once the first slot is reused, an older writer cannot
-safely append; deployment must prevent binary downgrade until the appliance
-format-epoch fence is implemented.
+safely append. The authoritative Commit-chain fence from
+[ADR 0071](0071-fence-writer-downgrade-in-the-commit-chain.md) now prevents an
+older writable appliance from reaching this publication path.
 
 Offline `audit_activation_log` repeats both local chain and cross-slot overlap
 checks and fully audits the selected Run Set dependency graph. Discarded
@@ -147,5 +148,5 @@ activation history is not a snapshot and does not pin old Runs or DATA.
 Activation-log I/O and memory are lifetime-bounded after the one-time legacy
 migration. Rotation occurs every 63 successor activations because one of each
 64 records is the bridge. The record byte format is unchanged. This decision
-does not solve large Exact-Run compaction, index-object garbage collection, or
-format-epoch fencing; those remain separate work.
+does not solve large Exact-Run compaction or index-object garbage collection.
+Repository-wide format-epoch fencing is supplied separately by ADR 0071.

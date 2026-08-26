@@ -45,19 +45,52 @@ becomes durable. A collision never replaces existing bytes. Failure may leave a
 temporary sealed orphan, but metadata commit has not started and recovery does
 not treat that name as published.
 
-## Allocator startup discovery
+## Durable generation allocator
 
-Writable startup lists and sorts canonical published names, then obtains each
-object's physical length and reads only its fixed 4-KiB Header and 4-KiB Footer.
-Both blocks must validate and agree on Container ID, generation, layout, and
-length; the ID must also match the filename. The maximum observed generation is
-the allocator high-water. A malformed claimed name or invalid envelope fails
-startup rather than being skipped.
+The DATA root contains two fixed 4-KiB slots,
+`container-generation.wal` and `container-generation.1.wal`. Each record has
+magic `FDCGHW01`, format version `1`, a monotonic sequence, the BLAKE3-256 hash
+of the exact predecessor record, a nonzero `reserved_through` generation, and a
+CRC-32C over the complete record. Bytes after the checksum are reserved zero.
 
-This 8-KiB-per-Container envelope proof is sufficient only to skip monotonically
-past every observed durable generation. It does not verify the Container hash,
-Recovery Index, records, or Chunk IDs and cannot authorize a Location. Complete
-verification remains mandatory for publication, scrub, and Exact-Index rebuild.
+| Offset | Width | Field | Requirement |
+| ---: | ---: | --- | --- |
+| 0 | 8 | magic | `FDCGHW01` |
+| 8 | 2 | format version | `1` |
+| 10 | 2 | header length | `128` |
+| 12 | 2 | record type | `1` |
+| 14 | 2 | hash algorithm | `1` = BLAKE3-256 |
+| 16 | 4 | record length | `4,096` |
+| 20 | 2 | checksum algorithm | `1` = CRC-32C |
+| 22 | 2 | reserved | zero |
+| 24 | 8 | sequence | nonzero |
+| 32 | 32 | previous record hash | zero only for sequence 1 |
+| 64 | 8 | reserved through | nonzero, monotone |
+| 72 | 4 | record CRC-32C | checksum with this field zero |
+| 76 | 4,020 | reserved | zero |
+
+The writer reserves 1,024 generations at a time. It alternates slots, writes
+and fixes the exact 4-KiB length, rereads and decodes the intended bytes, and
+syncs the target before returning any generation in that range. The selected
+pair has adjacent sequences, an exact predecessor link, and a nondecreasing
+high-water. Before the first record, missing or empty slots are an interrupted,
+nonauthoritative initialization and retry resumes legacy migration. Once a
+record exists, both names are required; a sequence-one record with an empty peer
+is the only accepted single-record state. Gaps after a crash are valid; reuse is
+not.
+
+Both absent slots identify a legacy repository. Its first epoch-one writer
+lists and sorts canonical published names once, then obtains each object's
+physical length and reads only its fixed Header and Footer. Both envelopes must
+validate and agree on identity, generation, layout, and length. Their greatest
+generation seeds the first durable high-water record. Later healthy opens read
+only the two fixed slots and perform no Container directory listing.
+
+The legacy envelope proof and the allocator high-water only prevent generation
+reuse. They do not authorize a Location or verify Container payload, Recovery
+Index, records, or Chunk IDs. Publication, Scrub, and Exact-Index rebuild retain
+their complete verification boundaries. Scrub also requires the durable
+high-water to cover the greatest fully verified Container generation.
 
 ## Whole-container recovery and scrub
 
@@ -90,7 +123,7 @@ ignored if their names do not claim the `.fdc` suffix.
 | --- | --- | --- | --- |
 | published bytes are the intended fully sealed image | exact production re-read, ID, and generation before file sync | complete Container v1 decode | substitute another valid image on writer reread; publication fails |
 | filename identity equals durable identity | both names derive from writer ID | compare canonical name with verified header/footer ID | rename a valid file to another canonical ID; recovery fails |
-| allocator never reuses an observed generation | consume one scalar generation under the checkpoint lock | pair object length, Header, Footer, and filename before taking the maximum generation | fail-after publication followed by restart skips the ambiguous durable generation without reading its payload |
+| allocator never reuses a returned or observed generation | durably reserve a 1,024-generation range before returning its first value | verify the paired hash chain and require its high-water to cover every fully verified Container; use the bounded envelope scan only for legacy migration | fail-before/fail-after at every initial publication and range extension recovers legacy or one valid old/new pair and skips all pre-crash values |
 | publication never replaces | `RENAME_NOREPLACE` | at most one canonical name per ID | duplicate publish returns `AlreadyExists`; original remains byte-valid |
 | no unbounded read from corrupt length | writer preflights 64 MiB | metadata check plus capped read | sparse file above 64 MiB fails before format decode |
 | acknowledged namespace entry is durable | file sync, atomic rename, directory sync | enumerate durable directory state | effective directory sync followed by returned error still recovers a valid orphan |

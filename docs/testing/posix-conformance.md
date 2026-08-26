@@ -45,7 +45,9 @@ and FUSE adapter. A bounded real-process
 [`SIGKILL`/remount/deadline matrix](sigkill-remount-deadline.md) now covers
 acknowledged sequential writes. When a valid Run Set already exists,
 normal POSIX reads use bounded verified Locations and transparently fall back to
-Container scans on index loss or corruption.
+Container scans on index loss or corruption. Commit Record v2 fences writer
+downgrade, and paired durable Container-generation high-water slots remove the
+healthy writable-start Container directory scan after one legacy migration.
 
 `fastdup_store::StorageIo` is an internal adapter for publishing canonical
 container files. Its `create_new`, `write_at`, `set_len`, `read`, sync, and

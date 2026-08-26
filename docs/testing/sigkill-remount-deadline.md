@@ -86,5 +86,5 @@ live visibility for already admitted mutations. A durable Appliance Recovery
 Latch survives process loss and requires complete startup recovery or a
 successful offline Scrub before it can be cleared. Remaining gates are
 randomized kill offsets during long ingest, block-device power-cut fault
-injection, sustained-pressure deadline evidence, and a stable
-downgrade/format-epoch fence.
+injection, and sustained-pressure deadline evidence. Commit Record v2 now
+supplies the stable downgrade/format-epoch fence.

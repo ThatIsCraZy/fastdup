@@ -43,3 +43,24 @@ fn commit_records_have_stable_bytes_and_form_a_hash_chain() {
     );
     assert_eq!(CommitRecord::decode(&second_bytes), Ok(second));
 }
+
+#[test]
+fn format_epoch_one_has_a_stable_v2_fence_and_round_trips() {
+    let record = CommitRecord::new_with_format_epoch(
+        1,
+        CommitRecordHash::ZERO,
+        MetadataObjectId::new([0x31; 32]).expect("nonzero namespace root"),
+        PolicySetId::new([0xb1; 32]).expect("nonzero policy set"),
+        0,
+        4_096,
+        2,
+        1,
+    )
+    .expect("epoch-one record is valid");
+    let bytes = record.encode();
+
+    assert_eq!(&bytes[8..10], &2_u16.to_le_bytes());
+    assert_eq!(&bytes[22..24], &1_u16.to_le_bytes());
+    assert_eq!(record.format_epoch(), 1);
+    assert_eq!(CommitRecord::decode(&bytes), Ok(record));
+}

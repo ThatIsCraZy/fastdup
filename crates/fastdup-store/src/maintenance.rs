@@ -18,10 +18,11 @@ use crate::generation::GenerationLivenessProof;
 use crate::maintenance_ioprio;
 use crate::similarity_index_repository::similarity_index_entry_v1_from_verified;
 use crate::{
-    ContainerAuditSummary, ContainerRepository, ExactIndexGenerationDrain, ExactIndexRunRepository,
-    ExactIndexStoreError, GcCandidateCatalogRepository, GcCandidateCatalogStoreError,
-    GcCandidateSelectionMode, GcCandidateShortlist, GenerationError, GenerationRepository,
-    SimilarityIndexRepository, SimilarityIndexStoreError, StorageIo, StoreError,
+    CONTAINER_GENERATION_RESERVATION_SPAN_V1, ContainerAuditSummary, ContainerRepository,
+    ExactIndexGenerationDrain, ExactIndexRunRepository, ExactIndexStoreError,
+    GcCandidateCatalogRepository, GcCandidateCatalogStoreError, GcCandidateSelectionMode,
+    GcCandidateShortlist, GenerationError, GenerationRepository, SimilarityIndexRepository,
+    SimilarityIndexStoreError, StorageIo, StoreError,
 };
 
 const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
@@ -422,6 +423,8 @@ where
     /// even though ordinary crash recovery may safely perform that fallback.
     pub fn scrub(&self) -> Result<EndToEndScrubReport, MaintenanceError> {
         let containers = self.containers.audit_published()?;
+        self.containers
+            .audit_generation_high_water(containers.generation_high_water())?;
         let generations = self.generations.scrub_all_with_data(&self.containers)?;
         self.generations.audit_metadata_mark_catalogs()?;
         let index_audit = self.indexes.audit_active_locations(&self.containers)?;
@@ -484,6 +487,8 @@ where
         let generation_proof = self.generations.scrub_all_for_gc(&self.containers)?;
         let online_chunks = generation_proof.online_chunks();
         let inventory = self.plan_container_gc(online_chunks)?;
+        self.containers
+            .audit_generation_high_water(inventory.containers.generation_high_water())?;
         let index_audit = self.indexes.audit_active_locations(&self.containers)?;
         if index_audit.is_some_and(|audit| audit.activation().profile() != self.exact_profile) {
             return Err(MaintenanceError::ExactProfileMismatch);
@@ -1051,16 +1056,9 @@ where
             .recover_active()?
             .filter(|active| active.record() == exact_activation)
             .ok_or(MaintenanceError::StaleGcPlan)?;
-        let first_replacement_generation = self
-            .containers
-            .discover_container_generation_high_water()?
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(MaintenanceError::ArithmeticOverflow)?;
         let replacements = self.publish_gc_replacements_using(
             &victims,
             &replacement_chunks,
-            first_replacement_generation,
             thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
             |container_id| Ok(self.containers.read_with_index(container_id, &exact)?),
         )?;
@@ -1166,17 +1164,10 @@ where
             .recover_active_generation()?
             .filter(|active| active.record() == exact_activation)
             .ok_or(MaintenanceError::StaleGcPlan)?;
-        let first_replacement_generation = self
-            .containers
-            .discover_container_generation_high_water()?
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(MaintenanceError::ArithmeticOverflow)?;
         let mut retiring_entries = Vec::new();
         let mut replacements = self.publish_gc_replacements_using(
             &victims,
             &replacement_chunks,
-            first_replacement_generation,
             relocation_workers,
             |container_id| {
                 let container = self.containers.read_with_index(container_id, &exact)?;
@@ -1462,7 +1453,6 @@ where
         plan: GarbageCollectionPlan,
     ) -> Result<GarbageCollectionReport, MaintenanceError> {
         let GarbageCollectionPlan {
-            scrub,
             generation_proof,
             exact_profile,
             reclaimable,
@@ -1495,15 +1485,9 @@ where
                 removed_activation_wall: Duration::ZERO,
             });
         }
-        let first_replacement_generation = scrub
-            .container_generation_high_water()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(MaintenanceError::ArithmeticOverflow)?;
         let replacements = self.publish_gc_replacements(
             &compaction_victims,
             &replacement_chunks,
-            first_replacement_generation,
             thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
         )?;
         if !self.generations.gc_proof_is_current(&generation_proof)? {
@@ -1552,30 +1536,37 @@ where
         &self,
         victims: &BTreeMap<[u8; 16], ContainerId>,
         required: &BTreeMap<ChunkId, u64>,
-        first_generation: u64,
         relocation_workers: NonZeroUsize,
     ) -> Result<ReplacementPublication, MaintenanceError> {
-        self.publish_gc_replacements_using(
-            victims,
-            required,
-            first_generation,
-            relocation_workers,
-            |container_id| Ok(self.containers.read(container_id)?),
-        )
+        self.publish_gc_replacements_using(victims, required, relocation_workers, |container_id| {
+            Ok(self.containers.read(container_id)?)
+        })
     }
 
     fn publish_gc_replacements_using(
         &self,
         victims: &BTreeMap<[u8; 16], ContainerId>,
         required: &BTreeMap<ChunkId, u64>,
-        first_generation: u64,
         relocation_workers: NonZeroUsize,
         mut read_victim: impl FnMut(ContainerId) -> Result<SealedContainer, MaintenanceError>,
     ) -> Result<ReplacementPublication, MaintenanceError> {
         let mut seen = BTreeSet::new();
         let mut batch = Vec::<Vec<u8>>::new();
         let mut batch_bytes = 0_u64;
-        let mut generation = first_generation;
+        let mut generations = None;
+        let mut reserve_generation = || -> Result<u64, MaintenanceError> {
+            if generations.is_none() {
+                generations = Some(
+                    self.containers
+                        .open_generation_allocator(CONTAINER_GENERATION_RESERVATION_SPAN_V1)?,
+                );
+            }
+            generations
+                .as_ref()
+                .expect("ASSERT: GC generation allocator was just initialized")
+                .reserve_generation()
+                .map_err(Into::into)
+        };
         let mut published = ReplacementPublication::default();
         for container_id in victims.values().copied() {
             let container = read_victim(container_id)?;
@@ -1603,12 +1594,10 @@ where
                 if !batch.is_empty()
                     && (would_exceed_bytes || batch.len() == GC_REPLACEMENT_CHUNK_LIMIT)
                 {
+                    let generation = reserve_generation()?;
                     let completed =
                         self.publish_gc_replacement_batch(generation, &batch, relocation_workers)?;
                     published.add(completed)?;
-                    generation = generation
-                        .checked_add(1)
-                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
                     batch.clear();
                     batch_bytes = 0;
                 }
@@ -1627,6 +1616,7 @@ where
             }
         }
         if !batch.is_empty() {
+            let generation = reserve_generation()?;
             published.add(self.publish_gc_replacement_batch(
                 generation,
                 &batch,

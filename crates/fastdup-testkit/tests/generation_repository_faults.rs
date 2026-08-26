@@ -4,8 +4,8 @@ use fastdup_format::{
     metadata_object_kind,
 };
 use fastdup_store::{
-    ContainerRepository, GenerationError, GenerationRepository, RequiredChunkVerifier, StorageIo,
-    StoreError, SuccessorPredecessor, WalTail,
+    ContainerRepository, GenerationError, GenerationRepository, RepositoryFormatSupport,
+    RequiredChunkVerifier, StorageIo, StoreError, SuccessorPredecessor, WalTail,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 use std::collections::BTreeMap;
@@ -354,6 +354,76 @@ fn every_generation_two_failpoint_recovers_only_the_previous_or_complete_next_ro
             expected,
             "fail-after position {relative_position} exposed a mixed generation"
         );
+    }
+}
+
+#[test]
+fn every_format_epoch_upgrade_fault_recovers_legacy_or_complete_fence() {
+    let policy = PolicySetId::new([0x53; 32]).expect("policy identity is nonzero");
+    let root = reservation_root(1_024);
+    let probe_storage = MemoryStorageIo::new();
+    let probe_legacy = GenerationRepository::new_with_format_support(
+        probe_storage.clone(),
+        policy,
+        RepositoryFormatSupport::legacy_only(),
+    );
+    probe_legacy
+        .commit_namespace(&root)
+        .expect("commit legacy fixture");
+    let baseline = probe_storage.operation_count();
+    GenerationRepository::new(probe_storage.clone(), policy)
+        .commit_namespace(&root)
+        .expect("commit epoch-one probe");
+    let upgrade_operations = probe_storage.operation_count() - baseline;
+    assert!(upgrade_operations > 0);
+
+    for fail_after_effect in [false, true] {
+        for relative in 0..upgrade_operations {
+            let position = baseline + relative;
+            let storage = if fail_after_effect {
+                MemoryStorageIo::with_fail_after(position)
+            } else {
+                MemoryStorageIo::with_fail_before(position)
+            };
+            GenerationRepository::new_with_format_support(
+                storage.clone(),
+                policy,
+                RepositoryFormatSupport::legacy_only(),
+            )
+            .commit_namespace(&root)
+            .expect("legacy fixture commits before the upgrade fault");
+            assert!(
+                GenerationRepository::new(storage.clone(), policy)
+                    .commit_namespace(&root)
+                    .is_err(),
+                "fault position {relative} must interrupt the epoch upgrade"
+            );
+            storage.crash();
+
+            let recovered = GenerationRepository::new(storage.clone(), policy)
+                .recover_latest()
+                .expect("modern recovery accepts the complete old or new epoch")
+                .expect("one complete generation survives");
+            assert!(matches!(recovered.record().format_epoch(), 0 | 1));
+            let legacy_recovery = GenerationRepository::new_with_format_support(
+                storage,
+                policy,
+                RepositoryFormatSupport::legacy_only(),
+            )
+            .recover_latest();
+            if recovered.record().format_epoch() == 1 {
+                assert!(matches!(
+                    legacy_recovery,
+                    Err(GenerationError::UnsupportedFormatEpoch { .. })
+                ));
+            } else {
+                assert!(
+                    legacy_recovery
+                        .expect("legacy epoch remains readable")
+                        .is_some()
+                );
+            }
+        }
     }
 }
 

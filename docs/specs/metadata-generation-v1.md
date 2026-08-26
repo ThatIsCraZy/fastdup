@@ -382,22 +382,22 @@ zero reserved word. The byte-exact target follows the header and the record is
 zero-padded to eight-byte alignment. Non-symlinks have no target; symlink
 targets are 1..=4,096 bytes and their Durable Inode kind is `3`.
 
-## Commit Record v1
+## Commit Record v1/v2
 
 The Commit WAL is a byte concatenation of fixed 4,096-byte Commit Records. A
 Commit Record is not a Metadata Object and has no envelope or filename-derived
 identity.
 
-| Offset | Width | Field | Version 1 requirement |
+| Offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
 | 0 | 8 | `magic` | ASCII `FDCMIT01` |
-| 8 | 2 | `format_version` | `1` |
+| 8 | 2 | `format_version` | `1` for epoch 0; `2` for a nonzero epoch |
 | 10 | 2 | `record_type` | `1` = Namespace commit |
 | 12 | 2 | `header_length` | `176` |
 | 14 | 2 | `record_hash_algorithm` | `1` = unkeyed BLAKE3-256 |
 | 16 | 4 | `record_length` | `4,096` |
 | 20 | 2 | `checksum_algorithm` | `1` = CRC-32C |
-| 22 | 2 | reserved | zero |
+| 22 | 2 | `repository_format_epoch` | zero in v1; nonzero in v2 |
 | 24 | 8 | reserved | zero |
 | 32 | 8 | reserved | zero |
 | 40 | 8 | `generation` | nonzero commit generation |
@@ -426,6 +426,12 @@ mutation cutoff, inode
 reservation end, and inode allocation cursor must each be monotone
 nondecreasing across the structurally valid record chain. A Commit Record
 contains no mutable root pointer and no separately stored self-hash.
+
+Repository Format Epoch is monotonic across the retained Commit chain. The
+current reader accepts epochs zero and one; the current writer emits only epoch
+one. Append, recovery, and Scrub reject an unsupported or decreasing epoch
+before graph fallback. A writable upgrade appends and syncs its epoch-one v2
+Commit before publishing any state whose interpretation depends on that epoch.
 
 `PolicySetId` is currently an opaque nonzero 32-byte identity supplied when the
 repository is opened. Recovery requires every record it reaches to equal the
@@ -584,10 +590,11 @@ appliance pin the newest valid Run Set for the lifetime of installed Manifest
 readers. Missing activation, recovery failure, a negative lookup, or unusable
 candidates fall back to the verified scan without rolling the Namespace back.
 Read-only recovery, writable recovery/reservation, and every later checkpoint
-use the same indexed graph verifier. The only remaining ordinary writable-mount
-directory scan is bounded Container-envelope discovery for the generation
-high-water; healthy indexed checkpoints perform no Container directory listing
-or whole-Container read for graph proof.
+use the same indexed graph verifier. The only remaining allocator directory
+scan is the one-time bounded Container-envelope migration when both Generation
+High-Water slots are absent. A healthy migrated repository performs no
+Container directory listing or whole-Container read for allocator recovery or
+indexed graph proof.
 
 ## Metadata Mark Catalog v1/v2
 
@@ -687,9 +694,10 @@ Normal recovery performs these steps:
 3. Compute the maximum `inode_reservation_end` over the structurally valid WAL
    prefix. This remains the allocator high-water mark even if graph verification
    later selects an older generation.
-4. Check the Policy Set ID of every record in the valid WAL record prefix.
-   Refuse recovery immediately if any ID differs from the repository's
-   supported Policy Set; do not hide an unknown writer policy by rolling back.
+4. Check the Repository Format Epoch and Policy Set ID of every record in the
+   valid WAL prefix. Refuse recovery immediately on an unsupported or decreasing
+   epoch or on any Policy Set different from the supported one; do not hide a
+   newer writer contract by rolling back.
 5. Build the Recovery Transition Prefix **forward**, oldest to newest. For each
    record, read `<namespace_root>.fdm`; enforce the 16-MiB bound, generic
    envelope identity, kind `2`, complete Namespace Root payload invariants,
@@ -748,20 +756,12 @@ is required before that repository can advance again.
 | Metadata GC never removes a live object | mark every selected Commit graph and every live Metadata Root Pin while holding the publication/commit barriers; only classify proof-bearing nonrotating commits as additive hints; verify every candidate before unlink; publish the audited mark catalog and sync the combined directory transition last | recovery and scrub traverse the same retained Commit graphs; live readers retain their root pins independently; scrub audits snapshot/addition chains without treating them as roots | an inflight publication blocks collection, a reader survives WAL rotation and collection, every snapshot/delta publication fault retries, rotation and unpublished-pin drain force exact proof, and fail-before/fail-after deletion always leaves a scrub-valid graph |
 | Counts cannot select unbounded allocations | preflight payload lengths and record equations | prove counts against the bounded payload before vector allocation | `entry_count = u32::MAX` fails as invalid payload under a constrained address space |
 | Policy selection is explicit | store the configured nonzero Policy Set ID in every record | refuse any reached record whose ID is not exactly supported | an unknown newer policy refuses recovery instead of silently rolling back |
+| Writer compatibility is monotonic | write epoch one in Commit Record v2 before epoch-dependent publication | validate every retained epoch before graph fallback and reject unsupported or decreasing values | fail-before/fail-after upgrade recovers only epoch zero or the complete epoch-one fence; a legacy-only writer cannot append beyond it |
 
 ## Explicit limitations
 
 This implemented checkpoint intentionally does **not** provide:
 
-- a fake-clock proof that the implemented five-second scheduler and admission
-  backpressure always meet the ten-second contract under the supported bounded
-  I/O envelope; `fsync` deliberately remains no stronger than that contract;
-- a persistent Container-generation allocator: writable mount still performs
-  one directory and paired Header/Footer envelope scan to recover its generation
-  high-water; when the active Exact Index is healthy, indexed commit/recovery
-  graph proof and demand lookup do not read whole Container payloads for that
-  purpose, while the plain methods deliberately retain the verified
-  scan/refusal behavior;
 - reconstruction of process-local Metadata Root Pins after restart: immutable
   Snapshot and Addition runs suppress unchanged and safely additive online
   cycles, but the first cycle after process start deliberately rebuilds the
@@ -769,7 +769,7 @@ This implemented checkpoint intentionally does **not** provide:
 - a scalable Namespace tree: NamespaceRoot v4 rewrites one bounded object and
   keeps xattrs, ACLs, timestamps, and symlink targets inline; external
   large-metadata objects remain future work;
-- automatic dirty-tail repair or a stable downgrade/format-epoch fence;
+- automatic dirty-tail repair;
 - serialization or transitive verification of the Policy Set itself;
 - data-tier Recovery Checkpoints or metadata-tier-loss rebuild.
 

@@ -87,6 +87,7 @@ struct SelectedGraph {
 pub struct GenerationRepository<I> {
     storage: I,
     supported_policy: PolicySetId,
+    format_support: RepositoryFormatSupport,
     commit_lock: Arc<Mutex<()>>,
     metadata_root_pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
     metadata_root_pin_handles: Arc<Mutex<Vec<Weak<MetadataRootPinInner>>>>,
@@ -95,6 +96,36 @@ pub struct GenerationRepository<I> {
     metadata_gc_clean: Arc<Mutex<Option<MetadataGcCleanState>>>,
     metadata_gc_delta: Arc<Mutex<MetadataGcDeltaJournal>>,
     metadata_gc_run_lock: Arc<Mutex<()>>,
+}
+
+/// Repository format epochs accepted and emitted by one writer binary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepositoryFormatSupport {
+    minimum_readable: u16,
+    writable: u16,
+}
+
+impl RepositoryFormatSupport {
+    #[must_use]
+    pub const fn current() -> Self {
+        Self {
+            minimum_readable: 0,
+            writable: 1,
+        }
+    }
+
+    /// Models the pre-fence writer for migration and downgrade tests.
+    #[must_use]
+    pub const fn legacy_only() -> Self {
+        Self {
+            minimum_readable: 0,
+            writable: 0,
+        }
+    }
+
+    const fn reads(self, epoch: u16) -> bool {
+        epoch >= self.minimum_readable && epoch <= self.writable
+    }
 }
 
 #[derive(Clone)]
@@ -264,9 +295,23 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
 impl<I: StorageIo> GenerationRepository<I> {
     #[must_use]
     pub fn new(storage: I, supported_policy: PolicySetId) -> Self {
+        Self::new_with_format_support(
+            storage,
+            supported_policy,
+            RepositoryFormatSupport::current(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_format_support(
+        storage: I,
+        supported_policy: PolicySetId,
+        format_support: RepositoryFormatSupport,
+    ) -> Self {
         Self {
             storage,
             supported_policy,
+            format_support,
             commit_lock: Arc::new(Mutex::new(())),
             metadata_root_pins: Arc::new(Mutex::new(BTreeMap::new())),
             metadata_root_pin_handles: Arc::new(Mutex::new(Vec::new())),
@@ -1992,6 +2037,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         if snapshot.tail() != &WalTail::Clean {
             return Err(GenerationError::WalNeedsRepair(snapshot.tail().clone()));
         }
+        self.validate_format_epoch_compatibility(snapshot.records())?;
         if let Some(expected) = expected_predecessor
             && snapshot.last_record() != Some(expected.record)
         {
@@ -2042,7 +2088,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             ),
             None => (1, CommitRecordHash::ZERO),
         };
-        let record = CommitRecord::new(
+        let record = CommitRecord::new_with_format_epoch(
             generation,
             previous_hash,
             root_id,
@@ -2050,6 +2096,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             root.namespace_mutation_sequence(),
             root.inode_reservation_end(),
             root.inode_allocation_cursor(),
+            self.format_support.writable,
         )?;
         let wal_rotated = snapshot.will_rotate();
         if wal_rotated {
@@ -2239,14 +2286,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         records: &[CommitRecord],
     ) -> Result<Vec<CommitRecord>, GenerationError> {
-        for record in records {
-            if record.policy_set() != self.supported_policy {
-                return Err(GenerationError::UnsupportedPolicySet {
-                    generation: record.generation(),
-                    policy_set: record.policy_set(),
-                });
-            }
-        }
+        self.validate_record_compatibility(records)?;
         let mut structurally_valid_records = Vec::new();
         structurally_valid_records
             .try_reserve_exact(records.len())
@@ -2280,6 +2320,47 @@ impl<I: StorageIo> GenerationRepository<I> {
             previous = Some((*record, root));
         }
         Ok(structurally_valid_records)
+    }
+
+    fn validate_record_compatibility(
+        &self,
+        records: &[CommitRecord],
+    ) -> Result<(), GenerationError> {
+        for record in records {
+            if record.policy_set() != self.supported_policy {
+                return Err(GenerationError::UnsupportedPolicySet {
+                    generation: record.generation(),
+                    policy_set: record.policy_set(),
+                });
+            }
+        }
+        self.validate_format_epoch_compatibility(records)
+    }
+
+    fn validate_format_epoch_compatibility(
+        &self,
+        records: &[CommitRecord],
+    ) -> Result<(), GenerationError> {
+        let mut previous_epoch = None;
+        for record in records {
+            if !self.format_support.reads(record.format_epoch()) {
+                return Err(GenerationError::UnsupportedFormatEpoch {
+                    generation: record.generation(),
+                    format_epoch: record.format_epoch(),
+                });
+            }
+            if let Some(previous) = previous_epoch
+                && previous > record.format_epoch()
+            {
+                return Err(GenerationError::NonMonotonicFormatEpoch {
+                    generation: record.generation(),
+                    previous,
+                    proposed: record.format_epoch(),
+                });
+            }
+            previous_epoch = Some(record.format_epoch());
+        }
+        Ok(())
     }
 
     fn select_live_recovery_graph(
@@ -3097,6 +3178,15 @@ pub enum GenerationError {
         generation: u64,
         policy_set: PolicySetId,
     },
+    UnsupportedFormatEpoch {
+        generation: u64,
+        format_epoch: u16,
+    },
+    NonMonotonicFormatEpoch {
+        generation: u64,
+        previous: u16,
+        proposed: u16,
+    },
     NonMonotonicNamespaceMutation {
         previous: u64,
         proposed: u64,
@@ -3203,11 +3293,20 @@ impl GenerationError {
                 | StoreError::ExactLocationMismatch,
             ) => true,
             Self::CommitFormat(_)
-            | Self::Store(StoreError::PublishVerificationMismatch)
+            | Self::Store(
+                StoreError::PublishVerificationMismatch
+                | StoreError::InvalidContainerGenerationReservationSpan
+                | StoreError::ContainerGenerationExhausted
+                | StoreError::ContainerGenerationHighWaterFormat(_)
+                | StoreError::ContainerGenerationHighWaterChain
+                | StoreError::ContainerGenerationHighWaterBehind { .. },
+            )
             | Self::MetadataTooLarge
             | Self::WalTooLarge
             | Self::GenerationExhausted
             | Self::UnsupportedPolicySet { .. }
+            | Self::UnsupportedFormatEpoch { .. }
+            | Self::NonMonotonicFormatEpoch { .. }
             | Self::NonMonotonicNamespaceMutation { .. }
             | Self::NonMonotonicInodeReservation { .. }
             | Self::NonMonotonicInodeAllocation { .. }

@@ -3,7 +3,8 @@ use fastdup_format::{
     ExactIndexRunSet,
 };
 use fastdup_store::{
-    ContainerRepository, ExactIndexRunRepository, MemoryPressureSnapshot, StorageIo, StoreError,
+    CONTAINER_GENERATION_HIGH_WATER_SLOT_0, ContainerRepository, ExactIndexRunRepository,
+    MemoryPressureSnapshot, StorageIo, StoreError,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
@@ -62,6 +63,123 @@ fn container_generation_discovery_reads_only_paired_envelopes() {
         repository.discover_container_generation_high_water(),
         Err(StoreError::Format(_))
     ));
+}
+
+#[test]
+fn durable_container_generation_high_water_reopens_without_a_directory_scan() {
+    let storage = MemoryStorageIo::new();
+    let repository = ContainerRepository::new(storage.clone());
+    let allocator = repository
+        .open_generation_allocator(4)
+        .expect("initialize the durable generation allocator");
+    let generation = allocator
+        .reserve_generation()
+        .expect("reserve the first generation from a durable range");
+    repository
+        .publish_raw(
+            ContainerId::new([0xA7; 16]).expect("container identity is nonzero"),
+            generation,
+            &[b"durable generation reservation"],
+        )
+        .expect("publish a Container inside the reserved range");
+    storage.crash();
+    let baseline = storage.operation_count();
+
+    let reopened = ContainerRepository::new(storage.clone())
+        .open_generation_allocator(4)
+        .expect("reopen from the durable high-water records");
+    let next = reopened
+        .reserve_generation()
+        .expect("reserve beyond every pre-crash generation");
+
+    assert!(next > generation);
+    assert!(
+        !storage.operations()[baseline..].contains(&StorageOperation::ListNames),
+        "a healthy durable high-water must eliminate Container directory discovery"
+    );
+}
+
+#[test]
+fn offline_audit_rejects_a_corrupt_container_generation_high_water() {
+    let storage = MemoryStorageIo::new();
+    let repository = ContainerRepository::new(storage.clone());
+    let allocator = repository
+        .open_generation_allocator(4)
+        .expect("initialize allocator records");
+    let generation = allocator
+        .reserve_generation()
+        .expect("durably reserve one generation");
+    assert_eq!(
+        repository
+            .audit_generation_high_water(Some(generation))
+            .expect("healthy allocator covers every observed Container"),
+        Some(4)
+    );
+
+    storage
+        .write_at(CONTAINER_GENERATION_HIGH_WATER_SLOT_0, 100, &[0xFF])
+        .expect("inject allocator-record corruption");
+    assert!(matches!(
+        repository.audit_generation_high_water(Some(generation)),
+        Err(StoreError::ContainerGenerationHighWaterFormat(_))
+    ));
+}
+
+#[test]
+fn offline_audit_rejects_a_container_above_the_durable_generation_high_water() {
+    let storage = MemoryStorageIo::new();
+    let repository = ContainerRepository::new(storage.clone());
+    let allocator = repository
+        .open_generation_allocator(4)
+        .expect("initialize allocator records");
+    assert_eq!(
+        allocator
+            .reserve_generation()
+            .expect("reserve the first generation"),
+        1
+    );
+    repository
+        .publish_raw(
+            ContainerId::new([0xA8; 16]).expect("container identity is nonzero"),
+            5,
+            &[b"generation beyond the durable reservation"],
+        )
+        .expect("publish the inconsistent fixture Container");
+
+    assert!(matches!(
+        repository.audit_generation_high_water(Some(5)),
+        Err(StoreError::ContainerGenerationHighWaterBehind {
+            reserved_through: 4,
+            observed: 5
+        })
+    ));
+}
+
+#[test]
+fn frontend_and_maintenance_views_share_one_generation_allocator_state() {
+    let storage = MemoryStorageIo::new();
+    let repository = ContainerRepository::new(storage.clone());
+    let frontend = repository
+        .open_generation_allocator(4)
+        .expect("open frontend allocator");
+    assert_eq!(frontend.reserve_generation().expect("frontend reserve"), 1);
+    let baseline = storage.operation_count();
+
+    let maintenance = repository
+        .with_maintenance_storage(storage.clone())
+        .open_generation_allocator(4)
+        .expect("open maintenance allocator over the shared lifecycle");
+    assert_eq!(
+        maintenance
+            .reserve_generation()
+            .expect("maintenance reserve"),
+        2
+    );
+    assert_eq!(frontend.reserve_generation().expect("frontend reserve"), 3);
+
+    assert_eq!(frontend.durable_reserved_through(), 4);
+    assert_eq!(maintenance.durable_reserved_through(), 4);
+    assert_eq!(storage.operation_count(), baseline);
 }
 
 #[test]

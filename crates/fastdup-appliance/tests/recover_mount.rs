@@ -352,10 +352,10 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
         .iter()
         .filter(|operation| **operation == StorageOperation::ReadExactAt)
         .count();
-    if object_lengths == 1 {
+    if object_lengths == 3 {
         assert_eq!(
-            bounded_reads, 4,
-            "the two graph proofs each verify only their Record while generation discovery independently reads Header/Footer: {writable_recovery_operations:?}"
+            bounded_reads, 5,
+            "graph proof, one-time Container migration, and fixed high-water verification stay bounded: {writable_recovery_operations:?}"
         );
     } else {
         let cache = writable.container_descriptor_cache_status();
@@ -363,8 +363,8 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
             cache.pressure_rejections() > 0 && cache.swap_used_bytes() > 0,
             "descriptor rereads are permitted only after the rebuildable cache rejects admission under swap pressure: {writable_recovery_operations:?}"
         );
-        assert_eq!(object_lengths, 3);
-        assert_eq!(bounded_reads, 8);
+        assert_eq!(object_lengths, 5);
+        assert_eq!(bounded_reads, 9);
     }
     let writable_baseline = container_storage.operation_count();
     let Reply::Entry(writable_entry) = writable

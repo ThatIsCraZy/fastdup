@@ -4,6 +4,7 @@
 
 mod commit;
 mod container;
+mod container_generation_high_water;
 mod exact_index;
 mod exact_index_activation;
 mod exact_index_run_set;
@@ -40,6 +41,10 @@ pub use container::{
     PreparedIndependentRecord, PreparedZstdPrefixRecord, RECORD_HEADER_BYTES, RawRecord,
     SealedContainer, SealedContainerDescriptor, VerifiedChunkLocation,
     VerifiedContainerPublication, VerifiedRawLocation, ZstdPrefixDependency, ZstdPrefixRecord,
+};
+pub use container_generation_high_water::{
+    CONTAINER_GENERATION_HIGH_WATER_RECORD_BYTES, ContainerGenerationHighWaterFormatError,
+    ContainerGenerationHighWaterHash, ContainerGenerationHighWaterRecord,
 };
 pub use exact_index::{
     EXACT_INDEX_ENTRY_BYTES, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES, ExactIndexEntry,

@@ -39,8 +39,9 @@ Crash-Konformitätsmatrix sind noch offen. Der verbleibende Umfang ist in der
 
 ## Aktueller Projektstand
 
-Die zuletzt abgeschlossenen Abschnitte haben Online-/Metadata-GC und den
-Haltbarkeitspfad bei ausbleibendem I/O-Fortschritt geschlossen:
+Die zuletzt abgeschlossenen Abschnitte haben Online-/Metadata-GC, den
+Haltbarkeitspfad bei ausbleibendem I/O-Fortschritt und zwei repositoryweite
+Upgrade-/Allocator-Grenzen geschlossen:
 
 - Online GC beweist Kandidaten gegen die aktuelle und vorherige Commit-
   Generation, alle aktiven Metadata Root Pins und die aktive Exact-Index-
@@ -62,9 +63,19 @@ Haltbarkeitspfad bei ausbleibendem I/O-Fortschritt geschlossen:
   ihn stehen; nur vollständige Recovery plus sauberer Shutdown oder ein
   erfolgreicher Offline-Scrub entfernen ihn. Fehler beim Setzen/Löschen sowie
   fehlerhafte Dateien und Symlinks werden fail-closed geprüft.
+- Commit Record v2 trägt eine monotone Repository Format Epoch. Der aktuelle
+  Writer liest Epoch 0/1, schreibt Epoch 1 und lehnt unbekannte oder fallende
+  Epochen bei Append, Recovery und Scrub ab. Ein alter Writer kann den v2-Zaun
+  nicht als gültigen v1-Commit überschreiben.
+- Zwei verkettete 4-KiB-DATA-Slots reservieren Container-Generationen in
+  1.024er-Bereichen dauerhaft. Nach einer einmaligen Legacy-Envelope-Migration
+  benötigt ein gesunder Start keinen Container-Verzeichnis-Scan mehr; Crashs
+  dürfen Nummern überspringen, aber niemals wiederverwenden.
 - Der Supervisor, die Latch-I/O und deren Synchronisation liegen ausschließlich
-  im Daemon-/Maintenance-Kontrollpfad. Die POSIX-Mutations- und Ingest-Hot-Loops
-  erhielten weder Clock-Dispatch noch Dateisystem-I/O oder neue Locks.
+  im Daemon-/Maintenance-Kontrollpfad. Auch Epoch-Prüfung und High-Water-I/O
+  liegen an Repository-Open, Commit, Container-Publikation und Scrub. Die
+  POSIX-Mutations- und Ingest-Admission-Hot-Loops erhielten weder zusätzliche
+  Dateisystem-I/O noch neue Locks.
 - Der vollständige serielle Workspace-Test, Clippy, der Release-Build und die
   reale siebenstufige SIGKILL/FUSE-Remount-Matrix sind für diesen Stand grün.
   Dauerhaft blockierte oder fehlerhaft bestätigende Hardware bleibt außerhalb
@@ -72,30 +83,28 @@ Haltbarkeitspfad bei ausbleibendem I/O-Fortschritt geschlossen:
 
 ## Empfohlener nächster Entwicklungsabschnitt
 
-Als Nächstes sollte ein stabiler Format-/Downgrade-Epoch eingeführt werden.
-Aktuell schützen Versionsfelder einzelne Objekte, aber noch kein
-repositoryweiter Zaun verhindert, dass ein älteres Binary nach einem Upgrade
-wieder schreibend öffnet und neuere gültige Zustände falsch behandelt. Das ist
-vor breiteren Deployment- und Power-Cut-Kampagnen die wichtigste verbleibende
-Produktionsgrenze.
+Als Nächstes sollte die bestehende deterministische Crash-Matrix durch eine
+randomisierte reale Process-Kill-Kampagne erweitert werden. Epoch-Zaun und
+Container-Generation-High-Water entfernen dafür zwei bisherige
+Wiederanlauf-Sonderfälle; jetzt kann ein Langlauf zufällige Kill-Zeitpunkte über
+Ingest, Commit-WAL-Rotation, High-Water-Erweiterung und GC legen und
+ausschließlich vollständige Generationen als Oracle verwenden.
 
 Der Abschnitt ist abgeschlossen, wenn:
 
-1. ein ADR die repositoryweite Epoch, unterstützte Lese-/Schreibbereiche und
-   das Verhalten bei Upgrade und Downgrade eindeutig festlegt;
-2. der Writer die Epoch vor der ersten Veröffentlichung eines davon abhängigen
-   Formats dauerhaft anhebt;
-3. Start, Recovery und Offline-Scrub unbekannte oder nicht schreibbare Epochen
-   vor jeder Mutation ablehnen;
-4. Fail-before/fail-after und Crash-Tests an jeder Epoch-Publikationsoperation
-   nur einen vollständig alten oder vollständig neuen Zustand akzeptieren; und
-5. ein älteres Binary einen neueren Writer-Zustand niemals stillschweigend
-   zurückstuft oder überschreibt.
+1. Seeds, Kill-Position, bestätigte Mutationen und erwartete Commit-Grenze pro
+   Lauf reproduzierbar protokolliert werden;
+2. jeder Remount entweder die vollständige alte oder neue Generation liefert,
+   nie Mischzustände oder wiederverwendete Inode-/Container-Generationen;
+3. Läufe WAL-Rotation, High-Water-Bereichswechsel und paralleles Online-GC
+   gezielt erreichen;
+4. Recovery Latch, Lease und Scrub nach jedem unsauberen Ende fail-closed
+   bleiben; und
+5. der Langlauf ohne Mess- oder Fault-Dispatch in der POSIX-Mutations- und
+   Ingest-Admission-Hot-Loop auskommt.
 
-Danach sollte der noch separate Container-Verzeichnis-Scan durch einen
-dauerhaften, aus den Container-Envelopes rekonstruierbaren Generation-
-High-Water ersetzt werden. Es folgen breitere randomisierte Process-Kill- und
-Blockgeräte-Power-Cut-Kampagnen und die offenen POSIX-/Samba-Matrizen.
+Danach folgen Blockgeräte-Power-Cut-/Torn-Write-Kampagnen, gemessene
+Large-Store-Scrub-/GC-Läufe und die offenen POSIX-/Samba-Matrizen.
 
 ## Ingest-Pipeline
 
@@ -319,7 +328,6 @@ sh samba/vfs_fastdup/tests/run.sh
 Vor einem produktiven Einsatz fehlen insbesondere:
 
 - vollständige POSIX-Abdeckung und breitere Client-Kompatibilität
-- ein stabiler Downgrade-/Format-Epoch-Zaun
 - Schutz vor Geräteverlust
 - Langzeit-, Zufalls-Kill- und echte Stromausfalltests auf Blockgeräten
 - dauerhafte Writer-, Recovery- und Scrub-Invarianten für Similarity, Delta,

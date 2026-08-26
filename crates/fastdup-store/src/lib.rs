@@ -3,6 +3,7 @@
 //! Durable container lifecycle behind an injectable storage boundary.
 
 mod container_descriptor_cache;
+mod container_generation_allocator;
 mod exact_activation_log;
 mod exact_index_repository;
 mod gc_candidate_catalog;
@@ -31,6 +32,10 @@ pub use fastdup_format::{SimilarityIndexPartitionRef, SimilarityIndexRunFamily};
 pub use similarity_external_sort::SIMILARITY_PARTITION_TARGET_REFERENCES;
 
 pub use container_descriptor_cache::ContainerDescriptorCacheStatus;
+pub use container_generation_allocator::{
+    CONTAINER_GENERATION_HIGH_WATER_SLOT_0, CONTAINER_GENERATION_HIGH_WATER_SLOT_1,
+    CONTAINER_GENERATION_RESERVATION_SPAN_V1, ContainerGenerationAllocator,
+};
 pub use exact_index_repository::{
     ActivatedExactIndex, EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES, ExactIndexGenerationDrain,
     ExactIndexGenerationPin, ExactIndexGenerationSnapshot, ExactIndexGenerationTransition,
@@ -46,8 +51,8 @@ pub use generation::{
     CommittedDataGeneration, GenerationError, GenerationLivenessDelta, GenerationRepository,
     GenerationScrubSummary, IndexedRequiredChunkVerifier, ManifestSuccessorProof,
     MetadataGcExactReason, MetadataGcMarkMode, MetadataGcMetrics, RecoveredDataGeneration,
-    RecoveredGeneration, RequiredChunkVerifier, SuccessorPredecessor, VerifiedCommittedFile,
-    WalTail,
+    RecoveredGeneration, RepositoryFormatSupport, RequiredChunkVerifier, SuccessorPredecessor,
+    VerifiedCommittedFile, WalTail,
 };
 pub use maintenance::{
     BackgroundMaintenanceJob, BackgroundMaintenanceReport, DataPoolUsage, DataPoolUsageError,
@@ -742,6 +747,9 @@ pub struct ContainerRepository<I> {
     storage: I,
     descriptors: Arc<container_descriptor_cache::ContainerDescriptorCache>,
     retiring: Arc<RwLock<BTreeMap<[u8; 16], usize>>>,
+    generation_allocator_barrier: Arc<Mutex<()>>,
+    generation_allocator_registry:
+        Arc<container_generation_allocator::ContainerGenerationAllocatorRegistry>,
 }
 
 struct RetiringSelectionBarrier {
@@ -799,7 +807,55 @@ impl<I: StorageIo> ContainerRepository<I> {
                 container_descriptor_cache::ContainerDescriptorCache::new_system(),
             ),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
+            generation_allocator_barrier: Arc::new(Mutex::new(())),
+            generation_allocator_registry: Arc::new(
+                container_generation_allocator::ContainerGenerationAllocatorRegistry::default(),
+            ),
         }
+    }
+
+    /// Opens the durable Container-generation allocator.
+    ///
+    /// A legacy repository performs one paired-envelope migration scan. Once
+    /// the high-water slots exist, healthy reopen reads only those fixed
+    /// records and skips every previously reserved generation after a crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid span, storage, format, chain, or generation-exhaustion
+    /// errors. No generation is returned before its containing range is
+    /// durable.
+    pub fn open_generation_allocator(
+        &self,
+        reservation_span: u64,
+    ) -> Result<ContainerGenerationAllocator<I>, StoreError>
+    where
+        I: Clone,
+    {
+        ContainerGenerationAllocator::open(self.clone(), reservation_span)
+    }
+
+    /// Audits the durable allocator against completely verified Containers.
+    ///
+    /// An absent pair is an accepted legacy repository. Once either canonical
+    /// slot exists, both slots and their selected hash chain must validate and
+    /// the durable reservation must cover the greatest observed generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage, record, chain, or insufficient-high-water errors.
+    pub fn audit_generation_high_water(
+        &self,
+        observed_generation: Option<u64>,
+    ) -> Result<Option<u64>, StoreError> {
+        let _guard = self
+            .generation_allocator_barrier
+            .lock()
+            .map_err(|_| io::Error::other("Container generation allocator barrier is poisoned"))?;
+        container_generation_allocator::audit_generation_high_water(
+            &self.storage,
+            observed_generation,
+        )
     }
 
     /// Creates a maintenance I/O view over the same process-local Container
@@ -816,6 +872,8 @@ impl<I: StorageIo> ContainerRepository<I> {
             storage,
             descriptors: Arc::clone(&self.descriptors),
             retiring: Arc::clone(&self.retiring),
+            generation_allocator_barrier: Arc::clone(&self.generation_allocator_barrier),
+            generation_allocator_registry: Arc::clone(&self.generation_allocator_registry),
         }
     }
 
@@ -835,6 +893,10 @@ impl<I: StorageIo> ContainerRepository<I> {
                 container_descriptor_cache::ContainerDescriptorCache::new_with_snapshot(snapshot),
             ),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
+            generation_allocator_barrier: Arc::new(Mutex::new(())),
+            generation_allocator_registry: Arc::new(
+                container_generation_allocator::ContainerGenerationAllocatorRegistry::default(),
+            ),
         }
     }
 
@@ -2669,6 +2731,14 @@ pub enum StoreError {
         logical_length: u64,
     },
     ExactLocationMismatch,
+    InvalidContainerGenerationReservationSpan,
+    ContainerGenerationExhausted,
+    ContainerGenerationHighWaterFormat(fastdup_format::ContainerGenerationHighWaterFormatError),
+    ContainerGenerationHighWaterChain,
+    ContainerGenerationHighWaterBehind {
+        reserved_through: u64,
+        observed: u64,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -2696,6 +2766,24 @@ impl fmt::Display for StoreError {
             Self::ExactLocationMismatch => formatter.write_str(
                 "Exact Index candidate does not pair with its sealed Container envelope and verified record",
             ),
+            Self::InvalidContainerGenerationReservationSpan => {
+                formatter.write_str("Container generation reservation span must be nonzero")
+            }
+            Self::ContainerGenerationExhausted => {
+                formatter.write_str("Container generation space is exhausted")
+            }
+            Self::ContainerGenerationHighWaterFormat(error) => {
+                write!(formatter, "Container generation high-water is invalid: {error}")
+            }
+            Self::ContainerGenerationHighWaterChain => formatter
+                .write_str("Container generation high-water slots do not form one monotonic chain"),
+            Self::ContainerGenerationHighWaterBehind {
+                reserved_through,
+                observed,
+            } => write!(
+                formatter,
+                "Container generation high-water {reserved_through} is below observed generation {observed}"
+            ),
         }
     }
 }
@@ -2705,11 +2793,16 @@ impl std::error::Error for StoreError {
         match self {
             Self::Io(error) => Some(error),
             Self::Format(error) => Some(error),
+            Self::ContainerGenerationHighWaterFormat(error) => Some(error),
             Self::PublishVerificationMismatch
             | Self::InvalidPublishedName(_)
             | Self::PublishedIdentityMismatch { .. }
             | Self::MissingVerifiedChunk { .. }
-            | Self::ExactLocationMismatch => None,
+            | Self::ExactLocationMismatch
+            | Self::InvalidContainerGenerationReservationSpan
+            | Self::ContainerGenerationExhausted
+            | Self::ContainerGenerationHighWaterChain
+            | Self::ContainerGenerationHighWaterBehind { .. } => None,
         }
     }
 }

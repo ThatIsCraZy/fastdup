@@ -4,7 +4,8 @@ use core::fmt;
 pub const COMMIT_RECORD_BYTES: usize = 4_096;
 const COMMIT_RECORD_BYTES_U32: u32 = 4_096;
 const COMMIT_MAGIC: &[u8; 8] = b"FDCMIT01";
-const FORMAT_VERSION: u16 = 1;
+const LEGACY_FORMAT_VERSION: u16 = 1;
+const EPOCH_FORMAT_VERSION: u16 = 2;
 const RECORD_TYPE_NAMESPACE: u16 = 1;
 const HEADER_BYTES: u16 = 176;
 const BLAKE3_256_ALGORITHM: u16 = 1;
@@ -61,6 +62,7 @@ pub struct CommitRecord {
     namespace_mutation_cutoff: u64,
     inode_reservation_end: u64,
     inode_allocation_cursor: u64,
+    format_epoch: u16,
 }
 
 impl CommitRecord {
@@ -78,6 +80,37 @@ impl CommitRecord {
         namespace_mutation_cutoff: u64,
         inode_reservation_end: u64,
         inode_allocation_cursor: u64,
+    ) -> Result<Self, CommitFormatError> {
+        Self::new_with_format_epoch(
+            generation,
+            previous_record_hash,
+            namespace_root,
+            policy_set,
+            namespace_mutation_cutoff,
+            inode_reservation_end,
+            inode_allocation_cursor,
+            0,
+        )
+    }
+
+    /// Constructs one record carrying an explicit repository format epoch.
+    ///
+    /// Epoch zero encodes the legacy v1 record. A nonzero epoch encodes v2 so
+    /// pre-epoch readers reject the record rather than ignoring the fence.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same chain and Inode allocator validation as [`Self::new`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_format_epoch(
+        generation: u64,
+        previous_record_hash: CommitRecordHash,
+        namespace_root: MetadataObjectId,
+        policy_set: PolicySetId,
+        namespace_mutation_cutoff: u64,
+        inode_reservation_end: u64,
+        inode_allocation_cursor: u64,
+        format_epoch: u16,
     ) -> Result<Self, CommitFormatError> {
         if generation == 0 || (generation == 1) != (previous_record_hash == CommitRecordHash::ZERO)
         {
@@ -97,6 +130,7 @@ impl CommitRecord {
             namespace_mutation_cutoff,
             inode_reservation_end,
             inode_allocation_cursor,
+            format_epoch,
         })
     }
 
@@ -136,15 +170,29 @@ impl CommitRecord {
     }
 
     #[must_use]
+    pub const fn format_epoch(self) -> u16 {
+        self.format_epoch
+    }
+
+    #[must_use]
     pub fn encode(self) -> [u8; COMMIT_RECORD_BYTES] {
         let mut bytes = [0_u8; COMMIT_RECORD_BYTES];
         bytes[0..8].copy_from_slice(COMMIT_MAGIC);
-        put_u16(&mut bytes, 8, FORMAT_VERSION);
+        put_u16(
+            &mut bytes,
+            8,
+            if self.format_epoch == 0 {
+                LEGACY_FORMAT_VERSION
+            } else {
+                EPOCH_FORMAT_VERSION
+            },
+        );
         put_u16(&mut bytes, 10, RECORD_TYPE_NAMESPACE);
         put_u16(&mut bytes, 12, HEADER_BYTES);
         put_u16(&mut bytes, 14, BLAKE3_256_ALGORITHM);
         put_u32(&mut bytes, 16, COMMIT_RECORD_BYTES_U32);
         put_u16(&mut bytes, 20, CRC32C_ALGORITHM);
+        put_u16(&mut bytes, 22, self.format_epoch);
         put_u64(&mut bytes, 40, self.generation);
         bytes[48..80].copy_from_slice(&self.previous_record_hash.0);
         bytes[80..112].copy_from_slice(&self.namespace_root.bytes());
@@ -173,13 +221,16 @@ impl CommitRecord {
         if crc32c_with_zeroed_field(bytes, CHECKSUM_OFFSET) != stored_checksum {
             return Err(CommitFormatError::ChecksumMismatch);
         }
-        if get_u16(bytes, 8) != FORMAT_VERSION
-            || get_u16(bytes, 10) != RECORD_TYPE_NAMESPACE
+        let format_version = get_u16(bytes, 8);
+        let format_epoch = get_u16(bytes, 22);
+        if !matches!(
+            (format_version, format_epoch),
+            (LEGACY_FORMAT_VERSION, 0) | (EPOCH_FORMAT_VERSION, 1..=u16::MAX)
+        ) || get_u16(bytes, 10) != RECORD_TYPE_NAMESPACE
             || get_u16(bytes, 12) != HEADER_BYTES
             || get_u16(bytes, 14) != BLAKE3_256_ALGORITHM
             || usize::try_from(get_u32(bytes, 16)) != Ok(COMMIT_RECORD_BYTES)
             || get_u16(bytes, 20) != CRC32C_ALGORITHM
-            || get_u16(bytes, 22) != 0
             || get_u64(bytes, 24) != 0
             || get_u64(bytes, 32) != 0
             || bytes[172..].iter().any(|byte| *byte != 0)
@@ -195,7 +246,7 @@ impl CommitRecord {
         let mut policy_set = [0_u8; 32];
         policy_set.copy_from_slice(&bytes[112..144]);
         let policy_set = PolicySetId::new(policy_set).ok_or(CommitFormatError::InvalidPolicySet)?;
-        Self::new(
+        Self::new_with_format_epoch(
             get_u64(bytes, 40),
             CommitRecordHash::from_bytes(previous_hash),
             namespace_root,
@@ -203,6 +254,7 @@ impl CommitRecord {
             get_u64(bytes, 144),
             get_u64(bytes, 152),
             get_u64(bytes, 160),
+            format_epoch,
         )
     }
 }

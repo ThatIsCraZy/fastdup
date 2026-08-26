@@ -41,13 +41,13 @@ A checkpoint performs this order:
 7. append, reread, verify, and sync the Commit Record in `commit.wal`;
 8. install verified Manifest-backed readers below the live dirty overlay.
 
-Opening the writable appliance initializes a scalar next-Container-generation
-high-water from each published object's paired 4-KiB Header/Footer envelope and
-physical length. It does not read Container payloads for allocator recovery.
-Checkpoints consume that generation under the serialization lock before
-attempting publication; gaps are permitted after failed attempts, but an
-in-process fail-after can never reuse a generation. This removes a
-directory/full-container scan from every checkpoint without introducing a
+Opening the writable appliance reads the paired fixed 4-KiB Container
+Generation High-Water slots. A legacy repository without either slot performs
+the paired Header/Footer envelope scan once and publishes its initial durable
+high-water. The allocator reserves 1,024 generations before returning the first
+one; gaps are permitted after failed attempts or crashes, but reuse is not.
+Frontend and maintenance views share the same process-local range state. This
+removes the ordinary writable-start directory scan without introducing a
 RAM-resident full Chunk index or weakening the separate graph verifier.
 
 At mount, the daemon recovers the newest valid immutable Exact-Index Run Set
@@ -309,13 +309,13 @@ does not reuse an ambiguously published generation.
 
 The indexed recovery/commit tracer measures the Container backend around the
 complete public operation rather than only later demand reads. Healthy read-only
-recovery performs no `ListNames` or whole-object `Read`. Writable recovery uses
-one directory listing for the still-separate Container-generation high-water,
-then reads only object length plus Header/Footer for each Container; recovery
-graph verification, reservation commit, and reader installation add no
-whole-object scan. A later healthy indexed checkpoint performs neither
-operation for graph proof. Corrupting the pinned Run page switches the same
-verifier to one complete Container scan and still returns byte-exact data.
+recovery performs no `ListNames` or whole-object `Read`. Writable recovery reads
+the two fixed Container-generation high-water slots and performs no Container
+directory listing after migration; recovery graph verification, reservation
+commit, and reader installation add no whole-object scan. A later healthy
+indexed checkpoint performs neither operation for graph proof. Corrupting the
+pinned Run page switches the same verifier to one complete Container scan and
+still returns byte-exact data.
 
 The deterministic storage fault matrix injects both fail-before and fail-after
 at every storage operation observed in the complete checkpoint path, separately
@@ -494,8 +494,9 @@ bytes, maximum eviction steps, available RAM, and Swap use after checkpoints.
   files, sequential appends, and equal-length replacement successors verify
   only introduced DATA. Every such proof is fenced to the exact installed
   Commit Record and stale proofs are rejected before dependency verification.
-  Container-generation discovery separately retains one O(number of Containers)
-  mount-time envelope scan until it receives its own durable high-water record.
+  Container-generation discovery performs its O(number of Containers)
+  envelope scan only once when migrating a repository without durable
+  high-water slots.
 - The bounded v2 Namespace Root stores regular and directory inode versions
   plus nested byte-exact entries. `mkdir`, empty-only `rmdir`, `..`, link counts,
   cycle rejection, cross-parent rename, recovery, and scrub share the same
@@ -517,9 +518,9 @@ bytes, maximum eviction steps, available RAM, and Swap use after checkpoints.
   kernel-backed Appliance Lease now prevents a second daemon or offline
   maintenance process from opening the repository. Fake-clock stalled-I/O
   proofs now cover both Metadata and DATA sync stalls, and a durable Recovery
-  Latch makes an unproven shutdown explicit. A stable format-epoch fence and
-  broad randomized process-kill/power-cut campaigns remain open.
+  Latch makes an unproven shutdown explicit. Commit Record v2 now supplies the
+  stable format-epoch fence. Broad randomized process-kill/power-cut campaigns
+  remain open.
 
-The next recovery-hardening slice is a stable format-/downgrade-epoch fence,
-followed by a durable Container-generation high-water and broader randomized
-process-kill/power-cut campaigns.
+The next recovery-hardening slice is a broader randomized real-process-kill
+campaign, followed by block-device power-cut and torn-write campaigns.

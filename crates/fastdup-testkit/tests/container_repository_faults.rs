@@ -160,3 +160,107 @@ fn publish_rejects_a_valid_but_unexpected_writer_reread() {
     storage.crash();
     assert!(recover(&repository).is_empty());
 }
+
+#[test]
+fn every_high_water_extension_fault_skips_all_precrash_generations() {
+    let probe_storage = MemoryStorageIo::new();
+    let probe_repository = ContainerRepository::new(probe_storage.clone());
+    let probe_allocator = probe_repository
+        .open_generation_allocator(2)
+        .expect("initialize probe allocator");
+    assert_eq!(
+        probe_allocator.reserve_generation().expect("reserve one"),
+        1
+    );
+    assert_eq!(
+        probe_allocator.reserve_generation().expect("reserve two"),
+        2
+    );
+    let baseline = probe_storage.operation_count();
+    assert_eq!(
+        probe_allocator.reserve_generation().expect("extend probe"),
+        3
+    );
+    let extension_operations = probe_storage.operation_count() - baseline;
+    assert!(extension_operations > 0);
+
+    for fail_after_effect in [false, true] {
+        for relative in 0..extension_operations {
+            let position = baseline + relative;
+            let storage = if fail_after_effect {
+                MemoryStorageIo::with_fail_after(position)
+            } else {
+                MemoryStorageIo::with_fail_before(position)
+            };
+            let repository = ContainerRepository::new(storage.clone());
+            let allocator = repository
+                .open_generation_allocator(2)
+                .expect("fixture allocator initializes before the injected extension fault");
+            assert_eq!(allocator.reserve_generation().expect("reserve one"), 1);
+            assert_eq!(allocator.reserve_generation().expect("reserve two"), 2);
+            assert!(
+                allocator.reserve_generation().is_err(),
+                "fault position {relative} must interrupt range extension"
+            );
+
+            storage.crash();
+            let reopened_repository = ContainerRepository::new(storage.clone());
+            reopened_repository
+                .audit_generation_high_water(None)
+                .expect("an interrupted extension retains one valid old or new pair");
+            let reopened = reopened_repository
+                .open_generation_allocator(2)
+                .expect("recover the selected durable reservation");
+            assert!(
+                reopened
+                    .reserve_generation()
+                    .expect("reserve after recovery")
+                    > 2,
+                "recovery must never reuse a generation returned before the crash"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_high_water_initialization_fault_recovers_to_legacy_or_a_valid_pair() {
+    let probe_storage = MemoryStorageIo::new();
+    let probe_repository = ContainerRepository::new(probe_storage.clone());
+    let probe_allocator = probe_repository
+        .open_generation_allocator(2)
+        .expect("initialize probe allocator");
+    probe_allocator
+        .reserve_generation()
+        .expect("publish the first probe reservation");
+    let operation_count = probe_storage.operation_count();
+    assert!(operation_count > 0);
+
+    for fail_after_effect in [false, true] {
+        for position in 0..operation_count {
+            let storage = if fail_after_effect {
+                MemoryStorageIo::with_fail_after(position)
+            } else {
+                MemoryStorageIo::with_fail_before(position)
+            };
+            let repository = ContainerRepository::new(storage.clone());
+            let attempt = repository
+                .open_generation_allocator(2)
+                .and_then(|allocator| allocator.reserve_generation());
+            assert!(
+                attempt.is_err(),
+                "fault position {position} must interrupt allocator initialization"
+            );
+
+            storage.crash();
+            let reopened_repository = ContainerRepository::new(storage.clone());
+            reopened_repository
+                .audit_generation_high_water(None)
+                .expect("an interrupted initialization is legacy or a valid pair");
+            reopened_repository
+                .open_generation_allocator(2)
+                .expect("reopen the allocator after the crash")
+                .reserve_generation()
+                .expect("reserve from the recovered or newly initialized allocator");
+        }
+    }
+}

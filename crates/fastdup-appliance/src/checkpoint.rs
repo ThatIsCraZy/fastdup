@@ -25,7 +25,8 @@ use fastdup_posix::{
     PreparedCommitExtent, PreparedDataRecipe,
 };
 use fastdup_store::{
-    AdaptiveContainerPublishMetrics, ContainerDescriptorCacheStatus, ContainerRepository,
+    AdaptiveContainerPublishMetrics, CONTAINER_GENERATION_RESERVATION_SPAN_V1,
+    ContainerDescriptorCacheStatus, ContainerGenerationAllocator, ContainerRepository,
     ExactIndexPageCacheStatus, ExactIndexRunRepository, ExactRunMembershipStatus, GenerationError,
     GenerationRepository, IndexedRequiredChunkVerifier, ManifestReadError, ManifestSuccessorProof,
     ManifestTreeSummary, PersistentChunkPlan, PersistentReductionIndex, RequiredChunkVerifier,
@@ -581,7 +582,7 @@ pub struct DurableNamespace<M, C> {
     checkpoint_lock: Mutex<()>,
     installed_predecessor: Mutex<SuccessorPredecessor>,
     manifests: Mutex<Vec<InstalledManifest>>,
-    next_container_generation: Arc<Mutex<u64>>,
+    container_generations: ContainerGenerationAllocator<C>,
     manifest_readers: Arc<dyn ManifestReaderPolicy<C>>,
     checkpoint_workers: NonZeroUsize,
     write_through: Arc<WriteThroughIngest<C>>,
@@ -1855,7 +1856,7 @@ impl WriteThroughRegistry {
 
 struct WriteThroughIngest<C> {
     containers: ContainerRepository<C>,
-    next_generation: Arc<Mutex<u64>>,
+    container_generations: ContainerGenerationAllocator<C>,
     index: Arc<dyn ManifestReaderPolicy<C>>,
     worker_budget: NonZeroUsize,
     worker_permits: WorkerPermits,
@@ -3800,7 +3801,7 @@ where
                 }
             })
             .collect::<Vec<_>>();
-        let generation = reserve_container_generation(&self.next_generation)?;
+        let generation = self.container_generations.reserve_generation()?;
         let active_writers = self.active_writers.load(Ordering::Acquire);
         let desired_workers = workers_per_ingest_job(self.worker_budget, active_writers);
         let worker_lease = self.worker_permits.acquire(desired_workers);
@@ -4027,7 +4028,7 @@ impl<C> Drop for WriteThroughIngest<C> {
 fn install_write_through<C>(
     namespace: &Arc<Namespace>,
     containers: ContainerRepository<C>,
-    next_generation: Arc<Mutex<u64>>,
+    container_generations: ContainerGenerationAllocator<C>,
     index: Arc<dyn ManifestReaderPolicy<C>>,
     worker_budget: NonZeroUsize,
     online_dependency_proofs: Arc<OnlineDependencyProofs>,
@@ -4037,7 +4038,7 @@ where
 {
     let write_through = Arc::new(WriteThroughIngest {
         containers,
-        next_generation,
+        container_generations,
         index,
         worker_budget,
         worker_permits: WorkerPermits::new(worker_budget),
@@ -4578,8 +4579,6 @@ where
         let graph_verifier = manifest_readers.graph_verifier(containers.clone());
         let recovered = generations
             .recover_latest_with_verified_files_using(&containers, graph_verifier.as_ref())?;
-        let next_container_generation =
-            Arc::new(Mutex::new(discover_next_container_generation(&containers)?));
         let (root, next_inode, reservation_end, installed_record, verified_files) = match recovered
         {
             None => {
@@ -4632,6 +4631,8 @@ where
                 )
             }
         };
+        let container_generations =
+            containers.open_generation_allocator(CONTAINER_GENERATION_RESERVATION_SPAN_V1)?;
         let manifests = load_manifest_cache(&root, &verified_files)?;
         let namespace = namespace_from_verified_files_using(
             config,
@@ -4649,7 +4650,7 @@ where
         let write_through = install_write_through(
             &namespace,
             containers.clone(),
-            Arc::clone(&next_container_generation),
+            container_generations.clone(),
             Arc::clone(&manifest_readers),
             checkpoint_workers,
             Arc::clone(&online_dependency_proofs),
@@ -4663,7 +4664,7 @@ where
                 installed_record,
             )),
             manifests: Mutex::new(manifests),
-            next_container_generation,
+            container_generations,
             manifest_readers,
             checkpoint_workers,
             write_through,
@@ -4845,7 +4846,7 @@ where
         self.namespace.externalize_verified_extents(stable);
         let mut writer = AdaptiveCommitWriter::new(
             &self.containers,
-            &self.next_container_generation,
+            &self.container_generations,
             self.manifest_readers.as_ref(),
             self.checkpoint_workers,
             Arc::clone(&self.online_dependency_proofs),
@@ -5522,16 +5523,6 @@ pub fn checkpoint_exact_index_profile_v1() -> ExactIndexProfileId {
         .bytes(),
     )
     .expect("ASSERT: the SeqCDC-v1 Exact-Index profile hash is nonzero")
-}
-
-fn discover_next_container_generation<I: StorageIo>(
-    containers: &ContainerRepository<I>,
-) -> Result<u64, DurableNamespaceError> {
-    containers
-        .discover_container_generation_high_water()?
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or(DurableNamespaceError::ContainerGenerationExhausted)
 }
 
 fn load_manifest_cache<I: StorageIo>(
@@ -6355,7 +6346,7 @@ fn push_extent(
 
 struct AdaptiveCommitWriter<'a, C> {
     containers: &'a ContainerRepository<C>,
-    next_generation: &'a Mutex<u64>,
+    container_generations: &'a ContainerGenerationAllocator<C>,
     index: &'a dyn ManifestReaderPolicy<C>,
     seen: BTreeMap<ChunkId, u64>,
     chunks: Vec<Vec<u8>>,
@@ -6371,14 +6362,14 @@ struct AdaptiveCommitWriter<'a, C> {
 impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
     fn new(
         containers: &'a ContainerRepository<C>,
-        next_generation: &'a Mutex<u64>,
+        container_generations: &'a ContainerGenerationAllocator<C>,
         index: &'a dyn ManifestReaderPolicy<C>,
         workers: NonZeroUsize,
         online_dependency_proofs: Arc<OnlineDependencyProofs>,
     ) -> Self {
         Self {
             containers,
-            next_generation,
+            container_generations,
             index,
             seen: BTreeMap::new(),
             chunks: Vec::new(),
@@ -6606,7 +6597,7 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             );
         }
         let region_refs = regions.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let generation = reserve_container_generation(self.next_generation)?;
+        let generation = self.container_generations.reserve_generation()?;
         let (verified, publish_metrics) =
             self.containers.publish_adaptive_regions_parallel_profiled(
                 id,
@@ -6691,17 +6682,6 @@ fn random_container_id() -> Result<ContainerId, DurableNamespaceError> {
             return ContainerId::new(bytes).map_err(|_| DurableNamespaceError::FrozenViewMismatch);
         }
     }
-}
-
-fn reserve_container_generation(allocator: &Mutex<u64>) -> Result<u64, DurableNamespaceError> {
-    let mut next = allocator
-        .lock()
-        .expect("ASSERT: Container generation allocator lock poisoned");
-    let generation = *next;
-    *next = generation
-        .checked_add(1)
-        .ok_or(DurableNamespaceError::ContainerGenerationExhausted)?;
-    Ok(generation)
 }
 
 #[derive(Debug)]

@@ -273,8 +273,9 @@ that crash recovery never exposes a Similarity family without its bound Exact
 Run Set. A maintenance CLI command for this paired operation is still pending.
 
 Remaining production gates are real block-device power-cut campaigns, measured
-large-store scrub/rebuild/GC throughput, broad randomized process-kill
-coverage, and a stable downgrade/format-epoch fence. Fake-clock tests now cover
+large-store scrub/rebuild/GC throughput, and broad randomized process-kill
+coverage. Commit Record v2 now supplies the downgrade/format-epoch fence;
+fake-clock tests cover
 stalled Metadata and DATA sync plus admission closure. Process-local Metadata
 Root Pins disappear with their owning process;
 the accepted restart boundary therefore performs one exact mark before catalog

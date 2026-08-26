@@ -114,10 +114,10 @@ For migration only, `commit.wal` may contain the older valid v1 chain up to its
 64-MiB hard limit. The first rotation copies its final record into
 `commit.1.wal`; every subsequent selected slot is bounded. Once `commit.wal` is
 reused, its first generation is greater than one, so the old v1 reader rejects
-it as a broken chain rather than appending a fork. This repository is still
-pre-`format-v1-stable`; deploying an older binary after a new writer has rotated
-is unsupported and must be prevented operationally until an appliance format
-epoch fence exists.
+it as a broken chain rather than appending a fork. The Repository Format Epoch
+accepted by [ADR 0071](0071-fence-writer-downgrade-in-the-commit-chain.md) now
+closes this downgrade boundary: current writers emit v2 epoch-one records and
+older v1 writers cannot append through that structural fence.
 
 No slot is a user-visible historical snapshot. Discarded records cease to pin
 Metadata Objects or DATA. Offline scrub must apply the same per-slot and
