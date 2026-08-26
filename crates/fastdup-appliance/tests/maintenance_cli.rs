@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fastdup_appliance::checkpoint_policy_set_v1;
+use fastdup_appliance::{APPLIANCE_RECOVERY_LATCH_FILE_NAME, checkpoint_policy_set_v1};
 use fastdup_format::{ManifestExtent, ManifestLeaf, MetadataObjectId, NamespaceRoot};
 use fastdup_store::{FsStorageIo, GenerationRepository};
 
@@ -105,5 +105,74 @@ fn offline_metadata_gc_cli_removes_an_orphan_and_scrubs_the_retained_graph() {
     assert!(
         !orphan_path.exists(),
         "ASSERT: Metadata GC must unlink the injected orphan"
+    );
+}
+
+#[test]
+fn recovery_required_repository_allows_scrub_before_other_offline_mutation() {
+    let root = unique_test_root("recovery-required-cli");
+    let metadata_root = root.join("metadata");
+    let container_root = root.join("containers");
+    std::fs::create_dir_all(&container_root).expect("create container root");
+    let generations = GenerationRepository::new(
+        FsStorageIo::open(&metadata_root).expect("create metadata repository"),
+        checkpoint_policy_set_v1(),
+    );
+    generations
+        .commit_namespace(
+            &NamespaceRoot::new(4_096, 2, 0, Vec::new(), Vec::new())
+                .expect("empty namespace root is valid"),
+        )
+        .expect("commit one scrub-valid generation");
+    drop(generations);
+    let latch = metadata_root.join(APPLIANCE_RECOVERY_LATCH_FILE_NAME);
+    std::fs::write(&latch, []).expect("arm empty recovery latch");
+    std::fs::File::open(&metadata_root)
+        .expect("open metadata directory")
+        .sync_all()
+        .expect("sync recovery latch name");
+
+    let run = |command: &str| {
+        Command::new(env!("CARGO_BIN_EXE_fastdup-maintenance"))
+            .args([
+                "--offline",
+                command,
+                metadata_root
+                    .to_str()
+                    .expect("workspace-local metadata path is UTF-8"),
+                container_root
+                    .to_str()
+                    .expect("workspace-local container path is UTF-8"),
+            ])
+            .output()
+            .expect("execute real maintenance CLI")
+    };
+
+    let blocked = run("rebuild-exact");
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr)
+            .contains("recovery-required repository needs a successful offline scrub"),
+        "ASSERT: unsafe offline mutation reports the required proof: {}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert!(
+        latch.exists(),
+        "ASSERT: rejected mutation retains the latch"
+    );
+
+    let scrubbed = run("scrub");
+    assert!(
+        scrubbed.status.success(),
+        "ASSERT: scrub clears recovery requirement: {}",
+        String::from_utf8_lossy(&scrubbed.stderr)
+    );
+    assert!(!latch.exists(), "ASSERT: successful scrub clears the latch");
+
+    let rebuilt = run("rebuild-exact");
+    assert!(
+        rebuilt.status.success(),
+        "ASSERT: offline mutation proceeds after scrub: {}",
+        String::from_utf8_lossy(&rebuilt.stderr)
     );
 }

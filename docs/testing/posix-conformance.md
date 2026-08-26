@@ -36,11 +36,12 @@ byte-range locks implement `F_GETLK`, `F_SETLK`, and `F_SETLKW`, including
 owner cleanup on close. Metadata-only allocation, hole punch, zero range,
 DATA/HOLE seek, and the shared-seam collapse/insert operations are connected.
 The stock Linux FUSE kernel forwards allocate, punch, and zero, but rejects
-collapse/insert flags before userspace. It does not yet implement per-region
-serialized Chunking Profile IDs, fake-clock stalled-I/O deadline proof, or BSD
-`flock`. Hardlinks, symlinks, ownership, timestamps, xattrs, POSIX ACLs, and
-volatile POSIX record locks are connected through the durable namespace and
-FUSE adapter. A bounded real-process
+collapse/insert flags before userspace. Fake-clock tests now stall Metadata and
+DATA sync at the public storage seam and prove admission closure at the
+five-second guard. Per-region serialized Chunking Profile IDs and BSD `flock`
+remain absent. Hardlinks, symlinks, ownership, timestamps, xattrs, POSIX ACLs,
+and volatile POSIX record locks are connected through the durable namespace
+and FUSE adapter. A bounded real-process
 [`SIGKILL`/remount/deadline matrix](sigkill-remount-deadline.md) now covers
 acknowledged sequential writes. When a valid Run Set already exists,
 normal POSIX reads use bounded verified Locations and transparently fall back to
@@ -178,9 +179,11 @@ ten-second deadline.
 This provides direct M/F evidence and durable-operation fault evidence for the
 implemented subset. The public maintenance seam adds deterministic corruption,
 global-index-invariant, and fail-before/fail-after evidence, but does not replace
-real block-device power-cut campaigns. The complete P0 matrix has not yet been
-rerun at every applicable M/F/K level: fake-clock stalled-I/O coverage, broad
-randomized process-kill coverage, and the remaining POSIX/Samba matrices are
+real block-device power-cut campaigns. Deterministic fake-clock coverage now
+holds Metadata and DATA syncs, closes admission at the guard, and proves that
+an already admitted write remains visible and commit-prioritized. The complete
+P0 matrix has not yet been rerun at every applicable M/F/K level: broad
+randomized process-kill coverage and the remaining POSIX/Samba matrices are
 still absent. Stock Linux FUSE still prevents mounted collapse/insert despite
 shared-seam coverage. Container Store,
 deterministic namespace, durable orchestration, offline scrub/rebuild, and

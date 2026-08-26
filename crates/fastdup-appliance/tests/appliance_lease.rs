@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fastdup_appliance::{ApplianceLease, ApplianceLeaseOwner};
+use fastdup_appliance::{APPLIANCE_RECOVERY_LATCH_FILE_NAME, ApplianceLease, ApplianceLeaseOwner};
 
 const HOLDER_ENV: &str = "FASTDUP_APPLIANCE_LEASE_HOLDER_ROOT";
 
@@ -135,5 +135,77 @@ fn invalid_gc_policy_fails_daemon_before_repository_open() {
     assert!(
         !container_root.exists(),
         "ASSERT: policy validation precedes opening or creating the DATA repository"
+    );
+}
+
+#[test]
+fn malformed_recovery_latch_fails_daemon_before_data_repository_open() {
+    let root = unique_test_root("malformed-recovery-latch");
+    let mount_root = root.join("mount");
+    let metadata_root = root.join("metadata");
+    let container_root = root.join("containers");
+    std::fs::create_dir_all(&mount_root).expect("create mount root");
+    std::fs::create_dir_all(&metadata_root).expect("create metadata root");
+    std::fs::write(
+        metadata_root.join(APPLIANCE_RECOVERY_LATCH_FILE_NAME),
+        b"not-an-empty-latch",
+    )
+    .expect("write malformed recovery latch");
+    std::fs::write(&container_root, b"DATA sentinel").expect("create invalid DATA root sentinel");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fastdup-durable-fuse"))
+        .args([&mount_root, &metadata_root, &container_root])
+        .output()
+        .expect("execute daemon against malformed recovery latch");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Appliance Recovery Latch must be an empty canonical object"),
+        "ASSERT: startup identifies the malformed latch before opening DATA: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&container_root).expect("read unchanged DATA sentinel"),
+        b"DATA sentinel",
+        "ASSERT: latch audit precedes opening or changing the DATA repository"
+    );
+}
+
+#[test]
+fn symlink_recovery_latch_fails_daemon_before_data_repository_open() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_test_root("symlink-recovery-latch");
+    let mount_root = root.join("mount");
+    let metadata_root = root.join("metadata");
+    let container_root = root.join("containers");
+    let symlink_target = root.join("empty-target");
+    std::fs::create_dir_all(&mount_root).expect("create mount root");
+    std::fs::create_dir_all(&metadata_root).expect("create metadata root");
+    std::fs::write(&symlink_target, b"").expect("create empty symlink target");
+    symlink(
+        &symlink_target,
+        metadata_root.join(APPLIANCE_RECOVERY_LATCH_FILE_NAME),
+    )
+    .expect("create symlink latch");
+    std::fs::write(&container_root, b"DATA sentinel").expect("create invalid DATA root sentinel");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fastdup-durable-fuse"))
+        .args([&mount_root, &metadata_root, &container_root])
+        .output()
+        .expect("execute daemon against symlink recovery latch");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Appliance Recovery Latch is not a regular file"),
+        "ASSERT: startup rejects a symlink latch before opening DATA: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&container_root).expect("read unchanged DATA sentinel"),
+        b"DATA sentinel",
+        "ASSERT: latch type audit precedes opening or changing the DATA repository"
     );
 }

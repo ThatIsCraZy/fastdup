@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use fastdup_appliance::{
-    ApplianceLease, ApplianceLeaseOwner, checkpoint_exact_index_profile_v1,
-    checkpoint_policy_set_v1, request_online_gc_now,
+    ApplianceLease, ApplianceLeaseOwner, ApplianceRecoveryLatch, ApplianceRecoveryState,
+    checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1, request_online_gc_now,
 };
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo, GenerationRepository,
@@ -53,11 +53,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::OfflineMaintenance)?;
 
     let metadata = FsStorageIo::open(&metadata_root)?;
+    let recovery_required = ApplianceRecoveryLatch::audit_filesystem(&metadata)?
+        == ApplianceRecoveryState::RecoveryRequired;
+    let recovery_proof_command = command == "scrub" || command == "scrub-gc" || command == "gc-now";
+    if recovery_required && !recovery_proof_command {
+        return Err(
+            "recovery-required repository needs a successful offline scrub before mutation".into(),
+        );
+    }
     let containers = ContainerRepository::new(FsStorageIo::open(&container_root)?);
     let maintenance = MaintenanceRepository::new(
         GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1()),
         containers,
-        ExactIndexRunRepository::new(metadata),
+        ExactIndexRunRepository::new(metadata.clone()),
         checkpoint_exact_index_profile_v1(),
     );
 
@@ -119,6 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_scrub(maintenance.scrub()?);
     } else {
         return Err(USAGE.into());
+    }
+    if recovery_required {
+        ApplianceRecoveryLatch::clear_filesystem_after_verified_recovery(&metadata)?;
+        println!("appliance_recovery_required=false proof=offline_scrub");
     }
     Ok(())
 }

@@ -7,9 +7,9 @@ and ADRs.
 
 **MVP**:
 The first usable FUSE appliance with crash-safe manifests, bounded updates,
-SeqCDC, Exact Dedup, bounded in-memory acceleration, and RAW/Zstd encodings.
-Similarity, Delta, automatic GC, production Samba hardening, and device-loss
-protection are later stages.
+SeqCDC, Exact Dedup, bounded in-memory acceleration, RAW/Zstd encodings, and
+adaptive DATA/Metadata GC. Similarity, Delta, production Samba hardening, and
+device-loss protection are later stages.
 _Avoid_: Container-store milestone, production appliance
 
 ## Stored data
@@ -576,6 +576,12 @@ The explicit health state controlling whether new mutations may be admitted.
 Background activities such as scrub are flags rather than mutually exclusive
 health states.
 _Avoid_: Metric, process status
+
+**Appliance recovery latch**:
+A durable marker requiring the next appliance owner to complete recovery or
+offline scrub before it may mutate the repository. Its presence is conservative
+evidence of an unproven shutdown, not evidence of corruption.
+_Avoid_: Health record, PID file, dirty bit
 
 **Appliance lease**:
 Exclusive cross-process ownership permitting one daemon or offline maintenance

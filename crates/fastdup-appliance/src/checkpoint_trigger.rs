@@ -25,6 +25,13 @@ pub enum CheckpointAction {
     PauseAndCommit(CheckpointTrigger),
 }
 
+/// Admission decision while one checkpoint is already performing durable I/O.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointProgressAction {
+    Continue,
+    CloseAdmission,
+}
+
 /// One immutable scheduler observation. Ages are measured from process-local
 /// monotonic time and never enter a durable format.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -32,6 +39,77 @@ pub struct CheckpointPressure {
     pub oldest_mutation_age: Option<Duration>,
     pub oldest_sealed_container_age: Option<Duration>,
     pub sealed_uncommitted_containers: u64,
+}
+
+/// One control-path observation used to derive checkpoint age without reading
+/// a clock inside the policy module.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DurabilityObservation {
+    pub has_checkpointable_dirty_payload: bool,
+    pub oldest_sealed_container_age: Option<Duration>,
+    pub sealed_uncommitted_containers: u64,
+}
+
+/// Process-local monotonic checkpoint and admission policy state.
+///
+/// Callers supply elapsed monotonic time explicitly. This keeps production and
+/// fake-clock adapters at the daemon control seam and out of mutation/Ingest
+/// hot loops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurabilitySupervisor {
+    oldest_dirty_since: Option<Duration>,
+    last_checkpoint_attempt: Duration,
+}
+
+impl DurabilitySupervisor {
+    #[must_use]
+    pub const fn new(now: Duration) -> Self {
+        Self {
+            oldest_dirty_since: None,
+            last_checkpoint_attempt: now,
+        }
+    }
+
+    #[must_use]
+    pub fn checkpoint_progress(elapsed: Duration) -> CheckpointProgressAction {
+        if elapsed >= MUTATION_ADMISSION_GUARD {
+            CheckpointProgressAction::CloseAdmission
+        } else {
+            CheckpointProgressAction::Continue
+        }
+    }
+
+    #[must_use]
+    pub fn observe(
+        &mut self,
+        now: Duration,
+        observation: DurabilityObservation,
+    ) -> CheckpointAction {
+        if observation.has_checkpointable_dirty_payload {
+            self.oldest_dirty_since.get_or_insert(now);
+        } else {
+            self.oldest_dirty_since = None;
+        }
+        let action = checkpoint_action(CheckpointPressure {
+            oldest_mutation_age: self
+                .oldest_dirty_since
+                .map(|started| now.saturating_sub(started)),
+            oldest_sealed_container_age: observation.oldest_sealed_container_age,
+            sealed_uncommitted_containers: observation.sealed_uncommitted_containers,
+        });
+        if matches!(action, CheckpointAction::Wait(_))
+            && now.saturating_sub(self.last_checkpoint_attempt) >= MUTATION_COMMIT_TARGET
+        {
+            CheckpointAction::Commit(CheckpointTrigger::MutationAge)
+        } else {
+            action
+        }
+    }
+
+    pub fn record_checkpoint_attempt(&mut self, now: Duration, dirty_remains: bool) {
+        self.last_checkpoint_attempt = now;
+        self.oldest_dirty_since = dirty_remains.then_some(now);
+    }
 }
 
 /// Decides the next action without performing I/O or reading wall-clock time.

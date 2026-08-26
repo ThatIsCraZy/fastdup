@@ -39,8 +39,8 @@ Crash-Konformitätsmatrix sind noch offen. Der verbleibende Umfang ist in der
 
 ## Aktueller Projektstand
 
-Der zuletzt abgeschlossene Wartungsabschnitt hat die Online- und
-Metadata-GC-Pfade bis an die produktiven Publikationsgrenzen geschlossen:
+Die zuletzt abgeschlossenen Abschnitte haben Online-/Metadata-GC und den
+Haltbarkeitspfad bei ausbleibendem I/O-Fortschritt geschlossen:
 
 - Online GC beweist Kandidaten gegen die aktuelle und vorherige Commit-
   Generation, alle aktiven Metadata Root Pins und die aktive Exact-Index-
@@ -52,38 +52,50 @@ Metadata-GC-Pfade bis an die produktiven Publikationsgrenzen geschlossen:
 - Ein kernelgestützter Appliance Lease schließt einen zweiten Writer und
   gleichzeitige Offline-Wartung aus. Ungültige Start-Policies scheitern, bevor
   das Repository geöffnet oder verändert wird.
-- Workspace-, Fault-, 16.400-Commit- und reale SIGKILL/FUSE-Remount-Tests sind
-  für diesen Stand grün. Der reale Remount-Test belegt vollständige Präfixe und
-  die akzeptierte Zehn-Sekunden-Grenze auf einem funktionierenden Storage-
-  Stack; er simuliert noch keinen dauerhaft blockierten oder lügenden
-  Blockspeicher.
+- Ein expliziter Durability Supervisor schließt Mutation Admission nach fünf
+  Sekunden ohne Checkpoint-Fortschritt. Deterministische Tests halten sowohl
+  Metadata- als auch DATA-Sync an, bewegen die monotone Testzeit ohne reale
+  Wartezeit und belegen: angenommene Writes bleiben lesbar, spätere Writes
+  gelangen nicht mehr in den Namespace.
+- Ein leerer, dauerhafter Appliance Recovery Latch wird vor dem Öffnen des
+  Repositorys schreibbar gesetzt. Crash oder fehlgeschlagener Abschluss lassen
+  ihn stehen; nur vollständige Recovery plus sauberer Shutdown oder ein
+  erfolgreicher Offline-Scrub entfernen ihn. Fehler beim Setzen/Löschen sowie
+  fehlerhafte Dateien und Symlinks werden fail-closed geprüft.
+- Der Supervisor, die Latch-I/O und deren Synchronisation liegen ausschließlich
+  im Daemon-/Maintenance-Kontrollpfad. Die POSIX-Mutations- und Ingest-Hot-Loops
+  erhielten weder Clock-Dispatch noch Dateisystem-I/O oder neue Locks.
+- Der vollständige serielle Workspace-Test, Clippy, der Release-Build und die
+  reale siebenstufige SIGKILL/FUSE-Remount-Matrix sind für diesen Stand grün.
+  Dauerhaft blockierte oder fehlerhaft bestätigende Hardware bleibt außerhalb
+  des unterstützten Ausfallmodells.
 
 ## Empfohlener nächster Entwicklungsabschnitt
 
-Als Nächstes sollte der Haltbarkeits- und Admission-Pfad unter absichtlich
-festgefahrener Storage-I/O deterministisch geprüft und geschlossen werden. Das
-ist derzeit die größte Lücke im zentralen Zehn-Sekunden-Vertrag: Der reale
-SIGKILL-Test beweist Recovery bei normal fortschreitender I/O, aber noch nicht,
-dass fastdup neue Mutationen rechtzeitig sperrt, wenn ein Commit seine Deadline
-nicht mehr sicher erreichen kann.
+Als Nächstes sollte ein stabiler Format-/Downgrade-Epoch eingeführt werden.
+Aktuell schützen Versionsfelder einzelne Objekte, aber noch kein
+repositoryweiter Zaun verhindert, dass ein älteres Binary nach einem Upgrade
+wieder schreibend öffnet und neuere gültige Zustände falsch behandelt. Das ist
+vor breiteren Deployment- und Power-Cut-Kampagnen die wichtigste verbleibende
+Produktionsgrenze.
 
 Der Abschnitt ist abgeschlossen, wenn:
 
-1. eine Fake Clock Commit-Alter und Deadline ohne echte Wartezeiten steuert;
-2. gezielt blockierbare Metadata- und DATA-Syncs jede relevante
-   Publikationsphase anhalten können;
-3. bereits angenommene Mutationen Vorrang behalten, während spätere Mutationen
-   vor einer nicht mehr erfüllbaren Deadline blockiert oder abgewiesen werden;
-4. der ungesunde Admission-Zustand einen Neustart konservativ übersteht;
-5. Kill-/Recovery-Fälle an jeder Grenze ausschließlich den vorherigen oder den
-   vollständigen nächsten Commit sichtbar machen; und
-6. Writer, Recovery, Offline-Scrub und Fault Injection dieselbe neue dauerhafte
-   Invariante prüfen.
+1. ein ADR die repositoryweite Epoch, unterstützte Lese-/Schreibbereiche und
+   das Verhalten bei Upgrade und Downgrade eindeutig festlegt;
+2. der Writer die Epoch vor der ersten Veröffentlichung eines davon abhängigen
+   Formats dauerhaft anhebt;
+3. Start, Recovery und Offline-Scrub unbekannte oder nicht schreibbare Epochen
+   vor jeder Mutation ablehnen;
+4. Fail-before/fail-after und Crash-Tests an jeder Epoch-Publikationsoperation
+   nur einen vollständig alten oder vollständig neuen Zustand akzeptieren; und
+5. ein älteres Binary einen neueren Writer-Zustand niemals stillschweigend
+   zurückstuft oder überschreibt.
 
-Danach folgen in dieser Reihenfolge ein stabiler Format-/Downgrade-Epoch samt
-dauerhaftem Container-Generation-High-Water, breitere randomisierte
-Process-Kill- und Blockgeräte-Power-Cut-Kampagnen und anschließend die noch
-offenen POSIX-/Samba-Kompatibilitätsmatrizen.
+Danach sollte der noch separate Container-Verzeichnis-Scan durch einen
+dauerhaften, aus den Container-Envelopes rekonstruierbaren Generation-
+High-Water ersetzt werden. Es folgen breitere randomisierte Process-Kill- und
+Blockgeräte-Power-Cut-Kampagnen und die offenen POSIX-/Samba-Matrizen.
 
 ## Ingest-Pipeline
 
@@ -307,7 +319,6 @@ sh samba/vfs_fastdup/tests/run.sh
 Vor einem produktiven Einsatz fehlen insbesondere:
 
 - vollständige POSIX-Abdeckung und breitere Client-Kompatibilität
-- deterministische Fake-Clock-/Stalled-I/O-Beweise für Deadline und Admission
 - ein stabiler Downgrade-/Format-Epoch-Zaun
 - Schutz vor Geräteverlust
 - Langzeit-, Zufalls-Kill- und echte Stromausfalltests auf Blockgeräten

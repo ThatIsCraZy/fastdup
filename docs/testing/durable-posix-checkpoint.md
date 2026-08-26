@@ -143,9 +143,10 @@ as `Again`; the kernel-FUSE adapter waits for the admission notification and
 retries the not-yet-applied mutation instead of leaking `EAGAIN` to ordinary
 POSIX writers. After a timed-out or pressure checkpoint catches up completely,
 admission reopens; after an error it remains closed until a later retry catches
-up. A future persisted health state must distinguish terminal capacity or
-device faults from retryable catch-up so they can return a stable errno instead
-of waiting indefinitely.
+up. The durable Appliance Recovery Latch conservatively carries an unproven
+shutdown across process loss. A future richer terminal-fault classification
+must still distinguish capacity or device faults from retryable catch-up so
+they can return a stable errno instead of waiting indefinitely.
 
 Closing the gate takes an exclusive admission lock. Every mutating dispatch
 holds a shared admission guard through application of the mutation, so the
@@ -198,8 +199,16 @@ hardware can meet a wall-clock deadline. Arbitrarily stalled total I/O remains
 outside the supported failure envelope in ADR 0007. The public
 [`SIGKILL`, remount, and deadline harness](sigkill-remount-deadline.md) now
 proves complete-prefix recovery inside the window and full recovery after ten
-seconds on the real mount. A fake-clock stalled-I/O deadline test and persisted
-appliance-health state remain open.
+seconds on the real mount. Deterministic fake-clock tests now pause real
+`StorageIo` Metadata and DATA sync operations, close mutation admission at the
+five-second guard, retain live visibility for already admitted bytes, reject a
+later mutation before application, and resume to a complete Commit without
+sleeping. The Appliance Recovery Latch is armed and synchronized before
+ordinary repository access; its create/remove crash matrices admit only clean
+or conservatively recovery-required outcomes. These mechanisms add no clock
+dispatch, latch I/O, filesystem I/O, or synchronization to the POSIX mutation
+or Ingest-Lane hot loops. Arbitrarily stalled total I/O remains outside the
+supported failure envelope.
 
 ## Validation on 2026-08-16
 
@@ -506,10 +515,11 @@ bytes, maximum eviction steps, available RAM, and Swap use after checkpoints.
 - Commit-Log rotation is implemented through paired bounded slots. A bounded
   real-process `SIGKILL`/remount/deadline matrix is green. The exclusive
   kernel-backed Appliance Lease now prevents a second daemon or offline
-  maintenance process from opening the repository. A stable format-epoch
-  fence, fake-clock stalled-I/O proofs, and broad randomized
-  process-kill/power-cut campaigns remain open.
+  maintenance process from opening the repository. Fake-clock stalled-I/O
+  proofs now cover both Metadata and DATA sync stalls, and a durable Recovery
+  Latch makes an unproven shutdown explicit. A stable format-epoch fence and
+  broad randomized process-kill/power-cut campaigns remain open.
 
-The next recovery-hardening slice is the fake-clock stalled-I/O proof and
-broader process-kill/power-cut campaigns, followed by a durable
-Container-generation high-water and stable format-epoch fence.
+The next recovery-hardening slice is a stable format-/downgrade-epoch fence,
+followed by a durable Container-generation high-water and broader randomized
+process-kill/power-cut campaigns.

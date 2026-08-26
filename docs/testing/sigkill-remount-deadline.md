@@ -80,8 +80,11 @@ or single-device loss. It also does not prove deadline behavior while the
 system is under sustained memory, CPU, or storage pressure. Lazy unmount only
 removes the dead daemon's mount attachment; it cannot flush daemon state.
 
-The next deadline gates are deterministic fake-clock tests with deliberately
-stalled storage, persisted unhealthy/admission state, randomized kill offsets
-during long ingest, and block-device power-cut fault injection. The exclusive
-Appliance Lease is implemented; a stable downgrade/format-epoch fence remains
-required before production deployment.
+Deterministic fake-clock tests now deliberately stall Metadata and DATA sync,
+close mutation admission at the five-second guard, and preserve priority and
+live visibility for already admitted mutations. A durable Appliance Recovery
+Latch survives process loss and requires complete startup recovery or a
+successful offline Scrub before it can be cleared. Remaining gates are
+randomized kill offsets during long ingest, block-device power-cut fault
+injection, sustained-pressure deadline evidence, and a stable
+downgrade/format-epoch fence.

@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 use fastdup_appliance::OnlineGcSchedulerStatus;
 use fastdup_appliance::{
-    ApplianceLease, ApplianceLeaseOwner, CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction,
-    CheckpointPressure, DurableNamespace, MUTATION_COMMIT_TARGET, ONLINE_GC_CONTROL_REQUEST,
-    OnlineGcPolicy, OnlineGcScheduler, ProfiledCheckpoint, STATFS_RESERVE_BASIS_POINTS,
-    StatFsOverride, TieredStatFsSource, bind_online_gc_control_socket, checkpoint_action,
-    checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1, online_gc_control_path,
+    ApplianceLease, ApplianceLeaseOwner, ApplianceRecoveryLatch, CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1,
+    CheckpointAction, CheckpointProgressAction, DurabilityObservation, DurabilitySupervisor,
+    DurableNamespace, ONLINE_GC_CONTROL_REQUEST, OnlineGcPolicy, OnlineGcScheduler,
+    ProfiledCheckpoint, STATFS_RESERVE_BASIS_POINTS, StatFsOverride, TieredStatFsSource,
+    bind_online_gc_control_socket, checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1,
+    online_gc_control_path,
 };
 use fastdup_copy_metrics::copy_telemetry;
 use fastdup_format::{HEADER_BYTES, VerifiedContainerPublication};
@@ -89,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&metadata_root)?;
     let _appliance_lease =
         ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::WritableDaemon)?;
+    let recovery_latch = arm_recovery_latch(&metadata_root)?;
     let (control_listener, _control_guard) = bind_online_gc_control(&metadata_root)?;
 
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
@@ -120,8 +122,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ticks = interval(SCHEDULER_RESOLUTION);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticks.tick().await;
-    let mut oldest_dirty = None::<Instant>;
-    let mut last_checkpoint_attempt = Instant::now();
+    let supervisor_epoch = Instant::now();
+    let mut durability = DurabilitySupervisor::new(Duration::ZERO);
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
@@ -129,24 +131,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             _ = ticks.tick() => {
-                let action = heartbeat_action(
-                    observe_checkpoint_action(&appliance, &mut oldest_dirty),
-                    last_checkpoint_attempt,
+                let action = observe_durability(
+                    &appliance,
+                    &mut durability,
+                    supervisor_epoch.elapsed(),
                 );
                 if !matches!(action, CheckpointAction::Wait(_)) {
                     if matches!(action, CheckpointAction::PauseAndCommit(_)) {
                         appliance.namespace().pause_mutation_admission();
                     }
-                    let checkpoint_started = Instant::now();
+                    let checkpoint_started = supervisor_epoch.elapsed();
                     if let Err(error) = checkpoint_cycle(Arc::clone(&appliance)).await {
                         appliance.namespace().pause_mutation_admission();
                         eprintln!(
                             "CRITICAL: durable progress failed; mutation admission remains closed: {error}"
                         );
                     }
-                    oldest_dirty = (appliance.namespace().checkpointable_dirty_payload_bytes() != 0)
-                        .then_some(checkpoint_started);
-                    last_checkpoint_attempt = Instant::now();
+                    record_checkpoint_attempt(&appliance, &mut durability, checkpoint_started);
                 }
             }
             dirty_bytes = appliance
@@ -159,7 +160,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "CRITICAL: pressure checkpoint failed; mutation admission remains closed: {error}"
                     );
                 }
-                last_checkpoint_attempt = Instant::now();
+                record_checkpoint_attempt(
+                    &appliance,
+                    &mut durability,
+                    supervisor_epoch.elapsed(),
+                );
             }
             accepted = control_listener.accept() => {
                 let (stream, _) = accepted?;
@@ -173,16 +178,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    appliance.namespace().pause_mutation_admission();
-    gc_runtime.stop().await?;
-    if let Err(error) = catch_up(Arc::clone(&appliance)).await {
-        eprintln!("CRITICAL: final checkpoint failed during shutdown: {error}");
-    }
+    let clean_catch_up = stop_background_and_catch_up(Arc::clone(&appliance), gc_runtime).await?;
     mount.unmount().await?;
+    if clean_catch_up {
+        recovery_latch.mark_clean()?;
+    }
     emit_verified_read_cache(&appliance);
     data_storage.emit();
     emit_io_uring_state(&data_storage);
     Ok(())
+}
+
+fn arm_recovery_latch(
+    metadata_root: &std::path::Path,
+) -> io::Result<ApplianceRecoveryLatch<FsStorageIo>> {
+    let latch = ApplianceRecoveryLatch::arm_filesystem(FsStorageIo::open(metadata_root)?)?;
+    if latch.prior_recovery_required() {
+        eprintln!(
+            "appliance_recovery_required=true action=verify_generation_before_mutation_admission"
+        );
+    }
+    Ok(latch)
+}
+
+async fn stop_background_and_catch_up(
+    appliance: Arc<FsAppliance>,
+    gc_runtime: OnlineGcRuntimeHandle,
+) -> Result<bool, String> {
+    appliance.namespace().pause_mutation_admission();
+    gc_runtime.stop().await?;
+    match catch_up(appliance).await {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            eprintln!("CRITICAL: final checkpoint failed during shutdown: {error}");
+            Ok(false)
+        }
+    }
 }
 
 fn parse_mount_arguments() -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::error::Error>> {
@@ -743,32 +774,34 @@ fn emit_checkpoint_pressure(appliance: &FsAppliance, dirty_bytes: u64, running: 
     );
 }
 
-fn heartbeat_action(action: CheckpointAction, last_attempt: Instant) -> CheckpointAction {
-    if matches!(action, CheckpointAction::Wait(_))
-        && last_attempt.elapsed() >= MUTATION_COMMIT_TARGET
-    {
-        CheckpointAction::Commit(fastdup_appliance::CheckpointTrigger::MutationAge)
-    } else {
-        action
-    }
+fn observe_durability(
+    appliance: &FsAppliance,
+    supervisor: &mut DurabilitySupervisor,
+    now: Duration,
+) -> CheckpointAction {
+    let staged = appliance.write_through_status();
+    supervisor.observe(
+        now,
+        DurabilityObservation {
+            has_checkpointable_dirty_payload: appliance
+                .namespace()
+                .checkpointable_dirty_payload_bytes()
+                != 0,
+            oldest_sealed_container_age: staged.oldest_sealed_age(),
+            sealed_uncommitted_containers: staged.sealed_uncommitted_containers(),
+        },
+    )
 }
 
-fn observe_checkpoint_action(
+fn record_checkpoint_attempt(
     appliance: &FsAppliance,
-    oldest_dirty: &mut Option<Instant>,
-) -> CheckpointAction {
-    let now = Instant::now();
-    if appliance.namespace().checkpointable_dirty_payload_bytes() == 0 {
-        *oldest_dirty = None;
-    } else {
-        oldest_dirty.get_or_insert(now);
-    }
-    let staged = appliance.write_through_status();
-    checkpoint_action(CheckpointPressure {
-        oldest_mutation_age: oldest_dirty.map(|started| now.duration_since(started)),
-        oldest_sealed_container_age: staged.oldest_sealed_age(),
-        sealed_uncommitted_containers: staged.sealed_uncommitted_containers(),
-    })
+    supervisor: &mut DurabilitySupervisor,
+    started: Duration,
+) {
+    supervisor.record_checkpoint_attempt(
+        started,
+        appliance.namespace().checkpointable_dirty_payload_bytes() != 0,
+    );
 }
 
 async fn checkpoint_cycle(appliance: Arc<FsAppliance>) -> Result<(), String> {
@@ -781,10 +814,14 @@ async fn checkpoint_cycle(appliance: Arc<FsAppliance>) -> Result<(), String> {
         tokio::select! {
             result = &mut worker => map_worker_result(result)?,
             () = sleep(CHECKPOINT_WARNING) => {
-                appliance.namespace().pause_mutation_admission();
-                eprintln!(
-                    "CRITICAL: checkpoint exceeded five seconds; mutation admission is closed"
-                );
+                if DurabilitySupervisor::checkpoint_progress(CHECKPOINT_WARNING)
+                    == CheckpointProgressAction::CloseAdmission
+                {
+                    appliance.namespace().pause_mutation_admission();
+                    eprintln!(
+                        "CRITICAL: checkpoint exceeded five seconds; mutation admission is closed"
+                    );
+                }
                 await_worker(worker).await?
             }
             dirty_bytes = appliance

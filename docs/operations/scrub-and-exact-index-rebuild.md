@@ -8,6 +8,15 @@ opening either repository and fail if the writable daemon or another offline
 process owns it. Stop and unmount `fastdup-durable-fuse`; `--offline` remains an
 explicit acknowledgement that unrestricted maintenance scheduling is intended.
 
+The writable daemon durably arms
+`.fastdup-appliance.recovery-required` before ordinary repository access and
+removes it only after a complete catch-up and clean unmount. If a crash or
+failed shutdown leaves that latch armed, offline `scrub`, `scrub-gc`, and
+`gc-now` may perform the required complete verification and clear it after
+success. `rebuild-exact` and `metadata-gc` fail before mutation until that proof
+exists. Unexpected latch bytes, symlinks, and other non-regular objects fail
+closed.
+
 ```bash
 export RUSTUP_HOME=/source/fastdup/.artifacts/rustup
 export CARGO_HOME=/source/fastdup/.artifacts/cargo
@@ -35,8 +44,10 @@ cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
   --online gc-now METADATA_ROOT
 ```
 
-`scrub` is read-only. It fails closed on a torn or invalid Commit-Log tail and
-does not use the ordinary recovery fallback. It verifies:
+`scrub` is read-only with respect to repository generations and stored user
+data; after a successful complete verification it may remove a pre-existing
+Appliance Recovery Latch. It fails closed on a torn or invalid Commit-Log tail
+and does not use the ordinary recovery fallback. It verifies:
 
 - both bounded Commit-Log slots and their selected bridge topology;
 - every generation retained by the selected bounded Log segment and every
@@ -262,8 +273,9 @@ that crash recovery never exposes a Similarity family without its bound Exact
 Run Set. A maintenance CLI command for this paired operation is still pending.
 
 Remaining production gates are real block-device power-cut campaigns, measured
-large-store scrub/rebuild/GC throughput, fake-clock stalled-I/O deadline proof,
-broad randomized process-kill coverage, and a stable downgrade/format-epoch
-fence. Process-local Metadata Root Pins disappear with their owning process;
+large-store scrub/rebuild/GC throughput, broad randomized process-kill
+coverage, and a stable downgrade/format-epoch fence. Fake-clock tests now cover
+stalled Metadata and DATA sync plus admission closure. Process-local Metadata
+Root Pins disappear with their owning process;
 the accepted restart boundary therefore performs one exact mark before catalog
 reuse instead of attempting to reconstruct unpublished pins across processes.

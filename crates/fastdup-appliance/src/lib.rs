@@ -3,6 +3,7 @@
 //! Durable repository-to-POSIX mount orchestration.
 
 mod appliance_lease;
+mod appliance_recovery_latch;
 mod checkpoint;
 mod checkpoint_trigger;
 mod historical_proof_cache;
@@ -11,6 +12,9 @@ mod proof_cache_trace;
 mod statfs;
 
 pub use appliance_lease::{APPLIANCE_LEASE_FILE_NAME, ApplianceLease, ApplianceLeaseOwner};
+pub use appliance_recovery_latch::{
+    APPLIANCE_RECOVERY_LATCH_FILE_NAME, ApplianceRecoveryLatch, ApplianceRecoveryState,
+};
 
 pub use checkpoint::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, CpuPhaseStatus,
@@ -18,9 +22,9 @@ pub use checkpoint::{
     WriteThroughStatus, checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1,
 };
 pub use checkpoint_trigger::{
-    CONTAINER_COMMIT_COALESCE, CheckpointAction, CheckpointPressure, CheckpointTrigger,
-    MUTATION_ADMISSION_GUARD, MUTATION_COMMIT_TARGET, SEALED_CONTAINER_COMMIT_LIMIT,
-    checkpoint_action,
+    CONTAINER_COMMIT_COALESCE, CheckpointAction, CheckpointPressure, CheckpointProgressAction,
+    CheckpointTrigger, DurabilityObservation, DurabilitySupervisor, MUTATION_ADMISSION_GUARD,
+    MUTATION_COMMIT_TARGET, SEALED_CONTAINER_COMMIT_LIMIT, checkpoint_action,
 };
 pub use historical_proof_cache::HistoricalProofCacheStatus;
 pub use online_gc::{
