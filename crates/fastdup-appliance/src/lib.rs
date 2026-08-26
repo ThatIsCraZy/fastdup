@@ -20,6 +20,7 @@ pub use checkpoint::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, CpuPhaseStatus,
     DurableNamespace, DurableNamespaceError, GenerationProofSetStatus, ProfiledCheckpoint,
     WriteThroughStatus, checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1,
+    checkpoint_policy_set_v2,
 };
 pub use checkpoint_trigger::{
     CONTAINER_COMMIT_COALESCE, CheckpointAction, CheckpointPressure, CheckpointProgressAction,

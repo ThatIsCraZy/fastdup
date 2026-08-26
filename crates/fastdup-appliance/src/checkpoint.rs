@@ -569,6 +569,23 @@ pub fn checkpoint_policy_set_v1() -> PolicySetId {
     .expect("ASSERT: the checkpoint Policy Set hash is nonzero")
 }
 
+/// Returns the immutable identity of the advanced durable checkpoint writer.
+///
+/// Version two retains every baseline decision and additionally pins the
+/// coherent Similarity profile, bounded candidate/trial counts, and Depth-1
+/// Zstd Prefix admission policy. Merely opening a Similarity Index must never
+/// change output under the baseline v1 Policy Set.
+#[must_use]
+pub fn checkpoint_policy_set_v2() -> PolicySetId {
+    PolicySetId::new(
+        ChunkId::of(
+            b"fastdup/checkpoint-policy-v2/SeqCDC=increasing:seq6:skip-trigger50:skip1024:min16384:max262144:append-tail-anchor-v1/region=524288/Zstd=level3:min4096:min3pct/exact=l0-runs-v2:fanin4:partition262144/proof=installed-successor-delta-v1/similarity=fingerprint-v1:bucket-v1:candidates16:trials4:paired-exact-v1/prefix=codec3:depth1:min4096:min5pct:contiguous-only",
+        )
+        .bytes(),
+    )
+    .expect("ASSERT: the advanced checkpoint Policy Set hash is nonzero")
+}
+
 /// Writable namespace plus the durable generation machinery behind it.
 ///
 /// The module owns the only checkpoint serialization lock. POSIX callers use

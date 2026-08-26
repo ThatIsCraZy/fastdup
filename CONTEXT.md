@@ -8,9 +8,18 @@ and ADRs.
 **MVP**:
 The first usable FUSE appliance with crash-safe manifests, bounded updates,
 SeqCDC, Exact Dedup, bounded in-memory acceleration, RAW/Zstd encodings, and
-adaptive DATA/Metadata GC. Similarity, Delta, production Samba hardening, and
-device-loss protection are later stages.
+adaptive DATA/Metadata GC. A durable, rebuildable Similarity Index and
+Depth-1 ZSTD_PREFIX encoding form the optional Advanced Reduction path;
+Dictionary encoding, Sparse-XOR Delta, Reorder, production Samba hardening,
+and device-loss protection remain later stages.
 _Avoid_: Container-store milestone, production appliance
+
+**Advanced reduction**:
+The optional writer path that pins one coherent Exact/Similarity snapshot and
+uses bounded Similarity Candidates to trial Depth-1 ZSTD_PREFIX encodings.
+Failure, absence, or staleness of this rebuildable acceleration falls back to
+independent RAW/Zstd without weakening write availability or content truth.
+_Avoid_: Delta mode, authoritative Similarity Index
 
 ## Stored data
 

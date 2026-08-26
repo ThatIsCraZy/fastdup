@@ -59,8 +59,12 @@ den fastdup-Benchmarks vergleichbar.
 Das Repository ist ein Prototyp und noch kein Backup-Produkt. Der dauerhafte
 Pfad umfasst Exact Dedup, RAW/Zstd-Encoding, sparse Dateien, Checkpoints,
 Recovery, Scrub, einen neu aufbaubaren Exact Index sowie adaptives DATA- und
-Metadata-GC. Similarity, Delta, Dictionary und Reorder sind Forschungs- oder
-Referenzpfade und noch nicht Teil des dauerhaften FUSE-Formats.
+Metadata-GC. Der erweiterte dauerhafte Pfad besitzt außerdem einen neu
+aufbaubaren, an den Exact Index gebundenen Similarity Index und Depth-1-
+`ZSTD_PREFIX`-Records. Diese Bausteine sind vollständig lesbar, recoverbar,
+scrubbar und GC-sicher; ihre betriebliche Aktivierung und reale
+Workload-Evidenz werden derzeit abgeschlossen. Sparse-XOR-Delta, Dictionary
+und Reorder bleiben Forschungs- oder Referenzpfade.
 
 Die verbindlichen Begriffe stehen in [CONTEXT.md](CONTEXT.md). Entscheidungen
 über Haltbarkeit und Formate stehen in den [ADRs](docs/adr/).
@@ -84,6 +88,8 @@ Der FUSE-Pfad unterstützt unter anderem:
   Bereichsinvalidierung; Read-only-`mmap` ist kohärent, Shared-writable-`mmap`
   wird in v1 abgewiesen
 - Offline-Scrub, adaptives Online-/Offline-GC und Neuaufbau des Exact Index
+- optionaler gepaarter Neuaufbau von Exact und Similarity sowie begrenzte
+  Depth-1-Zstd-PREFIX-Auswahl gegen unabhängig dekodierbare Bases
 
 Der Adapter bildet noch nicht den gesamten POSIX-Umfang ab. Insbesondere BSD
 `flock` sowie die breite Client-, POSIX-, Samba- und
@@ -416,8 +422,10 @@ Vor einem produktiven Einsatz fehlen insbesondere:
 - vollständige POSIX-Abdeckung und breitere Client-Kompatibilität
 - Schutz vor Geräteverlust
 - Langzeit-, Zufalls-Kill- und echte Stromausfalltests auf Blockgeräten
-- dauerhafte Writer-, Recovery- und Scrub-Invarianten für Similarity, Delta,
-  Dictionary und Reorder
+- Produktionsaktivierung und workloadrepräsentative SMB-/Restore-Evidenz für
+  Similarity und Zstd-PREFIX
+- dauerhafte Writer-, Recovery-, Scrub- und GC-Invarianten für
+  Dictionary-Encodings; Sparse-XOR-Delta und Reorder bleiben experimentell
 - Veeam-Protokollevidenz für das Samba-Modul
 
 Messwerte sind workload- und hostabhängig. Reproduzierbare Methoden und
