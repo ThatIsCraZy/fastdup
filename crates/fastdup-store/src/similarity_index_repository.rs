@@ -1,6 +1,9 @@
 use std::fmt;
 use std::io;
+use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use fastdup_format::{
     ChunkId, ExactIndexRunSetId, SIMILARITY_BUCKET_REFERENCES_PER_PAGE,
@@ -12,6 +15,9 @@ use fastdup_format::{
 };
 
 use crate::StorageIo;
+use crate::read_cache::{
+    MemoryPressureSnapshot, SYSTEM_REFRESH_INTERVAL, shared_cache_reserve_bytes,
+};
 use crate::reduction_similarity::{
     MAX_SIMILARITY_CANDIDATES, SIMILARITY_BUCKET_PROFILE_V1, SIMILARITY_PROFILE_V1,
     SimilarityError, SimilarityFingerprint,
@@ -32,15 +38,36 @@ pub const SIMILARITY_REPRESENTATIVE_PROFILE_V1: u16 = SIMILARITY_BUCKET_PROFILE_
 pub struct SimilarityIndexRepository<I> {
     storage: I,
     publish_lock: Arc<Mutex<()>>,
+    page_cache: Arc<SimilarityPageCache>,
 }
 
 impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     #[must_use]
     pub fn new(storage: I) -> Self {
+        let snapshot = MemoryPressureSnapshot::read_system()
+            .unwrap_or_else(|_| MemoryPressureSnapshot::new(0, 0, 1));
         Self {
             storage,
             publish_lock: Arc::new(Mutex::new(())),
+            page_cache: Arc::new(SimilarityPageCache::new(snapshot, true)),
         }
+    }
+
+    /// Constructs a repository with deterministic, manually fixed memory
+    /// pressure for tests and embedded runtimes with an external governor.
+    #[must_use]
+    pub fn new_with_memory_snapshot(storage: I, snapshot: MemoryPressureSnapshot) -> Self {
+        Self {
+            storage,
+            publish_lock: Arc::new(Mutex::new(())),
+            page_cache: Arc::new(SimilarityPageCache::new(snapshot, false)),
+        }
+    }
+
+    /// Returns repository-wide bounded Similarity page-cache evidence.
+    #[must_use]
+    pub fn page_cache_status(&self) -> SimilarityIndexPageCacheStatus {
+        self.page_cache.status()
     }
 
     /// Durably publishes one complete immutable pool snapshot.
@@ -450,7 +477,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
                         minimum_bucket_key: verified.minimum_bucket_key,
                         maximum_bucket_key: verified.maximum_bucket_key,
                         mapping: verified.mapping,
-                        page_cache: Arc::new(SimilarityPageCache::new()),
+                        page_cache: Arc::clone(&self.page_cache),
                     };
                     (generation, entries_streamed, buckets, None, vec![partition])
                 }
@@ -485,7 +512,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
                             minimum_bucket_key: verified.minimum_bucket_key,
                             maximum_bucket_key: verified.maximum_bucket_key,
                             mapping: verified.mapping,
-                            page_cache: Arc::new(SimilarityPageCache::new()),
+                            page_cache: Arc::clone(&self.page_cache),
                         });
                     }
                     (
@@ -1158,7 +1185,8 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             .partitions
             .get(partition_ordinal)
             .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-        if let Some(page) = partition.page_cache.bucket_pages.get(ordinal) {
+        let run_hash = partition.descriptor.run_hash();
+        if let Some(page) = partition.page_cache.get_bucket(run_hash, ordinal) {
             return Ok(page);
         }
         let offset = partition
@@ -1173,8 +1201,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         );
         partition
             .page_cache
-            .bucket_pages
-            .insert(ordinal, Arc::clone(&page));
+            .insert_bucket(run_hash, ordinal, Arc::clone(&page));
         Ok(page)
     }
 
@@ -1194,7 +1221,8 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             return Err(SimilarityIndexStoreError::IndexCorruption);
         }
         let page_ordinal = entry_ordinal / ENTRIES_PER_PAGE;
-        let page = if let Some(page) = partition.page_cache.entry_pages.get(page_ordinal) {
+        let run_hash = partition.descriptor.run_hash();
+        let page = if let Some(page) = partition.page_cache.get_entry(run_hash, page_ordinal) {
             page
         } else {
             let offset = partition
@@ -1209,8 +1237,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             );
             partition
                 .page_cache
-                .entry_pages
-                .insert(page_ordinal, Arc::clone(&page));
+                .insert_entry(run_hash, page_ordinal, Arc::clone(&page));
             page
         };
         page.entries()
@@ -1251,10 +1278,16 @@ impl AsRef<[u8]> for SimilarityPageBytes<'_> {
     }
 }
 
-const SIMILARITY_PAGE_CACHE_SLOTS: usize = 256;
+const SIMILARITY_PAGE_CACHE_SLOTS_PER_KIND: usize = 256;
 
 #[repr(align(64))]
-struct SimilarityPageCacheSlot<P>(Mutex<Option<(usize, Arc<P>)>>);
+struct SimilarityPageCacheSlot<P>(Mutex<Option<CachedSimilarityPage<P>>>);
+
+struct CachedSimilarityPage<P> {
+    run_hash: [u8; 32],
+    page_ordinal: usize,
+    page: Arc<P>,
+}
 
 struct DirectSimilarityPageCache<P> {
     slots: Box<[SimilarityPageCacheSlot<P>]>,
@@ -1263,48 +1296,295 @@ struct DirectSimilarityPageCache<P> {
 impl<P> DirectSimilarityPageCache<P> {
     fn new() -> Self {
         assert!(
-            SIMILARITY_PAGE_CACHE_SLOTS.is_power_of_two(),
+            SIMILARITY_PAGE_CACHE_SLOTS_PER_KIND.is_power_of_two(),
             "ASSERT: Similarity page-cache slots use a power-of-two mask"
         );
         let slots = std::iter::repeat_with(|| SimilarityPageCacheSlot(Mutex::new(None)))
-            .take(SIMILARITY_PAGE_CACHE_SLOTS)
+            .take(SIMILARITY_PAGE_CACHE_SLOTS_PER_KIND)
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self { slots }
     }
 
-    fn get(&self, ordinal: usize) -> Option<Arc<P>> {
-        let slot = &self.slots[ordinal & (self.slots.len() - 1)];
-        let guard = slot
-            .0
-            .lock()
-            .expect("ASSERT: Similarity page-cache slot lock poisoned");
-        guard.as_ref().and_then(|(cached_ordinal, page)| {
-            (*cached_ordinal == ordinal).then(|| Arc::clone(page))
-        })
+    fn slot(&self, run_hash: [u8; 32], page_ordinal: usize) -> &SimilarityPageCacheSlot<P> {
+        &self.slots[similarity_page_cache_slot(
+            run_hash,
+            page_ordinal,
+            self.slots.len(),
+        )]
     }
 
-    fn insert(&self, ordinal: usize, page: Arc<P>) {
-        let slot = &self.slots[ordinal & (self.slots.len() - 1)];
-        *slot
-            .0
-            .lock()
-            .expect("ASSERT: Similarity page-cache slot lock poisoned") = Some((ordinal, page));
+    fn purge(&self) -> u64 {
+        self.slots.iter().fold(0_u64, |removed, slot| {
+            removed
+                + u64::from(
+                    slot.0
+                        .lock()
+                        .expect("ASSERT: Similarity page-cache slot lock poisoned")
+                        .take()
+                        .is_some(),
+                )
+        })
     }
 }
 
 struct SimilarityPageCache {
     entry_pages: DirectSimilarityPageCache<SimilarityIndexPage>,
     bucket_pages: DirectSimilarityPageCache<SimilarityBucketPage>,
+    admission: Mutex<()>,
+    target_pages: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    resident_pages: AtomicU64,
+    evictions: AtomicU64,
+    pressure_rejections: AtomicU64,
+    effective_limit_bytes: AtomicU64,
+    available_bytes: AtomicU64,
+    swap_used_bytes: AtomicU64,
+    automatic_pressure: bool,
+    started: Instant,
+    last_refresh_millis: AtomicU64,
+}
+
+impl fmt::Debug for SimilarityPageCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SimilarityPageCache")
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SimilarityPageCache {
-    fn new() -> Self {
-        Self {
+    fn new(snapshot: MemoryPressureSnapshot, automatic_pressure: bool) -> Self {
+        let cache = Self {
             entry_pages: DirectSimilarityPageCache::new(),
             bucket_pages: DirectSimilarityPageCache::new(),
+            admission: Mutex::new(()),
+            target_pages: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            resident_pages: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            pressure_rejections: AtomicU64::new(0),
+            effective_limit_bytes: AtomicU64::new(snapshot.effective_limit_bytes()),
+            available_bytes: AtomicU64::new(snapshot.available_bytes()),
+            swap_used_bytes: AtomicU64::new(snapshot.swap_used_bytes()),
+            automatic_pressure,
+            started: Instant::now(),
+            last_refresh_millis: AtomicU64::new(0),
+        };
+        cache.apply_pressure_snapshot(snapshot);
+        cache
+    }
+
+    fn get_entry(&self, run_hash: [u8; 32], page_ordinal: usize) -> Option<Arc<SimilarityIndexPage>> {
+        self.get(&self.entry_pages, run_hash, page_ordinal)
+    }
+
+    fn get_bucket(
+        &self,
+        run_hash: [u8; 32],
+        page_ordinal: usize,
+    ) -> Option<Arc<SimilarityBucketPage>> {
+        self.get(&self.bucket_pages, run_hash, page_ordinal)
+    }
+
+    fn get<P>(
+        &self,
+        cache: &DirectSimilarityPageCache<P>,
+        run_hash: [u8; 32],
+        page_ordinal: usize,
+    ) -> Option<Arc<P>> {
+        self.refresh_pressure_if_due();
+        let cached = cache
+            .slot(run_hash, page_ordinal)
+            .0
+            .lock()
+            .expect("ASSERT: Similarity page-cache slot lock poisoned");
+        let found = cached
+            .as_ref()
+            .filter(|cached| {
+                cached.run_hash == run_hash && cached.page_ordinal == page_ordinal
+            })
+            .map(|cached| Arc::clone(&cached.page));
+        if found.is_some() {
+            self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        found
+    }
+
+    fn insert_entry(
+        &self,
+        run_hash: [u8; 32],
+        page_ordinal: usize,
+        page: Arc<SimilarityIndexPage>,
+    ) {
+        self.insert(&self.entry_pages, run_hash, page_ordinal, page);
+    }
+
+    fn insert_bucket(
+        &self,
+        run_hash: [u8; 32],
+        page_ordinal: usize,
+        page: Arc<SimilarityBucketPage>,
+    ) {
+        self.insert(&self.bucket_pages, run_hash, page_ordinal, page);
+    }
+
+    fn insert<P>(
+        &self,
+        cache: &DirectSimilarityPageCache<P>,
+        run_hash: [u8; 32],
+        page_ordinal: usize,
+        page: Arc<P>,
+    ) {
+        self.refresh_pressure_if_due();
+        let _admission = self
+            .admission
+            .lock()
+            .expect("ASSERT: Similarity page-cache admission lock poisoned");
+        let target = self.target_pages.load(AtomicOrdering::Acquire);
+        if target == 0 {
+            self.pressure_rejections
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return;
+        }
+        let mut cached = cache
+            .slot(run_hash, page_ordinal)
+            .0
+            .lock()
+            .expect("ASSERT: Similarity page-cache slot lock poisoned");
+        match cached.as_ref() {
+            None => {
+                if self.resident_pages.load(AtomicOrdering::Acquire) >= target {
+                    self.pressure_rejections
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    return;
+                }
+                self.resident_pages.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Some(previous)
+                if previous.run_hash != run_hash || previous.page_ordinal != page_ordinal =>
+            {
+                self.evictions.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Some(_) => {}
+        }
+        *cached = Some(CachedSimilarityPage {
+            run_hash,
+            page_ordinal,
+            page,
+        });
+    }
+
+    fn status(&self) -> SimilarityIndexPageCacheStatus {
+        self.refresh_pressure_if_due();
+        let effective_limit_bytes = self.effective_limit_bytes.load(AtomicOrdering::Relaxed);
+        SimilarityIndexPageCacheStatus {
+            hits: self.hits.load(AtomicOrdering::Relaxed),
+            misses: self.misses.load(AtomicOrdering::Relaxed),
+            resident_pages: self.resident_pages.load(AtomicOrdering::Relaxed),
+            evictions: self.evictions.load(AtomicOrdering::Relaxed),
+            pressure_rejections: self.pressure_rejections.load(AtomicOrdering::Relaxed),
+            target_pages: self.target_pages.load(AtomicOrdering::Relaxed),
+            capacity_pages: similarity_page_cache_capacity(),
+            reserve_bytes: shared_cache_reserve_bytes(effective_limit_bytes),
+            effective_limit_bytes,
+            available_bytes: self.available_bytes.load(AtomicOrdering::Relaxed),
+            swap_used_bytes: self.swap_used_bytes.load(AtomicOrdering::Relaxed),
         }
     }
+
+    fn refresh_pressure_if_due(&self) {
+        if !self.automatic_pressure {
+            return;
+        }
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let interval = u64::try_from(SYSTEM_REFRESH_INTERVAL.as_millis())
+            .expect("ASSERT: memory refresh interval fits u64 milliseconds");
+        let previous = self.last_refresh_millis.load(AtomicOrdering::Relaxed);
+        if elapsed.saturating_sub(previous) < interval
+            || self
+                .last_refresh_millis
+                .compare_exchange(
+                    previous,
+                    elapsed,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
+        let snapshot = MemoryPressureSnapshot::read_system()
+            .unwrap_or_else(|_| MemoryPressureSnapshot::new(0, 0, 1));
+        self.apply_pressure_snapshot(snapshot);
+    }
+
+    fn apply_pressure_snapshot(&self, snapshot: MemoryPressureSnapshot) {
+        let reserve = shared_cache_reserve_bytes(snapshot.effective_limit_bytes());
+        let available = snapshot.available_bytes().saturating_sub(reserve);
+        let capacity = similarity_page_cache_capacity();
+        let target = if snapshot.swap_used_bytes() == 0 {
+            (available / similarity_page_cache_accounted_page_bytes()).min(capacity)
+        } else {
+            0
+        };
+        self.effective_limit_bytes
+            .store(snapshot.effective_limit_bytes(), AtomicOrdering::Relaxed);
+        self.available_bytes
+            .store(snapshot.available_bytes(), AtomicOrdering::Relaxed);
+        self.swap_used_bytes
+            .store(snapshot.swap_used_bytes(), AtomicOrdering::Relaxed);
+        self.target_pages.store(target, AtomicOrdering::Release);
+        if self.resident_pages.load(AtomicOrdering::Acquire) > target {
+            self.purge();
+        }
+    }
+
+    fn purge(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .expect("ASSERT: Similarity page-cache admission lock poisoned");
+        let removed = self.entry_pages.purge() + self.bucket_pages.purge();
+        let previous = self.resident_pages.swap(0, AtomicOrdering::AcqRel);
+        assert_eq!(
+            removed, previous,
+            "ASSERT: Similarity page-cache resident accounting matches its slots"
+        );
+        self.evictions.fetch_add(removed, AtomicOrdering::Relaxed);
+    }
+}
+
+fn similarity_page_cache_capacity() -> u64 {
+    u64::try_from(2 * SIMILARITY_PAGE_CACHE_SLOTS_PER_KIND)
+        .expect("ASSERT: Similarity page-cache capacity fits u64")
+}
+
+fn similarity_page_cache_accounted_page_bytes() -> u64 {
+    u64::try_from(SIMILARITY_INDEX_PAGE_BYTES + size_of::<SimilarityPageCacheSlot<SimilarityIndexPage>>())
+        .expect("ASSERT: Similarity accounted page bytes fit u64")
+}
+
+fn similarity_page_cache_slot(
+    run_hash: [u8; 32],
+    page_ordinal: usize,
+    slot_count: usize,
+) -> usize {
+    let mut lane = [0_u8; 8];
+    lane.copy_from_slice(&run_hash[..8]);
+    let page = u64::try_from(page_ordinal)
+        .expect("ASSERT: a Similarity page ordinal fits the cache hash domain");
+    let mixed =
+        u64::from_le_bytes(lane) ^ page.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ page.rotate_left(29);
+    let mask = u64::try_from(slot_count - 1)
+        .expect("ASSERT: the Similarity page-cache mask fits u64");
+    usize::try_from(mixed & mask)
+        .expect("ASSERT: a masked Similarity page-cache slot fits usize")
 }
 
 const _: () = assert!(std::mem::align_of::<SimilarityPageCacheSlot<SimilarityIndexPage>>() == 64);
@@ -1415,6 +1695,79 @@ pub struct SimilarityIndexRebuildStatus {
     buckets: u64,
     read_mode: SimilarityIndexReadMode,
     source_exact_run_set_id: Option<ExactIndexRunSetId>,
+}
+
+/// Repository-wide pressure-bounded Similarity hot-page cache evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SimilarityIndexPageCacheStatus {
+    hits: u64,
+    misses: u64,
+    resident_pages: u64,
+    evictions: u64,
+    pressure_rejections: u64,
+    target_pages: u64,
+    capacity_pages: u64,
+    reserve_bytes: u64,
+    effective_limit_bytes: u64,
+    available_bytes: u64,
+    swap_used_bytes: u64,
+}
+
+impl SimilarityIndexPageCacheStatus {
+    #[must_use]
+    pub const fn hits(self) -> u64 {
+        self.hits
+    }
+
+    #[must_use]
+    pub const fn misses(self) -> u64 {
+        self.misses
+    }
+
+    #[must_use]
+    pub const fn resident_pages(self) -> u64 {
+        self.resident_pages
+    }
+
+    #[must_use]
+    pub const fn evictions(self) -> u64 {
+        self.evictions
+    }
+
+    #[must_use]
+    pub const fn pressure_rejections(self) -> u64 {
+        self.pressure_rejections
+    }
+
+    #[must_use]
+    pub const fn target_pages(self) -> u64 {
+        self.target_pages
+    }
+
+    #[must_use]
+    pub const fn capacity_pages(self) -> u64 {
+        self.capacity_pages
+    }
+
+    #[must_use]
+    pub const fn reserve_bytes(self) -> u64 {
+        self.reserve_bytes
+    }
+
+    #[must_use]
+    pub const fn effective_limit_bytes(self) -> u64 {
+        self.effective_limit_bytes
+    }
+
+    #[must_use]
+    pub const fn available_bytes(self) -> u64 {
+        self.available_bytes
+    }
+
+    #[must_use]
+    pub const fn swap_used_bytes(self) -> u64 {
+        self.swap_used_bytes
+    }
 }
 
 /// Physical page source selected for a recovered Similarity snapshot.

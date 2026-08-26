@@ -5,9 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fastdup_format::{ChunkId, SimilarityIndexEntry, SimilarityIndexRun};
 use fastdup_store::{
-    FsStorageIo, SIMILARITY_FINGERPRINT_PROFILE_V1, SIMILARITY_REPRESENTATIVE_PROFILE_V1,
-    SimilarityIndexReadMode, SimilarityIndexRepository, SimilarityIndexStoreError, StorageIo,
-    similarity_index_entry_v1,
+    FsStorageIo, MemoryPressureSnapshot, SIMILARITY_FINGERPRINT_PROFILE_V1,
+    SIMILARITY_REPRESENTATIVE_PROFILE_V1, SimilarityIndexReadMode, SimilarityIndexRepository,
+    SimilarityIndexStoreError, StorageIo, similarity_index_entry_v1,
 };
 
 #[test]
@@ -59,6 +59,50 @@ fn newest_complete_pool_snapshot_survives_restart_and_proposes_old_bases() {
             .iter()
             .all(|candidate| candidate.logical_length() == 64 * 1_024)
     );
+}
+
+#[test]
+fn repository_wide_page_cache_obeys_shared_memory_headroom() {
+    let root = test_root("memory-governor");
+    let storage = FsStorageIo::open(&root).expect("open governed Similarity root");
+    let gib = 1_024_u64 * 1_024 * 1_024;
+    let healthy = MemoryPressureSnapshot::new(16 * gib, 12 * gib, 0);
+    let repository = SimilarityIndexRepository::new_with_memory_snapshot(storage.clone(), healthy);
+    let base = fixture_bytes(64 * 1_024, 71);
+    repository
+        .publish(&snapshot(1, &[base.as_slice()]))
+        .expect("publish governed Similarity fixture");
+    let recovered = repository
+        .recover_latest()
+        .expect("recover governed Similarity fixture")
+        .expect("governed Similarity fixture exists");
+    let mut target = base.clone();
+    target[17_000] ^= 0x5a;
+
+    recovered.candidates(&target).expect("first cacheable query");
+    recovered.candidates(&target).expect("second cache-hit query");
+    let warm = repository.page_cache_status();
+    assert!(warm.resident_pages() > 0);
+    assert!(warm.hits() > 0);
+    assert_eq!(warm.target_pages(), warm.capacity_pages());
+    drop(recovered);
+    drop(repository);
+
+    let pressured = SimilarityIndexRepository::new_with_memory_snapshot(
+        storage,
+        MemoryPressureSnapshot::new(16 * gib, 4 * gib, 0),
+    );
+    let recovered = pressured
+        .recover_latest()
+        .expect("recover under memory pressure")
+        .expect("Similarity fixture remains available under pressure");
+    recovered
+        .candidates(&target)
+        .expect("pressure rejects cache admission, not the query");
+    let cold = pressured.page_cache_status();
+    assert_eq!(cold.target_pages(), 0);
+    assert_eq!(cold.resident_pages(), 0);
+    assert!(cold.pressure_rejections() > 0);
 }
 
 #[test]

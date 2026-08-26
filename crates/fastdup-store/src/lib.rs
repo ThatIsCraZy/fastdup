@@ -72,6 +72,7 @@ pub use memory_budget::{
 };
 pub use persistent_reduction::{
     PersistentChunkPlan, PersistentReductionError, PersistentReductionIndex,
+    PersistentReductionStatus,
 };
 pub use read_cache::{
     VerifiedReadCache, VerifiedReadCacheConfig, VerifiedReadCacheError, VerifiedReadCacheStatus,
@@ -96,8 +97,8 @@ pub use seqcdc::{
 pub use similarity_index_repository::{
     RecoveredSimilarityIndex, SIMILARITY_FINGERPRINT_PROFILE_V1,
     SIMILARITY_REPRESENTATIVE_PROFILE_V1, SimilarityBaseCandidate, SimilarityIndexAuditStatus,
-    SimilarityIndexReadMode, SimilarityIndexRebuildStatus, SimilarityIndexRepository,
-    SimilarityIndexStoreError, similarity_index_entry_v1,
+    SimilarityIndexPageCacheStatus, SimilarityIndexReadMode, SimilarityIndexRebuildStatus,
+    SimilarityIndexRepository, SimilarityIndexStoreError, similarity_index_entry_v1,
 };
 
 use std::collections::BTreeMap;

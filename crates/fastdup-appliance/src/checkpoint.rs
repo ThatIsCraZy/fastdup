@@ -29,8 +29,9 @@ use fastdup_store::{
     ContainerDescriptorCacheStatus, ContainerGenerationAllocator, ContainerRepository,
     ExactIndexPageCacheStatus, ExactIndexRunRepository, ExactRunMembershipStatus, GenerationError,
     GenerationRepository, IndexedRequiredChunkVerifier, ManifestReadError, ManifestSuccessorProof,
-    ManifestTreeSummary, PersistentChunkPlan, PersistentReductionIndex, RequiredChunkVerifier,
-    SeqCdcConfig, SimilarityIndexRepository, StorageIo, StoreError, SuccessorPredecessor,
+    ManifestTreeSummary, PersistentChunkPlan, PersistentReductionIndex, PersistentReductionStatus,
+    RequiredChunkVerifier, SeqCdcConfig, SimilarityIndexRepository, StorageIo, StoreError,
+    SuccessorPredecessor,
     VerifiedCommittedFile, VerifiedManifestFile, VerifiedReadCache, VerifiedReadCacheError,
     VerifiedReadCacheStatus, seqcdc_cut, seqcdc_cut_scalar, seqcdc_cut_segmented,
     seqcdc_cut_segmented_scalar,
@@ -190,6 +191,7 @@ pub struct WriteThroughStatus {
     ingest_ring_wait_ns: u64,
     hash_cpu: CpuPhaseStatus,
     encode_cpu: CpuPhaseStatus,
+    advanced_reduction: PersistentReductionStatus,
     degraded: bool,
 }
 
@@ -267,6 +269,11 @@ impl WriteThroughStatus {
     #[must_use]
     pub const fn encode_cpu(self) -> CpuPhaseStatus {
         self.encode_cpu
+    }
+
+    #[must_use]
+    pub const fn advanced_reduction(self) -> PersistentReductionStatus {
+        self.advanced_reduction
     }
 
     #[must_use]
@@ -3369,6 +3376,7 @@ where
             ingest_ring_wait_ns: ingest.ingest_ring_wait_ns,
             hash_cpu: self.hash_cpu.status(),
             encode_cpu: self.encode_cpu.status(),
+            advanced_reduction: self.index.advanced_reduction_status(),
             degraded: snapshot.degraded,
         }
     }
@@ -4098,6 +4106,7 @@ trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
     fn exact_index_page_cache_status(&self) -> ExactIndexPageCacheStatus;
     fn exact_run_membership_status(&self) -> ExactRunMembershipStatus;
     fn read_cache_status(&self) -> VerifiedReadCacheStatus;
+    fn advanced_reduction_status(&self) -> PersistentReductionStatus;
 }
 
 #[derive(Debug)]
@@ -4154,6 +4163,10 @@ impl<C: StorageIo + 'static> ManifestReaderPolicy<C> for ScanManifestReaders {
 
     fn read_cache_status(&self) -> VerifiedReadCacheStatus {
         self.read_cache.status()
+    }
+
+    fn advanced_reduction_status(&self) -> PersistentReductionStatus {
+        PersistentReductionStatus::default()
     }
 }
 
@@ -4408,6 +4421,12 @@ where
 
     fn read_cache_status(&self) -> VerifiedReadCacheStatus {
         self.read_cache.status()
+    }
+
+    fn advanced_reduction_status(&self) -> PersistentReductionStatus {
+        self.reduction
+            .as_deref()
+            .map_or_else(PersistentReductionStatus::default, PersistentReductionIndex::status)
     }
 }
 

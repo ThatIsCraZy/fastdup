@@ -209,6 +209,16 @@ fn pool_wide_similarity_emits_depth_one_prefix_in_write_through() {
         "write-through must publish the accepted target as codec-3 Depth-1 Prefix"
     );
     assert!(changed_range.contains(&changed_offset));
+    let reduction = appliance.write_through_status().advanced_reduction();
+    assert!(reduction.enabled());
+    assert!(reduction.queries() > 0);
+    assert!(reduction.candidates() > 0);
+    assert!(reduction.base_reads() > 0);
+    assert!(reduction.base_read_bytes() > 0);
+    assert!(reduction.prefix_trials() > 0);
+    assert!(reduction.accepted_prefixes() > 0);
+    assert!(reduction.saved_payload_bytes() > 0);
+    assert_eq!(reduction.errors(), 0);
     assert_eq!(read_named(appliance.namespace(), b"prefix-target"), target);
 }
 
