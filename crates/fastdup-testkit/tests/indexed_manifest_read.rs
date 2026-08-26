@@ -109,12 +109,10 @@ fn indexed_graph_verification_is_bounded_and_corruption_falls_back_to_one_comple
             .expect("construct one immutable Run Set"),
         )
         .expect("activate the Run Set");
-    let active = Arc::new(
-        indexes
-            .recover_active()
-            .expect("recover the complete index graph")
-            .expect("one Run Set is active"),
-    );
+    let active = indexes
+        .recover_active_generation()
+        .expect("recover the complete index graph")
+        .expect("one Run Set is active");
     let verifier = IndexedRequiredChunkVerifier::new(containers, active);
     let required = BTreeMap::from([(entry.chunk_id(), u64::from(entry.logical_length()))]);
 
@@ -139,4 +137,3 @@ fn indexed_graph_verification_is_bounded_and_corruption_falls_back_to_one_comple
     assert!(corrupt_operations.contains(&StorageOperation::ListNames));
 }
 use std::collections::BTreeMap;
-use std::sync::Arc;

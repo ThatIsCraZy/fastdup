@@ -63,15 +63,35 @@ and Recovery Indexes, and the complete target/Base dependency closure. It
 verifies replacement coverage for every reachable victim Chunk. Any changed
 binding invalidates the proof before the retirement barrier.
 
-The first implemented local-proof policy closes unknown reverse dependencies
-conservatively: it fully verifies only the bounded victim set, then requires
-replacement coverage for every logical Chunk in those victims, including
-Chunks not directly reachable from the protected Commit pair. Therefore a live
-dependent Location outside the set cannot lose its Base even though neither a
-catalog fanout estimate nor an Exact miss can prove that dependency absent. A
-victim set is rejected unless the independent-RAW replacement upper bound still
-proves positive physical gain. A future authoritative reverse-dependency
-generation may reduce this over-preservation, but cannot weaken the proof.
+The implementation derives Active/Frozen and open-orphan DATA from the same
+process-local Metadata Root Pin registry that protects their immutable Manifest
+graphs. Online liveness scans the durable Commit pair plus every pinned Manifest
+root. Final revalidation holds the Metadata publication barrier and Commit lock
+until the selection barrier is committed and the RETIRING Exact generation is
+active, so neither a new unpublished root nor a Namespace commit can enter
+between proof validation and retirement authority.
+
+The local proof builds and caches a process-local Reverse Dependency Generation
+for the exact protected Commit pair and Exact activation. It looks up every
+protected target, requires a complete effective ACTIVE Location prefix, and
+records Base-to-dependent edges from authenticated Exact Location fields. An
+incomplete lookup or a live target without an ACTIVE Location fails closed. The
+bounded victim read then replaces only protected target Chunks and Base Chunks
+named by that generation. Catalog fanout estimates and Exact negatives remain
+non-authoritative. The projection is discarded after either binding changes
+and rebuilt after process start; it introduces no frontend write.
+
+Paired Similarity families authenticate the selected Exact Run Set under ADR
+0062, and paired recovery refuses a family bound to any other Run Set. The
+proof's exact activation therefore transitively binds the only Similarity
+generation eligible for online selection; every paired rebuild activates a new
+Exact Run Set before publishing its Similarity family.
+
+A victim set is rejected unless the independent-RAW replacement upper bound
+still proves positive physical gain and remains under the bounded replacement
+budget. When the authoritative protected proof contains no DATA Chunk at all,
+the Reverse Dependency Generation is empty and the proof retires verified
+victims without replacements.
 
 ## Consequences
 
@@ -105,6 +125,13 @@ Recovery derives the scan-selection barrier from effective RETIRING
 transitions; Scrub verifies only effective ACTIVE dependencies while
 authenticating all transition bytes.
 
+Long-lived and cached Manifest readers retain an uncounted Exact-generation
+snapshot, not a generation pin. Each bounded DATA read attempts one operation
+pin; if retirement has closed admission, that read uses verified Container
+discovery instead. This keeps Exact acceleration coherent for the operation
+without allowing an idle file object or an already closed frontend read to
+stall RETIRING drain indefinitely.
+
 Before admitting frontend I/O, the writable appliance runs the Online GC
 recovery finalizer. A restarted process has no surviving predecessor-generation
 pins, so the active generation's effective RETIRING entries are sufficient
@@ -115,7 +142,6 @@ activating REMOVED and is idempotent across every interruption. A finalization
 error prevents writable mount admission rather than weakening the barrier.
 
 This authorizes bounded same-process online execution through the shared
-Container and Exact repositories, including restart completion. Automatic
-candidate scheduling and a durable Appliance Lease remain separate work: an
-offline process must not race the writable daemon merely because the in-process
-pin protocol exists.
+Container and Exact repositories, including restart completion. ADR 0065 adds
+automatic candidate scheduling and ADR 0069 requires one cross-process
+Appliance Lease before recovery or mutation.

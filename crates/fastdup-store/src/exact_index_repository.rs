@@ -1148,6 +1148,16 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         };
         let active = self.open_activated_record(record)?;
         self.audit_run_set_global_invariants(active.run_set())?;
+        if active.run_set().runs().is_empty() {
+            assert!(
+                active.readers.is_empty(),
+                "ASSERT: an empty Exact Run Set cannot own immutable Run readers"
+            );
+            return Ok(Some(ExactIndexLocationAudit {
+                activation: record,
+                active_locations: 0,
+            }));
+        }
         // Membership hints cover every persisted transition, including
         // tombstones. Check their no-false-negative invariant independently
         // from effective Location selection.

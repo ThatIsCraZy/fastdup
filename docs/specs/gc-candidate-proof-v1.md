@@ -1,9 +1,9 @@
 # GC Candidate Proof v1
 
-Status: implemented for bounded same-process online execution. Candidate
-discovery and proof construction do not require a preceding End-to-End Scrub or
-DATA-pool directory scan. Automatic scheduling and the cross-process durable
-Appliance Lease remain deferred.
+Status: implemented for bounded online execution. Candidate discovery and proof
+construction do not require a preceding End-to-End Scrub or DATA-pool directory
+scan. Adaptive scheduling and cross-process Appliance Lease exclusion are
+implemented.
 
 This module implements the bounded proof tier from
 [ADR 0064](../adr/0064-discover-gc-candidates-incrementally-and-prove-victims-locally.md).
@@ -18,9 +18,11 @@ One opaque process-local proof binds:
 - the exact current and immediately previous Commit Records;
 - the catalog descriptor and its incorporated generations;
 - the selected Exact activation record, profile, and Run Set;
+- one Reverse Dependency Generation bound to the same protected Commit pair and
+  Exact activation;
 - at most 64 fully verified victim Container identities, generations, and
   physical lengths;
-- the unique logical Chunk identities and lengths found in those victims;
+- the protected target and required Base Chunk identities found in those victims;
 - the independent-RAW replacement upper bound and positive projected gain.
 
 The protected Commit pair is derived from immutable Namespace/Manifest metadata
@@ -28,23 +30,25 @@ only. Every victim is then read and fully verified through the selected Exact
 generation, including Record CRCs, decoded Chunk IDs, Recovery Index bijection,
 structural commitment, and codec-3 Base resolution.
 
-## Conservative dependency closure
+## Generation-bound dependency closure
 
-The current Exact Index is rebuildable acceleration and cannot prove that a
-Location or reverse Base dependency is absent. Proof v1 therefore requires
-replacement of every unique logical Chunk found in every victim, not only the
-Chunks directly reachable from protected Manifests.
+The proof projects every target in the protected Current/Previous and
+process-local liveness set through the selected Exact generation. Newest
+transition wins per physical Location. Every effective ACTIVE dependent
+Location contributes one Base-to-target edge; lookup truncation or absence of
+an ACTIVE Location fails the proof. The projection is cached only while both
+Commit and Exact bindings remain identical and is rebuilt after restart.
 
-This deliberately over-preserves dead-looking Chunks. It guarantees that an
-unknown live dependent encoding outside the victim set cannot lose a Base when
-the victim disappears. It also means a candidate set is accepted only when:
+Victim verification replaces the intersection of victim Chunks with the union
+of protected targets and projected Bases. Unrelated dead Chunks are not copied.
+A candidate set is accepted only when:
 
 ```text
 independent_raw_replacement_upper_bound < total_victim_physical_bytes
 ```
 
-Proof construction stops before its cumulative publication-derived RAW bound
-would exceed 64 MiB. A first candidate exceeding that bound is rejected. The
+Proof construction stops before the exact required-Chunk RAW bound would exceed
+64 MiB. A first candidate exceeding that bound is rejected. The
 replacement writer retains its existing 48-MiB/32,768-Chunk batch bounds.
 
 ## Execution order
@@ -84,7 +88,7 @@ from resurrecting a victim.
 | --- | --- |
 | liveness producer | clean contiguous Commit WAL; exact current/previous Namespace roots; complete Manifest traversal; Chunk-length consistency |
 | catalog delta | base Commit generation matches descriptor; selected Exact generation is recorded; underflow becomes unknown |
-| proof constructor | bounded shortlist; full victim verification; exact identity/length match; all victim Chunks included; positive conservative gain |
+| proof constructor | bounded shortlist; complete target Exact lookups; Commit/Exact-bound reverse edges; full victim verification; required target/Base coverage; positive conservative gain |
 | executor | Commit and Exact revalidation before work and after replacements; replacement-first Exact activation; identity reread before unlink |
 | offline scrub | independently verify the resulting Namespace, Containers, and active Exact object graph |
 | fault injection | every interrupted replacement, activation, or deletion recovers with complete live Chunk coverage |

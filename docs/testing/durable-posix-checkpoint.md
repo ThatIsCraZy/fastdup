@@ -492,22 +492,24 @@ bytes, maximum eviction steps, available RAM, and Swap use after checkpoints.
   cycle rejection, cross-parent rename, recovery, and scrub share the same
   namespace rules. The compatibility Manifest planner retains its documented
   metadata size limits.
-- Hardlinks, symlinks, xattrs/ACLs, BSD `flock`, automatic GC, and broad
-  Samba/Veeam conformance remain open. Metadata-only allocate, punch, zero,
-  DATA/HOLE seek, collapse, and insert share the durable POSIX seam. The first
-  four reach a real FUSE mount; Linux FUSE rejects collapse/insert flags before
-  dispatching them to userspace. Volatile POSIX record
+- Hardlinks, symlinks, ownership, timestamps, and xattrs/ACLs are durable and
+  connected through FUSE. BSD `flock` and broad Samba/Veeam conformance remain
+  open. Metadata-only allocate, punch, zero, DATA/HOLE seek, collapse, and
+  insert share the durable POSIX seam. The first four reach a real FUSE mount;
+  Linux FUSE rejects collapse/insert flags before dispatching them to
+  userspace. Volatile POSIX record
   locks are connected through FUSE but intentionally do not enter the durable
   namespace. Atomic replacement rename, bounded
   verified read caching, offline end-to-end scrub, and RoW Exact-Index rebuild
   are implemented; the maintenance path is documented in
   [scrub and Exact-Index rebuild](../operations/scrub-and-exact-index-rebuild.md).
 - Commit-Log rotation is implemented through paired bounded slots. A bounded
-  real-process `SIGKILL`/remount/deadline matrix is green. A durable Appliance
-  Lease/format-epoch fence, fake-clock stalled-I/O proofs, broad randomized
-  process-kill/power-cut campaigns, and multi-process writer exclusion remain
-  open.
+  real-process `SIGKILL`/remount/deadline matrix is green. The exclusive
+  kernel-backed Appliance Lease now prevents a second daemon or offline
+  maintenance process from opening the repository. A stable format-epoch
+  fence, fake-clock stalled-I/O proofs, and broad randomized
+  process-kill/power-cut campaigns remain open.
 
-The next recovery-safe scaling slice is Metadata/DATA GC and a durable
-Container-generation high-water, followed by the Appliance Lease and broader
-process-kill/power-cut campaigns.
+The next recovery-hardening slice is the fake-clock stalled-I/O proof and
+broader process-kill/power-cut campaigns, followed by a durable
+Container-generation high-water and stable format-epoch fence.

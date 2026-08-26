@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use fastdup_format::{ChunkId, ContainerId};
-use fastdup_store::{ContainerStore, StoreError};
+use fastdup_store::{ContainerRepository, ContainerStore, FsStorageIo, StoreError};
 
 fn test_root(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -16,6 +16,28 @@ fn id(byte: u8) -> ContainerId {
 
 fn encoded_id(byte: u8) -> String {
     format!("{byte:02x}").repeat(16)
+}
+
+#[test]
+fn empty_container_audit_ignores_an_unrelated_repository_marker() {
+    let root = test_root("audit-empty-with-marker");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let repository = ContainerRepository::new(
+        FsStorageIo::open(&root).expect("create workspace-local Container repository"),
+    );
+    std::fs::write(root.join(".fastdup-benchmark-owner"), b"owned fixture")
+        .expect("create unrelated repository marker");
+
+    let audit = repository
+        .audit_published()
+        .expect("an empty Container repository may contain unrelated names");
+
+    assert_eq!(audit.containers(), 0);
+    assert_eq!(audit.chunks(), 0);
+    assert_eq!(audit.file_bytes(), 0);
+    assert_eq!(audit.generation_high_water(), None);
 }
 
 #[test]

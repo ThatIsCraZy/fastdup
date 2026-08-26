@@ -6,6 +6,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use fastdup_format::{
     ChunkId, ContainerId, ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError,
@@ -181,6 +182,102 @@ fn percentage_greater_than(numerator: u64, denominator: u64, percent: u64) -> bo
     u128::from(numerator) * 100 > u128::from(denominator) * u128::from(percent)
 }
 
+fn build_reverse_dependency_generation<X: StorageIo>(
+    exact: &crate::ActivatedExactIndex<X>,
+    liveness: &GenerationLivenessProof,
+) -> Result<ReverseDependencyGeneration, MaintenanceError> {
+    let mut required_chunks = liveness.online_chunks().clone();
+    let mut dependents_by_base = BTreeMap::<ChunkId, BTreeSet<ChunkId>>::new();
+    let mut dependency_edges = 0_u64;
+    for (chunk_id, logical_length) in liveness.online_chunks() {
+        let logical_length_u32 =
+            u32::try_from(*logical_length).map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+        let lookup = exact.lookup_transitions(*chunk_id, logical_length_u32)?;
+        if !lookup.complete() {
+            return Err(MaintenanceError::IncompleteReverseDependencyGeneration {
+                chunk_id: *chunk_id,
+            });
+        }
+        let mut seen_locations = Vec::new();
+        seen_locations
+            .try_reserve_exact(lookup.candidates().len())
+            .map_err(|_| MaintenanceError::OutOfMemory)?;
+        let mut active_location_seen = false;
+        for entry in lookup.candidates() {
+            assert_eq!(
+                entry.chunk_id(),
+                *chunk_id,
+                "ASSERT: Exact lookup returned another target while building reverse dependencies"
+            );
+            assert_eq!(
+                entry.logical_length(),
+                logical_length_u32,
+                "ASSERT: Exact lookup returned another length while building reverse dependencies"
+            );
+            let location = entry.location();
+            if seen_locations.contains(&location) {
+                continue;
+            }
+            seen_locations.push(location);
+            if entry.transition() != fastdup_format::ExactLocationTransition::Active {
+                continue;
+            }
+            active_location_seen = true;
+            if location.dependency_id() == [0; 32] {
+                continue;
+            }
+            let base_id = ChunkId::from_bytes(location.dependency_id());
+            if let Some(previous) = required_chunks.insert(base_id, *logical_length)
+                && previous != *logical_length
+            {
+                return Err(MaintenanceError::OnlineChunkLengthMismatch {
+                    chunk_id: base_id,
+                    expected: previous,
+                    observed: *logical_length,
+                });
+            }
+            if dependents_by_base
+                .entry(base_id)
+                .or_default()
+                .insert(*chunk_id)
+            {
+                dependency_edges = dependency_edges
+                    .checked_add(1)
+                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
+            }
+        }
+        if !active_location_seen {
+            return Err(MaintenanceError::MissingLiveExactLocation {
+                chunk_id: *chunk_id,
+            });
+        }
+    }
+    let mapped_edges = dependents_by_base
+        .values()
+        .map(BTreeSet::len)
+        .map(|count| u64::try_from(count).expect("ASSERT: reverse edge count fits u64"))
+        .try_fold(0_u64, u64::checked_add)
+        .expect("ASSERT: checked Reverse Dependency Generation edge count cannot overflow");
+    assert_eq!(
+        dependency_edges, mapped_edges,
+        "ASSERT: Reverse Dependency Generation edge count matches its Base map"
+    );
+    assert!(
+        dependents_by_base
+            .keys()
+            .all(|base_id| required_chunks.contains_key(base_id)),
+        "ASSERT: every reverse Base edge contributes replacement liveness"
+    );
+    Ok(ReverseDependencyGeneration {
+        exact_activation: exact.record(),
+        protected_commit_generation: liveness.summary().latest_generation(),
+        protected_targets: liveness.online_chunks().keys().copied().collect(),
+        required_chunks,
+        dependents_by_base,
+        dependency_edges,
+    })
+}
+
 fn next_gc_catalog_generation<G: Clone + StorageIo>(
     catalog: &GcCandidateCatalogRepository<G>,
 ) -> Result<u64, MaintenanceError> {
@@ -210,6 +307,7 @@ pub struct MaintenanceRepository<M, C, X> {
     indexes: ExactIndexRunRepository<X>,
     exact_profile: ExactIndexProfileId,
     rebuild_lock: Arc<Mutex<()>>,
+    reverse_dependency_cache: Arc<Mutex<Option<Arc<ReverseDependencyGeneration>>>>,
 }
 
 impl<M, C, X> MaintenanceRepository<M, C, X> {
@@ -226,6 +324,7 @@ impl<M, C, X> MaintenanceRepository<M, C, X> {
             indexes,
             exact_profile,
             rebuild_lock: Arc::new(Mutex::new(())),
+            reverse_dependency_cache: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -293,13 +392,17 @@ where
                 let scrub = plan.scrub_report();
                 let gc_priority = mode.effective_priority(plan.gc_priority());
                 plan.gc_priority = gc_priority;
-                let gc = run_at_priority(gc_priority, mode, "fastdup-gc", move || {
-                    repository.garbage_collect(plan)
-                })?;
+                let (gc, metadata_gc) =
+                    run_at_priority(gc_priority, mode, "fastdup-gc", move || {
+                        let gc = repository.garbage_collect(plan)?;
+                        let metadata_gc = repository.garbage_collect_metadata()?;
+                        Ok((gc, metadata_gc))
+                    })?;
                 Ok(BackgroundMaintenanceReport {
                     scrub,
                     scrub_priority,
                     gc,
+                    metadata_gc,
                 })
             })
             .map_err(MaintenanceError::MaintenanceThread)?;
@@ -320,6 +423,7 @@ where
     pub fn scrub(&self) -> Result<EndToEndScrubReport, MaintenanceError> {
         let containers = self.containers.audit_published()?;
         let generations = self.generations.scrub_all_with_data(&self.containers)?;
+        self.generations.audit_metadata_mark_catalogs()?;
         let index_audit = self.indexes.audit_active_locations(&self.containers)?;
         if index_audit.is_some_and(|audit| audit.activation().profile() != self.exact_profile) {
             return Err(MaintenanceError::ExactProfileMismatch);
@@ -333,6 +437,32 @@ where
             exact_activation_generation: index_audit.map(|audit| audit.activation().generation()),
             exact_active_locations_verified: index_audit
                 .map_or(0, crate::ExactIndexLocationAudit::active_locations),
+        })
+    }
+
+    /// Collects verified Metadata Objects outside every retained Commit graph.
+    ///
+    /// It verifies the complete retained Metadata graph, includes every live
+    /// reader/successor root pin, and verifies every deletion candidate identity
+    /// before the first unlink. Publication and Commit barriers exclude partial
+    /// graph races; one Metadata-directory sync completes the removal batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first Generation-Log, graph, identity, I/O, or durability
+    /// failure without treating an unverified name as garbage.
+    pub fn garbage_collect_metadata(
+        &self,
+    ) -> Result<MetadataGarbageCollectionReport, MaintenanceError> {
+        let summary = self.generations.garbage_collect_metadata()?;
+        Ok(MetadataGarbageCollectionReport {
+            objects_removed: summary.objects_removed(),
+            bytes_removed: summary.bytes_removed(),
+            objects_retained: summary.objects_retained(),
+            mark_mode: summary.mark_mode(),
+            exact_reason: summary.exact_reason(),
+            catalog_generation: summary.catalog_generation(),
+            metrics: summary.metrics(),
         })
     }
 
@@ -391,12 +521,11 @@ where
     /// Builds bounded deletion evidence from a catalog shortlist without a
     /// preceding complete End-to-End Scrub or complete Container-pool scan.
     ///
-    /// Version 1 deliberately over-preserves every logical Chunk found in a
-    /// selected victim, including apparently dead Chunks. This closes unknown
-    /// incoming Base dependencies without trusting an Exact-Index miss or a
-    /// catalog fanout estimate. The proof is accepted only when the
-    /// independent-RAW replacement upper bound still leaves positive physical
-    /// gain.
+    /// The proof first projects every protected target through the complete
+    /// active Exact generation and adds the Base ID from every effective ACTIVE
+    /// dependent Location. It then preserves only protected targets and those
+    /// generation-bound Bases found in selected victims. No catalog fanout,
+    /// Similarity hint, or Exact negative becomes deletion authority.
     ///
     /// The returned capability binds the current/previous Commit Records, the
     /// active Exact generation, the catalog generation, and fully verified
@@ -411,6 +540,7 @@ where
     ///
     /// Panics only if an audited catalog shortlist contains the same
     /// Container identity twice.
+    #[allow(clippy::too_many_lines)]
     pub fn prove_gc_candidates(
         &self,
         shortlist: &GcCandidateShortlist,
@@ -424,10 +554,10 @@ where
             return Err(MaintenanceError::ExactProfileMismatch);
         }
         let generation_proof = self.generations.scan_online_liveness()?;
+        let reverse_dependencies = self.reverse_dependency_generation(&exact, &generation_proof)?;
         let mut victims = BTreeMap::new();
         let mut replacement_chunks = BTreeMap::new();
         let mut victim_bytes = 0_u64;
-        let mut raw_bound = 0_u64;
         let mut reachable_victim_chunks = BTreeSet::new();
 
         for row in shortlist
@@ -436,15 +566,6 @@ where
             .copied()
             .take(GC_CANDIDATE_PROOF_MAX_VICTIMS)
         {
-            let projected = raw_bound
-                .checked_add(row.raw_replacement_upper_bound())
-                .ok_or(MaintenanceError::ArithmeticOverflow)?;
-            if projected > GC_CANDIDATE_PROOF_MAX_RAW_REPLACEMENT_BYTES {
-                if victims.is_empty() {
-                    return Err(MaintenanceError::GcCandidateProofBudgetExceeded);
-                }
-                break;
-            }
             let container = self
                 .containers
                 .read_with_index(row.container_id(), &exact)?;
@@ -453,24 +574,52 @@ where
             {
                 return Err(MaintenanceError::GcCandidateIdentityMismatch);
             }
+            let mut newly_required = Vec::new();
             for record in container.records() {
                 let logical_length = u64::try_from(record.payload().len())
                     .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
-                if let Some(previous) = replacement_chunks.insert(record.chunk_id(), logical_length)
-                    && previous != logical_length
-                {
+                let Some(expected_length) = reverse_dependencies
+                    .required_chunks
+                    .get(&record.chunk_id())
+                    .copied()
+                else {
+                    continue;
+                };
+                if expected_length != logical_length {
                     return Err(MaintenanceError::OnlineChunkLengthMismatch {
                         chunk_id: record.chunk_id(),
-                        expected: previous,
+                        expected: expected_length,
                         observed: logical_length,
                     });
                 }
-                if generation_proof
-                    .online_chunks()
-                    .contains_key(&record.chunk_id())
+                if let Some(previous) = replacement_chunks.insert(record.chunk_id(), logical_length)
                 {
-                    reachable_victim_chunks.insert(record.chunk_id());
+                    if previous != logical_length {
+                        return Err(MaintenanceError::OnlineChunkLengthMismatch {
+                            chunk_id: record.chunk_id(),
+                            expected: previous,
+                            observed: logical_length,
+                        });
+                    }
+                } else {
+                    newly_required.push(record.chunk_id());
                 }
+                reachable_victim_chunks.insert(record.chunk_id());
+            }
+            let projected = replacement_file_bytes_upper_bound(&replacement_chunks)?;
+            if projected > GC_CANDIDATE_PROOF_MAX_RAW_REPLACEMENT_BYTES {
+                for chunk_id in newly_required {
+                    let removed = replacement_chunks.remove(&chunk_id);
+                    assert!(
+                        removed.is_some(),
+                        "ASSERT: proof-budget rollback removes every newly required Chunk"
+                    );
+                    reachable_victim_chunks.remove(&chunk_id);
+                }
+                if victims.is_empty() {
+                    return Err(MaintenanceError::GcCandidateProofBudgetExceeded);
+                }
+                break;
             }
             let previous = victims.insert(row.container_id().bytes(), row.container_id());
             assert!(
@@ -480,10 +629,15 @@ where
             victim_bytes = victim_bytes
                 .checked_add(row.physical_bytes())
                 .ok_or(MaintenanceError::ArithmeticOverflow)?;
-            raw_bound = projected;
         }
         if victims.is_empty() {
             return Err(MaintenanceError::EmptyGcCandidateProof);
+        }
+        if generation_proof.online_chunks().is_empty() {
+            assert!(
+                replacement_chunks.is_empty() && reachable_victim_chunks.is_empty(),
+                "ASSERT: an empty protected DATA set cannot require GC replacement coverage"
+            );
         }
         let replacement_upper = replacement_file_bytes_upper_bound(&replacement_chunks)?;
         if replacement_upper >= victim_bytes {
@@ -497,7 +651,7 @@ where
         Ok(GcCandidateProof {
             catalog: shortlist.descriptor(),
             generation_proof,
-            exact_activation: exact.record(),
+            reverse_dependencies,
             exact_profile: self.exact_profile,
             victims,
             victim_bytes,
@@ -506,6 +660,38 @@ where
             reachable_victim_chunks: reachable_victim_chunks.len(),
             priority,
         })
+    }
+
+    fn reverse_dependency_generation(
+        &self,
+        exact: &crate::ActivatedExactIndex<X>,
+        liveness: &GenerationLivenessProof,
+    ) -> Result<Arc<ReverseDependencyGeneration>, MaintenanceError> {
+        let exact_activation = exact.record();
+        let protected_commit_generation = liveness.summary().latest_generation();
+        let mut cache = self
+            .reverse_dependency_cache
+            .lock()
+            .expect("ASSERT: Reverse Dependency Generation cache lock poisoned");
+        if let Some(cached) = cache.as_ref()
+            && cached.exact_activation == exact_activation
+            && cached.protected_commit_generation == protected_commit_generation
+            && cached.protected_targets.len() == liveness.online_chunks().len()
+            && cached
+                .protected_targets
+                .iter()
+                .copied()
+                .eq(liveness.online_chunks().keys().copied())
+            && liveness
+                .online_chunks()
+                .iter()
+                .all(|(chunk_id, length)| cached.required_chunks.get(chunk_id) == Some(length))
+        {
+            return Ok(Arc::clone(cached));
+        }
+        let built = Arc::new(build_reverse_dependency_generation(exact, liveness)?);
+        *cache = Some(Arc::clone(&built));
+        Ok(built)
     }
 
     /// Advances an existing publication-seeded GC catalog to the current
@@ -607,38 +793,111 @@ where
         X: Send + Sync + 'static,
         G: Clone + Send + Sync + StorageIo + 'static,
     {
+        self.run_adaptive_online_gc_cycle_with_workers(
+            catalog,
+            pool_usage,
+            mode,
+            thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+        )
+    }
+
+    /// Runs one adaptive quantum while capping relocation encoding workers.
+    /// Candidate proof, Exact transitions, and unlink remain serialized; only
+    /// the existing bounded replacement encoder uses this CPU limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::run_adaptive_online_gc_cycle`].
+    pub fn run_adaptive_online_gc_cycle_with_workers<G>(
+        &self,
+        catalog: &GcCandidateCatalogRepository<G>,
+        pool_usage: DataPoolUsage,
+        mode: OnlineGcRunMode,
+        relocation_workers: NonZeroUsize,
+    ) -> Result<OnlineGcCycleReport, MaintenanceError>
+    where
+        M: Send + 'static,
+        C: Send + 'static,
+        X: Send + Sync + 'static,
+        G: Clone + Send + Sync + StorageIo + 'static,
+    {
         let repository = self.clone();
         let catalog = catalog.clone();
         run_at_priority(
             mode.priority(),
             MaintenanceExecutionMode::Adaptive,
             "fastdup-online-gc",
-            move || repository.run_online_gc_cycle(&catalog, pool_usage, mode),
+            move || repository.run_online_gc_cycle(&catalog, pool_usage, mode, relocation_workers),
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_online_gc_cycle<G: Clone + StorageIo>(
         &self,
         catalog: &GcCandidateCatalogRepository<G>,
         pool_usage: DataPoolUsage,
         mode: OnlineGcRunMode,
+        relocation_workers: NonZeroUsize,
     ) -> Result<OnlineGcCycleReport, MaintenanceError>
     where
         X: Send + Sync + 'static,
     {
+        assert_eq!(
+            thread::current().name(),
+            Some("fastdup-online-gc"),
+            "ASSERT: adaptive Online-GC I/O runs only on its dedicated maintenance worker"
+        );
+        let started = Instant::now();
+        let mut metrics = OnlineGcMetrics {
+            relocation_workers: u64::try_from(relocation_workers.get())
+                .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
+            ..OnlineGcMetrics::default()
+        };
+        let phase_started = Instant::now();
         self.finalize_recovered_online_gc()?;
+        metrics.recovery_wall = phase_started.elapsed();
+        let phase_started = Instant::now();
+        let metadata_gc = self.garbage_collect_metadata()?;
+        metrics.metadata_gc_wall = phase_started.elapsed();
+        let phase_started = Instant::now();
         if catalog.recover_latest()?.is_none() {
-            self.rebuild_gc_candidate_catalog(catalog, next_gc_catalog_generation(catalog)?)?;
+            let rebuilt =
+                self.rebuild_gc_candidate_catalog(catalog, next_gc_catalog_generation(catalog)?)?;
+            metrics.catalog_write_bytes = metrics
+                .catalog_write_bytes
+                .checked_add(rebuilt.file_length())
+                .ok_or(MaintenanceError::ArithmeticOverflow)?;
         }
         let mut next_generation = next_gc_catalog_generation(catalog)?;
+        let before_refresh = catalog
+            .recover_latest()?
+            .ok_or(MaintenanceError::MissingGcCandidateCatalog)?
+            .descriptor();
         match self.refresh_gc_candidate_catalog(catalog, next_generation) {
-            Ok(_) => {}
+            Ok(refreshed) => {
+                if refreshed.generation() != before_refresh.generation() {
+                    metrics.catalog_write_bytes = metrics
+                        .catalog_write_bytes
+                        .checked_add(refreshed.file_length())
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                }
+            }
             Err(MaintenanceError::Generation(GenerationError::LivenessDeltaBaseUnavailable {
                 ..
             })) => {
-                self.rebuild_gc_candidate_catalog(catalog, next_generation)?;
+                let rebuilt = self.rebuild_gc_candidate_catalog(catalog, next_generation)?;
+                metrics.catalog_write_bytes = metrics
+                    .catalog_write_bytes
+                    .checked_add(rebuilt.file_length())
+                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
                 next_generation = next_gc_catalog_generation(catalog)?;
-                self.refresh_gc_candidate_catalog(catalog, next_generation)?;
+                let refreshed = self.refresh_gc_candidate_catalog(catalog, next_generation)?;
+                if refreshed.generation() != rebuilt.generation() {
+                    metrics.catalog_write_bytes = metrics
+                        .catalog_write_bytes
+                        .checked_add(refreshed.file_length())
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                }
             }
             Err(error) => return Err(error),
         }
@@ -647,41 +906,94 @@ where
             .ok_or(MaintenanceError::MissingGcCandidateCatalog)?;
         let shortlist =
             snapshot.shortlist(mode.selection_mode(), mode.shortlist_limit(), u64::MAX)?;
+        metrics.catalog_examined_bytes = snapshot.descriptor().file_length();
+        metrics.shortlisted_candidates = u64::try_from(shortlist.rows().len())
+            .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+        metrics.candidate_catalog_wall = phase_started.elapsed();
         if shortlist.rows().is_empty() {
+            metrics.total_wall = started.elapsed();
             return Ok(OnlineGcCycleReport {
                 outcome: OnlineGcCycleOutcome::NoCandidates,
                 catalog: snapshot.descriptor(),
+                metadata_gc,
+                metrics,
             });
         }
+        let phase_started = Instant::now();
         let proof = match self.prove_gc_candidates(&shortlist, pool_usage) {
-            Ok(proof) => proof,
+            Ok(proof) => {
+                metrics.proved_victims = u64::try_from(proof.victim_containers())
+                    .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+                metrics.reverse_dependency_edges = proof.reverse_dependency_edges();
+                metrics.reverse_dependency_required_chunks =
+                    u64::try_from(proof.reverse_dependency_required_chunks())
+                        .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+                metrics.candidate_proof_read_bytes = proof.victim_bytes();
+                metrics.candidate_proof_wall = phase_started.elapsed();
+                proof
+            }
             Err(
                 MaintenanceError::EmptyGcCandidateProof
                 | MaintenanceError::GcCandidateProofBudgetExceeded
                 | MaintenanceError::UnprofitableGcCandidateProof { .. },
             ) => {
+                metrics.candidate_proof_wall = phase_started.elapsed();
+                metrics.aborted_candidates = metrics.shortlisted_candidates;
+                metrics.total_wall = started.elapsed();
                 return Ok(OnlineGcCycleReport {
                     outcome: OnlineGcCycleOutcome::NoProfitableCandidates,
                     catalog: snapshot.descriptor(),
+                    metadata_gc,
+                    metrics,
                 });
             }
             Err(error) if gc_candidate_catalog_is_stale(&error) => {
                 let generation = next_gc_catalog_generation(catalog)?;
                 let catalog = self.rebuild_gc_candidate_catalog(catalog, generation)?;
+                metrics.candidate_proof_wall = phase_started.elapsed();
+                metrics.aborted_candidates = metrics.shortlisted_candidates;
+                metrics.catalog_write_bytes = metrics
+                    .catalog_write_bytes
+                    .checked_add(catalog.file_length())
+                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                metrics.total_wall = started.elapsed();
                 return Ok(OnlineGcCycleReport {
                     outcome: OnlineGcCycleOutcome::CatalogRebuilt,
                     catalog,
+                    metadata_gc,
+                    metrics,
                 });
             }
             Err(error) => return Err(error),
         };
-        let retirement = self.begin_online_gc_retirement(proof)?;
+        let victim_bytes = proof.victim_bytes();
+        let phase_started = Instant::now();
+        let retirement = self.begin_online_gc_retirement_with_workers(proof, relocation_workers)?;
         let collected = self.finish_online_gc_retirement(retirement)?;
+        metrics.relocation_wall = phase_started.elapsed();
+        metrics.relocation_read_bytes = victim_bytes;
+        metrics.relocation_write_bytes = collected.replacement_bytes();
+        metrics.unlinked_bytes = collected.bytes_removed();
+        metrics.retiring_activation_wall = collected.retiring_activation_wall();
+        metrics.pin_drain_wall = collected.pin_drain_wall();
+        metrics.victim_verify_wall = collected.victim_verify_wall();
+        metrics.unlink_wall = collected.unlink_wall();
+        metrics.data_sync_wall = collected.data_sync_wall();
+        metrics.removed_activation_wall = collected.removed_activation_wall();
+        let phase_started = Instant::now();
         let generation = next_gc_catalog_generation(catalog)?;
         let catalog = self.rebuild_gc_candidate_catalog(catalog, generation)?;
+        metrics.catalog_write_bytes = metrics
+            .catalog_write_bytes
+            .checked_add(catalog.file_length())
+            .ok_or(MaintenanceError::ArithmeticOverflow)?;
+        metrics.post_collection_catalog_wall = phase_started.elapsed();
+        metrics.total_wall = started.elapsed();
         Ok(OnlineGcCycleReport {
             outcome: OnlineGcCycleOutcome::Collected(collected),
             catalog,
+            metadata_gc,
+            metrics,
         })
     }
 
@@ -710,7 +1022,7 @@ where
     ) -> Result<GarbageCollectionReport, MaintenanceError> {
         let GcCandidateProof {
             generation_proof,
-            exact_activation,
+            reverse_dependencies,
             exact_profile,
             victims,
             victim_bytes,
@@ -718,6 +1030,16 @@ where
             priority,
             ..
         } = proof;
+        let exact_activation = reverse_dependencies.exact_activation;
+        assert_eq!(
+            reverse_dependencies.protected_commit_generation,
+            generation_proof.summary().latest_generation(),
+            "ASSERT: reverse dependencies and DATA liveness bind the same Commit generation"
+        );
+        assert!(
+            !victims.is_empty(),
+            "ASSERT: GC retirement consumes a nonempty candidate proof"
+        );
         if exact_profile != self.exact_profile {
             return Err(MaintenanceError::GcPlanProfileMismatch);
         }
@@ -739,6 +1061,7 @@ where
             &victims,
             &replacement_chunks,
             first_replacement_generation,
+            thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
             |container_id| Ok(self.containers.read_with_index(container_id, &exact)?),
         )?;
         if !self.generations.gc_proof_is_current(&generation_proof)?
@@ -750,7 +1073,8 @@ where
         if !self.generations.gc_proof_is_current(&generation_proof)? {
             return Err(MaintenanceError::StaleGcPlan);
         }
-        let bytes_removed = self.containers.remove_verified_published(&victims)?;
+        let (bytes_removed, removal_metrics) =
+            self.containers.remove_verified_published(&victims)?;
         assert_eq!(
             bytes_removed, victim_bytes,
             "ASSERT: proved victim identities retain their immutable lengths"
@@ -763,6 +1087,12 @@ where
             replacement_bytes: replacements.bytes,
             chunks_relocated: replacements.chunks,
             priority,
+            retiring_activation_wall: Duration::ZERO,
+            pin_drain_wall: Duration::ZERO,
+            victim_verify_wall: removal_metrics.verify_wall(),
+            unlink_wall: removal_metrics.unlink_wall(),
+            data_sync_wall: removal_metrics.sync_wall(),
+            removed_activation_wall: Duration::ZERO,
         })
     }
 
@@ -778,6 +1108,11 @@ where
     ///
     /// Returns stale proof bindings, victim/replacement verification,
     /// transition publication, or allocation failures. No victim is removed.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internally constructed candidate proof contains no
+    /// victim, which violates the proof constructor's invariant.
     pub fn begin_online_gc_retirement(
         &self,
         proof: GcCandidateProof,
@@ -785,9 +1120,24 @@ where
     where
         X: Send + Sync + 'static,
     {
+        self.begin_online_gc_retirement_with_workers(
+            proof,
+            thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+        )
+    }
+
+    fn begin_online_gc_retirement_with_workers(
+        &self,
+        proof: GcCandidateProof,
+        relocation_workers: NonZeroUsize,
+    ) -> Result<OnlineGcRetirement<X>, MaintenanceError>
+    where
+        X: Send + Sync + 'static,
+    {
+        let retirement_started = Instant::now();
         let GcCandidateProof {
             generation_proof,
-            exact_activation,
+            reverse_dependencies,
             exact_profile,
             victims,
             victim_bytes,
@@ -795,6 +1145,16 @@ where
             priority,
             ..
         } = proof;
+        let exact_activation = reverse_dependencies.exact_activation;
+        assert_eq!(
+            reverse_dependencies.protected_commit_generation,
+            generation_proof.summary().latest_generation(),
+            "ASSERT: reverse dependencies and DATA liveness bind the same Commit generation"
+        );
+        assert!(
+            !victims.is_empty(),
+            "ASSERT: Online-GC retirement consumes a nonempty candidate proof"
+        );
         if exact_profile != self.exact_profile {
             return Err(MaintenanceError::GcPlanProfileMismatch);
         }
@@ -817,6 +1177,7 @@ where
             &victims,
             &replacement_chunks,
             first_replacement_generation,
+            relocation_workers,
             |container_id| {
                 let container = self.containers.read_with_index(container_id, &exact)?;
                 retiring_entries
@@ -830,31 +1191,35 @@ where
                 Ok(container)
             },
         )?;
-        if !self.generations.gc_proof_is_current(&generation_proof)?
-            || !self.gc_exact_binding_is_current(exact_activation)?
-        {
-            return Err(MaintenanceError::StaleGcPlan);
-        }
-        let selection_barrier = self
-            .containers
-            .prepare_retiring_selection_barrier(&victims)?;
-        let mut transitions = std::mem::take(&mut replacements.locations);
-        transitions
-            .try_reserve(retiring_entries.len())
-            .map_err(|_| MaintenanceError::OutOfMemory)?;
-        transitions.extend(retiring_entries.iter().copied());
-        let transition = match self.indexes.append_level_zero_if_active(
-            self.exact_profile,
-            exact_activation,
-            transitions,
-        ) {
-            Ok(transition) => transition,
-            Err(ExactIndexStoreError::ActivationChanged) => {
-                return Err(MaintenanceError::StaleGcPlan);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        selection_barrier.commit();
+        let transition = self
+            .generations
+            .apply_if_gc_proof_current(&generation_proof, || {
+                if !self.gc_exact_binding_is_current(exact_activation)? {
+                    return Err(MaintenanceError::StaleGcPlan);
+                }
+                let selection_barrier = self
+                    .containers
+                    .prepare_retiring_selection_barrier(&victims)?;
+                let mut transitions = std::mem::take(&mut replacements.locations);
+                transitions
+                    .try_reserve(retiring_entries.len())
+                    .map_err(|_| MaintenanceError::OutOfMemory)?;
+                transitions.extend(retiring_entries.iter().copied());
+                let transition = match self.indexes.append_level_zero_if_active(
+                    self.exact_profile,
+                    exact_activation,
+                    transitions,
+                ) {
+                    Ok(transition) => transition,
+                    Err(ExactIndexStoreError::ActivationChanged) => {
+                        return Err(MaintenanceError::StaleGcPlan);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                selection_barrier.commit();
+                Ok(transition)
+            })?
+            .ok_or(MaintenanceError::StaleGcPlan)?;
         let drain = transition
             .into_retired()
             .ok_or(MaintenanceError::GcRetirementMissingPreviousGeneration)?;
@@ -865,6 +1230,7 @@ where
             retiring_entries,
             drain,
             priority,
+            retiring_activation_wall: retirement_started.elapsed(),
         })
     }
 
@@ -895,9 +1261,21 @@ where
             retiring_entries,
             drain,
             priority,
+            retiring_activation_wall,
         } = retirement;
+        assert!(
+            !victims.is_empty(),
+            "ASSERT: victim unlink consumes a nonempty RETIRING capability"
+        );
+        assert!(
+            !retiring_entries.is_empty(),
+            "ASSERT: victim unlink follows durable RETIRING location activation"
+        );
+        let drain_started = Instant::now();
         drain.wait();
-        let bytes_removed = self.containers.remove_verified_published(&victims)?;
+        let pin_drain_wall = drain_started.elapsed();
+        let (bytes_removed, removal_metrics) =
+            self.containers.remove_verified_published(&victims)?;
         assert_eq!(
             bytes_removed, victim_bytes,
             "ASSERT: online GC victim identities retain their immutable lengths"
@@ -909,8 +1287,10 @@ where
         for retiring in retiring_entries {
             removed.push(ExactIndexEntry::removed(retiring)?);
         }
+        let removed_activation_started = Instant::now();
         self.indexes
             .append_level_zero(self.exact_profile, removed)?;
+        let removed_activation_wall = removed_activation_started.elapsed();
         self.containers.remove_retiring_selection_barrier(&victims);
         Ok(GarbageCollectionReport {
             containers_removed: u64::try_from(victims.len())
@@ -920,6 +1300,12 @@ where
             replacement_bytes: replacements.bytes,
             chunks_relocated: replacements.chunks,
             priority,
+            retiring_activation_wall,
+            pin_drain_wall,
+            victim_verify_wall: removal_metrics.verify_wall(),
+            unlink_wall: removal_metrics.unlink_wall(),
+            data_sync_wall: removal_metrics.sync_wall(),
+            removed_activation_wall,
         })
     }
 
@@ -1101,6 +1487,12 @@ where
                 replacement_bytes: 0,
                 chunks_relocated: 0,
                 priority: gc_priority,
+                retiring_activation_wall: Duration::ZERO,
+                pin_drain_wall: Duration::ZERO,
+                victim_verify_wall: Duration::ZERO,
+                unlink_wall: Duration::ZERO,
+                data_sync_wall: Duration::ZERO,
+                removed_activation_wall: Duration::ZERO,
             });
         }
         let first_replacement_generation = scrub
@@ -1112,6 +1504,7 @@ where
             &compaction_victims,
             &replacement_chunks,
             first_replacement_generation,
+            thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
         )?;
         if !self.generations.gc_proof_is_current(&generation_proof)? {
             return Err(MaintenanceError::StaleGcPlan);
@@ -1128,7 +1521,7 @@ where
         if !self.generations.gc_proof_is_current(&generation_proof)? {
             return Err(MaintenanceError::StaleGcPlan);
         }
-        let bytes_removed = self
+        let (bytes_removed, removal_metrics) = self
             .containers
             .remove_verified_published(&removal_candidates)?;
         let expected_removed = reclaimable_bytes
@@ -1146,6 +1539,12 @@ where
             replacement_bytes: replacements.bytes,
             chunks_relocated: replacements.chunks,
             priority: gc_priority,
+            retiring_activation_wall: Duration::ZERO,
+            pin_drain_wall: Duration::ZERO,
+            victim_verify_wall: removal_metrics.verify_wall(),
+            unlink_wall: removal_metrics.unlink_wall(),
+            data_sync_wall: removal_metrics.sync_wall(),
+            removed_activation_wall: Duration::ZERO,
         })
     }
 
@@ -1154,10 +1553,15 @@ where
         victims: &BTreeMap<[u8; 16], ContainerId>,
         required: &BTreeMap<ChunkId, u64>,
         first_generation: u64,
+        relocation_workers: NonZeroUsize,
     ) -> Result<ReplacementPublication, MaintenanceError> {
-        self.publish_gc_replacements_using(victims, required, first_generation, |container_id| {
-            Ok(self.containers.read(container_id)?)
-        })
+        self.publish_gc_replacements_using(
+            victims,
+            required,
+            first_generation,
+            relocation_workers,
+            |container_id| Ok(self.containers.read(container_id)?),
+        )
     }
 
     fn publish_gc_replacements_using(
@@ -1165,11 +1569,9 @@ where
         victims: &BTreeMap<[u8; 16], ContainerId>,
         required: &BTreeMap<ChunkId, u64>,
         first_generation: u64,
+        relocation_workers: NonZeroUsize,
         mut read_victim: impl FnMut(ContainerId) -> Result<SealedContainer, MaintenanceError>,
     ) -> Result<ReplacementPublication, MaintenanceError> {
-        if required.is_empty() {
-            return Ok(ReplacementPublication::default());
-        }
         let mut seen = BTreeSet::new();
         let mut batch = Vec::<Vec<u8>>::new();
         let mut batch_bytes = 0_u64;
@@ -1201,7 +1603,8 @@ where
                 if !batch.is_empty()
                     && (would_exceed_bytes || batch.len() == GC_REPLACEMENT_CHUNK_LIMIT)
                 {
-                    let completed = self.publish_gc_replacement_batch(generation, &batch)?;
+                    let completed =
+                        self.publish_gc_replacement_batch(generation, &batch, relocation_workers)?;
                     published.add(completed)?;
                     generation = generation
                         .checked_add(1)
@@ -1224,7 +1627,11 @@ where
             }
         }
         if !batch.is_empty() {
-            published.add(self.publish_gc_replacement_batch(generation, &batch)?)?;
+            published.add(self.publish_gc_replacement_batch(
+                generation,
+                &batch,
+                relocation_workers,
+            )?)?;
         }
         if seen.len() != required.len() {
             return Err(MaintenanceError::MissingReplacementChunk);
@@ -1246,6 +1653,7 @@ where
         &self,
         generation: u64,
         chunks: &[Vec<u8>],
+        relocation_workers: NonZeroUsize,
     ) -> Result<ReplacementPublication, MaintenanceError> {
         assert!(
             !chunks.is_empty(),
@@ -1258,12 +1666,11 @@ where
             .try_reserve_exact(regions.len())
             .map_err(|_| MaintenanceError::OutOfMemory)?;
         region_refs.extend(regions.iter().map(Vec::as_slice));
-        let workers = thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
         let verified = self.containers.publish_gc_replacement_adaptive_verified(
             container_id,
             generation,
             &region_refs,
-            workers,
+            relocation_workers,
         )?;
         assert_eq!(
             verified.chunk_count(),
@@ -1938,14 +2345,53 @@ pub struct GarbageCollectionPlan {
     gc_priority: MaintenancePriority,
 }
 
-/// Opaque bounded authority for one candidate-local conservative compaction.
-/// Construction fully verifies only the selected victims and over-preserves
-/// every victim Chunk to close unknown incoming dependency edges.
+/// Opaque generation-bound projection from live target Chunks to every Base
+/// Chunk named by an effective ACTIVE Exact Location.
+#[derive(Debug)]
+pub struct ReverseDependencyGeneration {
+    exact_activation: ExactIndexActivationRecord,
+    protected_commit_generation: Option<u64>,
+    protected_targets: BTreeSet<ChunkId>,
+    required_chunks: BTreeMap<ChunkId, u64>,
+    dependents_by_base: BTreeMap<ChunkId, BTreeSet<ChunkId>>,
+    dependency_edges: u64,
+}
+
+impl ReverseDependencyGeneration {
+    #[must_use]
+    pub fn exact_activation(&self) -> ExactIndexActivationRecord {
+        self.exact_activation
+    }
+
+    #[must_use]
+    pub const fn protected_commit_generation(&self) -> Option<u64> {
+        self.protected_commit_generation
+    }
+
+    #[must_use]
+    pub fn required_chunks(&self) -> usize {
+        self.required_chunks.len()
+    }
+
+    #[must_use]
+    pub fn base_chunks(&self) -> usize {
+        self.dependents_by_base.len()
+    }
+
+    #[must_use]
+    pub const fn dependency_edges(&self) -> u64 {
+        self.dependency_edges
+    }
+}
+
+/// Opaque bounded authority for one candidate-local compaction. Construction
+/// fully verifies only selected victims and carries a Reverse Dependency
+/// Generation bound to the same Commit and Exact generations.
 #[derive(Debug)]
 pub struct GcCandidateProof {
     catalog: GcCandidateCatalogDescriptor,
     generation_proof: GenerationLivenessProof,
-    exact_activation: ExactIndexActivationRecord,
+    reverse_dependencies: Arc<ReverseDependencyGeneration>,
     exact_profile: ExactIndexProfileId,
     victims: BTreeMap<[u8; 16], ContainerId>,
     victim_bytes: u64,
@@ -1968,6 +2414,7 @@ pub struct OnlineGcRetirement<X> {
     retiring_entries: Vec<ExactIndexEntry>,
     drain: ExactIndexGenerationDrain<X>,
     priority: MaintenancePriority,
+    retiring_activation_wall: Duration,
 }
 
 impl<X> OnlineGcRetirement<X> {
@@ -2019,8 +2466,18 @@ impl GcCandidateProof {
     }
 
     #[must_use]
-    pub const fn exact_activation(&self) -> ExactIndexActivationRecord {
-        self.exact_activation
+    pub fn exact_activation(&self) -> ExactIndexActivationRecord {
+        self.reverse_dependencies.exact_activation
+    }
+
+    #[must_use]
+    pub fn reverse_dependency_edges(&self) -> u64 {
+        self.reverse_dependencies.dependency_edges
+    }
+
+    #[must_use]
+    pub fn reverse_dependency_required_chunks(&self) -> usize {
+        self.reverse_dependencies.required_chunks.len()
     }
 
     #[must_use]
@@ -2096,6 +2553,71 @@ pub struct GarbageCollectionReport {
     replacement_bytes: u64,
     chunks_relocated: u64,
     priority: MaintenancePriority,
+    retiring_activation_wall: Duration,
+    pin_drain_wall: Duration,
+    victim_verify_wall: Duration,
+    unlink_wall: Duration,
+    data_sync_wall: Duration,
+    removed_activation_wall: Duration,
+}
+
+/// Evidence returned after one exact verified Metadata-object deletion batch
+/// and durability barrier, or after an unchanged liveness epoch reused that
+/// batch's clean mark-catalog result.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetadataGarbageCollectionReport {
+    objects_removed: u64,
+    bytes_removed: u64,
+    objects_retained: u64,
+    mark_mode: crate::MetadataGcMarkMode,
+    exact_reason: Option<crate::MetadataGcExactReason>,
+    catalog_generation: Option<u64>,
+    metrics: crate::MetadataGcMetrics,
+}
+
+impl MetadataGarbageCollectionReport {
+    #[must_use]
+    pub const fn objects_removed(self) -> u64 {
+        self.objects_removed
+    }
+
+    #[must_use]
+    pub const fn bytes_removed(self) -> u64 {
+        self.bytes_removed
+    }
+
+    #[must_use]
+    pub const fn objects_retained(self) -> u64 {
+        self.objects_retained
+    }
+
+    /// Returns `true` when this cycle traversed the complete retained graph
+    /// and inventoried published Metadata Objects instead of reusing a clean
+    /// incrementally invalidated catalog state.
+    #[must_use]
+    pub const fn exact_mark_performed(self) -> bool {
+        self.mark_mode.has_deletion_authority()
+    }
+
+    #[must_use]
+    pub const fn mark_mode(self) -> crate::MetadataGcMarkMode {
+        self.mark_mode
+    }
+
+    #[must_use]
+    pub const fn exact_reason(self) -> Option<crate::MetadataGcExactReason> {
+        self.exact_reason
+    }
+
+    #[must_use]
+    pub const fn catalog_generation(self) -> Option<u64> {
+        self.catalog_generation
+    }
+
+    #[must_use]
+    pub const fn metrics(self) -> crate::MetadataGcMetrics {
+        self.metrics
+    }
 }
 
 impl GarbageCollectionReport {
@@ -2133,6 +2655,36 @@ impl GarbageCollectionReport {
     pub const fn priority(self) -> MaintenancePriority {
         self.priority
     }
+
+    #[must_use]
+    pub const fn retiring_activation_wall(self) -> Duration {
+        self.retiring_activation_wall
+    }
+
+    #[must_use]
+    pub const fn pin_drain_wall(self) -> Duration {
+        self.pin_drain_wall
+    }
+
+    #[must_use]
+    pub const fn victim_verify_wall(self) -> Duration {
+        self.victim_verify_wall
+    }
+
+    #[must_use]
+    pub const fn unlink_wall(self) -> Duration {
+        self.unlink_wall
+    }
+
+    #[must_use]
+    pub const fn data_sync_wall(self) -> Duration {
+        self.data_sync_wall
+    }
+
+    #[must_use]
+    pub const fn removed_activation_wall(self) -> Duration {
+        self.removed_activation_wall
+    }
 }
 
 /// Join capability for one asynchronous Scrub followed by safe GC.
@@ -2169,6 +2721,7 @@ pub struct BackgroundMaintenanceReport {
     scrub: EndToEndScrubReport,
     scrub_priority: MaintenancePriority,
     gc: GarbageCollectionReport,
+    metadata_gc: MetadataGarbageCollectionReport,
 }
 
 /// Evidence from idempotently finalizing one recovered RETIRING generation.
@@ -2187,6 +2740,8 @@ pub struct OnlineGcRecoveryReport {
 pub struct OnlineGcCycleReport {
     outcome: OnlineGcCycleOutcome,
     catalog: GcCandidateCatalogDescriptor,
+    metadata_gc: MetadataGarbageCollectionReport,
+    metrics: OnlineGcMetrics,
 }
 
 impl OnlineGcCycleReport {
@@ -2199,6 +2754,93 @@ impl OnlineGcCycleReport {
     pub const fn catalog(self) -> GcCandidateCatalogDescriptor {
         self.catalog
     }
+
+    #[must_use]
+    pub const fn metadata_gc(self) -> MetadataGarbageCollectionReport {
+        self.metadata_gc
+    }
+
+    #[must_use]
+    pub const fn metrics(self) -> OnlineGcMetrics {
+        self.metrics
+    }
+}
+
+/// Phase timing and physical work accounting for one bounded Online-GC
+/// quantum. Byte counts describe verified Container and immutable catalog
+/// work; they deliberately exclude filesystem cache hit/miss guesses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OnlineGcMetrics {
+    recovery_wall: Duration,
+    metadata_gc_wall: Duration,
+    candidate_catalog_wall: Duration,
+    candidate_proof_wall: Duration,
+    relocation_wall: Duration,
+    retiring_activation_wall: Duration,
+    pin_drain_wall: Duration,
+    victim_verify_wall: Duration,
+    unlink_wall: Duration,
+    data_sync_wall: Duration,
+    removed_activation_wall: Duration,
+    post_collection_catalog_wall: Duration,
+    total_wall: Duration,
+    catalog_examined_bytes: u64,
+    catalog_write_bytes: u64,
+    candidate_proof_read_bytes: u64,
+    relocation_read_bytes: u64,
+    relocation_write_bytes: u64,
+    unlinked_bytes: u64,
+    shortlisted_candidates: u64,
+    proved_victims: u64,
+    aborted_candidates: u64,
+    reverse_dependency_edges: u64,
+    reverse_dependency_required_chunks: u64,
+    relocation_workers: u64,
+}
+
+macro_rules! online_gc_metric_getter {
+    ($name:ident, $field:ident, $ty:ty) => {
+        #[must_use]
+        pub const fn $name(self) -> $ty {
+            self.$field
+        }
+    };
+}
+
+impl OnlineGcMetrics {
+    online_gc_metric_getter!(recovery_wall, recovery_wall, Duration);
+    online_gc_metric_getter!(metadata_gc_wall, metadata_gc_wall, Duration);
+    online_gc_metric_getter!(candidate_catalog_wall, candidate_catalog_wall, Duration);
+    online_gc_metric_getter!(candidate_proof_wall, candidate_proof_wall, Duration);
+    online_gc_metric_getter!(relocation_wall, relocation_wall, Duration);
+    online_gc_metric_getter!(retiring_activation_wall, retiring_activation_wall, Duration);
+    online_gc_metric_getter!(pin_drain_wall, pin_drain_wall, Duration);
+    online_gc_metric_getter!(victim_verify_wall, victim_verify_wall, Duration);
+    online_gc_metric_getter!(unlink_wall, unlink_wall, Duration);
+    online_gc_metric_getter!(data_sync_wall, data_sync_wall, Duration);
+    online_gc_metric_getter!(removed_activation_wall, removed_activation_wall, Duration);
+    online_gc_metric_getter!(
+        post_collection_catalog_wall,
+        post_collection_catalog_wall,
+        Duration
+    );
+    online_gc_metric_getter!(total_wall, total_wall, Duration);
+    online_gc_metric_getter!(catalog_examined_bytes, catalog_examined_bytes, u64);
+    online_gc_metric_getter!(catalog_write_bytes, catalog_write_bytes, u64);
+    online_gc_metric_getter!(candidate_proof_read_bytes, candidate_proof_read_bytes, u64);
+    online_gc_metric_getter!(relocation_read_bytes, relocation_read_bytes, u64);
+    online_gc_metric_getter!(relocation_write_bytes, relocation_write_bytes, u64);
+    online_gc_metric_getter!(unlinked_bytes, unlinked_bytes, u64);
+    online_gc_metric_getter!(shortlisted_candidates, shortlisted_candidates, u64);
+    online_gc_metric_getter!(proved_victims, proved_victims, u64);
+    online_gc_metric_getter!(aborted_candidates, aborted_candidates, u64);
+    online_gc_metric_getter!(reverse_dependency_edges, reverse_dependency_edges, u64);
+    online_gc_metric_getter!(
+        reverse_dependency_required_chunks,
+        reverse_dependency_required_chunks,
+        u64
+    );
+    online_gc_metric_getter!(relocation_workers, relocation_workers, u64);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2256,6 +2898,11 @@ impl BackgroundMaintenanceReport {
     pub const fn gc(self) -> GarbageCollectionReport {
         self.gc
     }
+
+    #[must_use]
+    pub const fn metadata_gc(self) -> MetadataGarbageCollectionReport {
+        self.metadata_gc
+    }
 }
 
 #[derive(Debug)]
@@ -2272,6 +2919,12 @@ pub enum MaintenanceError {
     MissingGcCandidateCatalog,
     GcCandidateProofBudgetExceeded,
     GcCandidateIdentityMismatch,
+    IncompleteReverseDependencyGeneration {
+        chunk_id: ChunkId,
+    },
+    MissingLiveExactLocation {
+        chunk_id: ChunkId,
+    },
     GcRetirementMissingPreviousGeneration,
     EmptyGcCandidateProof,
     UnprofitableGcCandidateProof {

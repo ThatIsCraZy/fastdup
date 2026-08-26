@@ -14,7 +14,9 @@ The governing decisions are [ADR 0011](../adr/0011-use-hierarchical-immutable-ma
 [ADR 0034](../adr/0034-reserve-inode-ids-before-visibility.md), and
 [ADR 0037](../adr/0037-separate-structural-recovery-from-current-data-proof.md),
 plus the bounded-log protocol in
-[ADR 0039](../adr/0039-rotate-namespace-commit-log-through-paired-slots.md).
+[ADR 0039](../adr/0039-rotate-namespace-commit-log-through-paired-slots.md) and
+Metadata-object liveness in
+[ADR 0066](../adr/0066-mark-metadata-from-durable-graphs-and-live-root-pins.md).
 Container data bytes and their separate publication protocol remain defined by
 [Container format v1](container-v1.md) and
 [Container Store v1](container-store-v1.md).
@@ -449,8 +451,10 @@ invisible metadata orphans.
 
 ## Writer and publication protocol
 
-Only one external writer may use a repository. The current repository assumes
-that exclusivity; it does not yet implement the durable Appliance Lease.
+Only one external writer may use a repository. Every writable daemon and
+offline maintenance process acquires the exclusive kernel-backed Appliance
+Lease before recovery or repository mutation and retains it for its complete
+lifetime, as required by ADR 0069.
 
 ### Immutable Metadata Object publication
 
@@ -585,6 +589,60 @@ directory scan is bounded Container-envelope discovery for the generation
 high-water; healthy indexed checkpoints perform no Container directory listing
 or whole-Container read for graph proof.
 
+## Metadata Mark Catalog v1/v2
+
+The rebuildable catalog name is
+`metadata-mark-catalog-<20-digit-generation>.run`; temporary publication uses
+`.metadata-mark-catalog-<20-digit-generation>.building`. It is not a Metadata
+Object and never participates in reachability.
+
+Each immutable run contains a 4,096-byte header, `row_count` strictly
+Object-ID-sorted 32-byte rows, zero padding to 4,096 bytes, and one mirrored
+4,096-byte footer. Header magic is `FDMMARK1`; footer magic is `FDMMARKF`.
+Both envelopes encode fields explicitly:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | header/footer magic |
+| 8 | 2 | format version `1` or `2`; writers emit `2` |
+| 10 | 2 | envelope bytes `4096` |
+| 12 | 2 | row bytes `32` |
+| 14 | 2 | v1: reserved zero; v2: run kind (`1` Snapshot, `2` Addition) |
+| 16 | 8 | nonzero catalog generation |
+| 24 | 32 | domain-separated BLAKE3 binding over the selected Commit Record bytes |
+| 56 | 8 | row count |
+| 64 | 8 | row offset `4096` |
+| 72 | 8 | aligned footer offset |
+| 80 | 8 | exact file length |
+| 88 | 32 | domain-separated BLAKE3 row-stream hash |
+| 120 | 8 | v1: reserved zero; v2: base generation (`0` for Snapshot, immediate predecessor for Addition) |
+| 128 | 32 | domain-separated BLAKE3 envelope hash with this field zeroed |
+| 160 | 3936 | reserved zero |
+
+The writer streams rows in 256-KiB batches, rereads and audits the complete
+temporary run, syncs it, and publishes without replacement. A Snapshot contains
+one complete exact mark. An Addition contains only newly published Metadata
+Objects classified by a successful proof-bearing, nonrotating Commit and names
+the immediately preceding catalog generation. Addition rows are sorted exact
+identities, but the run is acceleration only and cannot authorize unlink.
+
+The frontend Commit path journals these identities in memory and performs no
+catalog file I/O. A later maintenance quantum publishes and directory-syncs the
+Addition. Unclassified publication, unpublished-pin drain, uncertain Commit
+durability, Commit-WAL rotation, process restart, a broken chain, or 32
+consecutive Addition runs forces an exact Snapshot. Exact GC publishes a higher
+generation, removes all older catalog names and verified `.fdm` garbage, then
+performs one directory sync. Scrub validates every published run and requires
+each Addition to extend the immediately preceding published generation; a later
+Snapshot starts a new valid chain. Normal collection may discard a corrupt old
+run because only the exact Commit/Pin graph can authorize deletion.
+
+Proof-bearing complete, append, replacement, truncate, and splice writers carry
+every newly published Manifest-node identity into this journal. Releasing a pin
+for a root still named by the durable predecessor does not create a liveness
+contraction; releasing an unpublished intermediate root does and therefore
+forces an exact Snapshot.
+
 ## Crash outcomes
 
 - A crash before Metadata Object file synchronization may leave incomplete or
@@ -687,6 +745,7 @@ is required before that repository can advance again.
 | Commit Record is atomic visibility | publish and sync dependencies before append or rotation; re-read exact target; sync its slot last | accept only internally valid slots with exact cross-slot bridge continuity, validate transitions forward, then prove live graph candidates backward | exhaustive fail-before/fail-after rotation recovers only the previous or complete next generation; a 16,400-Commit lifetime gate crosses the old cap |
 | DATA is durable before visibility and verified before reads | initial/recovered graphs verify every referenced ID and length; a serialized successor composes unchanged predecessor proof with complete changed-dependency verification before WAL append | recovery completely verifies the selected current/previous candidate; demand reads re-verify the containing container; any unusable index candidate invokes the complete scan | healthy recovery proves only the newest graph, missing newest DATA falls back atomically once, unpinned history is never exposed, index-page corruption takes the scan path, suffix-proof work is independent of preserved-prefix size, and corruption after file construction fails demand reads |
 | Length-changing splice is one immutable successor | check predecessor range/result-length/allocation equations; encode partial DATA as bounded v2 DATA_SLICE extents; publish replacement leaves and rewritten parents child-first; append WAL last | completely traverse the selected root, recompute every partition and v2 allocation total, verify full-Chunk identity/length/offset for every slice, and verify every replacement DATA dependency | insertion, cross-child deletion, shifted-suffix identity, DATA-slice boundaries, and exhaustive fail-before/fail-after recover only the predecessor or complete successor |
+| Metadata GC never removes a live object | mark every selected Commit graph and every live Metadata Root Pin while holding the publication/commit barriers; only classify proof-bearing nonrotating commits as additive hints; verify every candidate before unlink; publish the audited mark catalog and sync the combined directory transition last | recovery and scrub traverse the same retained Commit graphs; live readers retain their root pins independently; scrub audits snapshot/addition chains without treating them as roots | an inflight publication blocks collection, a reader survives WAL rotation and collection, every snapshot/delta publication fault retries, rotation and unpublished-pin drain force exact proof, and fail-before/fail-after deletion always leaves a scrub-valid graph |
 | Counts cannot select unbounded allocations | preflight payload lengths and record equations | prove counts against the bounded payload before vector allocation | `entry_count = u32::MAX` fails as invalid payload under a constrained address space |
 | Policy selection is explicit | store the configured nonzero Policy Set ID in every record | refuse any reached record whose ID is not exactly supported | an unknown newer policy refuses recovery instead of silently rolling back |
 
@@ -703,18 +762,16 @@ This implemented checkpoint intentionally does **not** provide:
   graph proof and demand lookup do not read whole Container payloads for that
   purpose, while the plain methods deliberately retain the verified
   scan/refusal behavior;
-- a metadata garbage collector; installed reads, allocation queries, append,
-  equal-length replacement, truncate, and arbitrary middle splice/concat are
-  tree-native, while compatibility inspection may still flatten only bounded
-  recipes;
-- a scalable Namespace tree: NamespaceRoot v3 rewrites one bounded object and
-  keeps Xattrs and ACLs inline; nested directories are supported, while
-  symlinks, timestamps, and external large-metadata objects remain future work;
-- automatic dirty-tail repair, an offline paired-slot scrub, or a stable
-  downgrade/format-epoch fence;
+- reconstruction of process-local Metadata Root Pins after restart: immutable
+  Snapshot and Addition runs suppress unchanged and safely additive online
+  cycles, but the first cycle after process start deliberately rebuilds the
+  exact mark because those unpublished pins ended with the process;
+- a scalable Namespace tree: NamespaceRoot v4 rewrites one bounded object and
+  keeps xattrs, ACLs, timestamps, and symlink targets inline; external
+  large-metadata objects remain future work;
+- automatic dirty-tail repair or a stable downgrade/format-epoch fence;
 - serialization or transitive verification of the Policy Set itself;
-- durable Appliance Lease enforcement, concurrent-writer coordination,
-  metadata GC, data-tier Recovery Checkpoints, or metadata-tier-loss rebuild.
+- data-tier Recovery Checkpoints or metadata-tier-loss rebuild.
 
 These omissions are stage boundaries, not implicit format promises. Unknown
 future kinds, versions, flags, tree nodes, and record types require explicit

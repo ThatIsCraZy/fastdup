@@ -1,0 +1,109 @@
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use fastdup_appliance::checkpoint_policy_set_v1;
+use fastdup_format::{ManifestExtent, ManifestLeaf, MetadataObjectId, NamespaceRoot};
+use fastdup_store::{FsStorageIo, GenerationRepository};
+
+fn unique_test_root(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test clock must be after the Unix epoch")
+        .as_nanos();
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(".artifacts/tests")
+        .join(format!("{name}-{}-{nonce}", std::process::id()))
+}
+
+fn metadata_path(root: &Path, object_id: MetadataObjectId) -> PathBuf {
+    let mut name = String::with_capacity(64 + ".fdm".len());
+    for byte in object_id.bytes() {
+        write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    name.push_str(".fdm");
+    root.join(name)
+}
+
+#[test]
+fn offline_metadata_gc_cli_removes_an_orphan_and_scrubs_the_retained_graph() {
+    let root = unique_test_root("metadata-gc-cli");
+    let metadata_root = root.join("metadata");
+    let container_root = root.join("containers");
+    std::fs::create_dir_all(&container_root).expect("create workspace-local container root");
+
+    let generations = GenerationRepository::new(
+        FsStorageIo::open(&metadata_root).expect("create workspace-local metadata repository"),
+        checkpoint_policy_set_v1(),
+    );
+    generations
+        .commit_namespace(
+            &NamespaceRoot::new(4_096, 2, 0, Vec::new(), Vec::new())
+                .expect("empty namespace root is valid"),
+        )
+        .expect("commit the retained namespace graph");
+    let orphan = generations
+        .publish_manifest(
+            &ManifestLeaf::new(
+                4_096,
+                vec![ManifestExtent::Fill {
+                    logical_length: 4_096,
+                    value: 0xA5,
+                }],
+            )
+            .expect("fill-only orphan manifest is valid"),
+        )
+        .expect("publish a valid but uncommitted Metadata object");
+    let orphan_path = metadata_path(&metadata_root, orphan);
+    assert!(
+        orphan_path.is_file(),
+        "ASSERT: published orphan must exist before Metadata GC"
+    );
+    drop(generations);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fastdup-maintenance"))
+        .args([
+            "--offline",
+            "metadata-gc",
+            metadata_root
+                .to_str()
+                .expect("workspace-local metadata path is UTF-8"),
+            container_root
+                .to_str()
+                .expect("workspace-local container path is UTF-8"),
+        ])
+        .output()
+        .expect("execute the real maintenance CLI");
+    assert!(
+        output.status.success(),
+        "ASSERT: Metadata GC CLI failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    assert!(
+        stdout.contains("metadata_gc_ok=true objects_removed=1"),
+        "ASSERT: CLI must report exactly the injected orphan: {stdout}"
+    );
+    assert!(
+        stdout.contains("mark_mode=exact_snapshot"),
+        "ASSERT: CLI must distinguish the exact Metadata mark mode: {stdout}"
+    );
+    assert!(
+        stdout.contains("exact_reason=process_start")
+            && stdout.contains("object_graph_read_bytes=")
+            && stdout.contains("catalog_write_bytes=")
+            && stdout.contains("wall_us="),
+        "ASSERT: CLI must expose Metadata-GC reason, work, and latency: {stdout}"
+    );
+    assert!(
+        stdout.contains("scrub_ok=true"),
+        "ASSERT: CLI must scrub the retained graph after collection: {stdout}"
+    );
+    assert!(
+        !orphan_path.exists(),
+        "ASSERT: Metadata GC must unlink the injected orphan"
+    );
+}

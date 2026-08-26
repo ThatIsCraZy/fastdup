@@ -3,12 +3,12 @@
 Status: draft, pre-stable format. The field-by-field writer and reader,
 streaming successor merge, immutable publication, mmap and bounded-read scans,
 empty-generation handling, corruption fallback, and storage failpoint tests are
-implemented. Metadata-liveness deltas and the conservative candidate-local
+implemented. Metadata-liveness deltas and the generation-bound candidate-local
 `GcCandidateProof` are implemented. The shared repository path also implements
 same-process `RETIRING`, Exact-generation pin drain, victim unlink, and
-`REMOVED`. Envelope-only catalog bootstrap, adaptive daemon scheduling, and the
-local online control command are implemented; cross-process Appliance Lease
-exclusion remains follow-on work.
+`REMOVED`. Envelope-only catalog bootstrap, adaptive daemon scheduling, the
+local online control command, and cross-process Appliance Lease exclusion are
+implemented.
 
 This format implements the non-authoritative discovery tier from
 [ADR 0064](../adr/0064-discover-gc-candidates-incrementally-and-prove-victims-locally.md).

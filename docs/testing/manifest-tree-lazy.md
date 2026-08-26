@@ -54,7 +54,10 @@ two bounded v2 DATA_SLICE extents around the replacement without DATA ingest.
 The exhaustive fail-before/fail-after matrix spans splice Metadata publication,
 directory durability, Namespace publication, and the final WAL sync; crash
 recovery exposes only the byte-exact predecessor or complete successor.
-Metadata GC remains explicit follow-up work.
+Online Metadata GC now marks the complete retained Commit-WAL graph plus
+in-process Metadata Root Pins before reclaiming unreachable `.fdm` objects;
+the publication barrier and long-lived-reader tests cover the formerly open
+publication/read races.
 
 Manifest Inner Node v2 authenticates each child's allocated-byte total. A
 truncate can therefore account for and discard complete right-hand subtrees

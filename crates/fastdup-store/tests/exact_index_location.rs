@@ -24,6 +24,28 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 #[test]
+fn empty_active_exact_generation_audits_as_zero_active_locations() {
+    let root = test_root("empty-active");
+    let storage = FsStorageIo::open(&root).expect("open shared repository root");
+    let containers = ContainerRepository::new(storage.clone());
+    let profile = ExactIndexProfileId::new([0x90; 32]).expect("profile identity is nonzero");
+    let indexes = ExactIndexRunRepository::new(storage);
+    let empty = ExactIndexRunSet::new(profile, 1, Vec::new())
+        .expect("an empty Run Set is a durable Exact tombstone");
+    indexes
+        .activate(&empty)
+        .expect("activate the empty Exact tombstone");
+
+    let audit = indexes
+        .audit_active_locations(&containers)
+        .expect("scrub accepts an active empty Exact generation")
+        .expect("the empty Exact generation remains selected");
+
+    assert_eq!(audit.active_locations(), 0);
+    assert_eq!(audit.activation().run_set_generation(), 1);
+}
+
+#[test]
 fn exact_candidate_is_usable_only_after_pairing_with_its_verified_container() {
     let root = test_root("raw");
     let storage = FsStorageIo::open(&root).expect("open shared repository root");

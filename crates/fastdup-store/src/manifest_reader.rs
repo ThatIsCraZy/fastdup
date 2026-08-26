@@ -3,8 +3,9 @@ use crate::manifest_tree::{
     allocated_bytes_in_manifest_tree_range, read_manifest_tree_range,
 };
 use crate::{
-    ActivatedExactIndex, ContainerRepository, ExactIndexGenerationPin, StorageIo, StoreError,
-    VerifiedReadCache,
+    ActivatedExactIndex, ContainerRepository, ExactIndexGenerationPin,
+    ExactIndexGenerationSnapshot, StorageIo, StoreError, VerifiedReadCache,
+    generation::MetadataRootPin,
 };
 use fastdup_format::{
     ChunkId, MAX_METADATA_OBJECT_BYTES, ManifestExtent, ManifestLeaf, MetadataObjectId,
@@ -111,6 +112,7 @@ impl ManifestRecipe for FlatManifestRecipe {
 struct TreeManifestRecipe<M> {
     summary: ManifestTreeSummary,
     metadata: M,
+    _root_pin: MetadataRootPin,
 }
 
 impl<M> fmt::Debug for TreeManifestRecipe<M> {
@@ -177,7 +179,7 @@ trait VerifiedChunkReader: fmt::Debug + Send + Sync {
 
 struct ActiveIndexChunkReader<I, J> {
     containers: ContainerRepository<I>,
-    index: ExactIndexGenerationPin<J>,
+    index: ExactIndexGenerationSnapshot<J>,
 }
 
 impl<I, J> fmt::Debug for ActiveIndexChunkReader<I, J> {
@@ -198,8 +200,13 @@ where
         chunk_id: ChunkId,
         logical_length: u64,
     ) -> Result<Vec<u8>, StoreError> {
+        let Some(index) = self.index.try_pin() else {
+            return self
+                .containers
+                .read_verified_chunk(chunk_id, logical_length);
+        };
         self.containers
-            .read_verified_chunk_with_index(&self.index, chunk_id, logical_length)
+            .read_verified_chunk_with_index(&index, chunk_id, logical_length)
     }
 }
 
@@ -263,34 +270,40 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         summary: ManifestTreeSummary,
         metadata: M,
         containers: ContainerRepository<I>,
+        root_pin: MetadataRootPin,
     ) -> Self
     where
         M: Send + Sync + StorageIo + 'static,
     {
         Self {
-            recipe: Arc::new(TreeManifestRecipe { summary, metadata }),
+            recipe: Arc::new(TreeManifestRecipe {
+                summary,
+                metadata,
+                _root_pin: root_pin,
+            }),
             containers,
             indexed_reader: None,
             read_cache: None,
         }
     }
 
-    /// Pins one already recovered Exact Index generation behind this Manifest
-    /// reader. Subsequent ordinary demand reads use its bounded candidates and
-    /// retain the verified Container scan as their correctness fallback.
+    /// Binds one already recovered Exact Index generation behind this Manifest
+    /// reader. Each ordinary demand read takes a bounded operation pin and
+    /// retains the verified Container scan as its correctness fallback after
+    /// retirement closes admission.
     ///
-    /// Pinning by [`Arc`] prevents a concurrent activation from changing the
-    /// physical-location view halfway through a file read. The index remains
-    /// acceleration state and does not extend the lifetime of DATA objects.
+    /// A dormant or cached Manifest reader owns only an uncounted generation
+    /// snapshot, so it cannot delay GC pin-drain or extend the lifetime of DATA
+    /// objects.
     #[must_use]
-    pub fn with_active_index<J>(mut self, index: ExactIndexGenerationPin<J>) -> Self
+    pub fn with_active_index<J>(mut self, index: &ExactIndexGenerationPin<J>) -> Self
     where
         I: Clone + Send + Sync + 'static,
         J: Send + Sync + StorageIo + 'static,
     {
         self.indexed_reader = Some(Arc::new(ActiveIndexChunkReader {
             containers: self.containers.clone(),
-            index,
+            index: index.snapshot(),
         }));
         self
     }

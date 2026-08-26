@@ -11,6 +11,7 @@ mod gc_candidate_catalog;
 mod manifest;
 mod manifest_inner;
 mod metadata;
+mod metadata_mark_catalog;
 mod namespace;
 mod similarity_index;
 mod similarity_index_family;
@@ -67,6 +68,11 @@ pub use manifest_inner::{
 pub use metadata::{
     MAX_METADATA_OBJECT_BYTES, METADATA_HEADER_BYTES, MetadataFormatError, MetadataObjectId,
     MetadataObjectKind, metadata_object_kind,
+};
+pub use metadata_mark_catalog::{
+    METADATA_MARK_CATALOG_HEADER_BYTES, METADATA_MARK_CATALOG_ROW_BYTES, MetadataMarkCatalogAudit,
+    MetadataMarkCatalogDescriptor, MetadataMarkCatalogError, MetadataMarkCatalogRunKind,
+    MetadataMarkCatalogStreamEncoder, metadata_mark_commit_binding,
 };
 pub use namespace::{
     DurableInode, DurableInodeKind, DurableRootMetadata, DurableTimes, DurableTimestamp,

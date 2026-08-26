@@ -8,10 +8,12 @@ use fastdup_format::{
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, ExactIndexStoreError,
     GcCandidateCatalogRepository, GcCandidateSelectionMode, GenerationRepository, MaintenanceError,
-    MaintenanceExecutionMode, MaintenancePriority, MaintenanceRepository, OnlineGcCycleOutcome,
-    OnlineGcRunMode, SimilarityIndexRepository, StorageIo, StoreError,
+    MaintenanceExecutionMode, MaintenancePriority, MaintenanceRepository, MetadataGcExactReason,
+    MetadataGcMarkMode, OnlineGcCycleOutcome, OnlineGcRunMode, SimilarityIndexRepository,
+    StorageIo, StoreError,
 };
-use fastdup_testkit::{MemoryStorageIo, StorageOperation};
+use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
+use std::time::Duration;
 
 fn seeded_repositories() -> (
     GenerationRepository<MemoryStorageIo>,
@@ -88,6 +90,1267 @@ fn seeded_repositories_using(
         .expect("commit fixture DATA generation");
 
     (generations, containers, indexes, profile)
+}
+
+#[test]
+fn metadata_gc_removes_an_uncommitted_manifest_without_touching_the_committed_graph() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
+    let orphan = ManifestLeaf::new(
+        4_096,
+        vec![ManifestExtent::Fill {
+            logical_length: 4_096,
+            value: 0x5a,
+        }],
+    )
+    .expect("orphan Manifest is valid");
+    let orphan_root = generations
+        .publish_manifest(&orphan)
+        .expect("publish an uncommitted Metadata graph");
+    let maintenance = MaintenanceRepository::new(generations.clone(), containers, indexes, profile);
+
+    let report = maintenance
+        .garbage_collect_metadata()
+        .expect("collect unreachable Metadata Objects");
+
+    assert_eq!(report.objects_removed(), 1);
+    assert!(report.bytes_removed() != 0);
+    assert!(generations.read_manifest(orphan_root).is_err());
+    maintenance
+        .scrub()
+        .expect("Metadata GC retains the complete committed graph");
+    assert_eq!(
+        metadata
+            .list_names()
+            .expect("list retained Metadata names")
+            .iter()
+            .filter(|name| name.strip_suffix(".fdm").is_some())
+            .count(),
+        3,
+        "reservation root, committed Namespace root, and committed Manifest remain"
+    );
+}
+
+#[test]
+fn unchanged_metadata_gc_cycle_uses_the_clean_mark_catalog() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata, MemoryStorageIo::new());
+    let maintenance = MaintenanceRepository::new(generations, containers, indexes, profile);
+
+    let first = maintenance
+        .garbage_collect_metadata()
+        .expect("establish the exact Metadata mark catalog");
+    assert!(first.exact_mark_performed());
+    assert_eq!(first.mark_mode(), MetadataGcMarkMode::ExactSnapshot);
+    assert_eq!(
+        first.exact_reason(),
+        Some(MetadataGcExactReason::ProcessStart)
+    );
+    assert!(first.metrics().object_graph_read_bytes() > 0);
+    assert!(first.metrics().catalog_write_bytes() > 0);
+    assert_eq!(first.metrics().catalog_chain_runs(), 1);
+
+    let unchanged = maintenance
+        .garbage_collect_metadata()
+        .expect("reuse the unchanged clean Metadata mark catalog");
+    assert!(!unchanged.exact_mark_performed());
+    assert_eq!(unchanged.mark_mode(), MetadataGcMarkMode::Reused);
+    assert_eq!(unchanged.exact_reason(), None);
+    assert_eq!(unchanged.metrics().catalog_write_bytes(), 0);
+    assert_eq!(unchanged.objects_removed(), 0);
+    assert_eq!(unchanged.objects_retained(), first.objects_retained());
+    assert_eq!(first.catalog_generation(), Some(1));
+    assert_eq!(unchanged.catalog_generation(), Some(1));
+}
+
+#[test]
+fn committed_successor_advances_metadata_catalog_with_an_additive_delta_run() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
+    let maintenance =
+        MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+    let exact = maintenance
+        .garbage_collect_metadata()
+        .expect("establish the exact Metadata mark catalog");
+    assert_eq!(exact.catalog_generation(), Some(1));
+
+    let installed = generations
+        .recover_latest_with_data(&containers)
+        .expect("recover installed predecessor")
+        .expect("fixture has an installed predecessor");
+    let predecessor =
+        fastdup_store::SuccessorPredecessor::from_committed_record(installed.record());
+    let manifest = ManifestLeaf::new(
+        8_192,
+        vec![ManifestExtent::Fill {
+            logical_length: 8_192,
+            value: 0x4d,
+        }],
+    )
+    .expect("successor Manifest is valid");
+    let proof = generations
+        .publish_manifest_successor(predecessor, &manifest)
+        .expect("publish proof-bearing successor Metadata");
+    let namespace = NamespaceRoot::new(
+        1_024,
+        3,
+        2,
+        vec![
+            DurableInode::new(2, 0o640, 1_000, 1_000, 1, 2, 8_192, proof.summary().root())
+                .expect("successor inode is valid"),
+        ],
+        vec![NamespaceEntry::new(1, 2, b"backup.vbk".to_vec()).expect("successor name is valid")],
+    )
+    .expect("successor Namespace Root is valid");
+    let _committed = generations
+        .commit_namespace_with_successor_proofs_using(
+            &namespace,
+            &containers,
+            predecessor,
+            &[proof],
+            &containers,
+        )
+        .expect("commit proof-bearing successor");
+    assert_eq!(
+        metadata
+            .list_names()
+            .expect("list catalog names before maintenance")
+            .iter()
+            .filter(|name| name.starts_with("metadata-mark-catalog-"))
+            .count(),
+        1,
+        "the frontend commit path journals only in RAM and publishes no catalog file"
+    );
+
+    let delta = maintenance
+        .garbage_collect_metadata()
+        .expect("publish an additive Metadata root delta");
+
+    assert!(!delta.exact_mark_performed());
+    assert_eq!(delta.mark_mode(), MetadataGcMarkMode::AdditionDelta);
+    assert_eq!(delta.exact_reason(), None);
+    assert!(delta.metrics().catalog_write_bytes() > 0);
+    assert_eq!(delta.metrics().catalog_chain_runs(), 2);
+    assert_eq!(delta.objects_removed(), 0);
+    assert_eq!(delta.catalog_generation(), Some(2));
+    assert_eq!(delta.objects_retained(), exact.objects_retained() + 2);
+    maintenance
+        .scrub()
+        .expect("snapshot plus additive Metadata delta remains scrub-valid");
+    assert_eq!(
+        metadata
+            .list_names()
+            .expect("list Metadata catalog runs")
+            .iter()
+            .filter(|name| name.starts_with("metadata-mark-catalog-"))
+            .count(),
+        2,
+        "the exact snapshot and additive delta are both retained"
+    );
+}
+
+#[test]
+fn path_local_successors_classify_every_new_metadata_node_as_additive() {
+    #[derive(Clone, Copy, Debug)]
+    enum PathEdit {
+        Replacement,
+        Truncate,
+        Splice,
+    }
+
+    for edit in [PathEdit::Replacement, PathEdit::Truncate, PathEdit::Splice] {
+        let (generations, containers, indexes, profile) = seeded_repositories();
+        let maintenance =
+            MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+        maintenance
+            .garbage_collect_metadata()
+            .expect("establish exact Metadata mark state");
+        let installed = generations
+            .recover_latest_with_data(&containers)
+            .expect("recover installed predecessor")
+            .expect("fixture has an installed predecessor");
+        let predecessor =
+            fastdup_store::SuccessorPredecessor::from_committed_record(installed.record());
+        let inode = installed
+            .namespace_root()
+            .file_inodes()
+            .next()
+            .expect("fixture contains one file inode");
+        let original = generations
+            .read_manifest(inode.manifest_root())
+            .expect("read installed Manifest");
+        let proof = generations
+            .publish_manifest_successor(predecessor, &original)
+            .expect("reopen installed graph as a successor proof");
+        let logical_size = original.file_length();
+        let proof = match edit {
+            PathEdit::Replacement => generations
+                .publish_manifest_replacement_successor(
+                    proof,
+                    0..logical_size,
+                    &[ManifestExtent::Fill {
+                        logical_length: logical_size,
+                        value: 0x44,
+                    }],
+                )
+                .expect("publish path-local replacement nodes"),
+            PathEdit::Truncate => generations
+                .publish_manifest_truncate_successor(proof, logical_size - 1)
+                .expect("publish truncate-local nodes"),
+            PathEdit::Splice => generations
+                .publish_manifest_splice_successor(
+                    proof,
+                    0..1,
+                    &[ManifestExtent::Fill {
+                        logical_length: 2,
+                        value: 0x55,
+                    }],
+                )
+                .expect("publish splice-local nodes"),
+        };
+        let namespace = NamespaceRoot::new(
+            1_024,
+            3,
+            2,
+            vec![
+                DurableInode::new(
+                    2,
+                    0o640,
+                    1_000,
+                    1_000,
+                    1,
+                    2,
+                    proof.summary().logical_size(),
+                    proof.summary().root(),
+                )
+                .expect("successor inode is valid"),
+            ],
+            vec![
+                NamespaceEntry::new(1, 2, b"backup.vbk".to_vec()).expect("successor name is valid"),
+            ],
+        )
+        .expect("successor Namespace Root is valid");
+        generations
+            .commit_namespace_with_successor_proofs_using(
+                &namespace,
+                &containers,
+                predecessor,
+                &[proof],
+                &containers,
+            )
+            .expect("commit path-local proof-bearing successor");
+
+        let delta = maintenance
+            .garbage_collect_metadata()
+            .expect("persist classified path-local additions");
+        assert_eq!(
+            delta.mark_mode(),
+            MetadataGcMarkMode::AdditionDelta,
+            "{edit:?} must remain additive"
+        );
+        assert!(!delta.exact_mark_performed());
+        maintenance
+            .scrub()
+            .expect("path-local Metadata delta remains scrub-valid");
+    }
+}
+
+#[test]
+fn blocked_metadata_delta_io_does_not_block_a_frontend_commit() {
+    let metadata = MemoryStorageIo::new();
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        metadata,
+        StorageOperation::WriteAt,
+        ".metadata-mark-catalog-",
+    );
+    let policy = PolicySetId::new([0xd1; 32]).expect("policy ID is nonzero");
+    let profile = ExactIndexProfileId::new([0xd2; 32]).expect("profile ID is nonzero");
+    let generations = GenerationRepository::new(paused.clone(), policy);
+    let containers = ContainerRepository::new(MemoryStorageIo::new());
+    let indexes = ExactIndexRunRepository::new(paused.clone());
+    let reservation = NamespaceRoot::new(1_024, 2, 0, Vec::new(), Vec::new())
+        .expect("initial reservation is valid");
+    let first = generations
+        .commit_namespace(&reservation)
+        .expect("commit initial reservation");
+    let maintenance =
+        MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+    maintenance
+        .garbage_collect_metadata()
+        .expect("establish exact Metadata catalog before arming the pause");
+
+    let predecessor = fastdup_store::SuccessorPredecessor::from_committed_record(first);
+    let manifest = ManifestLeaf::new(
+        4_096,
+        vec![ManifestExtent::Fill {
+            logical_length: 4_096,
+            value: 0x6d,
+        }],
+    )
+    .expect("delta Manifest is valid");
+    let proof = generations
+        .publish_manifest_successor(predecessor, &manifest)
+        .expect("publish proof-bearing successor");
+    let namespace = NamespaceRoot::new(
+        1_024,
+        3,
+        2,
+        vec![
+            DurableInode::new(2, 0o640, 1_000, 1_000, 1, 2, 4_096, proof.summary().root())
+                .expect("delta inode is valid"),
+        ],
+        vec![NamespaceEntry::new(1, 2, b"delta.vbk".to_vec()).expect("name is valid")],
+    )
+    .expect("delta Namespace is valid");
+    generations
+        .commit_namespace_with_successor_proofs_using(
+            &namespace,
+            &containers,
+            predecessor,
+            &[proof],
+            &containers,
+        )
+        .expect("commit proof-bearing successor");
+
+    paused.arm();
+    let collecting = maintenance.clone();
+    let collector = std::thread::spawn(move || collecting.garbage_collect_metadata());
+    assert!(
+        paused.wait_until_reached(Duration::from_secs(2)),
+        "Metadata delta publication reaches its deliberately blocked catalog write"
+    );
+
+    let committing = generations.clone();
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let frontend = std::thread::spawn(move || {
+        let empty = NamespaceRoot::new(1_024, 3, 3, Vec::new(), Vec::new())
+            .expect("empty frontend successor is valid");
+        completed_tx
+            .send(committing.commit_namespace(&empty))
+            .expect("frontend completion receiver remains available");
+    });
+    let frontend_result = completed_rx.recv_timeout(Duration::from_secs(1));
+    paused.resume();
+
+    frontend_result
+        .expect("frontend Commit must not wait for Metadata delta file I/O")
+        .expect("concurrent frontend Commit succeeds");
+    frontend.join().expect("frontend thread remains healthy");
+    let delta = collector
+        .join()
+        .expect("Metadata-GC thread remains healthy")
+        .expect("blocked delta publication resumes safely");
+    assert_eq!(delta.mark_mode(), MetadataGcMarkMode::AdditionDelta);
+    let exact = maintenance
+        .garbage_collect_metadata()
+        .expect("concurrent legacy Commit forces an exact follow-up");
+    assert_eq!(exact.mark_mode(), MetadataGcMarkMode::ExactSnapshot);
+    assert_eq!(
+        exact.exact_reason(),
+        Some(MetadataGcExactReason::LegacyCommit)
+    );
+    maintenance
+        .scrub()
+        .expect("concurrent delta and frontend Commit remain scrub-clean");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn commit_log_rotation_forces_an_exact_metadata_mark_after_additive_deltas() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata, MemoryStorageIo::new());
+    let maintenance =
+        MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+    maintenance
+        .garbage_collect_metadata()
+        .expect("establish exact Metadata catalog");
+    let installed = generations
+        .recover_latest_with_data(&containers)
+        .expect("recover installed predecessor")
+        .expect("fixture has an installed predecessor");
+    let mut predecessor =
+        fastdup_store::SuccessorPredecessor::from_committed_record(installed.record());
+    let manifest = ManifestLeaf::new(
+        4_096,
+        vec![ManifestExtent::Fill {
+            logical_length: 4_096,
+            value: 0x72,
+        }],
+    )
+    .expect("rotating successor Manifest is valid");
+    let first_proof = generations
+        .publish_manifest_successor(predecessor, &manifest)
+        .expect("publish first rotating successor");
+    let summary = first_proof.summary();
+
+    for mutation_sequence in 2..=63 {
+        let proof = if mutation_sequence == 2 {
+            first_proof.clone()
+        } else {
+            generations.reuse_manifest_successor(predecessor, summary)
+        };
+        let namespace = NamespaceRoot::new(
+            1_024,
+            3,
+            mutation_sequence,
+            vec![
+                DurableInode::new(
+                    2,
+                    0o640,
+                    1_000,
+                    1_000,
+                    1,
+                    mutation_sequence,
+                    4_096,
+                    summary.root(),
+                )
+                .expect("rotating successor inode is valid"),
+            ],
+            vec![
+                NamespaceEntry::new(1, 2, b"backup.vbk".to_vec())
+                    .expect("rotating successor name is valid"),
+            ],
+        )
+        .expect("rotating successor Namespace is valid");
+        let committed = generations
+            .commit_namespace_with_successor_proofs_using(
+                &namespace,
+                &containers,
+                predecessor,
+                &[proof],
+                &containers,
+            )
+            .expect("commit nonrotating successor");
+        predecessor =
+            fastdup_store::SuccessorPredecessor::from_committed_record(committed.record());
+        if mutation_sequence <= 34 {
+            let catalog = maintenance
+                .garbage_collect_metadata()
+                .expect("advance the bounded Metadata delta chain");
+            if mutation_sequence == 34 {
+                assert!(
+                    catalog.exact_mark_performed(),
+                    "the 32-run delta chain limit starts a fresh exact Snapshot"
+                );
+                assert_eq!(
+                    catalog.exact_reason(),
+                    Some(MetadataGcExactReason::DeltaChainLimit)
+                );
+            } else {
+                assert!(!catalog.exact_mark_performed());
+            }
+        }
+    }
+    drop(first_proof);
+    let delta = maintenance
+        .garbage_collect_metadata()
+        .expect("collapse nonrotating root additions into one delta run");
+    assert!(!delta.exact_mark_performed());
+
+    let proof = generations.reuse_manifest_successor(predecessor, summary);
+    let rotating_namespace = NamespaceRoot::new(
+        1_024,
+        3,
+        64,
+        vec![
+            DurableInode::new(2, 0o640, 1_000, 1_000, 1, 64, 4_096, summary.root())
+                .expect("WAL-rotating inode is valid"),
+        ],
+        vec![
+            NamespaceEntry::new(1, 2, b"backup.vbk".to_vec()).expect("WAL-rotating name is valid"),
+        ],
+    )
+    .expect("WAL-rotating Namespace is valid");
+    generations
+        .commit_namespace_with_successor_proofs_using(
+            &rotating_namespace,
+            &containers,
+            predecessor,
+            &[proof],
+            &containers,
+        )
+        .expect("rotate the bounded Commit WAL");
+
+    let exact = maintenance
+        .garbage_collect_metadata()
+        .expect("rotation re-establishes exact Metadata deletion authority");
+
+    assert!(exact.exact_mark_performed());
+    assert_eq!(
+        exact.exact_reason(),
+        Some(MetadataGcExactReason::WalRotation)
+    );
+    assert!(exact.objects_removed() > 0);
+    maintenance
+        .scrub()
+        .expect("rotation collection retains both protected Commit graphs");
+}
+
+#[test]
+fn recovered_metadata_mark_catalog_forces_one_exact_refresh_before_reuse() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), data.clone());
+    let maintenance = MaintenanceRepository::new(generations, containers, indexes, profile);
+    let first = maintenance
+        .garbage_collect_metadata()
+        .expect("publish the first durable Metadata mark catalog");
+    assert_eq!(first.catalog_generation(), Some(1));
+    drop(maintenance);
+
+    let reopened = MaintenanceRepository::new(
+        GenerationRepository::new(
+            metadata.clone(),
+            PolicySetId::new([0x81; 32]).expect("policy ID is nonzero"),
+        ),
+        ContainerRepository::new(data),
+        ExactIndexRunRepository::new(metadata),
+        profile,
+    );
+    let recovered = reopened
+        .garbage_collect_metadata()
+        .expect("audit and refresh the recovered Metadata mark catalog");
+
+    assert!(recovered.exact_mark_performed());
+    assert_eq!(recovered.catalog_generation(), Some(2));
+    let unchanged = reopened
+        .garbage_collect_metadata()
+        .expect("reuse the refreshed catalog in the reopened process");
+    assert!(!unchanged.exact_mark_performed());
+    assert_eq!(unchanged.catalog_generation(), Some(2));
+}
+
+#[test]
+fn corrupt_metadata_mark_catalog_is_rebuilt_without_becoming_deletion_authority() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), data.clone());
+    let maintenance = MaintenanceRepository::new(generations, containers, indexes, profile);
+    maintenance
+        .garbage_collect_metadata()
+        .expect("publish the first Metadata mark catalog");
+    let catalog_name = metadata
+        .list_names()
+        .expect("list Metadata names")
+        .into_iter()
+        .find(|name| {
+            name.starts_with("metadata-mark-catalog-") && name.strip_suffix(".run").is_some()
+        })
+        .expect("one published Metadata mark catalog exists");
+    let row_byte = metadata
+        .read_exact_at(&catalog_name, 4_096, 1)
+        .expect("read one catalog row byte")[0];
+    metadata
+        .write_at(&catalog_name, 4_096, &[row_byte ^ 0xFF])
+        .expect("inject catalog-row corruption");
+    drop(maintenance);
+
+    let reopened = MaintenanceRepository::new(
+        GenerationRepository::new(
+            metadata.clone(),
+            PolicySetId::new([0x81; 32]).expect("policy ID is nonzero"),
+        ),
+        ContainerRepository::new(data),
+        ExactIndexRunRepository::new(metadata.clone()),
+        profile,
+    );
+    assert!(
+        reopened.scrub().is_err(),
+        "offline scrub must surface the damaged durable catalog"
+    );
+    let rebuilt = reopened
+        .garbage_collect_metadata()
+        .expect("ignore the damaged hint and rebuild from Metadata authority");
+
+    assert!(rebuilt.exact_mark_performed());
+    assert_eq!(rebuilt.catalog_generation(), Some(2));
+    assert!(
+        !metadata
+            .exists(&catalog_name)
+            .expect("check old catalog name")
+    );
+    reopened
+        .scrub()
+        .expect("catalog corruption never damaged the live Metadata graph");
+}
+
+#[test]
+fn every_metadata_mark_catalog_publication_fault_retries_from_durable_authority() {
+    fn fixture(
+        metadata: MemoryStorageIo,
+    ) -> MaintenanceRepository<MemoryStorageIo, MemoryStorageIo, MemoryStorageIo> {
+        let (generations, containers, indexes, profile) =
+            seeded_repositories_using(metadata, MemoryStorageIo::new());
+        MaintenanceRepository::new(generations, containers, indexes, profile)
+    }
+
+    let probe_metadata = MemoryStorageIo::new();
+    let probe = fixture(probe_metadata.clone());
+    let baseline = probe_metadata.operation_count();
+    probe
+        .garbage_collect_metadata()
+        .expect("probe Metadata mark catalog publication succeeds");
+    let publication_operations = probe_metadata.operations()[baseline..].len();
+    assert!(publication_operations > 5);
+
+    for fail_after_effect in [false, true] {
+        for relative in 0..publication_operations {
+            let absolute = baseline + relative;
+            let metadata = if fail_after_effect {
+                MemoryStorageIo::with_fail_after(absolute)
+            } else {
+                MemoryStorageIo::with_fail_before(absolute)
+            };
+            let maintenance = fixture(metadata.clone());
+            assert!(
+                maintenance.garbage_collect_metadata().is_err(),
+                "fault point {relative} must interrupt the first exact catalog publication"
+            );
+            metadata.crash();
+
+            let retried = maintenance
+                .garbage_collect_metadata()
+                .expect("retry rebuilds the catalog from durable Commit authority");
+            assert!(retried.exact_mark_performed());
+            maintenance
+                .scrub()
+                .expect("every catalog publication interruption preserves the live graph");
+        }
+    }
+}
+
+#[test]
+fn every_metadata_mark_delta_publication_fault_retries_without_exact_rebuild() {
+    fn fixture(
+        metadata: MemoryStorageIo,
+    ) -> MaintenanceRepository<MemoryStorageIo, MemoryStorageIo, MemoryStorageIo> {
+        let (generations, containers, indexes, profile) =
+            seeded_repositories_using(metadata, MemoryStorageIo::new());
+        let maintenance =
+            MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+        maintenance
+            .garbage_collect_metadata()
+            .expect("establish exact Metadata catalog before fault injection");
+        let installed = generations
+            .recover_latest_with_data(&containers)
+            .expect("recover installed predecessor")
+            .expect("fixture has an installed predecessor");
+        let predecessor =
+            fastdup_store::SuccessorPredecessor::from_committed_record(installed.record());
+        let manifest = ManifestLeaf::new(
+            2_048,
+            vec![ManifestExtent::Fill {
+                logical_length: 2_048,
+                value: 0x37,
+            }],
+        )
+        .expect("delta-fault Manifest is valid");
+        let proof = generations
+            .publish_manifest_successor(predecessor, &manifest)
+            .expect("publish delta-fault successor");
+        let namespace = NamespaceRoot::new(
+            1_024,
+            3,
+            2,
+            vec![
+                DurableInode::new(2, 0o640, 1_000, 1_000, 1, 2, 2_048, proof.summary().root())
+                    .expect("delta-fault inode is valid"),
+            ],
+            vec![
+                NamespaceEntry::new(1, 2, b"backup.vbk".to_vec())
+                    .expect("delta-fault name is valid"),
+            ],
+        )
+        .expect("delta-fault Namespace is valid");
+        generations
+            .commit_namespace_with_successor_proofs_using(
+                &namespace,
+                &containers,
+                predecessor,
+                &[proof],
+                &containers,
+            )
+            .expect("commit delta-fault successor");
+        maintenance
+    }
+
+    let probe_metadata = MemoryStorageIo::new();
+    let probe = fixture(probe_metadata.clone());
+    let baseline = probe_metadata.operation_count();
+    probe
+        .garbage_collect_metadata()
+        .expect("probe additive delta publication succeeds");
+    let publication_operations = probe_metadata.operation_count() - baseline;
+    assert!(publication_operations > 5);
+
+    for fail_after_effect in [false, true] {
+        for relative in 0..publication_operations {
+            let absolute = baseline + relative;
+            let metadata = if fail_after_effect {
+                MemoryStorageIo::with_fail_after(absolute)
+            } else {
+                MemoryStorageIo::with_fail_before(absolute)
+            };
+            let maintenance = fixture(metadata);
+            assert!(
+                maintenance.garbage_collect_metadata().is_err(),
+                "fault point {relative} must interrupt additive delta publication"
+            );
+            let retried = maintenance
+                .garbage_collect_metadata()
+                .expect("retry resumes the same additive delta without a graph rebuild");
+            assert!(!retried.exact_mark_performed());
+            assert_eq!(retried.catalog_generation(), Some(2));
+            maintenance
+                .scrub()
+                .expect("every additive delta publication interruption preserves authority");
+        }
+    }
+}
+
+#[test]
+fn metadata_publication_invalidates_the_clean_mark_catalog() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata, MemoryStorageIo::new());
+    let maintenance = MaintenanceRepository::new(generations.clone(), containers, indexes, profile);
+    maintenance
+        .garbage_collect_metadata()
+        .expect("establish the clean Metadata mark catalog");
+    let orphan = generations
+        .publish_manifest(
+            &ManifestLeaf::new(
+                8_192,
+                vec![ManifestExtent::Fill {
+                    logical_length: 8_192,
+                    value: 0x3c,
+                }],
+            )
+            .expect("orphan Manifest is valid"),
+        )
+        .expect("publish Metadata after the clean catalog");
+
+    let refreshed = maintenance
+        .garbage_collect_metadata()
+        .expect("refresh the invalidated Metadata mark catalog");
+
+    assert!(refreshed.exact_mark_performed());
+    assert_eq!(
+        refreshed.exact_reason(),
+        Some(MetadataGcExactReason::MetadataRootPinDrain)
+    );
+    assert_eq!(refreshed.objects_removed(), 1);
+    assert!(generations.read_manifest(orphan).is_err());
+}
+
+#[test]
+fn dropping_an_uncommitted_successor_proof_forces_exact_metadata_collection() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata, MemoryStorageIo::new());
+    let maintenance =
+        MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+    maintenance
+        .garbage_collect_metadata()
+        .expect("establish clean Metadata catalog");
+    let installed = generations
+        .recover_latest_with_data(&containers)
+        .expect("recover installed predecessor")
+        .expect("fixture has an installed predecessor");
+    let predecessor =
+        fastdup_store::SuccessorPredecessor::from_committed_record(installed.record());
+    let proof = generations
+        .publish_manifest_successor(
+            predecessor,
+            &ManifestLeaf::new(
+                12_288,
+                vec![ManifestExtent::Fill {
+                    logical_length: 12_288,
+                    value: 0x63,
+                }],
+            )
+            .expect("abandoned successor Manifest is valid"),
+        )
+        .expect("publish abandoned successor proof");
+    let abandoned_root = proof.summary().root();
+    drop(proof);
+
+    let collected = maintenance
+        .garbage_collect_metadata()
+        .expect("collect Metadata after the final unpublished root pin drains");
+
+    assert!(collected.exact_mark_performed());
+    assert!(collected.objects_removed() > 0);
+    assert!(generations.read_manifest(abandoned_root).is_err());
+}
+
+#[test]
+fn adaptive_online_gc_collects_metadata_in_the_idle_io_worker() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
+    let orphan = ManifestLeaf::new(
+        4_097,
+        vec![ManifestExtent::Fill {
+            logical_length: 4_097,
+            value: 0x6b,
+        }],
+    )
+    .expect("online orphan Manifest is valid");
+    let orphan_root = generations
+        .publish_manifest(&orphan)
+        .expect("publish online Metadata garbage");
+    let maintenance = MaintenanceRepository::new(generations.clone(), containers, indexes, profile);
+    maintenance
+        .rebuild_exact_index()
+        .expect("online scheduler requires active Exact state");
+    let catalog = GcCandidateCatalogRepository::new(metadata);
+
+    let cycle = maintenance
+        .run_adaptive_online_gc_cycle(
+            &catalog,
+            DataPoolUsage::new(50, 100).expect("fixture pool usage is valid"),
+            OnlineGcRunMode::Background,
+        )
+        .expect("adaptive cycle includes Metadata GC");
+
+    assert_eq!(cycle.metadata_gc().objects_removed(), 1);
+    assert!(cycle.metadata_gc().bytes_removed() != 0);
+    assert!(generations.read_manifest(orphan_root).is_err());
+    maintenance
+        .scrub()
+        .expect("online Metadata collection retains the committed graph");
+}
+
+#[test]
+fn metadata_gc_retains_a_manifest_pinned_by_a_long_lived_reader() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata, MemoryStorageIo::new());
+    let recovered = generations
+        .recover_latest_with_verified_files(&containers)
+        .expect("recover the committed DATA graph")
+        .expect("fixture has a committed generation");
+    let (_, mut files) = recovered.into_parts();
+    let file = files.remove(0).into_file();
+
+    for mutation_sequence in 2..=65 {
+        let empty = NamespaceRoot::new(1_024, 3, mutation_sequence, Vec::new(), Vec::new())
+            .expect("empty successor Namespace is valid");
+        generations
+            .commit_namespace_with_data(&empty, &containers)
+            .expect("rotate the old file generation out of the bounded WAL");
+    }
+    let maintenance = MaintenanceRepository::new(generations.clone(), containers, indexes, profile);
+
+    maintenance
+        .garbage_collect_metadata()
+        .expect("collect Metadata outside retained WAL and reader pins");
+    assert_eq!(
+        file.read_at(0, 8).expect("pinned reader remains usable"),
+        b"maintena"
+    );
+
+    drop(file);
+    let drained = maintenance
+        .garbage_collect_metadata()
+        .expect("collect the graph after its final reader pin drains");
+    assert!(drained.objects_removed() != 0);
+    maintenance
+        .scrub()
+        .expect("pin drain leaves the current Metadata graph valid");
+}
+
+#[test]
+fn online_gc_retains_data_pinned_by_a_long_lived_reader() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), data);
+    let recovered = generations
+        .recover_latest_with_verified_files(&containers)
+        .expect("recover the committed DATA graph")
+        .expect("fixture has a committed generation");
+    let (_, mut files) = recovered.into_parts();
+    let file = files.remove(0).into_file();
+
+    let empty = NamespaceRoot::new(1_024, 3, 2, Vec::new(), Vec::new())
+        .expect("empty successor Namespace is valid");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("first empty generation commits");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("second empty generation drains the durable DATA predecessor");
+    let maintenance = MaintenanceRepository::new(generations, containers.clone(), indexes, profile);
+    maintenance
+        .rebuild_exact_index()
+        .expect("Online GC requires active Exact coverage");
+    let catalog = GcCandidateCatalogRepository::new(metadata);
+
+    let cycle = maintenance
+        .run_adaptive_online_gc_cycle(
+            &catalog,
+            DataPoolUsage::new(50, 100).expect("fixture pool usage is valid"),
+            OnlineGcRunMode::Urgent,
+        )
+        .expect("pinned-reader Online-GC quantum succeeds conservatively");
+
+    if let OnlineGcCycleOutcome::Collected(collected) = cycle.outcome() {
+        assert_eq!(collected.replacement_containers(), 1);
+        assert_eq!(collected.chunks_relocated(), 1);
+    }
+    assert_eq!(
+        file.read_at(0, 8)
+            .expect("pinned DATA reader remains usable"),
+        b"maintena"
+    );
+}
+
+#[test]
+fn metadata_gc_waits_for_inflight_manifest_publication_and_retains_its_proof() {
+    let metadata = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0x91; 32]).expect("policy ID is nonzero");
+    let bootstrap = GenerationRepository::new(metadata.clone(), policy);
+    let reservation = NamespaceRoot::new(1_024, 2, 0, Vec::new(), Vec::new())
+        .expect("initial reservation is valid");
+    let predecessor = bootstrap
+        .commit_namespace(&reservation)
+        .expect("publish initial generation");
+
+    let paused = PausedStorageIo::before(metadata, StorageOperation::SyncRoot);
+    let generations = GenerationRepository::new(paused.clone(), policy);
+    let containers = ContainerRepository::new(MemoryStorageIo::new());
+    let indexes = ExactIndexRunRepository::new(paused.clone());
+    let profile = ExactIndexProfileId::new([0x92; 32]).expect("profile ID is nonzero");
+    let publishing = generations.clone();
+    let publisher = std::thread::spawn(move || {
+        let manifest = ManifestLeaf::new(
+            8_192,
+            vec![ManifestExtent::Fill {
+                logical_length: 8_192,
+                value: 0xa5,
+            }],
+        )
+        .expect("inflight Manifest is valid");
+        publishing.publish_manifest_successor(
+            fastdup_store::SuccessorPredecessor::from_committed_record(predecessor),
+            &manifest,
+        )
+    });
+    assert!(paused.wait_until_reached(Duration::from_secs(2)));
+
+    let maintenance = MaintenanceRepository::new(generations.clone(), containers, indexes, profile);
+    let collecting = std::thread::spawn(move || maintenance.garbage_collect_metadata());
+    assert!(
+        !paused.wait_until_reached_count(2, Duration::from_millis(100)),
+        "Metadata GC cannot enter deletion while a Metadata publication is inflight"
+    );
+    paused.resume();
+    let proof = publisher
+        .join()
+        .expect("publisher thread remains healthy")
+        .expect("publication completes");
+    let report = collecting
+        .join()
+        .expect("Metadata GC thread remains healthy")
+        .expect("Metadata GC completes after publication");
+    assert_eq!(report.objects_removed(), 0);
+    generations
+        .read_manifest(proof.summary().root())
+        .expect("successor proof keeps its complete graph readable");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn staged_path_publication_holds_the_gc_barrier_until_its_new_root_is_pinned() {
+    #[derive(Clone, Copy, Debug)]
+    enum PathEdit {
+        Replacement,
+        Truncate,
+    }
+
+    for edit in [PathEdit::Replacement, PathEdit::Truncate] {
+        let metadata = MemoryStorageIo::new();
+        let paused =
+            PausedStorageIo::disarmed_before_name_prefix(metadata, StorageOperation::WriteAt, ".");
+        let policy = PolicySetId::new([0x93; 32]).expect("policy ID is nonzero");
+        let profile = ExactIndexProfileId::new([0x94; 32]).expect("profile ID is nonzero");
+        let generations = GenerationRepository::new(paused.clone(), policy);
+        let containers = ContainerRepository::new(MemoryStorageIo::new());
+        let indexes = ExactIndexRunRepository::new(paused.clone());
+        let reservation = NamespaceRoot::new(1_024, 2, 0, Vec::new(), Vec::new())
+            .expect("initial reservation is valid");
+        let first = generations
+            .commit_namespace(&reservation)
+            .expect("publish initial generation");
+        let predecessor = fastdup_store::SuccessorPredecessor::from_committed_record(first);
+        let manifest = ManifestLeaf::new(
+            8_192,
+            vec![
+                ManifestExtent::Fill {
+                    logical_length: 4_096,
+                    value: 0x31,
+                },
+                ManifestExtent::Fill {
+                    logical_length: 4_096,
+                    value: 0x32,
+                },
+            ],
+        )
+        .expect("installed Manifest is valid");
+        let installed_proof = generations
+            .publish_manifest_successor(predecessor, &manifest)
+            .expect("publish installed Manifest");
+        let installed_summary = installed_proof.summary();
+        let namespace = NamespaceRoot::new(
+            1_024,
+            3,
+            1,
+            vec![
+                DurableInode::new(
+                    2,
+                    0o640,
+                    1_000,
+                    1_000,
+                    1,
+                    1,
+                    8_192,
+                    installed_summary.root(),
+                )
+                .expect("installed inode is valid"),
+            ],
+            vec![NamespaceEntry::new(1, 2, b"staged.vbk".to_vec()).expect("name is valid")],
+        )
+        .expect("installed Namespace Root is valid");
+        let committed = generations
+            .commit_namespace_with_successor_proofs_using(
+                &namespace,
+                &containers,
+                predecessor,
+                &[installed_proof],
+                &containers,
+            )
+            .expect("commit installed Manifest");
+        let committed_predecessor =
+            fastdup_store::SuccessorPredecessor::from_committed_record(committed.record());
+        let maintenance =
+            MaintenanceRepository::new(generations.clone(), containers, indexes, profile);
+        maintenance
+            .garbage_collect_metadata()
+            .expect("establish clean Metadata mark state");
+        generations
+            .publish_manifest(
+                &ManifestLeaf::new(
+                    1,
+                    vec![ManifestExtent::Fill {
+                        logical_length: 1,
+                        value: 0xee,
+                    }],
+                )
+                .expect("orphan Manifest is valid"),
+            )
+            .expect("publish orphan to require an exact collection");
+        let proof = generations.reuse_manifest_successor(committed_predecessor, installed_summary);
+
+        paused.arm();
+        let publishing = generations.clone();
+        let publisher = std::thread::spawn(move || match edit {
+            PathEdit::Replacement => publishing.stage_manifest_replacement_successor(
+                proof,
+                0..4_096,
+                &[ManifestExtent::Fill {
+                    logical_length: 4_096,
+                    value: 0x41,
+                }],
+            ),
+            PathEdit::Truncate => publishing.stage_manifest_truncate_successor(proof, 4_096),
+        });
+        assert!(
+            paused.wait_until_reached(Duration::from_secs(2)),
+            "{edit:?} reaches its deliberately blocked staged Metadata write"
+        );
+
+        let collecting = maintenance.clone();
+        let collector = std::thread::spawn(move || collecting.garbage_collect_metadata());
+        assert!(
+            !paused.wait_until_reached_count(2, Duration::from_millis(100)),
+            "Metadata GC cannot enter deletion while {edit:?} is staged before root-pin acquisition"
+        );
+
+        paused.resume();
+        let staged = publisher
+            .join()
+            .expect("staged publisher thread remains healthy")
+            .expect("staged path publication completes");
+        collector
+            .join()
+            .expect("Metadata-GC thread remains healthy")
+            .expect("Metadata GC completes after staged root-pin acquisition");
+        generations
+            .read_manifest(staged.summary().root())
+            .expect("staged proof keeps its complete graph readable");
+    }
+}
+
+#[test]
+fn reused_successor_pin_waits_for_an_exclusive_metadata_gc_batch() {
+    let metadata = MemoryStorageIo::new();
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        metadata,
+        StorageOperation::WriteAt,
+        ".metadata-mark-catalog-",
+    );
+    let policy = PolicySetId::new([0x95; 32]).expect("policy ID is nonzero");
+    let profile = ExactIndexProfileId::new([0x96; 32]).expect("profile ID is nonzero");
+    let generations = GenerationRepository::new(paused.clone(), policy);
+    let containers = ContainerRepository::new(MemoryStorageIo::new());
+    let indexes = ExactIndexRunRepository::new(paused.clone());
+    let reservation = NamespaceRoot::new(1_024, 2, 0, Vec::new(), Vec::new())
+        .expect("initial reservation is valid");
+    let predecessor = generations
+        .commit_namespace(&reservation)
+        .expect("publish initial generation");
+    let predecessor = fastdup_store::SuccessorPredecessor::from_committed_record(predecessor);
+    let manifest = ManifestLeaf::new(
+        4_096,
+        vec![ManifestExtent::Fill {
+            logical_length: 4_096,
+            value: 0x51,
+        }],
+    )
+    .expect("successor Manifest is valid");
+    let first_proof = generations
+        .publish_manifest_successor(predecessor, &manifest)
+        .expect("publish successor root before GC");
+    let summary = first_proof.summary();
+    let namespace = NamespaceRoot::new(
+        1_024,
+        3,
+        1,
+        vec![
+            DurableInode::new(2, 0o640, 1_000, 1_000, 1, 1, 4_096, summary.root())
+                .expect("installed inode is valid"),
+        ],
+        vec![NamespaceEntry::new(1, 2, b"reused.vbk".to_vec()).expect("name is valid")],
+    )
+    .expect("installed Namespace Root is valid");
+    let committed = generations
+        .commit_namespace_with_successor_proofs_using(
+            &namespace,
+            &containers,
+            predecessor,
+            &[first_proof],
+            &containers,
+        )
+        .expect("commit the root that will be reused");
+    let predecessor =
+        fastdup_store::SuccessorPredecessor::from_committed_record(committed.record());
+    let maintenance = MaintenanceRepository::new(generations.clone(), containers, indexes, profile);
+
+    paused.arm();
+    let collecting = maintenance.clone();
+    let collector = std::thread::spawn(move || collecting.garbage_collect_metadata());
+    assert!(
+        paused.wait_until_reached(Duration::from_secs(2)),
+        "exact Metadata GC reaches its blocked catalog publication"
+    );
+
+    let reusing = generations.clone();
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let publisher = std::thread::spawn(move || {
+        let proof = reusing.reuse_manifest_successor(predecessor, summary);
+        completed_tx
+            .send(proof)
+            .expect("reused-proof receiver remains available");
+    });
+    assert!(
+        completed_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "root-pin acquisition cannot pass an exclusive Metadata-GC batch"
+    );
+
+    paused.resume();
+    collector
+        .join()
+        .expect("Metadata-GC thread remains healthy")
+        .expect("Metadata GC completes after its catalog publication resumes");
+    let proof = completed_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("root-pin acquisition proceeds after Metadata GC releases its barrier");
+    publisher.join().expect("reuse thread remains healthy");
+    generations
+        .read_manifest(proof.summary().root())
+        .expect("reused proof names a readable Manifest root");
+}
+
+#[test]
+fn every_metadata_gc_delete_fault_recovers_a_complete_live_graph() {
+    fn fixture(
+        metadata: MemoryStorageIo,
+    ) -> MaintenanceRepository<MemoryStorageIo, MemoryStorageIo, MemoryStorageIo> {
+        let (generations, containers, indexes, profile) =
+            seeded_repositories_using(metadata, MemoryStorageIo::new());
+        let orphan = ManifestLeaf::new(
+            16_384,
+            vec![ManifestExtent::Fill {
+                logical_length: 16_384,
+                value: 0x33,
+            }],
+        )
+        .expect("fault-matrix orphan is valid");
+        generations
+            .publish_manifest(&orphan)
+            .expect("publish fault-matrix orphan");
+        MaintenanceRepository::new(generations, containers, indexes, profile)
+    }
+
+    let probe_metadata = MemoryStorageIo::new();
+    let probe = fixture(probe_metadata.clone());
+    let baseline = probe_metadata.operation_count();
+    probe
+        .garbage_collect_metadata()
+        .expect("probe Metadata GC succeeds");
+    let destructive = probe_metadata.operations()[baseline..]
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, operation)| {
+            matches!(
+                operation,
+                StorageOperation::RemoveFile | StorageOperation::SyncRoot
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        destructive.len(),
+        2,
+        "one orphan requires one unlink and one directory durability point"
+    );
+
+    for fail_after_effect in [false, true] {
+        for (relative, _) in &destructive {
+            let absolute = baseline + relative;
+            let metadata = if fail_after_effect {
+                MemoryStorageIo::with_fail_after(absolute)
+            } else {
+                MemoryStorageIo::with_fail_before(absolute)
+            };
+            let maintenance = fixture(metadata.clone());
+            assert!(maintenance.garbage_collect_metadata().is_err());
+            metadata.crash();
+            maintenance
+                .scrub()
+                .expect("post-crash scrub accepts retained or durably deleted Metadata garbage");
+        }
+    }
 }
 
 fn recoverable_retiring_fixture(
@@ -785,9 +2048,9 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
             &shortlist,
             DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
         )
-        .expect("candidate-local proof preserves every victim Chunk");
+        .expect("candidate-local proof preserves only live generation requirements");
     assert_eq!(proof.victim_containers(), 2);
-    assert_eq!(proof.replacement_chunks(), 4);
+    assert_eq!(proof.replacement_chunks(), 2);
     assert_eq!(proof.reachable_victim_chunks(), 2);
     assert!(proof.replacement_upper_bound() < proof.victim_bytes());
     let proof_operations = &data.operations()[baseline..];
@@ -880,7 +2143,7 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
         .expect("pin drain precedes victim deletion and REMOVED transition");
     assert_eq!(report.containers_removed(), 2);
     assert_eq!(report.replacement_containers(), 1);
-    assert_eq!(report.chunks_relocated(), 4);
+    assert_eq!(report.chunks_relocated(), 2);
     assert_eq!(
         containers
             .audit_published()
@@ -1012,10 +2275,11 @@ fn adaptive_online_gc_cycle_bootstraps_hints_and_collects_one_bounded_quantum() 
     let baseline = data.operation_count();
 
     let cycle = maintenance
-        .run_adaptive_online_gc_cycle(
+        .run_adaptive_online_gc_cycle_with_workers(
             &catalog,
             DataPoolUsage::new(50, 100).expect("fixture pool usage is valid"),
             OnlineGcRunMode::Idle,
+            std::num::NonZeroUsize::new(2).expect("two relocation workers are nonzero"),
         )
         .expect("idle scheduler quantum succeeds");
     let OnlineGcCycleOutcome::Collected(collected) = cycle.outcome() else {
@@ -1031,12 +2295,206 @@ fn adaptive_online_gc_cycle_bootstraps_hints_and_collects_one_bounded_quantum() 
         1
     );
     assert_eq!(cycle.catalog().row_count(), 1);
+    let metrics = cycle.metrics();
+    assert_eq!(metrics.shortlisted_candidates(), 2);
+    assert_eq!(metrics.proved_victims(), 2);
+    assert_eq!(metrics.relocation_workers(), 2);
+    assert!(metrics.candidate_proof_read_bytes() > 0);
+    assert!(metrics.relocation_read_bytes() > 0);
+    assert_eq!(
+        metrics.relocation_write_bytes(),
+        collected.replacement_bytes()
+    );
+    assert_eq!(metrics.unlinked_bytes(), collected.bytes_removed());
+    assert!(metrics.total_wall() >= metrics.candidate_proof_wall());
+    assert!(metrics.relocation_wall() >= metrics.retiring_activation_wall());
+    assert!(metrics.relocation_wall() >= metrics.pin_drain_wall());
+    assert!(metrics.relocation_wall() >= metrics.victim_verify_wall());
+    assert!(metrics.relocation_wall() >= metrics.unlink_wall());
+    assert!(metrics.relocation_wall() >= metrics.data_sync_wall());
+    assert!(metrics.relocation_wall() >= metrics.removed_activation_wall());
     assert!(
-        data.operations()[baseline..]
-            .iter()
-            .any(|operation| *operation == StorageOperation::ReadExactAt),
+        data.operations()[baseline..].contains(&StorageOperation::ReadExactAt),
         "catalog bootstrap reads only bounded Header/Footer ranges"
     );
+}
+
+#[test]
+fn adaptive_online_gc_reclaims_victims_without_relocation_when_protected_data_is_empty() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_mixed_repositories_using(metadata.clone(), data);
+    let maintenance =
+        MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+    maintenance
+        .rebuild_exact_index()
+        .expect("online scheduler requires one active Exact generation");
+    let empty = NamespaceRoot::new(1_024, 3, 3, Vec::new(), Vec::new())
+        .expect("empty successor Namespace is valid");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("first empty generation commits");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("second empty generation drains the last DATA predecessor");
+    let catalog = GcCandidateCatalogRepository::new(metadata);
+
+    let cycle = maintenance
+        .run_adaptive_online_gc_cycle(
+            &catalog,
+            DataPoolUsage::new(50, 100).expect("fixture pool usage is valid"),
+            OnlineGcRunMode::Urgent,
+        )
+        .expect("zero-live Online-GC quantum succeeds");
+    let OnlineGcCycleOutcome::Collected(collected) = cycle.outcome() else {
+        panic!("ASSERT: an empty protected DATA set makes every shortlisted victim reclaimable");
+    };
+
+    assert_eq!(collected.containers_removed(), 2);
+    assert_eq!(collected.replacement_containers(), 0);
+    assert_eq!(collected.chunks_relocated(), 0);
+    assert_eq!(cycle.catalog().row_count(), 0);
+    assert_eq!(
+        containers
+            .audit_published()
+            .expect("Online GC leaves an auditable empty DATA pool")
+            .containers(),
+        0
+    );
+    let scrub = maintenance
+        .scrub()
+        .expect("empty DATA and zero-active Exact state remain scrub-clean");
+    assert_eq!(scrub.containers(), 0);
+    assert_eq!(scrub.exact_active_locations_verified(), 0);
+}
+
+#[test]
+fn online_gc_holds_commit_binding_through_retiring_activation() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (_bootstrap_generations, _bootstrap_containers, _bootstrap_indexes, profile) =
+        seeded_mixed_repositories_using(metadata.clone(), data.clone());
+    let exact_prefix = format!(".{}", "82".repeat(32));
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        metadata,
+        StorageOperation::WriteAt,
+        exact_prefix,
+    );
+    let policy = PolicySetId::new([0x81; 32]).expect("policy ID is nonzero");
+    let generations = GenerationRepository::new(paused.clone(), policy);
+    let containers = ContainerRepository::new(data);
+    let indexes = ExactIndexRunRepository::new(paused.clone());
+    let maintenance =
+        MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+    maintenance
+        .rebuild_exact_index()
+        .expect("Online GC requires active Exact coverage");
+    let empty = NamespaceRoot::new(1_024, 3, 3, Vec::new(), Vec::new())
+        .expect("empty successor Namespace is valid");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("first empty generation commits");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("second empty generation drains the DATA predecessor");
+    let catalog = GcCandidateCatalogRepository::new(paused.clone());
+
+    paused.arm();
+    let collecting = std::thread::spawn(move || {
+        maintenance.run_adaptive_online_gc_cycle(
+            &catalog,
+            DataPoolUsage::new(50, 100).expect("fixture pool usage is valid"),
+            OnlineGcRunMode::Urgent,
+        )
+    });
+    assert!(
+        paused.wait_until_reached(Duration::from_secs(2)),
+        "Online GC reaches Exact RETIRING publication"
+    );
+
+    let committing_generations = generations.clone();
+    let committing_containers = containers.clone();
+    let committing = std::thread::spawn(move || {
+        committing_generations.commit_namespace_with_data(&empty, &committing_containers)
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !committing.is_finished(),
+        "a Namespace commit cannot pass the proof binding before RETIRING activates"
+    );
+
+    paused.resume();
+    let cycle = collecting
+        .join()
+        .expect("Online-GC worker remains healthy")
+        .expect("Online-GC retirement succeeds");
+    assert!(matches!(
+        cycle.outcome(),
+        OnlineGcCycleOutcome::Collected(_)
+    ));
+    committing
+        .join()
+        .expect("frontend commit worker remains healthy")
+        .expect("frontend commit proceeds after RETIRING activation");
+}
+
+#[test]
+fn urgent_zero_live_gc_drains_more_than_one_candidate_quantum_and_becomes_idempotent() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_replaced_generation_repositories(70, metadata.clone(), MemoryStorageIo::new());
+    let maintenance =
+        MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+    maintenance
+        .rebuild_exact_index()
+        .expect("build Exact coverage for all seventy Containers");
+    let empty = NamespaceRoot::new(1_024, 3, 71, Vec::new(), Vec::new())
+        .expect("empty successor Namespace is valid");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("first empty generation commits");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("second empty generation drains the last DATA predecessor");
+    let catalog = GcCandidateCatalogRepository::new(metadata);
+    let usage = DataPoolUsage::new(50, 100).expect("fixture pool usage is valid");
+
+    let first = maintenance
+        .run_adaptive_online_gc_cycle(&catalog, usage, OnlineGcRunMode::Urgent)
+        .expect("first bounded zero-live quantum succeeds");
+    let OnlineGcCycleOutcome::Collected(first) = first.outcome() else {
+        panic!("ASSERT: first urgent quantum must collect its bounded shortlist");
+    };
+    assert_eq!(first.containers_removed(), 64);
+    assert_eq!(first.replacement_containers(), 0);
+
+    let second = maintenance
+        .run_adaptive_online_gc_cycle(&catalog, usage, OnlineGcRunMode::Urgent)
+        .expect("second bounded zero-live quantum succeeds");
+    let OnlineGcCycleOutcome::Collected(second) = second.outcome() else {
+        panic!("ASSERT: second urgent quantum must collect the remaining shortlist");
+    };
+    assert_eq!(second.containers_removed(), 6);
+    assert_eq!(second.replacement_containers(), 0);
+
+    let stable = maintenance
+        .run_adaptive_online_gc_cycle(&catalog, usage, OnlineGcRunMode::Urgent)
+        .expect("empty follow-up quantum is a successful no-op");
+    assert!(matches!(
+        stable.outcome(),
+        OnlineGcCycleOutcome::NoCandidates
+    ));
+    assert_eq!(
+        containers
+            .audit_published()
+            .expect("audit empty DATA")
+            .containers(),
+        0
+    );
+    maintenance
+        .scrub()
+        .expect("multi-quantum empty pool remains scrub-clean");
 }
 
 #[test]
@@ -1088,7 +2546,8 @@ fn candidate_row(id: [u8; 16], generation: u64, chunks: &[&[u8]]) -> GcCandidate
 }
 
 #[test]
-fn local_proof_over_preserves_unknown_prefix_base_dependency() {
+#[allow(clippy::too_many_lines)]
+fn generation_bound_reverse_dependencies_preserve_live_base_without_copying_dead_chunks() {
     let metadata = MemoryStorageIo::new();
     let (generations, containers, indexes, profile) =
         seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
@@ -1096,18 +2555,47 @@ fn local_proof_over_preserves_unknown_prefix_base_dependency() {
     let mut target = base.to_vec();
     target[7] ^= 0x5a;
     let dependent_id = ContainerId::new([0xa3; 16]).expect("dependent ID is nonzero");
-    let dependent = containers
+    let _dependent = containers
         .publish_zstd_prefix_pairs_verified(dependent_id, 2, &[(base, target.as_slice())])
         .expect("publish dependent target");
-    let dependent_row = GcCandidateCatalogRow::from_intrinsic_summary(
-        dependent_id,
-        2,
-        dependent.header().layout().file_length,
-        dependent
-            .intrinsic_summary()
-            .expect("dependent publication exposes its intrinsic summary"),
+    let dead_id = ContainerId::new([0xa4; 16]).expect("dead ID is nonzero");
+    containers
+        .publish_raw(dead_id, 3, &[b"unrelated-dead-gc-padding"])
+        .expect("publish unrelated dead padding Container");
+    let target_manifest = ManifestLeaf::new(
+        u64::try_from(target.len()).expect("target length fits u64"),
+        vec![ManifestExtent::Data {
+            logical_length: u64::try_from(target.len()).expect("target length fits u64"),
+            chunk_id: ChunkId::of(&target),
+        }],
     )
-    .expect("dependent candidate row is valid");
+    .expect("target Manifest is valid");
+    let target_root = generations
+        .publish_manifest(&target_manifest)
+        .expect("publish target Manifest");
+    let target_namespace = NamespaceRoot::new(
+        1_024,
+        3,
+        2,
+        vec![
+            DurableInode::new(
+                2,
+                0o640,
+                1_000,
+                1_000,
+                1,
+                2,
+                u64::try_from(target.len()).expect("target length fits u64"),
+                target_root,
+            )
+            .expect("target inode is valid"),
+        ],
+        vec![NamespaceEntry::new(1, 2, b"backup.vbk".to_vec()).expect("target name is valid")],
+    )
+    .expect("target Namespace Root is valid");
+    generations
+        .commit_namespace_with_data(&target_namespace, &containers)
+        .expect("commit live PREFIX target while previous generation retains its Base");
     let maintenance =
         MaintenanceRepository::new(generations, containers.clone(), indexes.clone(), profile);
     maintenance
@@ -1127,7 +2615,7 @@ fn local_proof_over_preserves_unknown_prefix_base_dependency() {
                     1,
                     &[base.as_slice(), b"maintenance-second-chunk".as_slice()],
                 ),
-                dependent_row,
+                candidate_row([0xa4; 16], 3, &[b"unrelated-dead-gc-padding"]),
             ],
         )
         .expect("publish dependency test catalog");
@@ -1136,16 +2624,22 @@ fn local_proof_over_preserves_unknown_prefix_base_dependency() {
         .expect("recover dependency catalog")
         .expect("dependency catalog exists");
     let shortlist = snapshot
-        .shortlist(GcCandidateSelectionMode::Urgent, 2, 3)
-        .expect("select both underfilled victims");
+        .shortlist(GcCandidateSelectionMode::Urgent, 2, 4)
+        .expect("select Base plus dead padding; the live dependent stays outside the victim set");
     let proof = maintenance
         .prove_gc_candidates(
             &shortlist,
             DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
         )
-        .expect("proof resolves PREFIX and preserves every victim Chunk");
+        .expect("proof resolves the live reverse dependency generation");
+    assert_eq!(proof.victim_containers(), 2);
+    assert_eq!(proof.reverse_dependency_edges(), 1);
     assert_eq!(proof.reachable_victim_chunks(), 1);
-    assert_eq!(proof.replacement_chunks(), 3);
+    assert_eq!(
+        proof.replacement_chunks(),
+        1,
+        "the incoming live Base edge requires replacement; the unrelated dead Chunk does not"
+    );
     maintenance
         .garbage_collect_proved_candidates(proof)
         .expect("replacement closes unknown dependency before deletion");

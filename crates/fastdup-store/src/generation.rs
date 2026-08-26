@@ -5,20 +5,31 @@ use crate::manifest_tree::{
     rewrite_manifest_tree_range, rewrite_manifest_tree_range_successor, scan_manifest_tree,
     splice_manifest_tree, truncate_manifest_tree,
 };
+use crate::metadata_mark_catalog::{
+    MetadataMarkCatalogError, audit_named as audit_metadata_mark_catalog,
+    commit_binding as metadata_mark_commit_binding,
+    is_published_name as is_metadata_mark_catalog_name,
+    parse_generation as parse_metadata_mark_generation, prepare as prepare_metadata_mark_catalog,
+    prepare_addition as prepare_metadata_mark_addition,
+};
 use crate::{ContainerRepository, StorageIo, StoreError, VerifiedManifestFile};
 use fastdup_format::{
     CommitFormatError, CommitRecord, CommitRecordHash, MAX_METADATA_OBJECT_BYTES, ManifestExtent,
-    ManifestLeaf, MetadataFormatError, MetadataObjectId, NamespaceRoot, PolicySetId,
+    ManifestLeaf, MetadataFormatError, MetadataMarkCatalogRunKind, MetadataObjectId, NamespaceRoot,
+    PolicySetId,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 const METADATA_SUFFIX: &str = ".fdm";
 const WRITE_BLOCK_BYTES: usize = 4_096;
 const MAX_METADATA_OBJECT_BYTES_U64: u64 = 16 * 1_024 * 1_024;
+const MAX_METADATA_MARK_DELTA_RUNS: u32 = 32;
 type VerifiedManifests = Vec<(u64, ManifestTreeSummary)>;
 
 /// Opaque identity of the Commit Record that an online Successor Graph Proof
@@ -50,6 +61,8 @@ pub struct ManifestSuccessorProof {
     predecessor: SuccessorPredecessor,
     summary: ManifestTreeSummary,
     introduced_chunks: BTreeMap<fastdup_format::ChunkId, u64>,
+    introduced_metadata: BTreeSet<MetadataObjectId>,
+    metadata_root_pin: MetadataRootPin,
 }
 
 impl ManifestSuccessorProof {
@@ -75,6 +88,113 @@ pub struct GenerationRepository<I> {
     storage: I,
     supported_policy: PolicySetId,
     commit_lock: Arc<Mutex<()>>,
+    metadata_root_pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
+    metadata_root_pin_handles: Arc<Mutex<Vec<Weak<MetadataRootPinInner>>>>,
+    metadata_gc_barrier: Arc<RwLock<()>>,
+    metadata_gc_epoch: Arc<AtomicU64>,
+    metadata_gc_clean: Arc<Mutex<Option<MetadataGcCleanState>>>,
+    metadata_gc_delta: Arc<Mutex<MetadataGcDeltaJournal>>,
+    metadata_gc_run_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MetadataRootPin {
+    inner: Arc<MetadataRootPinInner>,
+}
+
+struct MetadataRootPinInner {
+    root: MetadataObjectId,
+    pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
+    metadata_gc_epoch: Arc<AtomicU64>,
+    release_requires_exact: AtomicBool,
+    metadata_gc_delta: Arc<Mutex<MetadataGcDeltaJournal>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MetadataGcCleanState {
+    epoch: u64,
+    objects_retained: u64,
+    catalog_generation: u64,
+    delta_run_count: u32,
+}
+
+#[derive(Debug, Default)]
+struct MetadataGcDeltaJournal {
+    revision: u64,
+    exact_required: bool,
+    exact_reason: Option<MetadataGcExactReason>,
+    unclassified: BTreeSet<MetadataObjectId>,
+    additions: BTreeSet<MetadataObjectId>,
+}
+
+#[derive(Clone, Copy)]
+struct StagedMetadata {
+    object_id: MetadataObjectId,
+    published_new: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CommittedMetadata {
+    record: CommitRecord,
+    namespace_root_published_new: bool,
+    wal_rotated: bool,
+}
+
+struct PublishedManifestProof {
+    summary: ManifestTreeSummary,
+    introduced_chunks: BTreeMap<fastdup_format::ChunkId, u64>,
+    introduced_metadata: BTreeSet<MetadataObjectId>,
+    metadata_root_pin: MetadataRootPin,
+}
+
+struct MetadataGcInventory {
+    candidates: Vec<(MetadataObjectId, String)>,
+    catalog_names: Vec<String>,
+    catalog_generation_high_water: u64,
+}
+
+impl fmt::Debug for MetadataRootPin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetadataRootPin")
+            .field("root", &self.inner.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for MetadataRootPinInner {
+    fn drop(&mut self) {
+        let mut pins = self
+            .pins
+            .lock()
+            .expect("ASSERT: Metadata root pin registry poisoned during release");
+        let remove = match pins.get_mut(&self.root) {
+            Some(count) => {
+                assert_ne!(
+                    *count, 0,
+                    "ASSERT: registered Metadata root pin count is nonzero"
+                );
+                if *count == 1 {
+                    true
+                } else {
+                    *count -= 1;
+                    false
+                }
+            }
+            None => panic!("ASSERT: Metadata root pin release has an acquisition"),
+        };
+        if remove {
+            pins.remove(&self.root);
+        }
+        drop(pins);
+        if self.release_requires_exact.load(Ordering::Acquire) {
+            mark_metadata_gc_exact_required(
+                &self.metadata_gc_epoch,
+                &self.metadata_gc_delta,
+                MetadataGcExactReason::MetadataRootPinDrain,
+            );
+        }
+    }
 }
 
 /// Verifies that every logical Chunk required by one metadata graph has at
@@ -148,7 +268,68 @@ impl<I: StorageIo> GenerationRepository<I> {
             storage,
             supported_policy,
             commit_lock: Arc::new(Mutex::new(())),
+            metadata_root_pins: Arc::new(Mutex::new(BTreeMap::new())),
+            metadata_root_pin_handles: Arc::new(Mutex::new(Vec::new())),
+            metadata_gc_barrier: Arc::new(RwLock::new(())),
+            metadata_gc_epoch: Arc::new(AtomicU64::new(0)),
+            metadata_gc_clean: Arc::new(Mutex::new(None)),
+            metadata_gc_delta: Arc::new(Mutex::new(MetadataGcDeltaJournal::default())),
+            metadata_gc_run_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    fn pin_metadata_root(&self, root: MetadataObjectId) -> MetadataRootPin {
+        let mut pins = self
+            .metadata_root_pins
+            .lock()
+            .expect("ASSERT: Metadata root pin registry poisoned during acquisition");
+        let count = pins.entry(root).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .expect("ASSERT: Metadata root pin count cannot overflow");
+        drop(pins);
+        let inner = Arc::new(MetadataRootPinInner {
+            root,
+            pins: Arc::clone(&self.metadata_root_pins),
+            metadata_gc_epoch: Arc::clone(&self.metadata_gc_epoch),
+            release_requires_exact: AtomicBool::new(true),
+            metadata_gc_delta: Arc::clone(&self.metadata_gc_delta),
+        });
+        self.metadata_root_pin_handles
+            .lock()
+            .expect("ASSERT: Metadata root pin handle registry poisoned")
+            .push(Arc::downgrade(&inner));
+        MetadataRootPin { inner }
+    }
+
+    fn mark_metadata_root_releases_covered_by_commit(&self, roots: &BTreeSet<MetadataObjectId>) {
+        let mut handles = self
+            .metadata_root_pin_handles
+            .lock()
+            .expect("ASSERT: Metadata root pin handle registry poisoned");
+        handles.retain(|handle| {
+            let Some(inner) = handle.upgrade() else {
+                return false;
+            };
+            if roots.contains(&inner.root) {
+                inner.release_requires_exact.store(false, Ordering::Release);
+            }
+            true
+        });
+    }
+
+    fn mark_all_metadata_root_pin_releases_exact(&self) {
+        let mut handles = self
+            .metadata_root_pin_handles
+            .lock()
+            .expect("ASSERT: Metadata root pin handle registry poisoned");
+        handles.retain(|handle| {
+            let Some(inner) = handle.upgrade() else {
+                return false;
+            };
+            inner.release_requires_exact.store(true, Ordering::Release);
+            true
+        });
     }
 
     /// Publishes one verified immutable Manifest metadata object.
@@ -168,7 +349,10 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         manifest: &ManifestLeaf,
     ) -> Result<MetadataObjectId, GenerationError> {
-        Ok(self.publish_complete_manifest(manifest, true)?.0.root())
+        Ok(self
+            .publish_complete_manifest(manifest, true)?
+            .summary
+            .root())
     }
 
     /// Publishes and rereads one complete Manifest tree while returning an
@@ -214,11 +398,13 @@ impl<I: StorageIo> GenerationRepository<I> {
         manifest: &ManifestLeaf,
         sync_root: bool,
     ) -> Result<ManifestSuccessorProof, GenerationError> {
-        let (summary, introduced_chunks) = self.publish_complete_manifest(manifest, sync_root)?;
+        let published = self.publish_complete_manifest(manifest, sync_root)?;
         Ok(ManifestSuccessorProof {
             predecessor,
-            summary,
-            introduced_chunks,
+            summary: published.summary,
+            introduced_chunks: published.introduced_chunks,
+            introduced_metadata: published.introduced_metadata,
+            metadata_root_pin: published.metadata_root_pin,
         })
     }
 
@@ -226,27 +412,37 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         manifest: &ManifestLeaf,
         sync_root: bool,
-    ) -> Result<(ManifestTreeSummary, BTreeMap<fastdup_format::ChunkId, u64>), GenerationError>
-    {
+    ) -> Result<PublishedManifestProof, GenerationError> {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
         let tree = encode_manifest_tree(manifest)?;
+        let mut introduced_metadata = BTreeSet::new();
         for (expected_id, encoded) in tree.objects() {
-            let published_id = self.stage_metadata(encoded)?;
+            let staged = self.stage_metadata_with_status(encoded)?;
             assert_eq!(
-                published_id, *expected_id,
+                staged.object_id, *expected_id,
                 "ASSERT: Manifest tree plan identity must equal published object identity"
             );
+            if staged.published_new {
+                introduced_metadata.insert(staged.object_id);
+            }
         }
         if sync_root {
             self.storage.sync_root()?;
         }
-        Ok((
-            ManifestTreeSummary::new(
-                tree.root(),
-                manifest.file_length(),
-                manifest_allocated_bytes(manifest.extents())?,
-            ),
-            manifest_dependencies(manifest.extents())?,
-        ))
+        let summary = ManifestTreeSummary::new(
+            tree.root(),
+            manifest.file_length(),
+            manifest_allocated_bytes(manifest.extents())?,
+        );
+        Ok(PublishedManifestProof {
+            summary,
+            introduced_chunks: manifest_dependencies(manifest.extents())?,
+            introduced_metadata,
+            metadata_root_pin: self.pin_metadata_root(summary.root()),
+        })
     }
 
     /// Appends a locally encoded Manifest suffix by rewriting only the prior
@@ -292,15 +488,23 @@ impl<I: StorageIo> GenerationRepository<I> {
         appended: &[ManifestExtent],
         sync_root: bool,
     ) -> Result<ManifestSuccessorProof, GenerationError> {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
         let (tree, summary) = append_manifest_tree(previous, appended, |node_id| {
             self.read_manifest_node(node_id)
         })?;
+        let mut introduced_metadata = BTreeSet::new();
         for (expected_id, encoded) in tree.objects() {
-            let published_id = self.stage_metadata(encoded)?;
+            let staged = self.stage_metadata_with_status(encoded)?;
             assert_eq!(
-                published_id, *expected_id,
+                staged.object_id, *expected_id,
                 "ASSERT: append-local Manifest plan identity must equal published object identity"
             );
+            if staged.published_new {
+                introduced_metadata.insert(staged.object_id);
+            }
         }
         if sync_root {
             self.storage.sync_root()?;
@@ -309,20 +513,33 @@ impl<I: StorageIo> GenerationRepository<I> {
             predecessor,
             summary,
             introduced_chunks: manifest_dependencies(appended)?,
+            introduced_metadata,
+            metadata_root_pin: self.pin_metadata_root(summary.root()),
         })
     }
 
     /// Reuses one graph proof without introducing new DATA dependencies.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a prior internal invariant panic poisoned the Metadata-GC
+    /// publication barrier.
     #[must_use]
     pub fn reuse_manifest_successor(
         &self,
         predecessor: SuccessorPredecessor,
         summary: ManifestTreeSummary,
     ) -> ManifestSuccessorProof {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
         ManifestSuccessorProof {
             predecessor,
             summary,
             introduced_chunks: BTreeMap::new(),
+            introduced_metadata: BTreeSet::new(),
+            metadata_root_pin: self.pin_metadata_root(summary.root()),
         }
     }
 
@@ -377,6 +594,10 @@ impl<I: StorageIo> GenerationRepository<I> {
         replacement: &[ManifestExtent],
         sync_root: bool,
     ) -> Result<ManifestSuccessorProof, GenerationError> {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
         for (chunk_id, logical_length) in manifest_dependencies(replacement)? {
             if let Some(first_length) = previous.introduced_chunks.insert(chunk_id, logical_length)
                 && first_length != logical_length
@@ -395,16 +616,21 @@ impl<I: StorageIo> GenerationRepository<I> {
             |node_id| self.read_manifest_node(node_id),
         )?;
         for (expected_id, encoded) in tree.objects() {
-            let published_id = self.stage_metadata(encoded)?;
+            let staged = self.stage_metadata_with_status(encoded)?;
             assert_eq!(
-                published_id, *expected_id,
+                staged.object_id, *expected_id,
                 "ASSERT: replacement-local Manifest plan identity must equal published object identity"
             );
+            if staged.published_new {
+                previous.introduced_metadata.insert(staged.object_id);
+            }
         }
         if sync_root {
             self.storage.sync_root()?;
         }
+        self.mark_successor_root_release_durable(&previous)?;
         previous.summary = summary;
+        previous.metadata_root_pin = self.pin_metadata_root(summary.root());
         Ok(previous)
     }
 
@@ -449,20 +675,29 @@ impl<I: StorageIo> GenerationRepository<I> {
         logical_size: u64,
         sync_root: bool,
     ) -> Result<ManifestSuccessorProof, GenerationError> {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
         let (tree, summary) = truncate_manifest_tree(previous.summary, logical_size, |node_id| {
             self.read_manifest_node(node_id)
         })?;
         for (expected_id, encoded) in tree.objects() {
-            let published_id = self.stage_metadata(encoded)?;
+            let staged = self.stage_metadata_with_status(encoded)?;
             assert_eq!(
-                published_id, *expected_id,
+                staged.object_id, *expected_id,
                 "ASSERT: truncate-local Manifest plan identity must equal published object identity"
             );
+            if staged.published_new {
+                previous.introduced_metadata.insert(staged.object_id);
+            }
         }
         if sync_root {
             self.storage.sync_root()?;
         }
+        self.mark_successor_root_release_durable(&previous)?;
         previous.summary = summary;
+        previous.metadata_root_pin = self.pin_metadata_root(summary.root());
         Ok(previous)
     }
 
@@ -490,18 +725,36 @@ impl<I: StorageIo> GenerationRepository<I> {
         replaced: Range<u64>,
         replacement: &[ManifestExtent],
     ) -> Result<ManifestTreeSummary, GenerationError> {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
+        self.publish_manifest_splice_under_guard(previous, replaced, replacement)
+            .map(|(summary, _introduced_metadata)| summary)
+    }
+
+    fn publish_manifest_splice_under_guard(
+        &self,
+        previous: ManifestTreeSummary,
+        replaced: Range<u64>,
+        replacement: &[ManifestExtent],
+    ) -> Result<(ManifestTreeSummary, BTreeSet<MetadataObjectId>), GenerationError> {
         let (tree, summary) = splice_manifest_tree(previous, replaced, replacement, |node_id| {
             self.read_manifest_node(node_id)
         })?;
+        let mut introduced_metadata = BTreeSet::new();
         for (expected_id, encoded) in tree.objects() {
-            let published_id = self.stage_metadata(encoded)?;
+            let staged = self.stage_metadata_with_status(encoded)?;
             assert_eq!(
-                published_id, *expected_id,
+                staged.object_id, *expected_id,
                 "ASSERT: splice-local Manifest plan identity must equal published object identity"
             );
+            if staged.published_new {
+                introduced_metadata.insert(staged.object_id);
+            }
         }
         self.storage.sync_root()?;
-        Ok(summary)
+        Ok((summary, introduced_metadata))
     }
 
     /// Publishes a length-changing middle splice and extends the installed
@@ -522,6 +775,10 @@ impl<I: StorageIo> GenerationRepository<I> {
         replaced: Range<u64>,
         replacement: &[ManifestExtent],
     ) -> Result<ManifestSuccessorProof, GenerationError> {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
         for (chunk_id, logical_length) in manifest_dependencies(replacement)? {
             if let Some(first_length) = previous.introduced_chunks.insert(chunk_id, logical_length)
                 && first_length != logical_length
@@ -533,8 +790,35 @@ impl<I: StorageIo> GenerationRepository<I> {
                 });
             }
         }
-        previous.summary = self.publish_manifest_splice(previous.summary, replaced, replacement)?;
+        let (summary, introduced_metadata) =
+            self.publish_manifest_splice_under_guard(previous.summary, replaced, replacement)?;
+        self.mark_successor_root_release_durable(&previous)?;
+        previous.summary = summary;
+        previous.introduced_metadata.extend(introduced_metadata);
+        previous.metadata_root_pin = self.pin_metadata_root(previous.summary.root());
         Ok(previous)
+    }
+
+    fn mark_successor_root_release_durable(
+        &self,
+        proof: &ManifestSuccessorProof,
+    ) -> Result<(), GenerationError> {
+        let predecessor_root =
+            self.read_namespace_root(proof.predecessor.record.namespace_root())?;
+        if !record_matches_namespace_root(proof.predecessor.record, &predecessor_root) {
+            return Err(GenerationError::PreviousGenerationRecordMismatch);
+        }
+        if predecessor_root
+            .file_inodes()
+            .any(|inode| inode.manifest_root() == proof.summary.root())
+        {
+            proof
+                .metadata_root_pin
+                .inner
+                .release_requires_exact
+                .store(false, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Transfers DATA dependencies from one Manifest range in the installed
@@ -635,6 +919,10 @@ impl<I: StorageIo> GenerationRepository<I> {
         replaced: Range<u64>,
         replacement: &[ManifestExtent],
     ) -> Result<MetadataObjectId, GenerationError> {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
         let tree = rewrite_manifest_tree_range(
             previous_root,
             expected_logical_size,
@@ -769,7 +1057,433 @@ impl<I: StorageIo> GenerationRepository<I> {
     /// the complete scrub path above additionally verifies every required
     /// Chunk before returning the same generation binding.
     pub(crate) fn scan_online_liveness(&self) -> Result<GenerationLivenessProof, GenerationError> {
-        self.scan_generation_liveness(false)
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .write()
+            .expect("ASSERT: Online-GC publication barrier poisoned");
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: Online-GC liveness lock poisoned");
+        let records = self.load_complete_commit_records_unlocked()?;
+        let mut proof = self.scan_generation_liveness_from_records(&records, false)?;
+        proof.pinned_roots = self
+            .metadata_root_pins
+            .lock()
+            .expect("ASSERT: Metadata root pin registry poisoned during DATA proof")
+            .keys()
+            .copied()
+            .collect();
+        for root in proof.pinned_roots.iter().copied() {
+            self.scan_manifest_root_required_chunks(root, &mut proof.online_chunks)?;
+        }
+        Ok(proof)
+    }
+
+    pub(crate) fn audit_metadata_mark_catalogs(&self) -> Result<u64, GenerationError> {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned during catalog scrub");
+        let mut names = Vec::new();
+        let mut inventory_error = None;
+        self.storage.visit_names(&mut |name| {
+            if inventory_error.is_some() || !is_metadata_mark_catalog_name(name) {
+                return;
+            }
+            let Some(generation) = parse_metadata_mark_generation(name) else {
+                inventory_error = Some(GenerationError::MetadataMarkCatalogCorruption);
+                return;
+            };
+            if names.try_reserve(1).is_err() {
+                inventory_error = Some(GenerationError::OutOfMemory);
+                return;
+            }
+            names.push((generation, name.to_owned()));
+        })?;
+        if let Some(error) = inventory_error {
+            return Err(error);
+        }
+        names.sort_unstable_by_key(|entry| entry.0);
+        let mut prior_generation = None;
+        for (generation, name) in &names {
+            let descriptor = audit_metadata_mark_catalog(&self.storage, name)?;
+            if descriptor.generation() != *generation {
+                return Err(GenerationError::MetadataMarkCatalogCorruption);
+            }
+            match descriptor.run_kind() {
+                MetadataMarkCatalogRunKind::Snapshot => {}
+                MetadataMarkCatalogRunKind::Addition
+                    if descriptor.base_generation() == prior_generation.unwrap_or(0) => {}
+                MetadataMarkCatalogRunKind::Addition => {
+                    return Err(GenerationError::MetadataMarkCatalogCorruption);
+                }
+            }
+            prior_generation = Some(*generation);
+        }
+        u64::try_from(names.len()).map_err(|_| GenerationError::MetadataTooLarge)
+    }
+
+    /// Removes fully verified Metadata Objects that are unreachable from every
+    /// Commit Record retained by the selected bounded Generation Log and every
+    /// live Metadata Root Pin. The exclusive publication barrier and Generation
+    /// commit lock make the mark/delete batch safe during online checkpoints.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn garbage_collect_metadata(
+        &self,
+    ) -> Result<GenerationMetadataGcSummary, GenerationError> {
+        let started = Instant::now();
+        let _run_guard = self
+            .metadata_gc_run_lock
+            .lock()
+            .expect("ASSERT: Metadata GC run lock poisoned");
+        let mark_epoch = self.metadata_gc_epoch.load(Ordering::Acquire);
+        let clean_state = *self
+            .metadata_gc_clean
+            .lock()
+            .expect("ASSERT: Metadata GC clean-catalog state poisoned");
+        if let Some(clean) = clean_state
+            && clean.epoch == mark_epoch
+        {
+            return Ok(GenerationMetadataGcSummary {
+                objects_removed: 0,
+                bytes_removed: 0,
+                objects_retained: clean.objects_retained,
+                mark_mode: MetadataGcMarkMode::Reused,
+                exact_reason: None,
+                catalog_generation: Some(clean.catalog_generation),
+                metrics: MetadataGcMetrics {
+                    wall: started.elapsed(),
+                    catalog_chain_runs: clean.delta_run_count + 1,
+                    ..MetadataGcMetrics::default()
+                },
+            });
+        }
+        if let Some(summary) =
+            self.try_publish_metadata_mark_delta(clean_state, mark_epoch, started)?
+        {
+            return Ok(summary);
+        }
+        let exact_reason = metadata_gc_exact_reason(clean_state, &self.metadata_gc_delta);
+        let barrier_started = Instant::now();
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .write()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: Metadata GC generation lock poisoned");
+        let barrier_wait = barrier_started.elapsed();
+        let mark_epoch = self.metadata_gc_epoch.load(Ordering::Acquire);
+        let records = self.load_complete_commit_records_unlocked()?;
+        let commit_binding = metadata_mark_commit_binding(&records);
+        let (reachable, object_graph_read_bytes) = self.mark_metadata_gc_roots(&records)?;
+        let inventory = self.inventory_metadata_gc(&reachable)?;
+        let bytes_removed = self.verify_metadata_gc_candidates(&inventory.candidates)?;
+        let catalog_generation = inventory
+            .catalog_generation_high_water
+            .checked_add(1)
+            .ok_or(GenerationError::GenerationExhausted)?;
+        let prepared_catalog = prepare_metadata_mark_catalog(
+            &self.storage,
+            catalog_generation,
+            commit_binding,
+            reachable.iter().copied(),
+            u64::try_from(reachable.len()).map_err(|_| GenerationError::MetadataTooLarge)?,
+        )?;
+        let published_catalog = prepared_catalog.publish(&self.storage)?;
+        assert_eq!(
+            published_catalog.generation(),
+            catalog_generation,
+            "ASSERT: prepared Metadata mark catalog publishes under its exact generation"
+        );
+        assert_eq!(
+            published_catalog.row_count(),
+            u64::try_from(reachable.len()).expect("ASSERT: reachable Metadata count fits u64"),
+            "ASSERT: durable Metadata mark catalog covers the exact mark set"
+        );
+        for name in &inventory.catalog_names {
+            self.storage.remove_file(name)?;
+        }
+        for (object_id, name) in &inventory.candidates {
+            assert!(
+                MetadataGcMarkMode::ExactSnapshot.has_deletion_authority(),
+                "ASSERT: only an exact Metadata mark can authorize object unlink"
+            );
+            assert!(
+                !reachable.contains(object_id),
+                "ASSERT: Metadata GC cannot unlink an object in its verified reachability set"
+            );
+            self.storage.remove_file(name)?;
+        }
+        self.storage.sync_root()?;
+        let summary = GenerationMetadataGcSummary {
+            objects_removed: u64::try_from(inventory.candidates.len())
+                .map_err(|_| GenerationError::MetadataTooLarge)?,
+            bytes_removed,
+            objects_retained: u64::try_from(reachable.len())
+                .map_err(|_| GenerationError::MetadataTooLarge)?,
+            mark_mode: MetadataGcMarkMode::ExactSnapshot,
+            exact_reason: Some(exact_reason),
+            catalog_generation: Some(catalog_generation),
+            metrics: MetadataGcMetrics {
+                wall: started.elapsed(),
+                barrier_wait,
+                object_graph_read_bytes,
+                candidate_read_bytes: bytes_removed,
+                catalog_read_bytes: published_catalog.file_length(),
+                catalog_write_bytes: published_catalog.file_length(),
+                unlinked_bytes: bytes_removed,
+                root_syncs: 1,
+                catalog_chain_runs: 1,
+            },
+        };
+        if self.metadata_gc_epoch.load(Ordering::Acquire) == mark_epoch {
+            *self
+                .metadata_gc_delta
+                .lock()
+                .expect("ASSERT: Metadata GC delta journal poisoned after exact mark") =
+                MetadataGcDeltaJournal::default();
+            *self
+                .metadata_gc_clean
+                .lock()
+                .expect("ASSERT: Metadata GC clean-catalog state poisoned") =
+                Some(MetadataGcCleanState {
+                    epoch: mark_epoch,
+                    objects_retained: summary.objects_retained,
+                    catalog_generation,
+                    delta_run_count: 0,
+                });
+        }
+        Ok(summary)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn try_publish_metadata_mark_delta(
+        &self,
+        clean_state: Option<MetadataGcCleanState>,
+        mark_epoch: u64,
+        started: Instant,
+    ) -> Result<Option<GenerationMetadataGcSummary>, GenerationError> {
+        let Some(clean) =
+            clean_state.filter(|clean| clean.delta_run_count < MAX_METADATA_MARK_DELTA_RUNS)
+        else {
+            return Ok(None);
+        };
+        let delta_snapshot = {
+            let journal = self
+                .metadata_gc_delta
+                .lock()
+                .expect("ASSERT: Metadata GC delta journal poisoned during collection");
+            (!journal.exact_required
+                && journal.unclassified.is_empty()
+                && !journal.additions.is_empty())
+            .then(|| (journal.revision, journal.additions.clone()))
+        };
+        let Some((journal_revision, additions)) = delta_snapshot else {
+            return Ok(None);
+        };
+
+        let records = self.load_complete_commit_records_unlocked()?;
+        let catalog_generation = clean
+            .catalog_generation
+            .checked_add(1)
+            .ok_or(GenerationError::GenerationExhausted)?;
+        let row_count =
+            u64::try_from(additions.len()).map_err(|_| GenerationError::MetadataTooLarge)?;
+        let prepared = prepare_metadata_mark_addition(
+            &self.storage,
+            catalog_generation,
+            clean.catalog_generation,
+            metadata_mark_commit_binding(&records),
+            additions.iter().copied(),
+            row_count,
+        )?;
+        let published = prepared.publish(&self.storage)?;
+        assert_eq!(
+            published.generation(),
+            catalog_generation,
+            "ASSERT: Metadata mark delta publishes under its exact generation"
+        );
+        assert_eq!(
+            published.base_generation(),
+            clean.catalog_generation,
+            "ASSERT: Metadata mark delta extends the installed catalog tail"
+        );
+        assert_eq!(
+            published.row_count(),
+            row_count,
+            "ASSERT: Metadata mark delta covers every classified addition"
+        );
+        self.storage.sync_root()?;
+        assert!(
+            !MetadataGcMarkMode::AdditionDelta.has_deletion_authority(),
+            "ASSERT: an additive Metadata catalog run never gains deletion authority"
+        );
+
+        let mut journal = self
+            .metadata_gc_delta
+            .lock()
+            .expect("ASSERT: Metadata GC delta journal poisoned after publication");
+        for object_id in &additions {
+            assert!(
+                journal.additions.remove(object_id),
+                "ASSERT: published Metadata delta identity remains journaled"
+            );
+        }
+        if journal.revision == journal_revision {
+            assert!(
+                journal.additions.is_empty(),
+                "ASSERT: unchanged Metadata delta journal was published completely"
+            );
+        }
+        drop(journal);
+
+        let objects_retained = clean
+            .objects_retained
+            .checked_add(row_count)
+            .ok_or(GenerationError::MetadataTooLarge)?;
+        *self
+            .metadata_gc_clean
+            .lock()
+            .expect("ASSERT: Metadata GC clean-catalog state poisoned") =
+            Some(MetadataGcCleanState {
+                epoch: mark_epoch,
+                objects_retained,
+                catalog_generation,
+                delta_run_count: clean.delta_run_count + 1,
+            });
+        Ok(Some(GenerationMetadataGcSummary {
+            objects_removed: 0,
+            bytes_removed: 0,
+            objects_retained,
+            mark_mode: MetadataGcMarkMode::AdditionDelta,
+            exact_reason: None,
+            catalog_generation: Some(catalog_generation),
+            metrics: MetadataGcMetrics {
+                wall: started.elapsed(),
+                catalog_read_bytes: published.file_length(),
+                catalog_write_bytes: published.file_length(),
+                root_syncs: 1,
+                catalog_chain_runs: clean.delta_run_count + 2,
+                ..MetadataGcMetrics::default()
+            },
+        }))
+    }
+
+    fn mark_metadata_gc_roots(
+        &self,
+        records: &[CommitRecord],
+    ) -> Result<(BTreeSet<MetadataObjectId>, u64), GenerationError> {
+        let mut reachable = BTreeSet::new();
+        let mut bytes_read = 0_u64;
+        for record in records {
+            reachable.insert(record.namespace_root());
+            let encoded_root = self.read_metadata(record.namespace_root())?;
+            bytes_read = bytes_read
+                .checked_add(
+                    u64::try_from(encoded_root.len())
+                        .map_err(|_| GenerationError::MetadataTooLarge)?,
+                )
+                .ok_or(GenerationError::MetadataTooLarge)?;
+            let root = NamespaceRoot::decode(&encoded_root)?;
+            if !record_matches_namespace_root(*record, &root) {
+                return Err(GenerationError::PreviousGenerationRecordMismatch);
+            }
+            for inode in root.file_inodes() {
+                scan_manifest_tree(
+                    inode.manifest_root(),
+                    |node_id| {
+                        reachable.insert(node_id);
+                        let bytes = self.read_manifest_node(node_id)?;
+                        bytes_read = bytes_read
+                            .checked_add(
+                                u64::try_from(bytes.len())
+                                    .map_err(|_| ManifestTreeError::ArithmeticOverflow)?,
+                            )
+                            .ok_or(ManifestTreeError::ArithmeticOverflow)?;
+                        Ok(bytes)
+                    },
+                    |_logical_offset, _extent| Ok(()),
+                )?;
+            }
+        }
+        let pinned_roots = self
+            .metadata_root_pins
+            .lock()
+            .expect("ASSERT: Metadata root pin registry poisoned during GC proof")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for root in pinned_roots {
+            if reachable.insert(root) {
+                scan_manifest_tree(
+                    root,
+                    |node_id| {
+                        reachable.insert(node_id);
+                        let bytes = self.read_manifest_node(node_id)?;
+                        bytes_read = bytes_read
+                            .checked_add(
+                                u64::try_from(bytes.len())
+                                    .map_err(|_| ManifestTreeError::ArithmeticOverflow)?,
+                            )
+                            .ok_or(ManifestTreeError::ArithmeticOverflow)?;
+                        Ok(bytes)
+                    },
+                    |_logical_offset, _extent| Ok(()),
+                )?;
+            }
+        }
+        Ok((reachable, bytes_read))
+    }
+
+    fn inventory_metadata_gc(
+        &self,
+        reachable: &BTreeSet<MetadataObjectId>,
+    ) -> Result<MetadataGcInventory, GenerationError> {
+        let mut inventory = MetadataGcInventory {
+            candidates: Vec::new(),
+            catalog_names: Vec::new(),
+            catalog_generation_high_water: 0,
+        };
+        let mut inventory_error = None;
+        self.storage.visit_names(&mut |name| {
+            if inventory_error.is_some() {
+                return;
+            }
+            let result = inventory_metadata_name(&mut inventory, reachable, name);
+            if let Err(error) = result {
+                inventory_error = Some(error);
+            }
+        })?;
+        if let Some(error) = inventory_error {
+            return Err(error);
+        }
+        Ok(inventory)
+    }
+
+    fn verify_metadata_gc_candidates(
+        &self,
+        candidates: &[(MetadataObjectId, String)],
+    ) -> Result<u64, GenerationError> {
+        let mut bytes_removed = 0_u64;
+        for (object_id, name) in candidates {
+            let length = self.storage.object_len(name)?;
+            if length > MAX_METADATA_OBJECT_BYTES_U64 {
+                return Err(GenerationError::MetadataIdentityCollision(*object_id));
+            }
+            let bytes = self.storage.read(name)?;
+            if u64::try_from(bytes.len()) != Ok(length)
+                || MetadataObjectId::from_encoded(&bytes)? != *object_id
+            {
+                return Err(GenerationError::MetadataIdentityCollision(*object_id));
+            }
+            bytes_removed = bytes_removed
+                .checked_add(length)
+                .ok_or(GenerationError::MetadataTooLarge)?;
+        }
+        Ok(bytes_removed)
     }
 
     fn scan_generation_liveness(
@@ -777,6 +1491,14 @@ impl<I: StorageIo> GenerationRepository<I> {
         audit_retained_history: bool,
     ) -> Result<GenerationLivenessProof, GenerationError> {
         let records = self.load_complete_commit_records()?;
+        self.scan_generation_liveness_from_records(&records, audit_retained_history)
+    }
+
+    fn scan_generation_liveness_from_records(
+        &self,
+        records: &[CommitRecord],
+        audit_retained_history: bool,
+    ) -> Result<GenerationLivenessProof, GenerationError> {
         if records.is_empty() {
             return Ok(GenerationLivenessProof::default());
         }
@@ -825,6 +1547,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             summary,
             online_records,
             online_chunks,
+            pinned_roots: BTreeSet::new(),
         })
     }
 
@@ -913,6 +1636,10 @@ impl<I: StorageIo> GenerationRepository<I> {
             .commit_lock
             .lock()
             .expect("ASSERT: generation liveness lock poisoned");
+        self.load_complete_commit_records_unlocked()
+    }
+
+    fn load_complete_commit_records_unlocked(&self) -> Result<Vec<CommitRecord>, GenerationError> {
         let Some(snapshot) = GenerationLog::new(&self.storage)
             .load_for_recovery()
             .map_err(map_log_error)?
@@ -959,10 +1686,31 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         proof: &GenerationLivenessProof,
     ) -> Result<bool, GenerationError> {
-        let _guard = self
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .write()
+            .expect("ASSERT: GC publication revalidation barrier poisoned");
+        let _commit_guard = self
             .commit_lock
             .lock()
             .expect("ASSERT: GC generation revalidation lock poisoned");
+        self.gc_proof_is_current_unlocked(proof)
+    }
+
+    fn gc_proof_is_current_unlocked(
+        &self,
+        proof: &GenerationLivenessProof,
+    ) -> Result<bool, GenerationError> {
+        let pinned_roots = self
+            .metadata_root_pins
+            .lock()
+            .expect("ASSERT: Metadata root pin registry poisoned during GC revalidation")
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if pinned_roots != proof.pinned_roots {
+            return Ok(false);
+        }
         let Some(snapshot) = GenerationLog::new(&self.storage)
             .load_for_recovery()
             .map_err(map_log_error)?
@@ -974,6 +1722,29 @@ impl<I: StorageIo> GenerationRepository<I> {
         }
         let first_online = snapshot.records().len().saturating_sub(2);
         Ok(snapshot.records()[first_online..] == proof.online_records)
+    }
+
+    pub(crate) fn apply_if_gc_proof_current<T, E, F>(
+        &self,
+        proof: &GenerationLivenessProof,
+        operation: F,
+    ) -> Result<Option<T>, E>
+    where
+        E: From<GenerationError>,
+        F: FnOnce() -> Result<T, E>,
+    {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .write()
+            .expect("ASSERT: GC retirement publication barrier poisoned");
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: GC retirement generation lock poisoned");
+        if !self.gc_proof_is_current_unlocked(proof).map_err(E::from)? {
+            return Ok(None);
+        }
+        operation().map(Some)
     }
 
     /// Publishes a complete Namespace Root and appends its Commit Record last.
@@ -1053,7 +1824,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: generation commit lock poisoned");
         let manifests = self.verify_manifest_graph(root, Some(containers))?;
-        let files = verified_files(manifests, &self.storage, containers)?;
+        let files = verified_files(manifests, self, containers)?;
         let record = self.commit_verified_namespace(root, None)?;
         Ok(CommittedDataGeneration { record, files })
     }
@@ -1090,7 +1861,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: generation commit lock poisoned");
         let manifests = self.verify_manifest_graph(root, Some(verifier))?;
-        let files = verified_files(manifests, &self.storage, containers)?;
+        let files = verified_files(manifests, self, containers)?;
         let record = self.commit_verified_namespace(root, None)?;
         Ok(CommittedDataGeneration { record, files })
     }
@@ -1166,9 +1937,40 @@ impl<I: StorageIo> GenerationRepository<I> {
             manifests.push((inode.inode(), proof.summary));
         }
         verifier.verify_required_chunks(&introduced)?;
-        let files = verified_files(manifests, &self.storage, containers)?;
-        let record = self.commit_verified_namespace_from_snapshot(root, &snapshot)?;
-        Ok(CommittedDataGeneration { record, files })
+        let files = verified_files(manifests, self, containers)?;
+        let committed = self.commit_verified_namespace_from_snapshot_tracked(root, &snapshot)?;
+        if committed.wal_rotated {
+            self.mark_all_metadata_root_pin_releases_exact();
+        }
+        let mut introduced_metadata = BTreeSet::new();
+        for proof in proofs {
+            introduced_metadata.extend(proof.introduced_metadata.iter().copied());
+        }
+        if committed.namespace_root_published_new {
+            introduced_metadata.insert(committed.record.namespace_root());
+        }
+        if committed.wal_rotated {
+            mark_metadata_gc_exact_required(
+                &self.metadata_gc_epoch,
+                &self.metadata_gc_delta,
+                MetadataGcExactReason::WalRotation,
+            );
+        } else {
+            classify_metadata_gc_additions(
+                &self.metadata_gc_epoch,
+                &self.metadata_gc_delta,
+                &introduced_metadata,
+            );
+        }
+        let committed_manifest_roots = proofs
+            .iter()
+            .map(|proof| proof.summary.root())
+            .collect::<BTreeSet<_>>();
+        self.mark_metadata_root_releases_covered_by_commit(&committed_manifest_roots);
+        Ok(CommittedDataGeneration {
+            record: committed.record,
+            files,
+        })
     }
 
     fn commit_verified_namespace(
@@ -1206,8 +2008,23 @@ impl<I: StorageIo> GenerationRepository<I> {
         root: &NamespaceRoot,
         snapshot: &LogSnapshot,
     ) -> Result<CommitRecord, GenerationError> {
+        let committed = self.commit_verified_namespace_from_snapshot_tracked(root, snapshot)?;
+        mark_metadata_gc_exact_required(
+            &self.metadata_gc_epoch,
+            &self.metadata_gc_delta,
+            MetadataGcExactReason::LegacyCommit,
+        );
+        Ok(committed.record)
+    }
+
+    fn commit_verified_namespace_from_snapshot_tracked(
+        &self,
+        root: &NamespaceRoot,
+        snapshot: &LogSnapshot,
+    ) -> Result<CommittedMetadata, GenerationError> {
         let encoded_root = root.encode()?;
-        let root_id = self.publish_metadata(&encoded_root)?;
+        let staged_root = self.publish_metadata_with_status(&encoded_root)?;
+        let root_id = staged_root.object_id;
         if let Some(previous) = snapshot.last_record() {
             self.verify_generation_transition(previous, root)?;
         } else if root.inode_allocation_cursor() != 2 || !root.inodes().is_empty() {
@@ -1234,10 +2051,26 @@ impl<I: StorageIo> GenerationRepository<I> {
             root.inode_reservation_end(),
             root.inode_allocation_cursor(),
         )?;
-        GenerationLog::new(&self.storage)
-            .append(snapshot, record)
-            .map_err(map_log_error)?;
-        Ok(record)
+        let wal_rotated = snapshot.will_rotate();
+        if wal_rotated {
+            self.mark_all_metadata_root_pin_releases_exact();
+        }
+        // Invalidate a clean catalog before the WAL durability attempt. A
+        // sync error may still have committed the exact record bytes.
+        mark_metadata_gc_dirty(&self.metadata_gc_epoch);
+        if let Err(error) = GenerationLog::new(&self.storage).append(snapshot, record) {
+            mark_metadata_gc_exact_required(
+                &self.metadata_gc_epoch,
+                &self.metadata_gc_delta,
+                MetadataGcExactReason::UncertainWalDurability,
+            );
+            return Err(map_log_error(error));
+        }
+        Ok(CommittedMetadata {
+            record,
+            namespace_root_published_new: staged_root.published_new,
+            wal_rotated,
+        })
     }
 
     /// Recovers the newest wholly verified generation supported by this writer.
@@ -1313,7 +2146,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         let Some(graph) = self.recover_latest_using(Some(containers))? else {
             return Ok(None);
         };
-        let files = verified_files(graph.manifests, &self.storage, containers)?;
+        let files = verified_files(graph.manifests, self, containers)?;
         Ok(Some(RecoveredDataGeneration {
             generation: graph.generation,
             files,
@@ -1353,7 +2186,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         let Some(graph) = self.recover_latest_using(Some(verifier))? else {
             return Ok(None);
         };
-        let files = verified_files(graph.manifests, &self.storage, containers)?;
+        let files = verified_files(graph.manifests, self, containers)?;
         Ok(Some(RecoveredDataGeneration {
             generation: graph.generation,
             files,
@@ -1482,13 +2315,23 @@ impl<I: StorageIo> GenerationRepository<I> {
         Ok(None)
     }
 
-    fn publish_metadata(&self, encoded: &[u8]) -> Result<MetadataObjectId, GenerationError> {
-        let object_id = self.stage_metadata(encoded)?;
+    fn publish_metadata_with_status(
+        &self,
+        encoded: &[u8],
+    ) -> Result<StagedMetadata, GenerationError> {
+        let staged = self.stage_metadata_with_status(encoded)?;
         self.storage.sync_root()?;
-        Ok(object_id)
+        Ok(staged)
     }
 
     fn stage_metadata(&self, encoded: &[u8]) -> Result<MetadataObjectId, GenerationError> {
+        Ok(self.stage_metadata_with_status(encoded)?.object_id)
+    }
+
+    fn stage_metadata_with_status(
+        &self,
+        encoded: &[u8],
+    ) -> Result<StagedMetadata, GenerationError> {
         if encoded.len() > MAX_METADATA_OBJECT_BYTES {
             return Err(GenerationError::MetadataTooLarge);
         }
@@ -1500,7 +2343,10 @@ impl<I: StorageIo> GenerationRepository<I> {
             if existing_id != object_id || existing != encoded {
                 return Err(GenerationError::MetadataIdentityCollision(object_id));
             }
-            return Ok(object_id);
+            return Ok(StagedMetadata {
+                object_id,
+                published_new: false,
+            });
         }
 
         let temporary_name = format!(".{}.building", encode_object_id(object_id));
@@ -1526,7 +2372,11 @@ impl<I: StorageIo> GenerationRepository<I> {
         self.storage.sync_file(&temporary_name)?;
         self.storage
             .publish_noreplace(&temporary_name, &published_name)?;
-        Ok(object_id)
+        mark_metadata_gc_unclassified(&self.metadata_gc_epoch, &self.metadata_gc_delta, object_id);
+        Ok(StagedMetadata {
+            object_id,
+            published_new: true,
+        })
     }
 
     fn read_namespace_root(
@@ -1634,6 +2484,48 @@ impl<I: StorageIo> GenerationRepository<I> {
             manifests.push((inode.inode(), summary));
         }
         Ok((manifests, required_chunks))
+    }
+
+    fn scan_manifest_root_required_chunks(
+        &self,
+        root: MetadataObjectId,
+        required_chunks: &mut BTreeMap<fastdup_format::ChunkId, u64>,
+    ) -> Result<(), GenerationError> {
+        let mut chunk_length_conflict = None;
+        scan_manifest_tree(
+            root,
+            |node_id| self.read_manifest_node(node_id),
+            |_logical_offset, extent| {
+                let (chunk_id, logical_length) = match *extent {
+                    ManifestExtent::Data {
+                        logical_length,
+                        chunk_id,
+                    } => (chunk_id, logical_length),
+                    ManifestExtent::DataSlice {
+                        chunk_id,
+                        chunk_length,
+                        ..
+                    } => (chunk_id, u64::from(chunk_length)),
+                    ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => return Ok(()),
+                };
+                if let Some(previous_length) = required_chunks.get(&chunk_id).copied() {
+                    if previous_length != logical_length {
+                        chunk_length_conflict = Some((chunk_id, previous_length, logical_length));
+                    }
+                } else {
+                    required_chunks.insert(chunk_id, logical_length);
+                }
+                Ok(())
+            },
+        )?;
+        if let Some((chunk_id, first_length, second_length)) = chunk_length_conflict {
+            return Err(GenerationError::ManifestChunkLengthConflict {
+                chunk_id,
+                first_length,
+                second_length,
+            });
+        }
+        Ok(())
     }
 
     fn read_manifest_node(
@@ -1745,11 +2637,170 @@ pub struct GenerationScrubSummary {
     latest_manifest_files: usize,
 }
 
+/// How one Metadata-GC quantum established its retained-object catalog view.
+///
+/// Only `ExactSnapshot` has deletion authority. Reuse and additive deltas are
+/// acceleration states and cannot authorize an unlink.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MetadataGcMarkMode {
+    #[default]
+    Reused,
+    AdditionDelta,
+    ExactSnapshot,
+}
+
+/// Why Metadata GC had to rebuild exact deletion authority instead of reusing
+/// or extending the process-local clean catalog state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetadataGcExactReason {
+    ProcessStart,
+    UnclassifiedPublication,
+    MetadataRootPinDrain,
+    WalRotation,
+    LegacyCommit,
+    UncertainWalDurability,
+    DeltaChainLimit,
+}
+
+impl MetadataGcExactReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessStart => "process_start",
+            Self::UnclassifiedPublication => "unclassified_publication",
+            Self::MetadataRootPinDrain => "metadata_root_pin_drain",
+            Self::WalRotation => "wal_rotation",
+            Self::LegacyCommit => "legacy_commit",
+            Self::UncertainWalDurability => "uncertain_wal_durability",
+            Self::DeltaChainLimit => "delta_chain_limit",
+        }
+    }
+}
+
+/// Per-quantum Metadata-GC work visible at the maintenance seam.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetadataGcMetrics {
+    wall: Duration,
+    barrier_wait: Duration,
+    object_graph_read_bytes: u64,
+    candidate_read_bytes: u64,
+    catalog_read_bytes: u64,
+    catalog_write_bytes: u64,
+    unlinked_bytes: u64,
+    root_syncs: u64,
+    catalog_chain_runs: u32,
+}
+
+impl MetadataGcMetrics {
+    #[must_use]
+    pub const fn wall(self) -> Duration {
+        self.wall
+    }
+
+    #[must_use]
+    pub const fn barrier_wait(self) -> Duration {
+        self.barrier_wait
+    }
+
+    #[must_use]
+    pub const fn object_graph_read_bytes(self) -> u64 {
+        self.object_graph_read_bytes
+    }
+
+    #[must_use]
+    pub const fn candidate_read_bytes(self) -> u64 {
+        self.candidate_read_bytes
+    }
+
+    #[must_use]
+    pub const fn catalog_read_bytes(self) -> u64 {
+        self.catalog_read_bytes
+    }
+
+    #[must_use]
+    pub const fn catalog_write_bytes(self) -> u64 {
+        self.catalog_write_bytes
+    }
+
+    #[must_use]
+    pub const fn unlinked_bytes(self) -> u64 {
+        self.unlinked_bytes
+    }
+
+    #[must_use]
+    pub const fn root_syncs(self) -> u64 {
+        self.root_syncs
+    }
+
+    #[must_use]
+    pub const fn catalog_chain_runs(self) -> u32 {
+        self.catalog_chain_runs
+    }
+}
+
+impl MetadataGcMarkMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::AdditionDelta => "addition_delta",
+            Self::ExactSnapshot => "exact_snapshot",
+        }
+    }
+
+    #[must_use]
+    pub const fn has_deletion_authority(self) -> bool {
+        matches!(self, Self::ExactSnapshot)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GenerationMetadataGcSummary {
+    objects_removed: u64,
+    bytes_removed: u64,
+    objects_retained: u64,
+    mark_mode: MetadataGcMarkMode,
+    exact_reason: Option<MetadataGcExactReason>,
+    catalog_generation: Option<u64>,
+    metrics: MetadataGcMetrics,
+}
+
+impl GenerationMetadataGcSummary {
+    pub(crate) const fn objects_removed(self) -> u64 {
+        self.objects_removed
+    }
+
+    pub(crate) const fn bytes_removed(self) -> u64 {
+        self.bytes_removed
+    }
+
+    pub(crate) const fn objects_retained(self) -> u64 {
+        self.objects_retained
+    }
+
+    pub(crate) const fn mark_mode(self) -> MetadataGcMarkMode {
+        self.mark_mode
+    }
+
+    pub(crate) const fn exact_reason(self) -> Option<MetadataGcExactReason> {
+        self.exact_reason
+    }
+
+    pub(crate) const fn catalog_generation(self) -> Option<u64> {
+        self.catalog_generation
+    }
+
+    pub(crate) const fn metrics(self) -> MetadataGcMetrics {
+        self.metrics
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GenerationLivenessProof {
     summary: GenerationScrubSummary,
     online_records: Vec<CommitRecord>,
     online_chunks: BTreeMap<fastdup_format::ChunkId, u64>,
+    pinned_roots: BTreeSet<MetadataObjectId>,
 }
 
 /// Metadata-only reachability changes for the current and previous protected
@@ -1924,7 +2975,7 @@ impl<I: StorageIo> VerifiedCommittedFile<I> {
 
 fn verified_files<M, I>(
     manifests: Vec<(u64, ManifestTreeSummary)>,
-    metadata: &M,
+    generations: &GenerationRepository<M>,
     containers: &ContainerRepository<I>,
 ) -> Result<Vec<VerifiedCommittedFile<I>>, GenerationError>
 where
@@ -1940,8 +2991,9 @@ where
             inode,
             file: VerifiedManifestFile::from_verified_tree(
                 summary,
-                metadata.clone(),
+                generations.storage.clone(),
                 containers.clone(),
+                generations.pin_metadata_root(summary.root()),
             ),
         });
     }
@@ -2111,6 +3163,8 @@ pub enum GenerationError {
         end: u64,
         logical_size: u64,
     },
+    InvalidMetadataObjectName(String),
+    MetadataMarkCatalogCorruption,
 }
 
 impl GenerationError {
@@ -2178,7 +3232,9 @@ impl GenerationError {
                 | ManifestTreeError::OutOfMemory
                 | ManifestTreeError::Inner(fastdup_format::ManifestInnerNodeError::OutOfMemory),
             )
-            | Self::OutOfMemory => false,
+            | Self::OutOfMemory
+            | Self::InvalidMetadataObjectName(_)
+            | Self::MetadataMarkCatalogCorruption => false,
         }
     }
 }
@@ -2205,6 +3261,21 @@ impl std::error::Error for GenerationError {
 impl From<io::Error> for GenerationError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<MetadataMarkCatalogError> for GenerationError {
+    fn from(error: MetadataMarkCatalogError) -> Self {
+        match error {
+            MetadataMarkCatalogError::Io(error) => Self::Io(error),
+            MetadataMarkCatalogError::Format(
+                fastdup_format::MetadataMarkCatalogError::OutOfMemory,
+            ) => Self::OutOfMemory,
+            MetadataMarkCatalogError::Format(
+                fastdup_format::MetadataMarkCatalogError::ArithmeticOverflow,
+            ) => Self::MetadataTooLarge,
+            MetadataMarkCatalogError::Format(_) => Self::MetadataMarkCatalogCorruption,
+        }
     }
 }
 
@@ -2249,6 +3320,159 @@ fn map_log_error(error: GenerationLogError) -> GenerationError {
 
 fn metadata_name(object_id: MetadataObjectId) -> String {
     format!("{}{}", encode_object_id(object_id), METADATA_SUFFIX)
+}
+
+fn inventory_metadata_name(
+    inventory: &mut MetadataGcInventory,
+    reachable: &BTreeSet<MetadataObjectId>,
+    name: &str,
+) -> Result<(), GenerationError> {
+    if is_metadata_mark_catalog_name(name) {
+        if let Some(generation) = parse_metadata_mark_generation(name) {
+            inventory.catalog_generation_high_water =
+                inventory.catalog_generation_high_water.max(generation);
+        }
+        inventory
+            .catalog_names
+            .try_reserve(1)
+            .map_err(|_| GenerationError::OutOfMemory)?;
+        inventory.catalog_names.push(name.to_owned());
+        return Ok(());
+    }
+    let Some(object_id) = parse_metadata_name(name)? else {
+        return Ok(());
+    };
+    if !reachable.contains(&object_id) {
+        inventory
+            .candidates
+            .try_reserve(1)
+            .map_err(|_| GenerationError::OutOfMemory)?;
+        inventory.candidates.push((object_id, name.to_owned()));
+    }
+    Ok(())
+}
+
+fn mark_metadata_gc_dirty(epoch: &AtomicU64) {
+    let previous = epoch.fetch_add(1, Ordering::AcqRel);
+    assert_ne!(
+        previous,
+        u64::MAX,
+        "ASSERT: Metadata GC liveness epoch cannot overflow"
+    );
+}
+
+fn advance_metadata_gc_journal_revision(journal: &mut MetadataGcDeltaJournal) {
+    journal.revision = journal
+        .revision
+        .checked_add(1)
+        .expect("ASSERT: Metadata GC delta journal revision cannot overflow");
+}
+
+fn mark_metadata_gc_unclassified(
+    epoch: &AtomicU64,
+    journal: &Mutex<MetadataGcDeltaJournal>,
+    object_id: MetadataObjectId,
+) {
+    let mut journal = journal
+        .lock()
+        .expect("ASSERT: Metadata GC delta journal poisoned during publication");
+    let inserted = journal.unclassified.insert(object_id);
+    assert!(
+        inserted,
+        "ASSERT: newly published Metadata identity is not already unclassified"
+    );
+    advance_metadata_gc_journal_revision(&mut journal);
+    drop(journal);
+    mark_metadata_gc_dirty(epoch);
+}
+
+fn mark_metadata_gc_exact_required(
+    epoch: &AtomicU64,
+    journal: &Mutex<MetadataGcDeltaJournal>,
+    reason: MetadataGcExactReason,
+) {
+    let mut journal = journal
+        .lock()
+        .expect("ASSERT: Metadata GC delta journal poisoned during invalidation");
+    journal.exact_required = true;
+    if journal.exact_reason.is_none() {
+        journal.exact_reason = Some(reason);
+    }
+    advance_metadata_gc_journal_revision(&mut journal);
+    drop(journal);
+    mark_metadata_gc_dirty(epoch);
+}
+
+fn metadata_gc_exact_reason(
+    clean: Option<MetadataGcCleanState>,
+    journal: &Mutex<MetadataGcDeltaJournal>,
+) -> MetadataGcExactReason {
+    let Some(clean) = clean else {
+        return MetadataGcExactReason::ProcessStart;
+    };
+    if clean.delta_run_count >= MAX_METADATA_MARK_DELTA_RUNS {
+        return MetadataGcExactReason::DeltaChainLimit;
+    }
+    let journal = journal
+        .lock()
+        .expect("ASSERT: Metadata GC delta journal poisoned while reporting exact reason");
+    if let Some(reason) = journal.exact_reason {
+        return reason;
+    }
+    if !journal.unclassified.is_empty() {
+        return MetadataGcExactReason::UnclassifiedPublication;
+    }
+    MetadataGcExactReason::UncertainWalDurability
+}
+
+fn classify_metadata_gc_additions(
+    epoch: &AtomicU64,
+    journal: &Mutex<MetadataGcDeltaJournal>,
+    additions: &BTreeSet<MetadataObjectId>,
+) {
+    let mut journal = journal
+        .lock()
+        .expect("ASSERT: Metadata GC delta journal poisoned during commit classification");
+    for object_id in additions {
+        if journal.unclassified.remove(object_id) {
+            let inserted = journal.additions.insert(*object_id);
+            assert!(
+                inserted,
+                "ASSERT: one newly committed Metadata identity enters one delta only"
+            );
+        }
+    }
+    advance_metadata_gc_journal_revision(&mut journal);
+    drop(journal);
+    mark_metadata_gc_dirty(epoch);
+}
+
+fn parse_metadata_name(name: &str) -> Result<Option<MetadataObjectId>, GenerationError> {
+    let Some(encoded) = name.strip_suffix(METADATA_SUFFIX) else {
+        return Ok(None);
+    };
+    if encoded.len() != 64 {
+        return Err(GenerationError::InvalidMetadataObjectName(name.to_owned()));
+    }
+    let mut bytes = [0_u8; 32];
+    for (output, pair) in bytes.iter_mut().zip(encoded.as_bytes().chunks_exact(2)) {
+        let (Some(high), Some(low)) = (decode_hex_nibble(pair[0]), decode_hex_nibble(pair[1]))
+        else {
+            return Err(GenerationError::InvalidMetadataObjectName(name.to_owned()));
+        };
+        *output = (high << 4) | low;
+    }
+    MetadataObjectId::new(bytes)
+        .map(Some)
+        .ok_or_else(|| GenerationError::InvalidMetadataObjectName(name.to_owned()))
+}
+
+const fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn encode_object_id(object_id: MetadataObjectId) -> String {

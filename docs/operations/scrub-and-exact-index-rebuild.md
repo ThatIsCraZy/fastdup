@@ -3,10 +3,10 @@
 Status: implemented and deterministically fault-tested for the current
 single-writer checkpoint formats.
 
-Stop and unmount `fastdup-durable-fuse` before every command. The repository
-does not yet have a durable Appliance Lease, so the tool requires an explicit
-`--offline` acknowledgement but cannot independently prove that another
-process is absent.
+Offline commands acquire the Metadata root's exclusive Appliance Lease before
+opening either repository and fail if the writable daemon or another offline
+process owns it. Stop and unmount `fastdup-durable-fuse`; `--offline` remains an
+explicit acknowledgement that unrestricted maintenance scheduling is intended.
 
 ```bash
 export RUSTUP_HOME=/source/fastdup/.artifacts/rustup
@@ -26,6 +26,9 @@ cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
 
 cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
   --offline gc-now METADATA_ROOT CONTAINER_ROOT
+
+cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
+  --offline metadata-gc METADATA_ROOT CONTAINER_ROOT
 
 # Against the currently mounted writable appliance:
 cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
@@ -101,9 +104,8 @@ retry resume a partially written non-authoritative `.building` object. The
 command prints `gc_ok=true` only after the directory sync.
 
 The destructive phase still requires `--offline`. The asynchronous job shape
-prevents the control plane from executing Scrub inline, but it is not authority
-for this separate CLI process to race a writable mount before the Appliance
-Lease is implemented.
+prevents the control plane from executing Scrub inline; the separately held
+Appliance Lease prevents this CLI process from racing a writable mount.
 
 The shared in-process store API now provides the safe online execution core for
 a locally constructed `GcCandidateProof`. It publishes replacement `ACTIVE`
@@ -124,7 +126,29 @@ adaptive scheduler. Continuing frontend io_uring submissions permit one small
 background quantum every fifteen minutes. After thirty seconds without a new
 frontend submission, the daemon may run one larger quantum per minute. At or
 above 90% physical Data Pool occupancy, it may run an urgent larger quantum
-every thirty seconds. All three remain in Linux idle I/O class.
+every thirty seconds; pressure remains latched until occupancy reaches 85%.
+All three remain in Linux idle I/O class. Operators may override the four
+intervals, low/high basis-point watermarks, one `HH:MM-HH:MM` UTC window and its
+interval, and the maximum relocation encoder workers through the corresponding
+`FASTDUP_ONLINE_GC_*` environment variables exported by the appliance crate.
+Background relocation remains single-worker; all destructive phases remain
+serialized.
+
+The startup overrides are:
+
+- `FASTDUP_ONLINE_GC_ACTIVE_INTERVAL_SECONDS`
+- `FASTDUP_ONLINE_GC_IDLE_AFTER_SECONDS`
+- `FASTDUP_ONLINE_GC_IDLE_INTERVAL_SECONDS`
+- `FASTDUP_ONLINE_GC_URGENT_INTERVAL_SECONDS`
+- `FASTDUP_ONLINE_GC_PRESSURE_LOW_BASIS_POINTS`
+- `FASTDUP_ONLINE_GC_PRESSURE_HIGH_BASIS_POINTS`
+- `FASTDUP_ONLINE_GC_DAILY_WINDOW_UTC`, for example `23:00-05:00`
+- `FASTDUP_ONLINE_GC_WINDOW_INTERVAL_SECONDS`
+- `FASTDUP_ONLINE_GC_MAX_RELOCATION_WORKERS`
+
+The low watermark must be below the high watermark. All durations and the
+worker count must be nonzero. Supplying a window interval without a daily
+window is rejected.
 
 `--online gc-now METADATA_ROOT` sends one request over the daemon-owned
 mode-0600 Unix socket in the Metadata root. It starts an urgent quantum
@@ -140,6 +164,70 @@ shares RETIRING state and descriptor cache with the frontend Container
 repository, while bypassing the frontend io_uring ring and inflight-byte
 budget. Candidate bootstrap streams rows from bounded Header/Footer reads; it
 does not read Container payload and does not retain a pool-sized catalog map.
+
+If Current/Previous, Active/Frozen, and open-orphan liveness contain no DATA
+Chunk, an urgent quantum retires its verified victims without publishing
+replacement Containers. A large empty pool is drained across repeated bounded
+quanta; a stable empty pool returns `outcome=no_candidates`. With protected
+DATA present, a cached Reverse Dependency Generation binds the protected Commit
+pair to the active Exact generation. It preserves live targets and their
+effective ACTIVE Prefix Bases while leaving unrelated dead victim Chunks
+behind. Truncated lookup, missing ACTIVE coverage, or either changed binding
+aborts the proof.
+
+The mode-0600 control socket remains a filesystem object in the Metadata root.
+Bind, stale-owner probing, and client connect use a short directory-descriptor
+alias internally, so long run-specific Metadata paths do not exceed Linux
+`sockaddr_un.sun_path`.
+
+Every admitted adaptive Online-GC quantum also runs Metadata GC in the same
+idle-I/O maintenance class. The first or invalidated cycle exactly marks all
+Namespace Roots and Manifest nodes reachable from the selected bounded
+Commit-Log segment together with every process-local Metadata Root Pin held by
+an installed/open Manifest reader or an unpublished successor proof. A
+publication barrier prevents collection from observing a child-first Manifest
+batch before its root becomes pinned. An unchanged process-local liveness epoch
+reuses the clean mark-catalog result without another graph or directory scan.
+Only canonical `.fdm` objects outside that union are candidates; every candidate
+is fully identity-verified before the first unlink. The exact result is written
+as a sorted immutable Metadata Mark Catalog, audited before no-replace
+publication, and committed together with garbage and obsolete-catalog removal
+by one final Metadata-root sync. The online status line reports removed
+objects/bytes, exact-versus-catalog mode, retained objects, and catalog
+generation separately from DATA GC.
+
+The online status line exposes one unambiguous Metadata mark mode
+(`reused`, `addition_delta`, or `exact_snapshot`) and, for an exact mark, the
+fallback reason. It also reports total and per-phase wall time for recovery,
+Metadata GC, candidate-catalog work, candidate proof, `RETIRING` activation,
+generation-pin drain, victim verification, unlink, DATA-directory sync,
+`REMOVED` activation, and the final catalog refresh. Physical work counters
+cover catalog bytes examined/written, verified victim bytes read in proof and
+relocation, replacement bytes written, bytes unlinked, shortlist/proof counts,
+and candidates abandoned as unprofitable or stale. Reverse-dependency counters
+report logical edges and required target/Base Chunks. Scheduler counters report
+polls, interval-deferred polls, frontend activity changes, admissions by pace
+and scheduled window, immediate operator requests, and the applied relocation
+worker bound. These counters are maintained by the
+maintenance runtime; the frontend I/O path does not update GC telemetry.
+
+Proof-bearing commits that do not rotate the Commit WAL journal their newly
+published Manifest nodes and Namespace Root in RAM. They perform no catalog
+I/O. A later maintenance quantum persists those identities as an immutable
+Addition run chained to the prior exact Snapshot or Addition and syncs the
+Metadata directory without holding the Metadata publication barrier or Commit
+lock over that I/O. Addition runs never authorize deletion. Unclassified
+publication, an unpublished-pin drain, uncertain WAL durability, WAL rotation,
+process restart, or the 32-run chain limit falls back to an exact mark and a new
+Snapshot.
+
+`--offline metadata-gc` runs this collector explicitly and follows it with a
+complete scrub. `scrub-gc` and offline `gc-now` collect both DATA Containers and
+Metadata Objects. The filesystem directory adapter streams names without a
+pool-sized name vector. The exact mark set remains bounded by reachable Metadata
+Objects. Continuously committed additions avoid complete graph and directory
+scans between exact safety boundaries; process restart deliberately performs
+one exact refresh.
 
 `rebuild-exact` scans and fully decodes one Container at a time. Verified
 Locations immediately become hidden immutable level-zero Runs. Four complete
@@ -173,7 +261,9 @@ generation of any orphan Similarity partition. The metadata fault matrix proves
 that crash recovery never exposes a Similarity family without its bound Exact
 Run Set. A maintenance CLI command for this paired operation is still pending.
 
-Remaining production gates are an Appliance Lease/multi-process exclusion,
-real block-device power-cut campaigns, streaming directory enumeration,
-measured large-store scrub/rebuild/GC throughput, configurable maintenance
-windows, and Metadata-object collection.
+Remaining production gates are real block-device power-cut campaigns, measured
+large-store scrub/rebuild/GC throughput, fake-clock stalled-I/O deadline proof,
+broad randomized process-kill coverage, and a stable downgrade/format-epoch
+fence. Process-local Metadata Root Pins disappear with their owning process;
+the accepted restart boundary therefore performs one exact mark before catalog
+reuse instead of attempting to reconstruct unpublished pins across processes.

@@ -57,6 +57,7 @@ pub struct PausedStorageIo {
 #[derive(Debug)]
 struct PauseControl {
     operation: StorageOperation,
+    name_prefix: Option<String>,
     state: Mutex<PauseState>,
     changed: Condvar,
 }
@@ -64,20 +65,66 @@ struct PauseControl {
 #[derive(Clone, Copy, Debug, Default)]
 struct PauseState {
     reached: usize,
+    armed: bool,
     resumed: bool,
 }
 
 impl PausedStorageIo {
     #[must_use]
     pub fn before(inner: MemoryStorageIo, operation: StorageOperation) -> Self {
+        Self::configured(inner, operation, None, true)
+    }
+
+    #[must_use]
+    pub fn disarmed_before_name_prefix(
+        inner: MemoryStorageIo,
+        operation: StorageOperation,
+        name_prefix: impl Into<String>,
+    ) -> Self {
+        Self::configured(inner, operation, Some(name_prefix.into()), false)
+    }
+
+    fn configured(
+        inner: MemoryStorageIo,
+        operation: StorageOperation,
+        name_prefix: Option<String>,
+        armed: bool,
+    ) -> Self {
         Self {
             inner,
             control: Arc::new(PauseControl {
                 operation,
-                state: Mutex::new(PauseState::default()),
+                name_prefix,
+                state: Mutex::new(PauseState {
+                    armed,
+                    ..PauseState::default()
+                }),
                 changed: Condvar::new(),
             }),
         }
+    }
+
+    /// Arms a name-filtered scheduling pause after fixture setup has finished.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the adapter was already armed or resumed, or if another test
+    /// thread poisoned its pause-state lock.
+    pub fn arm(&self) {
+        let mut state = self
+            .control
+            .state
+            .lock()
+            .expect("ASSERT: pause control lock poisoned while arming");
+        assert!(
+            !state.armed,
+            "ASSERT: a paused storage adapter is armed once"
+        );
+        assert!(
+            !state.resumed,
+            "ASSERT: a resumed pause cannot be armed again"
+        );
+        state.armed = true;
     }
 
     #[must_use]
@@ -135,8 +182,14 @@ impl PausedStorageIo {
         self.control.changed.notify_all();
     }
 
-    fn pause_before(&self, operation: StorageOperation) {
-        if operation != self.control.operation {
+    fn pause_before(&self, operation: StorageOperation, name: Option<&str>) {
+        if operation != self.control.operation
+            || self
+                .control
+                .name_prefix
+                .as_deref()
+                .is_some_and(|prefix| name.is_none_or(|name| !name.starts_with(prefix)))
+        {
             return;
         }
         let mut state = self
@@ -144,6 +197,9 @@ impl PausedStorageIo {
             .state
             .lock()
             .expect("ASSERT: pause control lock poisoned");
+        if !state.armed {
+            return;
+        }
         state.reached = state
             .reached
             .checked_add(1)
@@ -436,62 +492,62 @@ impl StorageIo for MemoryStorageIo {
 
 impl StorageIo for PausedStorageIo {
     fn create_new(&self, name: &str) -> io::Result<()> {
-        self.pause_before(StorageOperation::CreateNew);
+        self.pause_before(StorageOperation::CreateNew, Some(name));
         self.inner.create_new(name)
     }
 
     fn exists(&self, name: &str) -> io::Result<bool> {
-        self.pause_before(StorageOperation::Exists);
+        self.pause_before(StorageOperation::Exists, Some(name));
         self.inner.exists(name)
     }
 
     fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        self.pause_before(StorageOperation::WriteAt);
+        self.pause_before(StorageOperation::WriteAt, Some(name));
         self.inner.write_at(name, offset, bytes)
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
-        self.pause_before(StorageOperation::Read);
+        self.pause_before(StorageOperation::Read, Some(name));
         self.inner.read(name)
     }
 
     fn object_len(&self, name: &str) -> io::Result<u64> {
-        self.pause_before(StorageOperation::ObjectLen);
+        self.pause_before(StorageOperation::ObjectLen, Some(name));
         self.inner.object_len(name)
     }
 
     fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        self.pause_before(StorageOperation::ReadExactAt);
+        self.pause_before(StorageOperation::ReadExactAt, Some(name));
         self.inner.read_exact_at(name, offset, length)
     }
 
     fn list_names(&self) -> io::Result<Vec<String>> {
-        self.pause_before(StorageOperation::ListNames);
+        self.pause_before(StorageOperation::ListNames, None);
         self.inner.list_names()
     }
 
     fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
-        self.pause_before(StorageOperation::SetLen);
+        self.pause_before(StorageOperation::SetLen, Some(name));
         self.inner.set_len(name, length)
     }
 
     fn sync_file(&self, name: &str) -> io::Result<()> {
-        self.pause_before(StorageOperation::SyncFile);
+        self.pause_before(StorageOperation::SyncFile, Some(name));
         self.inner.sync_file(name)
     }
 
     fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
-        self.pause_before(StorageOperation::PublishNoreplace);
+        self.pause_before(StorageOperation::PublishNoreplace, Some(published_name));
         self.inner.publish_noreplace(temporary_name, published_name)
     }
 
     fn remove_file(&self, name: &str) -> io::Result<()> {
-        self.pause_before(StorageOperation::RemoveFile);
+        self.pause_before(StorageOperation::RemoveFile, Some(name));
         self.inner.remove_file(name)
     }
 
     fn sync_root(&self) -> io::Result<()> {
-        self.pause_before(StorageOperation::SyncRoot);
+        self.pause_before(StorageOperation::SyncRoot, None);
         self.inner.sync_root()
     }
 }

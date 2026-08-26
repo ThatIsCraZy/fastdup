@@ -13,9 +13,9 @@ maintenance never asks the write hot loop to measure, lock, signal, sleep, or
 reserve capacity on its behalf.
 
 The explicit `gc-now` execution mode skips CPU and I/O demotion. The appliance
-CLI admits it only after the operator supplies `--offline`; until the durable
-Appliance Lease exists, the operator must stop and unmount the writable
-appliance. Full speed changes resource scheduling only. It does not weaken the
+CLI admits it only after the operator supplies `--offline` and acquires the
+exclusive Appliance Lease from ADR 0069. Full speed changes resource scheduling
+only. It does not weaken the
 generation proof, replacement-before-deletion, Exact activation, identity
 reread, or directory-sync invariants.
 
@@ -32,11 +32,18 @@ admission capacity. Scheduled windows may raise maintenance concurrency, but
 only explicit exclusive full-speed mode may remove the frontend I/O priority
 separation.
 
-The writable appliance implements three adaptive paces. With continuing
-frontend submissions it admits one small background quantum no more often than
-every fifteen minutes. Thirty quiet seconds permit larger idle quanta no more
-often than once per minute. Inclusive 90% Data Pool occupancy admits an urgent
-large quantum every thirty seconds. The scheduler samples the frontend
+The writable appliance implements three adaptive paces. Defaults admit a small
+background quantum every fifteen minutes under continuing frontend submissions,
+a larger idle quantum once per minute after thirty quiet seconds, and an urgent
+large quantum every thirty seconds at the inclusive 90% high watermark. Space
+pressure stays latched until occupancy reaches the inclusive 85% low watermark,
+preventing admission oscillation. Operators may configure all intervals, both
+watermarks, one wrapping daily UTC window, and the maximum replacement-encoder
+worker count before startup. Invalid configuration fails before storage opens.
+Scheduled work uses Idle mode but retains idle-class I/O. Background relocation
+uses one encoder worker; Idle/Urgent work uses at most the configured count and
+available CPUs. Candidate proof, transition activation, pin drain, and unlink
+remain serialized. The scheduler samples the frontend
 io_uring submission counter that already exists; write and read paths gain no
 GC counter, lock, notification, or branch.
 
@@ -51,4 +58,8 @@ with normal CPU priority but retains idle I/O priority. Only the existing
 explicitly offline `gc-now` command means unrestricted CPU and ordinary I/O
 priority. The control path is a daemon-owned mode-0600 Unix socket inside the
 Metadata root; a CLI request never opens DATA or Metadata repositories and
-therefore cannot become a competing storage owner.
+therefore cannot become a competing storage owner. Bind and connect resolve
+that filesystem socket through a short directory-file-descriptor path, so the
+bounded `sockaddr_un.sun_path` does not impose a shorter-than-POSIX limit on the
+Metadata root while filesystem ownership and mode remain the authorization
+boundary.

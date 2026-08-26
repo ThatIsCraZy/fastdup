@@ -4302,7 +4302,7 @@ where
 {
     fn prepare(&self, file: VerifiedManifestFile<C>) -> VerifiedManifestFile<C> {
         let file = match self.core.repository.pin_active_generation() {
-            Some(active) => file.with_active_index(active),
+            Some(active) => file.with_active_index(&active),
             None => file,
         };
         file.with_verified_read_cache(Arc::clone(&self.read_cache))

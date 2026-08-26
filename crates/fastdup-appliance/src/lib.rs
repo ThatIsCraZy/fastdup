@@ -2,12 +2,15 @@
 
 //! Durable repository-to-POSIX mount orchestration.
 
+mod appliance_lease;
 mod checkpoint;
 mod checkpoint_trigger;
 mod historical_proof_cache;
 mod online_gc;
 mod proof_cache_trace;
 mod statfs;
+
+pub use appliance_lease::{APPLIANCE_LEASE_FILE_NAME, ApplianceLease, ApplianceLeaseOwner};
 
 pub use checkpoint::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, CpuPhaseStatus,
@@ -21,7 +24,13 @@ pub use checkpoint_trigger::{
 };
 pub use historical_proof_cache::HistoricalProofCacheStatus;
 pub use online_gc::{
-    ONLINE_GC_CONTROL_REQUEST, ONLINE_GC_CONTROL_SOCKET_NAME, OnlineGcScheduler,
+    DailyGcWindow, ONLINE_GC_ACTIVE_INTERVAL_SECONDS_ENV, ONLINE_GC_CONTROL_REQUEST,
+    ONLINE_GC_CONTROL_SOCKET_NAME, ONLINE_GC_DAILY_WINDOW_UTC_ENV,
+    ONLINE_GC_IDLE_AFTER_SECONDS_ENV, ONLINE_GC_IDLE_INTERVAL_SECONDS_ENV,
+    ONLINE_GC_MAX_RELOCATION_WORKERS_ENV, ONLINE_GC_PRESSURE_HIGH_BASIS_POINTS_ENV,
+    ONLINE_GC_PRESSURE_LOW_BASIS_POINTS_ENV, ONLINE_GC_URGENT_INTERVAL_SECONDS_ENV,
+    ONLINE_GC_WINDOW_INTERVAL_SECONDS_ENV, OnlineGcPolicy, OnlineGcPolicyConfigurationError,
+    OnlineGcPolicyError, OnlineGcScheduler, OnlineGcSchedulerStatus, bind_online_gc_control_socket,
     online_gc_control_path, remove_stale_online_gc_socket, request_online_gc_now,
 };
 pub use proof_cache_trace::{
@@ -134,7 +143,7 @@ where
         return Ok(None);
     };
     mount_recovered(config, recovered, |file| match &active {
-        Some(index) => file.with_active_index(index.clone()),
+        Some(index) => file.with_active_index(index),
         None => file,
     })
     .map(Some)

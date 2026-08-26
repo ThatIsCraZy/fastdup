@@ -27,12 +27,15 @@ Der FUSE-Pfad unterstützt unter anderem:
   erneut zu lesen oder zu chunken
 - absturzsichere Checkpoints und Recovery auf den jüngsten vollständigen
   Commit
-- Offline-Scrub, Garbage Collection und Neuaufbau des Exact Index
+- Unterverzeichnisse, Hardlinks, Symlinks, xattrs/ACLs, Besitz, Rechte,
+  Zeitstempel und flüchtige POSIX-Record-Locks
+- `statfs`, dünne Allokation, Hole Punch, Zero Range und DATA/HOLE-Seeks
+- Offline-Scrub, adaptives Online-/Offline-GC und Neuaufbau des Exact Index
 
-Der Adapter bildet noch nicht den gesamten POSIX-Umfang ab. Unterverzeichnisse,
-Hardlinks, Symlinks, xattrs, Besitz- und Rechteänderungen, Dateisperren,
-`statfs` und `fallocate` fehlen ganz oder teilweise. Der verbleibende Umfang
-ist in der [POSIX-Testplanung](docs/testing/posix-conformance.md) erfasst.
+Der Adapter bildet noch nicht den gesamten POSIX-Umfang ab. Insbesondere BSD
+`flock`, mmap-/Kernel-Cache-Verhalten und die breite Client- und
+Crash-Konformitätsmatrix sind noch offen. Der verbleibende Umfang ist in der
+[POSIX-Testplanung](docs/testing/posix-conformance.md) erfasst.
 
 ## Ingest-Pipeline
 
@@ -245,7 +248,7 @@ sh samba/vfs_fastdup/tests/run.sh
 Vor einem produktiven Einsatz fehlen insbesondere:
 
 - vollständige POSIX-Abdeckung und breitere Client-Kompatibilität
-- Online-GC und Metadata-GC im laufenden Betrieb
+- ein stabiler Downgrade-/Format-Epoch-Zaun
 - Schutz vor Geräteverlust
 - Langzeit-, Zufalls-Kill- und echte Stromausfalltests auf Blockgeräten
 - dauerhafte Writer-, Recovery- und Scrub-Invarianten für Similarity, Delta,
@@ -256,3 +259,7 @@ Messwerte sind workload- und hostabhängig. Reproduzierbare Methoden und
 Einschränkungen liegen unter [docs/benchmarks](docs/benchmarks/), Testpläne
 unter [docs/testing](docs/testing/) und Betriebsnotizen unter
 [docs/operations](docs/operations/).
+
+Der aktuelle reale Online-GC-Interferenzlauf ist unter
+[docs/benchmarks/online-gc-interference-2026-08-26.md](docs/benchmarks/online-gc-interference-2026-08-26.md)
+dokumentiert.

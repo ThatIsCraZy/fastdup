@@ -11,6 +11,7 @@ mod generation;
 mod generation_log;
 mod manifest_reader;
 mod manifest_tree;
+mod metadata_mark_catalog;
 pub use manifest_tree::{ManifestRangeExtent, ManifestTreeSummary};
 mod maintenance;
 mod maintenance_ioprio;
@@ -44,15 +45,17 @@ pub use gc_candidate_catalog::{
 pub use generation::{
     CommittedDataGeneration, GenerationError, GenerationLivenessDelta, GenerationRepository,
     GenerationScrubSummary, IndexedRequiredChunkVerifier, ManifestSuccessorProof,
-    RecoveredDataGeneration, RecoveredGeneration, RequiredChunkVerifier, SuccessorPredecessor,
-    VerifiedCommittedFile, WalTail,
+    MetadataGcExactReason, MetadataGcMarkMode, MetadataGcMetrics, RecoveredDataGeneration,
+    RecoveredGeneration, RequiredChunkVerifier, SuccessorPredecessor, VerifiedCommittedFile,
+    WalTail,
 };
 pub use maintenance::{
     BackgroundMaintenanceJob, BackgroundMaintenanceReport, DataPoolUsage, DataPoolUsageError,
     EndToEndScrubReport, ExactIndexRebuildReport, GarbageCollectionPlan, GarbageCollectionReport,
     GcCandidateProof, MaintenanceError, MaintenanceExecutionMode, MaintenancePriority,
-    MaintenanceRepository, OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport,
-    OnlineGcRetirement, OnlineGcRunMode, PoolIndexRebuildReport,
+    MaintenanceRepository, MetadataGarbageCollectionReport, OnlineGcCycleOutcome,
+    OnlineGcCycleReport, OnlineGcMetrics, OnlineGcRecoveryReport, OnlineGcRetirement,
+    OnlineGcRunMode, PoolIndexRebuildReport, ReverseDependencyGeneration,
 };
 pub use manifest_reader::{MAX_MANIFEST_READ_BYTES, ManifestReadError, VerifiedManifestFile};
 pub use manifest_tree::ManifestTreeError;
@@ -116,6 +119,27 @@ const MAINTENANCE_VERIFY_WINDOW_BYTES: u64 = 256 * 1_024 * 1_024;
 pub struct PublicationSampleRange {
     offset: u64,
     length: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ContainerRemovalMetrics {
+    verify: Duration,
+    unlink: Duration,
+    sync: Duration,
+}
+
+impl ContainerRemovalMetrics {
+    pub(crate) const fn verify_wall(self) -> Duration {
+        self.verify
+    }
+
+    pub(crate) const fn unlink_wall(self) -> Duration {
+        self.unlink
+    }
+
+    pub(crate) const fn sync_wall(self) -> Duration {
+        self.sync
+    }
 }
 
 impl PublicationSampleRange {
@@ -581,6 +605,19 @@ pub trait StorageIo {
     ///
     /// Returns the backend's directory-read or name-decoding error.
     fn list_names(&self) -> io::Result<Vec<String>>;
+    /// Visits current publication-directory names without requiring callers to
+    /// retain a pool-sized name collection. The default preserves compatibility
+    /// for adapters that only implement [`Self::list_names`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's directory-read or name-decoding error.
+    fn visit_names(&self, visitor: &mut dyn FnMut(&str)) -> io::Result<()> {
+        for name in self.list_names()? {
+            visitor(&name);
+        }
+        Ok(())
+    }
     /// Fixes the object's exact logical length before validation and sync.
     ///
     /// # Errors
@@ -2041,7 +2078,8 @@ impl<I: StorageIo> ContainerRepository<I> {
     pub(crate) fn remove_verified_published(
         &self,
         container_ids: &BTreeMap<[u8; 16], ContainerId>,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<(u64, ContainerRemovalMetrics), StoreError> {
+        let verify_started = Instant::now();
         let mut removed_bytes = 0_u64;
         let mut verified_removals = Vec::new();
         verified_removals
@@ -2056,13 +2094,25 @@ impl<I: StorageIo> ContainerRepository<I> {
                 .ok_or_else(audit_counter_overflow)?;
             verified_removals.push(name);
         }
+        let verify_wall = verify_started.elapsed();
+        let unlink_started = Instant::now();
         for name in verified_removals {
             self.storage.remove_file(&name)?;
         }
+        let unlink_wall = unlink_started.elapsed();
+        let sync_started = Instant::now();
         if !container_ids.is_empty() {
             self.storage.sync_root()?;
         }
-        Ok(removed_bytes)
+        let sync_wall = sync_started.elapsed();
+        Ok((
+            removed_bytes,
+            ContainerRemovalMetrics {
+                verify: verify_wall,
+                unlink: unlink_wall,
+                sync: sync_wall,
+            },
+        ))
     }
 
     /// Idempotently removes Containers named by effective durable RETIRING
@@ -2194,10 +2244,14 @@ impl<I: StorageIo> ContainerRepository<I> {
                 encoded.push((expected_id, bytes));
                 cursor += 1;
             }
-            assert!(
-                !encoded.is_empty(),
-                "ASSERT: a maintenance verification window must make input progress"
-            );
+            if encoded.is_empty() {
+                assert_eq!(
+                    cursor,
+                    names.len(),
+                    "ASSERT: an empty maintenance verification window is valid only at namespace EOF"
+                );
+                break;
+            }
             assert!(
                 encoded_bytes <= MAINTENANCE_VERIFY_WINDOW_BYTES,
                 "ASSERT: one format-v1 Container cannot exceed the maintenance verification window"
@@ -2472,6 +2526,19 @@ impl StorageIo for FsStorageIo {
                 })
             })
             .collect()
+    }
+
+    fn visit_names(&self, visitor: &mut dyn FnMut(&str)) -> io::Result<()> {
+        for entry in std::fs::read_dir(&self.root)? {
+            let name = entry?.file_name().into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "container directory contains a non-UTF-8 name",
+                )
+            })?;
+            visitor(&name);
+        }
+        Ok(())
     }
 
     fn set_len(&self, name: &str, length: u64) -> io::Result<()> {

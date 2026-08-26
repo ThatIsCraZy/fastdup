@@ -1,17 +1,17 @@
 use std::collections::BTreeMap;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use fastdup_appliance::OnlineGcSchedulerStatus;
 use fastdup_appliance::{
-    CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction, CheckpointPressure, DurableNamespace,
-    MUTATION_COMMIT_TARGET, ONLINE_GC_CONTROL_REQUEST, OnlineGcScheduler, ProfiledCheckpoint,
-    STATFS_RESERVE_BASIS_POINTS, StatFsOverride, TieredStatFsSource, checkpoint_action,
+    ApplianceLease, ApplianceLeaseOwner, CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction,
+    CheckpointPressure, DurableNamespace, MUTATION_COMMIT_TARGET, ONLINE_GC_CONTROL_REQUEST,
+    OnlineGcPolicy, OnlineGcScheduler, ProfiledCheckpoint, STATFS_RESERVE_BASIS_POINTS,
+    StatFsOverride, TieredStatFsSource, bind_online_gc_control_socket, checkpoint_action,
     checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1, online_gc_control_path,
-    remove_stale_online_gc_socket,
 };
 use fastdup_copy_metrics::copy_telemetry;
 use fastdup_format::{HEADER_BYTES, VerifiedContainerPublication};
@@ -23,6 +23,10 @@ use fastdup_store::{
     OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport, OnlineGcRunMode,
     OwnedContainerPublication, StorageIo, StoreError, publication_sample_ranges,
 };
+
+mod common;
+
+use common::metadata_gc_status_fields;
 use fuse3::raw::Session;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -81,6 +85,10 @@ impl Drop for OnlineGcSocketGuard {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mount_path, metadata_root, container_root) = parse_mount_arguments()?;
     let statfs_override = statfs_override_from_environment()?;
+    let online_gc_policy = OnlineGcPolicy::from_environment()?;
+    std::fs::create_dir_all(&metadata_root)?;
+    let _appliance_lease =
+        ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::WritableDaemon)?;
     let (control_listener, _control_guard) = bind_online_gc_control(&metadata_root)?;
 
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
@@ -97,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recovered.gc_catalog,
         data_storage.clone(),
         container_root.clone(),
+        online_gc_policy,
     );
     emit_mount_state(
         &appliance,
@@ -254,10 +263,10 @@ fn bind_online_gc_control(
     metadata_root: &std::path::Path,
 ) -> io::Result<(UnixListener, OnlineGcSocketGuard)> {
     let path = online_gc_control_path(metadata_root);
-    remove_stale_online_gc_socket(&path)?;
-    let listener = UnixListener::bind(&path)?;
+    let listener = bind_online_gc_control_socket(metadata_root)?;
     let guard = OnlineGcSocketGuard { path: path.clone() };
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(listener)?;
     Ok((listener, guard))
 }
 
@@ -273,6 +282,9 @@ async fn handle_online_gc_control(
     .await
     .map_err(|_| "control request timed out".to_owned())?
     .map_err(|error| format!("control request read failed: {error}"))?;
+    if request.is_empty() {
+        return Ok(());
+    }
     if request.as_slice() != ONLINE_GC_CONTROL_REQUEST {
         stream
             .write_all(b"online_gc_ok=false error=invalid_request\n")
@@ -309,6 +321,7 @@ fn start_online_gc_runtime(
     catalog: FsGcCatalog,
     frontend_storage: TelemetryStorageIo,
     container_root: PathBuf,
+    policy: OnlineGcPolicy,
 ) -> OnlineGcRuntimeHandle {
     let (requests, control) = mpsc::channel(1);
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -317,6 +330,7 @@ fn start_online_gc_runtime(
         catalog,
         frontend_storage,
         container_root,
+        policy,
         control,
         shutdown_rx,
     ));
@@ -332,12 +346,16 @@ async fn run_online_gc_runtime(
     catalog: FsGcCatalog,
     frontend_storage: TelemetryStorageIo,
     container_root: PathBuf,
+    policy: OnlineGcPolicy,
     mut control: mpsc::Receiver<OnlineGcControlRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let now = Instant::now();
-    let mut scheduler =
-        OnlineGcScheduler::new(now, frontend_storage.inner.status().submitted_operations());
+    let mut scheduler = OnlineGcScheduler::with_policy(
+        now,
+        frontend_storage.inner.status().submitted_operations(),
+        policy,
+    );
     let mut ticks = interval(ONLINE_GC_SCHEDULER_RESOLUTION);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticks.tick().await;
@@ -354,12 +372,15 @@ async fn run_online_gc_runtime(
                     return Ok(());
                 };
                 scheduler.record_immediate_start(Instant::now());
+                let relocation_workers = scheduler.relocation_workers(OnlineGcRunMode::Urgent);
                 let response = run_online_gc_quantum(
                     maintenance.clone(),
                     catalog.clone(),
                     data_pool_usage(&container_root).map_err(|error| error.to_string()),
                     OnlineGcRunMode::Urgent,
+                    relocation_workers,
                     "control",
+                    scheduler.status(),
                 ).await;
                 let _ = request.response.send(response);
             }
@@ -373,12 +394,15 @@ async fn run_online_gc_runtime(
                 };
                 let operations = frontend_storage.inner.status().submitted_operations();
                 if let Some(mode) = scheduler.poll(Instant::now(), operations, usage) {
+                    let relocation_workers = scheduler.relocation_workers(mode);
                     let status = run_online_gc_quantum(
                         maintenance.clone(),
                         catalog.clone(),
                         Ok(usage),
                         mode,
+                        relocation_workers,
                         "scheduler",
+                        scheduler.status(),
                     ).await;
                     eprint!("{status}");
                 }
@@ -392,11 +416,18 @@ async fn run_online_gc_quantum(
     catalog: FsGcCatalog,
     usage: Result<DataPoolUsage, String>,
     mode: OnlineGcRunMode,
+    relocation_workers: std::num::NonZeroUsize,
     source: &'static str,
+    scheduler: OnlineGcSchedulerStatus,
 ) -> String {
     let result = match usage {
         Ok(usage) => tokio::task::spawn_blocking(move || {
-            maintenance.run_adaptive_online_gc_cycle(&catalog, usage, mode)
+            maintenance.run_adaptive_online_gc_cycle_with_workers(
+                &catalog,
+                usage,
+                mode,
+                relocation_workers,
+            )
         })
         .await
         .map_err(|error| format!("worker_join_failed:{error}"))
@@ -404,32 +435,89 @@ async fn run_online_gc_quantum(
         Err(error) => Err(error),
     };
     match result {
-        Ok(report) => online_gc_status_line(source, mode, report),
+        Ok(report) => online_gc_status_line(source, mode, relocation_workers, &report, scheduler),
         Err(error) => format!(
-            "online_gc_ok=false source={source} mode={mode:?} error={}\n",
+            "online_gc_ok=false source={source} mode={mode:?} relocation_workers={} error={}\n",
+            relocation_workers,
             error.replace(['\n', '\r'], " ")
         ),
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn online_gc_status_line(
     source: &str,
     mode: OnlineGcRunMode,
-    report: OnlineGcCycleReport,
+    relocation_workers: std::num::NonZeroUsize,
+    report: &OnlineGcCycleReport,
+    scheduler: OnlineGcSchedulerStatus,
 ) -> String {
     let catalog_generation = report.catalog().generation();
+    let metadata = report.metadata_gc();
+    let metrics = report.metrics();
+    let metadata_status = format!(" {}", metadata_gc_status_fields(metadata, "metadata_"));
+    let work_status = format!(
+        concat!(
+            " total_wall_us={} recovery_wall_us={} candidate_catalog_wall_us={} ",
+            "metadata_gc_wall_us={} candidate_proof_wall_us={} relocation_wall_us={} ",
+            "retiring_activation_wall_us={} pin_drain_wall_us={} victim_verify_wall_us={} ",
+            "unlink_wall_us={} data_sync_wall_us={} removed_activation_wall_us={} ",
+            "post_catalog_wall_us={} ",
+            "catalog_examined_bytes={} catalog_write_bytes={} candidate_proof_read_bytes={} ",
+            "relocation_read_bytes={} relocation_write_bytes={} unlinked_bytes={} ",
+            "shortlisted_candidates={} proved_victims={} aborted_candidates={} ",
+            "reverse_dependency_edges={} reverse_dependency_required_chunks={} ",
+            "scheduler_polls={} scheduler_deferred_polls={} scheduler_frontend_activity_changes={} ",
+            "scheduler_background_admissions={} scheduler_idle_admissions={} ",
+            "scheduler_urgent_admissions={} scheduler_scheduled_admissions={} ",
+            "scheduler_immediate_requests={} relocation_workers={}"
+        ),
+        metrics.total_wall().as_micros(),
+        metrics.recovery_wall().as_micros(),
+        metrics.candidate_catalog_wall().as_micros(),
+        metrics.metadata_gc_wall().as_micros(),
+        metrics.candidate_proof_wall().as_micros(),
+        metrics.relocation_wall().as_micros(),
+        metrics.retiring_activation_wall().as_micros(),
+        metrics.pin_drain_wall().as_micros(),
+        metrics.victim_verify_wall().as_micros(),
+        metrics.unlink_wall().as_micros(),
+        metrics.data_sync_wall().as_micros(),
+        metrics.removed_activation_wall().as_micros(),
+        metrics.post_collection_catalog_wall().as_micros(),
+        metrics.catalog_examined_bytes(),
+        metrics.catalog_write_bytes(),
+        metrics.candidate_proof_read_bytes(),
+        metrics.relocation_read_bytes(),
+        metrics.relocation_write_bytes(),
+        metrics.unlinked_bytes(),
+        metrics.shortlisted_candidates(),
+        metrics.proved_victims(),
+        metrics.aborted_candidates(),
+        metrics.reverse_dependency_edges(),
+        metrics.reverse_dependency_required_chunks(),
+        scheduler.polls(),
+        scheduler.deferred_polls(),
+        scheduler.frontend_activity_changes(),
+        scheduler.background_admissions(),
+        scheduler.idle_admissions(),
+        scheduler.urgent_admissions(),
+        scheduler.scheduled_admissions(),
+        scheduler.immediate_requests(),
+        relocation_workers,
+    );
     match report.outcome() {
         OnlineGcCycleOutcome::NoCandidates => format!(
-            "online_gc_ok=true source={source} mode={mode:?} outcome=no_candidates catalog_generation={catalog_generation}\n"
+            "online_gc_ok=true source={source} mode={mode:?} outcome=no_candidates catalog_generation={catalog_generation}{work_status}{metadata_status}\n"
         ),
         OnlineGcCycleOutcome::NoProfitableCandidates => format!(
-            "online_gc_ok=true source={source} mode={mode:?} outcome=no_profitable_candidates catalog_generation={catalog_generation}\n"
+            "online_gc_ok=true source={source} mode={mode:?} outcome=no_profitable_candidates catalog_generation={catalog_generation}{work_status}{metadata_status}\n"
         ),
         OnlineGcCycleOutcome::CatalogRebuilt => format!(
-            "online_gc_ok=true source={source} mode={mode:?} outcome=catalog_rebuilt catalog_generation={catalog_generation}\n"
+            "online_gc_ok=true source={source} mode={mode:?} outcome=catalog_rebuilt catalog_generation={catalog_generation}{work_status}{metadata_status}\n"
         ),
         OnlineGcCycleOutcome::Collected(gc) => format!(
-            "online_gc_ok=true source={source} mode={mode:?} outcome=collected catalog_generation={catalog_generation} containers_removed={} bytes_removed={} replacement_containers={} replacement_bytes={} chunks_relocated={} bytes_reclaimed={}\n",
+            "online_gc_ok=true source={source} mode={mode:?} outcome=collected catalog_generation={catalog_generation} containers_removed={} bytes_removed={} replacement_containers={} replacement_bytes={} chunks_relocated={} bytes_reclaimed={}{work_status}{metadata_status}\n",
             gc.containers_removed(),
             gc.bytes_removed(),
             gc.replacement_containers(),
@@ -1167,6 +1255,7 @@ impl StorageIo for TelemetryStorageIo {
 mod tests {
     use std::ffi::OsStr;
     use std::num::NonZeroUsize;
+    use std::os::unix::fs::PermissionsExt;
 
     use fastdup_appliance::request_online_gc_now;
     use fastdup_format::ContainerId;
@@ -1263,24 +1352,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_control_socket_admits_one_bounded_gc_now_request() {
-        let root = PathBuf::from(
+    async fn local_control_socket_admits_one_bounded_gc_now_request_from_a_long_metadata_path() {
+        let owner = PathBuf::from(
             std::env::var_os("TMPDIR").expect("workspace test TMPDIR must be configured"),
         )
         .join(format!("fastdup-online-gc-control-{}", std::process::id()));
-        std::fs::create_dir(&root).expect("create unique control root");
+        let root = owner.join("metadata-path-".repeat(7));
+        std::fs::create_dir_all(&root).expect("create unique long control root");
+        assert!(
+            online_gc_control_path(&root)
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                > 108,
+            "fixture must exceed Linux sockaddr_un.sun_path"
+        );
         let (listener, guard) = bind_online_gc_control(&root).expect("bind control socket");
         let mode = std::fs::metadata(online_gc_control_path(&root))
             .expect("read socket metadata")
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+        let Err(second_owner) = bind_online_gc_control(&root) else {
+            panic!("ASSERT: a live control owner cannot be replaced");
+        };
+        assert_eq!(second_owner.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            online_gc_control_path(&root).exists(),
+            "a rejected second owner must not unlink the live socket"
+        );
         let (requests, mut received) = mpsc::channel(1);
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept control client");
-            handle_online_gc_control(stream, requests)
-                .await
-                .expect("serve control request");
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept control client");
+                handle_online_gc_control(stream, requests.clone())
+                    .await
+                    .expect("serve owner probe or control request");
+            }
         });
         let responder = tokio::spawn(async move {
             let request = received.recv().await.expect("receive GC request");
@@ -1298,6 +1406,6 @@ mod tests {
         server.await.expect("join control server");
         responder.await.expect("join control responder");
         drop(guard);
-        std::fs::remove_dir(root).expect("remove control root");
+        std::fs::remove_dir_all(owner).expect("remove control root");
     }
 }

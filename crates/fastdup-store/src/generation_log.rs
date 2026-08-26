@@ -180,6 +180,10 @@ impl LogSnapshot {
         self.last_encoded().map(CommitRecordHash::of)
     }
 
+    pub(crate) fn will_rotate(&self) -> bool {
+        self.record_count() >= MAX_SEGMENT_RECORDS
+    }
+
     fn record_count(&self) -> usize {
         self.records.len()
     }

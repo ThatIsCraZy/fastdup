@@ -1,15 +1,21 @@
 use std::path::{Path, PathBuf};
 
 use fastdup_appliance::{
-    checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1, request_online_gc_now,
+    ApplianceLease, ApplianceLeaseOwner, checkpoint_exact_index_profile_v1,
+    checkpoint_policy_set_v1, request_online_gc_now,
 };
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo, GenerationRepository,
     MaintenanceExecutionMode, MaintenanceRepository,
 };
 
-const USAGE: &str = "usage:\n  fastdup-maintenance --online gc-now METADATA_ROOT\n  fastdup-maintenance --offline (scrub|scrub-gc|gc-now|rebuild-exact) METADATA_ROOT CONTAINER_ROOT";
+mod common;
 
+use common::metadata_gc_status_fields;
+
+const USAGE: &str = "usage:\n  fastdup-maintenance --online gc-now METADATA_ROOT\n  fastdup-maintenance --offline (scrub|scrub-gc|gc-now|metadata-gc|rebuild-exact) METADATA_ROOT CONTAINER_ROOT";
+
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let ownership = arguments.next().ok_or(USAGE)?;
@@ -43,6 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::fs::canonicalize(&metadata_root)? == std::fs::canonicalize(&container_root)? {
         return Err("metadata and container roots must be distinct".into());
     }
+    let _appliance_lease =
+        ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::OfflineMaintenance)?;
 
     let metadata = FsStorageIo::open(&metadata_root)?;
     let containers = ContainerRepository::new(FsStorageIo::open(&container_root)?);
@@ -72,7 +80,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let completed = job.wait()?;
         print_scrub(completed.scrub());
         println!(
-            "gc_ok=true priority={:?} containers_removed={} bytes_removed={} replacement_containers={} replacement_bytes={} chunks_relocated={} bytes_reclaimed={}",
+            concat!(
+                "gc_ok=true priority={:?} containers_removed={} bytes_removed={} ",
+                "replacement_containers={} replacement_bytes={} chunks_relocated={} bytes_reclaimed={} ",
+                "retiring_activation_wall_us={} pin_drain_wall_us={} victim_verify_wall_us={} ",
+                "unlink_wall_us={} data_sync_wall_us={} removed_activation_wall_us={}"
+            ),
             completed.gc().priority(),
             completed.gc().containers_removed(),
             completed.gc().bytes_removed(),
@@ -80,7 +93,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             completed.gc().replacement_bytes(),
             completed.gc().chunks_relocated(),
             completed.gc().bytes_reclaimed(),
+            completed.gc().retiring_activation_wall().as_micros(),
+            completed.gc().pin_drain_wall().as_micros(),
+            completed.gc().victim_verify_wall().as_micros(),
+            completed.gc().unlink_wall().as_micros(),
+            completed.gc().data_sync_wall().as_micros(),
+            completed.gc().removed_activation_wall().as_micros(),
         );
+        print_metadata_gc(completed.metadata_gc());
+    } else if command == "metadata-gc" {
+        let report = maintenance.garbage_collect_metadata()?;
+        print_metadata_gc(report);
+        print_scrub(maintenance.scrub()?);
     } else if command == "rebuild-exact" {
         let rebuilt = maintenance.rebuild_exact_index()?;
         println!(
@@ -97,6 +121,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(USAGE.into());
     }
     Ok(())
+}
+
+fn print_metadata_gc(report: fastdup_store::MetadataGarbageCollectionReport) {
+    println!(
+        "metadata_gc_ok=true {}",
+        metadata_gc_status_fields(report, "")
+    );
 }
 
 fn data_pool_usage(path: &Path) -> Result<DataPoolUsage, Box<dyn std::error::Error>> {

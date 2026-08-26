@@ -72,6 +72,13 @@ The number of active dependent encodings naming one Base Chunk. It can improve
 cache reuse while also concentrating recovery dependency.
 _Avoid_: Reference count, duplicate count
 
+**Reverse dependency generation**:
+A generation-bound projection from protected logical chunks to every Base Chunk
+required by their active dependent Locations. It is deletion-proof input bound
+to one Commit pair and Exact Index generation, not durable liveness authority by
+itself.
+_Avoid_: Similarity fanout, mutable reference count, GC candidate estimate
+
 **Encoding record**:
 One physical payload that decodes to a contiguous region partitioned into one or
 more complete logical chunks. It is the unit of compression and integrity
@@ -312,8 +319,38 @@ _Avoid_: GC truth, Location set, deletion list
 
 **GC candidate proof**:
 Generation-bound evidence that proves reachability and dependency closure for a
-bounded victim set and verifies its replacement coverage before retirement.
+bounded victim set and verifies its replacement coverage before retirement. An
+empty protected DATA set is authoritative evidence that no replacement coverage
+is required.
 _Avoid_: GC hint, reference count, complete pool scrub
+
+**Metadata garbage collection**:
+The removal of immutable Metadata Objects outside every durable recovery graph
+and every live Manifest-reader root. It does not remove Commit Records, online
+indexes, or user DATA Containers.
+_Avoid_: DATA GC, index compaction, metadata cleanup
+
+**Metadata root pin**:
+A temporary liveness root retained by a Manifest reader or an unpublished
+successor proof. Its complete immutable Manifest graph remains protected until
+the final owner releases it.
+_Avoid_: Metadata reference count, Exact generation pin, file handle
+
+**Metadata mark catalog**:
+Rebuildable acceleration describing one previously exact Metadata reachability
+mark. It may suppress redundant collection work but never authorizes deletion.
+_Avoid_: Metadata reference count, deletion list, recovery root
+
+**Metadata mark delta**:
+An immutable additive extension from one Metadata Mark Catalog generation to
+the next. It records newly durable roots without granting deletion authority.
+_Avoid_: Reference-count update, Metadata deletion proof, WAL record
+
+**Metadata GC mark mode**:
+The way one Metadata-GC quantum established its retained-object view: reuse,
+an additive delta, or an exact snapshot. Only the exact snapshot carries
+deletion authority.
+_Avoid_: Exact-mark Boolean, catalog state, GC result
 
 **Online GC recovery finalizer**:
 The idempotent startup operation that derives effective `RETIRING` Locations
@@ -517,7 +554,10 @@ _Avoid_: Snapshot, reference count
 A temporary authorization to select and read physical Locations through one
 immutable Exact Index generation. A retiring generation admits no new pins;
 pins from every still-live predecessor generation must drain before any
-shadowed Container is removed.
+shadowed Container is removed. Cached or dormant Manifest readers retain only
+an uncounted generation snapshot and acquire a pin for each bounded DATA read;
+after retirement closes admission they fall back to verified Container
+discovery.
 _Avoid_: Exact Index reference, Container reference count
 
 **Corruption**:
@@ -538,8 +578,9 @@ health states.
 _Avoid_: Metric, process status
 
 **Appliance lease**:
-Exclusive durable ownership permitting one daemon or offline maintenance process
-to advance generations for an appliance.
+Exclusive cross-process ownership permitting one daemon or offline maintenance
+process to advance generations for an appliance. A persistent lease object
+names the ownership seam while its held kernel lease supplies live authority.
 _Avoid_: POSIX lock, generation pin
 
 **POSIX state**:

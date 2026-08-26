@@ -82,5 +82,6 @@ removes the dead daemon's mount attachment; it cannot flush daemon state.
 
 The next deadline gates are deterministic fake-clock tests with deliberately
 stalled storage, persisted unhealthy/admission state, randomized kill offsets
-during long ingest, and block-device power-cut fault injection. The Appliance
-Lease/format-epoch fence remains required before multi-process production use.
+during long ingest, and block-device power-cut fault injection. The exclusive
+Appliance Lease is implemented; a stable downgrade/format-epoch fence remains
+required before production deployment.
