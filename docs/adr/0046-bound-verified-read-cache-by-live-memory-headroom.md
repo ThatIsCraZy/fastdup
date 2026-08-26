@@ -29,22 +29,28 @@ The default hard cache limit is the smaller of one eighth of effective RAM and
 outside the cache for Dirty DATA, Ingest Lanes, codec workers, metadata/index
 caches, XFS clean pages, writeback, and device queues. The effective limit and
 available headroom are the conservative minima of `/proc/meminfo` and finite
-cgroup-v2 `memory.high`/`memory.max` limits. Sampling occurs at most every 250
-ms on cache access, not in FastCDC or encoding loops.
+cgroup-v2 `memory.high`/`memory.max` limits. One process-wide
+`MemoryBudgetGovernor` owns Linux sampling and publishes one fail-closed
+snapshot to every rebuildable cache. Sampling occurs at most every 250 ms on
+cache access, not in FastCDC, Bloom probes, or encoding loops.
 
 The Exact Index page cache has an independent smaller hard budget: one 128th of
 effective RAM, clamped between 1 MiB and 256 MiB. Its resident target grows up
 to that preallocated geometry only while `MemAvailable` exceeds the shared
-reserve. Falling below the reserve purges resident pages; any observed Swap use
-sets its target to zero. Fixed slot metadata is cache-line aligned, and page
+reserve. Falling below the reserve purges resident pages; Swap charged to
+fastdup's cgroup sets its target to zero. Fixed slot metadata is cache-line aligned, and page
 admission never allocates an unbounded lookup table.
 
 Active immutable Exact Runs additionally use rebuildable membership filters.
 They reuse the same cache-line-aligned blocked Bloom implementation as the
 reduction hot path, but have a separate active-set budget of one 32nd of
 effective RAM, clamped to 1 MiB through 8 GiB and limited by available bytes
-above the same shared reserve. Headroom is resampled for every Run-Set
-activation; if Swap is in use, no filters are admitted to the replacement.
+above the same shared reserve. Dense filters of at least 2 MiB use a dedicated
+anonymous mapping with `MADV_HUGEPAGE`; smaller filters stay on the heap. The
+advice never covers allocator pages containing unrelated Rust objects, and
+lookup remains one ordinary slice access with no branch on backing type.
+Headroom is resampled for every Run-Set activation; if fastdup's own cgroup has
+charged Swap, no filters are admitted to the replacement.
 A missing filter changes only performance:
 lookup falls through to verified Exact pages. The immutable filters are rebuilt
 during Run activation audit, never persisted, and never authorize a Location.
@@ -52,18 +58,21 @@ during Run activation audit, never persisted, and never authorize a Location.
 The fixed set metadata plus resident payload can never exceed the hard limit.
 When available memory cannot cover the reserve, the payload target shrinks. If
 resident payload exceeds the new target, all payload entries are discarded
-rather than gradually chasing pressure. Any observed nonzero host or cgroup
-Swap use sets the payload target to zero, purges all entries, and refuses new
-admission until Swap use returns to zero. Durable reads continue through the
-verified XFS path.
+rather than gradually chasing pressure. Nonzero `memory.swap.current` in
+fastdup's own cgroup sets the payload target to zero, purges all entries, and
+refuses new admission until that charge returns to zero. Host Swap use remains
+separate telemetry because it may belong entirely to another workload. Durable
+reads continue through the verified XFS path.
 
-This process policy prevents the fastdup cache from intentionally consuming the
-I/O reserve, but Linux may still swap unrelated anonymous process pages. A
-production service that promises no fastdup Swap must additionally run in a
-cgroup with `memory.swap.max=0` (systemd `MemorySwapMax=0`) and an explicitly
-validated `MemoryHigh`/`MemoryMax`. `mlock` is rejected: pinning cache pages
-would make kernel and device-queue pressure worse and commonly requires unsafe
-privilege/limit assumptions.
+This process policy prevents the fastdup caches from intentionally consuming
+the I/O reserve, but an application budget cannot overrule kernel reclaim. A
+production service that promises no fastdup Swap must run in a cgroup with
+`memory.swap.max=0` (systemd `MemorySwapMax=0`) and set
+`FASTDUP_REQUIRE_CGROUP_NO_SWAP=1`; daemon startup then validates the kernel
+boundary before creating or opening either repository root. `MemoryHigh` and
+`MemoryMax` remain explicit deployment inputs. `mlock` is rejected: pinning
+cache pages would make kernel and device-queue pressure worse and commonly
+requires unsafe privilege/limit assumptions.
 
 DATA-cache hits, misses, admissions, evictions, pressure/oversize rejections, entry count,
 payload resident/target bytes, fixed metadata bytes, hard limit, and reserve
@@ -90,9 +99,9 @@ The resident target is the smaller of hard capacity, two percent of effective
 RAM using a conservative 160 bytes per entry, and available bytes above the
 shared cache reserve. A healthy 128-GiB appliance can therefore reach the full
 512-TiB addressable set. Lower-memory or pressured systems retain less. Any
-observed Swap use sets the target to zero, releases all allocated shard maps,
-and rejects admission until pressure clears. Allocation failure rejects only
-the cache entry and never the verified read.
+Swap charged to fastdup's cgroup sets the target to zero, releases all allocated
+shard maps, and rejects admission until pressure clears. Allocation failure
+rejects only the cache entry and never the verified read.
 
 A hit removes `object_len` plus Header/Footer reads, but the selected Record is
 still range-read and must pass coordinate, CRC, decoded-length, and Chunk-ID
@@ -100,10 +109,11 @@ verification. Hits, misses, admissions, evictions, pressure/allocation
 rejections, hard and current entry/coverage limits, resident/fixed bytes, and
 the pressure sample are reported separately.
 
-Run-membership filter count, allocated bytes, probes, definite absences, and
-required Exact lookups are reported independently. A useful filter should
-remove substantially more Exact-page misses than its immutable RAM footprint;
-this remains a benchmark gate rather than a correctness assumption.
+Run-membership filter count, allocated and huge-page-advised bytes, probes,
+definite absences, and required Exact lookups are reported independently. A
+useful filter should remove substantially more Exact-page misses than its
+immutable RAM footprint; this remains a benchmark gate rather than a
+correctness assumption.
 
 ## XFS publication and io_uring
 

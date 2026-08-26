@@ -29,7 +29,12 @@ Exact-Dedup MVP from [ADR 0032](../adr/0032-deliver-a-posix-exact-dedup-mvp-befo
 - directory snapshots bounded to 256 entries per namespace call, avoiding an
   all-name copy and unbounded speculative lookup-pin acquisition;
 - expected errno mapping without assertions for client errors;
-- FUSE writeback disabled, all regular handles `DIRECT_IO`, and zero TTLs.
+- FUSE writeback disabled and zero attribute/entry TTLs. The original
+  all-`DIRECT_IO` checkpoint is superseded by ADR 0073: read-only regular
+  handles use `KEEP_CACHE`; write-capable handles remain `DIRECT_IO` and every
+  successful content mutation of a cache-exposed inode explicitly invalidates
+  its affected DATA range. Never-exposed Write-only inodes skip that redundant
+  kernel notification.
 
 The namespace catalog protects names, inode identity, and handle liveness. File
 bytes and mutation sequences use per-inode locks, so independent inodes do not
@@ -60,7 +65,7 @@ into two bounded extents without changing byte reconstruction or block counts.
 A 600-entry static-directory oracle resumes across bounded 256-entry namespace
 pages without omissions or duplicates.
 
-The final release-mode mount harness used `/dev/fuse` and the `/dev/sdb`
+The original release-mode mount harness used `/dev/fuse` and the `/dev/sdb`
 XFS-backed `/source/fastdup/.artifacts/tier-meta/fuse-mount`. It passed raw non-UTF-8 create/reopen,
 cross-handle live reads, `fsync`, overlapping writes, `ftruncate`, seek-write,
 including a one-byte write at a 1-TiB offset with only the written extents
@@ -70,6 +75,15 @@ frames. The mount then wrote and reconstructed a 20-MiB sequential file across
 the coalescing boundary and enumerated 512 long names with forced
 `readdirplus`, requiring multiple bounded kernel replies. It then unmounted
 cleanly.
+
+On 2026-08-26 the current release-mode harness additionally warmed clean pages
+through an independent read-only descriptor, overwrote across a 4-KiB page
+boundary, appended, truncated, punched and zeroed ranges, and immediately
+reread the boundaries. Rename, unlink, and a later open-orphan write retained
+the same coherent cached inode. A read-only shared mapping faulted coherent
+bytes before and after the overwrite; a shared writable mapping through a
+writable direct-I/O handle was rejected. The test ran on Linux 6.12 through a
+real `/dev/fuse` mount.
 
 ```bash
 export RUSTUP_HOME=/source/fastdup/.artifacts/rustup
@@ -112,10 +126,10 @@ assertions is blocked on the manifest/Commit-WAL slice.
 - durable manifests, Namespace Roots, Commit Records, or data-reduction records;
 - atomic rename, hardlinks, symlinks, nested directories, xattrs, ACLs, locks,
   `fallocate`, hole punch, zero range, and DATA/HOLE seeking;
-- durable sparse physical representation, `SEEK_DATA`/`SEEK_HOLE`, stable
-  directory cookies during concurrent mutation, read-only mmap, normal kernel
-  read caching, cache invalidation, timestamps, ownership changes, and
-  production `statfs`;
+- durable sparse physical representation and stable directory cookies during
+  concurrent mutation; the later durable checkpoint and ADR 0073 supersede the
+  former omissions for DATA/HOLE seeking, kernel read caching, read-only mmap,
+  timestamps, ownership, and production `statfs`;
 - Samba and crash/remount conformance.
 
 The versioned immutable manifest and namespace generation path is now connected

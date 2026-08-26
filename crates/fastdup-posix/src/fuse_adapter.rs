@@ -6,6 +6,7 @@ use crate::{
 };
 use bytes::Bytes;
 use fastdup_copy_metrics::{CopyClass, record_copy};
+use fuse3::notify::Notify;
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, FileAttr as FuseFileAttr, ReplyAttr, ReplyCopyFileRange,
     ReplyCreated, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyIoctl,
@@ -19,13 +20,16 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::pin::Pin;
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
 const MAXIMUM_WRITE_BYTES: u32 = 1_024 * 1_024;
 const FOPEN_DIRECT_IO: u32 = 1;
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 const ZERO_TTL: Duration = Duration::ZERO;
 const INTERNAL_CONTEXT: RequestContext = RequestContext {
     uid: 0,
@@ -217,6 +221,27 @@ pub struct FuseFilesystem {
     namespace: Arc<Namespace>,
     blocking_permits: Arc<Semaphore>,
     statfs_source: Option<Arc<dyn StatFsSource>>,
+    kernel_notify: Arc<OnceLock<KernelNotifier>>,
+}
+
+#[derive(Clone, Debug)]
+enum KernelNotifier {
+    Session(Notify),
+    #[cfg(test)]
+    Recording(Arc<Mutex<Vec<(u64, i64, i64)>>>),
+}
+
+impl KernelNotifier {
+    async fn invalid_inode(&self, inode: u64, offset: i64, length: i64) {
+        match self {
+            Self::Session(notify) => notify.invalid_inode(inode, offset, length).await,
+            #[cfg(test)]
+            Self::Recording(notifications) => notifications
+                .lock()
+                .expect("ASSERT: notification recorder lock poisoned")
+                .push((inode, offset, length)),
+        }
+    }
 }
 
 impl FuseFilesystem {
@@ -227,6 +252,7 @@ impl FuseFilesystem {
             namespace,
             blocking_permits: Arc::new(Semaphore::new(workers)),
             statfs_source: None,
+            kernel_notify: Arc::new(OnceLock::new()),
         }
     }
 
@@ -234,6 +260,15 @@ impl FuseFilesystem {
     pub fn with_statfs_source(mut self, source: Arc<dyn StatFsSource>) -> Self {
         self.statfs_source = Some(source);
         self
+    }
+
+    #[cfg(test)]
+    fn record_kernel_notifications(&self) -> Arc<Mutex<Vec<(u64, i64, i64)>>> {
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        self.kernel_notify
+            .set(KernelNotifier::Recording(Arc::clone(&notifications)))
+            .expect("ASSERT: test notification channel is installed once");
+        notifications
     }
 
     async fn run_blocking<R, F>(&self, work: F) -> R
@@ -268,7 +303,7 @@ impl FuseFilesystem {
         let inode = inode_from_raw(inode)?;
         let handle = handle_from_raw(handle)?;
         let request = context(request);
-        let reply = loop {
+        let (reply, kernel_data_cache_exposed) = loop {
             self.namespace
                 .wait_for_mutation_admission()
                 .await
@@ -277,7 +312,7 @@ impl FuseFilesystem {
             let payload = payload.clone();
             match self
                 .run_blocking(move || {
-                    namespace.dispatch_owned_write(request, inode, handle, offset, payload)
+                    namespace.dispatch_owned_write_for_fuse(request, inode, handle, offset, payload)
                 })
                 .await
             {
@@ -285,8 +320,73 @@ impl FuseFilesystem {
                 result => break result.map_err(errno)?,
             }
         };
-        let (bytes, _) = expect_written(&reply);
+        let (bytes, _, actual_offset) = expect_written(&reply);
+        self.invalidate_data_if_exposed(
+            inode,
+            KernelDataInvalidation::range(actual_offset, u64::from(bytes)),
+            kernel_data_cache_exposed,
+        )
+        .await;
         Ok(ReplyWrite { written: bytes })
+    }
+
+    async fn invalidate_data(&self, inode: InodeId, invalidation: KernelDataInvalidation) {
+        let kernel_data_cache_exposed = self.namespace.kernel_data_cache_exposed(inode);
+        self.invalidate_data_if_exposed(inode, invalidation, kernel_data_cache_exposed)
+            .await;
+    }
+
+    async fn invalidate_data_if_exposed(
+        &self,
+        inode: InodeId,
+        invalidation: KernelDataInvalidation,
+        kernel_data_cache_exposed: bool,
+    ) {
+        if !kernel_data_cache_exposed {
+            return;
+        }
+        let Some((offset, length)) = invalidation.wire_range() else {
+            return;
+        };
+        let Some(notify) = self.kernel_notify.get() else {
+            // Direct adapter tests invoke methods without a kernel session, so
+            // there is no page cache to invalidate. A real session proves the
+            // channel is present in `init` before serving its first request.
+            return;
+        };
+        notify.invalid_inode(inode.get(), offset, length).await;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelDataInvalidation {
+    None,
+    All,
+    From(u64),
+    Range { offset: u64, length: u64 },
+}
+
+impl KernelDataInvalidation {
+    const fn range(offset: u64, length: u64) -> Self {
+        if length == 0 {
+            Self::None
+        } else {
+            Self::Range { offset, length }
+        }
+    }
+
+    fn wire_range(self) -> Option<(i64, i64)> {
+        match self {
+            Self::None => None,
+            Self::All => Some((0, 0)),
+            Self::From(offset) => Some((i64::try_from(offset).unwrap_or(0), 0)),
+            Self::Range { offset, length } => {
+                let Ok(offset) = i64::try_from(offset) else {
+                    return Some((0, 0));
+                };
+                Some((offset, i64::try_from(length).unwrap_or(0)))
+            }
+        }
     }
 }
 
@@ -318,7 +418,20 @@ async fn dispatch_mutation_with_backpressure<R>(
 }
 
 impl Filesystem for FuseFilesystem {
+    fn register_notify(&self, notify: Notify) {
+        assert!(
+            self.kernel_notify
+                .set(KernelNotifier::Session(notify))
+                .is_ok(),
+            "ASSERT: one FUSE filesystem receives exactly one notification channel"
+        );
+    }
+
     async fn init(&self, _request: Request) -> fuse3::Result<ReplyInit> {
+        assert!(
+            self.kernel_notify.get().is_some(),
+            "ASSERT: FUSE notification channel is installed before init"
+        );
         Ok(ReplyInit {
             max_write: NonZeroU32::new(MAXIMUM_WRITE_BYTES)
                 .expect("ASSERT: maximum FUSE write size must be nonzero"),
@@ -451,6 +564,8 @@ impl Filesystem for FuseFilesystem {
         })
         .await
         .map_err(errno)?;
+        self.invalidate_data(inode, KernelDataInvalidation::All)
+            .await;
         Ok(ReplyAttr {
             ttl: ZERO_TTL,
             attr: fuse_attr(expect_attr(&reply)),
@@ -617,9 +732,18 @@ impl Filesystem for FuseFilesystem {
         }
         .map_err(errno)?;
         let handle = expect_opened(&reply);
+        if truncate {
+            self.invalidate_data(inode, KernelDataInvalidation::All)
+                .await;
+        }
+        if options.access == AccessMode::ReadOnly {
+            self.namespace
+                .expose_kernel_data_cache(inode)
+                .map_err(errno)?;
+        }
         Ok(ReplyOpen {
             fh: handle.get(),
-            flags: FOPEN_DIRECT_IO,
+            flags: regular_file_open_flags(options),
         })
     }
 
@@ -1244,12 +1368,22 @@ impl Filesystem for FuseFilesystem {
         .map_err(errno)?;
         let (entry, handle) = expect_created(reply);
 
+        if truncate {
+            self.invalidate_data(entry.attr.inode, KernelDataInvalidation::All)
+                .await;
+        }
+        if options.access == AccessMode::ReadOnly {
+            self.namespace
+                .expose_kernel_data_cache(entry.attr.inode)
+                .map_err(errno)?;
+        }
+
         Ok(ReplyCreated {
             ttl: ZERO_TTL,
             attr: fuse_attr(entry.attr),
             generation: 1,
             fh: handle.get(),
-            flags: FOPEN_DIRECT_IO,
+            flags: regular_file_open_flags(options),
         })
     }
 
@@ -1293,6 +1427,18 @@ impl Filesystem for FuseFilesystem {
                     let Reply::Attr(_) = reply else {
                         panic!("ASSERT: namespace fallocate returned a non-attr reply");
                     };
+                    let invalidation = match mode {
+                        FallocateMode::Allocate { keep_size: true } => KernelDataInvalidation::None,
+                        FallocateMode::Allocate { keep_size: false }
+                        | FallocateMode::PunchHole
+                        | FallocateMode::ZeroRange { .. } => {
+                            KernelDataInvalidation::range(offset, length)
+                        }
+                        FallocateMode::CollapseRange | FallocateMode::InsertRange => {
+                            KernelDataInvalidation::From(offset)
+                        }
+                    };
+                    self.invalidate_data(inode, invalidation).await;
                     return Ok(());
                 }
             }
@@ -1390,6 +1536,11 @@ impl Filesystem for FuseFilesystem {
         let Reply::Cloned { bytes, .. } = reply else {
             panic!("ASSERT: namespace clone returned a non-cloned reply");
         };
+        self.invalidate_data(
+            target_inode,
+            KernelDataInvalidation::range(target_offset, bytes),
+        )
+        .await;
         Ok(ReplyCopyFileRange { copied: bytes })
     }
 }
@@ -1498,6 +1649,13 @@ fn open_options(flags: u32) -> fuse3::Result<OpenOptions> {
             & u32::try_from(libc::O_APPEND).expect("ASSERT: O_APPEND must be nonnegative")
             != 0,
     })
+}
+
+const fn regular_file_open_flags(options: OpenOptions) -> u32 {
+    match options.access {
+        AccessMode::ReadOnly => FOPEN_KEEP_CACHE,
+        AccessMode::WriteOnly | AccessMode::ReadWrite => FOPEN_DIRECT_IO,
+    }
 }
 
 fn lock_kind(value: u32, allow_unlock: bool) -> fuse3::Result<LockKind> {
@@ -1700,15 +1858,16 @@ fn expect_data(reply: Reply) -> Vec<u8> {
     data
 }
 
-fn expect_written(reply: &Reply) -> (u32, u64) {
+fn expect_written(reply: &Reply) -> (u32, u64, u64) {
     let Reply::Written {
         bytes,
         mutation_sequence,
+        offset,
     } = *reply
     else {
         panic!("ASSERT: namespace write returned a non-written reply");
     };
-    (bytes, mutation_sequence)
+    (bytes, mutation_sequence, offset)
 }
 
 fn expect_directory(reply: Reply) -> Vec<NamespaceDirectoryEntry> {
@@ -1744,16 +1903,127 @@ fn release_lookup_reference(namespace: &Namespace, inode: InodeId) {
 #[cfg(test)]
 mod tests {
     use super::{
-        INTERNAL_CONTEXT, LookupTrackingStream, StatFsSnapshot,
-        dispatch_mutation_with_backpressure, fallocate_mode,
+        FuseFilesystem, INTERNAL_CONTEXT, KernelDataInvalidation, LookupTrackingStream,
+        StatFsSnapshot, dispatch_mutation_with_backpressure, fallocate_mode,
+        regular_file_open_flags,
     };
     use crate::{
-        FallocateMode, Namespace, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE,
-        Reply,
+        AccessMode, FallocateMode, Namespace, NamespaceConfig, OpenOptions, Operation, PosixError,
+        ROOT_INODE, Reply,
     };
+    use fuse3::raw::{Filesystem, Request};
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn v1_kernel_cache_policy_caches_only_read_only_regular_handles() {
+        assert_eq!(regular_file_open_flags(OpenOptions::READ_ONLY), 2);
+        assert_eq!(
+            regular_file_open_flags(OpenOptions {
+                access: AccessMode::WriteOnly,
+                append: false,
+            }),
+            1
+        );
+        assert_eq!(regular_file_open_flags(OpenOptions::READ_WRITE), 1);
+    }
+
+    #[test]
+    fn kernel_data_invalidation_is_bounded_and_overflow_safe() {
+        assert_eq!(KernelDataInvalidation::range(9, 0).wire_range(), None);
+        assert_eq!(
+            KernelDataInvalidation::range(4_095, 2).wire_range(),
+            Some((4_095, 2))
+        );
+        assert_eq!(
+            KernelDataInvalidation::From(8_192).wire_range(),
+            Some((8_192, 0))
+        );
+        assert_eq!(KernelDataInvalidation::All.wire_range(), Some((0, 0)));
+        assert_eq!(
+            KernelDataInvalidation::range(u64::MAX, 1).wire_range(),
+            Some((0, 0))
+        );
+        assert_eq!(
+            KernelDataInvalidation::range(7, u64::MAX).wire_range(),
+            Some((7, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn content_mutations_notify_only_after_a_cacheable_open() {
+        let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
+        let Reply::Created { entry, handle } = namespace
+            .dispatch(
+                INTERNAL_CONTEXT,
+                Operation::Create {
+                    parent: ROOT_INODE,
+                    name: b"cache-exposure",
+                    mode: 0o600,
+                    options: OpenOptions::READ_WRITE,
+                    exclusive: true,
+                    truncate: false,
+                },
+            )
+            .expect("fixture file is created")
+        else {
+            panic!("create returned the wrong reply");
+        };
+        let filesystem = FuseFilesystem::new(namespace);
+        let notifications = filesystem.record_kernel_notifications();
+
+        Filesystem::write(
+            &filesystem,
+            Request::default(),
+            entry.attr.inode.get(),
+            handle.get(),
+            0,
+            b"before",
+            0,
+            0,
+        )
+        .await
+        .expect("write before cache exposure succeeds");
+        let reader = Filesystem::open(
+            &filesystem,
+            Request::default(),
+            entry.attr.inode.get(),
+            u32::try_from(libc::O_RDONLY).expect("O_RDONLY is nonnegative"),
+        )
+        .await
+        .expect("cacheable read-only open succeeds");
+        Filesystem::release(
+            &filesystem,
+            Request::default(),
+            entry.attr.inode.get(),
+            reader.fh,
+            0,
+            0,
+            false,
+        )
+        .await
+        .expect("cacheable reader closes successfully");
+        Filesystem::write(
+            &filesystem,
+            Request::default(),
+            entry.attr.inode.get(),
+            handle.get(),
+            6,
+            b"after",
+            0,
+            0,
+        )
+        .await
+        .expect("write after cache exposure succeeds");
+
+        assert_eq!(
+            *notifications
+                .lock()
+                .expect("notification recorder lock remains healthy"),
+            vec![(entry.attr.inode.get(), 6, 5)]
+        );
+    }
 
     #[tokio::test]
     async fn dropped_readdirplus_item_rolls_back_its_lookup_pin() {

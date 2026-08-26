@@ -6,6 +6,8 @@ use std::mem::size_of;
 
 use fastdup_format::ChunkId;
 
+use crate::long_lived_arena::LongLivedArena;
+
 const CACHE_WAYS: usize = 4;
 const BLOOM_BITS_PER_BLOCK: usize = 512;
 const BLOOM_BYTES_PER_BLOCK: usize = BLOOM_BITS_PER_BLOCK / 8;
@@ -87,7 +89,7 @@ const _: () = assert!(size_of::<BloomBlock>() == 64);
 /// never an Exact Hit: callers must query the complete Exact Index.
 #[derive(Debug)]
 pub struct BlockedBloomHint {
-    blocks: Box<[BloomBlock]>,
+    blocks: LongLivedArena<BloomBlock>,
     expected_keys: usize,
 }
 
@@ -114,7 +116,8 @@ impl BlockedBloomHint {
             .checked_mul(BLOOM_BYTES_PER_BLOCK)
             .ok_or(HintStructureError::CapacityOverflow)?;
         ensure_budget(required_bytes, maximum_bytes)?;
-        let blocks = allocate_filled(block_count, BloomBlock::default())?;
+        let blocks = LongLivedArena::try_filled(block_count, BloomBlock::default())
+            .map_err(|_| HintStructureError::AllocationFailed)?;
         Ok(Self {
             blocks,
             expected_keys,
@@ -175,6 +178,14 @@ impl BlockedBloomHint {
             .len()
             .checked_mul(BLOOM_BYTES_PER_BLOCK)
             .expect("ASSERT: a constructed Bloom allocation size cannot overflow")
+    }
+
+    /// Reports whether this dense table was placed in its own THP-advised
+    /// anonymous mapping. Advice is a performance hint, not proof that every
+    /// page has already been promoted by the kernel.
+    #[must_use]
+    pub const fn huge_page_advised(&self) -> bool {
+        self.blocks.huge_page_advised()
     }
 }
 

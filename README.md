@@ -30,10 +30,13 @@ Der FUSE-Pfad unterstützt unter anderem:
 - Unterverzeichnisse, Hardlinks, Symlinks, xattrs/ACLs, Besitz, Rechte,
   Zeitstempel und flüchtige POSIX-Record-Locks
 - `statfs`, dünne Allokation, Hole Punch, Zero Range und DATA/HOLE-Seeks
+- Kernel-Read-Cache und Readahead für Read-only-Handles mit expliziter
+  Bereichsinvalidierung; Read-only-`mmap` ist kohärent, Shared-writable-`mmap`
+  wird in v1 abgewiesen
 - Offline-Scrub, adaptives Online-/Offline-GC und Neuaufbau des Exact Index
 
 Der Adapter bildet noch nicht den gesamten POSIX-Umfang ab. Insbesondere BSD
-`flock`, mmap-/Kernel-Cache-Verhalten und die breite Client- und
+`flock` sowie die breite Client-, POSIX-, Samba- und
 Crash-Konformitätsmatrix sind noch offen. Der verbleibende Umfang ist in der
 [POSIX-Testplanung](docs/testing/posix-conformance.md) erfasst.
 
@@ -71,11 +74,21 @@ Upgrade-/Allocator-Grenzen geschlossen:
   1.024er-Bereichen dauerhaft. Nach einer einmaligen Legacy-Envelope-Migration
   benötigt ein gesunder Start keinen Container-Verzeichnis-Scan mehr; Crashs
   dürfen Nummern überspringen, aber niemals wiederverwenden.
+- Read-only-FUSE-Handles nutzen jetzt den Kernel-Page-Cache mit `KEEP_CACHE`;
+  schreibfähige Handles bleiben `DIRECT_IO`, Writeback bleibt aus. Erfolgreiche
+  Writes, Truncates, Clone-/Fallocate-Mutationen invalidieren vor ihrer Antwort
+  exakt den betroffenen Inode-Bereich, sobald der Inode einmal einen
+  cachefähigen Read-only-Handle geliefert hat. Reine Write-only-Inodes
+  überspringen den redundanten Kernel-Notify. Der reale Mount-Test deckt
+  mehrere Handles, Seitengrenzen, Hole/Zero, Truncate sowie kohärentes
+  Read-only-`mmap` und die Ablehnung von Shared-writable-`mmap` ab.
 - Der Supervisor, die Latch-I/O und deren Synchronisation liegen ausschließlich
   im Daemon-/Maintenance-Kontrollpfad. Auch Epoch-Prüfung und High-Water-I/O
   liegen an Repository-Open, Commit, Container-Publikation und Scrub. Die
-  POSIX-Mutations- und Ingest-Admission-Hot-Loops erhielten weder zusätzliche
-  Dateisystem-I/O noch neue Locks.
+  POSIX-Namespace-, Ingest-Admission- und Reduktions-Hot-Loops erhielten weder
+  zusätzliche Dateisystem-I/O noch neue Locks. Der Write-Pfad trägt nur einen
+  Inode-lokalen Atomic-Load; Kernel-Cache-Notify bleibt am FUSE-Rand und läuft
+  nur nach einer erfolgreichen Inhaltsmutation eines cache-exponierten Inodes.
 - Der vollständige serielle Workspace-Test, Clippy, der Release-Build und die
   reale siebenstufige SIGKILL/FUSE-Remount-Matrix sind für diesen Stand grün.
   Dauerhaft blockierte oder fehlerhaft bestätigende Hardware bleibt außerhalb
@@ -262,6 +275,17 @@ mkdir -p \
 
 Der Daemon läuft im Vordergrund. `Ctrl-C` stoppt die Mutationsannahme, führt
 den abschließenden Checkpoint aus und hängt den Mount aus.
+
+Für den produktiven No-Swap-Betrieb muss der Daemon in einer eigenen
+cgroup-v2 mit `MemorySwapMax=0` laufen. Mit
+`FASTDUP_REQUIRE_CGROUP_NO_SWAP=1` prüft er diese Kernel-Grenze noch vor dem
+Öffnen von Metadata und DATA. Der gemeinsame `MemoryBudgetGovernor` passt die
+rebuildbaren Cache-Budgets an den kleineren Host-/cgroup-Headroom an; bereits
+belegter Swap anderer cgroups schaltet die fastdup-Caches nicht mehr ab.
+Langlebige, dichte Dedup-Bloom-Tabellen ab 2 MiB erhalten eine eigene
+`MADV_HUGEPAGE`-Arena, ohne die Bloom-Probe-Hot-Loop um Sampling oder Locks zu
+erweitern. Details und Abnahmekriterien stehen in
+[Memory and swap containment](docs/operations/memory-and-swap.md).
 
 ## Offline-Wartung
 

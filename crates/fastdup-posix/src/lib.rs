@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::ops::Bound::Excluded;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -663,14 +663,24 @@ pub enum Operation<'a> {
 pub enum Reply {
     Entry(Entry),
     Attr(FileAttr),
-    Created { entry: Entry, handle: HandleId },
+    Created {
+        entry: Entry,
+        handle: HandleId,
+    },
     Opened(HandleId),
     Data(Vec<u8>),
     LinkTarget(Vec<u8>),
     Xattr(Vec<u8>),
     FileFlags(u32),
-    Written { bytes: u32, mutation_sequence: u64 },
-    Cloned { bytes: u64, mutation_sequence: u64 },
+    Written {
+        bytes: u32,
+        mutation_sequence: u64,
+        offset: u64,
+    },
+    Cloned {
+        bytes: u64,
+        mutation_sequence: u64,
+    },
     Offset(u64),
     Lock(FileLock),
     Directory(Vec<DirectoryEntry>),
@@ -2189,7 +2199,14 @@ fn copy_bytes(source: &[u8]) -> Result<Vec<u8>, PosixError> {
 #[repr(align(64))]
 struct Inode {
     observer_order: Mutex<()>,
+    kernel_data_cache_exposed: AtomicBool,
     state: RwLock<InodeState>,
+}
+
+#[derive(Debug)]
+struct WriteResult {
+    reply: Reply,
+    kernel_data_cache_exposed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2364,6 +2381,7 @@ impl Namespace {
         );
         let root = Arc::new(Inode {
             observer_order: Mutex::new(()),
+            kernel_data_cache_exposed: AtomicBool::new(false),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
                 mode: 0o755,
@@ -2464,6 +2482,7 @@ impl Namespace {
         let committed_symlinks = snapshot.symlinks;
         let root = Arc::new(Inode {
             observer_order: Mutex::new(()),
+            kernel_data_cache_exposed: AtomicBool::new(false),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
                 mode: snapshot.root_mode,
@@ -2489,6 +2508,7 @@ impl Namespace {
             let inode = committed.inode;
             let object = Arc::new(Inode {
                 observer_order: Mutex::new(()),
+                kernel_data_cache_exposed: AtomicBool::new(false),
                 state: RwLock::new(InodeState {
                     kind: FileKind::Regular,
                     mode: committed.mode,
@@ -2516,6 +2536,7 @@ impl Namespace {
             let inode = committed.inode;
             let object = Arc::new(Inode {
                 observer_order: Mutex::new(()),
+                kernel_data_cache_exposed: AtomicBool::new(false),
                 state: RwLock::new(InodeState {
                     kind: FileKind::Directory,
                     mode: committed.mode,
@@ -2540,6 +2561,7 @@ impl Namespace {
             let inode = committed.inode;
             let object = Arc::new(Inode {
                 observer_order: Mutex::new(()),
+                kernel_data_cache_exposed: AtomicBool::new(false),
                 state: RwLock::new(InodeState {
                     kind: FileKind::Symlink,
                     mode: 0o777,
@@ -3318,6 +3340,32 @@ impl Namespace {
         payload: MutationPayload,
     ) -> Result<Reply, PosixError> {
         self.write_payload(inode, handle, offset, payload)
+            .map(|result| result.reply)
+    }
+
+    pub(crate) fn dispatch_owned_write_for_fuse(
+        &self,
+        _context: RequestContext,
+        inode: InodeId,
+        handle: HandleId,
+        offset: u64,
+        payload: MutationPayload,
+    ) -> Result<(Reply, bool), PosixError> {
+        self.write_payload(inode, handle, offset, payload)
+            .map(|result| (result.reply, result.kernel_data_cache_exposed))
+    }
+
+    pub(crate) fn expose_kernel_data_cache(&self, inode: InodeId) -> Result<(), PosixError> {
+        let object = self.resolve_inode(inode)?;
+        object
+            .kernel_data_cache_exposed
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn kernel_data_cache_exposed(&self, inode: InodeId) -> bool {
+        self.resolve_inode(inode)
+            .is_ok_and(|object| object.kernel_data_cache_exposed.load(Ordering::Acquire))
     }
 
     fn lookup(&self, parent: InodeId, name: &[u8]) -> Result<Reply, PosixError> {
@@ -3639,6 +3687,7 @@ impl Namespace {
         let inode = allocate_inode(&mut catalog)?;
         let object = Arc::new(Inode {
             observer_order: Mutex::new(()),
+            kernel_data_cache_exposed: AtomicBool::new(false),
             state: RwLock::new(InodeState {
                 kind: FileKind::Symlink,
                 mode: 0o777,
@@ -3829,6 +3878,7 @@ impl Namespace {
         let inode = allocate_inode(&mut catalog)?;
         let object = Arc::new(Inode {
             observer_order: Mutex::new(()),
+            kernel_data_cache_exposed: AtomicBool::new(false),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
                 mode,
@@ -3975,6 +4025,7 @@ impl Namespace {
     ) -> Result<Reply, PosixError> {
         let payload = MutationPayload::try_copy_from_slice(data)?;
         self.write_payload(inode, handle, requested_offset, payload)
+            .map(|result| result.reply)
     }
 
     fn write_payload(
@@ -3983,7 +4034,7 @@ impl Namespace {
         handle: HandleId,
         requested_offset: u64,
         payload: MutationPayload,
-    ) -> Result<Reply, PosixError> {
+    ) -> Result<WriteResult, PosixError> {
         let _admission = self.require_mutation_admission()?;
         let written = u32::try_from(payload.len()).map_err(|_| PosixError::FileTooLarge)?;
         let (object, open) = self.resolve_open_file(inode, handle)?;
@@ -4000,20 +4051,24 @@ impl Namespace {
             FileKind::Regular,
             "ASSERT: a file handle must reference a regular inode"
         );
-        if payload.is_empty() {
-            return Ok(Reply::Written {
-                bytes: 0,
-                mutation_sequence: state.mutation_sequence,
-            });
-        }
-        if state.metadata.is_immutable() {
-            return Err(PosixError::PermissionDenied);
-        }
         let offset = if open.options.append {
             state.data.logical_size()
         } else {
             requested_offset
         };
+        if payload.is_empty() {
+            return Ok(WriteResult {
+                reply: Reply::Written {
+                    bytes: 0,
+                    mutation_sequence: state.mutation_sequence,
+                    offset,
+                },
+                kernel_data_cache_exposed: object.kernel_data_cache_exposed.load(Ordering::Acquire),
+            });
+        }
+        if state.metadata.is_immutable() {
+            return Err(PosixError::PermissionDenied);
+        }
         let data_length = u64::try_from(payload.len()).expect("ASSERT: usize must fit in u64");
         let end = offset
             .checked_add(data_length)
@@ -4051,9 +4106,13 @@ impl Namespace {
         drop(observer_order);
         self.externalize_verified_extents(externalized);
 
-        Ok(Reply::Written {
-            bytes: written,
-            mutation_sequence: next_sequence,
+        Ok(WriteResult {
+            reply: Reply::Written {
+                bytes: written,
+                mutation_sequence: next_sequence,
+                offset,
+            },
+            kernel_data_cache_exposed: object.kernel_data_cache_exposed.load(Ordering::Acquire),
         })
     }
 
@@ -5696,6 +5755,7 @@ fn create_new_file(
     let handle = allocate_handle(catalog)?;
     let object = Arc::new(Inode {
         observer_order: Mutex::new(()),
+        kernel_data_cache_exposed: AtomicBool::new(false),
         state: RwLock::new(InodeState {
             kind: FileKind::Regular,
             mode,

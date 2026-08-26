@@ -144,7 +144,7 @@ format decisions part of the POSIX test API.
 | Extended attributes | Binary xattr names/values and create, replace, list, get, and remove semantics are atomic. | Test empty and bounded-large binary values, `XATTR_CREATE`/`XATTR_REPLACE`, missing attributes, concurrent replacements, and every commit fault. | M |
 | POSIX ACLs | Access/default ACLs, inheritance, and mode-mask interactions survive commits byte-exactly. | Use `setfacl`/`getfacl`, create children under default ACLs, mutate mode bits, test access under multiple credentials, and remount. | F |
 | Advisory locks | POSIX byte-range and whole-file lock conflicts are owner-aware, independent of mutation admission, and transient. Ordinary reads and writes remain advisory rather than mandatory-lock operations. | Use independent processes for overlapping/non-overlapping lock ranges, partial unlock and conversion, close and duplicate descriptors, unlink/rename locked files, kill a lock owner, and verify locks do not survive daemon restart. | F |
-| Kernel read cache | Writes invalidate every affected cached range; stale acknowledged data is never read. | Warm page-cache ranges through multiple descriptors, perform overlapping writes, and immediately reread boundaries under the normal and benchmark-only `direct_io` configurations. | F |
+| Kernel read cache | Once an inode has exposed a cacheable reader, writes invalidate every affected cached range; never-exposed Write-only inodes skip the redundant notification. Stale acknowledged data is never read. | Record the notification boundary before and after a cacheable open, then warm page-cache ranges through multiple descriptors, perform overlapping writes, and immediately reread boundaries under the normal and benchmark-only `direct_io` configurations. | F |
 | Shared writable mapping | Writable shared mappings are consistently rejected in v1; read-only mappings remain coherent. | Attempt `MAP_SHARED|PROT_WRITE` and require the documented failure; exercise read-only faults around concurrent writes and truncation without stale or unchecked bytes. | F |
 | Error mapping | Expected errors such as `ENOENT`, `EEXIST`, `ENOTEMPTY`, `ENOSPC`, `EFBIG`, `EOPNOTSUPP`, and `EIO` are not assertion crashes. | Table-drive invalid and resource-limited operations through the model and FUSE mount; compare operation, errno, and unchanged state with the oracle. | M |
 | Handle and request races | Lookup/forget, open/release, cancellation, and concurrent independent requests do not leak liveness or reuse identity. | Randomly schedule request completion, interruption, handle close, unlink, and daemon shutdown; all retained objects have an explicit handle, namespace, or generation pin. | M |
@@ -184,6 +184,9 @@ global-index-invariant, and fail-before/fail-after evidence, but does not replac
 real block-device power-cut campaigns. Deterministic fake-clock coverage now
 holds Metadata and DATA syncs, closes admission at the guard, and proves that
 an already admitted write remains visible and commit-prioritized. The complete
+Kernel-read-cache F-level row is green for independent cached readers,
+page-boundary overwrite, truncate, hole/zero mutation, read-only shared mmap,
+and rejection of shared writable mmap under the v1 direct-writer policy. The complete
 P0 matrix has not yet been rerun at every applicable M/F/K level: broad
 randomized process-kill coverage and the remaining POSIX/Samba matrices are
 still absent. Stock Linux FUSE still prevents mounted collapse/insert despite

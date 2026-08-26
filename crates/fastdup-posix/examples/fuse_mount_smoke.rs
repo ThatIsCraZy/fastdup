@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn exercise_syscalls(mount_path: &std::path::Path) -> io::Result<()> {
     const SPARSE_OFFSET: u64 = 1_024 * 1_024 * 1_024 * 1_024;
     exercise_statfs(mount_path)?;
+    exercise_kernel_read_cache(mount_path)?;
     let raw_name = std::ffi::OsString::from_vec(b"vm-\xff".to_vec());
     let path = mount_path.join(&raw_name);
     let writer = OpenOptions::new()
@@ -330,6 +331,122 @@ fn exercise_statfs(mount_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(unsafe_code)]
+fn exercise_kernel_read_cache(mount_path: &std::path::Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    const LENGTH: usize = 8 * 1_024;
+    const TRUNCATED_LENGTH: u64 = 5 * 1_024;
+    let path = mount_path.join("kernel-read-cache.dat");
+    let writer = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    let mut expected = (0..LENGTH)
+        .map(|index| u8::try_from(index % 251).expect("value is bounded"))
+        .collect::<Vec<_>>();
+    writer.write_all_at(&expected, 0)?;
+
+    // Read-only opens retain clean pages across handles. Mutations still use
+    // direct I/O and explicitly invalidate the affected cached pages before
+    // their syscall returns.
+    let cached_reader = OpenOptions::new().read(true).open(&path)?;
+    let mut warm = vec![0_u8; LENGTH];
+    cached_reader.read_exact_at(&mut warm, 0)?;
+    assert_eq!(warm, expected);
+
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            LENGTH,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            cached_reader.as_raw_fd(),
+            0,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    let mapping = mapping.cast::<u8>();
+    for (index, byte) in expected.iter().copied().enumerate() {
+        assert_eq!(unsafe { std::ptr::read_volatile(mapping.add(index)) }, byte);
+    }
+
+    let replacement = b"cross-page-cache";
+    let replacement_offset = 4_091_usize;
+    writer.write_all_at(
+        replacement,
+        u64::try_from(replacement_offset).expect("offset fits"),
+    )?;
+    expected[replacement_offset..replacement_offset + replacement.len()]
+        .copy_from_slice(replacement);
+    let mut boundary = [0_u8; 32];
+    cached_reader.read_exact_at(&mut boundary, 4_080)?;
+    assert_eq!(&boundary, &expected[4_080..4_112]);
+    for (index, expected_byte) in expected.iter().copied().enumerate().take(4_112).skip(4_080) {
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(mapping.add(index)) },
+            expected_byte
+        );
+    }
+
+    writer.set_len(TRUNCATED_LENGTH)?;
+    let last_retained = usize::try_from(TRUNCATED_LENGTH - 1).expect("length fits");
+    assert_eq!(
+        unsafe { std::ptr::read_volatile(mapping.add(last_retained)) },
+        expected[last_retained]
+    );
+    assert_eq!(cached_reader.metadata()?.len(), TRUNCATED_LENGTH);
+    if unsafe { libc::munmap(mapping.cast(), LENGTH) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let writable = OpenOptions::new().read(true).write(true).open(&path)?;
+    let writable_mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            usize::try_from(TRUNCATED_LENGTH).expect("length fits"),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            writable.as_raw_fd(),
+            0,
+        )
+    };
+    if writable_mapping != libc::MAP_FAILED {
+        let _ = unsafe {
+            libc::munmap(
+                writable_mapping,
+                usize::try_from(TRUNCATED_LENGTH).expect("length fits"),
+            )
+        };
+        return Err(io::Error::other(
+            "shared writable mmap unexpectedly succeeded for a direct-I/O handle",
+        ));
+    }
+
+    let mut append_writer = OpenOptions::new().append(true).open(&path)?;
+    append_writer.write_all(b"TAIL")?;
+    let mut appended = [0_u8; 4];
+    cached_reader.read_exact_at(&mut appended, TRUNCATED_LENGTH)?;
+    assert_eq!(&appended, b"TAIL");
+    drop(append_writer);
+
+    let renamed_path = mount_path.join("kernel-read-cache-renamed.dat");
+    std::fs::rename(&path, &renamed_path)?;
+    std::fs::remove_file(&renamed_path)?;
+    writer.write_all_at(b"open-orphan", 128)?;
+    let mut orphan_update = [0_u8; 11];
+    cached_reader.read_exact_at(&mut orphan_update, 128)?;
+    assert_eq!(&orphan_update, b"open-orphan");
+
+    drop(writable);
+    drop(cached_reader);
+    drop(writer);
+    Ok(())
+}
+
 fn exercise_sparse_allocation_syscalls(mount_path: &std::path::Path) -> io::Result<()> {
     use rustix::fs::{FallocateFlags, SeekFrom, fallocate, seek};
 
@@ -341,6 +458,10 @@ fn exercise_sparse_allocation_syscalls(mount_path: &std::path::Path) -> io::Resu
         .open(&path)?;
     file.write_all_at(b"abc", 0)?;
     file.write_all_at(b"XYZ", 8)?;
+    let cached_reader = OpenOptions::new().read(true).open(&path)?;
+    let mut cached_bytes = [0_u8; 11];
+    cached_reader.read_exact_at(&mut cached_bytes, 0)?;
+    assert_eq!(&cached_bytes, b"abc\0\0\0\0\0XYZ");
     assert_eq!(seek(&file, SeekFrom::Hole(0)).map_err(io::Error::from)?, 3);
     assert_eq!(seek(&file, SeekFrom::Data(3)).map_err(io::Error::from)?, 8);
 
@@ -351,8 +472,12 @@ fn exercise_sparse_allocation_syscalls(mount_path: &std::path::Path) -> io::Resu
         1,
     )
     .map_err(io::Error::from)?;
+    cached_reader.read_exact_at(&mut cached_bytes, 0)?;
+    assert_eq!(&cached_bytes, b"a\0c\0\0\0\0\0XYZ");
     assert_eq!(seek(&file, SeekFrom::Hole(1)).map_err(io::Error::from)?, 1);
     fallocate(&file, FallocateFlags::ZERO_RANGE, 1, 1).map_err(io::Error::from)?;
+    cached_reader.read_exact_at(&mut cached_bytes, 0)?;
+    assert_eq!(&cached_bytes, b"a\0c\0\0\0\0\0XYZ");
     assert_eq!(seek(&file, SeekFrom::Data(1)).map_err(io::Error::from)?, 1);
     fallocate(&file, FallocateFlags::empty(), 2, 6).map_err(io::Error::from)?;
     assert_eq!(seek(&file, SeekFrom::Hole(0)).map_err(io::Error::from)?, 11);
@@ -364,6 +489,7 @@ fn exercise_sparse_allocation_syscalls(mount_path: &std::path::Path) -> io::Resu
         assert_eq!(error, rustix::io::Errno::OPNOTSUPP);
     }
 
+    drop(cached_reader);
     drop(file);
     std::fs::remove_file(path)
 }

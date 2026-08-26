@@ -76,6 +76,7 @@ fn acknowledged_writes_are_live_and_open_orphans_remain_usable() {
         Ok(Reply::Written {
             bytes: 6,
             mutation_sequence: 1,
+            offset: 0,
         })
     );
     assert_eq!(
@@ -91,6 +92,7 @@ fn acknowledged_writes_are_live_and_open_orphans_remain_usable() {
         Ok(Reply::Written {
             bytes: 2,
             mutation_sequence: 2,
+            offset: 2,
         })
     );
     assert_eq!(
@@ -388,6 +390,7 @@ fn seek_write_truncate_and_access_modes_are_checked() {
         Ok(Reply::Written {
             bytes: 1,
             mutation_sequence: 1,
+            offset: 8_192,
         })
     );
     assert_eq!(
@@ -457,6 +460,7 @@ fn seek_write_truncate_and_access_modes_are_checked() {
         Ok(Reply::Written {
             bytes: 0,
             mutation_sequence: 2,
+            offset: 10_000,
         })
     );
     assert_eq!(

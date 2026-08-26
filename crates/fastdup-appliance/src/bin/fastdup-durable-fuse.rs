@@ -23,6 +23,7 @@ use fastdup_store::{
     GcCandidateCatalogRepository, GenerationRepository, MaintenanceRepository,
     OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport, OnlineGcRunMode,
     OwnedContainerPublication, StorageIo, StoreError, publication_sample_ranges,
+    system_memory_budget_governor,
 };
 
 mod common;
@@ -85,8 +86,7 @@ impl Drop for OnlineGcSocketGuard {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mount_path, metadata_root, container_root) = parse_mount_arguments()?;
-    let statfs_override = statfs_override_from_environment()?;
-    let online_gc_policy = OnlineGcPolicy::from_environment()?;
+    let (statfs_override, online_gc_policy) = validated_startup_policies()?;
     std::fs::create_dir_all(&metadata_root)?;
     let _appliance_lease =
         ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::WritableDaemon)?;
@@ -237,6 +237,39 @@ fn parse_mount_arguments() -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::e
         return Err("metadata and container roots must be distinct".into());
     }
     Ok((mount_path, metadata_root, container_root))
+}
+
+fn validate_memory_budget_policy() -> Result<(), Box<dyn std::error::Error>> {
+    const REQUIRE_NO_SWAP: &str = "FASTDUP_REQUIRE_CGROUP_NO_SWAP";
+    let required = match std::env::var(REQUIRE_NO_SWAP) {
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        Ok(value) => {
+            return Err(format!("{REQUIRE_NO_SWAP} must be 0 or 1, got {value:?}").into());
+        }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => return Err(error.into()),
+    };
+    let governor = system_memory_budget_governor();
+    if required {
+        governor.require_no_swap()?;
+    } else if governor
+        .snapshot()
+        .is_ok_and(|snapshot| !snapshot.swap_protection_enforced())
+    {
+        eprintln!(
+            "WARNING: fastdup cgroup can swap; production requires MemorySwapMax=0 and FASTDUP_REQUIRE_CGROUP_NO_SWAP=1"
+        );
+    }
+    Ok(())
+}
+
+fn validated_startup_policies()
+-> Result<(Option<StatFsOverride>, OnlineGcPolicy), Box<dyn std::error::Error>> {
+    let statfs_override = statfs_override_from_environment()?;
+    let online_gc_policy = OnlineGcPolicy::from_environment()?;
+    validate_memory_budget_policy()?;
+    Ok((statfs_override, online_gc_policy))
 }
 
 fn recover_appliance(
@@ -861,14 +894,18 @@ async fn catch_up(appliance: Arc<FsAppliance>) -> Result<(), String> {
 
 fn emit_verified_read_cache(appliance: &FsAppliance) {
     emit_write_through_cpu_state(appliance);
+    emit_memory_budget_governor();
     let membership = appliance.exact_run_membership_status();
     eprintln!(
         concat!(
-            "exact_run_membership filters={} allocated_bytes={} probes={} ",
+            "exact_run_membership filters={} allocated_bytes={} ",
+            "huge_page_advised_filters={} huge_page_advised_bytes={} probes={} ",
             "definitely_absent={} requires_exact_lookup={}"
         ),
         membership.filter_count(),
         membership.allocated_bytes(),
+        membership.huge_page_advised_filter_count(),
+        membership.huge_page_advised_bytes(),
         membership.probes(),
         membership.definitely_absent(),
         membership.requires_exact_lookup(),
@@ -946,6 +983,36 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         cache.available_bytes(),
         cache.swap_used_bytes(),
     );
+}
+
+fn emit_memory_budget_governor() {
+    let status = system_memory_budget_governor().status();
+    if let Some(snapshot) = status.snapshot() {
+        let swap_limit = snapshot
+            .cgroup_swap_limit_bytes()
+            .map_or_else(|| "max".to_owned(), |limit| limit.to_string());
+        eprintln!(
+            concat!(
+                "memory_budget_governor samples={} sample_failures={} ",
+                "effective_limit_bytes={} available_bytes={} host_swap_used_bytes={} ",
+                "cgroup_swap_used_bytes={} cgroup_swap_limit_bytes={} swap_protected={}"
+            ),
+            status.samples(),
+            status.sample_failures(),
+            snapshot.effective_limit_bytes(),
+            snapshot.available_bytes(),
+            snapshot.host_swap_used_bytes(),
+            snapshot.cgroup_swap_used_bytes(),
+            swap_limit,
+            snapshot.swap_protection_enforced(),
+        );
+    } else {
+        eprintln!(
+            "memory_budget_governor samples={} sample_failures={} admission=closed",
+            status.samples(),
+            status.sample_failures(),
+        );
+    }
 }
 
 fn emit_dependency_proof_caches(appliance: &FsAppliance) {

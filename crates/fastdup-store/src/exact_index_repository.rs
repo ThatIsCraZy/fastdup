@@ -415,6 +415,8 @@ impl ExactIndexPageCacheStatus {
 pub struct ExactRunMembershipStatus {
     filter_count: u64,
     allocated_bytes: u64,
+    huge_page_advised_filter_count: u64,
+    huge_page_advised_bytes: u64,
     probes: u64,
     definitely_absent: u64,
     requires_exact_lookup: u64,
@@ -429,6 +431,16 @@ impl ExactRunMembershipStatus {
     #[must_use]
     pub const fn allocated_bytes(self) -> u64 {
         self.allocated_bytes
+    }
+
+    #[must_use]
+    pub const fn huge_page_advised_filter_count(self) -> u64 {
+        self.huge_page_advised_filter_count
+    }
+
+    #[must_use]
+    pub const fn huge_page_advised_bytes(self) -> u64 {
+        self.huge_page_advised_bytes
     }
 
     #[must_use]
@@ -1925,6 +1937,21 @@ impl<I> ActivatedExactIndex<I> {
                 )
                 .expect("ASSERT: active Run membership byte accounting cannot overflow")
         });
+        let (huge_page_advised_filter_count, huge_page_advised_bytes) = self
+            .readers
+            .iter()
+            .filter_map(|reader| reader.membership.as_ref())
+            .filter(|filter| filter.huge_page_advised())
+            .fold((0_usize, 0_usize), |(count, bytes), filter| {
+                (
+                    count
+                        .checked_add(1)
+                        .expect("ASSERT: active THP membership count cannot overflow"),
+                    bytes
+                        .checked_add(filter.allocated_bytes())
+                        .expect("ASSERT: active THP membership bytes cannot overflow"),
+                )
+            });
         let Some(counters) = self
             .readers
             .first()
@@ -1943,6 +1970,10 @@ impl<I> ActivatedExactIndex<I> {
                 .expect("ASSERT: active membership filter count fits u64"),
             allocated_bytes: u64::try_from(allocated_bytes)
                 .expect("ASSERT: active membership bytes fit u64"),
+            huge_page_advised_filter_count: u64::try_from(huge_page_advised_filter_count)
+                .expect("ASSERT: active THP membership count fits u64"),
+            huge_page_advised_bytes: u64::try_from(huge_page_advised_bytes)
+                .expect("ASSERT: active THP membership bytes fit u64"),
             probes: counters.probes.load(AtomicOrdering::Relaxed),
             definitely_absent: counters.definitely_absent.load(AtomicOrdering::Relaxed),
             requires_exact_lookup: counters.requires_exact_lookup.load(AtomicOrdering::Relaxed),
@@ -3339,7 +3370,7 @@ mod tests {
         assert_eq!(
             exact_run_membership_budget(MemoryPressureSnapshot::new(16 * gib, 12 * gib, 1)),
             0,
-            "any observed Swap disables the next active filter set"
+            "Swap charged to fastdup disables the next active filter set"
         );
     }
 }

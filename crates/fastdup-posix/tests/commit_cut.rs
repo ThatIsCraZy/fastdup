@@ -716,6 +716,7 @@ fn closing_admission_waits_until_an_already_admitted_write_is_applied() {
             Ok(Reply::Written {
                 bytes: 1,
                 mutation_sequence: 1,
+                offset: 0,
             })
         );
         paused_rx

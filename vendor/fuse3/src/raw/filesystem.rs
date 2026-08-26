@@ -51,6 +51,12 @@ impl OwnedRequestPayload {
 #[trait_make::make(Send)]
 /// Inode based filesystem trait.
 pub trait Filesystem {
+    /// Installs the session notification channel before `init` or any request.
+    ///
+    /// Filesystems that keep kernel caches coherent may retain a clone and send
+    /// invalidation notifications after successful userspace mutations.
+    fn register_notify(&self, notify: Notify) {}
+
     /// initialize filesystem. Called before any other filesystem method.
     async fn init(&self, req: Request) -> Result<ReplyInit>;
 

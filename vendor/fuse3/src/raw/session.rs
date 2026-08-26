@@ -583,6 +583,10 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             send_failed: send_failed.clone(),
             connection: fuse_write_connection,
         }));
+        self.filesystem
+            .as_ref()
+            .expect("filesystem not init")
+            .register_notify(self.get_notify());
 
         let dispatch_task = self.dispatch().fuse();
         let mut dispatch_task = pin!(dispatch_task);
@@ -1147,6 +1151,12 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             debug!("enable FUSE_AUTO_INVAL_DATA");
 
             reply_flags |= FUSE_AUTO_INVAL_DATA;
+        }
+
+        if init_in.flags & FUSE_EXPLICIT_INVAL_DATA > 0 {
+            debug!("enable FUSE_EXPLICIT_INVAL_DATA");
+
+            reply_flags |= FUSE_EXPLICIT_INVAL_DATA;
         }
 
         if init_in.flags & FUSE_DO_READDIRPLUS > 0 || self.mount_options.force_readdir_plus {

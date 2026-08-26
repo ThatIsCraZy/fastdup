@@ -1,93 +1,19 @@
 use fastdup_format::ChunkId;
 use std::array;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+pub(crate) use crate::memory_budget::{MemoryPressureSnapshot, SYSTEM_REFRESH_INTERVAL};
 
 const CACHE_WAYS: usize = 4;
 const CACHE_SLOT_TARGET_BYTES: usize = 16 * 1_024;
-pub(crate) const SYSTEM_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const MINIMUM_SYSTEM_RESERVE_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
 const MAXIMUM_DEFAULT_CACHE_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
-
-/// One conservative view of memory available to this process.
-///
-/// `effective_limit_bytes` is the smaller finite host/cgroup limit and
-/// `available_bytes` is the smaller host/cgroup headroom. Any nonzero Swap use
-/// makes the verified read cache fail closed until pressure clears.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MemoryPressureSnapshot {
-    effective_limit: u64,
-    available: u64,
-    swap_used: u64,
-}
-
-impl MemoryPressureSnapshot {
-    #[must_use]
-    pub const fn new(
-        effective_limit_bytes: u64,
-        available_bytes: u64,
-        swap_used_bytes: u64,
-    ) -> Self {
-        Self {
-            effective_limit: effective_limit_bytes,
-            available: available_bytes,
-            swap_used: swap_used_bytes,
-        }
-    }
-
-    /// Samples `/proc` and the current cgroup-v2 memory controller.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O or parse error when the host cannot provide a complete
-    /// conservative snapshot. Callers must fail closed rather than guess.
-    pub fn read_system() -> io::Result<Self> {
-        let meminfo = fs::read_to_string("/proc/meminfo")?;
-        let host_total = meminfo_kib(&meminfo, "MemTotal")?;
-        let host_available = meminfo_kib(&meminfo, "MemAvailable")?;
-        let swap_total = meminfo_kib(&meminfo, "SwapTotal")?;
-        let swap_free = meminfo_kib(&meminfo, "SwapFree")?;
-        let mut effective_limit = host_total;
-        let mut available = host_available;
-        let mut swap_used = swap_total.saturating_sub(swap_free);
-
-        if let Some(cgroup) = current_cgroup_v2()? {
-            let maximum = read_optional_limit(cgroup.join("memory.max"))?;
-            let high = read_optional_limit(cgroup.join("memory.high"))?;
-            let current = read_counter(cgroup.join("memory.current"))?;
-            let cgroup_limit = [maximum, high].into_iter().flatten().min();
-            if let Some(limit) = cgroup_limit {
-                effective_limit = effective_limit.min(limit);
-                available = available.min(limit.saturating_sub(current));
-            }
-            swap_used = swap_used.max(read_optional_counter(cgroup.join("memory.swap.current"))?);
-        }
-
-        Ok(Self::new(effective_limit, available, swap_used))
-    }
-
-    #[must_use]
-    pub const fn effective_limit_bytes(self) -> u64 {
-        self.effective_limit
-    }
-
-    #[must_use]
-    pub const fn available_bytes(self) -> u64 {
-        self.available
-    }
-
-    #[must_use]
-    pub const fn swap_used_bytes(self) -> u64 {
-        self.swap_used
-    }
-}
 
 /// Hard geometry and memory reserve for the shared verified read cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,7 +60,7 @@ impl VerifiedReadCacheConfig {
     /// invariants.
     #[must_use]
     pub fn conservative(snapshot: MemoryPressureSnapshot) -> Self {
-        let effective = snapshot.effective_limit.max(1);
+        let effective = snapshot.effective_limit_bytes().max(1);
         let reserve = shared_cache_reserve_bytes(effective);
         let hard = (effective / 8).clamp(64 * 1_024, MAXIMUM_DEFAULT_CACHE_BYTES);
         let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
@@ -455,10 +381,12 @@ impl VerifiedReadCache {
             .admission
             .lock()
             .expect("ASSERT: verified read-cache admission lock poisoned");
-        let total_target = if snapshot.swap_used != 0 {
+        let total_target = if snapshot.swap_used_bytes() != 0 {
             0
         } else {
-            let available = snapshot.available.min(snapshot.effective_limit);
+            let available = snapshot
+                .available_bytes()
+                .min(snapshot.effective_limit_bytes());
             let headroom = available.saturating_sub(self.config.reserve_bytes);
             usize::try_from(headroom)
                 .unwrap_or(usize::MAX)
@@ -466,11 +394,11 @@ impl VerifiedReadCache {
         };
         let payload_target = total_target.saturating_sub(self.metadata_bytes);
         self.effective_limit_bytes
-            .store(snapshot.effective_limit, Ordering::Release);
+            .store(snapshot.effective_limit_bytes(), Ordering::Release);
         self.available_bytes
-            .store(snapshot.available, Ordering::Release);
+            .store(snapshot.available_bytes(), Ordering::Release);
         self.swap_used_bytes
-            .store(snapshot.swap_used, Ordering::Release);
+            .store(snapshot.swap_used_bytes(), Ordering::Release);
         self.target_bytes.store(payload_target, Ordering::Release);
         if self.resident_bytes.load(Ordering::Acquire) > payload_target {
             self.clear_locked();
@@ -671,63 +599,6 @@ fn cache_hash(key: CacheKey) -> usize {
     })
 }
 
-fn meminfo_kib(meminfo: &str, key: &str) -> io::Result<u64> {
-    let value = meminfo
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            (name == key).then_some(value)
-        })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing /proc/meminfo key"))?;
-    let kib = value
-        .split_ascii_whitespace()
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty /proc/meminfo value"))?
-        .parse::<u64>()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    kib.checked_mul(1_024)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "meminfo byte overflow"))
-}
-
-fn current_cgroup_v2() -> io::Result<Option<PathBuf>> {
-    let cgroup = fs::read_to_string("/proc/self/cgroup")?;
-    let Some(path) = cgroup.lines().find_map(|line| line.strip_prefix("0::")) else {
-        return Ok(None);
-    };
-    let path = PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/'));
-    if !path.join("memory.max").is_file() {
-        return Ok(None);
-    }
-    Ok(Some(path))
-}
-
-fn read_optional_limit(path: PathBuf) -> io::Result<Option<u64>> {
-    let value = fs::read_to_string(path)?;
-    let value = value.trim();
-    if value == "max" {
-        return Ok(None);
-    }
-    value
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-fn read_counter(path: PathBuf) -> io::Result<u64> {
-    fs::read_to_string(path)?
-        .trim()
-        .parse::<u64>()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-fn read_optional_counter(path: PathBuf) -> io::Result<u64> {
-    match read_counter(path) {
-        Ok(value) => Ok(value),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(error),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +684,23 @@ mod tests {
                 Some(bytes.clone())
             );
         }
+    }
+
+    #[test]
+    fn unrelated_host_swap_does_not_close_fastdup_cache_admission() {
+        let config = VerifiedReadCacheConfig::new(2 * 1_024 * 1_024, 0, NonZeroUsize::MIN)
+            .expect("valid cache geometry");
+        let snapshot = MemoryPressureSnapshot::with_swap_state(
+            8 * 1_024 * 1_024,
+            8 * 1_024 * 1_024,
+            4 * 1_024 * 1_024,
+            0,
+            Some(0),
+        );
+        let cache = VerifiedReadCache::new_with_snapshot(config, snapshot)
+            .expect("construct host-Swap cache");
+
+        assert!(cache.status().target_bytes() > 0);
+        assert_eq!(cache.status().swap_used_bytes(), 0);
     }
 }

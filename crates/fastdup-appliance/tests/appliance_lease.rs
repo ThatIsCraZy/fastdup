@@ -139,6 +139,37 @@ fn invalid_gc_policy_fails_daemon_before_repository_open() {
 }
 
 #[test]
+fn invalid_memory_policy_fails_daemon_before_repository_open() {
+    let root = unique_test_root("invalid-memory-policy");
+    let mount_root = root.join("mount");
+    let metadata_root = root.join("metadata");
+    let container_root = root.join("containers");
+    std::fs::create_dir_all(&mount_root).expect("create mount root");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fastdup-durable-fuse"))
+        .args([&mount_root, &metadata_root, &container_root])
+        .env("FASTDUP_REQUIRE_CGROUP_NO_SWAP", "sometimes")
+        .output()
+        .expect("execute real writable daemon entry point");
+
+    assert!(!output.status.success(), "ASSERT: invalid policy must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("FASTDUP_REQUIRE_CGROUP_NO_SWAP must be 0 or 1"),
+        "ASSERT: startup reports the invalid policy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !metadata_root.exists(),
+        "ASSERT: policy validation precedes creating the Metadata repository"
+    );
+    assert!(
+        !container_root.exists(),
+        "ASSERT: policy validation precedes opening or creating the DATA repository"
+    );
+}
+
+#[test]
 fn malformed_recovery_latch_fails_daemon_before_data_repository_open() {
     let root = unique_test_root("malformed-recovery-latch");
     let mount_root = root.join("mount");

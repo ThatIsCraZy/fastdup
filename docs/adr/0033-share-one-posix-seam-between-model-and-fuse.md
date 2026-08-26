@@ -35,7 +35,8 @@ applied.
 The first mounted checkpoint is explicitly volatile. It disables FUSE
 writeback, sets `DIRECT_IO` and zero attribute/entry TTLs, and implements only
 the operations listed in the POSIX checkpoint report. This safe cache policy is
-not the final performance policy, and the checkpoint does not satisfy the
+superseded by the read-only cached policy in [ADR 0073](0073-cache-read-only-fuse-handles-and-invalidate-data-explicitly.md),
+and the checkpoint does not satisfy the
 ten-second durability contract until immutable manifests, Namespace Roots, and
 the Commit WAL sit behind the same seam.
 

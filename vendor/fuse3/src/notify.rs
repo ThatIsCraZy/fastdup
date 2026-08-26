@@ -29,7 +29,7 @@ impl Notify {
 
     /// notify kernel there are something need to handle. If notify failed, the `kind` will be
     /// return in `Err`.
-    async fn notify(&mut self, kind: NotifyKind) {
+    async fn notify(&self, kind: NotifyKind) {
         match &kind {
             NotifyKind::Wakeup { kh } => {
                 let out_header = fuse_out_header {
@@ -151,23 +151,23 @@ impl Notify {
     }
 
     /// try to notify kernel the IO is ready, kernel can wakeup the waiting program.
-    pub async fn wakeup(mut self, kh: u64) {
+    pub async fn wakeup(&self, kh: u64) {
         self.notify(NotifyKind::Wakeup { kh }).await;
     }
 
     /// try to notify the cache invalidation about an inode.
-    pub async fn invalid_inode(mut self, inode: u64, offset: i64, len: i64) {
+    pub async fn invalid_inode(&self, inode: u64, offset: i64, len: i64) {
         self.notify(NotifyKind::InvalidInode { inode, offset, len })
             .await;
     }
 
     /// try to notify the invalidation about a directory entry.
-    pub async fn invalid_entry(mut self, parent: u64, name: OsString) {
+    pub async fn invalid_entry(&self, parent: u64, name: OsString) {
         self.notify(NotifyKind::InvalidEntry { parent, name }).await;
     }
 
     /// try to notify a directory entry has been deleted.
-    pub async fn delete(mut self, parent: u64, child: u64, name: OsString) {
+    pub async fn delete(&self, parent: u64, child: u64, name: OsString) {
         self.notify(NotifyKind::Delete {
             parent,
             child,
@@ -177,7 +177,7 @@ impl Notify {
     }
 
     /// try to push the data in an inode for updating the kernel cache.
-    pub async fn store(mut self, inode: u64, offset: u64, mut data: impl Buf) {
+    pub async fn store(&self, inode: u64, offset: u64, mut data: impl Buf) {
         self.notify(NotifyKind::Store {
             inode,
             offset,
@@ -187,7 +187,7 @@ impl Notify {
     }
 
     /// try to retrieve data in an inode from the kernel cache.
-    pub async fn retrieve(mut self, notify_unique: u64, inode: u64, offset: u64, size: u32) {
+    pub async fn retrieve(&self, notify_unique: u64, inode: u64, offset: u64, size: u32) {
         self.notify(NotifyKind::Retrieve {
             notify_unique,
             inode,

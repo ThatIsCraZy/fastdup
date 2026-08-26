@@ -14,8 +14,10 @@ mod manifest_reader;
 mod manifest_tree;
 mod metadata_mark_catalog;
 pub use manifest_tree::{ManifestRangeExtent, ManifestTreeSummary};
+mod long_lived_arena;
 mod maintenance;
 mod maintenance_ioprio;
+mod memory_budget;
 mod persistent_reduction;
 mod read_cache;
 mod reduction;
@@ -64,12 +66,16 @@ pub use maintenance::{
 };
 pub use manifest_reader::{MAX_MANIFEST_READ_BYTES, ManifestReadError, VerifiedManifestFile};
 pub use manifest_tree::ManifestTreeError;
+pub use memory_budget::{
+    MemoryBudgetGovernor, MemoryBudgetGovernorStatus, MemoryPressureSnapshot,
+    system_memory_budget_governor,
+};
 pub use persistent_reduction::{
     PersistentChunkPlan, PersistentReductionError, PersistentReductionIndex,
 };
 pub use read_cache::{
-    MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig, VerifiedReadCacheError,
-    VerifiedReadCacheStatus, shared_cache_reserve_bytes,
+    VerifiedReadCache, VerifiedReadCacheConfig, VerifiedReadCacheError, VerifiedReadCacheStatus,
+    shared_cache_reserve_bytes,
 };
 pub use reduction::{
     ReducedObject, ReductionAuditReport, ReductionEngine, ReductionError, ReductionFeatures,
