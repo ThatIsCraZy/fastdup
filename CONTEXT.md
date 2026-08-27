@@ -271,6 +271,19 @@ A decoded chunk or region admitted to a shared read cache only after its complet
 stored encoding and logical content identity were verified.
 _Avoid_: Kernel-dirty page, cache location
 
+**Verified read plan**:
+A bounded demand-read plan that maps logical Manifest extents to verified
+physical Locations, shares one Encoding Record read and decode across its
+Chunks, and returns bytes in logical order. It is acceleration, never content,
+liveness, or Location authority.
+_Avoid_: Reorder, prefetch, Location Set
+
+**Restore-local placement**:
+Physical ordering of newly published independent Locations that favors long
+ascending reads of logically adjacent data on the HDD Data Tier. It changes
+only placement, never Manifest order, Chunk identity, or liveness.
+_Avoid_: Similarity Reorder, canonical Location, defragmentation
+
 **Generation proof set**:
 The bounded in-memory set of verified DATA Locations required by the Active and
 Frozen Commit Generations. Its entries remain pinned until the owning generation

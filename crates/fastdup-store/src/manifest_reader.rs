@@ -5,7 +5,7 @@ use crate::manifest_tree::{
 use crate::{
     ActivatedExactIndex, ContainerRepository, ExactIndexGenerationPin,
     ExactIndexGenerationSnapshot, StorageIo, StoreError, VerifiedReadCache,
-    generation::MetadataRootPin,
+    generation::MetadataRootPin, read_cache::VerifiedChunkPayload,
 };
 use fastdup_format::{
     ChunkId, MAX_METADATA_OBJECT_BYTES, ManifestExtent, ManifestLeaf, MetadataObjectId,
@@ -174,7 +174,16 @@ trait VerifiedChunkReader: fmt::Debug + Send + Sync {
         &self,
         chunk_id: ChunkId,
         logical_length: u64,
-    ) -> Result<Vec<u8>, StoreError>;
+    ) -> Result<VerifiedChunkPayload, StoreError>;
+
+    fn read_verified_chunks(
+        &self,
+        requests: &[(ChunkId, u64)],
+    ) -> Result<Vec<VerifiedChunkPayload>, StoreError> {
+        read_chunks_scalar(requests, |chunk_id, logical_length| {
+            self.read_verified_chunk(chunk_id, logical_length)
+        })
+    }
 }
 
 struct ActiveIndexChunkReader<I, J> {
@@ -199,14 +208,37 @@ where
         &self,
         chunk_id: ChunkId,
         logical_length: u64,
-    ) -> Result<Vec<u8>, StoreError> {
+    ) -> Result<VerifiedChunkPayload, StoreError> {
         let Some(index) = self.index.try_pin() else {
             return self
                 .containers
-                .read_verified_chunk(chunk_id, logical_length);
+                .read_verified_chunk(chunk_id, logical_length)
+                .map(VerifiedChunkPayload::from_verified_store);
         };
         self.containers
             .read_verified_chunk_with_index(&index, chunk_id, logical_length)
+            .map(VerifiedChunkPayload::from_verified_store)
+    }
+
+    fn read_verified_chunks(
+        &self,
+        requests: &[(ChunkId, u64)],
+    ) -> Result<Vec<VerifiedChunkPayload>, StoreError> {
+        let Some(index) = self.index.try_pin() else {
+            return read_chunks_scalar(requests, |chunk_id, logical_length| {
+                self.containers
+                    .read_verified_chunk(chunk_id, logical_length)
+                    .map(VerifiedChunkPayload::from_verified_store)
+            });
+        };
+        self.containers
+            .read_verified_chunks_with_index(&index, requests)
+            .map(|payloads| {
+                payloads
+                    .into_iter()
+                    .map(VerifiedChunkPayload::from_verified_store)
+                    .collect()
+            })
     }
 }
 
@@ -384,18 +416,29 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
     /// cover the requested range, which is an impossible internal state.
     pub fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, ManifestReadError> {
         if let Some(reader) = &self.indexed_reader {
-            self.read_at_using(offset, length, |chunk_id, logical_length| {
-                self.read_cached(chunk_id, logical_length, || {
-                    reader.read_verified_chunk(chunk_id, logical_length)
-                })
-            })
+            self.read_at_using(
+                offset,
+                length,
+                |chunk_id, logical_length| reader.read_verified_chunk(chunk_id, logical_length),
+                |requests| reader.read_verified_chunks(requests),
+            )
         } else {
-            self.read_at_using(offset, length, |chunk_id, logical_length| {
-                self.read_cached(chunk_id, logical_length, || {
+            self.read_at_using(
+                offset,
+                length,
+                |chunk_id, logical_length| {
                     self.containers
                         .read_verified_chunk(chunk_id, logical_length)
-                })
-            })
+                        .map(VerifiedChunkPayload::from_verified_store)
+                },
+                |requests| {
+                    read_chunks_scalar(requests, |chunk_id, logical_length| {
+                        self.containers
+                            .read_verified_chunk(chunk_id, logical_length)
+                            .map(VerifiedChunkPayload::from_verified_store)
+                    })
+                },
+            )
         }
     }
 
@@ -418,12 +461,25 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         offset: u64,
         length: u32,
     ) -> Result<Vec<u8>, ManifestReadError> {
-        self.read_at_using(offset, length, |chunk_id, logical_length| {
-            self.read_cached(chunk_id, logical_length, || {
+        self.read_at_using(
+            offset,
+            length,
+            |chunk_id, logical_length| {
                 self.containers
                     .read_verified_chunk_with_index(index, chunk_id, logical_length)
-            })
-        })
+                    .map(VerifiedChunkPayload::from_verified_store)
+            },
+            |requests| {
+                self.containers
+                    .read_verified_chunks_with_index(index, requests)
+                    .map(|payloads| {
+                        payloads
+                            .into_iter()
+                            .map(VerifiedChunkPayload::from_verified_store)
+                            .collect()
+                    })
+            },
+        )
     }
 
     fn read_cached<F>(
@@ -431,9 +487,9 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         chunk_id: ChunkId,
         logical_length: u64,
         read_verified: F,
-    ) -> Result<Vec<u8>, StoreError>
+    ) -> Result<VerifiedChunkPayload, StoreError>
     where
-        F: FnOnce() -> Result<Vec<u8>, StoreError>,
+        F: FnOnce() -> Result<VerifiedChunkPayload, StoreError>,
     {
         let Some(cache) = &self.read_cache else {
             return read_verified();
@@ -442,18 +498,72 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             return Ok(bytes);
         }
         let bytes = read_verified()?;
-        cache.admit_verified(chunk_id, logical_length, &bytes);
+        cache.admit_verified(chunk_id, logical_length, bytes.clone());
         Ok(bytes)
     }
 
-    fn read_at_using<F>(
+    fn read_cached_many<F>(
+        &self,
+        requests: &[(ChunkId, u64)],
+        read_verified: F,
+    ) -> Result<Vec<VerifiedChunkPayload>, StoreError>
+    where
+        F: FnOnce(&[(ChunkId, u64)]) -> Result<Vec<VerifiedChunkPayload>, StoreError>,
+    {
+        let Some(cache) = &self.read_cache else {
+            return read_verified(requests);
+        };
+        let mut resolved = Vec::new();
+        resolved
+            .try_reserve_exact(requests.len())
+            .map_err(|_| StoreError::from(std::io::Error::from(std::io::ErrorKind::OutOfMemory)))?;
+        resolved.resize_with(requests.len(), || None);
+        let mut missing = Vec::new();
+        let mut missing_ordinals = Vec::new();
+        missing
+            .try_reserve_exact(requests.len())
+            .map_err(|_| StoreError::from(std::io::Error::from(std::io::ErrorKind::OutOfMemory)))?;
+        missing_ordinals
+            .try_reserve_exact(requests.len())
+            .map_err(|_| StoreError::from(std::io::Error::from(std::io::ErrorKind::OutOfMemory)))?;
+        for (ordinal, &(chunk_id, logical_length)) in requests.iter().enumerate() {
+            if let Some(bytes) = cache.get(chunk_id, logical_length) {
+                resolved[ordinal] = Some(bytes);
+            } else {
+                missing.push((chunk_id, logical_length));
+                missing_ordinals.push(ordinal);
+            }
+        }
+        if !missing.is_empty() {
+            let payloads = read_verified(&missing)?;
+            assert_eq!(
+                payloads.len(),
+                missing.len(),
+                "ASSERT: a verified Read Plan returns one payload per request"
+            );
+            for ((ordinal, (chunk_id, logical_length)), payload) in
+                missing_ordinals.into_iter().zip(missing).zip(payloads)
+            {
+                cache.admit_verified(chunk_id, logical_length, payload.clone());
+                resolved[ordinal] = Some(payload);
+            }
+        }
+        Ok(resolved
+            .into_iter()
+            .map(|payload| payload.expect("ASSERT: every cache request resolved or returned"))
+            .collect())
+    }
+
+    fn read_at_using<F, G>(
         &self,
         offset: u64,
         length: u32,
         mut read_chunk: F,
+        read_chunks: G,
     ) -> Result<Vec<u8>, ManifestReadError>
     where
-        F: FnMut(ChunkId, u64) -> Result<Vec<u8>, StoreError>,
+        F: FnMut(ChunkId, u64) -> Result<VerifiedChunkPayload, StoreError>,
+        G: FnOnce(&[(ChunkId, u64)]) -> Result<Vec<VerifiedChunkPayload>, StoreError>,
     {
         if length > MAX_MANIFEST_READ_BYTES {
             return Err(ManifestReadError::RequestTooLarge(length));
@@ -464,78 +574,169 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         let read_end = offset
             .saturating_add(u64::from(length))
             .min(self.logical_size());
-        let output_length = usize::try_from(read_end - offset)
-            .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(output_length)
-            .map_err(|_| ManifestReadError::OutOfMemory)?;
-        output.resize(output_length, 0);
-
         let extents = self.recipe.read_range(offset, read_end - offset)?;
-        let mut covered_until = offset;
-        for located in &extents {
-            let extent = located.extent();
-            let extent_start = located.logical_offset();
-            let extent_length = extent_logical_length(extent);
-            let extent_end = extent_start
-                .checked_add(extent_length)
-                .ok_or(ManifestReadError::ArithmeticOverflow)?;
-            let copy_start = extent_start.max(offset);
-            let copy_end = extent_end.min(read_end);
-            assert_eq!(
-                copy_start, covered_until,
-                "ASSERT: validated Manifest extents must cover reads without gaps"
+        let data_extent_count = extents
+            .iter()
+            .filter(|located| {
+                matches!(
+                    located.extent(),
+                    ManifestExtent::Data { .. } | ManifestExtent::DataSlice { .. }
+                )
+            })
+            .count();
+        if data_extent_count < 2 {
+            return assemble_manifest_read(
+                offset,
+                read_end,
+                &extents,
+                |chunk_id, logical_length| {
+                    self.read_cached(chunk_id, logical_length, || {
+                        read_chunk(chunk_id, logical_length)
+                    })
+                },
             );
-            let target_start = usize::try_from(copy_start - offset)
-                .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
-            let target_end = usize::try_from(copy_end - offset)
-                .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
-            match *extent {
-                ManifestExtent::Hole { .. } => {}
-                ManifestExtent::Fill { value, .. } => {
-                    output[target_start..target_end].fill(value);
-                }
+        }
+
+        let mut requests = Vec::new();
+        requests
+            .try_reserve_exact(data_extent_count)
+            .map_err(|_| ManifestReadError::OutOfMemory)?;
+        for located in &extents {
+            match *located.extent() {
                 ManifestExtent::Data {
                     logical_length,
                     chunk_id,
-                } => {
-                    let payload = read_chunk(chunk_id, logical_length)?;
-                    let source_start = usize::try_from(copy_start - extent_start)
-                        .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
-                    let source_end = usize::try_from(copy_end - extent_start)
-                        .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
-                    output[target_start..target_end]
-                        .copy_from_slice(&payload[source_start..source_end]);
-                }
+                } => requests.push((chunk_id, logical_length)),
                 ManifestExtent::DataSlice {
                     chunk_id,
                     chunk_length,
-                    chunk_offset,
                     ..
-                } => {
-                    let payload = read_chunk(chunk_id, u64::from(chunk_length))?;
-                    let source_start =
-                        usize::try_from(u64::from(chunk_offset) + (copy_start - extent_start))
-                            .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
-                    let source_end = source_start
-                        .checked_add(target_end - target_start)
-                        .ok_or(ManifestReadError::ArithmeticOverflow)?;
-                    if source_end > payload.len() {
-                        return Err(ManifestReadError::ArithmeticOverflow);
-                    }
-                    output[target_start..target_end]
-                        .copy_from_slice(&payload[source_start..source_end]);
-                }
+                } => requests.push((chunk_id, u64::from(chunk_length))),
+                ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => {}
             }
-            covered_until = copy_end;
         }
-        assert_eq!(
-            covered_until, read_end,
-            "ASSERT: validated Manifest partition must cover every bounded read"
+        let payloads = self.read_cached_many(&requests, read_chunks)?;
+        let mut payloads = payloads.into_iter();
+        let output =
+            assemble_manifest_read(offset, read_end, &extents, |chunk_id, logical_length| {
+                let payload = payloads
+                    .next()
+                    .expect("ASSERT: every planned DATA extent has one payload");
+                assert_eq!(
+                    ChunkId::of(payload.as_slice()),
+                    chunk_id,
+                    "ASSERT: a verified Read Plan cannot change Chunk identity"
+                );
+                assert_eq!(
+                    u64::try_from(payload.len()),
+                    Ok(logical_length),
+                    "ASSERT: a verified Read Plan cannot change logical length"
+                );
+                Ok(payload)
+            })?;
+        assert!(
+            payloads.next().is_none(),
+            "ASSERT: a verified Read Plan cannot return extra payloads"
         );
         Ok(output)
     }
+}
+
+fn read_chunks_scalar<F>(
+    requests: &[(ChunkId, u64)],
+    mut read_chunk: F,
+) -> Result<Vec<VerifiedChunkPayload>, StoreError>
+where
+    F: FnMut(ChunkId, u64) -> Result<VerifiedChunkPayload, StoreError>,
+{
+    let mut payloads = Vec::new();
+    payloads
+        .try_reserve_exact(requests.len())
+        .map_err(|_| StoreError::from(std::io::Error::from(std::io::ErrorKind::OutOfMemory)))?;
+    for &(chunk_id, logical_length) in requests {
+        payloads.push(read_chunk(chunk_id, logical_length)?);
+    }
+    Ok(payloads)
+}
+
+fn assemble_manifest_read<F>(
+    offset: u64,
+    read_end: u64,
+    extents: &[ManifestRangeExtent],
+    mut read_chunk: F,
+) -> Result<Vec<u8>, ManifestReadError>
+where
+    F: FnMut(ChunkId, u64) -> Result<VerifiedChunkPayload, StoreError>,
+{
+    let output_length =
+        usize::try_from(read_end - offset).map_err(|_| ManifestReadError::ArithmeticOverflow)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_length)
+        .map_err(|_| ManifestReadError::OutOfMemory)?;
+    output.resize(output_length, 0);
+    let mut covered_until = offset;
+    for located in extents {
+        let extent = located.extent();
+        let extent_start = located.logical_offset();
+        let extent_length = extent_logical_length(extent);
+        let extent_end = extent_start
+            .checked_add(extent_length)
+            .ok_or(ManifestReadError::ArithmeticOverflow)?;
+        let copy_start = extent_start.max(offset);
+        let copy_end = extent_end.min(read_end);
+        assert_eq!(
+            copy_start, covered_until,
+            "ASSERT: validated Manifest extents must cover reads without gaps"
+        );
+        let target_start = usize::try_from(copy_start - offset)
+            .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
+        let target_end = usize::try_from(copy_end - offset)
+            .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
+        match *extent {
+            ManifestExtent::Hole { .. } => {}
+            ManifestExtent::Fill { value, .. } => {
+                output[target_start..target_end].fill(value);
+            }
+            ManifestExtent::Data {
+                logical_length,
+                chunk_id,
+            } => {
+                let payload = read_chunk(chunk_id, logical_length)?;
+                let source_start = usize::try_from(copy_start - extent_start)
+                    .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
+                let source_end = usize::try_from(copy_end - extent_start)
+                    .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
+                output[target_start..target_end]
+                    .copy_from_slice(&payload.as_slice()[source_start..source_end]);
+            }
+            ManifestExtent::DataSlice {
+                chunk_id,
+                chunk_length,
+                chunk_offset,
+                ..
+            } => {
+                let payload = read_chunk(chunk_id, u64::from(chunk_length))?;
+                let source_start =
+                    usize::try_from(u64::from(chunk_offset) + (copy_start - extent_start))
+                        .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
+                let source_end = source_start
+                    .checked_add(target_end - target_start)
+                    .ok_or(ManifestReadError::ArithmeticOverflow)?;
+                if source_end > payload.len() {
+                    return Err(ManifestReadError::ArithmeticOverflow);
+                }
+                output[target_start..target_end]
+                    .copy_from_slice(&payload.as_slice()[source_start..source_end]);
+            }
+        }
+        covered_until = copy_end;
+    }
+    assert_eq!(
+        covered_until, read_end,
+        "ASSERT: validated Manifest partition must cover every bounded read"
+    );
+    Ok(output)
 }
 
 #[derive(Debug)]

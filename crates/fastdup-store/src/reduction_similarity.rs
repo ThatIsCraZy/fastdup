@@ -57,9 +57,13 @@ impl SimilarityFingerprint {
     /// Local edits affect the rolling shingles and bounded minimizer spans
     /// that cover them rather than mixing every later byte into one state.
     pub(crate) fn v1(bytes: &[u8]) -> Result<Self, SimilarityError> {
+        Self::v1_with_vector(bytes, crate::similarity_simd::available())
+    }
+
+    fn v1_with_vector(bytes: &[u8], vector_votes: bool) -> Result<Self, SimilarityError> {
         validate_chunk_length(bytes.len())?;
 
-        let mut accumulator = FingerprintAccumulator::new();
+        let mut accumulator = FingerprintAccumulator::new(vector_votes);
         if bytes.len() < SHINGLE_BYTES {
             let mut shingle = 0_u64;
             for &byte in bytes {
@@ -141,16 +145,18 @@ struct FingerprintAccumulator {
     span_minimum: u64,
     span_length: usize,
     minimizer_count: usize,
+    vector_votes: bool,
 }
 
 impl FingerprintAccumulator {
-    const fn new() -> Self {
+    const fn new(vector_votes: bool) -> Self {
         Self {
             superfeatures: [u64::MAX; 4],
             sketch_votes: [0; 512],
             span_minimum: u64::MAX,
             span_length: 0,
             minimizer_count: 0,
+            vector_votes,
         }
     }
 
@@ -171,14 +177,18 @@ impl FingerprintAccumulator {
         for (slot, seed) in self.superfeatures.iter_mut().zip(SUPERFEATURE_SEEDS) {
             *slot = (*slot).min(mix64(minimizer ^ seed));
         }
-        for (word_index, seed) in SKETCH_SEEDS.into_iter().enumerate() {
-            let word = mix64(minimizer ^ seed);
-            let votes = &mut self.sketch_votes[word_index * 64..(word_index + 1) * 64];
-            for (bit, vote) in votes.iter_mut().enumerate() {
-                if word & (1_u64 << bit) == 0 {
-                    *vote -= 1;
-                } else {
-                    *vote += 1;
+        let words = SKETCH_SEEDS.map(|seed| mix64(minimizer ^ seed));
+        if self.vector_votes {
+            crate::similarity_simd::update_votes(&mut self.sketch_votes, words);
+        } else {
+            for (word_index, word) in words.into_iter().enumerate() {
+                let votes = &mut self.sketch_votes[word_index * 64..(word_index + 1) * 64];
+                for (bit, vote) in votes.iter_mut().enumerate() {
+                    if word & (1_u64 << bit) == 0 {
+                        *vote -= 1;
+                    } else {
+                        *vote += 1;
+                    }
                 }
             }
         }
@@ -1221,8 +1231,20 @@ fn validate_logical_length(length: u32) -> Result<(), SimilarityError> {
     Ok(())
 }
 
+const BYTE_HASHES: [u64; 256] = build_byte_hashes();
+
+const fn build_byte_hashes() -> [u64; 256] {
+    let mut hashes = [0_u64; 256];
+    let mut byte = 0_usize;
+    while byte < hashes.len() {
+        hashes[byte] = mix64(BYTE_HASH_SEED ^ byte as u64);
+        byte += 1;
+    }
+    hashes
+}
+
 fn byte_hash(byte: u8) -> u64 {
-    mix64(BYTE_HASH_SEED ^ u64::from(byte))
+    BYTE_HASHES[usize::from(byte)]
 }
 
 const fn mix64(mut value: u64) -> u64 {
@@ -1235,6 +1257,9 @@ const fn mix64(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
     use super::*;
 
     #[test]
@@ -1266,6 +1291,77 @@ mod tests {
             ]
         );
         assert_eq!(fingerprint.distance(fingerprint), Ok(0));
+    }
+
+    #[test]
+    fn byte_hash_table_and_avx2_votes_match_the_scalar_profile_oracle() {
+        for byte in 0_u8..=u8::MAX {
+            assert_eq!(byte_hash(byte), mix64(BYTE_HASH_SEED ^ u64::from(byte)));
+        }
+        if !crate::similarity_simd::available() {
+            return;
+        }
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for length in [1, 31, 32, 33, 95, 96, 97, 4_096, 65_536, 262_144] {
+            let mut bytes = Vec::with_capacity(length);
+            for _ in 0..length {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                bytes.push(state.to_le_bytes()[0]);
+            }
+            assert_eq!(
+                SimilarityFingerprint::v1_with_vector(&bytes, true),
+                SimilarityFingerprint::v1_with_vector(&bytes, false),
+                "AVX2 votes changed profile v1 at length {length}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode Similarity fingerprint microbenchmark"]
+    fn similarity_fingerprint_scalar_and_avx2_microbenchmark() {
+        if !crate::similarity_simd::available() {
+            eprintln!("AVX2 unavailable on this x86-64 host");
+            return;
+        }
+        let bytes = fixture_bytes(256 * 1_024, 0x5a17_2026_0827);
+        let rounds = 16_u32;
+        let samples = 7_usize;
+        let measure = |vector_votes| {
+            let started = Instant::now();
+            for _ in 0..rounds {
+                black_box(
+                    SimilarityFingerprint::v1_with_vector(black_box(&bytes), vector_votes)
+                        .expect("benchmark fixture is valid"),
+                );
+            }
+            started.elapsed()
+        };
+        let mut scalar_samples = Vec::with_capacity(samples);
+        let mut avx2_samples = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            if sample % 2 == 0 {
+                scalar_samples.push(measure(false));
+                avx2_samples.push(measure(true));
+            } else {
+                avx2_samples.push(measure(true));
+                scalar_samples.push(measure(false));
+            }
+        }
+        scalar_samples.sort_unstable();
+        avx2_samples.sort_unstable();
+        let scalar = scalar_samples[samples / 2];
+        let avx2 = avx2_samples[samples / 2];
+        let logical_bytes = f64::from(rounds)
+            * f64::from(u32::try_from(bytes.len()).expect("benchmark Chunk length fits u32"));
+        println!(
+            "similarity_fingerprint median_samples={samples} scalar_ns_per_byte={:.3} avx2_ns_per_byte={:.3} speedup={:.3}x",
+            scalar.as_secs_f64() * 1_000_000_000.0 / logical_bytes,
+            avx2.as_secs_f64() * 1_000_000_000.0 / logical_bytes,
+            scalar.as_secs_f64() / avx2.as_secs_f64(),
+        );
     }
 
     #[test]

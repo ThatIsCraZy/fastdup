@@ -38,8 +38,14 @@ adapter's one-megabyte limit are assembled from bounded chunks.
 
 The ingest hot loop performs no additional hash, filter probe, payload scan,
 I/O, allocation, or lock acquisition. A tested Header/Footer digest and 3-KiB
-membership filter were removed before release after real SingleStream SMB runs
-showed checkpoint-boundary amplification despite small isolated costs.
+membership filter remain excluded. The initial SingleStream result against
+those fields was invalidated after a shared-cgroup Swap charge was found to
+close every rebuildable cache. Repeating the evolving-family GC experiment
+with the corrected governor and this bounded v2 resolver reduced the
+Prefix/Off GC ratio from 3.424x to 1.306x. An isolated provider probe found that
+the filter could avoid at most 1.47% of one complete verification pass's bytes.
+That acceleration does not justify an incompatible durable format; see
+`docs/benchmarks/container-format-v3-gc-reevaluation-2026-08-27.md`.
 
 Tests cover envelope/index/record verification, corrupt Index CRCs, one
 namespace enumeration per dependent Container, and repeated-Base caching.

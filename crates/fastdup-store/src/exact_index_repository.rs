@@ -2027,9 +2027,30 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
         logical_length: u32,
     ) -> Result<ExactIndexLookup, ExactIndexStoreError> {
         let mut candidates = Vec::new();
-        candidates
-            .try_reserve_exact(MAX_EXACT_LOOKUP_CANDIDATES)
-            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        let complete = self.lookup_transitions_into(chunk_id, logical_length, &mut candidates)?;
+        Ok(ExactIndexLookup {
+            candidates,
+            complete,
+        })
+    }
+
+    /// Reuses caller-owned candidate storage for one bounded lookup.
+    ///
+    /// The buffer is cleared before use and retains its capacity afterwards,
+    /// allowing one frontend Read Plan to resolve many logical Chunks without
+    /// one allocation per key.
+    pub(crate) fn lookup_transitions_into(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u32,
+        candidates: &mut Vec<ExactIndexEntry>,
+    ) -> Result<bool, ExactIndexStoreError> {
+        candidates.clear();
+        if candidates.capacity() < MAX_EXACT_LOOKUP_CANDIDATES {
+            candidates
+                .try_reserve_exact(MAX_EXACT_LOOKUP_CANDIDATES)
+                .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        }
         let mut complete = true;
         for family in &self.lookup_families {
             let partition_ordinal = family
@@ -2042,28 +2063,17 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
             if chunk_id < run_ref.minimum_chunk_id() {
                 continue;
             }
-            let lookup = self.readers[index].lookup(chunk_id, logical_length)?;
-            complete &= lookup.complete();
-            let remaining = MAX_EXACT_LOOKUP_CANDIDATES - candidates.len();
-            if lookup.candidates().len() > remaining {
-                candidates.extend_from_slice(&lookup.candidates()[..remaining]);
-                return Ok(ExactIndexLookup {
-                    candidates,
-                    complete: false,
-                });
-            }
-            candidates.extend_from_slice(lookup.candidates());
+            complete &= self.readers[index].lookup_into(
+                chunk_id,
+                logical_length,
+                candidates,
+                MAX_EXACT_LOOKUP_CANDIDATES,
+            )?;
             if candidates.len() == MAX_EXACT_LOOKUP_CANDIDATES {
-                return Ok(ExactIndexLookup {
-                    candidates,
-                    complete: false,
-                });
+                return Ok(false);
             }
         }
-        Ok(ExactIndexLookup {
-            candidates,
-            complete,
-        })
+        Ok(complete)
     }
 }
 
@@ -2906,6 +2916,29 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         chunk_id: ChunkId,
         logical_length: u32,
     ) -> Result<ExactIndexLookup, ExactIndexStoreError> {
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(MAX_EXACT_LOOKUP_CANDIDATES)
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        let complete = self.lookup_into(
+            chunk_id,
+            logical_length,
+            &mut candidates,
+            MAX_EXACT_LOOKUP_CANDIDATES,
+        )?;
+        Ok(ExactIndexLookup {
+            candidates,
+            complete,
+        })
+    }
+
+    fn lookup_into(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u32,
+        candidates: &mut Vec<ExactIndexEntry>,
+        maximum_candidates: usize,
+    ) -> Result<bool, ExactIndexStoreError> {
         if let Some(membership) = &self.membership {
             self.membership_counters
                 .probes
@@ -2919,10 +2952,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
                     self.membership_counters
                         .definitely_absent
                         .fetch_add(1, AtomicOrdering::Relaxed);
-                    return Ok(ExactIndexLookup {
-                        candidates: Vec::new(),
-                        complete: true,
-                    });
+                    return Ok(true);
                 }
                 BloomLookupHint::RequiresExactLookup => {
                     self.membership_counters
@@ -2942,50 +2972,31 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
             }
         }
 
-        let mut candidates = Vec::new();
         let mut page_ordinal = lower;
         while page_ordinal < self.descriptor.page_count() {
             let page = self.read_page(page_ordinal)?;
             let matches = page.candidates(chunk_id, logical_length);
             if matches.is_empty() {
-                return Ok(ExactIndexLookup {
-                    candidates,
-                    complete: true,
-                });
+                return Ok(true);
             }
-            let remaining = MAX_EXACT_LOOKUP_CANDIDATES - candidates.len();
+            let remaining = maximum_candidates.saturating_sub(candidates.len());
             let accepted = matches.len().min(remaining);
-            candidates
-                .try_reserve_exact(accepted)
-                .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
             candidates.extend_from_slice(&matches[..accepted]);
             let key_reaches_page_end = page.entries().last().is_some_and(|entry| {
                 entry.chunk_id() == chunk_id && entry.logical_length() == logical_length
             });
             if matches.len() > remaining {
-                return Ok(ExactIndexLookup {
-                    candidates,
-                    complete: false,
-                });
+                return Ok(false);
             }
             if !key_reaches_page_end || page_ordinal + 1 == self.descriptor.page_count() {
-                return Ok(ExactIndexLookup {
-                    candidates,
-                    complete: true,
-                });
+                return Ok(true);
             }
-            if candidates.len() == MAX_EXACT_LOOKUP_CANDIDATES {
-                return Ok(ExactIndexLookup {
-                    candidates,
-                    complete: false,
-                });
+            if candidates.len() == maximum_candidates {
+                return Ok(false);
             }
             page_ordinal += 1;
         }
-        Ok(ExactIndexLookup {
-            candidates,
-            complete: true,
-        })
+        Ok(true)
     }
 
     fn read_page(&self, page_ordinal: usize) -> Result<Arc<ExactIndexPage>, ExactIndexStoreError> {

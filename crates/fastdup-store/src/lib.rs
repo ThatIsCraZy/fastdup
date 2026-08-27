@@ -30,6 +30,7 @@ mod seqcdc;
 mod similarity_external_sort;
 mod similarity_index_repository;
 mod similarity_mmap;
+mod similarity_simd;
 pub use fastdup_format::{SimilarityIndexPartitionRef, SimilarityIndexRunFamily};
 pub use similarity_external_sort::SIMILARITY_PARTITION_TARGET_REFERENCES;
 
@@ -1830,6 +1831,15 @@ impl<I: StorageIo> ContainerRepository<I> {
         if candidate.transition() != ExactLocationTransition::Active {
             return Err(StoreError::ExactLocationMismatch);
         }
+        let descriptor = self.read_candidate_descriptor(candidate)?;
+        let encoded_record = self.read_candidate_record_with_descriptor(candidate, descriptor)?;
+        Ok((descriptor, encoded_record))
+    }
+
+    fn read_candidate_descriptor(
+        &self,
+        candidate: ExactIndexEntry,
+    ) -> Result<SealedContainerDescriptor, StoreError> {
         let location = candidate.location();
         let name = published_name(location.container_id());
         let descriptor = if let Some(descriptor) = self.descriptors.get(location.container_id()) {
@@ -1861,13 +1871,33 @@ impl<I: StorageIo> ContainerRepository<I> {
             self.descriptors.insert(location.container_id(), descriptor);
             descriptor
         };
+        Ok(descriptor)
+    }
+
+    fn read_candidate_record_with_descriptor(
+        &self,
+        candidate: ExactIndexEntry,
+        descriptor: SealedContainerDescriptor,
+    ) -> Result<Vec<u8>, StoreError> {
+        if candidate.transition() != ExactLocationTransition::Active {
+            return Err(StoreError::ExactLocationMismatch);
+        }
+        let location = candidate.location();
+        if descriptor.container_id() != location.container_id()
+            || descriptor.container_generation() != location.container_generation()
+        {
+            return Err(StoreError::ExactLocationMismatch);
+        }
         let range = descriptor
             .record_range(candidate)
             .map_err(map_exact_location_error)?;
-        let encoded_record = self
-            .storage
-            .read_exact_at(&name, range.offset(), range.length())?;
-        Ok((descriptor, encoded_record))
+        self.storage
+            .read_exact_at(
+                &published_name(location.container_id()),
+                range.offset(),
+                range.length(),
+            )
+            .map_err(StoreError::from)
     }
 
     /// Attempts one bounded persistent Exact-Index lookup without falling back
@@ -2064,6 +2094,231 @@ impl<I: StorageIo> ContainerRepository<I> {
             return Ok(bytes);
         }
         self.read_verified_chunk(chunk_id, logical_length)
+    }
+
+    /// Resolves one bounded logical read as a physical Record plan.
+    ///
+    /// Independent Chunks whose preferred ACTIVE Exact Locations name the
+    /// same immutable Encoding Record share one range read. Record groups are
+    /// visited in Container/offset order, while returned payloads retain the
+    /// caller's logical order. Any unusable preferred candidate falls back to
+    /// the ordinary bounded candidate and verified-scan path for that Chunk.
+    ///
+    /// A one-Chunk request takes the scalar path without constructing a plan.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn read_verified_chunks_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        requests: &[(fastdup_format::ChunkId, u64)],
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        if requests.len() == 1 {
+            let (chunk_id, logical_length) = requests[0];
+            return self
+                .read_verified_chunk_with_index(index, chunk_id, logical_length)
+                .map(|bytes| vec![bytes]);
+        }
+        let mut resolved = Vec::new();
+        resolved
+            .try_reserve_exact(requests.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        resolved.resize_with(requests.len(), || None);
+        let mut planned = Vec::<(([u8; 16], u64, u64, u32), usize, ExactIndexEntry)>::new();
+        planned
+            .try_reserve_exact(requests.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let mut active_candidates = Vec::new();
+        active_candidates
+            .try_reserve_exact(requests.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        active_candidates.resize(requests.len(), [None::<ExactIndexEntry>; 2]);
+        let mut lookup_order = Vec::new();
+        lookup_order
+            .try_reserve_exact(requests.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        lookup_order.extend(0..requests.len());
+        lookup_order.sort_unstable_by_key(|&ordinal| {
+            let (chunk_id, logical_length) = requests[ordinal];
+            (chunk_id, logical_length, ordinal)
+        });
+        let mut lookup_scratch = Vec::new();
+        let mut last_lookup = None::<(fastdup_format::ChunkId, u32, [Option<ExactIndexEntry>; 2])>;
+
+        for request_ordinal in lookup_order {
+            let (chunk_id, logical_length) = requests[request_ordinal];
+            let Ok(index_length) = u32::try_from(logical_length) else {
+                continue;
+            };
+            if let Some((previous_id, previous_length, previous_candidates)) = last_lookup
+                && previous_id == chunk_id
+                && previous_length == index_length
+            {
+                active_candidates[request_ordinal] = previous_candidates;
+                continue;
+            }
+            if index
+                .lookup_transitions_into(chunk_id, index_length, &mut lookup_scratch)
+                .is_err()
+            {
+                continue;
+            }
+            let mut seen_locations: [Option<ExactIndexLocation>; MAX_EXACT_LOOKUP_CANDIDATES] =
+                [None; MAX_EXACT_LOOKUP_CANDIDATES];
+            let mut seen_count = 0_usize;
+            let mut active = [None::<ExactIndexEntry>; 2];
+            let mut active_count = 0_usize;
+            for candidate in lookup_scratch.iter().copied() {
+                assert_eq!(
+                    candidate.chunk_id(),
+                    chunk_id,
+                    "ASSERT: Exact Index lookup returned a different Chunk ID"
+                );
+                assert_eq!(
+                    candidate.logical_length(),
+                    index_length,
+                    "ASSERT: Exact Index lookup returned a different logical length"
+                );
+                let location = candidate.location();
+                if seen_locations[..seen_count].contains(&Some(location)) {
+                    continue;
+                }
+                assert!(
+                    seen_count < seen_locations.len(),
+                    "ASSERT: bounded lookup returned more candidates than its hard limit"
+                );
+                seen_locations[seen_count] = Some(location);
+                seen_count += 1;
+                if candidate.transition() == ExactLocationTransition::Active {
+                    active[active_count] = Some(candidate);
+                    active_count += 1;
+                    if active_count == active.len() {
+                        break;
+                    }
+                }
+            }
+            active_candidates[request_ordinal] = active;
+            last_lookup = Some((chunk_id, index_length, active));
+        }
+
+        let mut previous_location = None::<ExactIndexLocation>;
+
+        for (request_ordinal, active) in active_candidates.iter().copied().enumerate() {
+            let active_count = active.iter().flatten().count();
+            let Some(mut candidate) = active[0] else {
+                continue;
+            };
+            if let Some(previous) = previous_location {
+                candidate = active[..active_count]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .enumerate()
+                    .min_by_key(|(ordinal, candidate)| {
+                        let location = candidate.location();
+                        let same_container = location.container_id() == previous.container_id()
+                            && location.container_generation() == previous.container_generation();
+                        let direction = usize::from(
+                            !same_container || location.record_offset() < previous.record_offset(),
+                        );
+                        let distance = if same_container {
+                            location.record_offset().abs_diff(previous.record_offset())
+                        } else {
+                            u64::MAX
+                        };
+                        (usize::from(!same_container), direction, distance, *ordinal)
+                    })
+                    .map(|(_, candidate)| candidate)
+                    .expect("ASSERT: one ACTIVE candidate was established");
+            }
+            let location = candidate.location();
+            if location.dependency_id() != [0; 32] {
+                continue;
+            }
+            previous_location = Some(location);
+            let key = (
+                location.container_id().bytes(),
+                location.container_generation(),
+                location.record_offset(),
+                location.record_length(),
+            );
+            planned.push((key, request_ordinal, candidate));
+        }
+
+        planned.sort_unstable_by_key(|&(key, request_ordinal, _)| (key, request_ordinal));
+        let mut group_start = 0_usize;
+        let mut exact_candidates = Vec::new();
+        let mut current_descriptor = None::<([u8; 16], u64, SealedContainerDescriptor)>;
+        while group_start < planned.len() {
+            let key = planned[group_start].0;
+            let group_end = group_start
+                + planned[group_start..]
+                    .iter()
+                    .take_while(|(candidate_key, _, _)| *candidate_key == key)
+                    .count();
+            let candidates = &planned[group_start..group_end];
+            let Some(&(_, _, first)) = candidates.first() else {
+                unreachable!("ASSERT: a planned Record group is nonempty")
+            };
+            let location = first.location();
+            let descriptor_key = (
+                location.container_id().bytes(),
+                location.container_generation(),
+            );
+            let descriptor =
+                if let Some((container_id, generation, descriptor)) = current_descriptor {
+                    if (container_id, generation) == descriptor_key {
+                        descriptor
+                    } else {
+                        let Ok(descriptor) = self.read_candidate_descriptor(first) else {
+                            group_start = group_end;
+                            continue;
+                        };
+                        current_descriptor = Some((descriptor_key.0, descriptor_key.1, descriptor));
+                        descriptor
+                    }
+                } else {
+                    let Ok(descriptor) = self.read_candidate_descriptor(first) else {
+                        group_start = group_end;
+                        continue;
+                    };
+                    current_descriptor = Some((descriptor_key.0, descriptor_key.1, descriptor));
+                    descriptor
+                };
+            let Ok(encoded_record) = self.read_candidate_record_with_descriptor(first, descriptor)
+            else {
+                group_start = group_end;
+                continue;
+            };
+            exact_candidates.clear();
+            exact_candidates
+                .try_reserve(candidates.len())
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            exact_candidates.extend(candidates.iter().map(|(_, _, candidate)| *candidate));
+            let Ok(records) = descriptor.decode_candidates(&exact_candidates, &encoded_record)
+            else {
+                group_start = group_end;
+                continue;
+            };
+            assert_eq!(
+                records.len(),
+                candidates.len(),
+                "ASSERT: a verified Record group returns one Chunk per candidate"
+            );
+            for (&(_, request_ordinal, _), record) in candidates.iter().zip(records) {
+                resolved[request_ordinal] = Some(record.into_payload());
+            }
+            group_start = group_end;
+        }
+
+        for (request_ordinal, &(chunk_id, logical_length)) in requests.iter().enumerate() {
+            if resolved[request_ordinal].is_none() {
+                resolved[request_ordinal] =
+                    Some(self.read_verified_chunk_with_index(index, chunk_id, logical_length)?);
+            }
+        }
+        Ok(resolved
+            .into_iter()
+            .map(|payload| payload.expect("ASSERT: every planned Chunk resolved or returned"))
+            .collect())
     }
 
     /// Discovers published names and verifies every complete container.

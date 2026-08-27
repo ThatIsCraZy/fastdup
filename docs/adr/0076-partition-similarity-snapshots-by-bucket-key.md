@@ -4,6 +4,10 @@ status: accepted
 
 # Partition Similarity snapshots by complete BucketKey ranges
 
+This record was originally committed under the already occupied number 0046.
+It was renumbered to 0076 during the 2026-08-27 ADR audit; the decision and its
+chronology are unchanged.
+
 One logical Similarity generation is represented by one or more immutable
 physical Runs plus one small family manifest. Physical partitions own complete,
 strictly disjoint `BucketKey` ranges. A bucket is never split. The family

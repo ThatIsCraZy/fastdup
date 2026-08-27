@@ -4,6 +4,11 @@ status: accepted
 
 # Compose successor DATA proofs from the installed generation
 
+Current-state note (2026-08-27): the successor-proof decision remains current.
+ADR 0054 replaced FastCDC with SeqCDC, ADR 0051 replaced the historical LRU
+with S3-FIFO, and ADR 0069 implemented the Appliance Lease described below as
+deferred.
+
 Normal in-process commits form a Successor Graph Proof: unchanged Manifest
 extents retain the complete DATA proof of the immediately preceding verified
 and installed generation, while every newly introduced Chunk dependency is

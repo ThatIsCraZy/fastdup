@@ -2,6 +2,9 @@
 
 //! Explicit, versioned serialization for fastdup durable objects.
 
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("fastdup supports only 64-bit x86 (x86-64) targets; see ADR 0078");
+
 mod commit;
 mod container;
 mod container_generation_high_water;

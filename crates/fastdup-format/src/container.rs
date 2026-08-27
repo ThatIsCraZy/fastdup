@@ -609,56 +609,112 @@ impl SealedContainerDescriptor {
         candidate: ExactIndexEntry,
         record_bytes: &[u8],
     ) -> Result<RawRecord, FormatError> {
-        let range = self.record_range(candidate)?;
-        let location = candidate.location();
+        let mut records = self.decode_candidates(&[candidate], record_bytes)?;
+        records.pop().ok_or(FormatError::ExactLocationMismatch)
+    }
+
+    /// Fully validates several Exact candidates naming one independent
+    /// Encoding Record while decoding that Record only once.
+    ///
+    /// Returned Chunks retain candidate order. Repeated candidates may clone
+    /// only their already verified logical payload; ordinary distinct Chunk
+    /// ordinals transfer ownership directly from the one decoded Record.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structural, coordinate, checksum, codec, Chunk-ID, and
+    /// length failures as [`Self::decode_candidate`]. Every candidate must name
+    /// the exact same physical Record and no partial result is returned.
+    pub fn decode_candidates(
+        self,
+        candidates: &[ExactIndexEntry],
+        record_bytes: &[u8],
+    ) -> Result<Vec<RawRecord>, FormatError> {
+        let Some(&first) = candidates.first() else {
+            return Ok(Vec::new());
+        };
+        let range = self.record_range(first)?;
+        let first_location = first.location();
         if record_bytes.len() != range.length
-            || get_u16(record_bytes, 12) != location.codec_id()
-            || get_u32(record_bytes, 32) != location.record_length()
-            || get_u32(record_bytes, 36) != location.record_decoded_length()
-            || get_u32(record_bytes, 44) != location.record_payload_length()
-            || get_u32(record_bytes, RECORD_CRC_OFFSET) != location.record_crc32c()
+            || get_u16(record_bytes, 12) != first_location.codec_id()
+            || get_u32(record_bytes, 32) != first_location.record_length()
+            || get_u32(record_bytes, 36) != first_location.record_decoded_length()
+            || get_u32(record_bytes, 44) != first_location.record_payload_length()
+            || get_u32(record_bytes, RECORD_CRC_OFFSET) != first_location.record_crc32c()
         {
             return Err(FormatError::ExactLocationMismatch);
+        }
+        if first_location.codec_id() == ZSTD_PREFIX_CODEC {
+            return Err(FormatError::ZstdPrefixBaseRequired);
         }
         let chunk_count = usize::try_from(get_u32(record_bytes, 56))
             .map_err(|_| FormatError::ArithmeticOverflow)?;
-        let ordinal = usize::try_from(location.chunk_ordinal())
+        let mut ordinals = Vec::new();
+        ordinals
+            .try_reserve_exact(candidates.len())
             .map_err(|_| FormatError::ArithmeticOverflow)?;
-        if ordinal >= chunk_count {
-            return Err(FormatError::ExactLocationMismatch);
+        for &candidate in candidates {
+            if self.record_range(candidate)? != range {
+                return Err(FormatError::ExactLocationMismatch);
+            }
+            let location = candidate.location();
+            if location.codec_id() != first_location.codec_id()
+                || location.record_decoded_length() != first_location.record_decoded_length()
+                || location.record_payload_length() != first_location.record_payload_length()
+                || location.record_crc32c() != first_location.record_crc32c()
+                || location.dependency_id() != [0; 32]
+            {
+                return Err(FormatError::ExactLocationMismatch);
+            }
+            let ordinal = usize::try_from(location.chunk_ordinal())
+                .map_err(|_| FormatError::ArithmeticOverflow)?;
+            if ordinal >= chunk_count {
+                return Err(FormatError::ExactLocationMismatch);
+            }
+            let table_offset = RECORD_HEADER_BYTES
+                .checked_add(
+                    ordinal
+                        .checked_mul(CHUNK_TABLE_ENTRY_BYTES)
+                        .ok_or(FormatError::ArithmeticOverflow)?,
+                )
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            let table_end = table_offset
+                .checked_add(CHUNK_TABLE_ENTRY_BYTES)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            if table_end > record_bytes.len()
+                || record_bytes[table_offset..table_offset + 32] != candidate.chunk_id().bytes()
+                || get_u32(record_bytes, table_offset + 32) != location.decoded_offset()
+                || get_u32(record_bytes, table_offset + 36) != candidate.logical_length()
+            {
+                return Err(FormatError::ExactLocationMismatch);
+            }
+            ordinals.push(ordinal);
         }
-        let table_offset = RECORD_HEADER_BYTES
-            .checked_add(
-                ordinal
-                    .checked_mul(CHUNK_TABLE_ENTRY_BYTES)
-                    .ok_or(FormatError::ArithmeticOverflow)?,
-            )
-            .ok_or(FormatError::ArithmeticOverflow)?;
-        let table_end = table_offset
-            .checked_add(CHUNK_TABLE_ENTRY_BYTES)
-            .ok_or(FormatError::ArithmeticOverflow)?;
-        if table_end > record_bytes.len()
-            || record_bytes[table_offset..table_offset + 32] != candidate.chunk_id().bytes()
-            || get_u32(record_bytes, table_offset + 32) != location.decoded_offset()
-            || get_u32(record_bytes, table_offset + 36) != candidate.logical_length()
-        {
-            return Err(FormatError::ExactLocationMismatch);
-        }
-        if location.codec_id() == ZSTD_PREFIX_CODEC {
-            return Err(FormatError::ZstdPrefixBaseRequired);
-        }
+
         let decoded = decode_encoding_record(record_bytes)?;
-        let record = decoded
-            .chunks
-            .into_iter()
-            .nth(ordinal)
-            .ok_or(FormatError::ExactLocationMismatch)?;
-        if record.chunk_id() != candidate.chunk_id()
-            || usize::try_from(candidate.logical_length()) != Ok(record.payload().len())
-        {
-            return Err(FormatError::ExactLocationMismatch);
+        let mut available = decoded.chunks.into_iter().map(Some).collect::<Vec<_>>();
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(candidates.len())
+            .map_err(|_| FormatError::ArithmeticOverflow)?;
+        for (&candidate, ordinal) in candidates.iter().zip(ordinals) {
+            let record = if let Some(record) = available[ordinal].take() {
+                record
+            } else {
+                selected
+                    .iter()
+                    .find(|record: &&RawRecord| record.chunk_id() == candidate.chunk_id())
+                    .cloned()
+                    .ok_or(FormatError::ExactLocationMismatch)?
+            };
+            if record.chunk_id() != candidate.chunk_id()
+                || usize::try_from(candidate.logical_length()) != Ok(record.payload().len())
+            {
+                return Err(FormatError::ExactLocationMismatch);
+            }
+            selected.push(record);
         }
-        Ok(record)
+        Ok(selected)
     }
 
     /// Fully validates one codec-3 Exact candidate using its resolved Base.
@@ -3533,6 +3589,11 @@ impl RawRecord {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    #[must_use]
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
     }
 }
 

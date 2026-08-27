@@ -4,6 +4,11 @@ status: accepted
 
 # Bound read amplification and background I/O
 
+Current-state note (2026-08-27): ADR 0077 implements bounded demand Record
+planning and restore-local Location selection. The per-handle speculative
+prefetch described below is not implemented; kernel readahead under ADR 0073
+does not satisfy that separate userspace policy.
+
 Version 1 decodes a complete bounded Compression Region, and at most one
 independent Depth-1 Base, even for a small logical read. A shared cache entry
 becomes visible only after stored CRC, decode, length, and complete Chunk-ID hash

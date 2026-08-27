@@ -192,7 +192,47 @@ struct CacheKey {
 #[derive(Clone, Debug)]
 struct CacheEntry {
     key: CacheKey,
-    bytes: Arc<[u8]>,
+    payload: VerifiedChunkPayload,
+}
+
+/// Shared ownership of one already verified decoded Chunk payload.
+///
+/// The owner adopts a decoder-produced `Vec` without copying its payload.
+/// Clones share those exact bytes until the final Manifest assembly copies the
+/// requested slice into the frontend reply.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct VerifiedChunkPayload(Arc<Vec<u8>>);
+
+impl VerifiedChunkPayload {
+    pub(crate) fn from_verified_store(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(bytes))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    fn allocation_bytes(&self) -> usize {
+        self.0.capacity()
+    }
+
+    #[cfg(test)]
+    fn payload_address(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+}
+
+impl fmt::Debug for VerifiedChunkPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedChunkPayload")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -213,6 +253,24 @@ impl Default for CacheSet {
 #[derive(Debug)]
 struct CacheShardState {
     sets: Box<[CacheSet]>,
+    counters: CacheShardCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CacheShardCounters {
+    hits: u64,
+    misses: u64,
+    admissions: u64,
+    evictions: u64,
+}
+
+impl CacheShardCounters {
+    fn add_assign(&mut self, other: Self) {
+        self.hits = self.hits.saturating_add(other.hits);
+        self.misses = self.misses.saturating_add(other.misses);
+        self.admissions = self.admissions.saturating_add(other.admissions);
+        self.evictions = self.evictions.saturating_add(other.evictions);
+    }
 }
 
 #[repr(C, align(64))]
@@ -236,10 +294,6 @@ pub struct VerifiedReadCache {
     target_bytes: AtomicUsize,
     resident_bytes: AtomicUsize,
     entry_count: AtomicUsize,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    admissions: AtomicU64,
-    evictions: AtomicU64,
     pressure_rejections: AtomicU64,
     oversized_rejections: AtomicU64,
     effective_limit_bytes: AtomicU64,
@@ -332,6 +386,7 @@ impl VerifiedReadCache {
             shards.push(CacheShard {
                 state: Mutex::new(CacheShardState {
                     sets: sets.into_boxed_slice(),
+                    counters: CacheShardCounters::default(),
                 }),
             });
         }
@@ -343,10 +398,6 @@ impl VerifiedReadCache {
             target_bytes: AtomicUsize::new(0),
             resident_bytes: AtomicUsize::new(0),
             entry_count: AtomicUsize::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            admissions: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
             pressure_rejections: AtomicU64::new(0),
             oversized_rejections: AtomicU64::new(0),
             effective_limit_bytes: AtomicU64::new(0),
@@ -407,11 +458,12 @@ impl VerifiedReadCache {
 
     #[must_use]
     pub fn status(&self) -> VerifiedReadCacheStatus {
+        let counters = self.counters();
         VerifiedReadCacheStatus {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            admissions: self.admissions.load(Ordering::Relaxed),
-            evictions: self.evictions.load(Ordering::Relaxed),
+            hits: counters.hits,
+            misses: counters.misses,
+            admissions: counters.admissions,
+            evictions: counters.evictions,
             pressure_rejections: self.pressure_rejections.load(Ordering::Relaxed),
             oversized_rejections: self.oversized_rejections.load(Ordering::Relaxed),
             entry_count: self.entry_count.load(Ordering::Acquire),
@@ -426,7 +478,11 @@ impl VerifiedReadCache {
         }
     }
 
-    pub(crate) fn get(&self, chunk_id: ChunkId, logical_length: u64) -> Option<Vec<u8>> {
+    pub(crate) fn get(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u64,
+    ) -> Option<VerifiedChunkPayload> {
         self.maybe_refresh_pressure();
         let key = CacheKey {
             chunk_id,
@@ -434,34 +490,43 @@ impl VerifiedReadCache {
         };
         let hash = cache_hash(key);
         let shard = &self.shards[hash & (self.shards.len() - 1)];
-        let state = shard
+        let mut state = shard
             .state
             .lock()
             .expect("ASSERT: verified read-cache shard lock poisoned");
         let set_index = (hash / self.shards.len()) % state.sets.len();
-        for entry in state.sets[set_index].ways.iter().flatten() {
-            if entry.key == key {
-                assert_eq!(
-                    u64::try_from(entry.bytes.len()).ok(),
-                    Some(logical_length),
-                    "ASSERT: verified cache entry length changed after admission"
-                );
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Some(entry.bytes.to_vec());
-            }
+        let payload = state.sets[set_index]
+            .ways
+            .iter()
+            .flatten()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.payload.clone());
+        if let Some(payload) = payload {
+            assert_eq!(
+                u64::try_from(payload.len()).ok(),
+                Some(logical_length),
+                "ASSERT: verified cache entry length changed after admission"
+            );
+            state.counters.hits = state.counters.hits.saturating_add(1);
+            return Some(payload);
         }
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        state.counters.misses = state.counters.misses.saturating_add(1);
         None
     }
 
-    pub(crate) fn admit_verified(&self, chunk_id: ChunkId, logical_length: u64, bytes: &[u8]) {
+    pub(crate) fn admit_verified(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u64,
+        payload: VerifiedChunkPayload,
+    ) {
         assert_eq!(
-            u64::try_from(bytes.len()).ok(),
+            u64::try_from(payload.len()).ok(),
             Some(logical_length),
             "ASSERT: Store returned a verified Chunk with the wrong length"
         );
         assert_eq!(
-            ChunkId::of(bytes),
+            ChunkId::of(payload.as_slice()),
             chunk_id,
             "ASSERT: Store returned bytes under the wrong verified Chunk ID"
         );
@@ -475,7 +540,7 @@ impl VerifiedReadCache {
             self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if bytes.len() > target {
+        if payload.allocation_bytes() > target {
             self.oversized_rejections.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -501,26 +566,25 @@ impl VerifiedReadCache {
             .unwrap_or(set.next_victim);
         let victim_bytes = set.ways[victim]
             .as_ref()
-            .map_or(0, |entry| entry.bytes.len());
+            .map_or(0, |entry| entry.payload.allocation_bytes());
         let resident = self.resident_bytes.load(Ordering::Acquire);
         let proposed = resident
             .checked_sub(victim_bytes)
-            .and_then(|remaining| remaining.checked_add(bytes.len()))
+            .and_then(|remaining| remaining.checked_add(payload.allocation_bytes()))
             .expect("ASSERT: verified read-cache resident accounting overflowed");
         if proposed > target {
             self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let bytes: Arc<[u8]> = Arc::from(bytes);
-        let replaced = set.ways[victim].replace(CacheEntry { key, bytes });
+        let replaced = set.ways[victim].replace(CacheEntry { key, payload });
         set.next_victim = (victim + 1) % CACHE_WAYS;
         self.resident_bytes.store(proposed, Ordering::Release);
         if replaced.is_some() {
-            self.evictions.fetch_add(1, Ordering::Relaxed);
+            state.counters.evictions = state.counters.evictions.saturating_add(1);
         } else {
             self.entry_count.fetch_add(1, Ordering::Release);
         }
-        self.admissions.fetch_add(1, Ordering::Relaxed);
+        state.counters.admissions = state.counters.admissions.saturating_add(1);
         assert!(
             proposed <= target,
             "ASSERT: verified read cache exceeded its current payload target"
@@ -561,6 +625,7 @@ impl VerifiedReadCache {
     fn clear_locked(&self) {
         let mut removed = 0_usize;
         for shard in &self.shards {
+            let mut shard_removed = 0_usize;
             let mut state = shard
                 .state
                 .lock()
@@ -568,13 +633,19 @@ impl VerifiedReadCache {
             for set in &mut state.sets {
                 for way in &mut set.ways {
                     if way.take().is_some() {
-                        removed = removed
+                        shard_removed = shard_removed
                             .checked_add(1)
                             .expect("ASSERT: cache entry count cannot overflow");
                     }
                 }
                 set.next_victim = 0;
             }
+            removed = removed
+                .checked_add(shard_removed)
+                .expect("ASSERT: cache entry count cannot overflow");
+            state.counters.evictions = state.counters.evictions.saturating_add(
+                u64::try_from(shard_removed).expect("ASSERT: shard cache entry count fits u64"),
+            );
         }
         let previous_count = self.entry_count.swap(0, Ordering::AcqRel);
         assert_eq!(
@@ -582,10 +653,19 @@ impl VerifiedReadCache {
             "ASSERT: verified read-cache entry accounting disagreed with its shards"
         );
         self.resident_bytes.store(0, Ordering::Release);
-        self.evictions.fetch_add(
-            u64::try_from(removed).expect("ASSERT: cache entry count fits u64"),
-            Ordering::Relaxed,
-        );
+    }
+
+    fn counters(&self) -> CacheShardCounters {
+        self.shards
+            .iter()
+            .fold(CacheShardCounters::default(), |mut total, shard| {
+                let state = shard
+                    .state
+                    .lock()
+                    .expect("ASSERT: verified read-cache shard lock poisoned");
+                total.add_assign(state.counters);
+                total
+            })
     }
 }
 
@@ -662,7 +742,7 @@ mod tests {
             cache.admit_verified(
                 *chunk_id,
                 u64::try_from(bytes.len()).expect("fixture length fits u64"),
-                bytes,
+                VerifiedChunkPayload::from_verified_store(bytes.clone()),
             );
         }
 
@@ -681,9 +761,37 @@ mod tests {
                     *chunk_id,
                     u64::try_from(bytes.len()).expect("fixture length fits u64")
                 ),
-                Some(bytes.clone())
+                Some(VerifiedChunkPayload::from_verified_store(bytes.clone()))
             );
         }
+    }
+
+    #[test]
+    fn admission_and_hit_retain_the_decoder_owned_payload_allocation() {
+        let cache = VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(2 * 1_024 * 1_024, 0, NonZeroUsize::MIN)
+                .expect("valid cache geometry"),
+            MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 8 * 1_024 * 1_024, 0),
+        )
+        .expect("construct ownership cache");
+        let mut bytes = Vec::with_capacity(128 * 1_024);
+        bytes.extend_from_slice(&b"decoder-owned verified payload".repeat(1_024));
+        assert!(bytes.capacity() > bytes.len());
+        let allocation_bytes = bytes.capacity();
+        let address = bytes.as_ptr();
+        let chunk_id = ChunkId::of(&bytes);
+        let logical_length = u64::try_from(bytes.len()).expect("fixture length fits u64");
+        let payload = VerifiedChunkPayload::from_verified_store(bytes);
+        assert_eq!(payload.payload_address(), address);
+
+        cache.admit_verified(chunk_id, logical_length, payload.clone());
+        let hit = cache
+            .get(chunk_id, logical_length)
+            .expect("admitted verified payload is resident");
+
+        assert_eq!(payload.payload_address(), address);
+        assert_eq!(hit.payload_address(), address);
+        assert_eq!(cache.status().resident_bytes(), allocation_bytes);
     }
 
     #[test]

@@ -21,6 +21,24 @@ const _: () =
 #[derive(Debug, Default)]
 struct ShardState {
     entries: HashMap<[u8; 16], SealedContainerDescriptor>,
+    counters: DescriptorShardCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DescriptorShardCounters {
+    hits: u64,
+    misses: u64,
+    admissions: u64,
+    evictions: u64,
+}
+
+impl DescriptorShardCounters {
+    fn add_assign(&mut self, other: Self) {
+        self.hits = self.hits.saturating_add(other.hits);
+        self.misses = self.misses.saturating_add(other.misses);
+        self.admissions = self.admissions.saturating_add(other.admissions);
+        self.evictions = self.evictions.saturating_add(other.evictions);
+    }
 }
 
 #[repr(align(64))]
@@ -41,10 +59,7 @@ pub(crate) struct ContainerDescriptorCache {
     pressure_gate: RwLock<()>,
     target_entries: AtomicUsize,
     entry_count: AtomicUsize,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    admissions: AtomicU64,
-    evictions: AtomicU64,
+    unsharded_misses: AtomicU64,
     pressure_rejections: AtomicU64,
     allocation_rejections: AtomicU64,
     effective_limit_bytes: AtomicU64,
@@ -195,10 +210,7 @@ impl ContainerDescriptorCache {
             pressure_gate: RwLock::new(()),
             target_entries: AtomicUsize::new(0),
             entry_count: AtomicUsize::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            admissions: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
+            unsharded_misses: AtomicU64::new(0),
             pressure_rejections: AtomicU64::new(0),
             allocation_rejections: AtomicU64::new(0),
             effective_limit_bytes: AtomicU64::new(0),
@@ -215,10 +227,10 @@ impl ContainerDescriptorCache {
     pub(crate) fn get(&self, container_id: ContainerId) -> Option<SealedContainerDescriptor> {
         self.maybe_refresh_pressure();
         let Some(shard) = self.shards.get(shard_index(container_id)) else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            self.unsharded_misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let state = shard
+        let mut state = shard
             .state
             .lock()
             .expect("ASSERT: Container descriptor cache shard lock poisoned");
@@ -229,9 +241,9 @@ impl ContainerDescriptorCache {
                 container_id,
                 "ASSERT: cached Container descriptor changed identity"
             );
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            state.counters.hits = state.counters.hits.saturating_add(1);
         } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            state.counters.misses = state.counters.misses.saturating_add(1);
         }
         descriptor
     }
@@ -280,7 +292,7 @@ impl ContainerDescriptorCache {
                 state.entries.remove(&victim).is_some(),
                 "ASSERT: selected descriptor-cache victim must exist"
             );
-            self.evictions.fetch_add(1, Ordering::Relaxed);
+            state.counters.evictions = state.counters.evictions.saturating_add(1);
             self.entry_count.fetch_sub(1, Ordering::Release);
         }
         if state.entries.try_reserve(1).is_err() {
@@ -292,7 +304,7 @@ impl ContainerDescriptorCache {
             "ASSERT: a new descriptor-cache key cannot replace an entry"
         );
         let resident = self.entry_count.fetch_add(1, Ordering::Release) + 1;
-        self.admissions.fetch_add(1, Ordering::Relaxed);
+        state.counters.admissions = state.counters.admissions.saturating_add(1);
         assert!(
             resident <= target,
             "ASSERT: descriptor cache exceeded its distributed target"
@@ -303,11 +315,15 @@ impl ContainerDescriptorCache {
         self.maybe_refresh_pressure();
         let entries = self.entry_count.load(Ordering::Acquire);
         let target = self.target_entries.load(Ordering::Acquire);
+        let mut counters = self.counters();
+        counters.misses = counters
+            .misses
+            .saturating_add(self.unsharded_misses.load(Ordering::Relaxed));
         ContainerDescriptorCacheStatus {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            admissions: self.admissions.load(Ordering::Relaxed),
-            evictions: self.evictions.load(Ordering::Relaxed),
+            hits: counters.hits,
+            misses: counters.misses,
+            admissions: counters.admissions,
+            evictions: counters.evictions,
             pressure_rejections: self.pressure_rejections.load(Ordering::Relaxed),
             allocation_rejections: self.allocation_rejections.load(Ordering::Relaxed),
             capacity: self.hard_capacity_entries(),
@@ -382,20 +398,34 @@ impl ContainerDescriptorCache {
                 .state
                 .lock()
                 .expect("ASSERT: Container descriptor cache shard lock poisoned");
+            let shard_removed = state.entries.len();
             removed = removed
-                .checked_add(state.entries.len())
+                .checked_add(shard_removed)
                 .expect("ASSERT: descriptor cache entry count cannot overflow");
             state.entries = HashMap::new();
+            state.counters.evictions = state.counters.evictions.saturating_add(
+                u64::try_from(shard_removed)
+                    .expect("ASSERT: descriptor shard entry count fits u64"),
+            );
         }
         let accounted = self.entry_count.swap(0, Ordering::AcqRel);
         assert_eq!(
             removed, accounted,
             "ASSERT: descriptor cache entry accounting disagreed with its shards"
         );
-        self.evictions.fetch_add(
-            u64::try_from(removed).expect("ASSERT: descriptor entry count fits u64"),
-            Ordering::Relaxed,
-        );
+    }
+
+    fn counters(&self) -> DescriptorShardCounters {
+        self.shards
+            .iter()
+            .fold(DescriptorShardCounters::default(), |mut total, shard| {
+                let state = shard
+                    .state
+                    .lock()
+                    .expect("ASSERT: Container descriptor cache shard lock poisoned");
+                total.add_assign(state.counters);
+                total
+            })
     }
 
     fn hard_capacity_entries(&self) -> usize {

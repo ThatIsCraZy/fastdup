@@ -4,6 +4,10 @@ status: accepted
 
 # Version writer policy without stranding old data
 
+ADR 0074 supersedes this record's predecessor-Policy migration and read-only
+downgrade scope for the pre-production repository. Object-local decode versions
+and explicit writer-policy identity remain current.
+
 Each commit generation identifies one immutable Policy Set governing new
 chunking, encoding, placement, and maintenance decisions. Durable records retain
 their complete decode profile independently. Runtime feature flags stop writers

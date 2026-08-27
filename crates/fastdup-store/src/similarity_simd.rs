@@ -1,0 +1,89 @@
+//! x86-64 SIMD kernels for deterministic Similarity fingerprinting.
+
+#![allow(unsafe_code)]
+
+#[repr(C, align(32))]
+#[derive(Clone, Copy)]
+struct VoteDeltas([i32; 8]);
+
+#[repr(C, align(32))]
+struct VoteDeltaTable([VoteDeltas; 256]);
+
+const VOTE_DELTAS: VoteDeltaTable = VoteDeltaTable(build_vote_deltas());
+
+const fn build_vote_deltas() -> [VoteDeltas; 256] {
+    let mut table = [VoteDeltas([0; 8]); 256];
+    let mut byte = 0_usize;
+    while byte < table.len() {
+        let mut bit = 0_usize;
+        while bit < 8 {
+            table[byte].0[bit] = if byte & (1 << bit) == 0 { -1 } else { 1 };
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+
+#[must_use]
+pub(crate) fn available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+}
+
+/// Adds the 512 sign votes represented by eight 64-bit words.
+///
+/// The safe seam is callable only after [`available`] selected AVX2. Durable
+/// fingerprint semantics remain defined by the scalar implementation in the
+/// parent module.
+pub(crate) fn update_votes(votes: &mut [i32; 512], words: [u64; 8]) {
+    assert!(
+        available(),
+        "ASSERT: Similarity AVX2 dispatch is feature-gated"
+    );
+    // SAFETY: runtime detection above establishes AVX2. The kernel accesses
+    // exactly 512 initialized i32 votes and immutable aligned table entries.
+    unsafe { update_votes_avx2(votes, words) };
+}
+
+#[target_feature(enable = "avx2")]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn update_votes_avx2(votes: &mut [i32; 512], words: [u64; 8]) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_add_epi32, _mm256_load_si256, _mm256_loadu_si256, _mm256_storeu_si256,
+    };
+
+    for (word_ordinal, word) in words.into_iter().enumerate() {
+        let word_bytes = word.to_le_bytes();
+        for (byte_ordinal, byte) in word_bytes.into_iter().enumerate() {
+            let byte = usize::from(byte);
+            let vote_offset = word_ordinal * 64 + byte_ordinal * 8;
+            // SAFETY: both loop bounds prove the vote range and table entry
+            // contain eight i32 lanes. VoteDeltas is 32-byte aligned.
+            unsafe {
+                let current = _mm256_loadu_si256(votes.as_ptr().add(vote_offset).cast::<__m256i>());
+                let delta = _mm256_load_si256(VOTE_DELTAS.0[byte].0.as_ptr().cast::<__m256i>());
+                _mm256_storeu_si256(
+                    votes.as_mut_ptr().add(vote_offset).cast::<__m256i>(),
+                    _mm256_add_epi32(current, delta),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vote_delta_table_maps_low_to_high_bits_to_minus_or_plus_one() {
+        for byte in 0_u8..=u8::MAX {
+            for bit in 0..8 {
+                assert_eq!(
+                    VOTE_DELTAS.0[usize::from(byte)].0[bit],
+                    if byte & (1 << bit) == 0 { -1 } else { 1 }
+                );
+            }
+        }
+    }
+}

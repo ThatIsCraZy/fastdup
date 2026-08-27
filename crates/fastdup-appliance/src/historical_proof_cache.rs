@@ -195,6 +195,38 @@ struct ShardState {
     ghost_fifo: VecDeque<(u64, u64)>,
     next_ghost_epoch: u64,
     entries: usize,
+    counters: HistoricalShardCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HistoricalShardCounters {
+    hits: u64,
+    misses: u64,
+    admissions: u64,
+    admission_rejections: u64,
+    allocation_rejections: u64,
+    evictions: u64,
+    ghost_hits: u64,
+    maximum_eviction_steps: usize,
+}
+
+impl HistoricalShardCounters {
+    fn add_assign(&mut self, other: Self) {
+        self.hits = self.hits.saturating_add(other.hits);
+        self.misses = self.misses.saturating_add(other.misses);
+        self.admissions = self.admissions.saturating_add(other.admissions);
+        self.admission_rejections = self
+            .admission_rejections
+            .saturating_add(other.admission_rejections);
+        self.allocation_rejections = self
+            .allocation_rejections
+            .saturating_add(other.allocation_rejections);
+        self.evictions = self.evictions.saturating_add(other.evictions);
+        self.ghost_hits = self.ghost_hits.saturating_add(other.ghost_hits);
+        self.maximum_eviction_steps = self
+            .maximum_eviction_steps
+            .max(other.maximum_eviction_steps);
+    }
 }
 
 impl Default for ShardState {
@@ -209,6 +241,7 @@ impl Default for ShardState {
             ghost_fifo: VecDeque::new(),
             next_ghost_epoch: 0,
             entries: 0,
+            counters: HistoricalShardCounters::default(),
         }
     }
 }
@@ -230,14 +263,8 @@ pub(crate) struct HistoricalProofCache {
     pressure_gate: RwLock<()>,
     target_entries: AtomicUsize,
     entry_count: AtomicUsize,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    admissions: AtomicU64,
-    admission_rejections: AtomicU64,
-    allocation_rejections: AtomicU64,
-    evictions: AtomicU64,
-    ghost_hits: AtomicU64,
-    maximum_eviction_steps: AtomicUsize,
+    unsharded_misses: AtomicU64,
+    unsharded_admission_rejections: AtomicU64,
     effective_limit_bytes: AtomicU64,
     available_bytes: AtomicU64,
     swap_used_bytes: AtomicU64,
@@ -302,14 +329,8 @@ impl HistoricalProofCache {
             pressure_gate: RwLock::new(()),
             target_entries: AtomicUsize::new(0),
             entry_count: AtomicUsize::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            admissions: AtomicU64::new(0),
-            admission_rejections: AtomicU64::new(0),
-            allocation_rejections: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
-            ghost_hits: AtomicU64::new(0),
-            maximum_eviction_steps: AtomicUsize::new(0),
+            unsharded_misses: AtomicU64::new(0),
+            unsharded_admission_rejections: AtomicU64::new(0),
             effective_limit_bytes: AtomicU64::new(0),
             available_bytes: AtomicU64::new(0),
             swap_used_bytes: AtomicU64::new(0),
@@ -326,7 +347,7 @@ impl HistoricalProofCache {
     pub(crate) fn get(&self, chunk_id: ChunkId, logical_length: u64) -> Option<ExactIndexEntry> {
         self.maybe_refresh_pressure();
         let Ok(logical_length) = u32::try_from(logical_length) else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            self.unsharded_misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
         let key = ProofKey::new(chunk_id, logical_length);
@@ -337,7 +358,7 @@ impl HistoricalProofCache {
             .lock()
             .expect("ASSERT: Historical Proof Cache shard lock poisoned");
         let Some(slot_index) = find_slot(&state, key, hash) else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            state.counters.misses = state.counters.misses.saturating_add(1);
             return None;
         };
         let slot = state
@@ -349,7 +370,7 @@ impl HistoricalProofCache {
             .expect("ASSERT: Historical Proof Cache index points to an occupied slot");
         assert_entry_key(entry, key);
         slot.frequency = slot.frequency.saturating_add(1).min(3);
-        self.hits.fetch_add(1, Ordering::Relaxed);
+        state.counters.hits = state.counters.hits.saturating_add(1);
         Some(entry)
     }
 
@@ -373,7 +394,8 @@ impl HistoricalProofCache {
         let shard_ordinal = shard_index(hash, self.shards.len());
         let shard_target = target_for_shard(target, shard_ordinal, self.shards.len());
         if shard_target == 0 {
-            self.admission_rejections.fetch_add(1, Ordering::Relaxed);
+            self.unsharded_admission_rejections
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         let shard = &self.shards[shard_ordinal];
@@ -394,32 +416,32 @@ impl HistoricalProofCache {
             return;
         }
         if !reserve_admission(&mut state) {
-            self.allocation_rejections.fetch_add(1, Ordering::Relaxed);
+            state.counters.allocation_rejections =
+                state.counters.allocation_rejections.saturating_add(1);
             return;
         }
         let mut steps = 0_usize;
         let mut evictions = 0_usize;
         while state.entries >= shard_target {
             if !evict_one(&mut state, shard_target, &mut steps, &mut evictions) {
-                self.maximum_eviction_steps
-                    .fetch_max(steps, Ordering::Relaxed);
-                self.admission_rejections.fetch_add(1, Ordering::Relaxed);
+                state.counters.maximum_eviction_steps =
+                    state.counters.maximum_eviction_steps.max(steps);
+                state.counters.admission_rejections =
+                    state.counters.admission_rejections.saturating_add(1);
                 return;
             }
         }
-        self.maximum_eviction_steps
-            .fetch_max(steps, Ordering::Relaxed);
+        state.counters.maximum_eviction_steps = state.counters.maximum_eviction_steps.max(steps);
         if evictions != 0 {
-            self.evictions.fetch_add(
+            state.counters.evictions = state.counters.evictions.saturating_add(
                 u64::try_from(evictions).expect("ASSERT: bounded eviction count fits u64"),
-                Ordering::Relaxed,
             );
             self.entry_count.fetch_sub(evictions, Ordering::Release);
         }
         let ghost_tag = ghost_tag(key);
         let ghost_hit = state.ghost.remove(&ghost_tag).is_some();
         if ghost_hit {
-            self.ghost_hits.fetch_add(1, Ordering::Relaxed);
+            state.counters.ghost_hits = state.counters.ghost_hits.saturating_add(1);
         }
         let queue = if admission == HistoricalProofAdmission::ExactReuse || ghost_hit {
             Queue::Main
@@ -429,7 +451,7 @@ impl HistoricalProofCache {
         insert_entry(&mut state, entry, key, hash, queue)
             .expect("ASSERT: admission pre-reserved one slot and one Swiss-table entry");
         self.entry_count.fetch_add(1, Ordering::Release);
-        self.admissions.fetch_add(1, Ordering::Relaxed);
+        state.counters.admissions = state.counters.admissions.saturating_add(1);
         assert!(
             self.entry_count.load(Ordering::Acquire) <= target,
             "ASSERT: Historical Proof Cache exceeded its distributed target"
@@ -454,21 +476,28 @@ impl HistoricalProofCache {
     pub(crate) fn status(&self) -> HistoricalProofCacheStatus {
         self.maybe_refresh_pressure();
         let entries = self.entry_count.load(Ordering::Acquire);
+        let mut counters = self.counters();
+        counters.misses = counters
+            .misses
+            .saturating_add(self.unsharded_misses.load(Ordering::Relaxed));
+        counters.admission_rejections = counters
+            .admission_rejections
+            .saturating_add(self.unsharded_admission_rejections.load(Ordering::Relaxed));
         HistoricalProofCacheStatus {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            admissions: self.admissions.load(Ordering::Relaxed),
-            admission_rejections: self.admission_rejections.load(Ordering::Relaxed),
-            allocation_rejections: self.allocation_rejections.load(Ordering::Relaxed),
-            evictions: self.evictions.load(Ordering::Relaxed),
-            ghost_hits: self.ghost_hits.load(Ordering::Relaxed),
+            hits: counters.hits,
+            misses: counters.misses,
+            admissions: counters.admissions,
+            admission_rejections: counters.admission_rejections,
+            allocation_rejections: counters.allocation_rejections,
+            evictions: counters.evictions,
+            ghost_hits: counters.ghost_hits,
             entry_count: entries,
             target_entries: self.target_entries.load(Ordering::Acquire),
             resident_bytes: entries.saturating_mul(ACCOUNTED_ENTRY_BYTES),
             metadata_bytes: self.shards.len().saturating_mul(size_of::<CacheShard>()),
             hard_limit_bytes: self.config.hard_limit_bytes,
             reserve_bytes: self.config.reserve_bytes,
-            maximum_eviction_steps: self.maximum_eviction_steps.load(Ordering::Relaxed),
+            maximum_eviction_steps: counters.maximum_eviction_steps,
             effective_limit_bytes: self.effective_limit_bytes.load(Ordering::Acquire),
             available_bytes: self.available_bytes.load(Ordering::Acquire),
             swap_used_bytes: self.swap_used_bytes.load(Ordering::Acquire),
@@ -541,13 +570,28 @@ impl HistoricalProofCache {
             removed = removed
                 .checked_add(state.entries)
                 .expect("ASSERT: Historical Proof Cache entry count cannot overflow");
+            let counters = state.counters;
             *state = ShardState::default();
+            state.counters = counters;
         }
         let accounted = self.entry_count.swap(0, Ordering::AcqRel);
         assert_eq!(
             accounted, removed,
             "ASSERT: Historical Proof Cache global and sharded counts agree"
         );
+    }
+
+    fn counters(&self) -> HistoricalShardCounters {
+        self.shards
+            .iter()
+            .fold(HistoricalShardCounters::default(), |mut total, shard| {
+                let state = shard
+                    .state
+                    .lock()
+                    .expect("ASSERT: Historical Proof Cache shard lock poisoned");
+                total.add_assign(state.counters);
+                total
+            })
     }
 }
 
@@ -876,13 +920,18 @@ mod tests {
             cache.get(proof.chunk_id(), u64::from(proof.logical_length())),
             Some(proof)
         );
+        assert_eq!(cache.status().admissions(), 1);
+        assert_eq!(cache.status().hits(), 1);
         cache.update_memory_pressure(MemoryPressureSnapshot::new(1 << 30, 1 << 30, 1));
         assert_eq!(cache.status().target_entries(), 0);
         assert_eq!(cache.status().entry_count(), 0);
+        assert_eq!(cache.status().admissions(), 1);
+        assert_eq!(cache.status().hits(), 1);
         assert_eq!(
             cache.get(proof.chunk_id(), u64::from(proof.logical_length())),
             None
         );
+        assert_eq!(cache.status().misses(), 1);
     }
 
     #[test]

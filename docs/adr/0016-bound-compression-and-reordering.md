@@ -11,6 +11,10 @@ Placement Window, with `reorder=off` retaining input order as the measurement
 baseline. This bounds restore locality loss while permitting compression-aware
 packing.
 
+ADR 0077 later supersedes the physical similarity-clustering permission:
+production placement retains logical order because the DATA Tier is HDD-backed.
+The Compression Region and Placement Window bounds below remain current.
+
 Version 1 assigns an indivisible logical chunk to the Placement Window
 containing its first byte. A CDC chunk may therefore straddle the numeric
 64-MiB boundary by at most the versioned 256-KiB maximum Chunk size. A

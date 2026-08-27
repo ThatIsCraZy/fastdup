@@ -72,6 +72,11 @@ Kapazitätswirkung und streuender GC-Kosten aber noch keine Aktivierung als
 Default. Sparse-XOR-Delta, Dictionary und Reorder bleiben Forschungs- oder
 Referenzpfade.
 
+fastdup wird ausschließlich für 64-Bit-x86-Systeme entwickelt, getestet und
+qualifiziert. ARM, andere CPU-Architekturen und entsprechende Cross-Builds sind
+nicht unterstützt. AVX2/BMI2 und weitere x86-Erweiterungen werden nur nach
+Runtime-Erkennung benutzt; die x86-64-Baseline bleibt lauffähig.
+
 Die verbindlichen Begriffe stehen in [CONTEXT.md](CONTEXT.md). Entscheidungen
 über Haltbarkeit und Formate stehen in den [ADRs](docs/adr/).
 
@@ -188,13 +193,13 @@ Als Nächstes sollte der opt-in Advanced-Reduction-Pfad gegen ein breiteres,
 realistisch entwickeltes Backup-Corpus und mehrere ABBA-Wiederholungen
 qualifiziert werden. Der erste reale Lauf belegt den funktionierenden
 Similarity-/Prefix-Pfad und null Prozess-Swap, zeigt aber nur 0,0527 % weniger
-Repository-Allokation und im Mittel 3,42-mal so lange Offline-GC-Läufe. Die
-Ursache der GC-Verstärkung war der alte index-freie Base-Fallback: Jeder
-Prefix-Record listete den DATA-Namensraum neu und las Provider-Container bis
-zur gefundenen Base vollständig. Der pass-lokale Resolver nutzt stattdessen den
-bereits vorhandenen Recovery Index von Format 2; ein erneuter realer
-Prefix-ABBA-Lauf muss die GC-Wirkung noch quantifizieren, bevor `prefix-v1`
-Default werden darf.
+Repository-Allokation. Der aktuelle Format-2-Recovery-Index-Resolver senkt das
+damalige Prefix-/Off-GC-Verhältnis von 3,424 auf 1,306. Eine erneute Prüfung des
+verworfenen Format-3-Digests und 3-KiB-Base-Filters fand keinen isolierten
+Writer-Nachteil, aber auch nur höchstens 1,47 % vermeidbare Bytes pro
+vollständigem Provider-Probe. Format 2 bleibt deshalb das einzige Format; bei
+erneut messbarer Base-Resolution-Verstärkung ist zuerst ein poolweiter
+pass-lokaler Resolver ohne neue dauerhafte Felder zu testen.
 
 Der Abschnitt ist abgeschlossen, wenn:
 
@@ -202,9 +207,9 @@ Der Abschnitt ist abgeschlossen, wenn:
    ISO Exact-, Similarity- und Fallback-Entscheidungen reproduzierbar auslösen;
 2. ABBA-Läufe Kapazität, SMB-Durchsatz, completed-write-p99, Restore und
    Prozess-/cgroup-Swap gemeinsam ausweisen;
-3. der erneute Prefix-ABBA-Lauf bestätigt, dass Scrub/GC keine vollständigen
-   Provider-Container pro Dependency mehr scannt und das ausdrückliche
-   Regressionsbudget einhält;
+3. breitere Prefix-ABBA-Läufe bestätigen das aktuelle GC-Verhältnis und messen
+   Base-Resolver-I/O getrennt von vollständiger Containerverifikation und
+   Relocation;
 4. alle Restores bytegenau sowie Recovery, Scrub und GC fail-closed bleiben;
    und
 5. Metrik, Cache-Governance und Policy-Auswahl weiterhin keine Locks, Syscalls
@@ -487,3 +492,6 @@ Der aktuelle reale Online-GC-Interferenzlauf ist unter
 [docs/benchmarks/online-gc-interference-2026-08-26.md](docs/benchmarks/online-gc-interference-2026-08-26.md)
 dokumentiert. Der opt-in Prefix-ABBA-Lauf steht unter
 [docs/benchmarks/persistent-prefix-smb-ab-2026-08-27.md](docs/benchmarks/persistent-prefix-smb-ab-2026-08-27.md).
+Die Neubewertung des verworfenen Container-Formats 3 nach dem Governor-Fix ist
+unter [docs/benchmarks/container-format-v3-gc-reevaluation-2026-08-27.md](docs/benchmarks/container-format-v3-gc-reevaluation-2026-08-27.md)
+dokumentiert.
