@@ -1,5 +1,5 @@
 use fastdup_appliance::{
-    DurableNamespace, checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1, recover_mount,
+    DurableNamespace, checkpoint_exact_index_profile_v1, checkpoint_policy_set, recover_mount,
 };
 use fastdup_format::ChunkId;
 use fastdup_posix::{
@@ -8,7 +8,7 @@ use fastdup_posix::{
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, GenerationRepository, MaintenanceRepository,
-    SeqCdcConfig, SimilarityIndexRepository, StorageIo, seqcdc_cut,
+    PersistentReductionStatus, SeqCdcConfig, SimilarityIndexRepository, StorageIo, seqcdc_cut,
 };
 use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
 use std::ops::Range;
@@ -39,7 +39,7 @@ fn open_appliance_on(
 ) -> Appliance {
     DurableNamespace::open_with_index(
         NamespaceConfig::default(),
-        GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        GenerationRepository::new(metadata, checkpoint_policy_set()),
         ContainerRepository::new(containers),
         &ExactIndexRunRepository::new(indexes),
         32,
@@ -53,7 +53,7 @@ fn open_appliance_with_paused_containers(
     let pause = containers.clone();
     let appliance = DurableNamespace::open_with_index(
         NamespaceConfig::default(),
-        GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set_v1()),
+        GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set()),
         ContainerRepository::new(containers),
         &ExactIndexRunRepository::new(MemoryStorageIo::new()),
         32,
@@ -96,13 +96,25 @@ fn rebuild_pool_indexes(
     similarity: &SimilarityIndexRepository<MemoryStorageIo>,
 ) {
     MaintenanceRepository::new(
-        GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1()),
+        GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
         ContainerRepository::new(data.clone()),
         exact.clone(),
         checkpoint_exact_index_profile_v1(),
     )
     .rebuild_pool_indexes(similarity)
     .expect("build coherent Exact/Similarity pair");
+}
+
+fn assert_accepted_advanced_reduction(reduction: PersistentReductionStatus) {
+    assert!(reduction.enabled());
+    assert!(reduction.queries() > 0);
+    assert!(reduction.candidates() > 0);
+    assert!(reduction.base_reads() > 0);
+    assert!(reduction.base_read_bytes() > 0);
+    assert!(reduction.prefix_trials() > 0);
+    assert!(reduction.accepted_prefixes() > 0);
+    assert!(reduction.saved_payload_bytes() > 0);
+    assert_eq!(reduction.errors(), 0);
 }
 
 #[test]
@@ -161,7 +173,7 @@ fn pool_wide_similarity_emits_depth_one_prefix_in_write_through() {
 
     let appliance = DurableNamespace::open_with_reduction_indexes(
         NamespaceConfig::default(),
-        GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        GenerationRepository::new(metadata, checkpoint_policy_set()),
         ContainerRepository::new(data),
         &exact,
         &similarity,
@@ -209,16 +221,7 @@ fn pool_wide_similarity_emits_depth_one_prefix_in_write_through() {
         "write-through must publish the accepted target as codec-3 Depth-1 Prefix"
     );
     assert!(changed_range.contains(&changed_offset));
-    let reduction = appliance.write_through_status().advanced_reduction();
-    assert!(reduction.enabled());
-    assert!(reduction.queries() > 0);
-    assert!(reduction.candidates() > 0);
-    assert!(reduction.base_reads() > 0);
-    assert!(reduction.base_read_bytes() > 0);
-    assert!(reduction.prefix_trials() > 0);
-    assert!(reduction.accepted_prefixes() > 0);
-    assert!(reduction.saved_payload_bytes() > 0);
-    assert_eq!(reduction.errors(), 0);
+    assert_accepted_advanced_reduction(appliance.write_through_status().advanced_reduction());
     assert_eq!(read_named(appliance.namespace(), b"prefix-target"), target);
 }
 
@@ -1049,7 +1052,7 @@ fn partial_update_rechunks_only_the_affected_recipe_and_recovers_byte_exact() {
 
     let recovered = recover_mount(
         NamespaceConfig::default(),
-        &GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        &GenerationRepository::new(metadata, checkpoint_policy_set()),
         &ContainerRepository::new(containers),
     )
     .expect("recover recipe-backed generation")
@@ -1172,7 +1175,7 @@ fn frozen_cut_commits_while_the_next_epoch_stays_live_and_recovers_in_order() {
     );
     let recovered_first = recover_mount(
         NamespaceConfig::default(),
-        &GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1()),
+        &GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
         &ContainerRepository::new(containers.clone()),
     )
     .expect("recover first committed epoch")
@@ -1194,7 +1197,7 @@ fn frozen_cut_commits_while_the_next_epoch_stays_live_and_recovers_in_order() {
     containers.crash();
     let recovered_second = recover_mount(
         NamespaceConfig::default(),
-        &GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        &GenerationRepository::new(metadata, checkpoint_policy_set()),
         &ContainerRepository::new(containers),
     )
     .expect("recover successor epoch after crash")

@@ -10,8 +10,8 @@ had already hashed logical Chunks and calculated each Record CRC. On the ingest
 hot path it duplicated memory-bandwidth work without adding an independent
 observation of storage.
 
-Container format v1 uses algorithm identifier `2` for a domain-separated
-BLAKE3 structural commitment. It covers the Header, every Record header and
+The Container structural-commitment algorithm uses identifier `2` for a
+domain-separated BLAKE3 digest. It covers the Header, every Record header and
 Chunk Table, the complete Recovery Index, and the Footer with its commitment
 and CRC fields zeroed. It excludes encoded payload and alignment gaps.
 

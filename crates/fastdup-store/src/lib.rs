@@ -112,11 +112,12 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use fastdup_format::{
-    BuildingContainerHeader, ContainerId, ContainerIntrinsicSummary, ExactIndexEntry,
-    ExactIndexLocation, ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES,
-    IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
-    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, SealedContainer,
-    SealedContainerDescriptor, VerifiedContainerPublication,
+    BuildingContainerHeader, ChunkId, ContainerId, ContainerIntrinsicSummary,
+    ContainerRecoveryEnvelope, ExactIndexEntry, ExactIndexLocation, ExactLocationTransition,
+    FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
+    IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, PrehashedAdaptiveRegion, PrehashedChunk,
+    PrehashedContiguousRegion, SealedContainer, SealedContainerDescriptor,
+    VerifiedContainerPublication,
 };
 use rayon::prelude::*;
 
@@ -765,6 +766,18 @@ struct RetiringSelectionBarrier {
     committed: bool,
 }
 
+/// One decode-local, index-free Base resolver.
+///
+/// Namespace enumeration and successfully verified Base bytes are retained
+/// only for the duration of one requested Container decode. This keeps the
+/// ordinary read cache and long-lived memory budget unchanged while preventing
+/// one Prefix record from recursively rescanning every complete Container.
+struct ContainerBaseResolver<'a, I> {
+    repository: &'a ContainerRepository<I>,
+    names: Option<Vec<(String, ContainerId)>>,
+    resolved: BTreeMap<(ChunkId, u32), Vec<u8>>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RecoveredRetiringRemoval {
     containers_removed: u64,
@@ -802,6 +815,58 @@ impl Drop for RetiringSelectionBarrier {
                 retiring.remove(container_id);
             }
         }
+    }
+}
+
+impl<'a, I: StorageIo> ContainerBaseResolver<'a, I> {
+    fn new(repository: &'a ContainerRepository<I>) -> Self {
+        Self {
+            repository,
+            names: None,
+            resolved: BTreeMap::new(),
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        dependency: fastdup_format::ZstdPrefixDependency,
+    ) -> Result<Vec<u8>, StoreError> {
+        let key = (dependency.chunk_id(), dependency.logical_length());
+        if let Some(bytes) = self.resolved.get(&key) {
+            return Ok(bytes.clone());
+        }
+        if self.names.is_none() {
+            let mut names = self.repository.storage.list_names()?;
+            names.sort_unstable();
+            let mut published = Vec::new();
+            published
+                .try_reserve_exact(names.len())
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            for name in names {
+                let Some(container_id) = parse_published_name(&name)? else {
+                    continue;
+                };
+                if self.repository.selectable_container(container_id) {
+                    published.push((name, container_id));
+                }
+            }
+            self.names = Some(published);
+        }
+        let names = self
+            .names
+            .as_deref()
+            .expect("ASSERT: resolver namespace initializes before lookup");
+        let bytes = self
+            .repository
+            .find_independent_base_in_names(names, key.0, key.1)?;
+        let Some(bytes) = bytes else {
+            return Err(StoreError::MissingVerifiedChunk {
+                chunk_id: key.0,
+                logical_length: u64::from(key.1),
+            });
+        };
+        self.resolved.insert(key, bytes.clone());
+        Ok(bytes)
     }
 }
 
@@ -1141,7 +1206,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     ///
     /// # Panics
     ///
-    /// Panics only if a validated format-v1 writer violates its bounded
+    /// Panics only if the validated Container writer violates its bounded
     /// length/accounting invariants or process CPU time moves backwards.
     pub fn publish_adaptive_regions_parallel_profiled(
         &self,
@@ -1371,7 +1436,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     ///
     /// # Panics
     ///
-    /// Panics only if a validated format-v1 image violates its bounded length
+    /// Panics only if a validated Container image violates its bounded length
     /// or decoded-byte accounting invariants.
     pub fn publish_prepared_adaptive_profiled(
         &self,
@@ -1392,8 +1457,8 @@ impl<I: StorageIo> ContainerRepository<I> {
             encode_process_cpu,
             incompressibility_gate,
         } = prepared;
-        let file_bytes = u64::try_from(sealed.len())
-            .expect("ASSERT: a format-v1 Container image length fits u64");
+        let file_bytes =
+            u64::try_from(sealed.len()).expect("ASSERT: a Container image length fits u64");
         let publish_wall_started = Instant::now();
         let publish_cpu_started = process_cpu_time();
         let verified =
@@ -1425,8 +1490,8 @@ impl<I: StorageIo> ContainerRepository<I> {
         let building = BuildingContainerHeader::new(container_id, container_generation)?.encode();
         let temporary_name = temporary_name(container_id);
         let published_name = published_name(container_id);
-        let sealed_length = u64::try_from(sealed.len())
-            .expect("ASSERT: a format-v1 container length always fits u64");
+        let sealed_length =
+            u64::try_from(sealed.len()).expect("ASSERT: a Container length always fits u64");
         assert!(
             sealed_length <= MAX_CONTAINER_BYTES,
             "ASSERT: the format writer returned an oversized container"
@@ -1469,11 +1534,11 @@ impl<I: StorageIo> ContainerRepository<I> {
             self.storage.create_new(&temporary_name)?;
         }
         let building = BuildingContainerHeader::new(container_id, container_generation)?.encode();
-        let sealed_length = u64::try_from(sealed.len())
-            .expect("ASSERT: a format-v1 Container image length fits u64");
+        let sealed_length =
+            u64::try_from(sealed.len()).expect("ASSERT: a Container image length fits u64");
         assert!(
             sealed_length <= MAX_CONTAINER_BYTES,
-            "ASSERT: resumable GC publication cannot exceed the format-v1 Container limit"
+            "ASSERT: resumable GC publication cannot exceed the Container format limit"
         );
         self.storage.write_at(&temporary_name, 0, &building)?;
         self.storage.write_at(
@@ -1514,11 +1579,22 @@ impl<I: StorageIo> ContainerRepository<I> {
         expected_id: ContainerId,
         bytes: &[u8],
     ) -> Result<SealedContainer, StoreError> {
-        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| {
-            self.read_verified_independent_chunk(dependency.chunk_id(), dependency.logical_length())
-                .map_err(|_| FormatError::ZstdPrefixBaseRequired)
+        let mut base_resolver = ContainerBaseResolver::new(self);
+        let mut resolver_error = None;
+        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| match base_resolver
+            .resolve(dependency)
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                resolver_error = Some(error);
+                Err(FormatError::ZstdPrefixBaseRequired)
+            }
         };
-        let container = SealedContainer::decode_with_zstd_prefix_resolver(bytes, &mut resolve)?;
+        let decoded = SealedContainer::decode_with_zstd_prefix_resolver(bytes, &mut resolve);
+        if let Some(error) = resolver_error {
+            return Err(error);
+        }
+        let container = decoded?;
         let embedded_id = container.header().container_id();
         if embedded_id != expected_id {
             return Err(StoreError::PublishedIdentityMismatch {
@@ -1529,37 +1605,98 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(container)
     }
 
-    fn read_verified_independent_chunk(
+    fn find_independent_base_in_names(
         &self,
-        chunk_id: fastdup_format::ChunkId,
+        names: &[(String, ContainerId)],
+        chunk_id: ChunkId,
         logical_length: u32,
-    ) -> Result<Vec<u8>, StoreError> {
-        let mut names = self.storage.list_names()?;
-        names.sort_unstable();
-        for name in names {
-            let Some(expected_id) = parse_published_name(&name)? else {
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        for (name, expected_id) in names {
+            let envelope = self.read_recovery_envelope(name, *expected_id)?;
+            let index_range = envelope.recovery_index_range()?;
+            let index_bytes =
+                self.read_storage_range_chunked(name, index_range.offset(), index_range.length())?;
+            let index = envelope.verify_recovery_index(&index_bytes)?;
+            let Some(candidate) = index.find_independent_candidate(chunk_id, logical_length) else {
                 continue;
             };
-            if !self.selectable_container(expected_id) {
-                continue;
+            let record_range = candidate.record_range()?;
+            let encoded_record =
+                self.storage
+                    .read_exact_at(name, record_range.offset(), record_range.length())?;
+            let record = index.decode_independent_candidate(candidate, &encoded_record)?;
+            if record.chunk_id() != chunk_id
+                || u32::try_from(record.payload().len()) != Ok(logical_length)
+            {
+                return Err(StoreError::ExactLocationMismatch);
             }
-            let bytes = self.storage.read(&name)?;
-            let (embedded_id, found) =
-                SealedContainer::find_verified_independent_chunk(&bytes, chunk_id, logical_length)?;
-            if embedded_id != expected_id {
-                return Err(StoreError::PublishedIdentityMismatch {
-                    name: expected_id,
-                    header: embedded_id,
-                });
-            }
-            if let Some(bytes) = found {
-                return Ok(bytes);
-            }
+            return Ok(Some(record.payload().to_vec()));
         }
-        Err(StoreError::MissingVerifiedChunk {
-            chunk_id,
-            logical_length: u64::from(logical_length),
-        })
+        Ok(None)
+    }
+
+    fn read_recovery_envelope(
+        &self,
+        name: &str,
+        expected_id: ContainerId,
+    ) -> Result<ContainerRecoveryEnvelope, StoreError> {
+        let actual_length = self.storage.object_len(name)?;
+        let minimum_length = u64::try_from(HEADER_BYTES)
+            .map_err(|_| FormatError::ArithmeticOverflow)?
+            .checked_add(FOOTER_BYTES)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        if actual_length < minimum_length
+            || actual_length > MAX_CONTAINER_BYTES
+            || !actual_length.is_multiple_of(FOOTER_BYTES)
+        {
+            return Err(StoreError::Format(FormatError::InvalidContainerLength(
+                usize::try_from(actual_length).unwrap_or(usize::MAX),
+            )));
+        }
+        let footer_offset = actual_length
+            .checked_sub(FOOTER_BYTES)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        let header = self.storage.read_exact_at(name, 0, HEADER_BYTES)?;
+        let footer = self.storage.read_exact_at(
+            name,
+            footer_offset,
+            usize::try_from(FOOTER_BYTES).map_err(|_| FormatError::ArithmeticOverflow)?,
+        )?;
+        let envelope = ContainerRecoveryEnvelope::decode(&header, &footer, actual_length)?;
+        if envelope.container_id() != expected_id {
+            return Err(StoreError::PublishedIdentityMismatch {
+                name: expected_id,
+                header: envelope.container_id(),
+            });
+        }
+        Ok(envelope)
+    }
+
+    fn read_storage_range_chunked(
+        &self,
+        name: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let mut completed = 0_usize;
+        while completed < length {
+            let read_length = (length - completed).min(MAX_STORAGE_RANGE_BYTES);
+            let read_offset = offset
+                .checked_add(u64::try_from(completed).map_err(|_| FormatError::ArithmeticOverflow)?)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            bytes.extend(self.storage.read_exact_at(name, read_offset, read_length)?);
+            completed = completed
+                .checked_add(read_length)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+        }
+        if bytes.len() != length {
+            return Err(StoreError::Format(FormatError::InvalidRecoveryIndex));
+        }
+        Ok(bytes)
     }
 
     /// Reads one Container while resolving codec-3 Bases through the active
@@ -2323,7 +2460,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             }
             assert!(
                 encoded_bytes <= MAINTENANCE_VERIFY_WINDOW_BYTES,
-                "ASSERT: one format-v1 Container cannot exceed the maintenance verification window"
+                "ASSERT: one Container cannot exceed the maintenance verification window"
             );
             let decoded = encoded
                 .into_par_iter()
@@ -2404,10 +2541,10 @@ fn publish_owned_container_synchronously<I: StorageIo + ?Sized>(
         published_name,
     ) = publication.into_parts();
     let sealed_length =
-        u64::try_from(sealed.len()).expect("ASSERT: a format-v1 Container image length fits u64");
+        u64::try_from(sealed.len()).expect("ASSERT: a Container image length fits u64");
     assert!(
         sealed_length <= MAX_CONTAINER_BYTES,
-        "ASSERT: owned publication cannot exceed the format-v1 Container limit"
+        "ASSERT: owned publication cannot exceed the Container format limit"
     );
     assert!(
         sealed.len() > HEADER_BYTES,

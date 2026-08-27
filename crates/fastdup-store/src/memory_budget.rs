@@ -10,21 +10,22 @@ const UNBOUNDED_SWAP: u64 = u64::MAX;
 
 /// One conservative view of memory available to this process.
 ///
-/// Host Swap is kept separate from the current cgroup's Swap: unrelated host
-/// activity is telemetry, while only memory charged to fastdup may close cache
-/// admission. A production no-Swap promise additionally requires
+/// Process Swap, current-cgroup Swap, and Host Swap are separate signals. Only
+/// Swap attributed to this process closes cache admission. A production
+/// no-Swap promise additionally requires a dedicated cgroup with
 /// `memory.swap.max=0`, exposed by [`Self::swap_protection_enforced`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryPressureSnapshot {
     effective_limit: u64,
     available: u64,
+    process_swap_used: u64,
     host_swap_used: u64,
     cgroup_swap_used: u64,
     cgroup_swap_limit: u64,
 }
 
 impl MemoryPressureSnapshot {
-    /// Constructs a deterministic protected-cgroup snapshot.
+    /// Constructs a deterministic process-pressure snapshot.
     #[must_use]
     pub const fn new(
         effective_limit_bytes: u64,
@@ -34,8 +35,9 @@ impl MemoryPressureSnapshot {
         Self {
             effective_limit: effective_limit_bytes,
             available: available_bytes,
+            process_swap_used: swap_used_bytes,
             host_swap_used: 0,
-            cgroup_swap_used: swap_used_bytes,
+            cgroup_swap_used: 0,
             cgroup_swap_limit: 0,
         }
     }
@@ -45,6 +47,7 @@ impl MemoryPressureSnapshot {
     pub const fn with_swap_state(
         effective_limit_bytes: u64,
         available_bytes: u64,
+        process_swap_used_bytes: u64,
         host_swap_used_bytes: u64,
         cgroup_swap_used_bytes: u64,
         cgroup_swap_limit_bytes: Option<u64>,
@@ -52,6 +55,7 @@ impl MemoryPressureSnapshot {
         Self {
             effective_limit: effective_limit_bytes,
             available: available_bytes,
+            process_swap_used: process_swap_used_bytes,
             host_swap_used: host_swap_used_bytes,
             cgroup_swap_used: cgroup_swap_used_bytes,
             cgroup_swap_limit: match cgroup_swap_limit_bytes {
@@ -85,10 +89,15 @@ impl MemoryPressureSnapshot {
         self.available
     }
 
-    /// Returns Swap charged to fastdup's current cgroup.
+    /// Returns Swap currently charged to this fastdup process.
     #[must_use]
     pub const fn swap_used_bytes(self) -> u64 {
-        self.cgroup_swap_used
+        self.process_swap_used
+    }
+
+    #[must_use]
+    pub const fn process_swap_used_bytes(self) -> u64 {
+        self.process_swap_used
     }
 
     #[must_use]
@@ -141,6 +150,7 @@ pub struct MemoryBudgetGovernor {
     valid: AtomicBool,
     effective_limit: AtomicU64,
     available: AtomicU64,
+    process_swap_used: AtomicU64,
     host_swap_used: AtomicU64,
     cgroup_swap_used: AtomicU64,
     cgroup_swap_limit: AtomicU64,
@@ -182,6 +192,7 @@ impl MemoryBudgetGovernor {
             valid: AtomicBool::new(false),
             effective_limit: AtomicU64::new(0),
             available: AtomicU64::new(0),
+            process_swap_used: AtomicU64::new(1),
             host_swap_used: AtomicU64::new(0),
             cgroup_swap_used: AtomicU64::new(1),
             cgroup_swap_limit: AtomicU64::new(UNBOUNDED_SWAP),
@@ -206,6 +217,7 @@ impl MemoryBudgetGovernor {
         Ok(MemoryPressureSnapshot::with_swap_state(
             self.effective_limit.load(Ordering::Acquire),
             self.available.load(Ordering::Acquire),
+            self.process_swap_used.load(Ordering::Acquire),
             self.host_swap_used.load(Ordering::Acquire),
             self.cgroup_swap_used.load(Ordering::Acquire),
             decode_swap_limit(self.cgroup_swap_limit.load(Ordering::Acquire)),
@@ -277,6 +289,8 @@ impl MemoryBudgetGovernor {
                 .store(snapshot.effective_limit_bytes(), Ordering::Release);
             self.available
                 .store(snapshot.available_bytes(), Ordering::Release);
+            self.process_swap_used
+                .store(snapshot.process_swap_used_bytes(), Ordering::Release);
             self.host_swap_used
                 .store(snapshot.host_swap_used_bytes(), Ordering::Release);
             self.cgroup_swap_used
@@ -332,6 +346,7 @@ fn decode_swap_limit(encoded: u64) -> Option<u64> {
 
 fn sample_linux_memory() -> io::Result<MemoryPressureSnapshot> {
     let meminfo = fs::read_to_string("/proc/meminfo")?;
+    let process_status = fs::read_to_string("/proc/self/status")?;
     let host_total = meminfo_kib(&meminfo, "MemTotal")?;
     let host_available = meminfo_kib(&meminfo, "MemAvailable")?;
     let swap_total = meminfo_kib(&meminfo, "SwapTotal")?;
@@ -339,6 +354,7 @@ fn sample_linux_memory() -> io::Result<MemoryPressureSnapshot> {
     let mut effective_limit = host_total;
     let mut available = host_available;
     let host_swap_used = swap_total.saturating_sub(swap_free);
+    let process_swap_used = status_kib(&process_status, "VmSwap")?;
     let mut cgroup_swap_used = 0;
     let mut cgroup_swap_limit = None;
 
@@ -358,10 +374,15 @@ fn sample_linux_memory() -> io::Result<MemoryPressureSnapshot> {
     Ok(MemoryPressureSnapshot::with_swap_state(
         effective_limit,
         available,
+        process_swap_used,
         host_swap_used,
         cgroup_swap_used,
         cgroup_swap_limit,
     ))
+}
+
+fn status_kib(status: &str, key: &str) -> io::Result<u64> {
+    meminfo_kib(status, key)
 }
 
 fn meminfo_kib(meminfo: &str, key: &str) -> io::Result<u64> {
@@ -449,11 +470,19 @@ mod tests {
     }
 
     #[test]
-    fn host_swap_does_not_impersonate_fastdup_swap() {
-        let snapshot =
-            MemoryPressureSnapshot::with_swap_state(128 << 30, 96 << 30, 12 << 30, 0, Some(0));
+    fn host_and_shared_cgroup_swap_do_not_impersonate_fastdup_process_swap() {
+        let snapshot = MemoryPressureSnapshot::with_swap_state(
+            128 << 30,
+            96 << 30,
+            0,
+            12 << 30,
+            31 << 20,
+            Some(0),
+        );
 
         assert_eq!(snapshot.host_swap_used_bytes(), 12 << 30);
+        assert_eq!(snapshot.cgroup_swap_used_bytes(), 31 << 20);
+        assert_eq!(snapshot.process_swap_used_bytes(), 0);
         assert_eq!(snapshot.swap_used_bytes(), 0);
         assert!(snapshot.swap_protection_enforced());
     }
@@ -480,7 +509,7 @@ mod tests {
     fn no_swap_promise_requires_a_zero_cgroup_limit() {
         let unprotected = SequenceSource {
             samples: Mutex::new(VecDeque::from([Ok(
-                MemoryPressureSnapshot::with_swap_state(128 << 30, 96 << 30, 0, 0, None),
+                MemoryPressureSnapshot::with_swap_state(128 << 30, 96 << 30, 0, 0, 0, None),
             )])),
         };
         let governor =

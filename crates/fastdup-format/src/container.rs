@@ -398,6 +398,34 @@ pub struct SealedContainerDescriptor {
     container_hash: [u8; 32],
 }
 
+/// Paired immutable Container envelope carrying payload-free recovery
+/// acceleration.
+///
+/// The paired descriptor supplies the exact bounded range for a compact
+/// Recovery Index before one selected record is read and independently
+/// verified.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainerRecoveryEnvelope {
+    descriptor: SealedContainerDescriptor,
+}
+
+/// One independently decodable record candidate obtained from an
+/// authenticated Container Recovery Index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryIndexCandidate {
+    container_id: ContainerId,
+    container_generation: u64,
+    entry: IndexEntry,
+}
+
+/// A Container-local Recovery Index whose CRC, canonical order, and record
+/// geometry have been validated without reading record payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRecoveryIndex {
+    descriptor: SealedContainerDescriptor,
+    entries: Vec<IndexEntry>,
+}
+
 impl SealedContainerDescriptor {
     /// Pairs independently read Header and Footer blocks with the physical
     /// object length.
@@ -698,6 +726,191 @@ impl SealedContainerDescriptor {
             return Err(FormatError::ExactLocationMismatch);
         }
         self.decode_candidate(candidate, record_bytes)
+    }
+}
+
+impl ContainerRecoveryEnvelope {
+    /// Pairs Header and Footer and retains only immutable recovery
+    /// acceleration. No record payload or Recovery Index bytes are read by
+    /// this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an envelope error when identity, layout, checksums, summary, or
+    /// recovery acceleration disagree.
+    pub fn decode(
+        header_bytes: &[u8],
+        footer_bytes: &[u8],
+        actual_length: u64,
+    ) -> Result<Self, FormatError> {
+        let descriptor =
+            SealedContainerDescriptor::decode(header_bytes, footer_bytes, actual_length)?;
+        Ok(Self { descriptor })
+    }
+
+    #[must_use]
+    pub const fn container_id(&self) -> ContainerId {
+        self.descriptor.container_id()
+    }
+
+    #[must_use]
+    pub const fn container_generation(&self) -> u64 {
+        self.descriptor.container_generation()
+    }
+
+    /// Returns the exact bounded range occupied by the Recovery Index.
+    ///
+    /// # Errors
+    ///
+    /// Returns overflow when the validated durable length cannot be represented
+    /// by this process.
+    pub fn recovery_index_range(&self) -> Result<ContainerRecordRange, FormatError> {
+        let layout = self.descriptor.layout();
+        Ok(ContainerRecordRange {
+            offset: layout.index_offset,
+            length: usize::try_from(layout.index_length)
+                .map_err(|_| FormatError::ArithmeticOverflow)?,
+        })
+    }
+
+    /// Authenticates and decodes the complete compact Recovery Index without
+    /// reading record payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index length, CRC, order, or record-geometry mismatch.
+    pub fn verify_recovery_index(
+        &self,
+        index_bytes: &[u8],
+    ) -> Result<VerifiedRecoveryIndex, FormatError> {
+        if index_bytes.len() != self.recovery_index_range()?.length {
+            return Err(FormatError::InvalidRecoveryIndex);
+        }
+        let entries = decode_index(index_bytes, self.descriptor.layout().chunk_entry_count)?;
+        if entries
+            .iter()
+            .any(|entry| !valid_recovery_index_entry_geometry(self.descriptor.layout(), *entry))
+        {
+            return Err(FormatError::InvalidRecoveryIndex);
+        }
+        Ok(VerifiedRecoveryIndex {
+            descriptor: self.descriptor,
+            entries,
+        })
+    }
+}
+
+impl VerifiedRecoveryIndex {
+    /// Finds one dependency-free RAW/Zstd candidate for the requested Base.
+    /// The returned record must still be read and passed to
+    /// [`Self::decode_independent_candidate`].
+    #[must_use]
+    pub fn find_independent_candidate(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u32,
+    ) -> Option<RecoveryIndexCandidate> {
+        let first = self
+            .entries
+            .partition_point(|entry| entry.chunk_id < chunk_id);
+        self.entries[first..]
+            .iter()
+            .take_while(|entry| entry.chunk_id == chunk_id)
+            .find(|entry| {
+                entry.logical_length == logical_length
+                    && matches!(entry.codec_id, RAW_CODEC | ZSTD_CODEC)
+                    && entry.dependency_id == [0; 32]
+            })
+            .copied()
+            .map(|entry| RecoveryIndexCandidate {
+                container_id: self.descriptor.container_id(),
+                container_generation: self.descriptor.container_generation(),
+                entry,
+            })
+    }
+
+    /// Fully validates the selected independent record and returns exactly the
+    /// logical Chunk paired by the verified Recovery Index entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candidate-pairing, record CRC, codec, Chunk-ID, or length
+    /// error. No bytes escape before all checks complete.
+    pub fn decode_independent_candidate(
+        &self,
+        candidate: RecoveryIndexCandidate,
+        record_bytes: &[u8],
+    ) -> Result<RawRecord, FormatError> {
+        if candidate.container_id != self.descriptor.container_id()
+            || candidate.container_generation != self.descriptor.container_generation()
+            || self.entries.binary_search(&candidate.entry).is_err()
+        {
+            return Err(FormatError::RecoveryIndexCandidateMismatch);
+        }
+        let entry = candidate.entry;
+        let range = candidate.record_range()?;
+        if record_bytes.len() != range.length
+            || get_u16(record_bytes, 12) != entry.codec_id
+            || get_u32(record_bytes, 32) != entry.record_length
+            || get_u32(record_bytes, 36) != entry.record_decoded_length
+            || get_u32(record_bytes, 44) != entry.record_payload_length
+            || get_u32(record_bytes, RECORD_CRC_OFFSET) != entry.record_crc32c
+        {
+            return Err(FormatError::RecoveryIndexCandidateMismatch);
+        }
+        let chunk_count = usize::try_from(get_u32(record_bytes, 56))
+            .map_err(|_| FormatError::ArithmeticOverflow)?;
+        let ordinal =
+            usize::try_from(entry.chunk_ordinal).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let table_offset = RECORD_HEADER_BYTES
+            .checked_add(
+                ordinal
+                    .checked_mul(CHUNK_TABLE_ENTRY_BYTES)
+                    .ok_or(FormatError::ArithmeticOverflow)?,
+            )
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        let table_end = table_offset
+            .checked_add(CHUNK_TABLE_ENTRY_BYTES)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        if ordinal >= chunk_count
+            || table_end > record_bytes.len()
+            || record_bytes[table_offset..table_offset + 32] != entry.chunk_id.bytes()
+            || get_u32(record_bytes, table_offset + 32) != entry.decoded_offset
+            || get_u32(record_bytes, table_offset + 36) != entry.logical_length
+            || !matches!(entry.codec_id, RAW_CODEC | ZSTD_CODEC)
+            || entry.dependency_id != [0; 32]
+        {
+            return Err(FormatError::RecoveryIndexCandidateMismatch);
+        }
+        let decoded = decode_encoding_record(record_bytes)?;
+        let record = decoded
+            .chunks
+            .into_iter()
+            .nth(ordinal)
+            .ok_or(FormatError::RecoveryIndexCandidateMismatch)?;
+        if record.chunk_id() != entry.chunk_id
+            || usize::try_from(entry.logical_length) != Ok(record.payload().len())
+        {
+            return Err(FormatError::RecoveryIndexCandidateMismatch);
+        }
+        Ok(record)
+    }
+}
+
+impl RecoveryIndexCandidate {
+    /// Returns the bounded record range named by this verified Index
+    /// candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns overflow when the validated durable record length cannot be
+    /// represented by this process.
+    pub fn record_range(self) -> Result<ContainerRecordRange, FormatError> {
+        Ok(ContainerRecordRange {
+            offset: self.entry.record_offset,
+            length: usize::try_from(self.entry.record_length)
+                .map_err(|_| FormatError::ArithmeticOverflow)?,
+        })
     }
 }
 
@@ -1287,7 +1500,7 @@ impl SealedContainer {
         bytes: &[u8],
         permitted_workers: NonZeroUsize,
     ) -> Result<Self, FormatError> {
-        Self::decode_with_resolver(bytes, permitted_workers, None, false)
+        Self::decode_with_resolver(bytes, permitted_workers, None)
     }
 
     /// Fully validates a sealed Container and resolves codec-3 Bases through
@@ -1305,37 +1518,7 @@ impl SealedContainer {
         bytes: &[u8],
         resolve: &mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>,
     ) -> Result<Self, FormatError> {
-        Self::decode_with_resolver(bytes, NonZeroUsize::MIN, Some(resolve), false)
-    }
-
-    /// Verifies one complete Container while decoding only dependency-free
-    /// records, then returns a matching independent Chunk if present.
-    ///
-    /// Codec-3 records still pass structure, CRC, Recovery Index, padding, and
-    /// Container-commitment validation, but their targets are not decoded and
-    /// can never satisfy this lookup. This is the index-free Depth-1 Base
-    /// fallback used by recovery and offline rebuild.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first Container, independent-record, Recovery Index, or
-    /// integrity failure.
-    pub fn find_verified_independent_chunk(
-        bytes: &[u8],
-        chunk_id: ChunkId,
-        logical_length: u32,
-    ) -> Result<(ContainerId, Option<Vec<u8>>), FormatError> {
-        let independent = Self::decode_with_resolver(bytes, NonZeroUsize::MIN, None, true)?;
-        let container_id = independent.header.container_id;
-        let found = independent
-            .records
-            .into_iter()
-            .find(|record| {
-                record.chunk_id == chunk_id
-                    && u32::try_from(record.payload.len()) == Ok(logical_length)
-            })
-            .map(|record| record.payload);
-        Ok((container_id, found))
+        Self::decode_with_resolver(bytes, NonZeroUsize::MIN, Some(resolve))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1343,7 +1526,6 @@ impl SealedContainer {
         bytes: &[u8],
         _permitted_workers: NonZeroUsize,
         mut resolve: Option<&mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>>,
-        skip_prefix_targets: bool,
     ) -> Result<Self, FormatError> {
         validate_container_file_length(bytes.len())?;
         let footer_offset = bytes
@@ -1362,7 +1544,6 @@ impl SealedContainer {
         {
             return Err(FormatError::HeaderFooterMismatch);
         }
-
         let index_offset = usize::try_from(header.layout.index_offset)
             .map_err(|_| FormatError::ArithmeticOverflow)?;
         let index_length = usize::try_from(header.layout.index_length)
@@ -1405,24 +1586,16 @@ impl SealedContainer {
             intrinsic_summary.observe_encoded_record(encoded)?;
             let decoded = if encoded.len() >= 14 && get_u16(encoded, 12) == ZSTD_PREFIX_CODEC {
                 let dependency = ZstdPrefixRecord::dependency(encoded)?;
-                if skip_prefix_targets {
-                    DecodedEncodingRecord {
-                        codec: EncodingCodec::ZstdPrefix,
-                        logical_bytes: u64::from(dependency.logical_length),
-                        chunks: Vec::new(),
-                    }
-                } else {
-                    let resolver = resolve
-                        .as_deref_mut()
-                        .ok_or(FormatError::ZstdPrefixBaseRequired)?;
-                    let base = resolver(dependency)?;
-                    let record = ZstdPrefixRecord::decode(encoded, &base)?;
-                    DecodedEncodingRecord {
-                        codec: EncodingCodec::ZstdPrefix,
-                        logical_bytes: u64::try_from(record.payload.len())
-                            .map_err(|_| FormatError::ArithmeticOverflow)?,
-                        chunks: vec![record],
-                    }
+                let resolver = resolve
+                    .as_deref_mut()
+                    .ok_or(FormatError::ZstdPrefixBaseRequired)?;
+                let base = resolver(dependency)?;
+                let record = ZstdPrefixRecord::decode(encoded, &base)?;
+                DecodedEncodingRecord {
+                    codec: EncodingCodec::ZstdPrefix,
+                    logical_bytes: u64::try_from(record.payload.len())
+                        .map_err(|_| FormatError::ArithmeticOverflow)?,
+                    chunks: vec![record],
                 }
             } else {
                 decode_encoding_record(encoded)?
@@ -1589,7 +1762,6 @@ impl SealedContainer {
         {
             return Err(FormatError::HeaderFooterMismatch);
         }
-
         let index_offset = usize::try_from(header.layout.index_offset)
             .map_err(|_| FormatError::ArithmeticOverflow)?;
         let index_length = usize::try_from(header.layout.index_length)
@@ -1934,7 +2106,7 @@ impl VerifiedRawLocation {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct IndexEntry {
     chunk_id: ChunkId,
     logical_length: u32,
@@ -4035,6 +4207,7 @@ pub enum FormatError {
     HeaderFooterMismatch,
     InvalidRecoveryIndex,
     IndexChecksumMismatch,
+    RecoveryIndexCandidateMismatch,
     IndexRecordMismatch,
     ExactLocationMismatch,
     NonZeroContainerPadding,
@@ -4133,6 +4306,34 @@ fn validate_container_file_length(length: usize) -> Result<(), FormatError> {
         return Err(FormatError::InvalidContainerLength(length));
     }
     Ok(())
+}
+
+fn valid_recovery_index_entry_geometry(layout: ContainerLayout, entry: IndexEntry) -> bool {
+    let Ok(record_length) = usize::try_from(entry.record_length) else {
+        return false;
+    };
+    entry.logical_length != 0
+        && usize::try_from(entry.logical_length)
+            .is_ok_and(|length| length <= MAX_LOGICAL_CHUNK_BYTES)
+        && entry.record_offset >= HEADER_BYTES as u64
+        && entry
+            .record_offset
+            .checked_add(u64::from(entry.record_length))
+            .is_some_and(|end| end <= layout.index_offset)
+        && entry
+            .record_offset
+            .is_multiple_of(u64::from(RECORD_ALIGNMENT))
+        && (MIN_RAW_RECORD_BYTES..=MAX_RECORD_BYTES).contains(&record_length)
+        && record_length.is_multiple_of(usize::from(RECORD_ALIGNMENT))
+        && entry.record_decoded_length != 0
+        && usize::try_from(entry.record_decoded_length)
+            .is_ok_and(|length| length <= MAX_DECODED_RECORD_BYTES)
+        && entry.record_payload_length != 0
+        && entry.record_payload_length <= entry.record_length
+        && entry
+            .decoded_offset
+            .checked_add(entry.logical_length)
+            .is_some_and(|end| end <= entry.record_decoded_length)
 }
 
 fn encode_index(entries: &[IndexEntry]) -> Result<Vec<u8>, FormatError> {
@@ -4428,6 +4629,26 @@ fn adaptive_container_layout(
     Ok((layout, summary))
 }
 
+fn seal_container_envelope(
+    container: &mut [u8],
+    header: &ContainerHeader,
+    intrinsic_summary: ContainerIntrinsicSummary,
+    footer_offset: usize,
+) -> Result<(), FormatError> {
+    container[..HEADER_BYTES].copy_from_slice(&header.encode(intrinsic_summary));
+    encode_footer(&mut container[footer_offset..], header, intrinsic_summary);
+    let hash = calculate_container_commitment(container, header)?;
+    container[footer_offset + FOOTER_HASH_OFFSET..footer_offset + FOOTER_HASH_OFFSET + 32]
+        .copy_from_slice(&hash);
+    let footer_checksum = crc32c_with_zeroed_field(&container[footer_offset..], FOOTER_CRC_OFFSET);
+    put_u32(
+        &mut container[footer_offset..],
+        FOOTER_CRC_OFFSET,
+        footer_checksum,
+    );
+    Ok(())
+}
+
 fn encode_container_from_adaptive_plans(
     container_id: ContainerId,
     container_generation: u64,
@@ -4453,7 +4674,6 @@ fn encode_container_from_adaptive_plans(
     let mut zstd_record_count = 0_usize;
     let mut zstd_prefix_record_count = 0_usize;
     let mut container = vec![0_u8; file_length];
-    container[..HEADER_BYTES].copy_from_slice(&header.encode(intrinsic_summary));
     let mut cursor = HEADER_BYTES;
     for record in records {
         let record_length = record.record_length()?;
@@ -4504,16 +4724,7 @@ fn encode_container_from_adaptive_plans(
         .checked_add(index.len())
         .ok_or(FormatError::ArithmeticOverflow)?;
     container[cursor..index_end].copy_from_slice(&index);
-    encode_footer(&mut container[footer_offset..], &header, intrinsic_summary);
-    let hash = calculate_container_commitment(&container, &header)?;
-    container[footer_offset + FOOTER_HASH_OFFSET..footer_offset + FOOTER_HASH_OFFSET + 32]
-        .copy_from_slice(&hash);
-    let footer_checksum = crc32c_with_zeroed_field(&container[footer_offset..], FOOTER_CRC_OFFSET);
-    put_u32(
-        &mut container[footer_offset..],
-        FOOTER_CRC_OFFSET,
-        footer_checksum,
-    );
+    seal_container_envelope(&mut container, &header, intrinsic_summary, footer_offset)?;
     Ok(AdaptiveContainerEncoding {
         bytes: container,
         publication: VerifiedContainerPublication {
@@ -4652,7 +4863,6 @@ fn encode_container_from_records(
     let footer_offset_usize =
         usize::try_from(layout.footer_offset).map_err(|_| FormatError::ArithmeticOverflow)?;
     let mut container = vec![0_u8; file_length_usize];
-    container[0..HEADER_BYTES].copy_from_slice(&header.encode(intrinsic_summary));
     let mut cursor = HEADER_BYTES;
     for record in encoded_records {
         let end = cursor
@@ -4666,22 +4876,12 @@ fn encode_container_from_records(
         .checked_add(index.len())
         .ok_or(FormatError::ArithmeticOverflow)?;
     container[cursor..index_end].copy_from_slice(&index);
-    encode_footer(
-        &mut container[footer_offset_usize..],
+    seal_container_envelope(
+        &mut container,
         &header,
         intrinsic_summary,
-    );
-    let hash = calculate_container_commitment(&container, &header)?;
-    container
-        [footer_offset_usize + FOOTER_HASH_OFFSET..footer_offset_usize + FOOTER_HASH_OFFSET + 32]
-        .copy_from_slice(&hash);
-    let footer_checksum =
-        crc32c_with_zeroed_field(&container[footer_offset_usize..], FOOTER_CRC_OFFSET);
-    put_u32(
-        &mut container[footer_offset_usize..],
-        FOOTER_CRC_OFFSET,
-        footer_checksum,
-    );
+        footer_offset_usize,
+    )?;
     Ok(AdaptiveContainerEncoding {
         bytes: container,
         publication: VerifiedContainerPublication {

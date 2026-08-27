@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fastdup_appliance::{APPLIANCE_RECOVERY_LATCH_FILE_NAME, checkpoint_policy_set_v1};
+use fastdup_appliance::{APPLIANCE_RECOVERY_LATCH_FILE_NAME, checkpoint_policy_set};
 use fastdup_format::{ManifestExtent, ManifestLeaf, MetadataObjectId, NamespaceRoot};
 use fastdup_store::{FsStorageIo, GenerationRepository};
 
@@ -36,7 +36,7 @@ fn offline_metadata_gc_cli_removes_an_orphan_and_scrubs_the_retained_graph() {
 
     let generations = GenerationRepository::new(
         FsStorageIo::open(&metadata_root).expect("create workspace-local metadata repository"),
-        checkpoint_policy_set_v1(),
+        checkpoint_policy_set(),
     );
     generations
         .commit_namespace(
@@ -109,6 +109,54 @@ fn offline_metadata_gc_cli_removes_an_orphan_and_scrubs_the_retained_graph() {
 }
 
 #[test]
+fn offline_pool_rebuild_cli_publishes_a_coherent_exact_similarity_pair() {
+    let root = unique_test_root("pool-rebuild-cli");
+    let metadata_root = root.join("metadata");
+    let container_root = root.join("containers");
+    std::fs::create_dir_all(&container_root).expect("create container root");
+    let generations = GenerationRepository::new(
+        FsStorageIo::open(&metadata_root).expect("create metadata repository"),
+        checkpoint_policy_set(),
+    );
+    generations
+        .commit_namespace(
+            &NamespaceRoot::new(4_096, 2, 0, Vec::new(), Vec::new())
+                .expect("empty namespace root is valid"),
+        )
+        .expect("commit a rebuildable empty pool");
+    drop(generations);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fastdup-maintenance"))
+        .args([
+            "--offline",
+            "rebuild-pool-indexes",
+            metadata_root
+                .to_str()
+                .expect("workspace-local metadata path is UTF-8"),
+            container_root
+                .to_str()
+                .expect("workspace-local container path is UTF-8"),
+        ])
+        .output()
+        .expect("execute the real paired-rebuild CLI");
+    assert!(
+        output.status.success(),
+        "ASSERT: paired rebuild CLI failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    assert!(
+        stdout.contains("pool_rebuild_ok=true")
+            && stdout.contains("similarity_generation=")
+            && stdout.contains("similarity_entries=0")
+            && stdout.contains("source_exact_run_set_id="),
+        "ASSERT: paired rebuild identity and work are observable: {stdout}"
+    );
+    assert!(stdout.contains("scrub_ok=true"));
+}
+
+#[test]
 fn recovery_required_repository_allows_scrub_before_other_offline_mutation() {
     let root = unique_test_root("recovery-required-cli");
     let metadata_root = root.join("metadata");
@@ -116,7 +164,7 @@ fn recovery_required_repository_allows_scrub_before_other_offline_mutation() {
     std::fs::create_dir_all(&container_root).expect("create container root");
     let generations = GenerationRepository::new(
         FsStorageIo::open(&metadata_root).expect("create metadata repository"),
-        checkpoint_policy_set_v1(),
+        checkpoint_policy_set(),
     );
     generations
         .commit_namespace(

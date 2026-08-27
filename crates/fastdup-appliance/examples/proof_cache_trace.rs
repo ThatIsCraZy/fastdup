@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use fastdup_appliance::{
-    DurableNamespace, ProofCachePolicy, ProofCacheTrace, checkpoint_policy_set_v1,
+    DurableNamespace, ProofCachePolicy, ProofCacheTrace, checkpoint_policy_set,
     replay_proof_cache_trace,
 };
 use fastdup_posix::{NamespaceConfig, OpenOptions, Operation, ROOT_INODE, Reply, RequestContext};
@@ -76,7 +76,7 @@ fn record(args: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
         NamespaceConfig::default(),
         GenerationRepository::new(
             FsStorageIo::open(&generation_root)?,
-            checkpoint_policy_set_v1(),
+            checkpoint_policy_set(),
         ),
         ContainerRepository::new(FsStorageIo::open(&container_root)?),
         &indexes,

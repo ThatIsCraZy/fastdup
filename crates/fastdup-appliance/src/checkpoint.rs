@@ -30,11 +30,10 @@ use fastdup_store::{
     ExactIndexPageCacheStatus, ExactIndexRunRepository, ExactRunMembershipStatus, GenerationError,
     GenerationRepository, IndexedRequiredChunkVerifier, ManifestReadError, ManifestSuccessorProof,
     ManifestTreeSummary, PersistentChunkPlan, PersistentReductionIndex, PersistentReductionStatus,
-    RequiredChunkVerifier, SeqCdcConfig, SimilarityIndexRepository, StorageIo, StoreError,
-    SuccessorPredecessor,
-    VerifiedCommittedFile, VerifiedManifestFile, VerifiedReadCache, VerifiedReadCacheError,
-    VerifiedReadCacheStatus, seqcdc_cut, seqcdc_cut_scalar, seqcdc_cut_segmented,
-    seqcdc_cut_segmented_scalar,
+    RequiredChunkVerifier, SeqCdcConfig, SimilarityIndexPageCacheStatus, SimilarityIndexRepository,
+    StorageIo, StoreError, SuccessorPredecessor, VerifiedCommittedFile, VerifiedManifestFile,
+    VerifiedReadCache, VerifiedReadCacheError, VerifiedReadCacheStatus, seqcdc_cut,
+    seqcdc_cut_scalar, seqcdc_cut_segmented, seqcdc_cut_segmented_scalar,
 };
 use rayon::prelude::*;
 
@@ -558,39 +557,25 @@ impl PhaseStarted {
 /// checkpoint writer policy.
 ///
 /// The canonical bytes pin SeqCDC-v1, region sizing, adaptive Zstd thresholds,
-/// and automatic level-zero Exact-Index publication. Changing any decision
-/// requires a new canonical policy string rather than silently reusing this ID.
+/// Exact publication, the optional coherent Similarity profile, bounded
+/// candidate/trial counts, and Depth-1 Zstd Prefix admission. Every new
+/// repository uses this Policy Set from its first Commit. Disabling Prefix
+/// selection or lacking a usable Similarity snapshot selects the independent
+/// RAW/Zstd fallback without changing the Policy Set.
 ///
 /// # Panics
 ///
 /// Panics only if BLAKE3 maps the fixed canonical policy bytes to the reserved
 /// all-zero identity, an impossible production `ASSERT` for this pinned input.
 #[must_use]
-pub fn checkpoint_policy_set_v1() -> PolicySetId {
-    PolicySetId::new(
-        ChunkId::of(
-            b"fastdup/checkpoint-policy-v1/SeqCDC=increasing:seq6:skip-trigger50:skip1024:min16384:max262144:append-tail-anchor-v1/region=524288/Zstd=level3:min4096:min3pct/exact=l0-runs-v2:fanin4:partition262144/proof=installed-successor-delta-v1",
-        )
-        .bytes(),
-    )
-    .expect("ASSERT: the checkpoint Policy Set hash is nonzero")
-}
-
-/// Returns the immutable identity of the advanced durable checkpoint writer.
-///
-/// Version two retains every baseline decision and additionally pins the
-/// coherent Similarity profile, bounded candidate/trial counts, and Depth-1
-/// Zstd Prefix admission policy. Merely opening a Similarity Index must never
-/// change output under the baseline v1 Policy Set.
-#[must_use]
-pub fn checkpoint_policy_set_v2() -> PolicySetId {
+pub fn checkpoint_policy_set() -> PolicySetId {
     PolicySetId::new(
         ChunkId::of(
             b"fastdup/checkpoint-policy-v2/SeqCDC=increasing:seq6:skip-trigger50:skip1024:min16384:max262144:append-tail-anchor-v1/region=524288/Zstd=level3:min4096:min3pct/exact=l0-runs-v2:fanin4:partition262144/proof=installed-successor-delta-v1/similarity=fingerprint-v1:bucket-v1:candidates16:trials4:paired-exact-v1/prefix=codec3:depth1:min4096:min5pct:contiguous-only",
         )
         .bytes(),
     )
-    .expect("ASSERT: the advanced checkpoint Policy Set hash is nonzero")
+    .expect("ASSERT: the current checkpoint Policy Set hash is nonzero")
 }
 
 /// Writable namespace plus the durable generation machinery behind it.
@@ -4107,6 +4092,7 @@ trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
     fn exact_run_membership_status(&self) -> ExactRunMembershipStatus;
     fn read_cache_status(&self) -> VerifiedReadCacheStatus;
     fn advanced_reduction_status(&self) -> PersistentReductionStatus;
+    fn similarity_page_cache_status(&self) -> SimilarityIndexPageCacheStatus;
 }
 
 #[derive(Debug)]
@@ -4167,6 +4153,10 @@ impl<C: StorageIo + 'static> ManifestReaderPolicy<C> for ScanManifestReaders {
 
     fn advanced_reduction_status(&self) -> PersistentReductionStatus {
         PersistentReductionStatus::default()
+    }
+
+    fn similarity_page_cache_status(&self) -> SimilarityIndexPageCacheStatus {
+        SimilarityIndexPageCacheStatus::default()
     }
 }
 
@@ -4424,9 +4414,17 @@ where
     }
 
     fn advanced_reduction_status(&self) -> PersistentReductionStatus {
-        self.reduction
-            .as_deref()
-            .map_or_else(PersistentReductionStatus::default, PersistentReductionIndex::status)
+        self.reduction.as_deref().map_or_else(
+            PersistentReductionStatus::default,
+            PersistentReductionIndex::status,
+        )
+    }
+
+    fn similarity_page_cache_status(&self) -> SimilarityIndexPageCacheStatus {
+        self.reduction.as_deref().map_or_else(
+            SimilarityIndexPageCacheStatus::default,
+            PersistentReductionIndex::similarity_page_cache_status,
+        )
     }
 }
 
@@ -4743,6 +4741,12 @@ where
     #[must_use]
     pub fn exact_run_membership_status(&self) -> ExactRunMembershipStatus {
         self.manifest_readers.exact_run_membership_status()
+    }
+
+    /// Returns pressure-aware Similarity hot-page cache evidence.
+    #[must_use]
+    pub fn similarity_index_page_cache_status(&self) -> SimilarityIndexPageCacheStatus {
+        self.manifest_readers.similarity_page_cache_status()
     }
 
     /// Returns bounded shared read-cache memory and hit/miss evidence.

@@ -16,15 +16,15 @@ all rebuildable caches. The verified read cache is a separate discardable tier:
 it is hard-capped at one eighth of effective RAM (and at most 8 GiB), while
 reserving at least one quarter of effective RAM or 4 GiB for ingest, XFS, and
 I/O queues. It purges and stops admitting payloads whenever the reserve is
-unavailable or the fastdup cgroup has charged Swap. The persistent Exact Index
+unavailable or the fastdup process has charged Swap. The persistent Exact Index
 retains only verified hot 4-KiB pages in a separate direct-mapped cache. Its hard geometry is one 128th
 of effective RAM, clamped to 1-256 MiB, while its resident target uses the same
-live reserve and drops to zero on cgroup Swap. It is never a complete in-memory Chunk
+live reserve and drops to zero on Process Swap. It is never a complete in-memory Chunk
 map. Rebuildable per-Run blocked Bloom hints use a separate active-set budget of
 one 32nd of effective RAM, clamped to 1 MiB-8 GiB and limited by headroom above
-the shared reserve. Every Run-Set activation resamples headroom, and Swap
-charged to the fastdup cgroup disables filters in the replacement; host Swap
-belonging to other workloads does not. Filters of at least 2 MiB use their own
+the shared reserve. Every Run-Set activation resamples headroom, and Process
+Swap disables filters in the replacement; Host or shared-cgroup Swap belonging
+to other workloads does not. Filters of at least 2 MiB use their own
 anonymous `MADV_HUGEPAGE` mapping; smaller filters remain normal heap
 allocations. Absence always falls back to the verified Exact pages. The
 data-tier `io_uring` adapter has an independent
@@ -95,15 +95,17 @@ For every sustained ingest test record all of the following:
   this cache contains no Header/Footer pages or DATA payload; and
 - `exact_run_membership` filters, allocated and huge-page-advised bytes, probes,
   definite absences, and lookups requiring Exact pages; and
-- `memory_budget_governor` effective limit, available bytes, host and cgroup
-  Swap separately, cgroup Swap limit/protection, sample count, and failures; and
+- `memory_budget_governor` effective limit, available bytes, process, host, and
+  cgroup Swap separately, cgroup Swap limit/protection, sample count, and
+  failures; and
 - `data_io_uring` mode, `inflight_bytes`, `peak_inflight_bytes`, submitted and
   completed operation counts, root-sync caller/submission counts, owned
   publications started/completed, `borrowed_write_copy_bytes`, configured
   verifier workers, jobs started/completed/failed, and active/peak-active
   verifications.
 
-Pass requires daemon and cgroup Swap to remain zero. Host `pswpout` may change
+Pass requires daemon and its dedicated production cgroup Swap to remain zero.
+Host `pswpout` may change
 because of another cgroup and must be attributed before failing fastdup;
 fastdup's `memory.swap.current` and process `VmSwap` must not increase. No
 `oom`, `oom_kill`, or `max` event may occur. Historical host SwapUsed is not by

@@ -17,9 +17,7 @@ replacement-before-deletion ordering, generation revalidation, exact canonical
 identity check, and directory sync remain required. Full scrub becomes a
 periodic audit and catalog-repair source.
 
-This also advances the Container envelope from format version 1 to version 2.
-The record, Recovery Index, integrity, alignment, and structural-commitment
-rules accepted by ADRs 0008 and 0060 do not change.
+This advances the Container envelope from format version 1 to version 2.
 
 ## Trust levels
 

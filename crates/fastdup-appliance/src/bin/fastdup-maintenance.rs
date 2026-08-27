@@ -2,18 +2,18 @@ use std::path::{Path, PathBuf};
 
 use fastdup_appliance::{
     ApplianceLease, ApplianceLeaseOwner, ApplianceRecoveryLatch, ApplianceRecoveryState,
-    checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1, request_online_gc_now,
+    checkpoint_exact_index_profile_v1, checkpoint_policy_set, request_online_gc_now,
 };
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo, GenerationRepository,
-    MaintenanceExecutionMode, MaintenanceRepository,
+    MaintenanceExecutionMode, MaintenanceRepository, SimilarityIndexRepository,
 };
 
 mod common;
 
 use common::metadata_gc_status_fields;
 
-const USAGE: &str = "usage:\n  fastdup-maintenance --online gc-now METADATA_ROOT\n  fastdup-maintenance --offline (scrub|scrub-gc|gc-now|metadata-gc|rebuild-exact) METADATA_ROOT CONTAINER_ROOT";
+const USAGE: &str = "usage:\n  fastdup-maintenance --online gc-now METADATA_ROOT\n  fastdup-maintenance --offline (scrub|scrub-gc|gc-now|metadata-gc|rebuild-exact|rebuild-pool-indexes) METADATA_ROOT CONTAINER_ROOT";
 
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,10 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let containers = ContainerRepository::new(FsStorageIo::open(&container_root)?);
+    let indexes = ExactIndexRunRepository::new(metadata.clone());
     let maintenance = MaintenanceRepository::new(
-        GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1()),
+        GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
         containers,
-        ExactIndexRunRepository::new(metadata.clone()),
+        indexes,
         checkpoint_exact_index_profile_v1(),
     );
 
@@ -125,6 +126,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rebuilt.activation_generation(),
         );
         print_scrub(maintenance.scrub()?);
+    } else if command == "rebuild-pool-indexes" {
+        let similarities = SimilarityIndexRepository::new(metadata.clone());
+        let rebuilt = maintenance.rebuild_pool_indexes(&similarities)?;
+        println!(
+            concat!(
+                "pool_rebuild_ok=true containers_scanned={} entries_rebuilt={} ",
+                "run_families={} physical_runs={} run_set_generation={} activation_generation={} ",
+                "source_exact_run_set_id={} similarity_generation={} similarity_entries={} ",
+                "similarity_partitions={}"
+            ),
+            rebuilt.exact().containers_scanned(),
+            rebuilt.exact().entries_rebuilt(),
+            rebuilt.exact().run_families(),
+            rebuilt.exact().physical_runs(),
+            rebuilt.exact().run_set_generation(),
+            rebuilt.exact().activation_generation(),
+            encode_hex(rebuilt.exact_run_set_id().bytes()),
+            rebuilt.similarity_generation(),
+            rebuilt.similarity_entries(),
+            rebuilt.similarity_partitions(),
+        );
+        print_scrub(maintenance.scrub()?);
     } else {
         return Err(USAGE.into());
     }
@@ -133,6 +156,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("appliance_recovery_required=false proof=offline_scrub");
     }
     Ok(())
+}
+
+fn encode_hex<const N: usize>(bytes: [u8; N]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(N * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}")
+            .expect("ASSERT: writing into an owned String cannot fail");
+    }
+    encoded
 }
 
 fn print_metadata_gc(report: fastdup_store::MetadataGarbageCollectionReport) {

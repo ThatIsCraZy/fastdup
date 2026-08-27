@@ -24,4 +24,7 @@ only the latter authorizes newer writer behavior.
 Policy Set and Repository Format Epoch remain distinct. A Policy Set identifies
 chunking, encoding, placement, and maintenance choices for one generation; the
 epoch fences repository-wide reader/writer compatibility. Object-local versions
-still determine how individual immutable bytes decode.
+still determine how individual immutable bytes decode. Under ADR 0074 the
+pre-production writer accepts only the one current Policy Set from the first
+Commit; this does not remove the separate epoch-zero reader needed by the
+Format-Epoch fault and downgrade boundary.

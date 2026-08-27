@@ -35,12 +35,14 @@ pub use commit::{
 };
 pub use container::{
     AdaptiveContainerEncoding, BuildingContainerHeader, ChunkId, ContainerHeader, ContainerId,
-    ContainerIntrinsicSummary, ContainerLayout, ContainerRecordRange, FOOTER_BYTES, FormatError,
-    HEADER_BYTES, IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
-    MAX_LOGICAL_CHUNK_BYTES, PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
-    PreparedIndependentRecord, PreparedZstdPrefixRecord, RECORD_HEADER_BYTES, RawRecord,
+    ContainerIntrinsicSummary, ContainerLayout, ContainerRecordRange, ContainerRecoveryEnvelope,
+    FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
+    IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, MAX_LOGICAL_CHUNK_BYTES,
+    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, PreparedIndependentRecord,
+    PreparedZstdPrefixRecord, RECORD_HEADER_BYTES, RawRecord, RecoveryIndexCandidate,
     SealedContainer, SealedContainerDescriptor, VerifiedChunkLocation,
-    VerifiedContainerPublication, VerifiedRawLocation, ZstdPrefixDependency, ZstdPrefixRecord,
+    VerifiedContainerPublication, VerifiedRawLocation, VerifiedRecoveryIndex, ZstdPrefixDependency,
+    ZstdPrefixRecord,
 };
 pub use container_generation_high_water::{
     CONTAINER_GENERATION_HIGH_WATER_RECORD_BYTES, ContainerGenerationHighWaterFormatError,

@@ -79,8 +79,12 @@ fn repository_wide_page_cache_obeys_shared_memory_headroom() {
     let mut target = base.clone();
     target[17_000] ^= 0x5a;
 
-    recovered.candidates(&target).expect("first cacheable query");
-    recovered.candidates(&target).expect("second cache-hit query");
+    recovered
+        .candidates(&target)
+        .expect("first cacheable query");
+    recovered
+        .candidates(&target)
+        .expect("second cache-hit query");
     let warm = repository.page_cache_status();
     assert!(warm.resident_pages() > 0);
     assert!(warm.hits() > 0);

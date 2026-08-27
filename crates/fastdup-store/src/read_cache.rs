@@ -687,14 +687,15 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_host_swap_does_not_close_fastdup_cache_admission() {
+    fn unrelated_host_and_shared_cgroup_swap_do_not_close_fastdup_cache_admission() {
         let config = VerifiedReadCacheConfig::new(2 * 1_024 * 1_024, 0, NonZeroUsize::MIN)
             .expect("valid cache geometry");
         let snapshot = MemoryPressureSnapshot::with_swap_state(
             8 * 1_024 * 1_024,
             8 * 1_024 * 1_024,
-            4 * 1_024 * 1_024,
             0,
+            4 * 1_024 * 1_024,
+            3 * 1_024 * 1_024,
             Some(0),
         );
         let cache = VerifiedReadCache::new_with_snapshot(config, snapshot)

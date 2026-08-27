@@ -6,8 +6,8 @@
 //! for the mount lifetime and is replaced only by a later paired recovery.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fastdup_format::{
     ChunkId, IncompressibilityGatePolicy, PrehashedChunk, PreparedIndependentRecord,
@@ -17,7 +17,7 @@ use fastdup_format::{
 use crate::exact_index_repository::{ExactIndexGenerationPin, ExactIndexGenerationSnapshot};
 use crate::reduction_prefix::{BaseChunkRef, VerifiedBaseChunk, ZstdPrefixCodec, ZstdPrefixTrial};
 use crate::similarity_index_repository::{RecoveredSimilarityIndex, SimilarityIndexStoreError};
-use crate::{ContainerRepository, StorageIo};
+use crate::{ContainerRepository, SimilarityIndexPageCacheStatus, StorageIo};
 
 const MAXIMUM_PREFIX_TRIALS_V1: usize = 4;
 const DEPENDENT_MINIMUM_SAVINGS_BYTES_V1: usize = 4_096;
@@ -45,7 +45,7 @@ impl<I: Clone + StorageIo> fmt::Debug for PersistentReductionIndex<I> {
             .debug_struct("PersistentReductionIndex")
             .field("exact_activation", &self.exact.activation())
             .field("similarity", &self.similarity.status())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -99,6 +99,11 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             saved_payload_bytes: self.saved_payload_bytes.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
         }
+    }
+
+    #[must_use]
+    pub fn similarity_page_cache_status(&self) -> SimilarityIndexPageCacheStatus {
+        self.similarity.page_cache_status()
     }
 
     /// Plans one candidate Chunk without repeated target hashing or encoding.

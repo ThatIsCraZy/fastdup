@@ -17,8 +17,8 @@ _Avoid_: Container-store milestone, production appliance
 **Advanced reduction**:
 The optional writer path that pins one coherent Exact/Similarity snapshot and
 uses bounded Similarity Candidates to trial Depth-1 ZSTD_PREFIX encodings.
-Failure, absence, or staleness of this rebuildable acceleration falls back to
-independent RAW/Zstd without weakening write availability or content truth.
+Unavailable or stale acceleration falls back to independent encoding without
+weakening content truth.
 _Avoid_: Delta mode, authoritative Similarity Index
 
 ## Stored data
@@ -295,10 +295,23 @@ It protects Dirty DATA, reduction workers, XFS clean/writeback pages, and device
 queues; pressure shrinks or disables cache admission rather than borrowing it.
 _Avoid_: Cache capacity, free RAM, metadata reserve
 
+**Process Swap**:
+Swap currently attributable to the running fastdup process. It closes
+rebuildable cache admission until cleared. Host or shared-cgroup Swap is not
+Process Swap; a dedicated no-Swap cgroup remains the hard production boundary.
+_Avoid_: Host Swap, cgroup Swap, memory pressure
+
 **Recovery index**:
 Container-local metadata from which stored logical chunk identities and physical
 locations can be rediscovered without the online deduplication index.
 _Avoid_: Dedup index
+
+**Recovery index evidence**:
+The paired Container envelope plus one complete compact, checksummed Recovery
+Index. It bounds candidate discovery without reading record payloads, but the
+selected Encoding Record must still verify before yielding logical bytes and
+the evidence never establishes liveness.
+_Avoid_: Exact Index, Container proof, GC deletion proof
 
 **Quarantined location**:
 A physical location excluded from reads because its integrity could not be

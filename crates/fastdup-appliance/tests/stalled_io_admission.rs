@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fastdup_appliance::{
-    CheckpointProgressAction, DurabilitySupervisor, DurableNamespace, checkpoint_policy_set_v1,
+    CheckpointProgressAction, DurabilitySupervisor, DurableNamespace, checkpoint_policy_set,
 };
 use fastdup_posix::{
     InodeId, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE, Reply, RequestContext,
@@ -118,7 +118,7 @@ fn fake_clock_closes_admission_while_metadata_sync_is_stalled() {
     );
     let appliance = DurableNamespace::open(
         NamespaceConfig::default(),
-        GenerationRepository::new(paused.clone(), checkpoint_policy_set_v1()),
+        GenerationRepository::new(paused.clone(), checkpoint_policy_set()),
         ContainerRepository::new(MemoryStorageIo::new()),
         4_096,
     )
@@ -135,7 +135,7 @@ fn fake_clock_closes_admission_while_data_sync_is_stalled() {
     );
     let appliance = DurableNamespace::open(
         NamespaceConfig::default(),
-        GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set_v1()),
+        GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set()),
         ContainerRepository::new(paused.clone()),
         4_096,
     )

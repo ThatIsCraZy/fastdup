@@ -15,10 +15,11 @@ checkpoint serialization lock. Opening a new repository publishes an initial
 Inode ID reservation before mutation admission. Reopening an existing
 repository first skips the complete old reservation and durably publishes a
 fresh range; no ID acknowledged inside a lost durability window is reused.
-The daemon derives its nonzero Policy Set ID from canonical
-`checkpoint-policy-v1` bytes that pin FastCDC, Compression Region, Zstd
-selection, level-zero publication, and four-way compaction decisions; these
-rules cannot change silently under the earlier experimental constant ID.
+The daemon derives its one current nonzero Policy Set ID from canonical bytes
+that pin SeqCDC-v1, Compression Region and Zstd selection, Exact publication,
+and the optional Similarity/Zstd-PREFIX decisions. Every new repository uses
+that identity from its first Commit; runtime Prefix activation selects only a
+path already covered by the Policy Set.
 
 A checkpoint performs this order:
 

@@ -185,8 +185,14 @@ impl<'a, I: StorageIo> SimilarityEntryStager<'a, I> {
             return Err(SimilarityIndexStoreError::InvalidTarget);
         }
         let entry_runs = std::mem::take(&mut self.entry_runs);
-        let entry_run =
+        let merged_entry_run =
             merge_all::<I, EntryRecord>(&mut self.scratch, "entries", entry_runs, self.config)?;
+        let entry_run = compact_entry_run(
+            &mut self.scratch,
+            &merged_entry_run,
+            self.config.spool_buffer_bytes,
+        )?;
+        remove_if_present(self.scratch.storage, &merged_entry_run.name)?;
         let (bucket_runs, entry_count, _key_bounds) =
             derive_bucket_runs(&mut self.scratch, &entry_run, self.config)?;
         let raw_bucket_run =
@@ -535,6 +541,35 @@ where
         if let Some(next) = readers[ordinal].next()? {
             heap.push(Reverse((next, ordinal)));
         }
+    }
+    writer.finish()
+}
+
+fn compact_entry_run<I>(
+    scratch: &mut ScratchNames<'_, I>,
+    input: &SpoolRun,
+    buffer_bytes: usize,
+) -> Result<SpoolRun, SimilarityIndexStoreError>
+where
+    I: StorageIo,
+{
+    let name = scratch.create("unique-entries")?;
+    let mut writer = SpoolWriter::<I, EntryRecord>::new(scratch.storage, name, buffer_bytes);
+    let mut reader = SpoolReader::<I, EntryRecord>::new(scratch.storage, input, buffer_bytes);
+    let mut previous = None;
+    while let Some(record @ EntryRecord(entry)) = reader.next()? {
+        if let Some(EntryRecord(previous_entry)) = previous {
+            if previous_entry.chunk_id() > entry.chunk_id()
+                || (previous_entry.chunk_id() == entry.chunk_id() && previous_entry != entry)
+            {
+                return Err(SimilarityIndexStoreError::IndexCorruption);
+            }
+            if previous_entry.chunk_id() == entry.chunk_id() {
+                continue;
+            }
+        }
+        writer.push(record)?;
+        previous = Some(record);
     }
     writer.finish()
 }
@@ -1051,6 +1086,59 @@ mod tests {
 
     use super::*;
     use crate::FsStorageIo;
+
+    #[test]
+    fn duplicate_chunk_ids_are_compacted_before_partition_streaming() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is after Unix epoch")
+            .as_nanos();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".artifacts/tests")
+            .join(format!(
+                "similarity-external-duplicates-{}-{nonce}",
+                std::process::id()
+            ));
+        let storage = FsStorageIo::open(root).expect("open duplicate fixture root");
+        let unique = (0_u64..4)
+            .map(|ordinal| {
+                SimilarityIndexEntry::new(
+                    ChunkId::of(&ordinal.to_le_bytes()),
+                    64 * 1_024,
+                    SIMILARITY_FINGERPRINT_PROFILE_V1,
+                    [ordinal; 4],
+                    [ordinal; 8],
+                )
+                .expect("construct duplicate fixture entry")
+            })
+            .collect::<Vec<_>>();
+        let entries = vec![
+            unique[3], unique[1], unique[0], unique[3], unique[2], unique[1],
+        ];
+        let config = ExternalSortConfig {
+            entry_chunk_records: 2,
+            bucket_chunk_records: 3,
+            merge_fan_in: 2,
+            spool_buffer_bytes: ENTRY_SPOOL_BYTES * 2,
+            partition_target_references: 5,
+        };
+
+        let build = write_partitioned_runs_with_config(&storage, 78, entries, config)
+            .expect("compact duplicate Chunk IDs into one canonical entry");
+
+        assert_eq!(build.logical_entry_count, unique.len() as u64);
+        for partition in &build.partitions {
+            fastdup_format::SimilarityIndexRun::decode(
+                &storage
+                    .read(&partition.temporary_name)
+                    .expect("read duplicate fixture partition"),
+            )
+            .expect("decode duplicate-free partition");
+            remove_if_present(&storage, &partition.temporary_name)
+                .expect("remove duplicate fixture partition");
+        }
+    }
 
     #[test]
     fn tiny_chunks_force_multilevel_merge_and_bucket_partitions() {

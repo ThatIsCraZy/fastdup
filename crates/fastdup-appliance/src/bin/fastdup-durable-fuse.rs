@@ -11,7 +11,7 @@ use fastdup_appliance::{
     CheckpointAction, CheckpointProgressAction, DurabilityObservation, DurabilitySupervisor,
     DurableNamespace, ONLINE_GC_CONTROL_REQUEST, OnlineGcPolicy, OnlineGcScheduler,
     ProfiledCheckpoint, STATFS_RESERVE_BASIS_POINTS, StatFsOverride, TieredStatFsSource,
-    bind_online_gc_control_socket, checkpoint_exact_index_profile_v1, checkpoint_policy_set_v1,
+    bind_online_gc_control_socket, checkpoint_exact_index_profile_v1, checkpoint_policy_set,
     online_gc_control_path,
 };
 use fastdup_copy_metrics::copy_telemetry;
@@ -22,8 +22,8 @@ use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo,
     GcCandidateCatalogRepository, GenerationRepository, MaintenanceRepository,
     OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport, OnlineGcRunMode,
-    OwnedContainerPublication, StorageIo, StoreError, publication_sample_ranges,
-    system_memory_budget_governor,
+    OwnedContainerPublication, SimilarityIndexRepository, StorageIo, StoreError,
+    publication_sample_ranges, system_memory_budget_governor,
 };
 
 mod common;
@@ -40,6 +40,12 @@ const SCHEDULER_RESOLUTION: Duration = Duration::from_millis(50);
 const CHECKPOINT_WARNING: Duration = Duration::from_secs(5);
 const ONLINE_GC_SCHEDULER_RESOLUTION: Duration = Duration::from_secs(5);
 const INODE_RESERVATION_SPAN: u64 = 4_096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdvancedReductionPolicy {
+    Off,
+    PrefixV1,
+}
 
 type FsAppliance = DurableNamespace<FsStorageIo, TelemetryStorageIo>;
 type FsOnlineMaintenance = MaintenanceRepository<FsStorageIo, FsStorageIo, FsStorageIo>;
@@ -86,7 +92,7 @@ impl Drop for OnlineGcSocketGuard {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mount_path, metadata_root, container_root) = parse_mount_arguments()?;
-    let (statfs_override, online_gc_policy) = validated_startup_policies()?;
+    let (statfs_override, online_gc_policy, advanced_reduction) = validated_startup_policies()?;
     std::fs::create_dir_all(&metadata_root)?;
     let _appliance_lease =
         ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::WritableDaemon)?;
@@ -95,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
     let data_storage = open_data_storage(&container_root, io_telemetry_enabled)?;
-    let recovered = recover_appliance(&metadata_root, &data_storage)?;
+    let recovered = recover_appliance(&metadata_root, &data_storage, advanced_reduction)?;
     emit_online_gc_recovery(recovered.online_gc_recovery);
     let appliance = Arc::new(recovered.appliance);
     let filesystem =
@@ -117,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &data_storage,
         io_telemetry_enabled,
         statfs_override,
+        advanced_reduction,
     );
 
     let mut ticks = interval(SCHEDULER_RESOLUTION);
@@ -264,23 +271,42 @@ fn validate_memory_budget_policy() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn validated_startup_policies()
--> Result<(Option<StatFsOverride>, OnlineGcPolicy), Box<dyn std::error::Error>> {
+fn validated_startup_policies() -> Result<
+    (
+        Option<StatFsOverride>,
+        OnlineGcPolicy,
+        AdvancedReductionPolicy,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let statfs_override = statfs_override_from_environment()?;
     let online_gc_policy = OnlineGcPolicy::from_environment()?;
+    let advanced_reduction = advanced_reduction_policy_from_environment()?;
     validate_memory_budget_policy()?;
-    Ok((statfs_override, online_gc_policy))
+    Ok((statfs_override, online_gc_policy, advanced_reduction))
+}
+
+fn advanced_reduction_policy_from_environment()
+-> Result<AdvancedReductionPolicy, Box<dyn std::error::Error>> {
+    const NAME: &str = "FASTDUP_ADVANCED_REDUCTION";
+    match std::env::var(NAME) {
+        Ok(value) if value == "off" => Ok(AdvancedReductionPolicy::Off),
+        Ok(value) if value == "prefix-v1" => Ok(AdvancedReductionPolicy::PrefixV1),
+        Ok(value) => Err(format!("{NAME} must be off or prefix-v1, got {value:?}").into()),
+        Err(std::env::VarError::NotPresent) => Ok(AdvancedReductionPolicy::Off),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn recover_appliance(
     metadata_root: &std::path::Path,
     data_storage: &TelemetryStorageIo,
+    advanced_reduction: AdvancedReductionPolicy,
 ) -> Result<RecoveredAppliance, Box<dyn std::error::Error>> {
     let metadata_storage = FsStorageIo::open(metadata_root)?;
-    let generations =
-        GenerationRepository::new(metadata_storage.clone(), checkpoint_policy_set_v1());
+    let generations = GenerationRepository::new(metadata_storage.clone(), checkpoint_policy_set());
     let containers = ContainerRepository::new(data_storage.clone());
-    let indexes = ExactIndexRunRepository::new(metadata_storage);
+    let indexes = ExactIndexRunRepository::new(metadata_storage.clone());
     let maintenance_containers =
         containers.with_maintenance_storage(FsStorageIo::open(data_storage.inner.root())?);
     let online_maintenance = MaintenanceRepository::new(
@@ -291,13 +317,26 @@ fn recover_appliance(
     );
     let online_gc_recovery = online_maintenance.finalize_recovered_online_gc()?;
     let gc_catalog = GcCandidateCatalogRepository::new(FsStorageIo::open(metadata_root)?);
-    let appliance = DurableNamespace::open_with_index(
-        NamespaceConfig::default(),
-        generations,
-        containers,
-        &indexes,
-        INODE_RESERVATION_SPAN,
-    )?;
+    let appliance = match advanced_reduction {
+        AdvancedReductionPolicy::Off => DurableNamespace::open_with_index(
+            NamespaceConfig::default(),
+            generations,
+            containers,
+            &indexes,
+            INODE_RESERVATION_SPAN,
+        )?,
+        AdvancedReductionPolicy::PrefixV1 => {
+            let similarities = SimilarityIndexRepository::new(metadata_storage);
+            DurableNamespace::open_with_reduction_indexes(
+                NamespaceConfig::default(),
+                generations,
+                containers,
+                &indexes,
+                &similarities,
+                INODE_RESERVATION_SPAN,
+            )?
+        }
+    };
     Ok(RecoveredAppliance {
         appliance,
         online_gc_recovery,
@@ -619,7 +658,9 @@ fn emit_mount_state(
     data_storage: &TelemetryStorageIo,
     io_telemetry_enabled: bool,
     statfs_override: Option<StatFsOverride>,
+    advanced_reduction: AdvancedReductionPolicy,
 ) {
+    let reduction = appliance.write_through_status().advanced_reduction();
     eprintln!(
         "fastdup durable checkpoint mount at {}; metadata+exact-index={}, containers={}, exact-index-runs={}, checkpoint-workers={}, dirty-checkpoint-bytes={}, exact-index-degraded={}",
         mount_path.display(),
@@ -629,6 +670,10 @@ fn emit_mount_state(
         appliance.checkpoint_worker_limit(),
         CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1,
         appliance.exact_index_degraded(),
+    );
+    eprintln!(
+        "advanced_reduction_configured={advanced_reduction:?} active={}",
+        reduction.enabled(),
     );
     emit_io_telemetry_state(io_telemetry_enabled);
     emit_statfs_state(statfs_override);
@@ -768,6 +813,26 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
     );
     emit_cpu_phase_state("write_through_hash_cpu", status.hash_cpu());
     emit_cpu_phase_state("write_through_encode_cpu", status.encode_cpu());
+    let reduction = status.advanced_reduction();
+    eprintln!(
+        concat!(
+            "advanced_reduction enabled={} queries={} candidates={} base_reads={} ",
+            "base_read_bytes={} prefix_trials={} accepted_prefixes={} ",
+            "independent_fallbacks={} no_candidate_fallbacks={} ",
+            "saved_payload_bytes={} errors={}"
+        ),
+        reduction.enabled(),
+        reduction.queries(),
+        reduction.candidates(),
+        reduction.base_reads(),
+        reduction.base_read_bytes(),
+        reduction.prefix_trials(),
+        reduction.accepted_prefixes(),
+        reduction.independent_fallbacks(),
+        reduction.no_candidate_fallbacks(),
+        reduction.saved_payload_bytes(),
+        reduction.errors(),
+    );
 }
 
 fn emit_cpu_phase_state(label: &str, status: fastdup_appliance::CpuPhaseStatus) {
@@ -931,6 +996,7 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         exact.available_bytes(),
         exact.swap_used_bytes(),
     );
+    emit_similarity_index_page_cache(appliance);
     let descriptors = appliance.container_descriptor_cache_status();
     eprintln!(
         concat!(
@@ -985,6 +1051,30 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
     );
 }
 
+fn emit_similarity_index_page_cache(appliance: &FsAppliance) {
+    let similarity = appliance.similarity_index_page_cache_status();
+    eprintln!(
+        concat!(
+            "similarity_index_page_cache hits={} misses={} hit_rate_basis_points={} ",
+            "resident_pages={} target_pages={} capacity_pages={} evictions={} ",
+            "pressure_rejections={} reserve_bytes={} effective_limit_bytes={} ",
+            "available_bytes={} swap_used_bytes={}"
+        ),
+        similarity.hits(),
+        similarity.misses(),
+        similarity.hit_rate_basis_points(),
+        similarity.resident_pages(),
+        similarity.target_pages(),
+        similarity.capacity_pages(),
+        similarity.evictions(),
+        similarity.pressure_rejections(),
+        similarity.reserve_bytes(),
+        similarity.effective_limit_bytes(),
+        similarity.available_bytes(),
+        similarity.swap_used_bytes(),
+    );
+}
+
 fn emit_memory_budget_governor() {
     let status = system_memory_budget_governor().status();
     if let Some(snapshot) = status.snapshot() {
@@ -994,13 +1084,15 @@ fn emit_memory_budget_governor() {
         eprintln!(
             concat!(
                 "memory_budget_governor samples={} sample_failures={} ",
-                "effective_limit_bytes={} available_bytes={} host_swap_used_bytes={} ",
+                "effective_limit_bytes={} available_bytes={} process_swap_used_bytes={} ",
+                "host_swap_used_bytes={} ",
                 "cgroup_swap_used_bytes={} cgroup_swap_limit_bytes={} swap_protected={}"
             ),
             status.samples(),
             status.sample_failures(),
             snapshot.effective_limit_bytes(),
             snapshot.available_bytes(),
+            snapshot.process_swap_used_bytes(),
             snapshot.host_swap_used_bytes(),
             snapshot.cgroup_swap_used_bytes(),
             swap_limit,

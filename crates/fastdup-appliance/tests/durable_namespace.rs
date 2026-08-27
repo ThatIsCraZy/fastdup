@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fastdup_appliance::{
-    DurableNamespace, checkpoint_policy_set_v1, recover_mount, recover_mount_with_index,
+    DurableNamespace, checkpoint_policy_set, recover_mount, recover_mount_with_index,
 };
 use fastdup_format::PolicySetId;
 use fastdup_posix::{
@@ -1438,7 +1438,7 @@ fn one_checkpoint_shares_one_barrier_across_all_new_metadata_objects() {
     let metadata = MemoryStorageIo::new();
     let appliance = DurableNamespace::open(
         NamespaceConfig::default(),
-        GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1()),
+        GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
         ContainerRepository::new(MemoryStorageIo::new()),
         16,
     )
@@ -2400,7 +2400,7 @@ fn checkpoint_consumes_writer_verified_dependencies_without_record_reread() {
     let indexes = MemoryStorageIo::new();
     let appliance = DurableNamespace::open_with_index(
         NamespaceConfig::default(),
-        GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        GenerationRepository::new(metadata, checkpoint_policy_set()),
         ContainerRepository::new(containers.clone()),
         &ExactIndexRunRepository::new(indexes),
         16,
@@ -2439,7 +2439,7 @@ fn second_identical_file_reuses_online_proofs_or_reverifies_under_memory_pressur
     let indexes = MemoryStorageIo::new();
     let appliance = DurableNamespace::open_with_index(
         NamespaceConfig::default(),
-        GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        GenerationRepository::new(metadata, checkpoint_policy_set()),
         ContainerRepository::new(containers.clone()),
         &ExactIndexRunRepository::new(indexes),
         16,
@@ -2505,7 +2505,7 @@ fn actual_ingest_emits_replayable_online_proof_events() {
     let indexes = MemoryStorageIo::new();
     let appliance = DurableNamespace::open_with_index(
         NamespaceConfig::default(),
-        GenerationRepository::new(metadata, checkpoint_policy_set_v1()),
+        GenerationRepository::new(metadata, checkpoint_policy_set()),
         ContainerRepository::new(containers),
         &ExactIndexRunRepository::new(indexes),
         16,
@@ -2685,11 +2685,11 @@ fn published_chunk_count(container_root: &Path) -> usize {
 fn nested_directories_checkpoint_recover_and_scrub_with_one_file_manifest() {
     let metadata = MemoryStorageIo::new();
     let container_storage = MemoryStorageIo::new();
-    let generations = GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1());
+    let generations = GenerationRepository::new(metadata.clone(), checkpoint_policy_set());
     let containers = ContainerRepository::new(container_storage.clone());
     let appliance = DurableNamespace::open(
         NamespaceConfig::default(),
-        GenerationRepository::new(metadata.clone(), checkpoint_policy_set_v1()),
+        GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
         ContainerRepository::new(container_storage.clone()),
         16,
     )

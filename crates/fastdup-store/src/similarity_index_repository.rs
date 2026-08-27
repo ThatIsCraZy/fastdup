@@ -544,6 +544,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         Ok(Some(RecoveredSimilarityIndex {
             storage: self.storage.clone(),
             partitions: partitions.into_boxed_slice(),
+            page_cache: Arc::clone(&self.page_cache),
             status,
         }))
     }
@@ -979,6 +980,7 @@ fn read_entry_at<I: StorageIo>(
 pub struct RecoveredSimilarityIndex<I> {
     storage: I,
     partitions: Box<[RecoveredSimilarityPartition]>,
+    page_cache: Arc<SimilarityPageCache>,
     status: SimilarityIndexRebuildStatus,
 }
 
@@ -995,6 +997,11 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
     #[must_use]
     pub const fn status(&self) -> SimilarityIndexRebuildStatus {
         self.status
+    }
+
+    #[must_use]
+    pub fn page_cache_status(&self) -> SimilarityIndexPageCacheStatus {
+        self.page_cache.status()
     }
 
     /// Returns at most 16 pool-wide candidate identities for one target.
@@ -1307,11 +1314,7 @@ impl<P> DirectSimilarityPageCache<P> {
     }
 
     fn slot(&self, run_hash: [u8; 32], page_ordinal: usize) -> &SimilarityPageCacheSlot<P> {
-        &self.slots[similarity_page_cache_slot(
-            run_hash,
-            page_ordinal,
-            self.slots.len(),
-        )]
+        &self.slots[similarity_page_cache_slot(run_hash, page_ordinal, self.slots.len())]
     }
 
     fn purge(&self) -> u64 {
@@ -1378,7 +1381,11 @@ impl SimilarityPageCache {
         cache
     }
 
-    fn get_entry(&self, run_hash: [u8; 32], page_ordinal: usize) -> Option<Arc<SimilarityIndexPage>> {
+    fn get_entry(
+        &self,
+        run_hash: [u8; 32],
+        page_ordinal: usize,
+    ) -> Option<Arc<SimilarityIndexPage>> {
         self.get(&self.entry_pages, run_hash, page_ordinal)
     }
 
@@ -1404,9 +1411,7 @@ impl SimilarityPageCache {
             .expect("ASSERT: Similarity page-cache slot lock poisoned");
         let found = cached
             .as_ref()
-            .filter(|cached| {
-                cached.run_hash == run_hash && cached.page_ordinal == page_ordinal
-            })
+            .filter(|cached| cached.run_hash == run_hash && cached.page_ordinal == page_ordinal)
             .map(|cached| Arc::clone(&cached.page));
         if found.is_some() {
             self.hits.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1566,25 +1571,22 @@ fn similarity_page_cache_capacity() -> u64 {
 }
 
 fn similarity_page_cache_accounted_page_bytes() -> u64 {
-    u64::try_from(SIMILARITY_INDEX_PAGE_BYTES + size_of::<SimilarityPageCacheSlot<SimilarityIndexPage>>())
-        .expect("ASSERT: Similarity accounted page bytes fit u64")
+    u64::try_from(
+        SIMILARITY_INDEX_PAGE_BYTES + size_of::<SimilarityPageCacheSlot<SimilarityIndexPage>>(),
+    )
+    .expect("ASSERT: Similarity accounted page bytes fit u64")
 }
 
-fn similarity_page_cache_slot(
-    run_hash: [u8; 32],
-    page_ordinal: usize,
-    slot_count: usize,
-) -> usize {
+fn similarity_page_cache_slot(run_hash: [u8; 32], page_ordinal: usize, slot_count: usize) -> usize {
     let mut lane = [0_u8; 8];
     lane.copy_from_slice(&run_hash[..8]);
     let page = u64::try_from(page_ordinal)
         .expect("ASSERT: a Similarity page ordinal fits the cache hash domain");
     let mixed =
         u64::from_le_bytes(lane) ^ page.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ page.rotate_left(29);
-    let mask = u64::try_from(slot_count - 1)
-        .expect("ASSERT: the Similarity page-cache mask fits u64");
-    usize::try_from(mixed & mask)
-        .expect("ASSERT: a masked Similarity page-cache slot fits usize")
+    let mask =
+        u64::try_from(slot_count - 1).expect("ASSERT: the Similarity page-cache mask fits u64");
+    usize::try_from(mixed & mask).expect("ASSERT: a masked Similarity page-cache slot fits usize")
 }
 
 const _: () = assert!(std::mem::align_of::<SimilarityPageCacheSlot<SimilarityIndexPage>>() == 64);
@@ -1722,6 +1724,15 @@ impl SimilarityIndexPageCacheStatus {
     #[must_use]
     pub const fn misses(self) -> u64 {
         self.misses
+    }
+
+    #[must_use]
+    pub const fn hit_rate_basis_points(self) -> u64 {
+        let total = self.hits.saturating_add(self.misses);
+        match self.hits.saturating_mul(10_000).checked_div(total) {
+            Some(rate) => rate,
+            None => 0,
+        }
     }
 
     #[must_use]

@@ -170,6 +170,32 @@ fn invalid_memory_policy_fails_daemon_before_repository_open() {
 }
 
 #[test]
+fn invalid_advanced_reduction_policy_fails_before_repository_open() {
+    let root = unique_test_root("invalid-advanced-reduction-policy");
+    let mount_root = root.join("mount");
+    let metadata_root = root.join("metadata");
+    let container_root = root.join("containers");
+    std::fs::create_dir_all(&mount_root).expect("create mount root");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fastdup-durable-fuse"))
+        .args([&mount_root, &metadata_root, &container_root])
+        .env("FASTDUP_ADVANCED_REDUCTION", "maybe")
+        .output()
+        .expect("execute daemon with invalid advanced-reduction policy");
+    assert!(!output.status.success(), "ASSERT: invalid policy must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("FASTDUP_ADVANCED_REDUCTION must be off or prefix-v1"),
+        "ASSERT: startup reports the invalid policy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !metadata_root.exists() && !container_root.exists(),
+        "ASSERT: invalid advanced-reduction policy cannot open either storage root"
+    );
+}
+
+#[test]
 fn malformed_recovery_latch_fails_daemon_before_data_repository_open() {
     let root = unique_test_root("malformed-recovery-latch");
     let mount_root = root.join("mount");

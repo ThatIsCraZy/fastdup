@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use fastdup_format::{
     ChunkId, ContainerId, ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError,
     ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError,
-    GcCandidateCatalogDescriptor, GcCandidateCatalogRow, MAX_LOGICAL_CHUNK_BYTES, SealedContainer,
+    ExactIndexRunSetId, GcCandidateCatalogDescriptor, GcCandidateCatalogRow,
+    MAX_LOGICAL_CHUNK_BYTES, SealedContainer,
 };
 
 use crate::generation::GenerationLivenessProof;
@@ -1780,6 +1781,7 @@ where
         );
         Ok(PoolIndexRebuildReport {
             exact,
+            exact_run_set_id,
             similarity_generation,
             similarity_entries,
             similarity_partitions,
@@ -2232,6 +2234,7 @@ impl ExactIndexRebuildReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolIndexRebuildReport {
     exact: ExactIndexRebuildReport,
+    exact_run_set_id: ExactIndexRunSetId,
     similarity_generation: u64,
     similarity_entries: u64,
     similarity_partitions: usize,
@@ -2241,6 +2244,11 @@ impl PoolIndexRebuildReport {
     #[must_use]
     pub const fn exact(self) -> ExactIndexRebuildReport {
         self.exact
+    }
+
+    #[must_use]
+    pub const fn exact_run_set_id(self) -> ExactIndexRunSetId {
+        self.exact_run_set_id
     }
 
     #[must_use]

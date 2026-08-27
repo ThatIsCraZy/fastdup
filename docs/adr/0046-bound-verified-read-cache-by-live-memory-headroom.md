@@ -37,8 +37,8 @@ cache access, not in FastCDC, Bloom probes, or encoding loops.
 The Exact Index page cache has an independent smaller hard budget: one 128th of
 effective RAM, clamped between 1 MiB and 256 MiB. Its resident target grows up
 to that preallocated geometry only while `MemAvailable` exceeds the shared
-reserve. Falling below the reserve purges resident pages; Swap charged to
-fastdup's cgroup sets its target to zero. Fixed slot metadata is cache-line aligned, and page
+reserve. Falling below the reserve purges resident pages; Swap charged to the
+fastdup process sets its target to zero. Fixed slot metadata is cache-line aligned, and page
 admission never allocates an unbounded lookup table.
 
 Active immutable Exact Runs additionally use rebuildable membership filters.
@@ -49,7 +49,7 @@ above the same shared reserve. Dense filters of at least 2 MiB use a dedicated
 anonymous mapping with `MADV_HUGEPAGE`; smaller filters stay on the heap. The
 advice never covers allocator pages containing unrelated Rust objects, and
 lookup remains one ordinary slice access with no branch on backing type.
-Headroom is resampled for every Run-Set activation; if fastdup's own cgroup has
+Headroom is resampled for every Run-Set activation; if the fastdup process has
 charged Swap, no filters are admitted to the replacement.
 A missing filter changes only performance:
 lookup falls through to verified Exact pages. The immutable filters are rebuilt
@@ -58,11 +58,12 @@ during Run activation audit, never persisted, and never authorize a Location.
 The fixed set metadata plus resident payload can never exceed the hard limit.
 When available memory cannot cover the reserve, the payload target shrinks. If
 resident payload exceeds the new target, all payload entries are discarded
-rather than gradually chasing pressure. Nonzero `memory.swap.current` in
-fastdup's own cgroup sets the payload target to zero, purges all entries, and
-refuses new admission until that charge returns to zero. Host Swap use remains
-separate telemetry because it may belong entirely to another workload. Durable
-reads continue through the verified XFS path.
+rather than gradually chasing pressure. Nonzero Process Swap sets the payload
+target to zero, purges all entries, and refuses new admission until that charge
+returns to zero. Host and current-cgroup Swap remain separate telemetry because
+either may belong to another workload when the process is not yet running in
+its dedicated production cgroup. Durable reads continue through the verified
+XFS path.
 
 This process policy prevents the fastdup caches from intentionally consuming
 the I/O reserve, but an application budget cannot overrule kernel reclaim. A
@@ -99,8 +100,8 @@ The resident target is the smaller of hard capacity, two percent of effective
 RAM using a conservative 160 bytes per entry, and available bytes above the
 shared cache reserve. A healthy 128-GiB appliance can therefore reach the full
 512-TiB addressable set. Lower-memory or pressured systems retain less. Any
-Swap charged to fastdup's cgroup sets the target to zero, releases all allocated
-shard maps, and rejects admission until pressure clears. Allocation failure
+Swap charged to the fastdup process sets the target to zero, releases all
+allocated shard maps, and rejects admission until pressure clears. Allocation failure
 rejects only the cache entry and never the verified read.
 
 A hit removes `object_len` plus Header/Footer reads, but the selected Record is

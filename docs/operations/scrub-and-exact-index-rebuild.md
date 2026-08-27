@@ -31,6 +31,9 @@ cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
   --offline rebuild-exact METADATA_ROOT CONTAINER_ROOT
 
 cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
+  --offline rebuild-pool-indexes METADATA_ROOT CONTAINER_ROOT
+
+cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
   --offline scrub-gc METADATA_ROOT CONTAINER_ROOT
 
 cargo run --release -p fastdup-appliance --bin fastdup-maintenance -- \
@@ -55,8 +58,8 @@ and does not use the ordinary recovery fallback. It verifies:
 - the complete union of DATA dependencies pinned by the current and immediately
   previous online generations; older Log records remain diagnostic transition
   history and never become implicit DATA snapshots;
-- every canonically named published Container, including decoded records,
-  Recovery Index, CRCs, Chunk tables, and BLAKE3 Chunk identities;
+- every canonically named published format-2 Container, including decoded
+  records, Recovery Index, CRCs, Chunk tables, and BLAKE3 Chunk identities;
 - both Exact-Index activation slots, the selected Run Set, every complete Run
   hash/page/order invariant, and cross-family Chunk-length identity; and
 - every ACTIVE Exact-Index Location against its exact immutable Container
@@ -262,15 +265,17 @@ index or the complete new generation. Additional tests cover corruption of a
 Container and active Run page, cross-Run Chunk-length conflict, orphan retry,
 repeat rebuild generations, and multi-level compaction across 17 Containers.
 
-The library also exposes a paired pool-index rebuild for advanced reduction.
+`rebuild-pool-indexes` performs the paired pool-index rebuild for advanced
+reduction.
 It feeds Exact and Similarity builders from the same verified Container read,
 audits both hidden outputs, activates Exact first, and publishes the Similarity
-family manifest last. The family authenticates the active Exact Run Set ID;
-paired recovery and offline audit do not select a different or unbound identity. Empty
-pools publish a bound empty Similarity tombstone, and retry allocates after the
-generation of any orphan Similarity partition. The metadata fault matrix proves
-that crash recovery never exposes a Similarity family without its bound Exact
-Run Set. A maintenance CLI command for this paired operation is still pending.
+family manifest last. Identical Chunk IDs from multiple valid Locations are
+compacted before Similarity partitioning; conflicting entries fail closed. The
+family authenticates the active Exact Run Set ID; paired recovery and offline
+audit do not select a different or unbound identity. Empty pools publish a
+bound empty Similarity tombstone, and retry allocates after the generation of
+any orphan Similarity partition. The metadata fault matrix proves that crash
+recovery never exposes a Similarity family without its bound Exact Run Set.
 
 Remaining production gates are real block-device power-cut campaigns, measured
 large-store scrub/rebuild/GC throughput, and broad randomized process-kill

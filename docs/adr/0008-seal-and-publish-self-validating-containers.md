@@ -4,10 +4,11 @@ status: accepted
 
 # Seal and publish self-validating containers
 
-Container format v1 uses explicit little-endian serialization, zeroed reserved
-fields, fixed 4 KiB header/footer blocks, and 64-byte record alignment. ADR
-0060 narrows the original whole-image BLAKE3 decision to a structural
-commitment while retaining independent payload checks. A
+The current Container format retains explicit little-endian serialization,
+zeroed reserved fields, fixed 4 KiB header/footer blocks, and 64-byte record
+alignment. ADR 0060 narrows the original whole-image BLAKE3 decision to a
+structural commitment while retaining independent payload checks; ADR 0075
+adds payload-free Recovery Index discovery. A
 container moves through `BUILDING`, `SEALED`, and `PUBLISHED`; only a fully
 checksummed, synchronized, atomically renamed, and directory-synchronized
 container may be referenced by metadata. This makes torn construction detectable

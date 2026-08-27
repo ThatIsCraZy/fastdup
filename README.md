@@ -62,9 +62,15 @@ Recovery, Scrub, einen neu aufbaubaren Exact Index sowie adaptives DATA- und
 Metadata-GC. Der erweiterte dauerhafte Pfad besitzt außerdem einen neu
 aufbaubaren, an den Exact Index gebundenen Similarity Index und Depth-1-
 `ZSTD_PREFIX`-Records. Diese Bausteine sind vollständig lesbar, recoverbar,
-scrubbar und GC-sicher; ihre betriebliche Aktivierung und reale
-Workload-Evidenz werden derzeit abgeschlossen. Sparse-XOR-Delta, Dictionary
-und Reorder bleiben Forschungs- oder Referenzpfade.
+scrubbar und GC-sicher. Der Daemon kann sie nach einem gepaarten
+Exact-/Similarity-Rebuild explizit mit `FASTDUP_ADVANCED_REDUCTION=prefix-v1`
+aktivieren. Alle neuen Repositories tragen vom ersten Commit an dieselbe
+aktuelle Writer-Policy; `off` ist deren unabhängiger RAW/Zstd-Fallback und
+keine zweite Policy. Andere Policy-IDs werden ohne Migration abgewiesen. Ein
+realer ABBA-SMB-Lauf ist dokumentiert, rechtfertigt wegen kleiner
+Kapazitätswirkung und streuender GC-Kosten aber noch keine Aktivierung als
+Default. Sparse-XOR-Delta, Dictionary und Reorder bleiben Forschungs- oder
+Referenzpfade.
 
 Die verbindlichen Begriffe stehen in [CONTEXT.md](CONTEXT.md). Entscheidungen
 über Haltbarkeit und Formate stehen in den [ADRs](docs/adr/).
@@ -90,6 +96,8 @@ Der FUSE-Pfad unterstützt unter anderem:
 - Offline-Scrub, adaptives Online-/Offline-GC und Neuaufbau des Exact Index
 - optionaler gepaarter Neuaufbau von Exact und Similarity sowie begrenzte
   Depth-1-Zstd-PREFIX-Auswahl gegen unabhängig dekodierbare Bases
+- lock-freie Advanced-Reduction- und druckbegrenzte Similarity-Cache-
+  Telemetrie für Queries, Trials, Base-I/O, Annahmen, Fallbacks und Einsparung
 
 Der Adapter bildet noch nicht den gesamten POSIX-Umfang ab. Insbesondere BSD
 `flock` sowie die breite Client-, POSIX-, Samba- und
@@ -140,11 +148,17 @@ Upgrade-/Allocator-Grenzen geschlossen:
   mehrere Handles, Seitengrenzen, Hole/Zero, Truncate sowie kohärentes
   Read-only-`mmap` und die Ablehnung von Shared-writable-`mmap` ab.
 - Ein prozessweiter `MemoryBudgetGovernor` liefert allen rebuildbaren Caches
-  höchstens alle 250 ms denselben fail-closed Host-/cgroup-Snapshot. Bereits
-  belegter Host-Swap anderer cgroups schaltet fastdup nicht mehr ab; nur
-  `memory.swap.current` der eigenen, im Produktionsbetrieb dedizierten cgroup
-  schließt Cache Admission. `MemorySwapMax=0` plus die Startprüfung
-  `FASTDUP_REQUIRE_CGROUP_NO_SWAP=1` bilden die harte Kernel-Grenze.
+  höchstens alle 250 ms denselben fail-closed Prozess-/Host-/cgroup-Snapshot. Bereits
+  belegter Host- oder Shared-cgroup-Swap schaltet fastdup nicht ab; nur der
+  eigene Prozess-Swap schließt Cache Admission. `MemorySwapMax=0` in einer
+  dedizierten cgroup plus `FASTDUP_REQUIRE_CGROUP_NO_SWAP=1` bilden die harte
+  Kernel-Grenze.
+- Das aktuelle Policy Set gilt vom ersten Repository-Commit an für `off` und
+  `prefix-v1`; es gibt weder eine Legacy-Policy noch einen Policy-
+  Migrationspfad. `rebuild-pool-indexes` veröffentlicht Exact und Similarity
+  aus einem verifizierten Scan als kohärentes Paar; doppelte Chunk-IDs werden
+  im begrenzten externen Sort vor der kanonischen Similarity-Publikation
+  verdichtet.
 - Langlebige, dichte Dedup-Bloom-Tabellen ab 2 MiB liegen in eigenen anonymen
   `MADV_HUGEPAGE`-Mappings. Kleine Tabellen bleiben auf dem Heap. Die
   Bloom-Probe-Hot-Loop erhält dadurch weder Sampling noch Locks noch eine
@@ -160,31 +174,44 @@ Upgrade-/Allocator-Grenzen geschlossen:
   reale siebenstufige SIGKILL/FUSE-Remount-Matrix sind für diesen Stand grün.
   Dauerhaft blockierte oder fehlerhaft bestätigende Hardware bleibt außerhalb
   des unterstützten Ausfallmodells.
+- Das einzige Container-Format bleibt Version 2; es gibt weder einen
+  Format-3-Writer noch Migration oder Legacy-Reader. Index-freie Prefix-Reads
+  listen den DATA-Namensraum einmal, durchsuchen nur die vorhandenen kompakten,
+  checksummierten Recovery Indexes, lesen genau den ausgewählten Record und
+  cachen wiederholt verwendete Bases nur für den laufenden Container-Read.
+  Physische Base-Adressen bleiben ausschließlich rebuildbare
+  Location-Beschleunigung.
 
 ## Empfohlener nächster Entwicklungsabschnitt
 
-Als Nächstes sollte die bestehende deterministische Crash-Matrix durch eine
-randomisierte reale Process-Kill-Kampagne erweitert werden. Epoch-Zaun und
-Container-Generation-High-Water entfernen dafür zwei bisherige
-Wiederanlauf-Sonderfälle; jetzt kann ein Langlauf zufällige Kill-Zeitpunkte über
-Ingest, Commit-WAL-Rotation, High-Water-Erweiterung und GC legen und
-ausschließlich vollständige Generationen als Oracle verwenden.
+Als Nächstes sollte der opt-in Advanced-Reduction-Pfad gegen ein breiteres,
+realistisch entwickeltes Backup-Corpus und mehrere ABBA-Wiederholungen
+qualifiziert werden. Der erste reale Lauf belegt den funktionierenden
+Similarity-/Prefix-Pfad und null Prozess-Swap, zeigt aber nur 0,0527 % weniger
+Repository-Allokation und im Mittel 3,42-mal so lange Offline-GC-Läufe. Die
+Ursache der GC-Verstärkung war der alte index-freie Base-Fallback: Jeder
+Prefix-Record listete den DATA-Namensraum neu und las Provider-Container bis
+zur gefundenen Base vollständig. Der pass-lokale Resolver nutzt stattdessen den
+bereits vorhandenen Recovery Index von Format 2; ein erneuter realer
+Prefix-ABBA-Lauf muss die GC-Wirkung noch quantifizieren, bevor `prefix-v1`
+Default werden darf.
 
 Der Abschnitt ist abgeschlossen, wenn:
 
-1. Seeds, Kill-Position, bestätigte Mutationen und erwartete Commit-Grenze pro
-   Lauf reproduzierbar protokolliert werden;
-2. jeder Remount entweder die vollständige alte oder neue Generation liefert,
-   nie Mischzustände oder wiederverwendete Inode-/Container-Generationen;
-3. Läufe WAL-Rotation, High-Water-Bereichswechsel und paralleles Online-GC
-   gezielt erreichen;
-4. Recovery Latch, Lease und Scrub nach jedem unsauberen Ende fail-closed
-   bleiben; und
-5. der Langlauf ohne Mess- oder Fault-Dispatch in der POSIX-Mutations- und
-   Ingest-Admission-Hot-Loop auskommt.
+1. mehrere versionierte Backup-Familien statt nur acht Ein-Byte-Änderungen pro
+   ISO Exact-, Similarity- und Fallback-Entscheidungen reproduzierbar auslösen;
+2. ABBA-Läufe Kapazität, SMB-Durchsatz, completed-write-p99, Restore und
+   Prozess-/cgroup-Swap gemeinsam ausweisen;
+3. der erneute Prefix-ABBA-Lauf bestätigt, dass Scrub/GC keine vollständigen
+   Provider-Container pro Dependency mehr scannt und das ausdrückliche
+   Regressionsbudget einhält;
+4. alle Restores bytegenau sowie Recovery, Scrub und GC fail-closed bleiben;
+   und
+5. Metrik, Cache-Governance und Policy-Auswahl weiterhin keine Locks, Syscalls
+   oder Speicher-Samples in die Ingest- und Candidate-Hot-Loops einführen.
 
-Danach folgen Blockgeräte-Power-Cut-/Torn-Write-Kampagnen, gemessene
-Large-Store-Scrub-/GC-Läufe und die offenen POSIX-/Samba-Matrizen.
+Danach folgen die randomisierte Process-Kill-Kampagne, Blockgeräte-Power-Cut-/
+Torn-Write-Tests und die offenen POSIX-/Samba-Matrizen.
 
 ## Ingest-Pipeline
 
@@ -344,12 +371,34 @@ mkdir -p \
 Der Daemon läuft im Vordergrund. `Ctrl-C` stoppt die Mutationsannahme, führt
 den abschließenden Checkpoint aus und hängt den Mount aus.
 
+Advanced Reduction ist opt-in. Alle neuen Repositories verwenden bereits vom
+ersten Commit an das aktuelle Policy Set. Zuerst wird bei beendetem Daemon ein
+kohärentes Indexpaar aufgebaut, danach wird die optionale Prefix-Auswahl
+aktiviert:
+
+```bash
+BIN=/source/fastdup/.artifacts/target/release
+META=/source/fastdup/.artifacts/repository/metadata
+DATA=/source/fastdup/.artifacts/repository/containers
+
+"$BIN/fastdup-maintenance" --offline rebuild-pool-indexes "$META" "$DATA"
+FASTDUP_ADVANCED_REDUCTION=prefix-v1 \
+  "$BIN/fastdup-durable-fuse" \
+  /source/fastdup/.artifacts/mount "$META" "$DATA"
+```
+
+Fehlt das Paar oder passt seine Exact-Bindung nicht, bleibt der Write-Pfad
+verfügbar und fällt auf unabhängiges RAW/Zstd zurück. Ein Repository-Head darf
+nur mit genau dem aktuellen Policy Set geöffnet werden;
+Prototype-Repositories mit einer anderen Policy-ID werden nicht migriert.
+
 Für den produktiven No-Swap-Betrieb muss der Daemon in einer eigenen
 cgroup-v2 mit `MemorySwapMax=0` laufen. Mit
 `FASTDUP_REQUIRE_CGROUP_NO_SWAP=1` prüft er diese Kernel-Grenze noch vor dem
 Öffnen von Metadata und DATA. Der gemeinsame `MemoryBudgetGovernor` passt die
 rebuildbaren Cache-Budgets an den kleineren Host-/cgroup-Headroom an; bereits
-belegter Swap anderer cgroups schaltet die fastdup-Caches nicht mehr ab.
+belegter Host- oder Shared-cgroup-Swap schaltet die fastdup-Caches nicht ab.
+Nur Swap des Daemon-Prozesses schließt ihre Admission.
 Langlebige, dichte Dedup-Bloom-Tabellen ab 2 MiB erhalten eine eigene
 `MADV_HUGEPAGE`-Arena, ohne die Bloom-Probe-Hot-Loop um Sampling oder Locks zu
 erweitern. Details und Abnahmekriterien stehen in
@@ -368,6 +417,7 @@ DATA=/source/fastdup/.artifacts/repository/containers
 "$BIN" --offline scrub "$META" "$DATA"
 "$BIN" --offline metadata-gc "$META" "$DATA"
 "$BIN" --offline rebuild-exact "$META" "$DATA"
+"$BIN" --offline rebuild-pool-indexes "$META" "$DATA"
 "$BIN" --offline scrub-gc "$META" "$DATA"
 ```
 
@@ -422,8 +472,8 @@ Vor einem produktiven Einsatz fehlen insbesondere:
 - vollständige POSIX-Abdeckung und breitere Client-Kompatibilität
 - Schutz vor Geräteverlust
 - Langzeit-, Zufalls-Kill- und echte Stromausfalltests auf Blockgeräten
-- Produktionsaktivierung und workloadrepräsentative SMB-/Restore-Evidenz für
-  Similarity und Zstd-PREFIX
+- breitere versionierte Backup-Corpora und ein belastbares GC-/Restore-Gate,
+  bevor Similarity und Zstd-PREFIX zum Default werden
 - dauerhafte Writer-, Recovery-, Scrub- und GC-Invarianten für
   Dictionary-Encodings; Sparse-XOR-Delta und Reorder bleiben experimentell
 - Veeam-Protokollevidenz für das Samba-Modul
@@ -435,4 +485,5 @@ unter [docs/testing](docs/testing/) und Betriebsnotizen unter
 
 Der aktuelle reale Online-GC-Interferenzlauf ist unter
 [docs/benchmarks/online-gc-interference-2026-08-26.md](docs/benchmarks/online-gc-interference-2026-08-26.md)
-dokumentiert.
+dokumentiert. Der opt-in Prefix-ABBA-Lauf steht unter
+[docs/benchmarks/persistent-prefix-smb-ab-2026-08-27.md](docs/benchmarks/persistent-prefix-smb-ab-2026-08-27.md).
