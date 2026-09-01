@@ -41,7 +41,7 @@ CPUs, AVX2/BMI2 und kein AVX-512:
 | --- | ---: | --- |
 | Drei serielle SingleStream-SMB-Uploads | **1.022,1 MiB/s** | aktueller Produktionspfad |
 | Erster physischer / schnellster Exact-Upload | **601,0 / 1.576,2 MiB/s** | bytegenau geprüfter SMB-Lauf |
-| Gesamte Repository-Reduction | **3,104× / 67,78 % gespart** | derselbe dauerhafte SMB-Lauf |
+| Reduction bei drei Kopien | **67,78 % gespart / 3,104×** | inklusive Metadaten; reine Exact-Dedup ist auf 66,67 % begrenzt |
 | SeqCDC-AVX2-/BMI2-Scanner | **9.568 MiB/s** | isolierter Rocky-ISO-Scan in 1-MiB-Slices |
 | Reduction im versionierten ISO-Stresstest | **42,95× / 98,311 % Exact Hits** | Ingest-Historie, keine Live-Kapazität |
 
@@ -49,6 +49,14 @@ Die Werte sind host- und workloadspezifisch und keine SLA-Zusage. Siehe
 [aktueller SMB-Nachweis](docs/benchmarks/hot-buffer-reuse-2026-09-01.md),
 [601-Sekunden-FUSE-Lauf](docs/benchmarks/io-intensive-fuse-600s.md) und
 [interaktive Produktseite](https://thatiscrazy.github.io/fastdup/#performance).
+
+Das Drei-Kopien-Ergebnis ist bewusst kein Maximaltest: Drei identische Kopien
+können durch reine Exact-Dedup höchstens 3:1 zeigen. fastdup übertrifft die
+dazugehörige Einsparung von 66,67 % bereits inklusive Repository-Metadaten,
+weil weitere Reduction-Stufen beitragen. Werte wie 50:1 benötigen genügend
+redundante Versionen und einen passenden Datenmix; der separate
+50-Versionen-Workload erreichte 42,95×, aber ein Drei-Kopien-Test kann kein
+allgemeingültiges 50:1 belegen.
 
 fastdup geht über eine klassische Exact-Dedup-plus-Kompression-Pipeline hinaus.
 Der dauerhafte Default kombiniert SeqCDC Content-Defined Chunking,

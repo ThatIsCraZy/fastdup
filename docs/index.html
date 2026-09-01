@@ -15,7 +15,7 @@
     <meta property="og:url" content="https://thatiscrazy.github.io/fastdup/">
     <meta property="og:image" content="https://thatiscrazy.github.io/fastdup/assets/webui-overview.png">
     <meta name="twitter:card" content="summary_large_image">
-    <link rel="stylesheet" href="site.css">
+    <link rel="stylesheet" href="site.css?v=20260902-2">
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
@@ -82,7 +82,7 @@
       <section class="trust-strip" aria-label="Produktmerkmale">
         <div><strong>Standard x86-64</strong><span class="lang-de">softwaredefinierte Appliance</span><span class="lang-en">software-defined appliance</span></div>
         <div><strong class="lang-de">1.022,1 MiB/s</strong><strong class="lang-en">1,022.1 MiB/s</strong><span class="lang-de">aktueller SMB-Aggregatdurchsatz</span><span class="lang-en">current aggregate SMB throughput</span></div>
-        <div><strong class="lang-de">3,104×</strong><strong class="lang-en">3.104×</strong><span class="lang-de">gemessene Repository-Reduction</span><span class="lang-en">measured repository reduction</span></div>
+        <div><strong class="lang-de">42,95×</strong><strong class="lang-en">42.95×</strong><span class="lang-de">im 50-Versionen-Stresstest</span><span class="lang-en">in the 50-version stress test</span></div>
         <div><strong>HTTPS WebUI</strong><span class="lang-de">Provisionierung bis Telemetrie</span><span class="lang-en">provisioning through telemetry</span></div>
       </section>
 
@@ -114,17 +114,23 @@
             <p class="lang-de">Der Messhost war keine große Storage-CPU: eine VM auf einem Intel Core i7-1370P aus der Notebook-Klasse, mit nur zehn sichtbaren logischen CPUs, AVX2/BMI2 und ohne AVX-512. Der aktuelle SMB-Lauf blieb dabei bei 569,5 MB Peak RSS und 0 Byte Prozess-Swap.</p>
             <p class="lang-en">The measured host was not a large storage CPU: a VM on a notebook-class Intel Core i7-1370P, exposing only ten logical CPUs, with AVX2/BMI2 and no AVX-512. The current SMB run stayed at 569.5 MB peak RSS and zero bytes of process swap.</p>
           </div>
+          <div class="reduction-context">
+            <strong class="lang-de">Drei Kopien testen nicht das maximale Reduction-Potenzial.</strong>
+            <strong class="lang-en">Three copies do not test the maximum reduction potential.</strong>
+            <p class="lang-de">Bei drei identischen Kopien kann reine Exact-Dedup höchstens 66,67 % einsparen. fastdup erreicht im dauerhaften SMB-Lauf 67,78 % inklusive Metadaten—dank zusätzlicher Reduction-Stufen sogar etwas mehr als dieses reine Dedup-Limit. Mit mehr redundanten Versionen wächst das Verhältnis weiter: Ein separater Lauf mit 50 minimal veränderten ISO-Versionen erreichte 42,95×.</p>
+            <p class="lang-en">With three identical copies, exact dedup alone can save at most 66.67%. fastdup reaches 67.78% in the durable SMB run including metadata—additional reduction stages push it slightly beyond that dedup-only limit. The ratio grows with more redundant versions: a separate run with 50 minimally changed ISO versions reached 42.95×.</p>
+          </div>
           <div class="metric-grid">
             <article><span class="metric lang-de">1.022,1</span><span class="metric lang-en">1,022.1</span><strong>MiB/s</strong><h3 class="lang-de">SMB-Aggregat</h3><h3 class="lang-en">aggregate SMB</h3><p class="lang-de">Drei serielle ISO-Uploads im aktuellen Produktionspfad.</p><p class="lang-en">Three serial ISO uploads on the current production path.</p><small>END-TO-END · CURRENT RUN</small></article>
             <article><span class="metric lang-de">601,0</span><span class="metric lang-en">601.0</span><strong>MiB/s</strong><h3 class="lang-de">Erster physischer Upload</h3><h3 class="lang-en">first physical upload</h3><p class="lang-de">Neue Chunks inklusive Container-Publication auf den DATA-Tier.</p><p class="lang-en">New chunks including container publication to the DATA tier.</p><small>END-TO-END · COPY 1</small></article>
             <article><span class="metric lang-de">1.576,2</span><span class="metric lang-en">1,576.2</span><strong>MiB/s</strong><h3 class="lang-de">Exact-Wiederholung</h3><h3 class="lang-en">exact repeat</h3><p class="lang-de">Schnellste Einzelkopie im selben bytegenau geprüften SMB-Lauf.</p><p class="lang-en">Fastest individual copy in the same byte-verified SMB run.</p><small>END-TO-END · COPY 3</small></article>
-            <article class="accent"><span class="metric lang-de">3,104×</span><span class="metric lang-en">3.104×</span><strong class="lang-de">67,78 % gespart</strong><strong class="lang-en">67.78% saved</strong><h3 class="lang-de">Repository gesamt</h3><h3 class="lang-en">whole repository</h3><p class="lang-de">Logische Daten zu allokiertem Repository inklusive Metadaten.</p><p class="lang-en">Logical data versus allocated repository including metadata.</p><small>DURABLE SMB PATH · 3 LIVE COPIES</small></article>
+            <article class="accent"><span class="metric lang-de">67,78 %</span><span class="metric lang-en">67.78%</span><strong class="lang-de">bei nur drei Kopien</strong><strong class="lang-en">with only three copies</strong><h3 class="lang-de">Dedup-Limit erreicht</h3><h3 class="lang-en">dedup limit reached</h3><p class="lang-de">Reine Exact-Dedup ist bei drei identischen Kopien auf 66,67 % begrenzt.</p><p class="lang-en">Exact dedup alone is capped at 66.67% with three identical copies.</p><small class="lang-de">3,104× GESAMT · INKLUSIVE METADATEN</small><small class="lang-en">3.104× TOTAL · INCLUDING METADATA</small></article>
             <article><span class="metric lang-de">9.568</span><span class="metric lang-en">9,568</span><strong>MiB/s</strong><h3>SeqCDC AVX2/BMI2</h3><p class="lang-de">Isolierter 1-MiB-Slice-Scanner über die Rocky-ISO.</p><p class="lang-en">Isolated 1 MiB-slice scanner over the Rocky ISO.</p><small class="lang-de">MICROBENCHMARK · 6.223 MiB/s SKALAR</small><small class="lang-en">MICROBENCHMARK · 6,223 MiB/s SCALAR</small></article>
-            <article class="accent-soft"><span class="metric lang-de">42,95×</span><span class="metric lang-en">42.95×</span><strong class="lang-de">98,311 % Exact Hits</strong><strong class="lang-en">98.311% exact hits</strong><h3 class="lang-de">Versionierter ISO-Stresstest</h3><h3 class="lang-en">versioned ISO stress test</h3><p class="lang-de">601 Sekunden FUSE; logische Ingest-Daten zu DATA plus Metadaten.</p><p class="lang-en">601 seconds of FUSE; logical ingest data versus DATA plus metadata.</p><small>WORKLOAD RESULT · NOT LIVE CAPACITY</small></article>
+            <article class="accent-soft"><span class="metric lang-de">42,95×</span><span class="metric lang-en">42.95×</span><strong class="lang-de">98,311 % Exact Hits</strong><strong class="lang-en">98.311% exact hits</strong><h3 class="lang-de">50-Versionen-Stresstest</h3><h3 class="lang-en">50-version stress test</h3><p class="lang-de">Minimal veränderte ISO-Versionen zeigen, wie die Reduction mit Redundanz skaliert.</p><p class="lang-en">Minimally changed ISO versions show how reduction scales with redundancy.</p><small>WORKLOAD RESULT · NOT LIVE CAPACITY</small></article>
           </div>
           <div class="evidence-row">
-            <p class="lang-de">Workload- und hostabhängige Messungen, keine SLA. Der SMB-Lauf nutzt ein ISO mit warmen Exact-Wiederholungen und virtuelle Testgeräte. 42,95× misst Ingest-Historie aus 50 minimal veränderten ISO-Versionen; der finale Namespace war leer und GC-Credit fehlte, daher ist es keine Live-Kapazitätsquote.</p>
-            <p class="lang-en">Workload- and host-specific measurements, not an SLA. The SMB run uses one ISO with warm exact repeats and virtual test devices. 42.95× measures ingest history from 50 minimally changed ISO versions; the final namespace was empty and no GC credit applied, so it is not a live-capacity ratio.</p>
+            <p class="lang-de">Reduction ist abhängig von Datenmix, Änderungsrate und Aufbewahrung. Werte wie 50:1 brauchen entsprechend viele redundante Daten und lassen sich aus einem Drei-Kopien-Test weder belegen noch widerlegen. 42,95× misst die Ingest-Historie aus 50 minimal veränderten ISO-Versionen; der finale Namespace war leer und GC-Credit fehlte, daher ist es keine Live-Kapazitätsquote. Alle Messungen sind workload- und hostabhängig und keine SLA.</p>
+            <p class="lang-en">Reduction depends on data mix, change rate, and retention. Ratios such as 50:1 require enough redundant data and can be neither proven nor disproven by a three-copy test. 42.95× measures ingest history from 50 minimally changed ISO versions; the final namespace was empty and no GC credit applied, so it is not a live-capacity ratio. All measurements are workload- and host-specific, not an SLA.</p>
             <nav><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/hot-buffer-reuse-2026-09-01.md#singlestream-smb-ab">Current SMB run ↗</a><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/io-intensive-fuse-600s.md#incremental-streaming-and-bounded-recovery-600-second-rerun">601 s FUSE run ↗</a><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/adr/0054-use-seqcdc-v1-as-the-default-chunking-profile.md">SeqCDC decision ↗</a></nav>
           </div>
         </div>
@@ -251,6 +257,6 @@
       <p>Apache-2.0 · Samba module GPL-3.0-or-later</p>
       <nav><a href="https://github.com/ThatIsCraZy/fastdup/releases">Releases</a><a href="https://github.com/ThatIsCraZy/fastdup/tree/main/docs">Docs</a><a href="https://github.com/ThatIsCraZy/fastdup">Source</a></nav>
     </footer>
-    <script src="site.js"></script>
+    <script src="site.js?v=20260902-2"></script>
   </body>
 </html>
