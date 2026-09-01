@@ -72,6 +72,7 @@ pub(crate) fn scan_sparse_xor(
 }
 
 #[target_feature(enable = "avx2")]
+#[allow(clippy::cast_ptr_alignment)]
 unsafe fn scan_sparse_xor_avx2(
     base: &[u8],
     target: &[u8],
@@ -93,7 +94,8 @@ unsafe fn scan_sparse_xor_avx2(
                 _mm256_loadu_si256(target.as_ptr().add(cursor).cast::<__m256i>()),
             )
         };
-        let equal_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(base_lane, target_lane)) as u32;
+        let equal_mask =
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(base_lane, target_lane)).cast_unsigned();
         if equal_mask == u32::MAX {
             if let Some(start) = run_start.take() {
                 runs.push((start, cursor - start));

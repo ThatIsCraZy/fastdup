@@ -1509,6 +1509,7 @@ fn worker_loop(
         wake,
         ready: VecDeque::with_capacity(ring_entries),
         submitted: HashMap::with_capacity(ring_entries),
+        completion_scratch: Vec::with_capacity(ring_entries),
         roots: RootCohort::default(),
         next_user_data: 1,
         wake_submitted: false,
@@ -1525,6 +1526,7 @@ struct RingWorker<'a> {
     wake: &'a WakeSignal,
     ready: VecDeque<Operation>,
     submitted: HashMap<u64, Operation>,
+    completion_scratch: Vec<(u64, i32)>,
     roots: RootCohort,
     next_user_data: u64,
     wake_submitted: bool,
@@ -1557,14 +1559,21 @@ impl RingWorker<'_> {
     }
 
     fn reap_completions(&mut self) -> io::Result<()> {
-        let completions = {
+        self.completion_scratch.clear();
+        {
             let mut completion = self.ring.completion();
-            completion
-                .by_ref()
-                .map(|entry| (entry.user_data(), entry.result()))
-                .collect::<Vec<_>>()
-        };
-        for (user_data, result) in completions {
+            self.completion_scratch.extend(
+                completion
+                    .by_ref()
+                    .map(|entry| (entry.user_data(), entry.result())),
+            );
+        }
+        assert!(
+            self.completion_scratch.capacity() >= self.ring_entries,
+            "ASSERT: CQE scratch retains its ring-sized allocation"
+        );
+        for index in 0..self.completion_scratch.len() {
+            let (user_data, result) = self.completion_scratch[index];
             if user_data == WAKE_USER_DATA {
                 self.wake_submitted = false;
                 self.wake.drain()?;
