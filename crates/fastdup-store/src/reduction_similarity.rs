@@ -912,6 +912,23 @@ impl IndependentBaseRef {
         })
     }
 
+    /// Reuses identity evidence from an already verified independent Exact
+    /// Location without hashing the Base bytes again.
+    pub(crate) fn from_verified_identity(
+        chunk_id: ChunkId,
+        logical_length: u32,
+        bytes: &[u8],
+    ) -> Result<Self, SimilarityError> {
+        validate_logical_length(logical_length)?;
+        if usize::try_from(logical_length) != Ok(bytes.len()) {
+            return Err(SimilarityError::BaseLengthMismatch);
+        }
+        Ok(Self {
+            chunk_id,
+            logical_length,
+        })
+    }
+
     #[must_use]
     pub(crate) const fn chunk_id(self) -> ChunkId {
         self.chunk_id
@@ -1023,9 +1040,33 @@ impl SparseXorDelta {
         base_bytes: &[u8],
         target_bytes: &[u8],
     ) -> Result<DeltaTrial, SimilarityError> {
+        let target_id = ChunkId::of(target_bytes);
+        let trial = Self::encode_trial_with_vector(
+            base,
+            base_bytes,
+            target_id,
+            target_bytes,
+            crate::similarity_simd::available(),
+        )?;
+        // Exercise the reader-side invariant for the self-verifying API.
+        if trial.encoding.decode(base_bytes)? != target_bytes {
+            return Err(SimilarityError::DeltaReconstructionMismatch);
+        }
+        Ok(trial)
+    }
+
+    /// Builds a trial from target and Base identities already established by
+    /// the write-through hash and verified Exact read paths.
+    pub(crate) fn encode_prehashed_trial(
+        base: IndependentBaseRef,
+        base_bytes: &[u8],
+        target_id: ChunkId,
+        target_bytes: &[u8],
+    ) -> Result<DeltaTrial, SimilarityError> {
         Self::encode_trial_with_vector(
             base,
             base_bytes,
+            target_id,
             target_bytes,
             crate::similarity_simd::available(),
         )
@@ -1034,12 +1075,14 @@ impl SparseXorDelta {
     fn encode_trial_with_vector(
         base: IndependentBaseRef,
         base_bytes: &[u8],
+        target_id: ChunkId,
         target_bytes: &[u8],
         vector: bool,
     ) -> Result<DeltaTrial, SimilarityError> {
-        base.verify(base_bytes)?;
         validate_chunk_length(target_bytes.len())?;
-        if base_bytes.len() != target_bytes.len() {
+        if usize::try_from(base.logical_length) != Ok(base_bytes.len())
+            || base_bytes.len() != target_bytes.len()
+        {
             return Err(SimilarityError::DeltaLengthMismatch);
         }
 
@@ -1082,15 +1125,11 @@ impl SparseXorDelta {
             .ok_or(SimilarityError::ArithmeticOverflow)?;
         let encoding = Self {
             base,
-            target_id: ChunkId::of(target_bytes),
+            target_id,
             logical_length,
             runs: runs.into_boxed_slice(),
             xor_bytes: xor_bytes.into_boxed_slice(),
         };
-        // Exercise the reader-side invariant before presenting a writer trial.
-        if encoding.decode(base_bytes)? != target_bytes {
-            return Err(SimilarityError::DeltaReconstructionMismatch);
-        }
         Ok(DeltaTrial {
             encoding,
             cost: DeltaTrialCost {
@@ -1115,6 +1154,26 @@ impl SparseXorDelta {
     #[must_use]
     pub(crate) const fn logical_length(&self) -> u32 {
         self.logical_length
+    }
+
+    /// Moves one verified SIMD/scalar-equivalent trial into the durable
+    /// codec-4 writer without rescanning the Base and target.
+    pub(crate) fn into_prepared_record(
+        self,
+    ) -> Result<fastdup_format::PreparedSparseXorRecord, fastdup_format::FormatError> {
+        let runs = self
+            .runs
+            .iter()
+            .map(|run| fastdup_format::SparseXorRun::new(run.logical_offset, run.length))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        fastdup_format::SparseXorRecord::prepare(
+            self.base.chunk_id(),
+            self.logical_length,
+            self.target_id,
+            runs,
+            self.xor_bytes,
+        )
     }
 
     /// Reconstructs and fully verifies the target bytes.
@@ -1854,9 +1913,10 @@ mod tests {
             sparse_xor_parts(&base_bytes, &target, false)
         );
         let base = IndependentBaseRef::from_verified_bytes(&base_bytes).expect("valid base");
+        let target_id = ChunkId::of(&target);
         assert_eq!(
-            SparseXorDelta::encode_trial_with_vector(base, &base_bytes, &target, true),
-            SparseXorDelta::encode_trial_with_vector(base, &base_bytes, &target, false)
+            SparseXorDelta::encode_trial_with_vector(base, &base_bytes, target_id, &target, true),
+            SparseXorDelta::encode_trial_with_vector(base, &base_bytes, target_id, &target, false)
         );
 
         let samples = 7_usize;
@@ -1880,6 +1940,7 @@ mod tests {
                     SparseXorDelta::encode_trial_with_vector(
                         base,
                         black_box(&base_bytes),
+                        target_id,
                         black_box(&target),
                         vector,
                     )

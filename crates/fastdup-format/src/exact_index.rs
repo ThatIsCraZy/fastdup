@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::container::{
-    MAX_DECODED_RECORD_BYTES, MAX_RECORD_BYTES, RAW_CODEC, VerifiedChunkLocation,
+    MAX_DECODED_RECORD_BYTES, MAX_RECORD_BYTES, RAW_CODEC, SPARSE_XOR_CODEC, VerifiedChunkLocation,
     VerifiedRawLocation, ZSTD_CODEC, ZSTD_PREFIX_CODEC,
 };
 use crate::{ChunkId, ContainerId, MAX_CONTAINER_BYTES, MAX_LOGICAL_CHUNK_BYTES};
@@ -1340,7 +1340,7 @@ fn valid_location(logical_length: u32, location: ExactIndexLocation) -> bool {
                     .checked_add(logical_length)
                     .is_some_and(|end| end <= location.record_decoded_length)
         }
-        ZSTD_PREFIX_CODEC => {
+        ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC => {
             location.dependency_id != [0; 32]
                 && location.chunk_ordinal == 0
                 && location.decoded_offset == 0

@@ -990,7 +990,7 @@ impl<'a, I: StorageIo> ContainerBaseResolver<'a, I> {
 
     fn resolve(
         &mut self,
-        dependency: fastdup_format::ZstdPrefixDependency,
+        dependency: fastdup_format::DependentDependency,
     ) -> Result<Vec<u8>, StoreError> {
         let key = (dependency.chunk_id(), dependency.logical_length());
         if let Some(bytes) = self.resolved.get(&key) {
@@ -1598,7 +1598,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     }
 
     /// Encodes ordinary adaptive regions and already-trialled independent or
-    /// Prefix records into one immutable Container image.
+    /// dependent records into one immutable Container image.
     ///
     /// Each prepared record is consumed. No candidate target is compressed a
     /// second time after the v1 cost decision.
@@ -1611,7 +1611,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_generation: u64,
         regions: &[PrehashedAdaptiveRegion<'_>],
         independent: Vec<fastdup_format::PreparedIndependentRecord>,
-        prefixes: Vec<fastdup_format::PreparedZstdPrefixRecord>,
+        dependents: Vec<fastdup_format::PreparedDependentRecord>,
         workers: NonZeroUsize,
     ) -> Result<PreparedAdaptiveContainer, StoreError> {
         let encode_wall_started = Instant::now();
@@ -1622,7 +1622,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                 container_generation,
                 regions,
                 independent,
-                prefixes,
+                dependents,
                 workers,
                 IncompressibilityGatePolicy::Off,
             )?;
@@ -1834,16 +1834,16 @@ impl<I: StorageIo> ContainerRepository<I> {
         let bytes = self.storage.read(&published_name(container_id))?;
         let mut base_resolver = ContainerBaseResolver::new(self);
         let mut resolver_error = None;
-        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| match base_resolver
+        let mut resolve = |dependency: fastdup_format::DependentDependency| match base_resolver
             .resolve(dependency)
         {
             Ok(bytes) => Ok(bytes),
             Err(error) => {
                 resolver_error = Some(error);
-                Err(FormatError::ZstdPrefixBaseRequired)
+                Err(FormatError::DependentBaseRequired)
             }
         };
-        let decoded = VerifiedContainerImage::decode_with_zstd_prefix_resolver(bytes, &mut resolve);
+        let decoded = VerifiedContainerImage::decode_with_dependent_resolver(bytes, &mut resolve);
         if let Some(error) = resolver_error {
             return Err(error);
         }
@@ -1865,16 +1865,16 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Result<SealedContainer, StoreError> {
         let mut base_resolver = ContainerBaseResolver::new(self);
         let mut resolver_error = None;
-        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| match base_resolver
+        let mut resolve = |dependency: fastdup_format::DependentDependency| match base_resolver
             .resolve(dependency)
         {
             Ok(bytes) => Ok(bytes),
             Err(error) => {
                 resolver_error = Some(error);
-                Err(FormatError::ZstdPrefixBaseRequired)
+                Err(FormatError::DependentBaseRequired)
             }
         };
-        let decoded = SealedContainer::decode_with_zstd_prefix_resolver(bytes, &mut resolve);
+        let decoded = SealedContainer::decode_with_dependent_resolver(bytes, &mut resolve);
         if let Some(error) = resolver_error {
             return Err(error);
         }
@@ -1896,17 +1896,17 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Result<VerifiedContainerPublication, StoreError> {
         let mut base_resolver = ContainerBaseResolver::new(self);
         let mut resolver_error = None;
-        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| match base_resolver
+        let mut resolve = |dependency: fastdup_format::DependentDependency| match base_resolver
             .resolve(dependency)
         {
             Ok(bytes) => Ok(bytes),
             Err(error) => {
                 resolver_error = Some(error);
-                Err(FormatError::ZstdPrefixBaseRequired)
+                Err(FormatError::DependentBaseRequired)
             }
         };
         let verified =
-            SealedContainer::verify_publication_with_zstd_prefix_resolver(bytes, &mut resolve);
+            SealedContainer::verify_publication_with_dependent_resolver(bytes, &mut resolve);
         if let Some(error) = resolver_error {
             return Err(error);
         }
@@ -2032,15 +2032,15 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Result<SealedContainer, StoreError> {
         let name = published_name(container_id);
         let bytes = self.storage.read(&name)?;
-        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| {
+        let mut resolve = |dependency: fastdup_format::DependentDependency| {
             self.find_verified_independent_base_with_index(
                 index,
                 dependency.chunk_id(),
                 dependency.logical_length(),
             )
-            .ok_or(FormatError::ZstdPrefixBaseRequired)
+            .ok_or(FormatError::DependentBaseRequired)
         };
-        let container = SealedContainer::decode_with_zstd_prefix_resolver(&bytes, &mut resolve)?;
+        let container = SealedContainer::decode_with_dependent_resolver(&bytes, &mut resolve)?;
         if container.header().container_id() != container_id {
             return Err(StoreError::PublishedIdentityMismatch {
                 name: container_id,
@@ -2201,26 +2201,26 @@ impl<I: StorageIo> ContainerRepository<I> {
     /// Returns Container I/O/integrity failures or
     /// [`StoreError::ExactLocationMismatch`] for any unpaired dependency or
     /// physical coordinate.
-    pub fn read_verified_zstd_prefix_location(
+    pub fn read_verified_dependent_location(
         &self,
         candidate: ExactIndexEntry,
         verified_base: &[u8],
     ) -> Result<Vec<u8>, StoreError> {
         let (descriptor, encoded_record) = self.read_candidate_record(candidate)?;
         let record = descriptor
-            .decode_zstd_prefix_candidate(candidate, &encoded_record, verified_base)
+            .decode_dependent_candidate(candidate, &encoded_record, verified_base)
             .map_err(map_exact_location_error)?;
         Ok(record.into_payload())
     }
 
-    fn read_verified_zstd_prefix_location_payload(
+    fn read_verified_dependent_location_payload(
         &self,
         candidate: ExactIndexEntry,
         verified_base: &VerifiedChunkPayload,
     ) -> Result<VerifiedChunkRead, StoreError> {
         let (descriptor, encoded_record) = self.read_candidate_record(candidate)?;
         let record = descriptor
-            .decode_zstd_prefix_candidate_with_verified_base(
+            .decode_dependent_candidate_with_verified_base(
                 candidate,
                 &encoded_record,
                 verified_base,
@@ -2435,7 +2435,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                 let Some(base) = base_requested.pop() else {
                     continue;
                 };
-                self.read_verified_zstd_prefix_location_payload(candidate, &base)
+                self.read_verified_dependent_location_payload(candidate, &base)
                     .map(|target_read| {
                         let (requested, target_groups) = target_read.into_parts();
                         groups.extend(target_groups);
@@ -2913,7 +2913,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                     continue;
                 };
                 let Ok(target_read) =
-                    self.read_verified_zstd_prefix_location_payload(candidate, base)
+                    self.read_verified_dependent_location_payload(candidate, base)
                 else {
                     continue;
                 };

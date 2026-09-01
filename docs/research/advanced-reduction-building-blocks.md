@@ -1,5 +1,8 @@
 # Bausteine für erweiterte Datenreduktion
 
+> Statusupdate, 2026-09-02: Sparse-XOR ist inzwischen dauerhafter Codec 4 im
+> opt-in Dependent-v1-Pfad; siehe [ADR 0088](../adr/0088-persist-sparse-xor-as-a-depth-one-dependent-codec.md).
+
 Stand: 2026-08-25. Diese Notiz bewertet fertige Rust- und C-Bausteine für
 Similarity Search, Delta, Zstd-Dictionaries, SIMD und Byte-Puffer. Der erste
 Prototyp weist Zstd Prefix inzwischen die Container-Codec-ID 3 zu. Der

@@ -1,5 +1,8 @@
 # CPU cache, SIMD, and lock-free parallelism audit
 
+> Status update, 2026-09-02: Sparse-XOR has since become durable codec 4 in
+> the opt-in dependent-codec path; see [ADR 0088](../adr/0088-persist-sparse-xor-as-a-depth-one-dependent-codec.md).
+
 This review follows the complete frontend DATA path:
 
 `FUSE -> POSIX mutation/read -> Ingest Lane -> SeqCDC -> Chunk ID -> Exact /
@@ -58,7 +61,7 @@ allocation-free scalar path for one DATA extent.
 | Similarity lookup | immutable mapped Runs and bounded page decode | Good lock-free read shape after activation. Shared telemetry atomics remain a minor contention source. | P2 |
 | Prefix selection | at most four Bases, sequential verified reads and codec trials | Do not issue these random HDD Base reads in parallel. Depth-one bounded latency is preferable to four simultaneous seeks. CPU trials may run independently only when Bases are already cache-resident. | Keep |
 | Independent encode | Zstd/LZ4 contexts are worker-owned; regions use bounded Rayon | Good. Codec libraries already use optimized native loops. No shared codec lock exists. | Keep |
-| Sparse XOR | scalar byte comparison/XOR in the experimental reducer | AVX2 compare masks plus vector XOR could help, but this encoding is not on the production persistent path. Do not optimize it before a durable Delta decision. | Defer |
+| Sparse XOR | scalar oracle plus AVX2 changed-run scan; durable codec 4 in the opt-in dependent path | The durable decision is complete. Preserve scalar/AVX2 equivalence and measure further changes against the production path. | Done |
 | Container verification | structural scan plus Rayon record verification for large work | Good. CRC32C, Zstd, BLAKE3, and memory copies already use optimized implementations. | Keep |
 | DATA publication | one bounded CQE-driven io_uring worker and separate verifier pool | Good ownership and concurrency boundary. More rings or a ring per worker would add queue contention and ordering complexity. | Keep |
 | Verified Manifest read | bounded Read Plan, Exact resolution, ordered Record reads, decode, final assembly | `VerifiedChunkPayload` adopts the decoder `Vec`; cache hits clone only its owner and final assembly performs the one required reply copy. | Done |

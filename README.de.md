@@ -64,9 +64,10 @@ Der dauerhafte Default kombiniert SeqCDC Content-Defined Chunking,
 BLAKE3-geprüfte Exact Dedup, Sparse-HOLE- und Constant-Byte-FILL-Extents,
 gruppiertes adaptives RAW/Zstd mit versionierter Sparschwelle. Workloads mit
 `copy_file_range` erhalten zusätzlich Metadata Fast Clone. Ein neu aufbaubarer
-Similarity Index mit Depth-1-`ZSTD_PREFIX` ist opt-in.
-Inhaltsidentifizierte Dictionaries und Sparse-XOR Delta bleiben klar
-gekennzeichnete Forschungspfade; Similarity-Reorder wurde zugunsten der
+Similarity Index mit Depth-1-`ZSTD_PREFIX` und Sparse-XOR ist opt-in. Beide
+dauerhaften abhängigen Codecs nutzen genau eine unabhängig dekodierbare Base
+und dieselbe begrenzte Trial- und Sparpolitik. Inhaltsidentifizierte
+Zstd-Dictionaries bleiben ein Forschungspfad; Similarity-Reorder wurde zugunsten der
 Restore-Lokalität verworfen. Weil proprietäre Appliance-Interna nicht
 vollständig offengelegt sind, behauptet das Projekt keinen unseriös zählbaren
 Technikvorsprung. Die Quellen stehen in der

@@ -18,6 +18,7 @@ fn envelope_exposes_exact_raw_geometry_without_reading_the_record_region() {
     assert_eq!(summary.raw_record_count(), 2);
     assert_eq!(summary.zstd_record_count(), 0);
     assert_eq!(summary.zstd_prefix_record_count(), 0);
+    assert_eq!(summary.sparse_xor_record_count(), 0);
     assert_eq!(summary.independent_chunk_count(), 2);
     assert_eq!(summary.dependent_chunk_count(), 0);
     assert_eq!(summary.raw_encoded_bytes(), 512);
@@ -26,6 +27,38 @@ fn envelope_exposes_exact_raw_geometry_without_reading_the_record_region() {
     assert_eq!(summary.multi_chunk_record_count(), 0);
     assert_eq!(summary.outgoing_dependency_edges(), 0);
     assert_eq!(summary.unique_outgoing_base_ids(), 0);
+}
+
+#[test]
+fn envelope_accounts_sparse_xor_as_a_dependent_codec() {
+    let base = vec![b'A'; 64 * 1_024];
+    let mut first = base.clone();
+    first[17] = b'B';
+    let mut second = base.clone();
+    second[31] = b'C';
+    let image = SealedContainer::encode_sparse_xor_pairs(
+        ContainerId::new([0x94; 16]).expect("fixture ID is nonzero"),
+        10,
+        &[
+            (base.as_slice(), first.as_slice()),
+            (base.as_slice(), second.as_slice()),
+        ],
+    )
+    .expect("Sparse-XOR Container encodes")
+    .into_bytes();
+    let summary = summary(&image).expect("Header/Footer envelope verifies");
+
+    assert_eq!(summary.raw_record_count(), 0);
+    assert_eq!(summary.zstd_record_count(), 0);
+    assert_eq!(summary.zstd_prefix_record_count(), 0);
+    assert_eq!(summary.sparse_xor_record_count(), 2);
+    assert_eq!(summary.independent_chunk_count(), 0);
+    assert_eq!(summary.dependent_chunk_count(), 2);
+    assert_eq!(summary.sparse_xor_decoded_bytes(), 128 * 1_024);
+    assert!(summary.sparse_xor_encoded_bytes() > 0);
+    assert_eq!(summary.single_chunk_record_count(), 2);
+    assert_eq!(summary.outgoing_dependency_edges(), 2);
+    assert_eq!(summary.unique_outgoing_base_ids(), 1);
 }
 
 #[test]

@@ -85,7 +85,7 @@ pub struct BlockTarget {
 #[serde(rename_all = "snake_case")]
 pub enum AdvancedReduction {
     Off,
-    PrefixV1,
+    DependentV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

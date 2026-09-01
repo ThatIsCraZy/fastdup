@@ -125,15 +125,16 @@ verwenden, nicht im Produkt-Hero.
 | BLAKE3 Exact Dedup | produktiver Standard | Bereits vorhandene, verifizierte Chunks werden referenziert statt erneut gespeichert; der persistente Index bleibt rebuildbare Beschleunigung. [ADR 0015](../adr/0015-keep-exact-dedup-correct-without-index-authority.md) |
 | Compression Grouping + adaptive RAW/Zstd | produktiver Standard | Benachbarte neue Chunks werden in maximal 512-KiB-Regionen gemeinsam bewertet. Zstd wird nur gewählt, wenn der vollständige Record mindestens 4 KiB und 3 % spart; sonst bleibt RAW. [Writer-Policy](../adr/0016-bound-compression-and-reordering.md) |
 | Metadata-only range clone / recipe reuse | produktiv, workloadabhängig | `copy_file_range` und die Samba-Fast-Clone-Integration können bestehende immutable Chunk-Rezepte referenzieren, ohne DATA erneut einzulesen oder zu speichern. Die Veeam-Qualifikation ist noch offen. [ADR 0043](../adr/0043-expose-metadata-range-clones-for-veeam-fast-clone.md) |
-| Similarity + Depth-1 ZSTD_PREFIX | produktiv, **opt-in** | Ein kohärenter Exact-/Similarity-Snapshot liefert höchstens vier Base-Trials; Prefix gewinnt nur mit mindestens 4 KiB und 5 % Vorteil gegenüber RAW/Zstd. Default des RPM ist `off`. [ADR 0063](../adr/0063-pin-a-coherent-reduction-snapshot-for-write-through.md), [`repository.env`](../../packaging/fastdup/repository.env) |
+| Similarity + Depth-1 ZSTD_PREFIX/Sparse-XOR | produktiv, **opt-in** | Ein kohärenter Exact-/Similarity-Snapshot liefert ein gemeinsames Budget von höchstens vier Codec-Trials. Die kleinere abhängige Kodierung gewinnt nur mit mindestens 4 KiB und 5 % Vorteil gegenüber RAW/Zstd. Jede Kodierung referenziert genau eine unabhängig dekodierbare Base. Default des RPM ist `off`. [ADR 0063](../adr/0063-pin-a-coherent-reduction-snapshot-for-write-through.md), [ADR 0088](../adr/0088-persist-sparse-xor-as-a-depth-one-dependent-codec.md), [`repository.env`](../../packaging/fastdup/repository.env) |
 | Family-Zstd-Dictionaries | Research/Format-Gate | Experimentell gemessen, aber Container v1 hat keinen produktiven Dictionary-Codec. Nicht als aktuelle Appliance-Funktion bewerben. [ADR 0047](../adr/0047-train-and-activate-dictionaries-by-bounded-family.md) |
-| Sparse-XOR Delta | Research-only | Im bytegenau geprüften In-Memory-Harness implementiert; kein dauerhafter produktiver Appliance-Writer. Nicht mit dem verfügbaren Prefix-Codec gleichsetzen. [Reduction-Referenz](../benchmarks/data-reduction-reference-v1.md) |
 | Incompressibility Gate | implementiert, Produktionspfad `off` | LZ4/Zstd-1 sind nur Prädiktoren, keine gespeicherten zusätzlichen Codecs. Alle aktuellen Store-Einstiege übergeben `Off`; daher nicht als aktive Technik zählen. [ADR 0052](../adr/0052-reject-incompressible-regions-before-target-zstd.md) |
 | Similarity-Reorder | verworfen | Produktions-Placement bleibt für HDD-Restore in logischer Reihenfolge. [ADR 0077](../adr/0077-prefer-restore-locality-over-similarity-reordering.md) |
 
 Damit darf die öffentliche Liste heute fünf automatisch aktive Bausteine,
 workloadabhängige Clone-Reuse und einen Opt-in-Mechanismus hervorheben.
-Dictionary und Sparse-XOR gehören getrennt in eine Roadmap-/Research-Zeile.
+Dictionary gehört getrennt in eine Roadmap-/Research-Zeile; Sparse-XOR ist Teil
+des opt-in Production-Pfads und darf nicht als automatisch aktiver Default
+dargestellt werden.
 
 ## Was Dell und HPE selbst dokumentieren
 

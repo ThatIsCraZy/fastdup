@@ -1226,7 +1226,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                         entry.logical_length(),
                     )
                     .ok_or(ExactIndexStoreError::DependencyMismatch)?;
-                containers.read_verified_zstd_prefix_location(entry, &base)?;
+                containers.read_verified_dependent_location(entry, &base)?;
             }
             active_locations = active_locations
                 .checked_add(1)

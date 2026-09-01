@@ -62,8 +62,9 @@ default combines SeqCDC content-defined chunking, BLAKE3-verified exact dedup,
 sparse HOLE and constant-byte FILL extents, grouped adaptive RAW/Zstd with a
 versioned saving threshold. Workloads using `copy_file_range` also get
 metadata-only Fast Clone. A rebuildable similarity index with depth-1
-`ZSTD_PREFIX` is opt-in. Content-identified dictionaries and sparse-XOR delta
-remain clearly labelled research paths; similarity reorder was
+`ZSTD_PREFIX` and Sparse-XOR is opt-in. Both durable dependent codecs use one
+independently decodable base and the same bounded trial and saving policy.
+Content-identified dictionaries remain a research path; similarity reorder was
 evaluated and rejected in favor of restore locality. Proprietary appliance
 internals are not fully disclosed, so this project does not claim an
 unverifiable numeric technique advantage. The sourcing is recorded in the

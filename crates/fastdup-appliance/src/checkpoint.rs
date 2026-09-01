@@ -16,8 +16,8 @@ use fastdup_format::{
     DurableTimestamp, DurableXattr, ExactIndexEntry, ExactIndexProfileId,
     IncompressibilityGateMetrics, MAX_LOGICAL_CHUNK_BYTES, ManifestExtent, ManifestLeaf,
     MetadataFormatError, MetadataObjectId, NamespaceEntry, NamespaceRoot, PolicySetId,
-    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, PreparedIndependentRecord,
-    PreparedZstdPrefixRecord,
+    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, PreparedDependentRecord,
+    PreparedIndependentRecord,
 };
 use fastdup_posix::{
     CommitInode, CommitRange, CommittedFile, CommittedFileInstall, ExternalizedExtent, InodeId,
@@ -570,8 +570,8 @@ impl PhaseStarted {
 ///
 /// The canonical bytes pin SeqCDC-v1, region sizing, adaptive Zstd thresholds,
 /// Exact publication, the optional coherent Similarity profile, bounded
-/// candidate/trial counts, and Depth-1 Zstd Prefix admission. Every new
-/// repository uses this Policy Set from its first Commit. Disabling Prefix
+/// candidate/trial counts, and Depth-1 dependent-codec admission. Every new
+/// repository uses this Policy Set from its first Commit. Disabling dependent
 /// selection or lacking a usable Similarity snapshot selects the independent
 /// RAW/Zstd fallback without changing the Policy Set.
 ///
@@ -583,7 +583,7 @@ impl PhaseStarted {
 pub fn checkpoint_policy_set() -> PolicySetId {
     PolicySetId::new(
         ChunkId::of(
-            b"fastdup/checkpoint-policy-v2/SeqCDC=increasing:seq6:skip-trigger50:skip1024:min16384:max262144:append-tail-anchor-v1/region=524288/Zstd=level3:min4096:min3pct/exact=l0-runs-v2:fanin4:partition262144/proof=installed-successor-delta-v1/similarity=fingerprint-v1:bucket-v1:candidates16:trials4:paired-exact-v1/prefix=codec3:depth1:min4096:min5pct:contiguous-only",
+            b"fastdup/checkpoint-policy-v3/SeqCDC=increasing:seq6:skip-trigger50:skip1024:min16384:max262144:append-tail-anchor-v1/region=524288/Zstd=level3:min4096:min3pct/exact=l0-runs-v2:fanin4:partition262144/proof=installed-successor-delta-v1/similarity=fingerprint-v1:bucket-v1:candidates16:trials4:paired-exact-v1/dependent=codec3-zstd-prefix+codec4-sparse-xor:depth1:min4096:min5pct:contiguous-only",
         )
         .bytes(),
     )
@@ -1263,7 +1263,7 @@ struct PreparedCompressionRegions<'a> {
 struct PreparedWriteThroughReduction<'a> {
     ordinary_chunks: Vec<&'a PendingWriteThroughChunk>,
     independent: Vec<PreparedIndependentRecord>,
-    prefixes: Vec<PreparedZstdPrefixRecord>,
+    dependents: Vec<PreparedDependentRecord>,
 }
 
 #[derive(Debug)]
@@ -3824,7 +3824,7 @@ where
         let PreparedWriteThroughReduction {
             ordinary_chunks,
             independent,
-            prefixes,
+            dependents,
         } = self.plan_new_chunk_encodings(new_chunks)?;
         let prepared_regions = prepare_compression_regions(&ordinary_chunks)?;
         let materialized_chunks = prepared_regions
@@ -3876,7 +3876,7 @@ where
             generation,
             &regions,
             independent,
-            prefixes,
+            dependents,
             workers,
         )?;
         drop(cpu_phase);
@@ -3903,7 +3903,7 @@ where
         let mut planned = PreparedWriteThroughReduction {
             ordinary_chunks: Vec::new(),
             independent: Vec::new(),
-            prefixes: Vec::new(),
+            dependents: Vec::new(),
         };
         planned
             .ordinary_chunks
@@ -3914,7 +3914,7 @@ where
             .try_reserve_exact(new_chunks.len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         planned
-            .prefixes
+            .dependents
             .try_reserve_exact(new_chunks.len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         for chunk in new_chunks {
@@ -3938,18 +3938,18 @@ where
                     );
                     planned.independent.push(record);
                 }
-                PersistentChunkPlan::ZstdPrefix(record) => {
+                PersistentChunkPlan::Dependent(record) => {
                     assert_eq!(
                         record.target_id(),
                         chunk.chunk_id,
-                        "ASSERT: prepared Prefix record retains its target identity"
+                        "ASSERT: prepared dependent record retains its target identity"
                     );
-                    planned.prefixes.push(record);
+                    planned.dependents.push(record);
                 }
             }
         }
         assert_eq!(
-            planned.ordinary_chunks.len() + planned.independent.len() + planned.prefixes.len(),
+            planned.ordinary_chunks.len() + planned.independent.len() + planned.dependents.len(),
             new_chunks.len(),
             "ASSERT: every unique new Chunk has exactly one encoding plan"
         );

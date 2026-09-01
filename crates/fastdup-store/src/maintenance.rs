@@ -1588,6 +1588,7 @@ where
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn publish_gc_replacements_using(
         &self,
         victims: &BTreeMap<[u8; 16], ContainerId>,

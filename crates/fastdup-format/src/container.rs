@@ -21,7 +21,7 @@ pub const MAX_LOGICAL_CHUNK_BYTES: usize = 256 * 1_024;
 const HEADER_MAGIC: &[u8; 8] = b"FDCTNR01";
 const HEADER_BYTES_U16: u16 = 4_096;
 const FORMAT_VERSION: u16 = 1;
-const CONTAINER_FORMAT_VERSION: u16 = 2;
+const CONTAINER_FORMAT_VERSION: u16 = 3;
 const SEALED_STATE: u16 = 2;
 const CRC32C_ALGORITHM: u16 = 1;
 const BLAKE3_256_ALGORITHM: u16 = 1;
@@ -32,11 +32,12 @@ const INDEX_HEADER_BYTES: u64 = 64;
 const INDEX_ENTRY_BYTES: u64 = 128;
 const HEADER_CRC_OFFSET: usize = 104;
 const HEADER_SUMMARY_OFFSET: usize = 128;
-const CONTAINER_SUMMARY_BYTES: usize = 96;
+const CONTAINER_SUMMARY_BYTES: usize = 128;
 const RECORD_MAGIC: &[u8; 8] = b"FDRECD01";
 pub(crate) const RAW_CODEC: u16 = 1;
 pub(crate) const ZSTD_CODEC: u16 = 2;
 pub(crate) const ZSTD_PREFIX_CODEC: u16 = 3;
+pub(crate) const SPARSE_XOR_CODEC: u16 = 4;
 const ZSTD_LEVEL_V1: i32 = 3;
 const ZSTD_PREFIX_LEVEL_V1: i32 = 3;
 const ZSTD_RESCUE_LEVEL_V1: i32 = 1;
@@ -116,6 +117,7 @@ pub struct SealedContainer {
     raw_record_count: usize,
     zstd_record_count: usize,
     zstd_prefix_record_count: usize,
+    sparse_xor_record_count: usize,
 }
 
 /// One owned Container image whose decoded payloads and physical bytes were
@@ -148,6 +150,7 @@ pub struct VerifiedContainerPublication {
     raw_record_count: usize,
     zstd_record_count: usize,
     zstd_prefix_record_count: usize,
+    sparse_xor_record_count: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +193,11 @@ impl VerifiedContainerPublication {
     #[must_use]
     pub const fn zstd_prefix_record_count(&self) -> usize {
         self.zstd_prefix_record_count
+    }
+
+    #[must_use]
+    pub const fn sparse_xor_record_count(&self) -> usize {
+        self.sparse_xor_record_count
     }
 
     /// Reconstructs the immutable Container summary from payload-free writer
@@ -235,7 +243,7 @@ impl VerifiedContainerPublication {
                 usize::try_from(first.record_decoded_length)
                     .map_err(|_| FormatError::ArithmeticOverflow)?,
                 group.len(),
-                (first.codec_id == ZSTD_PREFIX_CODEC).then_some(first.dependency_id),
+                is_dependent_codec(first.codec_id).then_some(first.dependency_id),
             )?;
             cursor = end;
         }
@@ -767,7 +775,7 @@ impl SealedContainerDescriptor {
             || record_end > self.header.layout.index_offset
             || !matches!(
                 location.codec_id(),
-                RAW_CODEC | ZSTD_CODEC | ZSTD_PREFIX_CODEC
+                RAW_CODEC | ZSTD_CODEC | ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC
             )
             || location.record_decoded_length() == 0
             || usize::try_from(location.record_decoded_length())
@@ -778,8 +786,8 @@ impl SealedContainerDescriptor {
                 .decoded_offset()
                 .checked_add(candidate.logical_length())
                 .is_none_or(|end| end > location.record_decoded_length())
-            || (location.codec_id() == ZSTD_PREFIX_CODEC && location.dependency_id() == [0; 32])
-            || (location.codec_id() != ZSTD_PREFIX_CODEC && location.dependency_id() != [0; 32])
+            || (is_dependent_codec(location.codec_id()) && location.dependency_id() == [0; 32])
+            || (!is_dependent_codec(location.codec_id()) && location.dependency_id() != [0; 32])
         {
             return Err(FormatError::ExactLocationMismatch);
         }
@@ -875,8 +883,8 @@ impl SealedContainerDescriptor {
         {
             return Err(FormatError::ExactLocationMismatch);
         }
-        if first_location.codec_id() == ZSTD_PREFIX_CODEC {
-            return Err(FormatError::ZstdPrefixBaseRequired);
+        if is_dependent_codec(first_location.codec_id()) {
+            return Err(FormatError::DependentBaseRequired);
         }
         let chunk_count = usize::try_from(get_u32(record_bytes, 56))
             .map_err(|_| FormatError::ArithmeticOverflow)?;
@@ -963,7 +971,10 @@ impl SealedContainerDescriptor {
         record_bytes: &[u8],
         base: &[u8],
     ) -> Result<RawRecord, FormatError> {
-        self.decode_zstd_prefix_candidate_using(candidate, record_bytes, |bytes| {
+        if candidate.location().codec_id() != ZSTD_PREFIX_CODEC {
+            return Err(FormatError::ExactLocationMismatch);
+        }
+        self.decode_dependent_candidate_using(candidate, record_bytes, |bytes| {
             ZstdPrefixRecord::decode(bytes, base)
         })
     }
@@ -973,25 +984,65 @@ impl SealedContainerDescriptor {
     ///
     /// The target is still decompressed and rehashed. Only the redundant second
     /// full Base hash is replaced by an O(1) capability comparison.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Exact pairing, record, Base, codec, or integrity error.
     pub fn decode_zstd_prefix_candidate_with_verified_base(
         self,
         candidate: ExactIndexEntry,
         record_bytes: &[u8],
         base: &VerifiedChunkPayload,
     ) -> Result<RawRecord, FormatError> {
-        self.decode_zstd_prefix_candidate_using(candidate, record_bytes, |bytes| {
+        if candidate.location().codec_id() != ZSTD_PREFIX_CODEC {
+            return Err(FormatError::ExactLocationMismatch);
+        }
+        self.decode_dependent_candidate_using(candidate, record_bytes, |bytes| {
             ZstdPrefixRecord::decode_with_verified_base(bytes, base)
         })
     }
 
-    fn decode_zstd_prefix_candidate_using(
+    /// Fully validates any durable dependent Exact candidate with Base bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Exact pairing, record, Base, codec, or integrity error.
+    pub fn decode_dependent_candidate(
+        self,
+        candidate: ExactIndexEntry,
+        record_bytes: &[u8],
+        base: &[u8],
+    ) -> Result<RawRecord, FormatError> {
+        self.decode_dependent_candidate_using(candidate, record_bytes, |bytes| {
+            DependentRecord::decode(bytes, base)
+        })
+    }
+
+    /// Fully validates any durable dependent candidate using an already
+    /// verified independent Base payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Exact pairing, record, Base, codec, or integrity error.
+    pub fn decode_dependent_candidate_with_verified_base(
+        self,
+        candidate: ExactIndexEntry,
+        record_bytes: &[u8],
+        base: &VerifiedChunkPayload,
+    ) -> Result<RawRecord, FormatError> {
+        self.decode_dependent_candidate_using(candidate, record_bytes, |bytes| {
+            DependentRecord::decode_with_verified_base(bytes, base)
+        })
+    }
+
+    fn decode_dependent_candidate_using(
         self,
         candidate: ExactIndexEntry,
         record_bytes: &[u8],
         decode: impl FnOnce(&[u8]) -> Result<RawRecord, FormatError>,
     ) -> Result<RawRecord, FormatError> {
         let location = candidate.location();
-        if location.codec_id() != ZSTD_PREFIX_CODEC {
+        if !is_dependent_codec(location.codec_id()) {
             return Err(FormatError::ExactLocationMismatch);
         }
         let range = self.record_range(candidate)?;
@@ -1008,7 +1059,7 @@ impl SealedContainerDescriptor {
         {
             return Err(FormatError::ExactLocationMismatch);
         }
-        let dependency = ZstdPrefixRecord::dependency(record_bytes)?;
+        let dependency = DependentRecord::dependency(record_bytes)?;
         if dependency.chunk_id().bytes() != location.dependency_id()
             || dependency.logical_length() != candidate.logical_length()
         {
@@ -1359,6 +1410,34 @@ impl SealedContainer {
         )
     }
 
+    /// Encodes one codec-4 record per same-length `(Base, target)` pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Sparse-XOR codec, length, allocation, layout, or Container error.
+    pub fn encode_sparse_xor_pairs(
+        container_id: ContainerId,
+        container_generation: u64,
+        pairs: &[(&[u8], &[u8])],
+    ) -> Result<AdaptiveContainerEncoding, FormatError> {
+        if pairs.is_empty() {
+            return Err(FormatError::InvalidContainerLayout);
+        }
+        let mut encoded_records = Vec::new();
+        encoded_records
+            .try_reserve_exact(pairs.len())
+            .map_err(|_| FormatError::ArithmeticOverflow)?;
+        for &(base, target) in pairs {
+            encoded_records.push(SparseXorRecord::encode(base, target)?);
+        }
+        encode_container_from_records(
+            container_id,
+            container_generation,
+            encoded_records,
+            NonZeroUsize::MIN,
+        )
+    }
+
     /// Encodes bounded regions using Zstd only when the complete encoded
     /// record saves at least 4 KiB and 3% versus independent RAW records.
     ///
@@ -1699,8 +1778,8 @@ impl SealedContainer {
         Ok(PreparedIndependentRecord { bytes })
     }
 
-    /// Encodes independent adaptive regions together with already-compressed
-    /// Depth-1 Prefix records in one Container image.
+    /// Encodes independent adaptive regions together with prepared Depth-1
+    /// dependent records in one Container image.
     ///
     /// Prefix frames are consumed and copied only once, directly into the
     /// final Container image. Their target identities are prior writer
@@ -1716,7 +1795,7 @@ impl SealedContainer {
         container_generation: u64,
         regions: &[PrehashedAdaptiveRegion<'_>],
         independent: Vec<PreparedIndependentRecord>,
-        prefixes: Vec<PreparedZstdPrefixRecord>,
+        dependents: Vec<PreparedDependentRecord>,
         workers: NonZeroUsize,
         gate: IncompressibilityGatePolicy,
     ) -> Result<AdaptiveContainerEncoding, FormatError> {
@@ -1739,26 +1818,27 @@ impl SealedContainer {
             &inputs,
             Vec::new(),
             independent,
-            prefixes,
+            dependents,
             workers,
             gate,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_adaptive_region_inputs_parallel_profiled_with_gate(
         container_id: ContainerId,
         container_generation: u64,
         regions: &[AdaptiveRegionInput<'_>],
         transplanted: Vec<PreparedEncodedRecord>,
         independent: Vec<PreparedIndependentRecord>,
-        prefixes: Vec<PreparedZstdPrefixRecord>,
+        dependents: Vec<PreparedDependentRecord>,
         workers: NonZeroUsize,
         gate: IncompressibilityGatePolicy,
     ) -> Result<AdaptiveContainerEncoding, FormatError> {
         if regions.is_empty()
             && transplanted.is_empty()
             && independent.is_empty()
-            && prefixes.is_empty()
+            && dependents.is_empty()
         {
             return Err(FormatError::InvalidContainerLayout);
         }
@@ -1813,7 +1893,7 @@ impl SealedContainer {
                 .into_iter()
                 .map(AdaptiveRecordPlan::PreparedIndependent),
         );
-        encoded_records.extend(prefixes.into_iter().map(AdaptiveRecordPlan::ZstdPrefix));
+        encoded_records.extend(dependents.into_iter().map(AdaptiveRecordPlan::Dependent));
         let encoding = encode_container_from_adaptive_plans(
             container_id,
             container_generation,
@@ -1866,10 +1946,10 @@ impl SealedContainer {
         Self::decode_with_resolver(bytes, permitted_workers, None)
     }
 
-    /// Fully validates a sealed Container and resolves codec-3 Bases through
+    /// Fully validates a sealed Container and resolves dependent-codec Bases through
     /// one caller-supplied adapter.
     ///
-    /// The format module validates each Prefix record CRC and dependency shape
+    /// The format module validates each dependent record CRC and dependency shape
     /// before invoking `resolve`. The returned bytes must match the requested
     /// Base identity and length; the codec verifies both again before target
     /// reconstruction.
@@ -1877,7 +1957,7 @@ impl SealedContainer {
     /// # Errors
     ///
     /// Returns the first Container, resolver, Base, or target-integrity error.
-    pub fn decode_with_zstd_prefix_resolver(
+    pub fn decode_with_dependent_resolver(
         bytes: &[u8],
         resolve: &mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>,
     ) -> Result<Self, FormatError> {
@@ -1927,6 +2007,7 @@ impl SealedContainer {
         let mut raw_record_count = 0_usize;
         let mut zstd_record_count = 0_usize;
         let mut zstd_prefix_record_count = 0_usize;
+        let mut sparse_xor_record_count = 0_usize;
         let mut intrinsic_summary =
             IntrinsicSummaryAccumulator::with_record_capacity(record_capacity)?;
         let mut cursor = HEADER_BYTES;
@@ -1947,15 +2028,20 @@ impl SealedContainer {
             }
             let encoded = &bytes[cursor..end];
             intrinsic_summary.observe_encoded_record(encoded)?;
-            let decoded = if encoded.len() >= 14 && get_u16(encoded, 12) == ZSTD_PREFIX_CODEC {
-                let dependency = ZstdPrefixRecord::dependency(encoded)?;
+            let decoded = if encoded.len() >= 14 && is_dependent_codec(get_u16(encoded, 12)) {
+                let codec = get_u16(encoded, 12);
+                let dependency = DependentRecord::dependency(encoded)?;
                 let resolver = resolve
                     .as_deref_mut()
-                    .ok_or(FormatError::ZstdPrefixBaseRequired)?;
+                    .ok_or(FormatError::DependentBaseRequired)?;
                 let base = resolver(dependency)?;
-                let record = ZstdPrefixRecord::decode(encoded, &base)?;
+                let record = DependentRecord::decode(encoded, &base)?;
                 DecodedEncodingRecord {
-                    codec: EncodingCodec::ZstdPrefix,
+                    codec: if codec == ZSTD_PREFIX_CODEC {
+                        EncodingCodec::ZstdPrefix
+                    } else {
+                        EncodingCodec::SparseXor
+                    },
                     logical_bytes: u64::try_from(record.payload().len())
                         .map_err(|_| FormatError::ArithmeticOverflow)?,
                     chunks: vec![record],
@@ -2010,6 +2096,11 @@ impl SealedContainer {
                         .checked_add(1)
                         .ok_or(FormatError::ArithmeticOverflow)?;
                 }
+                EncodingCodec::SparseXor => {
+                    sparse_xor_record_count = sparse_xor_record_count
+                        .checked_add(1)
+                        .ok_or(FormatError::ArithmeticOverflow)?;
+                }
             }
             expected_entries.extend(index_entries);
             records.extend(decoded.chunks);
@@ -2047,6 +2138,7 @@ impl SealedContainer {
             raw_record_count,
             zstd_record_count,
             zstd_prefix_record_count,
+            sparse_xor_record_count,
         })
     }
 
@@ -2071,12 +2163,12 @@ impl SealedContainer {
     }
 
     /// Fully validates a Container without retaining logical payloads while
-    /// resolving codec-3 Bases through one caller-owned adapter.
+    /// resolving dependent-codec Bases through one caller-owned adapter.
     ///
     /// # Errors
     ///
     /// Returns the first Container, resolver, Base, or target-integrity error.
-    pub fn verify_publication_with_zstd_prefix_resolver(
+    pub fn verify_publication_with_dependent_resolver(
         bytes: &[u8],
         resolve: &mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>,
     ) -> Result<VerifiedContainerPublication, FormatError> {
@@ -2167,6 +2259,7 @@ impl SealedContainer {
         let mut raw_record_count = 0_usize;
         let mut zstd_record_count = 0_usize;
         let mut zstd_prefix_record_count = 0_usize;
+        let mut sparse_xor_record_count = 0_usize;
         let mut intrinsic_summary = IntrinsicSummaryAccumulator::with_record_capacity(
             usize::try_from(header.layout.record_count)
                 .map_err(|_| FormatError::ArithmeticOverflow)?,
@@ -2189,15 +2282,20 @@ impl SealedContainer {
             }
             let encoded = &bytes[cursor..end];
             intrinsic_summary.observe_encoded_record(encoded)?;
-            let decoded = if encoded.len() >= 14 && get_u16(encoded, 12) == ZSTD_PREFIX_CODEC {
-                let dependency = ZstdPrefixRecord::dependency(encoded)?;
+            let decoded = if encoded.len() >= 14 && is_dependent_codec(get_u16(encoded, 12)) {
+                let codec = get_u16(encoded, 12);
+                let dependency = DependentRecord::dependency(encoded)?;
                 let resolver = resolve
                     .as_deref_mut()
-                    .ok_or(FormatError::ZstdPrefixBaseRequired)?;
+                    .ok_or(FormatError::DependentBaseRequired)?;
                 let base = resolver(dependency)?;
-                let record = ZstdPrefixRecord::decode(encoded, &base)?;
+                let record = DependentRecord::decode(encoded, &base)?;
                 DecodedEncodingRecord {
-                    codec: EncodingCodec::ZstdPrefix,
+                    codec: if codec == ZSTD_PREFIX_CODEC {
+                        EncodingCodec::ZstdPrefix
+                    } else {
+                        EncodingCodec::SparseXor
+                    },
                     logical_bytes: u64::try_from(record.payload().len())
                         .map_err(|_| FormatError::ArithmeticOverflow)?,
                     chunks: Vec::new(),
@@ -2255,6 +2353,11 @@ impl SealedContainer {
                         .checked_add(1)
                         .ok_or(FormatError::ArithmeticOverflow)?;
                 }
+                EncodingCodec::SparseXor => {
+                    sparse_xor_record_count = sparse_xor_record_count
+                        .checked_add(1)
+                        .ok_or(FormatError::ArithmeticOverflow)?;
+                }
             }
             expected_entries.extend(index_entries);
             cursor = end;
@@ -2293,6 +2396,7 @@ impl SealedContainer {
             raw_record_count,
             zstd_record_count,
             zstd_prefix_record_count,
+            sparse_xor_record_count,
         })
     }
 
@@ -2329,6 +2433,11 @@ impl SealedContainer {
     #[must_use]
     pub const fn zstd_prefix_record_count(&self) -> usize {
         self.zstd_prefix_record_count
+    }
+
+    #[must_use]
+    pub const fn sparse_xor_record_count(&self) -> usize {
+        self.sparse_xor_record_count
     }
 
     /// Returns fully verified decoded logical chunks in physical-record order.
@@ -2392,18 +2501,18 @@ impl VerifiedContainerImage {
         Ok(Self { container, bytes })
     }
 
-    /// Owns an image after complete verification with Depth-1 Prefix Base
+    /// Owns an image after complete verification with Depth-1 dependent Base
     /// resolution.
     ///
     /// # Errors
     ///
     /// Returns the same errors as
-    /// [`SealedContainer::decode_with_zstd_prefix_resolver`].
-    pub fn decode_with_zstd_prefix_resolver(
+    /// [`SealedContainer::decode_with_dependent_resolver`].
+    pub fn decode_with_dependent_resolver(
         bytes: Vec<u8>,
         resolve: &mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>,
     ) -> Result<Self, FormatError> {
-        let container = SealedContainer::decode_with_zstd_prefix_resolver(&bytes, resolve)?;
+        let container = SealedContainer::decode_with_dependent_resolver(&bytes, resolve)?;
         Ok(Self { container, bytes })
     }
 
@@ -2628,7 +2737,7 @@ struct IndexEntry {
 impl IndexEntry {
     fn from_encoded_record(bytes: &[u8], record_offset: u64) -> Result<Vec<Self>, FormatError> {
         let codec_id = get_u16(bytes, 12);
-        let dependency_id = if codec_id == ZSTD_PREFIX_CODEC {
+        let dependency_id = if is_dependent_codec(codec_id) {
             bytes[64..96]
                 .try_into()
                 .expect("ASSERT: fixed dependency field is 32 bytes")
@@ -2698,10 +2807,12 @@ impl IndexEntry {
         let dependency_id: [u8; 32] = bytes[64..96]
             .try_into()
             .expect("ASSERT: fixed Recovery Index dependency field is 32 bytes");
-        if !matches!(codec_id, RAW_CODEC | ZSTD_CODEC | ZSTD_PREFIX_CODEC)
-            || get_u16(bytes, 58) != 0
-            || (codec_id == ZSTD_PREFIX_CODEC && dependency_id == [0; 32])
-            || (codec_id != ZSTD_PREFIX_CODEC && dependency_id != [0; 32])
+        if !matches!(
+            codec_id,
+            RAW_CODEC | ZSTD_CODEC | ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC
+        ) || get_u16(bytes, 58) != 0
+            || (is_dependent_codec(codec_id) && dependency_id == [0; 32])
+            || (!is_dependent_codec(codec_id) && dependency_id != [0; 32])
             || bytes[104..].iter().any(|byte| *byte != 0)
         {
             return Err(FormatError::InvalidRecoveryIndex);
@@ -2890,6 +3001,7 @@ enum EncodingCodec {
     Raw,
     Zstd,
     ZstdPrefix,
+    SparseXor,
 }
 
 struct AdaptiveEncoderV1 {
@@ -2918,7 +3030,7 @@ enum AdaptiveRecordPlan<'a> {
     },
     PreparedEncoded(PreparedEncodedRecord),
     PreparedIndependent(PreparedIndependentRecord),
-    ZstdPrefix(PreparedZstdPrefixRecord),
+    Dependent(PreparedDependentRecord),
 }
 
 impl AdaptiveRecordPlan<'_> {
@@ -2930,7 +3042,7 @@ impl AdaptiveRecordPlan<'_> {
             } => zstd_record_length(chunks.len(), payload.len()),
             Self::PreparedEncoded(record) => Ok(record.bytes.len()),
             Self::PreparedIndependent(record) => Ok(record.bytes.len()),
-            Self::ZstdPrefix(record) => record.record_length(),
+            Self::Dependent(record) => record.record_length(),
         }
     }
 
@@ -2938,7 +3050,7 @@ impl AdaptiveRecordPlan<'_> {
         match self {
             Self::Zstd { chunks, .. } => chunks.len(),
             Self::PreparedEncoded(record) => record.chunk_count,
-            Self::Raw(_) | Self::PreparedIndependent(_) | Self::ZstdPrefix(_) => 1,
+            Self::Raw(_) | Self::PreparedIndependent(_) | Self::Dependent(_) => 1,
         }
     }
 
@@ -2963,13 +3075,13 @@ impl AdaptiveRecordPlan<'_> {
             ),
             Self::PreparedEncoded(record) => summary.observe_encoded_record(&record.bytes),
             Self::PreparedIndependent(record) => summary.observe_encoded_record(&record.bytes),
-            Self::ZstdPrefix(record) => summary.observe(
-                ZSTD_PREFIX_CODEC,
+            Self::Dependent(record) => summary.observe(
+                record.codec_id(),
                 self.record_length()?,
-                usize::try_from(record.logical_length)
+                usize::try_from(record.logical_length())
                     .map_err(|_| FormatError::ArithmeticOverflow)?,
                 1,
-                Some(record.dependency.chunk_id.bytes()),
+                Some(record.dependency().chunk_id.bytes()),
             ),
         }
     }
@@ -3003,7 +3115,7 @@ impl AdaptiveRecordPlan<'_> {
                 destination.copy_from_slice(&record.bytes);
                 Ok(())
             }
-            Self::ZstdPrefix(record) => record.encode_into(destination),
+            Self::Dependent(record) => record.encode_into(destination),
         }
     }
 }
@@ -3610,7 +3722,7 @@ fn decode_encoding_record_mode(
         || usize::try_from(get_u32(bytes, 48)) != Ok(RECORD_HEADER_BYTES)
         || usize::from(get_u16(bytes, 52)) != CHUNK_TABLE_ENTRY_BYTES
         || get_u16(bytes, 54) != 0
-        || (get_u16(bytes, 12) != ZSTD_PREFIX_CODEC && bytes[64..96].iter().any(|byte| *byte != 0))
+        || (!is_dependent_codec(get_u16(bytes, 12)) && bytes[64..96].iter().any(|byte| *byte != 0))
     {
         return Err(FormatError::InvalidZstdRecord);
     }
@@ -3634,6 +3746,10 @@ fn decode_encoding_record_mode(
     if get_u16(bytes, 12) == ZSTD_PREFIX_CODEC {
         validate_zstd_prefix_record(bytes)?;
         return Err(FormatError::ZstdPrefixBaseRequired);
+    }
+    if get_u16(bytes, 12) == SPARSE_XOR_CODEC {
+        validate_sparse_xor_record(bytes)?;
+        return Err(FormatError::DependentBaseRequired);
     }
     if get_u16(bytes, 12) != ZSTD_CODEC
         || i32::from_le_bytes(
@@ -3758,17 +3874,17 @@ fn decode_encoding_record_mode(
     })
 }
 
-/// One verified logical dependency named by a Zstd Prefix record.
+/// One verified logical dependency named by a Depth-1 dependent record.
 ///
 /// The reference contains no physical Location. A reader must resolve it to
 /// an independently decodable Chunk before calling [`ZstdPrefixRecord::decode`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ZstdPrefixDependency {
+pub struct DependentDependency {
     chunk_id: ChunkId,
     logical_length: u32,
 }
 
-impl ZstdPrefixDependency {
+impl DependentDependency {
     #[must_use]
     pub const fn chunk_id(self) -> ChunkId {
         self.chunk_id
@@ -3779,6 +3895,9 @@ impl ZstdPrefixDependency {
         self.logical_length
     }
 }
+
+/// Compatibility name for callers that only handle codec-3 records.
+pub type ZstdPrefixDependency = DependentDependency;
 
 /// One already-compressed codec-3 record awaiting Container assembly.
 ///
@@ -3817,6 +3936,167 @@ impl PreparedZstdPrefixRecord {
     #[must_use]
     pub const fn target_id(&self) -> ChunkId {
         self.target_id
+    }
+}
+
+/// The durable codec selected for one prepared dependent record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependentCodec {
+    ZstdPrefix,
+    SparseXor,
+}
+
+/// One canonical changed-byte run in a codec-4 Sparse-XOR record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SparseXorRun {
+    logical_offset: u32,
+    length: u32,
+}
+
+impl SparseXorRun {
+    /// Creates one run. Full ordering and payload validation happens when the
+    /// prepared record is constructed.
+    #[must_use]
+    pub const fn new(logical_offset: u32, length: u32) -> Self {
+        Self {
+            logical_offset,
+            length,
+        }
+    }
+
+    #[must_use]
+    pub const fn logical_offset(self) -> u32 {
+        self.logical_offset
+    }
+
+    #[must_use]
+    pub const fn length(self) -> u32 {
+        self.length
+    }
+}
+
+/// One codec-4 record awaiting Container assembly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedSparseXorRecord {
+    dependency: DependentDependency,
+    target_id: ChunkId,
+    logical_length: u32,
+    runs: Box<[SparseXorRun]>,
+    xor_bytes: Box<[u8]>,
+}
+
+impl PreparedSparseXorRecord {
+    fn record_length(&self) -> Result<usize, FormatError> {
+        sparse_xor_record_length(self.logical_length, self.runs.len(), self.xor_bytes.len())
+    }
+
+    fn encode_into(&self, destination: &mut [u8]) -> Result<(), FormatError> {
+        encode_sparse_xor_record_into(
+            self.dependency,
+            self.target_id,
+            self.logical_length,
+            &self.runs,
+            &self.xor_bytes,
+            destination,
+        )
+    }
+
+    /// Returns the dependency, run table and XOR bytes charged by the v1 cost
+    /// policy.
+    #[must_use]
+    pub fn encoded_payload_bytes(&self) -> usize {
+        32_usize
+            .saturating_add(4)
+            .saturating_add(self.runs.len().saturating_mul(8))
+            .saturating_add(self.xor_bytes.len())
+    }
+
+    #[must_use]
+    pub const fn target_id(&self) -> ChunkId {
+        self.target_id
+    }
+}
+
+/// One prepared Depth-1 record behind the Container writer's dependent-codec
+/// seam.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparedDependentRecord {
+    ZstdPrefix(PreparedZstdPrefixRecord),
+    SparseXor(PreparedSparseXorRecord),
+}
+
+impl PreparedDependentRecord {
+    fn record_length(&self) -> Result<usize, FormatError> {
+        match self {
+            Self::ZstdPrefix(record) => record.record_length(),
+            Self::SparseXor(record) => record.record_length(),
+        }
+    }
+
+    fn encode_into(&self, destination: &mut [u8]) -> Result<(), FormatError> {
+        match self {
+            Self::ZstdPrefix(record) => record.encode_into(destination),
+            Self::SparseXor(record) => record.encode_into(destination),
+        }
+    }
+
+    #[must_use]
+    pub const fn codec(&self) -> DependentCodec {
+        match self {
+            Self::ZstdPrefix(_) => DependentCodec::ZstdPrefix,
+            Self::SparseXor(_) => DependentCodec::SparseXor,
+        }
+    }
+
+    const fn codec_id(&self) -> u16 {
+        match self {
+            Self::ZstdPrefix(_) => ZSTD_PREFIX_CODEC,
+            Self::SparseXor(_) => SPARSE_XOR_CODEC,
+        }
+    }
+
+    #[must_use]
+    pub const fn dependency(&self) -> DependentDependency {
+        match self {
+            Self::ZstdPrefix(record) => record.dependency,
+            Self::SparseXor(record) => record.dependency,
+        }
+    }
+
+    #[must_use]
+    pub const fn target_id(&self) -> ChunkId {
+        match self {
+            Self::ZstdPrefix(record) => record.target_id,
+            Self::SparseXor(record) => record.target_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn logical_length(&self) -> u32 {
+        match self {
+            Self::ZstdPrefix(record) => record.logical_length,
+            Self::SparseXor(record) => record.logical_length,
+        }
+    }
+
+    #[must_use]
+    pub fn encoded_payload_bytes(&self) -> usize {
+        match self {
+            Self::ZstdPrefix(record) => record.encoded_payload_bytes(),
+            Self::SparseXor(record) => record.encoded_payload_bytes(),
+        }
+    }
+}
+
+impl From<PreparedZstdPrefixRecord> for PreparedDependentRecord {
+    fn from(record: PreparedZstdPrefixRecord) -> Self {
+        Self::ZstdPrefix(record)
+    }
+}
+
+impl From<PreparedSparseXorRecord> for PreparedDependentRecord {
+    fn from(record: PreparedSparseXorRecord) -> Self {
+        Self::SparseXor(record)
     }
 }
 
@@ -4169,6 +4449,453 @@ fn validate_zstd_prefix_record(bytes: &[u8]) -> Result<(), FormatError> {
     Ok(())
 }
 
+/// Field-by-field codec-4 record for one Depth-1 Sparse-XOR target.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SparseXorRecord;
+
+impl SparseXorRecord {
+    /// Wraps canonical runs and XOR bytes produced by a bounded writer trial.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid lengths, noncanonical runs, zero XOR bytes,
+    /// or a record that exceeds the format bounds.
+    pub fn prepare(
+        base_id: ChunkId,
+        logical_length: u32,
+        target_id: ChunkId,
+        runs: Box<[SparseXorRun]>,
+        xor_bytes: Box<[u8]>,
+    ) -> Result<PreparedSparseXorRecord, FormatError> {
+        let dependency = DependentDependency {
+            chunk_id: base_id,
+            logical_length,
+        };
+        validate_sparse_xor_parts(logical_length, &runs, &xor_bytes)?;
+        sparse_xor_record_length(logical_length, runs.len(), xor_bytes.len())?;
+        Ok(PreparedSparseXorRecord {
+            dependency,
+            target_id,
+            logical_length,
+            runs,
+            xor_bytes,
+        })
+    }
+
+    /// Encodes a target against a same-length Base using the canonical scalar
+    /// oracle. Production trials use the SIMD-equivalent store implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, unequal, unchanged, or oversized chunks, or
+    /// when the canonical record cannot be represented.
+    pub fn encode(base: &[u8], target: &[u8]) -> Result<Vec<u8>, FormatError> {
+        validate_logical_chunk_length(base.len())?;
+        validate_logical_chunk_length(target.len())?;
+        if base.len() != target.len() {
+            return Err(FormatError::InvalidSparseXorRecord);
+        }
+        let mut runs = Vec::new();
+        let mut xor_bytes = Vec::new();
+        let mut cursor = 0_usize;
+        while cursor < target.len() {
+            if base[cursor] == target[cursor] {
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            while cursor < target.len() && base[cursor] != target[cursor] {
+                xor_bytes.push(base[cursor] ^ target[cursor]);
+                cursor += 1;
+            }
+            runs.push(SparseXorRun::new(
+                u32::try_from(start).map_err(|_| FormatError::ArithmeticOverflow)?,
+                u32::try_from(cursor - start).map_err(|_| FormatError::ArithmeticOverflow)?,
+            ));
+        }
+        let prepared = Self::prepare(
+            ChunkId::of(base),
+            u32::try_from(base.len()).map_err(|_| FormatError::ArithmeticOverflow)?,
+            ChunkId::of(target),
+            runs.into_boxed_slice(),
+            xor_bytes.into_boxed_slice(),
+        )?;
+        let mut bytes = vec![0_u8; prepared.record_length()?];
+        prepared.encode_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Returns the authenticated Base dependency from a codec-4 record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a record, checksum, geometry, or bounds error.
+    pub fn dependency(bytes: &[u8]) -> Result<DependentDependency, FormatError> {
+        validate_sparse_xor_record(bytes)?;
+        let mut chunk_id = [0_u8; 32];
+        chunk_id.copy_from_slice(&bytes[64..96]);
+        Ok(DependentDependency {
+            chunk_id: ChunkId::from_bytes(chunk_id),
+            logical_length: get_u32(bytes, 100),
+        })
+    }
+
+    /// Reconstructs and verifies a codec-4 target from its Base bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a record, Base, bounds, or target-integrity error.
+    pub fn decode(bytes: &[u8], base: &[u8]) -> Result<RawRecord, FormatError> {
+        let dependency = Self::dependency(bytes)?;
+        if usize::try_from(dependency.logical_length) != Ok(base.len())
+            || ChunkId::of(base) != dependency.chunk_id
+        {
+            return Err(FormatError::DependentBaseMismatch);
+        }
+        Self::decode_after_base_verification(bytes, base)
+    }
+
+    /// Reconstructs a codec-4 target while reusing verified Base identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a record, Base, bounds, or target-integrity error.
+    pub fn decode_with_verified_base(
+        bytes: &[u8],
+        base: &VerifiedChunkPayload,
+    ) -> Result<RawRecord, FormatError> {
+        let dependency = Self::dependency(bytes)?;
+        if usize::try_from(dependency.logical_length) != Ok(base.len())
+            || dependency.chunk_id != base.chunk_id()
+        {
+            return Err(FormatError::DependentBaseMismatch);
+        }
+        Self::decode_after_base_verification(bytes, base.as_slice())
+    }
+
+    fn decode_after_base_verification(bytes: &[u8], base: &[u8]) -> Result<RawRecord, FormatError> {
+        let logical_length =
+            usize::try_from(get_u32(bytes, 36)).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let run_count =
+            usize::try_from(get_u32(bytes, 104)).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let xor_length =
+            usize::try_from(get_u32(bytes, 108)).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let run_table_bytes = run_count
+            .checked_mul(8)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        let run_table_end = RAW_PAYLOAD_OFFSET
+            .checked_add(run_table_bytes)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        let xor_end = run_table_end
+            .checked_add(xor_length)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        let xor = &bytes[run_table_end..xor_end];
+        let mut decoded = base.to_vec();
+        let mut xor_cursor = 0_usize;
+        for ordinal in 0..run_count {
+            let entry = RAW_PAYLOAD_OFFSET + ordinal * 8;
+            let logical_offset = usize::try_from(get_u32(bytes, entry))
+                .map_err(|_| FormatError::ArithmeticOverflow)?;
+            let run_length = usize::try_from(get_u32(bytes, entry + 4))
+                .map_err(|_| FormatError::ArithmeticOverflow)?;
+            let logical_end = logical_offset
+                .checked_add(run_length)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            let next_xor = xor_cursor
+                .checked_add(run_length)
+                .ok_or(FormatError::ArithmeticOverflow)?;
+            if logical_end > logical_length || next_xor > xor.len() {
+                return Err(FormatError::InvalidSparseXorRecord);
+            }
+            for (target, difference) in decoded[logical_offset..logical_end]
+                .iter_mut()
+                .zip(&xor[xor_cursor..next_xor])
+            {
+                *target ^= difference;
+            }
+            xor_cursor = next_xor;
+        }
+        if xor_cursor != xor.len() {
+            return Err(FormatError::InvalidSparseXorRecord);
+        }
+        let mut target_id = [0_u8; 32];
+        target_id.copy_from_slice(&bytes[RECORD_HEADER_BYTES..RECORD_HEADER_BYTES + 32]);
+        let target_id = ChunkId::from_bytes(target_id);
+        if ChunkId::of(&decoded) != target_id {
+            return Err(FormatError::ChunkHashMismatch);
+        }
+        Ok(RawRecord {
+            payload: VerifiedChunkPayload::from_owned(target_id, decoded),
+        })
+    }
+}
+
+/// Codec-independent dispatcher for every durable Depth-1 record.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DependentRecord;
+
+impl DependentRecord {
+    /// Returns the authenticated Base dependency for any known dependent codec.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown, malformed, or corrupt dependent record.
+    pub fn dependency(bytes: &[u8]) -> Result<DependentDependency, FormatError> {
+        match record_codec(bytes)? {
+            ZSTD_PREFIX_CODEC => ZstdPrefixRecord::dependency(bytes),
+            SPARSE_XOR_CODEC => SparseXorRecord::dependency(bytes),
+            _ => Err(FormatError::InvalidDependentRecord),
+        }
+    }
+
+    /// Reconstructs and verifies any known dependent codec from Base bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a record, Base, codec, bounds, or target-integrity error.
+    pub fn decode(bytes: &[u8], base: &[u8]) -> Result<RawRecord, FormatError> {
+        match record_codec(bytes)? {
+            ZSTD_PREFIX_CODEC => ZstdPrefixRecord::decode(bytes, base),
+            SPARSE_XOR_CODEC => SparseXorRecord::decode(bytes, base),
+            _ => Err(FormatError::InvalidDependentRecord),
+        }
+    }
+
+    /// Reconstructs any known dependent codec using verified Base identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a record, Base, codec, bounds, or target-integrity error.
+    pub fn decode_with_verified_base(
+        bytes: &[u8],
+        base: &VerifiedChunkPayload,
+    ) -> Result<RawRecord, FormatError> {
+        match record_codec(bytes)? {
+            ZSTD_PREFIX_CODEC => ZstdPrefixRecord::decode_with_verified_base(bytes, base),
+            SPARSE_XOR_CODEC => SparseXorRecord::decode_with_verified_base(bytes, base),
+            _ => Err(FormatError::InvalidDependentRecord),
+        }
+    }
+}
+
+fn record_codec(bytes: &[u8]) -> Result<u16, FormatError> {
+    if bytes.len() < RECORD_HEADER_BYTES || &bytes[0..8] != RECORD_MAGIC {
+        return Err(FormatError::InvalidDependentRecord);
+    }
+    Ok(get_u16(bytes, 12))
+}
+
+fn is_dependent_codec(codec_id: u16) -> bool {
+    matches!(codec_id, ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC)
+}
+
+fn sparse_xor_record_length(
+    logical_length: u32,
+    run_count: usize,
+    xor_length: usize,
+) -> Result<usize, FormatError> {
+    validate_logical_chunk_length(
+        usize::try_from(logical_length).map_err(|_| FormatError::ArithmeticOverflow)?,
+    )?;
+    if run_count == 0 || xor_length == 0 {
+        return Err(FormatError::InvalidSparseXorRecord);
+    }
+    let payload_length = run_count
+        .checked_mul(8)
+        .and_then(|length| length.checked_add(xor_length))
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let payload_end = RAW_PAYLOAD_OFFSET
+        .checked_add(payload_length)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let record_length = align_up_usize(payload_end, usize::from(RECORD_ALIGNMENT))?;
+    if record_length > MAX_RECORD_BYTES {
+        return Err(FormatError::InvalidRecordLength(record_length));
+    }
+    Ok(record_length)
+}
+
+fn validate_sparse_xor_parts(
+    logical_length: u32,
+    runs: &[SparseXorRun],
+    xor_bytes: &[u8],
+) -> Result<(), FormatError> {
+    let logical_length =
+        usize::try_from(logical_length).map_err(|_| FormatError::ArithmeticOverflow)?;
+    validate_logical_chunk_length(logical_length)?;
+    if runs.is_empty() || xor_bytes.is_empty() || xor_bytes.contains(&0) {
+        return Err(FormatError::InvalidSparseXorRecord);
+    }
+    let mut previous_end = 0_usize;
+    let mut payload_bytes = 0_usize;
+    for (ordinal, run) in runs.iter().copied().enumerate() {
+        let start =
+            usize::try_from(run.logical_offset).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let length = usize::try_from(run.length).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        if length == 0 || end > logical_length || (ordinal != 0 && start <= previous_end) {
+            return Err(FormatError::InvalidSparseXorRecord);
+        }
+        previous_end = end;
+        payload_bytes = payload_bytes
+            .checked_add(length)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+    }
+    if payload_bytes != xor_bytes.len() {
+        return Err(FormatError::InvalidSparseXorRecord);
+    }
+    Ok(())
+}
+
+fn encode_sparse_xor_record_into(
+    dependency: DependentDependency,
+    target_id: ChunkId,
+    logical_length: u32,
+    runs: &[SparseXorRun],
+    xor_bytes: &[u8],
+    bytes: &mut [u8],
+) -> Result<(), FormatError> {
+    if dependency.logical_length != logical_length
+        || dependency.chunk_id == ChunkId::from_bytes([0; 32])
+    {
+        return Err(FormatError::InvalidSparseXorRecord);
+    }
+    validate_sparse_xor_parts(logical_length, runs, xor_bytes)?;
+    let record_length = sparse_xor_record_length(logical_length, runs.len(), xor_bytes.len())?;
+    if bytes.len() != record_length {
+        return Err(FormatError::InvalidRecordLength(bytes.len()));
+    }
+    let run_table_bytes = runs
+        .len()
+        .checked_mul(8)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let xor_offset = RAW_PAYLOAD_OFFSET
+        .checked_add(run_table_bytes)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let payload_length = run_table_bytes
+        .checked_add(xor_bytes.len())
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let payload_end = RAW_PAYLOAD_OFFSET
+        .checked_add(payload_length)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    bytes.fill(0);
+    bytes[0..8].copy_from_slice(RECORD_MAGIC);
+    put_u16(bytes, 8, FORMAT_VERSION);
+    put_u16(bytes, 10, RECORD_HEADER_BYTES_U16);
+    put_u16(bytes, 12, SPARSE_XOR_CODEC);
+    put_u32(
+        bytes,
+        32,
+        u32::try_from(record_length).map_err(|_| FormatError::ArithmeticOverflow)?,
+    );
+    put_u32(bytes, 36, logical_length);
+    put_u32(bytes, 40, RAW_PAYLOAD_OFFSET_U32);
+    put_u32(
+        bytes,
+        44,
+        u32::try_from(payload_length).map_err(|_| FormatError::ArithmeticOverflow)?,
+    );
+    put_u32(bytes, 48, RECORD_HEADER_BYTES_U32);
+    put_u16(bytes, 52, CHUNK_TABLE_ENTRY_BYTES_U16);
+    put_u32(bytes, 56, 1);
+    bytes[64..96].copy_from_slice(&dependency.chunk_id.0);
+    put_u32(bytes, 96, 1);
+    put_u32(bytes, 100, dependency.logical_length);
+    put_u32(
+        bytes,
+        104,
+        u32::try_from(runs.len()).map_err(|_| FormatError::ArithmeticOverflow)?,
+    );
+    put_u32(
+        bytes,
+        108,
+        u32::try_from(xor_bytes.len()).map_err(|_| FormatError::ArithmeticOverflow)?,
+    );
+    bytes[RECORD_HEADER_BYTES..RECORD_HEADER_BYTES + 32].copy_from_slice(&target_id.0);
+    put_u32(bytes, RECORD_HEADER_BYTES + 36, logical_length);
+    for (ordinal, run) in runs.iter().copied().enumerate() {
+        let offset = RAW_PAYLOAD_OFFSET + ordinal * 8;
+        put_u32(bytes, offset, run.logical_offset);
+        put_u32(bytes, offset + 4, run.length);
+    }
+    bytes[xor_offset..payload_end].copy_from_slice(xor_bytes);
+    let checksum = crc32c_with_zeroed_field(bytes, RECORD_CRC_OFFSET);
+    put_u32(bytes, RECORD_CRC_OFFSET, checksum);
+    Ok(())
+}
+
+fn validate_sparse_xor_record(bytes: &[u8]) -> Result<(), FormatError> {
+    if bytes.len() < MIN_RAW_RECORD_BYTES
+        || bytes.len() > MAX_RECORD_BYTES
+        || !bytes.len().is_multiple_of(usize::from(RECORD_ALIGNMENT))
+        || &bytes[0..8] != RECORD_MAGIC
+        || get_u16(bytes, 8) != FORMAT_VERSION
+        || usize::from(get_u16(bytes, 10)) != RECORD_HEADER_BYTES
+        || get_u16(bytes, 12) != SPARSE_XOR_CODEC
+        || get_u16(bytes, 14) != 0
+        || get_u64(bytes, 16) != 0
+        || get_u64(bytes, 24) != 0
+        || usize::try_from(get_u32(bytes, 32)) != Ok(bytes.len())
+        || usize::try_from(get_u32(bytes, 40)) != Ok(RAW_PAYLOAD_OFFSET)
+        || usize::try_from(get_u32(bytes, 48)) != Ok(RECORD_HEADER_BYTES)
+        || usize::from(get_u16(bytes, 52)) != CHUNK_TABLE_ENTRY_BYTES
+        || get_u16(bytes, 54) != 0
+        || get_u32(bytes, 56) != 1
+        || get_u32(bytes, 96) != 1
+        || bytes[112..128].iter().any(|byte| *byte != 0)
+        || get_u32(bytes, 100) != get_u32(bytes, 36)
+        || bytes[64..96].iter().all(|byte| *byte == 0)
+        || get_u32(bytes, RECORD_HEADER_BYTES + 32) != 0
+        || get_u32(bytes, RECORD_HEADER_BYTES + 36) != get_u32(bytes, 36)
+        || bytes[RECORD_HEADER_BYTES + 40..RAW_PAYLOAD_OFFSET]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(FormatError::InvalidSparseXorRecord);
+    }
+    if crc32c_with_zeroed_field(bytes, RECORD_CRC_OFFSET) != get_u32(bytes, RECORD_CRC_OFFSET) {
+        return Err(FormatError::RecordChecksumMismatch);
+    }
+    let logical_length = get_u32(bytes, 36);
+    let run_count =
+        usize::try_from(get_u32(bytes, 104)).map_err(|_| FormatError::ArithmeticOverflow)?;
+    let xor_length =
+        usize::try_from(get_u32(bytes, 108)).map_err(|_| FormatError::ArithmeticOverflow)?;
+    let run_table_bytes = run_count
+        .checked_mul(8)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let xor_offset = RAW_PAYLOAD_OFFSET
+        .checked_add(run_table_bytes)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let payload_length = run_table_bytes
+        .checked_add(xor_length)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    let payload_end = RAW_PAYLOAD_OFFSET
+        .checked_add(payload_length)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    if run_count == 0
+        || xor_length == 0
+        || usize::try_from(get_u32(bytes, 44)) != Ok(payload_length)
+        || payload_end > bytes.len()
+        || align_up_usize(payload_end, usize::from(RECORD_ALIGNMENT))? != bytes.len()
+        || bytes[payload_end..].iter().any(|byte| *byte != 0)
+    {
+        return Err(FormatError::InvalidSparseXorRecord);
+    }
+    let mut runs = Vec::new();
+    runs.try_reserve_exact(run_count)
+        .map_err(|_| FormatError::ArithmeticOverflow)?;
+    for ordinal in 0..run_count {
+        let offset = RAW_PAYLOAD_OFFSET + ordinal * 8;
+        runs.push(SparseXorRun::new(
+            get_u32(bytes, offset),
+            get_u32(bytes, offset + 4),
+        ));
+    }
+    validate_sparse_xor_parts(logical_length, &runs, &bytes[xor_offset..payload_end])
+}
+
 /// One decoded logical Chunk whose complete stored Encoding Record and BLAKE3
 /// identity were independently verified.
 ///
@@ -4477,14 +5204,17 @@ pub struct ContainerIntrinsicSummary {
     raw_record_count: u32,
     zstd_record_count: u32,
     zstd_prefix_record_count: u32,
+    sparse_xor_record_count: u32,
     independent_chunk_count: u32,
     dependent_chunk_count: u32,
     raw_encoded_bytes: u64,
     zstd_encoded_bytes: u64,
     zstd_prefix_encoded_bytes: u64,
+    sparse_xor_encoded_bytes: u64,
     raw_decoded_bytes: u64,
     zstd_decoded_bytes: u64,
     zstd_prefix_decoded_bytes: u64,
+    sparse_xor_decoded_bytes: u64,
     single_chunk_record_count: u32,
     multi_chunk_record_count: u32,
     outgoing_dependency_edges: u32,
@@ -4508,6 +5238,7 @@ impl IntrinsicSummaryAccumulator {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn observe(
         &mut self,
         codec_id: u16,
@@ -4611,6 +5342,34 @@ impl IntrinsicSummaryAccumulator {
                     .ok_or(FormatError::ArithmeticOverflow)?;
                 self.outgoing_base_ids.push(base_id);
             }
+            (SPARSE_XOR_CODEC, Some(base_id)) if base_id != [0; 32] && chunk_count == 1 => {
+                self.summary.sparse_xor_record_count = self
+                    .summary
+                    .sparse_xor_record_count
+                    .checked_add(1)
+                    .ok_or(FormatError::ArithmeticOverflow)?;
+                self.summary.dependent_chunk_count = self
+                    .summary
+                    .dependent_chunk_count
+                    .checked_add(chunk_count)
+                    .ok_or(FormatError::ArithmeticOverflow)?;
+                self.summary.sparse_xor_encoded_bytes = self
+                    .summary
+                    .sparse_xor_encoded_bytes
+                    .checked_add(encoded_bytes)
+                    .ok_or(FormatError::ArithmeticOverflow)?;
+                self.summary.sparse_xor_decoded_bytes = self
+                    .summary
+                    .sparse_xor_decoded_bytes
+                    .checked_add(decoded_bytes)
+                    .ok_or(FormatError::ArithmeticOverflow)?;
+                self.summary.outgoing_dependency_edges = self
+                    .summary
+                    .outgoing_dependency_edges
+                    .checked_add(chunk_count)
+                    .ok_or(FormatError::ArithmeticOverflow)?;
+                self.outgoing_base_ids.push(base_id);
+            }
             _ => return Err(FormatError::InvalidContainerSummary),
         }
         Ok(())
@@ -4623,7 +5382,7 @@ impl IntrinsicSummaryAccumulator {
             return Err(FormatError::InvalidContainerSummary);
         }
         let codec_id = get_u16(record, 12);
-        let dependency_id = if codec_id == ZSTD_PREFIX_CODEC {
+        let dependency_id = if is_dependent_codec(codec_id) {
             Some(
                 record[64..96]
                     .try_into()
@@ -4674,6 +5433,7 @@ impl ContainerIntrinsicSummary {
             .raw_decoded_bytes
             .checked_add(self.zstd_decoded_bytes)
             .and_then(|bytes| bytes.checked_add(self.zstd_prefix_decoded_bytes))
+            .and_then(|bytes| bytes.checked_add(self.sparse_xor_decoded_bytes))
             .ok_or(FormatError::ArithmeticOverflow)?;
         let chunk_count = u64::from(
             self.independent_chunk_count
@@ -4705,6 +5465,11 @@ impl ContainerIntrinsicSummary {
     }
 
     #[must_use]
+    pub const fn sparse_xor_record_count(self) -> u32 {
+        self.sparse_xor_record_count
+    }
+
+    #[must_use]
     pub const fn independent_chunk_count(self) -> u32 {
         self.independent_chunk_count
     }
@@ -4730,6 +5495,11 @@ impl ContainerIntrinsicSummary {
     }
 
     #[must_use]
+    pub const fn sparse_xor_encoded_bytes(self) -> u64 {
+        self.sparse_xor_encoded_bytes
+    }
+
+    #[must_use]
     pub const fn raw_decoded_bytes(self) -> u64 {
         self.raw_decoded_bytes
     }
@@ -4742,6 +5512,11 @@ impl ContainerIntrinsicSummary {
     #[must_use]
     pub const fn zstd_prefix_decoded_bytes(self) -> u64 {
         self.zstd_prefix_decoded_bytes
+    }
+
+    #[must_use]
+    pub const fn sparse_xor_decoded_bytes(self) -> u64 {
+        self.sparse_xor_decoded_bytes
     }
 
     #[must_use]
@@ -4771,7 +5546,7 @@ impl ContainerIntrinsicSummary {
             "ASSERT: intrinsic summary always occupies its fixed durable extent"
         );
         output.fill(0);
-        put_u16(output, 0, 1);
+        put_u16(output, 0, 2);
         put_u16(output, 2, 0);
         put_u32(output, 4, self.raw_record_count);
         put_u32(output, 8, self.zstd_record_count);
@@ -4788,13 +5563,17 @@ impl ContainerIntrinsicSummary {
         put_u32(output, 76, self.multi_chunk_record_count);
         put_u32(output, 80, self.outgoing_dependency_edges);
         put_u32(output, 84, self.unique_outgoing_base_ids);
+        put_u32(output, 88, self.sparse_xor_record_count);
+        put_u64(output, 96, self.sparse_xor_encoded_bytes);
+        put_u64(output, 104, self.sparse_xor_decoded_bytes);
     }
 
     fn decode(input: &[u8]) -> Result<Self, FormatError> {
         if input.len() != CONTAINER_SUMMARY_BYTES
-            || get_u16(input, 0) != 1
+            || get_u16(input, 0) != 2
             || get_u16(input, 2) != 0
-            || input[88..].iter().any(|byte| *byte != 0)
+            || get_u32(input, 92) != 0
+            || input[112..].iter().any(|byte| *byte != 0)
         {
             return Err(FormatError::InvalidContainerSummary);
         }
@@ -4802,14 +5581,17 @@ impl ContainerIntrinsicSummary {
             raw_record_count: get_u32(input, 4),
             zstd_record_count: get_u32(input, 8),
             zstd_prefix_record_count: get_u32(input, 12),
+            sparse_xor_record_count: get_u32(input, 88),
             independent_chunk_count: get_u32(input, 16),
             dependent_chunk_count: get_u32(input, 20),
             raw_encoded_bytes: get_u64(input, 24),
             zstd_encoded_bytes: get_u64(input, 32),
             zstd_prefix_encoded_bytes: get_u64(input, 40),
+            sparse_xor_encoded_bytes: get_u64(input, 96),
             raw_decoded_bytes: get_u64(input, 48),
             zstd_decoded_bytes: get_u64(input, 56),
             zstd_prefix_decoded_bytes: get_u64(input, 64),
+            sparse_xor_decoded_bytes: get_u64(input, 104),
             single_chunk_record_count: get_u32(input, 72),
             multi_chunk_record_count: get_u32(input, 76),
             outgoing_dependency_edges: get_u32(input, 80),
@@ -4822,6 +5604,7 @@ impl ContainerIntrinsicSummary {
             .raw_record_count
             .checked_add(self.zstd_record_count)
             .and_then(|count| count.checked_add(self.zstd_prefix_record_count))
+            .and_then(|count| count.checked_add(self.sparse_xor_record_count))
             .ok_or(FormatError::ArithmeticOverflow)?;
         let chunk_count = self
             .independent_chunk_count
@@ -4835,6 +5618,7 @@ impl ContainerIntrinsicSummary {
             .raw_encoded_bytes
             .checked_add(self.zstd_encoded_bytes)
             .and_then(|bytes| bytes.checked_add(self.zstd_prefix_encoded_bytes))
+            .and_then(|bytes| bytes.checked_add(self.sparse_xor_encoded_bytes))
             .ok_or(FormatError::ArithmeticOverflow)?;
         let expected_encoded_bytes = layout
             .index_offset
@@ -4845,16 +5629,21 @@ impl ContainerIntrinsicSummary {
             || chunk_count != layout.chunk_entry_count
             || encoded_bytes != expected_encoded_bytes
             || self.dependent_chunk_count != self.outgoing_dependency_edges
-            || self.zstd_prefix_record_count != self.outgoing_dependency_edges
+            || self
+                .zstd_prefix_record_count
+                .checked_add(self.sparse_xor_record_count)
+                != Some(self.outgoing_dependency_edges)
             || self.unique_outgoing_base_ids > self.outgoing_dependency_edges
             || (self.unique_outgoing_base_ids == 0) != (self.outgoing_dependency_edges == 0)
             || self.raw_record_count > self.independent_chunk_count
             || (self.raw_encoded_bytes == 0) != (self.raw_record_count == 0)
             || (self.zstd_encoded_bytes == 0) != (self.zstd_record_count == 0)
             || (self.zstd_prefix_encoded_bytes == 0) != (self.zstd_prefix_record_count == 0)
+            || (self.sparse_xor_encoded_bytes == 0) != (self.sparse_xor_record_count == 0)
             || (self.raw_decoded_bytes == 0) != (self.raw_record_count == 0)
             || (self.zstd_decoded_bytes == 0) != (self.zstd_record_count == 0)
             || (self.zstd_prefix_decoded_bytes == 0) != (self.zstd_prefix_record_count == 0)
+            || (self.sparse_xor_decoded_bytes == 0) != (self.sparse_xor_record_count == 0)
             || !self
                 .raw_encoded_bytes
                 .is_multiple_of(u64::from(RECORD_ALIGNMENT))
@@ -4863,6 +5652,9 @@ impl ContainerIntrinsicSummary {
                 .is_multiple_of(u64::from(RECORD_ALIGNMENT))
             || !self
                 .zstd_prefix_encoded_bytes
+                .is_multiple_of(u64::from(RECORD_ALIGNMENT))
+            || !self
+                .sparse_xor_encoded_bytes
                 .is_multiple_of(u64::from(RECORD_ALIGNMENT))
         {
             return Err(FormatError::InvalidContainerSummary);
@@ -5011,6 +5803,10 @@ pub enum FormatError {
     InvalidZstdPrefixRecord,
     ZstdPrefixBaseMismatch,
     ZstdPrefixBaseRequired,
+    InvalidSparseXorRecord,
+    InvalidDependentRecord,
+    DependentBaseMismatch,
+    DependentBaseRequired,
     ZstdFailure,
     CompressionGateFailure,
     ChunkHashMismatch,
@@ -5486,6 +6282,7 @@ fn encode_container_from_adaptive_plans(
     let mut raw_record_count = 0_usize;
     let mut zstd_record_count = 0_usize;
     let mut zstd_prefix_record_count = 0_usize;
+    let mut sparse_xor_record_count = 0_usize;
     let mut container = AlignedContainerBytes::zeroed(file_length);
     let mut cursor = HEADER_BYTES;
     for record in records {
@@ -5520,6 +6317,11 @@ fn encode_container_from_adaptive_plans(
                     .checked_add(1)
                     .ok_or(FormatError::ArithmeticOverflow)?;
             }
+            SPARSE_XOR_CODEC => {
+                sparse_xor_record_count = sparse_xor_record_count
+                    .checked_add(1)
+                    .ok_or(FormatError::ArithmeticOverflow)?;
+            }
             _ => return Err(FormatError::UnsupportedHeaderField),
         }
         index_entries.extend(record_entries);
@@ -5548,6 +6350,7 @@ fn encode_container_from_adaptive_plans(
             raw_record_count,
             zstd_record_count,
             zstd_prefix_record_count,
+            sparse_xor_record_count,
         },
         metrics: IncompressibilityGateMetrics::default(),
     })
@@ -5633,6 +6436,7 @@ fn encode_container_from_records(
     let mut raw_record_count = 0_usize;
     let mut zstd_record_count = 0_usize;
     let mut zstd_prefix_record_count = 0_usize;
+    let mut sparse_xor_record_count = 0_usize;
     for encoded in &encoded_records {
         let record_entries = writer_record_evidence(
             &header,
@@ -5657,6 +6461,11 @@ fn encode_container_from_records(
             }
             ZSTD_PREFIX_CODEC => {
                 zstd_prefix_record_count = zstd_prefix_record_count
+                    .checked_add(1)
+                    .ok_or(FormatError::ArithmeticOverflow)?;
+            }
+            SPARSE_XOR_CODEC => {
+                sparse_xor_record_count = sparse_xor_record_count
                     .checked_add(1)
                     .ok_or(FormatError::ArithmeticOverflow)?;
             }
@@ -5713,6 +6522,7 @@ fn encode_container_from_records(
             raw_record_count,
             zstd_record_count,
             zstd_prefix_record_count,
+            sparse_xor_record_count,
         },
         metrics: IncompressibilityGateMetrics::default(),
     })

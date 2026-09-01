@@ -58,7 +58,7 @@ static TELEMETRY_PHYSICAL_CONTAINER_BYTES: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdvancedReductionPolicy {
     Off,
-    PrefixV1,
+    DependentV1,
 }
 
 struct StartupPolicies {
@@ -581,8 +581,8 @@ fn advanced_reduction_policy_from_environment()
     const NAME: &str = "FASTDUP_ADVANCED_REDUCTION";
     match std::env::var(NAME) {
         Ok(value) if value == "off" => Ok(AdvancedReductionPolicy::Off),
-        Ok(value) if value == "prefix-v1" => Ok(AdvancedReductionPolicy::PrefixV1),
-        Ok(value) => Err(format!("{NAME} must be off or prefix-v1, got {value:?}").into()),
+        Ok(value) if value == "dependent-v1" => Ok(AdvancedReductionPolicy::DependentV1),
+        Ok(value) => Err(format!("{NAME} must be off or dependent-v1, got {value:?}").into()),
         Err(std::env::VarError::NotPresent) => Ok(AdvancedReductionPolicy::Off),
         Err(error) => Err(error.into()),
     }
@@ -634,7 +634,7 @@ fn recover_appliance(
     );
     let online_gc_recovery = online_maintenance.finalize_recovered_online_gc()?;
     let gc_catalog = GcCandidateCatalogRepository::new(FsStorageIo::open(metadata_root)?);
-    let similarities = (advanced_reduction == AdvancedReductionPolicy::PrefixV1)
+    let similarities = (advanced_reduction == AdvancedReductionPolicy::DependentV1)
         .then(|| SimilarityIndexRepository::new(metadata_storage));
     if restored_from_data_tier.is_some() {
         if let Some(similarities) = &similarities {
@@ -660,7 +660,7 @@ fn recover_appliance(
             &indexes,
             INODE_RESERVATION_SPAN_V1,
         )?,
-        AdvancedReductionPolicy::PrefixV1 => DurableNamespace::open_with_reduction_indexes(
+        AdvancedReductionPolicy::DependentV1 => DurableNamespace::open_with_reduction_indexes(
             NamespaceConfig::default(),
             generations.clone(),
             containers.clone(),
@@ -1507,7 +1507,8 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
     eprintln!(
         concat!(
             "advanced_reduction enabled={} queries={} candidates={} base_reads={} ",
-            "base_read_bytes={} prefix_trials={} accepted_prefixes={} ",
+            "base_read_bytes={} sparse_xor_trials={} prefix_trials={} ",
+            "accepted_sparse_xor={} accepted_prefixes={} ",
             "independent_fallbacks={} no_candidate_fallbacks={} ",
             "saved_payload_bytes={} errors={}"
         ),
@@ -1516,7 +1517,9 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
         reduction.candidates(),
         reduction.base_reads(),
         reduction.base_read_bytes(),
+        reduction.sparse_xor_trials(),
         reduction.prefix_trials(),
+        reduction.accepted_sparse_xor(),
         reduction.accepted_prefixes(),
         reduction.independent_fallbacks(),
         reduction.no_candidate_fallbacks(),

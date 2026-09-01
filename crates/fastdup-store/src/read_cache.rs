@@ -539,6 +539,7 @@ impl VerifiedReadCache {
 
     /// Atomically accounts one decoder backing while admitting any number of
     /// verified Chunk views from that Encoding Record.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn admit_verified_group(&self, payloads: Vec<(ChunkId, u64, VerifiedChunkPayload)>) {
         let Some((_, _, first)) = payloads.first() else {
             return;

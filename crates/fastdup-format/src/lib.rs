@@ -42,14 +42,16 @@ pub use commit::{
 pub use container::{
     AdaptiveContainerEncoding, AlignedContainerBytes, BuildingContainerHeader, ChunkId,
     ContainerHeader, ContainerId, ContainerIntrinsicSummary, ContainerLayout, ContainerRecordRange,
-    ContainerRecoveryEnvelope, FOOTER_BYTES, FormatError, HEADER_BYTES,
-    IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
-    MAX_LOGICAL_CHUNK_BYTES, PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
-    PreparedEncodedRecord, PreparedIndependentRecord, PreparedZstdPrefixRecord,
+    ContainerRecoveryEnvelope, DependentCodec, DependentDependency, DependentRecord, FOOTER_BYTES,
+    FormatError, HEADER_BYTES, IncompressibilityGateMetrics, IncompressibilityGatePolicy,
+    MAX_CONTAINER_BYTES, MAX_LOGICAL_CHUNK_BYTES, PrehashedAdaptiveRegion, PrehashedChunk,
+    PrehashedContiguousRegion, PreparedDependentRecord, PreparedEncodedRecord,
+    PreparedIndependentRecord, PreparedSparseXorRecord, PreparedZstdPrefixRecord,
     RECORD_HEADER_BYTES, RawRecord, RecoveryIndexCandidate, SealedContainer,
-    SealedContainerDescriptor, VerifiedChunkLocation, VerifiedChunkPayload, VerifiedContainerImage,
-    VerifiedContainerPublication, VerifiedRawLocation, VerifiedRecordPayloads,
-    VerifiedRecoveryIndex, ZstdPrefixDependency, ZstdPrefixRecord,
+    SealedContainerDescriptor, SparseXorRecord, SparseXorRun, VerifiedChunkLocation,
+    VerifiedChunkPayload, VerifiedContainerImage, VerifiedContainerPublication,
+    VerifiedRawLocation, VerifiedRecordPayloads, VerifiedRecoveryIndex, ZstdPrefixDependency,
+    ZstdPrefixRecord,
 };
 pub use container_generation_high_water::{
     CONTAINER_GENERATION_HIGH_WATER_RECORD_BYTES, ContainerGenerationHighWaterFormatError,

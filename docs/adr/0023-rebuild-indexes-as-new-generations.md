@@ -22,5 +22,5 @@ valid later objects may be exposed only through `lost+found`.
 When the complete Metadata Tier is absent, startup first installs the selected
 checkpoint's Commit and immutable Metadata graph into the empty replacement
 tier. It then performs the same verified pool scan and publishes either a fresh
-Exact generation or, under `prefix-v1`, one coherently bound Exact/Similarity
+Exact generation or, under `dependent-v1`, one coherently bound Exact/Similarity
 pair before the recovered namespace becomes available.

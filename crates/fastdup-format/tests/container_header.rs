@@ -22,7 +22,7 @@ fn sealed_header_has_stable_bytes_and_round_trips() {
 
     assert_eq!(encoded.len(), HEADER_BYTES);
     assert_eq!(&encoded[0..8], b"FDCTNR01");
-    assert_eq!(&encoded[8..10], &2_u16.to_le_bytes());
+    assert_eq!(&encoded[8..10], &3_u16.to_le_bytes());
     assert_eq!(&encoded[10..12], &4096_u16.to_le_bytes());
     assert_eq!(&encoded[12..14], &2_u16.to_le_bytes());
     assert_eq!(&encoded[40..56], &[0x5a; 16]);

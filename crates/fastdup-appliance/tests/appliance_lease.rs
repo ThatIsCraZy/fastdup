@@ -189,7 +189,7 @@ fn invalid_advanced_reduction_policy_fails_before_repository_open() {
     assert!(!output.status.success(), "ASSERT: invalid policy must fail");
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("FASTDUP_ADVANCED_REDUCTION must be off or prefix-v1"),
+            .contains("FASTDUP_ADVANCED_REDUCTION must be off or dependent-v1"),
         "ASSERT: startup reports the invalid policy: {}",
         String::from_utf8_lossy(&output.stderr)
     );

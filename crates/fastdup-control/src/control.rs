@@ -513,7 +513,7 @@ impl AgentRuntime {
                         if was_online {
                             systemctl("stop", REPOSITORY_UNIT)?;
                         }
-                        if settings.advanced_reduction == AdvancedReduction::PrefixV1 {
+                        if settings.advanced_reduction == AdvancedReduction::DependentV1 {
                             maintenance("rebuild-pool-indexes")?;
                         }
                         if was_online {
@@ -1122,7 +1122,7 @@ fn write_runtime_environment(settings: &crate::RepositorySettings) -> Result<(),
     let stage = path.with_extension("staged");
     let reduction = match settings.advanced_reduction {
         AdvancedReduction::Off => "off",
-        AdvancedReduction::PrefixV1 => "prefix-v1",
+        AdvancedReduction::DependentV1 => "dependent-v1",
     };
     let mut file = std::fs::File::create(&stage).map_err(problem("runtime_write"))?;
     writeln!(file, "FASTDUP_ADVANCED_REDUCTION={reduction}").map_err(problem("runtime_write"))?;

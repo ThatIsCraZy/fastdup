@@ -107,7 +107,7 @@ fn container_writer_pairs_dependency_through_recovery_and_exact_evidence() {
         assert_eq!(dependency.chunk_id(), ChunkId::of(&base));
         Ok(base.clone())
     };
-    let fully_decoded = SealedContainer::decode_with_zstd_prefix_resolver(&image, &mut resolve)
+    let fully_decoded = SealedContainer::decode_with_dependent_resolver(&image, &mut resolve)
         .expect("full Container decode resolves its verified Base");
     assert_eq!(fully_decoded.zstd_prefix_record_count(), 1);
     assert_eq!(
@@ -118,7 +118,7 @@ fn container_writer_pairs_dependency_through_recovery_and_exact_evidence() {
     );
     assert_eq!(
         SealedContainer::decode(&image),
-        Err(FormatError::ZstdPrefixBaseRequired)
+        Err(FormatError::DependentBaseRequired)
     );
 }
 

@@ -10,16 +10,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fastdup_format::{
-    ChunkId, IncompressibilityGatePolicy, PrehashedChunk, PreparedIndependentRecord,
-    PreparedZstdPrefixRecord, SealedContainer,
+    ChunkId, DependentCodec, IncompressibilityGatePolicy, PrehashedChunk, PreparedDependentRecord,
+    PreparedIndependentRecord, SealedContainer,
 };
 
 use crate::exact_index_repository::{ExactIndexGenerationPin, ExactIndexGenerationSnapshot};
-use crate::reduction_prefix::{BaseChunkRef, VerifiedBaseChunk, ZstdPrefixCodec, ZstdPrefixTrial};
+use crate::reduction_prefix::{BaseChunkRef, VerifiedBaseChunk, ZstdPrefixCodec};
+use crate::reduction_similarity::{IndependentBaseRef, SparseXorDelta};
 use crate::similarity_index_repository::{RecoveredSimilarityIndex, SimilarityIndexStoreError};
 use crate::{ContainerRepository, SimilarityIndexPageCacheStatus, StorageIo};
 
-const MAXIMUM_PREFIX_TRIALS_V1: usize = 4;
+const MAXIMUM_DEPENDENT_TRIALS_V1: usize = 4;
 const DEPENDENT_MINIMUM_SAVINGS_BYTES_V1: usize = 4_096;
 const DEPENDENT_MINIMUM_SAVINGS_PERCENT_V1: usize = 5;
 const REDUCTION_COUNTER_STRIPES: usize = 64;
@@ -33,7 +34,9 @@ struct ReductionCounterStripe {
     base_reads: AtomicU64,
     base_read_bytes: AtomicU64,
     prefix_trials: AtomicU64,
+    sparse_xor_trials: AtomicU64,
     accepted_prefixes: AtomicU64,
+    accepted_sparse_xor: AtomicU64,
     independent_fallbacks: AtomicU64,
     no_candidate_fallbacks: AtomicU64,
     saved_payload_bytes: AtomicU64,
@@ -68,7 +71,9 @@ impl ReductionCounters {
                     base_reads: stripe.base_reads.load(Ordering::Relaxed),
                     base_read_bytes: stripe.base_read_bytes.load(Ordering::Relaxed),
                     prefix_trials: stripe.prefix_trials.load(Ordering::Relaxed),
+                    sparse_xor_trials: stripe.sparse_xor_trials.load(Ordering::Relaxed),
                     accepted_prefixes: stripe.accepted_prefixes.load(Ordering::Relaxed),
+                    accepted_sparse_xor: stripe.accepted_sparse_xor.load(Ordering::Relaxed),
                     independent_fallbacks: stripe.independent_fallbacks.load(Ordering::Relaxed),
                     no_candidate_fallbacks: stripe.no_candidate_fallbacks.load(Ordering::Relaxed),
                     saved_payload_bytes: stripe.saved_payload_bytes.load(Ordering::Relaxed),
@@ -86,7 +91,9 @@ struct ReductionCounterValues {
     base_reads: u64,
     base_read_bytes: u64,
     prefix_trials: u64,
+    sparse_xor_trials: u64,
     accepted_prefixes: u64,
+    accepted_sparse_xor: u64,
     independent_fallbacks: u64,
     no_candidate_fallbacks: u64,
     saved_payload_bytes: u64,
@@ -100,9 +107,15 @@ impl ReductionCounterValues {
         self.base_reads = self.base_reads.saturating_add(other.base_reads);
         self.base_read_bytes = self.base_read_bytes.saturating_add(other.base_read_bytes);
         self.prefix_trials = self.prefix_trials.saturating_add(other.prefix_trials);
+        self.sparse_xor_trials = self
+            .sparse_xor_trials
+            .saturating_add(other.sparse_xor_trials);
         self.accepted_prefixes = self
             .accepted_prefixes
             .saturating_add(other.accepted_prefixes);
+        self.accepted_sparse_xor = self
+            .accepted_sparse_xor
+            .saturating_add(other.accepted_sparse_xor);
         self.independent_fallbacks = self
             .independent_fallbacks
             .saturating_add(other.independent_fallbacks);
@@ -169,7 +182,9 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             base_reads: counters.base_reads,
             base_read_bytes: counters.base_read_bytes,
             prefix_trials: counters.prefix_trials,
+            sparse_xor_trials: counters.sparse_xor_trials,
             accepted_prefixes: counters.accepted_prefixes,
+            accepted_sparse_xor: counters.accepted_sparse_xor,
             independent_fallbacks: counters.independent_fallbacks,
             no_candidate_fallbacks: counters.no_candidate_fallbacks,
             saved_payload_bytes: counters.saved_payload_bytes,
@@ -214,6 +229,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn plan_chunk_inner<C: StorageIo>(
         &self,
         containers: &ContainerRepository<C>,
@@ -244,8 +260,12 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         )
         .map_err(|_| PersistentReductionError::IndependentCodec)?;
         let maximum_encoded_payload_bytes = independent.encoded_payload_bytes();
-        let mut best: Option<ZstdPrefixTrial> = None;
-        for candidate in candidates.into_iter().take(MAXIMUM_PREFIX_TRIALS_V1) {
+        let mut best: Option<(usize, PreparedDependentRecord)> = None;
+        let mut remaining_trials = MAXIMUM_DEPENDENT_TRIALS_V1;
+        for candidate in candidates {
+            if remaining_trials == 0 {
+                break;
+            }
             counters.base_reads.fetch_add(1, Ordering::Relaxed);
             let Some(base_bytes) = containers.find_verified_independent_base_with_index(
                 &exact,
@@ -261,34 +281,61 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             let expected = BaseChunkRef::new(candidate.chunk_id(), candidate.logical_length());
             let base = VerifiedBaseChunk::from_verified_location(expected, &base_bytes)
                 .map_err(|_| PersistentReductionError::VerifiedBaseMismatch)?;
-            counters.prefix_trials.fetch_add(1, Ordering::Relaxed);
-            let Some(trial) = ZstdPrefixCodec::encode_prehashed_trial(
-                base,
-                target_id,
-                target,
-                maximum_encoded_payload_bytes,
+            let sparse_base = IndependentBaseRef::from_verified_identity(
+                candidate.chunk_id(),
+                candidate.logical_length(),
+                &base_bytes,
             )
-            .map_err(|_| PersistentReductionError::PrefixCodec)?
-            else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|current| {
-                trial.encoded_payload_bytes() < current.encoded_payload_bytes()
-            }) {
-                best = Some(trial);
+            .map_err(|_| PersistentReductionError::VerifiedBaseMismatch)?;
+            counters.sparse_xor_trials.fetch_add(1, Ordering::Relaxed);
+            remaining_trials -= 1;
+            let sparse =
+                SparseXorDelta::encode_prehashed_trial(sparse_base, &base_bytes, target_id, target)
+                    .map_err(|_| PersistentReductionError::SparseXorCodec)?;
+            if sparse.cost().run_count() != 0 {
+                let sparse_bytes = usize::try_from(sparse.cost().encoded_payload_bytes())
+                    .map_err(|_| PersistentReductionError::SparseXorCodec)?;
+                let prepared = sparse
+                    .into_encoding()
+                    .into_prepared_record()
+                    .map(PreparedDependentRecord::from)
+                    .map_err(|_| PersistentReductionError::SparseXorCodec)?;
+                if best.as_ref().is_none_or(|(bytes, _)| sparse_bytes < *bytes) {
+                    best = Some((sparse_bytes, prepared));
+                }
+            }
+
+            if remaining_trials != 0 {
+                counters.prefix_trials.fetch_add(1, Ordering::Relaxed);
+                remaining_trials -= 1;
+                if let Some(trial) = ZstdPrefixCodec::encode_prehashed_trial(
+                    base,
+                    target_id,
+                    target,
+                    maximum_encoded_payload_bytes,
+                )
+                .map_err(|_| PersistentReductionError::PrefixCodec)?
+                {
+                    let prefix_bytes = usize::try_from(trial.encoded_payload_bytes())
+                        .map_err(|_| PersistentReductionError::PrefixCodec)?;
+                    let prepared = trial
+                        .into_encoding()
+                        .into_prepared_record()
+                        .map(PreparedDependentRecord::from)
+                        .map_err(|_| PersistentReductionError::PrefixCodec)?;
+                    if best.as_ref().is_none_or(|(bytes, _)| prefix_bytes < *bytes) {
+                        best = Some((prefix_bytes, prepared));
+                    }
+                }
             }
         }
-        let Some(best) = best else {
+        let Some((best_bytes, best)) = best else {
             counters
                 .independent_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(PersistentChunkPlan::Independent(independent));
         };
-        if !accept_dependent_v1(
-            independent.encoded_payload_bytes(),
-            usize::try_from(best.encoded_payload_bytes())
-                .map_err(|_| PersistentReductionError::PrefixCodec)?,
-        ) {
+        if !accept_dependent_v1(independent.encoded_payload_bytes(), best_bytes) {
             counters
                 .independent_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
@@ -296,22 +343,25 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         }
         let saved_payload_bytes = independent
             .encoded_payload_bytes()
-            .saturating_sub(usize::try_from(best.encoded_payload_bytes()).unwrap_or(usize::MAX));
-        let prefix = best
-            .into_encoding()
-            .into_prepared_record()
-            .map_err(|_| PersistentReductionError::PrefixCodec)?;
+            .saturating_sub(best_bytes);
         assert_eq!(
-            prefix.target_id(),
+            best.target_id(),
             target_id,
-            "ASSERT: accepted Prefix trial retains the prehashed target identity"
+            "ASSERT: accepted dependent trial retains the prehashed target identity"
         );
-        counters.accepted_prefixes.fetch_add(1, Ordering::Relaxed);
+        match best.codec() {
+            DependentCodec::ZstdPrefix => {
+                counters.accepted_prefixes.fetch_add(1, Ordering::Relaxed);
+            }
+            DependentCodec::SparseXor => {
+                counters.accepted_sparse_xor.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         counters.saved_payload_bytes.fetch_add(
             u64::try_from(saved_payload_bytes).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        Ok(PersistentChunkPlan::ZstdPrefix(prefix))
+        Ok(PersistentChunkPlan::Dependent(best))
     }
 }
 
@@ -333,7 +383,9 @@ pub struct PersistentReductionStatus {
     base_reads: u64,
     base_read_bytes: u64,
     prefix_trials: u64,
+    sparse_xor_trials: u64,
     accepted_prefixes: u64,
+    accepted_sparse_xor: u64,
     independent_fallbacks: u64,
     no_candidate_fallbacks: u64,
     saved_payload_bytes: u64,
@@ -356,7 +408,9 @@ impl PersistentReductionStatus {
     reduction_status_getter!(base_reads, base_reads, u64);
     reduction_status_getter!(base_read_bytes, base_read_bytes, u64);
     reduction_status_getter!(prefix_trials, prefix_trials, u64);
+    reduction_status_getter!(sparse_xor_trials, sparse_xor_trials, u64);
     reduction_status_getter!(accepted_prefixes, accepted_prefixes, u64);
+    reduction_status_getter!(accepted_sparse_xor, accepted_sparse_xor, u64);
     reduction_status_getter!(independent_fallbacks, independent_fallbacks, u64);
     reduction_status_getter!(no_candidate_fallbacks, no_candidate_fallbacks, u64);
     reduction_status_getter!(saved_payload_bytes, saved_payload_bytes, u64);
@@ -366,7 +420,7 @@ impl PersistentReductionStatus {
 pub enum PersistentChunkPlan {
     NoCandidates,
     Independent(PreparedIndependentRecord),
-    ZstdPrefix(PreparedZstdPrefixRecord),
+    Dependent(PreparedDependentRecord),
 }
 
 fn accept_dependent_v1(independent_bytes: usize, dependent_bytes: usize) -> bool {
@@ -385,6 +439,7 @@ pub enum PersistentReductionError {
     VerifiedBaseMismatch,
     IndependentCodec,
     PrefixCodec,
+    SparseXorCodec,
 }
 
 impl fmt::Display for PersistentReductionError {
@@ -400,7 +455,8 @@ impl std::error::Error for PersistentReductionError {
             Self::IndexBindingMismatch
             | Self::VerifiedBaseMismatch
             | Self::IndependentCodec
-            | Self::PrefixCodec => None,
+            | Self::PrefixCodec
+            | Self::SparseXorCodec => None,
         }
     }
 }

@@ -200,14 +200,16 @@ fn assert_accepted_advanced_reduction(reduction: PersistentReductionStatus) {
     assert!(reduction.candidates() > 0);
     assert!(reduction.base_reads() > 0);
     assert!(reduction.base_read_bytes() > 0);
+    assert!(reduction.sparse_xor_trials() > 0);
     assert!(reduction.prefix_trials() > 0);
-    assert!(reduction.accepted_prefixes() > 0);
+    assert!(reduction.accepted_sparse_xor() > 0);
     assert!(reduction.saved_payload_bytes() > 0);
     assert_eq!(reduction.errors(), 0);
 }
 
 #[test]
-fn pool_wide_similarity_emits_depth_one_prefix_in_write_through() {
+#[allow(clippy::too_many_lines)]
+fn pool_wide_similarity_emits_depth_one_sparse_xor_in_write_through() {
     let metadata = MemoryStorageIo::new();
     let data = MemoryStorageIo::new();
     let exact_storage = MemoryStorageIo::new();
@@ -262,8 +264,8 @@ fn pool_wide_similarity_emits_depth_one_prefix_in_write_through() {
 
     let appliance = DurableNamespace::open_with_reduction_indexes(
         NamespaceConfig::default(),
-        GenerationRepository::new(metadata, checkpoint_policy_set()),
-        ContainerRepository::new(data),
+        GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
+        ContainerRepository::new(data.clone()),
         &exact,
         &similarity,
         32,
@@ -307,11 +309,24 @@ fn pool_wide_similarity_emits_depth_one_prefix_in_write_through() {
                         .any(|entry| entry.location().dependency_id() != [0; 32])
                 })
         }),
-        "write-through must publish the accepted target as codec-3 Depth-1 Prefix"
+        "write-through must publish the accepted target as a Depth-1 dependent record"
     );
     assert!(changed_range.contains(&changed_offset));
     assert_accepted_advanced_reduction(appliance.write_through_status().advanced_reduction());
     assert_eq!(read_named(appliance.namespace(), b"prefix-target"), target);
+    drop(appliance);
+
+    metadata.crash();
+    data.crash();
+    let generations = GenerationRepository::new(metadata, checkpoint_policy_set());
+    let containers = ContainerRepository::new(data);
+    let recovered = recover_mount(NamespaceConfig::default(), &generations, &containers)
+        .expect("recover repository containing codec-4 target")
+        .expect("Sparse-XOR target generation exists");
+    assert_eq!(read_named(&recovered, b"prefix-target"), target);
+    generations
+        .scrub_all_with_data(&containers)
+        .expect("offline scrub verifies codec-4 target and its independent Base");
 }
 
 #[test]
