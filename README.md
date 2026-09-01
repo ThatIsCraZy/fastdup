@@ -1,411 +1,106 @@
 # fastdup
 
-> **Ein experimentelles POSIX-Dateisystem, das Exact Dedup als offen
-> nachvollziehbare Storage-Semantik statt ausschließlich hinter einer
-> Backup-Appliance implementiert.**
+<p align="center">
+  <strong>Crash-safe, deduplicating POSIX storage for Linux — built in Rust.</strong>
+</p>
 
-## Was fastdup besonders macht
+<p align="center">
+  English · <a href="README.de.md">Deutsch</a>
+</p>
 
-fastdup nimmt normale Linux-Dateioperationen auf einem lebenden, veränderbaren
-Namensraum an und übersetzt sie in unveränderliche, inhaltsidentifizierte
-Container, hierarchische Manifeste und atomar ausgewählte Commit-Generationen.
-Identische Logical Chunks werden nur einmal gespeichert. Trotzdem bleibt eine
-Datei eine bytegenaue POSIX-Datei mit Random Writes, Sparse Extents, Hardlinks,
-xattrs und offenen, bereits gelöschten Inodes.
+<p align="center">
+  <a href="https://github.com/ThatIsCraZy/fastdup/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/ThatIsCraZy/fastdup"></a>
+  <a href="LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <img alt="Linux x86-64" src="https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey">
+  <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-orange">
+</p>
 
-Der entscheidende Unterschied ist die Trennung von Wahrheit und
-Beschleunigung: Manifeste und geprüfte Container tragen die Inhalte; Exact
-Index, Bloom-Filter und Read Caches dürfen vollständig verloren gehen und neu
-aufgebaut werden. Writer, Recovery und Offline-Scrub prüfen dieselben
-dauerhaften Invarianten. Crash-Grenzen, Format-Epochen, GC-Beweise und
-Generation-Reservierungen sind als versionierte Formate, ADRs und
-Fault-Injection-Tests im Apache-2.0-lizenzierten Quellcode nachvollziehbar.
+fastdup is an experimental single-node **deduplicating filesystem and storage
+appliance**. It exposes a mutable Linux POSIX namespace through FUSE and
+optionally SMB/Samba, while storing identical content-defined chunks only once.
+The Rust storage engine combines SeqCDC, BLAKE3, Zstd, immutable containers,
+rebuildable indexes, crash recovery, integrity scrubbing, and adaptive garbage
+collection.
 
-### Abgrenzung zu Data Domain und StoreOnce
+> [!WARNING]
+> fastdup is a research prototype, not a production backup product. It has no
+> device-loss protection, WORM guarantee, replication, or vendor support. Use
+> it for evaluation and development, not as the only copy of important data.
 
-fastdup ist kein kleinerer Nachbau von Dell PowerProtect Data Domain oder HPE
-StoreOnce. Die Produkte lösen überlappende Probleme, setzen ihre primäre
-Abstraktion aber an einer anderen Stelle:
+## Why fastdup?
 
-| Aspekt | fastdup | Dell PowerProtect Data Domain / HPE StoreOnce |
-| --- | --- | --- |
-| Primäre Aufgabe | Experimenteller, direkt mutierbarer Single-Node-POSIX-Speicher mit transparenter Exact Dedup | Ausgereifte Protection-Storage-Plattformen für Backup, Restore, Retention und Cyber Resilience |
-| Frontdoor | Linux FUSE und optional Samba; die Anwendung sieht Dateien und Verzeichnisse | Backup-optimierte Integrationen wie DD Boost beziehungsweise StoreOnce Catalyst, zusätzlich je nach Produkt NFS/SMB und VTL |
-| Technischer Schwerpunkt | Bytegenaue POSIX-Semantik, explizite Crash-Generationen, öffentlich spezifizierte Formate und neu aufbaubare Beschleunigungsindizes | Backup-Fenster, Restore-SLAs, Backup-Software-Ökosysteme, Replikation, Cloud-Tiering und zentraler Betrieb |
-| Schutzumfang heute | Prozess-/Power-Loss auf funktionierendem Stable Storage; kein eigener Schutz gegen Geräteverlust, keine WORM-/Vault-Garantie | Herstellerfunktionen für Immutability, Verschlüsselung, Replikation und isolierte beziehungsweise Cloud-basierte Recovery-Kopien |
-| Reifegrad | Forschungsprototyp mit reproduzierbaren Tests und Benchmarks, ohne Support- oder Kapazitätszusage | Kommerzielle Appliances und virtuelle Angebote mit dokumentierten Modell-, Support- und Integrationsgrenzen |
+Most deduplication systems hide their storage semantics behind a proprietary
+backup appliance. fastdup makes the interesting parts inspectable:
 
-Dell beschreibt Data Domain als Purpose-Built Backup Appliance mit breitem
-Backup-Software-Ökosystem, DD Boost, Replikation, Cloud Tier und
-Security-/Immutability-Funktionen; DD OS unterstützt außerdem NFS, CIFS und VTL.
-HPE positioniert StoreOnce ebenfalls als Purpose-Built Data-Protection-Plattform
-mit Catalyst, NAS-/VTL-Zielen, Catalyst Copy, Cloud Bank und integrierten
-Cyber-Resilience-Funktionen. Maßgeblich sind die aktuellen
-[Dell-Produktinformationen](https://www.dell.com/en-us/shop/powerprotect-data-domain/sf/powerprotect-data-domain),
-die [Dell-Protokolldokumentation](https://www.dell.com/support/manuals/en-ca/dd-os-7.10/dd_p_ddos_7.10.1.70_ag/data-access-by-protocol?guid=guid-ff3483b7-d324-4cc5-8814-877818407dfd&lang=en-us)
-und die [HPE-Produktinformationen](https://www.hpe.com/us/en/storage/storeonce.html).
-Die belegten Einzelmerkmale und bewusst vermiedenen Vergleichsbehauptungen
-stehen in der
-[Recherchegrundlage](docs/research/commercial-backup-appliance-comparison.md).
+- **Transparent exact deduplication:** identical logical chunks share physical
+  storage without changing byte-exact file behavior.
+- **Real POSIX semantics:** random writes, sparse files, hardlinks, symlinks,
+  xattrs/ACLs, ownership, timestamps, record locks, and open unlinked inodes.
+- **Crash-safe generations:** immutable manifests and a checksummed commit WAL
+  select the newest fully durable namespace after a crash.
+- **Truth is separate from acceleration:** manifests and verified containers
+  are authoritative; exact/similarity indexes, Bloom filters, and read caches
+  may be discarded and rebuilt.
+- **Auditable durability:** writers, recovery, and offline scrub enforce the
+  same versioned invariants, backed by ADRs, fault injection, and benchmarks.
+- **Bounded resource use:** `io_uring`, bounded ingest lanes, cache governance,
+  and adaptive DATA/metadata GC are designed for predictable single-node use.
 
-Das ist kein Überlegenheitsversprechen: Wer heute zertifizierte
-Backup-Integrationen, Hersteller-Support, Replikation, Immutability oder
-Cyber-Recovery benötigt, braucht ein entsprechend ausgereiftes Produkt.
-fastdup ist interessant, wenn ein offener POSIX-Speicherkern untersucht,
-erweitert und gegen explizite Crash- und Integritätsinvarianten geprüft werden
-soll. Herstellerangaben zu Datenreduktion oder Durchsatz sind nicht direkt mit
-den fastdup-Benchmarks vergleichbar.
-
-Das Repository ist ein Prototyp und noch kein Backup-Produkt. Der dauerhafte
-Pfad umfasst Exact Dedup, RAW/Zstd-Encoding, sparse Dateien, Checkpoints,
-Recovery, Scrub, einen neu aufbaubaren Exact Index sowie adaptives DATA- und
-Metadata-GC. Der erweiterte dauerhafte Pfad besitzt außerdem einen neu
-aufbaubaren, an den Exact Index gebundenen Similarity Index und Depth-1-
-`ZSTD_PREFIX`-Records. Diese Bausteine sind vollständig lesbar, recoverbar,
-scrubbar und GC-sicher. Der Daemon kann sie nach einem gepaarten
-Exact-/Similarity-Rebuild explizit mit `FASTDUP_ADVANCED_REDUCTION=prefix-v1`
-aktivieren. Alle neuen Repositories tragen vom ersten Commit an dieselbe
-aktuelle Writer-Policy; `off` ist deren unabhängiger RAW/Zstd-Fallback und
-keine zweite Policy. Andere Policy-IDs werden ohne Migration abgewiesen. Ein
-realer ABBA-SMB-Lauf ist dokumentiert, rechtfertigt wegen kleiner
-Kapazitätswirkung und streuender GC-Kosten aber noch keine Aktivierung als
-Default. Sparse-XOR-Delta, Dictionary und Reorder bleiben Forschungs- oder
-Referenzpfade.
-
-fastdup wird ausschließlich für 64-Bit-x86-Systeme entwickelt, getestet und
-qualifiziert. ARM, andere CPU-Architekturen und entsprechende Cross-Builds sind
-nicht unterstützt. AVX2/BMI2 und weitere x86-Erweiterungen werden nur nach
-Runtime-Erkennung benutzt; die x86-64-Baseline bleibt lauffähig.
-
-Die verbindlichen Begriffe stehen in [CONTEXT.md](CONTEXT.md). Entscheidungen
-über Haltbarkeit und Formate stehen in den [ADRs](docs/adr/).
-
-## Aktueller Funktionsumfang
-
-Der FUSE-Pfad unterstützt unter anderem:
-
-- Dateien anlegen, öffnen, lesen, schreiben, verkürzen, umbenennen und löschen
-- zufällige Writes, Append, `O_TRUNC`, `O_EXCL`, `RENAME_NOREPLACE`, `flush`
-  und `fsync`
-- sparse Dateien mit DATA-, FILL- und HOLE-Extents
-- Metadatenklone über `copy_file_range`, ohne bereits unveränderliche DATA
-  erneut zu lesen oder zu chunken
-- absturzsichere Checkpoints und Recovery auf den jüngsten vollständigen
-  Commit
-- selbstständige DATA-Tier-Recovery-Checkpoints für vollständigen Verlust der
-  NVMe-Metadaten; aktueller und vorheriger Stand bleiben unabhängig prüfbar
-- Unterverzeichnisse, Hardlinks, Symlinks, xattrs/ACLs, Besitz, Rechte,
-  Zeitstempel und flüchtige POSIX-Record-Locks
-- Namespace-Zustände oberhalb der 16-MiB-Objektgrenze: eine Commit-Root bindet
-  geordnete, content-definierte 256-KiB/512-KiB/1-MiB-Shards; Recovery, GC,
-  Scrub und DATA-Tier-Recovery prüfen denselben vollständigen Graphen
-- `statfs`, dünne Allokation, Hole Punch, Zero Range und DATA/HOLE-Seeks
-- Kernel-Read-Cache und Readahead für Read-only-Handles mit expliziter
-  Bereichsinvalidierung; Read-only-`mmap` ist kohärent, Shared-writable-`mmap`
-  wird in v1 abgewiesen
-- Offline-Scrub, adaptives Online-/Offline-GC und Neuaufbau des Exact Index
-- optionaler gepaarter Neuaufbau von Exact und Similarity sowie begrenzte
-  Depth-1-Zstd-PREFIX-Auswahl gegen unabhängig dekodierbare Bases
-- lock-freie Advanced-Reduction- und druckbegrenzte Similarity-Cache-
-  Telemetrie für Queries, Trials, Base-I/O, Annahmen, Fallbacks und Einsparung
-
-Der Adapter bildet noch nicht den gesamten POSIX-Umfang ab. Insbesondere BSD
-`flock` sowie die breite Client-, POSIX-, Samba- und
-Crash-Konformitätsmatrix sind noch offen. Der verbleibende Umfang ist in der
-[POSIX-Testplanung](docs/testing/posix-conformance.md) erfasst.
-
-## Aktueller Projektstand
-
-Die zuletzt abgeschlossenen Abschnitte haben Kernel- und Userspace-Caches,
-Memory-/Swap-Containment, Online-/Metadata-GC, den Haltbarkeitspfad bei
-ausbleibendem I/O-Fortschritt und zwei repositoryweite
-Upgrade-/Allocator-Grenzen geschlossen:
-
-- Online GC beweist Kandidaten gegen die aktuelle und vorherige Commit-
-  Generation, alle aktiven Metadata Root Pins und die aktive Exact-Index-
-  Generation. Vor `RETIRING` werden diese Bindungen unter der gemeinsamen
-  Publikationsbarriere erneut geprüft.
-- Metadata GC markiert alle dauerhaften und prozesslokal gepinnten Graphen.
-  Persistente Snapshot-/Addition-Kataloge beschleunigen unveränderte oder rein
-  additive Läufe, erhalten aber nur nach einem exakten Mark Löschbefugnis.
-- Ein kernelgestützter Appliance Lease schließt einen zweiten Writer und
-  gleichzeitige Offline-Wartung aus. Ungültige Start-Policies scheitern, bevor
-  das Repository geöffnet oder verändert wird.
-- Ein expliziter Durability Supervisor schließt Mutation Admission nach fünf
-  Sekunden ohne Checkpoint-Fortschritt. Deterministische Tests halten sowohl
-  Metadata- als auch DATA-Sync an, bewegen die monotone Testzeit ohne reale
-  Wartezeit und belegen: angenommene Writes bleiben lesbar, spätere Writes
-  gelangen nicht mehr in den Namespace.
-- Ein leerer, dauerhafter Appliance Recovery Latch wird vor dem Öffnen des
-  Repositorys schreibbar gesetzt. Crash oder fehlgeschlagener Abschluss lassen
-  ihn stehen; nur vollständige Recovery plus sauberer Shutdown oder ein
-  erfolgreicher Offline-Scrub entfernen ihn. Fehler beim Setzen/Löschen sowie
-  fehlerhafte Dateien und Symlinks werden fail-closed geprüft.
-- Commit Record v2 trägt Repository Format Epoch 1. Writer, Recovery und Scrub
-  akzeptieren ausschließlich Epoch 1; Commit-v1/Epoch-0 ist nicht migrierbarer
-  Vorproduktionszustand und wird vor jeder Repository-Mutation abgewiesen.
-- Zwei verkettete 4-KiB-DATA-Slots reservieren Container-Generationen in
-  1.024er-Bereichen dauerhaft. Sie dürfen nur in einem leeren DATA-Repository
-  initialisiert werden; ein nichtleeres Repository ohne High-Water wird ohne
-  Envelope-Migration abgewiesen. Ein gesunder Start benötigt keinen
-  Container-Verzeichnis-Scan; Crashs dürfen Nummern überspringen, aber niemals
-  wiederverwenden.
-- Read-only-FUSE-Handles nutzen jetzt den Kernel-Page-Cache mit `KEEP_CACHE`;
-  schreibfähige Handles bleiben `DIRECT_IO`, Writeback bleibt aus. Erfolgreiche
-  Writes, Truncates, Clone-/Fallocate-Mutationen invalidieren vor ihrer Antwort
-  exakt den betroffenen Inode-Bereich, sobald der Inode einmal einen
-  cachefähigen Read-only-Handle geliefert hat. Reine Write-only-Inodes
-  überspringen den redundanten Kernel-Notify. Der reale Mount-Test deckt
-  mehrere Handles, Seitengrenzen, Hole/Zero, Truncate sowie kohärentes
-  Read-only-`mmap` und die Ablehnung von Shared-writable-`mmap` ab.
-- Ein prozessweiter `MemoryBudgetGovernor` liefert allen rebuildbaren Caches
-  höchstens alle 250 ms denselben fail-closed Prozess-/Host-/cgroup-Snapshot. Bereits
-  belegter Host- oder Shared-cgroup-Swap schaltet fastdup nicht ab; nur der
-  eigene Prozess-Swap schließt Cache Admission. `MemorySwapMax=0` in einer
-  dedizierten cgroup plus `FASTDUP_REQUIRE_CGROUP_NO_SWAP=1` bilden die harte
-  Kernel-Grenze.
-- Das aktuelle Policy Set gilt vom ersten Repository-Commit an für `off` und
-  `prefix-v1`; es gibt weder eine Legacy-Policy noch einen Policy-
-  Migrationspfad. `rebuild-pool-indexes` veröffentlicht Exact und Similarity
-  aus einem verifizierten Scan als kohärentes Paar; doppelte Chunk-IDs werden
-  im begrenzten externen Sort vor der kanonischen Similarity-Publikation
-  verdichtet.
-- Langlebige, dichte Dedup-Bloom-Tabellen ab 2 MiB liegen in eigenen anonymen
-  `MADV_HUGEPAGE`-Mappings. Kleine Tabellen bleiben auf dem Heap. Die
-  Bloom-Probe-Hot-Loop erhält dadurch weder Sampling noch Locks noch eine
-  Heap-/Mmap-Fallunterscheidung.
-- Der Supervisor, die Latch-I/O und deren Synchronisation liegen ausschließlich
-  im Daemon-/Maintenance-Kontrollpfad. Auch Epoch-Prüfung und High-Water-I/O
-  liegen an Repository-Open, Commit, Container-Publikation und Scrub. Die
-  POSIX-Namespace-, Ingest-Admission- und Reduktions-Hot-Loops erhielten keine
-  zusätzliche Dateisystem-I/O und keinen neuen globalen Lock. Der Write-Pfad
-  trägt neben dem Inode-lokalen Cache-Atomic nur begrenzte atomare
-  Kapazitäts-Claims; `statvfs`, Commit-Epoch-Rotation und deren Mutex bleiben
-  im Kontrollpfad. Kernel-Cache-Notify bleibt am FUSE-Rand und läuft nur nach
-  einer erfolgreichen Inhaltsmutation eines cache-exponierten Inodes.
-- Der vollständige serielle Workspace-Test, Clippy, der Release-Build und die
-  reale siebenstufige SIGKILL/FUSE-Remount-Matrix sind für diesen Stand grün.
-  Dauerhaft blockierte oder fehlerhaft bestätigende Hardware bleibt außerhalb
-  des unterstützten Ausfallmodells.
-- Das einzige Container-Format bleibt Version 2; es gibt weder einen
-  Format-3-Writer noch Migration oder Legacy-Reader. Index-freie Prefix-Reads
-  listen den DATA-Namensraum einmal, durchsuchen nur die vorhandenen kompakten,
-  checksummierten Recovery Indexes, lesen genau den ausgewählten Record und
-  cachen wiederholt verwendete Bases nur für den laufenden Container-Read.
-  Physische Base-Adressen bleiben ausschließlich rebuildbare
-  Location-Beschleunigung.
-- Commit, geschardeter Namespace-Graph, Manifest Leaf/Inner, Exact Run Set,
-  Metadata-Mark und Similarity-Publikation besitzen jeweils nur noch ihren
-  aktuellen Writer- und Readerpfad. Similarity nutzt auch für Singleton-Snapshots immer
-  Partition plus Family-Manifest; Vorproduktionsformate werden nicht migriert.
-- Restore-Read-Pläne sortieren ausgewählte Exact-Locations nach
-  Container/Record-Offset und lesen direkt benachbarte Records desselben
-  Containers in einem höchstens 1-MiB großen DATA-Read. Jeder Record wird aus
-  seinem eigenen Slice weiterhin vollständig und unabhängig verifiziert; die
-  logische Ausgabeordnung und der skalare Einzel-Extent-Pfad bleiben erhalten.
-- Ein separater Worker schreibt alle 90 Sekunden und beim sauberen Shutdown
-  einen selbstständigen Recovery Checkpoint auf das DATA Tier. Zwei verkettete
-  Selector-Slots halten den aktuellen und vorherigen vollständigen Graphen.
-  Nach vollständigem Metadata-Tier-Verlust werden Checkpoint und DATA vor der
-  ersten Metadata-Mutation geprüft, der originale Commit zuletzt installiert
-  und Exact beziehungsweise Exact/Similarity vor dem Mount neu aufgebaut.
-  Root-Pins binden parallel laufendes GC; Graphscan, Verifikation und HDD-I/O
-  halten weder den Commit-Lock noch die Metadata-GC-Publikationsbarriere.
-- Metadata- und DATA-Pool tragen checksummierte persistente Identitäten. Beide
-  teilen eine Appliance-ID, besitzen verschiedene Pool-IDs und feste Rollen;
-  vertauschte Pfade, fremde Pools, doppelte IDs, Symlinks und befüllte
-  Vorproduktions-Pools ohne Identität scheitern vor Recovery beziehungsweise
-  Offline-Scrub. Die Initialisierung ist gegen jeden Publikationsabbruch
-  fault-injection-getestet und berührt keine Ingest-Hot-Loop.
-- Produktiver Writable-Start verlangt zwei physisch getrennte XFS-
-  Dateisysteme; verschiedene Verzeichnisse oder Pool-IDs allein genügen nicht.
-  Nur `FASTDUP_POOL_ISOLATION=lab-allow-shared` erlaubt bewusst einen
-  nicht-produktiven Ein-Disk-Aufbau. Ein lock-freier
-  `CommitCapacityGovernor` schützt dauerhaft 64 MiB Metadata-Commit-Reserve
-  und reserviert vor jeder sichtbaren Mutation den pessimistischen Metadata-/
-  DATA-Footprint. `ENOSPC` kommt vor der Mutation; Reads und Cleanup bleiben
-  möglich. Claims bleiben bei fehlgeschlagenem Commit gebunden und werden erst
-  nach durablem Commit plus nachfolgender physischer Kapazitätsmessung
-  freigegeben.
-
-## Empfohlener nächster Entwicklungsabschnitt
-
-Die Kapazitätsentscheidungen aus ADR 0081 bis 0084 sind umgesetzt. Die live in
-der WebUI konfigurierbaren Dateiendungen (Default `.xml`/`.json`) und der
-explizite Placement-Hint wählen bis 8 MiB den Small-File-Tier; neue Records
-darüber gehen auf DATA. Der Tier besitzt
-eine eigene XFS-Projekt-Hard-Quota und einen eigenen synchronen Admission-
-Bucket, während sein physischer Footprint zugleich gegen Metadata gerechnet
-wird. Der privilegierte XFS/FUSE-Test füllt DATA und Small-File-Quota, prüft
-stabiles `ENOSPC`, Cleanup, Offline-Scrub und bytegenauen Remount. Parallel
-bleibt der HDD-Lesepfad auf echter rotierender Hardware zu qualifizieren. Der
-korrigierte A/B nutzt den produktiven
-`IoUringStorageIo`-Adapter: Bei 64-KiB-Chunks sinken Ring-Submissions von 128
-auf 16 und der Planned-Pfad ist im Median 25,7 Prozent schneller. Beide Pfade
-erzeugen wegen Kernel-Readahead trotzdem dieselben zehn sequenziellen Block-
-Reads. Bei 256-KiB-Chunks sinken Submissions nur von 128 auf 64, Block-Reads von
-34 auf 33, und Planned ist 12,0 Prozent langsamer. Obwohl der Gast `ROTA=1`
-meldet, wurde keine HDD-Latenz emuliert. Coalescing bleibt für das HDD-Ziel
-aktiv; ein Schwellwert, spekulatives Readahead oder Parallel-I/O benötigt zuerst
-fragmentierte Messungen auf echter HDD. Gleichzeitig bleibt der opt-in
-Advanced-Reduction-Pfad gegen breitere Backup-Corpora zu qualifizieren.
-
-Der Abschnitt ist abgeschlossen, wenn:
-
-1. ein alternierender Cold-Restore-A/B auf physischer HDD oder dem geplanten
-   redundanten HDD-Array sequenzielle, fragmentierte und Container-übergreifende
-   Dateien abdeckt;
-2. breitere Small-File-Workloads Suchwege, IOPS, Platzverbrauch und Write
-   Amplification auf Produktions-NVMe messen;
-3. die jetzt automatisierte volle Small-File-Quota regelmäßig auf der
-   Produktions-XFS-Version qualifizieren und eine künftige Cache-Quota in
-   denselben Metadata-Reserve-Beweis aufnehmen;
-4. mehrere versionierte Backup-Familien Exact-, Similarity- und Fallback-
-   Entscheidungen reproduzierbar auslösen und ABBA-Läufe Kapazität,
-   SMB-Durchsatz, completed-write-p99, Restore und Swap gemeinsam ausweisen;
-5. alle Restores bytegenau sowie Recovery, Scrub und GC fail-closed bleiben;
-   und
-6. weder Restore-Optimierung noch Metrik, Cache-Governance oder Policy-Auswahl
-   neue Locks, Syscalls oder Speicher-Samples in die Ingest- und Candidate-
-   Hot-Loops einführen.
-
-Der fixed-seed Process-Kill-Harness und die modellierte Torn-Write-
-Vorgängergeneration sind vorhanden. Offen bleiben scheduled Longevity-Läufe,
-echte Blockgeräte-Power-Cuts und die POSIX-/Samba-Matrizen.
-
-## Ingest-Pipeline
-
-Ein Write durchläuft den Live-Namensraum und anschließend die dauerhafte
-Reduktionspipeline:
-
-1. SeqCDC-v1 bestimmt inhaltsabhängige Chunkgrenzen.
-2. BLAKE3-256 bildet die Chunk-ID und prüft rekonstruierte Bytes.
-3. Der Exact Index sucht eine bereits geprüfte Location. Er ist nur eine
-   Beschleunigung und keine Wahrheitsquelle.
-4. Neue benachbarte Chunks werden zu höchstens 512 KiB großen Compression
-   Regions zusammengefasst.
-5. Jede Region wird RAW oder als unabhängiger Zstd-Level-3-Record gespeichert.
-   Zstd wird nur gewählt, wenn die vollständige Speicherung mindestens 4 KiB
-   und 3 Prozent spart.
-6. Ein Checkpoint veröffentlicht Container, Manifeste, Exact-Index-Runs und
-   den neuen Namespace-Commit in der vorgeschriebenen Reihenfolge.
-
-Gleichförmige allokierte Bereiche werden als FILL gespeichert. Nicht
-allokierte Nullbereiche bleiben HOLE und benötigen keinen DATA-Record.
+## How it works
 
 ```text
-POSIX/FUSE write
-      |
-      v
-Live-Namensraum -> SeqCDC -> BLAKE3 -> Exact Lookup
-                                           | Treffer
-                                           +----------> vorhandene Location
-                                           |
-                                           | neu
-                                           v
-                                      RAW oder Zstd
-                                           |
-                                           v
-                                Container -> Manifest -> Commit-WAL
+POSIX / FUSE / SMB write
+          │
+          ▼
+   live namespace ──► SeqCDC-v1 ──► BLAKE3-256 ──► exact lookup
+                                                        │
+                              existing verified chunk ◄─┤
+                                                        │ new
+                                                        ▼
+                                                   RAW or Zstd
+                                                        │
+                                                        ▼
+                                  container ──► manifest ──► commit WAL
 ```
 
-Die Stufen teilen sich ein begrenztes CPU- und Speicherbudget. Dadurch kann
-ein einzelner Stream freie Kerne nutzen, ohne bei mehreren Streams unbegrenzt
-zusätzliche Arbeit oder Speicher zu erzeugen.
+SeqCDC-v1 creates content-defined chunks from 16 KiB to 256 KiB. BLAKE3-256
+identifies their contents. New neighboring chunks become compression regions
+of at most 512 KiB and are stored independently as RAW or Zstd level 3.
+Uniform allocated ranges become FILL extents; unallocated zero ranges remain
+HOLE extents and consume no DATA record.
 
-## SeqCDC-v1 und SIMD
+An optional advanced-reduction path adds a rebuildable similarity index and
+depth-1 `ZSTD_PREFIX` records. It is explicitly opt-in and always falls back to
+independently decodable RAW/Zstd storage when its acceleration state is absent
+or stale.
 
-SeqCDC-v1 ist das Standardprofil für Write-through-Ingest und
-Checkpoint-Rechunking. Die Parameter sind:
+## Current capabilities
 
-| Parameter | Wert |
-| --- | ---: |
-| Modus | Increasing |
-| Sequenzlänge | 6 Bytes |
-| Skip-Trigger | 50 Gegenflanken |
-| Skip-Länge | 1.024 Bytes |
-| Minimale Chunkgröße | 16 KiB |
-| Maximale Chunkgröße | 256 KiB |
+- Create, open, read, write, truncate, rename, and unlink files
+- Random writes, append, `O_TRUNC`, `O_EXCL`, `RENAME_NOREPLACE`, `flush`, and
+  `fsync`
+- Sparse DATA/FILL/HOLE extents, hole punching, zero ranges, and DATA/HOLE seeks
+- Metadata-only clones through `copy_file_range`
+- Subdirectories, hardlinks, symlinks, xattrs/ACLs, permissions, and ownership
+- Crash recovery to the latest complete commit generation
+- Independent DATA-tier recovery checkpoints for total metadata-tier loss
+- Rebuildable exact and similarity indexes
+- Offline scrub plus adaptive online/offline DATA and metadata garbage collection
+- Read-only kernel page cache and readahead with explicit range invalidation
+- Logical per-share quotas and policy-selected small-file placement
+- HTTPS control plane with an embedded WebUI
+- Experimental Samba VFS module for SMB Fast Clone
 
-Auf CPUs mit AVX2 und BMI2 verwendet der Scanner automatisch einen
-vektorisierten Kernel. Auf anderen CPUs läuft die skalare Implementierung.
-Beide Pfade liefern exakt dieselben Grenzen; Differentialtests prüfen diese
-Eigenschaft. Punktuelles `unsafe` ist auf den SIMD-Kernel begrenzt, der sichere
-Aufrufer prüft die CPU-Features und Slice-Grenzen.
+The durable path supports exact deduplication, RAW/Zstd encoding, sparse files,
+checkpoints, recovery, scrub, and GC. Advanced reduction remains opt-in while
+broader backup corpora are evaluated. fastdup targets **Linux on x86-64 only**;
+AVX2/BMI2 paths are selected at runtime and retain scalar equivalents.
 
-`FASTDUP_SEQCDC_FORCE_SCALAR=1` schaltet ausschließlich für Diagnose und
-Vergleichsmessungen auf den skalaren Pfad. Für den normalen Betrieb ist keine
-Umgebungsvariable nötig.
+## Install release 0.5
 
-Auf der gemessenen Rocky-ISO erreichte der isolierte AVX2/BMI2-Scanner 8.009
-MiB/s und damit das 2,90-Fache des skalaren SeqCDC-Scanners. Im gepaarten
-SingleStream-SMB-Test stieg der Median des Gesamtdurchsatzes gegenüber
-skalarem SeqCDC um 13,8 Prozent; bei zwei gleichzeitigen Streams waren es
-4,4 Prozent. Das sind Ergebnisse eines bestimmten Hosts und keine
-Kapazitätszusage. Aufbau, Rohdaten, Streuung und Einschränkungen stehen im
-[SeqCDC-Benchmark](docs/benchmarks/seqcdc-prototype-2026-08-22.md).
-
-Der Wechsel auf SeqCDC-v1 änderte die Policy- und Exact-Index-Profilidentitäten.
-Ältere FastCDC-Prototyp-Repositories sind absichtlich inkompatibel. Die
-Entscheidung ist in [ADR 0054](docs/adr/0054-use-seqcdc-v1-as-the-default-chunking-profile.md)
-festgehalten.
-
-## Haltbarkeit und Integrität
-
-Akzeptierte Änderungen sind sofort im Live-Namensraum sichtbar. Ein Checkpoint
-friert einen konsistenten Präfix ein und veröffentlicht ihn erst, nachdem DATA,
-Metadaten und Commit Record vollständig geschrieben und geprüft wurden. Nach
-einem Absturz lädt fastdup die jüngste vollständige Generation. Eine
-unterbrochene Datei kann deshalb mit ihrem bereits committeten Präfix
-zurückkehren.
-
-Unabhängig davon versucht der Daemon alle 90 Sekunden und beim geordneten
-Shutdown, den vollständigen Graphen eines Commit als unveränderlichen Recovery
-Checkpoint auf das DATA Tier zu schreiben. Er dient ausschließlich dem Verlust
-des kompletten Metadata Tiers. Discovery läuft über zwei feste, verkettete
-Head-Slots; Recovery akzeptiert nur einen vollständig geprüften Checkpoint samt
-aller erreichbaren DATA-Abhängigkeiten.
-
-Der Standard-Daemon plant etwa alle fünf Sekunden einen Checkpoint. Bei 512
-MiB einzigartiger, noch nicht committeter DATA stoppt er kurz die Aufnahme
-neuer Mutationen, um die Dirty-DATA-Menge zu begrenzen. `fsync` erzeugt keine
-private Transaktion und verschärft die Haltbarkeitsgarantie nicht.
-
-Die dauerhaften Grenzen werden mehrfach geprüft:
-
-- BLAKE3-256 bindet Logical Chunks an ihre Inhalte.
-- CRC32C, Header, Footer, physische Länge und Container-Hash prüfen Container.
-- Unveränderliche Manifeste beschreiben jede sichtbare Dateiversion.
-- Ein verkettetes, gechecksummtes Commit-WAL wählt die Namespace-Generation.
-- Der Exact Index darf fehlen oder neu aufgebaut werden, ohne zur
-  Inhaltsautorität zu werden.
-- Aktivierte Exact-Runs werden nach vollständigem Audit read-only unter einer
-  Immutable-File-Lease gemappt. Kompakte Seitengrenzen halten die binäre Suche
-  aus I/O und decoded Page Cache heraus; Adapter-Fallback, Publication und
-  Offline-Scrub bleiben unabhängige bounded `read_exact_at`-Pfade.
-- Scrub prüft erreichbare Generationen, Container und aktive Locations.
-
-Container werden zunächst aufgebaut, vollständig erneut gelesen und geprüft,
-mit `fsync` stabilisiert, atomisch ohne Überschreiben veröffentlicht und durch
-einen Directory-Sync abgeschlossen. Das Modell setzt einen ehrlichen
-Stable-Storage-Stack voraus. RAID, Gerätespiegelung, Snapshots und Schutz gegen
-Geräteverlust gehören nicht zu fastdup.
-
-Details stehen im
-[Checkpoint-Testplan](docs/testing/durable-posix-checkpoint.md), in der
-[Container-Spezifikation](docs/specs/container-v1.md), der
-[Metadatenspezifikation](docs/specs/metadata-generation-v1.md) und der
-[Exact-Index-Spezifikation](docs/specs/exact-index-run-v1.md). Das DATA-Tier-
-Notfallformat beschreibt die
-[Recovery-Checkpoint-Spezifikation](docs/specs/recovery-checkpoint-v1.md).
-
-## Version 0.5 als RPM installieren
-
-Version 0.5 wird als natives RPM für Rocky Linux 10 auf x86-64 ausgeliefert.
-Das Paket enthält den FUSE-Repository-Daemon, die Offline-Wartung, den
-privilegierten Appliance-Agent und die HTTPS-Control-Plane einschließlich der
-eingebetteten WebUI. Node.js oder eine Rust-Toolchain werden auf dem Zielsystem
-nicht benötigt.
+The native RPM targets **Rocky Linux 10 on x86-64** and contains the FUSE
+runtime, maintenance CLI, privileged appliance agent, HTTPS control plane,
+embedded WebUI, systemd policy, and Samba VFS module.
 
 ```bash
 curl -LO \
@@ -414,70 +109,25 @@ sudo dnf install ./fastdup-0.5.0-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 
-Das RPM installiert und prüft die benötigte Laufzeitumgebung:
+Open `https://<appliance-host>:8080/`. The first certificate is self-signed.
+The initial credentials are `admin` / `fastdup01.` and the UI immediately
+requires a new password of at least twelve characters.
 
-- `kernel.io_uring_disabled=0` unter `/usr/lib/sysctl.d`; der DATA-Publisher
-  hat gemäß ADR 0058 bewusst keinen synchronen Fallback
-- getrennte systemd-Slices für Storage und Management, `MemorySwapMax=0` für
-  den Repository-Prozess sowie einen checkpointenden Stop über `SIGINT`
-- den Benutzer `fastdup-control`, Laufzeit-/State-Verzeichnisse und die
-  Standardkonfiguration unter `/etc/fastdup`
-- XFS-, FUSE-, Samba- und Provisionierungswerkzeuge als RPM-Abhängigkeiten;
-  automatisch provisionierte XFS-Pools werden mit `prjquota` eingehängt
+The repository service does not start until two empty, physically separate
+devices are selected for the metadata and DATA tiers in the WebUI.
 
-Nach der Installation ist die WebUI über
-`https://<appliance-host>:8080/` erreichbar. Das beim ersten Start erzeugte
-Zertifikat ist selbstsigniert. Die initiale Anmeldung lautet `admin` /
-`fastdup01.` und erzwingt sofort ein neues Passwort mit mindestens zwölf
-Zeichen. Falls `firewalld` aktiv ist, muss TCP-Port 8080 gezielt für das
-Management-Netz freigegeben werden.
+> [!CAUTION]
+> Provisioning erases the partition table and all contents of both selected
+> devices. Verify the device identities before confirming.
 
-Der Repository-Dienst wird nicht automatisch gestartet: Zuerst müssen in der
-WebUI zwei leere, physisch getrennte Geräte für Metadata und DATA ausgewählt
-und provisioniert werden. **Die Provisionierung löscht Partitionstabelle und
-Inhalt der ausgewählten Geräte.** Danach steuert die WebUI Mount, Unmount,
-Scrub, GC, Shares und die Repository-Einstellungen. Das RPM bindet
-`/etc/samba/fastdup-shares.conf` idempotent in den globalen Samba-Abschnitt ein
-und installiert den verpflichtenden, gegen Samba 4.23.5 gebauten
-`vfs_fastdup`-Adapter unter `/usr/lib64/samba/vfs/fastdup.so`. Er stellt SMB
-Fast Clone über genau einen `copy_file_range`-Aufruf bereit. Die noch geltenden
-Veeam- und Produktionsgrenzen stehen im
-[Samba-Modul-README](samba/vfs_fastdup/README.md).
+The release page also publishes a source RPM and SHA-256 checksums:
+[fastdup 0.5 release](https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.5).
 
-Die Installation lässt sich ohne Storage-Provisionierung prüfen:
+## Build and test
 
-```bash
-uname -m
-sysctl kernel.io_uring_disabled
-systemctl status fastdup-agent.service fastdup-control.service
-curl --insecure https://127.0.0.1:8080/api/v1/session
-```
-
-Zum Entfernen der Programme (Repository-Daten unter `/var/lib/fastdup` und
-`/srv/fastdup` bleiben absichtlich erhalten):
-
-```bash
-sudo dnf remove fastdup
-```
-
-### RPM reproduzierbar bauen
-
-Auf Rocky Linux 10 werden Rust 1.97.1, Node.js/npm, `rpm-build`, `patchelf` und
-die Development-Pakete von Samba, LDB, Talloc, TDB und Tevent benötigt.
-Der Build schreibt ausschließlich nach `.artifacts` und gibt am Ende den Pfad
-zum fertigen RPM aus:
-
-```bash
-sudo dnf install nodejs npm rpm-build patchelf \
-  samba-devel libldb-devel libtalloc-devel libtdb-devel libtevent-devel
-./packaging/build-rpm.sh
-```
-
-## Bauen und testen
-
-Vorausgesetzt werden Linux, eine aktuelle Rust-Toolchain und für einen echten
-Mount ein nutzbares `/dev/fuse`. Alle erzeugten Dateien bleiben unter
-`.artifacts`:
+Requirements are Linux, a current Rust toolchain, and `/dev/fuse` for real
+mount tests. Repository policy requires every generated artifact to stay under
+`.artifacts/`:
 
 ```bash
 cd /source/fastdup
@@ -488,9 +138,6 @@ export CARGO_TARGET_DIR=/source/fastdup/.artifacts/target
 export TMPDIR=/source/fastdup/.artifacts/tmp
 export PATH=/source/fastdup/.artifacts/cargo/bin:$PATH
 
-# Cargo creates CARGO_TARGET_DIR itself, including its CACHEDIR.TAG safety
-# marker. Do not pre-create that directory; otherwise `cargo clean` may refuse
-# to remove the regenerable cache.
 mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$TMPDIR"
 
 cargo test --workspace --all-targets
@@ -498,13 +145,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release -p fastdup-appliance
 ```
 
-## Lokalen Mount starten
+Cargo creates `CARGO_TARGET_DIR` itself; do not pre-create that directory.
 
-Der Mountpunkt muss als Verzeichnis bestehen; fehlende Metadata- und
-Containerwurzeln legt der Daemon nach erfolgreicher Start-Policy-Prüfung an.
-Metadata und DATA dürfen nicht dasselbe Verzeichnis sein. Für einen lokalen
-Funktionstest reichen getrennte Unterverzeichnisse; repräsentative Messungen
-sollten getrennte Metadata- und DATA-Geräte nutzen.
+To build the Rocky Linux RPM reproducibly, install Node.js/npm, `rpm-build`,
+`patchelf`, and the Samba development packages, then run:
+
+```bash
+./packaging/build-rpm.sh
+```
+
+## Run a local lab mount
+
+The production runtime requires separate physical XFS filesystems. For a local
+single-disk lab only, create separate directories and enable the explicit lab
+override:
 
 ```bash
 mkdir -p \
@@ -512,19 +166,20 @@ mkdir -p \
   /source/fastdup/.artifacts/repository/metadata \
   /source/fastdup/.artifacts/repository/containers
 
-/source/fastdup/.artifacts/target/release/fastdup-durable-fuse \
+FASTDUP_POOL_ISOLATION=lab-allow-shared \
+  /source/fastdup/.artifacts/target/release/fastdup-durable-fuse \
   /source/fastdup/.artifacts/mount \
   /source/fastdup/.artifacts/repository/metadata \
   /source/fastdup/.artifacts/repository/containers
 ```
 
-Der Daemon läuft im Vordergrund. `Ctrl-C` stoppt die Mutationsannahme, führt
-den abschließenden Checkpoint aus und hängt den Mount aus.
+The daemon stays in the foreground. `Ctrl-C` stops mutation admission, creates
+a final checkpoint, and unmounts cleanly.
 
-Advanced Reduction ist opt-in. Alle neuen Repositories verwenden bereits vom
-ersten Commit an das aktuelle Policy Set. Zuerst wird bei beendetem Daemon ein
-kohärentes Indexpaar aufgebaut, danach wird die optionale Prefix-Auswahl
-aktiviert:
+### Enable advanced reduction
+
+With the daemon stopped, build one coherent exact/similarity index pair before
+enabling prefix selection:
 
 ```bash
 BIN=/source/fastdup/.artifacts/target/release
@@ -532,32 +187,18 @@ META=/source/fastdup/.artifacts/repository/metadata
 DATA=/source/fastdup/.artifacts/repository/containers
 
 "$BIN/fastdup-maintenance" --offline rebuild-pool-indexes "$META" "$DATA"
+FASTDUP_POOL_ISOLATION=lab-allow-shared \
 FASTDUP_ADVANCED_REDUCTION=prefix-v1 \
   "$BIN/fastdup-durable-fuse" \
   /source/fastdup/.artifacts/mount "$META" "$DATA"
 ```
 
-Fehlt das Paar oder passt seine Exact-Bindung nicht, bleibt der Write-Pfad
-verfügbar und fällt auf unabhängiges RAW/Zstd zurück. Ein Repository-Head darf
-nur mit genau dem aktuellen Policy Set geöffnet werden;
-Prototype-Repositories mit einer anderen Policy-ID werden nicht migriert.
+If the paired snapshot is missing or stale, writes remain available and fall
+back to independent RAW/Zstd encoding.
 
-Für den produktiven No-Swap-Betrieb muss der Daemon in einer eigenen
-cgroup-v2 mit `MemorySwapMax=0` laufen. Mit
-`FASTDUP_REQUIRE_CGROUP_NO_SWAP=1` prüft er diese Kernel-Grenze noch vor dem
-Öffnen von Metadata und DATA. Der gemeinsame `MemoryBudgetGovernor` passt die
-rebuildbaren Cache-Budgets an den kleineren Host-/cgroup-Headroom an; bereits
-belegter Host- oder Shared-cgroup-Swap schaltet die fastdup-Caches nicht ab.
-Nur Swap des Daemon-Prozesses schließt ihre Admission.
-Langlebige, dichte Dedup-Bloom-Tabellen ab 2 MiB erhalten eine eigene
-`MADV_HUGEPAGE`-Arena, ohne die Bloom-Probe-Hot-Loop um Sampling oder Locks zu
-erweitern. Details und Abnahmekriterien stehen in
-[Memory and swap containment](docs/operations/memory-and-swap.md).
+## Maintenance
 
-## Offline-Wartung
-
-Vor Wartungsarbeiten muss der fastdup-Daemon beendet und der Mount ausgehängt
-sein. `--offline` ist deshalb verpflichtend.
+Stop the daemon and unmount before using the mandatory `--offline` mode:
 
 ```bash
 BIN=/source/fastdup/.artifacts/target/release/fastdup-maintenance
@@ -571,75 +212,59 @@ DATA=/source/fastdup/.artifacts/repository/containers
 "$BIN" --offline scrub-gc "$META" "$DATA"
 ```
 
-`scrub-gc` koppelt Garbage Collection an einen erfolgreichen Scrub und den
-beobachteten Füllstand des DATA-Geräts. Ablauf und Ausgaben beschreibt die
-[Wartungsanleitung](docs/operations/scrub-and-exact-index-rebuild.md).
+See the [maintenance guide](docs/operations/scrub-and-exact-index-rebuild.md)
+for recovery, scrub, index rebuild, and GC semantics.
 
-Bei laufendem Daemon kann ein sofortiger, vollständig vom Daemon koordinierter
-Online-GC-Durchlauf angefordert werden:
+## Repository map
 
-```bash
-"$BIN" --online gc-now "$META"
-```
-
-Der Appliance Lease verhindert, dass derselbe Repository-Stand gleichzeitig
-über den Offline-Pfad geöffnet wird.
-
-## SMB und Samba
-
-Eine Samba-Freigabe kann auf dem FUSE-Mount liegen. Das experimentelle Modul
-[`samba/vfs_fastdup`](samba/vfs_fastdup/README.md) ergänzt Duplicate Extents
-und Integrity FSCTLs für Fast-Clone-Clients. Es übersetzt einen gültigen
-`FSCTL_DUPLICATE_EXTENTS_TO_FILE`-Aufruf in genau einen Linux-
-`copy_file_range`-Aufruf und fällt bei Fehlern nicht unbemerkt auf eine
-gepufferte Kopie zurück.
-
-Das Modul ist noch nicht für Veeam Fast Clone freigegeben. Es fehlen reale
-Veeam-Traces, breitere Protokolltests und weitere Lock-, Alignment- und
-Fehlerfälle. Der portable Contract-Test läuft mit:
-
-```bash
-sh samba/vfs_fastdup/tests/run.sh
-```
-
-## Workspace
-
-| Komponente | Aufgabe |
+| Path | Purpose |
 | --- | --- |
-| `fastdup-format` | Versionierte Container-, Manifest-, Commit- und Exact-Index-Bytes |
-| `fastdup-store` | SeqCDC, Reduktion, Container, Exact Index, Scrub und GC |
-| `fastdup-io-uring` | Erforderlicher Linux-`io_uring`-Pfad für begrenzte parallele Container-I/O |
-| `fastdup-posix` | POSIX-Modell, Live-Dirty-Overlay und Low-Level-FUSE-Adapter |
-| `fastdup-appliance` | Ingest, Checkpoints, Recovery und ausführbare Programme |
-| `fastdup-copy-metrics` | Günstige Hot-Path- und Kopiertelemetrie |
-| `fastdup-exact-bench` | Reproduzierbares A/B für aktivierte Exact-Lookups über mmap und bounded Reads |
-| `fastdup-testkit` | Deterministische Fehler, Crash-Modell und Corpus-Werkzeuge |
-| `samba/vfs_fastdup` | Experimentelles Samba-VFS-Modul für Fast Clone |
+| `crates/fastdup-format` | Versioned container, manifest, commit, and index formats |
+| `crates/fastdup-store` | SeqCDC, reduction, containers, indexes, scrub, and GC |
+| `crates/fastdup-io-uring` | Bounded asynchronous Linux container I/O |
+| `crates/fastdup-posix` | POSIX model, live dirty overlay, and FUSE adapter |
+| `crates/fastdup-appliance` | Ingest, checkpoints, recovery, and executables |
+| `crates/fastdup-control` | HTTPS API, WebUI, provisioning, and telemetry |
+| `crates/fastdup-testkit` | Deterministic faults, crash model, and corpus tools |
+| `samba/vfs_fastdup` | Experimental Samba VFS module for Fast Clone |
 
-## Grenzen
+## Design and evidence
 
-Vor einem produktiven Einsatz fehlen insbesondere:
+- [Domain language](CONTEXT.md)
+- [Architecture Decision Records](docs/adr/)
+- [Durable format specifications](docs/specs/)
+- [Test plans](docs/testing/)
+- [Operations guides](docs/operations/)
+- [Reproducible benchmarks](docs/benchmarks/)
+- [Commercial appliance comparison methodology](docs/research/commercial-backup-appliance-comparison.md)
+- [Samba VFS status and limits](samba/vfs_fastdup/README.md)
 
-- vollständige POSIX-Abdeckung und breitere Client-Kompatibilität
-- Schutz vor Geräteverlust
-- Langzeit-, Zufalls-Kill- und echte Stromausfalltests auf Blockgeräten
-- breitere versionierte Backup-Corpora und ein belastbares GC-/Restore-Gate,
-  bevor Similarity und Zstd-PREFIX zum Default werden
-- dauerhafte Writer-, Recovery-, Scrub- und GC-Invarianten für
-  Dictionary-Encodings; Sparse-XOR-Delta und Reorder bleiben experimentell
-- Veeam-Protokollevidenz für das Samba-Modul
+One example result: on the documented Rocky ISO workload, the isolated
+AVX2/BMI2 SeqCDC scanner reached 8,009 MiB/s (2.90× the scalar scanner), while
+the paired single-stream SMB benchmark improved end-to-end median throughput by
+13.8%. These are host- and workload-specific measurements, not performance
+promises; see the [full benchmark](docs/benchmarks/seqcdc-prototype-2026-08-22.md).
 
-Messwerte sind workload- und hostabhängig. Reproduzierbare Methoden und
-Einschränkungen liegen unter [docs/benchmarks](docs/benchmarks/), Testpläne
-unter [docs/testing](docs/testing/) und Betriebsnotizen unter
-[docs/operations](docs/operations/).
+## Limitations
 
-Der aktuelle reale Online-GC-Interferenzlauf ist unter
-[docs/benchmarks/online-gc-interference-2026-08-26.md](docs/benchmarks/online-gc-interference-2026-08-26.md)
-dokumentiert. Der opt-in Prefix-ABBA-Lauf steht unter
-[docs/benchmarks/persistent-prefix-smb-ab-2026-08-27.md](docs/benchmarks/persistent-prefix-smb-ab-2026-08-27.md).
-Die Neubewertung des verworfenen Container-Formats 3 nach dem Governor-Fix ist
-unter [docs/benchmarks/container-format-v3-gc-reevaluation-2026-08-27.md](docs/benchmarks/container-format-v3-gc-reevaluation-2026-08-27.md)
-dokumentiert.
-Der kalte A/B-Test für Restore-Coalescing steht unter
-[docs/benchmarks/verified-restore-coalescing-2026-08-27.md](docs/benchmarks/verified-restore-coalescing-2026-08-27.md).
+Before production use, fastdup still needs:
+
+- Complete POSIX coverage and a broader client/Samba compatibility matrix
+- Device-loss protection, replication, immutability, and encryption policy
+- Long-running, randomized kill, and physical power-cut testing
+- Broader versioned backup corpora and a production gate for advanced reduction
+- Real Veeam protocol evidence for the Samba module
+- Capacity and support commitments
+
+Commercial systems such as Dell PowerProtect Data Domain and HPE StoreOnce
+solve overlapping backup-storage problems but provide mature integrations,
+replication, retention, cyber-resilience, and support that fastdup does not.
+fastdup is intended for studying and extending an open POSIX deduplication
+engine, not as a superiority claim or drop-in replacement.
+
+## License
+
+The Rust workspace and project documentation are licensed under
+[Apache License 2.0](LICENSE). The in-process Samba module under
+[`samba/vfs_fastdup`](samba/vfs_fastdup/README.md) is licensed separately under
+GPL-3.0-or-later, as required for a Samba VFS module.
