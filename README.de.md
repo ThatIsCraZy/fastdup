@@ -1,7 +1,7 @@
 # fastdup
 
 <p align="center">
-  <strong>Deduplizierender POSIX-Speicher: als RPM installieren und bequem im Browser verwalten.</strong>
+  <strong>Aus geeigneter x86-64-Hardware wird eine High-Performance Dedup-Appliance—bequem im Browser verwaltet.</strong>
 </p>
 
 <p align="center">
@@ -20,16 +20,48 @@
   · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.5">Release-Informationen</a>
 </p>
 
-fastdup ist eine experimentelle Single-Node-Storage-Appliance für Linux. Sie
-stellt normale Dateien und Verzeichnisse über FUSE und SMB/Samba bereit und
-reduziert den physischen Speicherbedarf durch Exact Dedup und Zstd-Kompression.
-Administratoren bedienen die Appliance über eine eingebettete HTTPS-WebUI—ein
-separater Management-Stack ist nicht nötig.
+fastdup ist eine experimentelle, softwaredefinierte Single-Node-
+Storage-Appliance für Linux. Ein RPM auf geeigneter x86-64-Hardware, getrennte
+Metadata- und DATA-Tiers, und schon stehen normale Dateien und Verzeichnisse
+über FUSE und SMB/Samba bereit. Eine mehrstufige Reduction-Pipeline und ein
+optimierter Rust-Datenpfad zielen auf hohen Durchsatz; die eingebettete
+HTTPS-WebUI hält die Administration einfach.
 
 > [!WARNING]
 > fastdup ist ein Forschungsprototyp und kein produktionsreifes Backup-Produkt.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
+
+## Gemessen mit 10 vCPUs auf einem Notebook-Prozessor
+
+Die Benchmark-VM lief auf einem Intel Core i7-1370P und sah nur zehn logische
+CPUs, AVX2/BMI2 und kein AVX-512:
+
+| Messung | Ergebnis | Umfang |
+| --- | ---: | --- |
+| Drei serielle SingleStream-SMB-Uploads | **1.022,1 MiB/s** | aktueller Produktionspfad |
+| Erster physischer / schnellster Exact-Upload | **601,0 / 1.576,2 MiB/s** | bytegenau geprüfter SMB-Lauf |
+| Gesamte Repository-Reduction | **3,104× / 67,78 % gespart** | derselbe dauerhafte SMB-Lauf |
+| SeqCDC-AVX2-/BMI2-Scanner | **9.568 MiB/s** | isolierter Rocky-ISO-Scan in 1-MiB-Slices |
+| Reduction im versionierten ISO-Stresstest | **42,95× / 98,311 % Exact Hits** | Ingest-Historie, keine Live-Kapazität |
+
+Die Werte sind host- und workloadspezifisch und keine SLA-Zusage. Siehe
+[aktueller SMB-Nachweis](docs/benchmarks/hot-buffer-reuse-2026-09-01.md),
+[601-Sekunden-FUSE-Lauf](docs/benchmarks/io-intensive-fuse-600s.md) und
+[interaktive Produktseite](https://thatiscrazy.github.io/fastdup/#performance).
+
+fastdup geht über eine klassische Exact-Dedup-plus-Kompression-Pipeline hinaus.
+Der dauerhafte Default kombiniert SeqCDC Content-Defined Chunking,
+BLAKE3-geprüfte Exact Dedup, Sparse-HOLE- und Constant-Byte-FILL-Extents,
+gruppiertes adaptives RAW/Zstd mit versionierter Sparschwelle. Workloads mit
+`copy_file_range` erhalten zusätzlich Metadata Fast Clone. Ein neu aufbaubarer
+Similarity Index mit Depth-1-`ZSTD_PREFIX` ist opt-in.
+Inhaltsidentifizierte Dictionaries und Sparse-XOR Delta bleiben klar
+gekennzeichnete Forschungspfade; Similarity-Reorder wurde zugunsten der
+Restore-Lokalität verworfen. Weil proprietäre Appliance-Interna nicht
+vollständig offengelegt sind, behauptet das Projekt keinen unseriös zählbaren
+Technikvorsprung. Die Quellen stehen in der
+[Recherchegrundlage für Website-Aussagen](docs/research/webpage-performance-reduction-claims-2026-09-02.md).
 
 ## Auf Rocky Linux 10 installieren
 

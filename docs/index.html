@@ -3,15 +3,15 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>fastdup · Deduplizierender POSIX-Speicher mit WebUI</title>
-    <meta name="description" content="fastdup ist eine experimentelle POSIX-Storage-Appliance für Rocky Linux mit Exact Dedup, Zstd, FUSE, SMB und einfacher HTTPS-WebUI.">
+    <title>fastdup · Aus x86-64-Hardware wird eine High-Performance Dedup-Appliance</title>
+    <meta name="description" content="fastdup macht aus geeigneter x86-64-Hardware eine schnelle, per WebUI verwaltete POSIX-Dedup-Appliance mit FUSE, SMB, Exact Dedup, Zstd und Advanced Reduction.">
     <meta name="keywords" content="deduplication, filesystem, storage appliance, POSIX, FUSE, SMB, Samba, Rust, Rocky Linux, Zstd, backup storage">
     <meta name="theme-color" content="#071016">
     <meta name="robots" content="index,follow">
     <link rel="canonical" href="https://thatiscrazy.github.io/fastdup/">
     <meta property="og:type" content="website">
-    <meta property="og:title" content="fastdup · POSIX Storage einfach verwalten">
-    <meta property="og:description" content="Als RPM installieren. Im Browser provisionieren, überwachen und verwalten.">
+    <meta property="og:title" content="fastdup · Deine Hardware. Deine Dedup-Appliance.">
+    <meta property="og:description" content="Als RPM installieren, zwei Storage-Tiers wählen und schnelle POSIX-/SMB-Deduplizierung per WebUI verwalten.">
     <meta property="og:url" content="https://thatiscrazy.github.io/fastdup/">
     <meta property="og:image" content="https://thatiscrazy.github.io/fastdup/assets/webui-overview.png">
     <meta name="twitter:card" content="summary_large_image">
@@ -37,6 +37,10 @@
         <span><strong>fastdup</strong><small>STORAGE APPLIANCE</small></span>
       </a>
       <nav aria-label="Hauptnavigation">
+        <a class="lang-de" href="#performance">Leistung</a>
+        <a class="lang-en" href="#performance">Performance</a>
+        <a class="lang-de" href="#reduction">Reduction</a>
+        <a class="lang-en" href="#reduction">Reduction</a>
         <a class="lang-de" href="#webui">WebUI</a>
         <a class="lang-en" href="#webui">WebUI</a>
         <a class="lang-de" href="#installation">Installation</a>
@@ -52,12 +56,12 @@
     <main id="top">
       <section class="hero section-shell">
         <div class="hero-copy">
-          <div class="eyebrow lang-de"><span></span> STORAGE VERWALTEN, NICHT ERFORSCHEN MÜSSEN</div>
-          <div class="eyebrow lang-en"><span></span> MANAGE STORAGE—WITHOUT HAVING TO STUDY IT</div>
-          <h1 class="lang-de">Deduplizierender POSIX-Speicher. <em>Einfach im Browser.</em></h1>
-          <h1 class="lang-en">Deduplicating POSIX storage. <em>Simple in your browser.</em></h1>
-          <p class="hero-lead lang-de">RPM installieren, zwei Storage-Geräte auswählen und Shares anlegen. fastdup verbindet Exact Dedup, Zstd, FUSE und SMB mit einer eingebetteten HTTPS-WebUI.</p>
-          <p class="hero-lead lang-en">Install one RPM, select two storage devices, and create shares. fastdup combines exact deduplication, Zstd, FUSE, and SMB with an embedded HTTPS WebUI.</p>
+          <div class="eyebrow lang-de"><span></span> SOFTWARE-DEFINIERTER STORAGE FÜR X86-64</div>
+          <div class="eyebrow lang-en"><span></span> SOFTWARE-DEFINED STORAGE FOR X86-64</div>
+          <h1 class="lang-de">Mach aus deiner Kiste eine <em>High-Performance Dedup-Appliance.</em></h1>
+          <h1 class="lang-en">Turn your box into a <em>high-performance dedup appliance.</em></h1>
+          <p class="hero-lead lang-de">Geeignete x86-64-Hardware, Rocky Linux und zwei Storage-Tiers genügen. Ein RPM liefert POSIX/FUSE, SMB, eine mehrstufige Reduction-Pipeline und die komplette HTTPS-WebUI.</p>
+          <p class="hero-lead lang-en">Suitable x86-64 hardware, Rocky Linux, and two storage tiers are enough. One RPM delivers POSIX/FUSE, SMB, a multi-stage reduction pipeline, and the complete HTTPS WebUI.</p>
           <div class="hero-actions">
             <a class="button primary lang-de" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">RPM herunterladen <span>↓</span></a>
             <a class="button primary lang-en" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">Download RPM <span>↓</span></a>
@@ -65,21 +69,96 @@
             <a class="button secondary lang-en" href="#installation">View installation</a>
           </div>
           <div class="compatibility">
-            <span>v0.5.0</span><span>Rocky Linux 10</span><span>x86-64</span><span>Apache-2.0</span>
+            <span>v0.5.0</span><span>Rocky Linux 10</span><span>x86-64</span><span class="lang-de">kein Spezial-Controller nötig</span><span class="lang-en">no special controller required</span>
           </div>
         </div>
         <div class="hero-visual">
           <div class="browser-bar"><i></i><i></i><i></i><span>https://fastdup-appliance:8080</span></div>
           <img src="assets/webui-overview.png" alt="fastdup WebUI mit Repository-Zustand, Durchsatz und Kapazität" width="1600" height="1000">
-          <div class="live-chip"><i></i><span class="lang-de">Eine Oberfläche für den Betrieb</span><span class="lang-en">One interface for operations</span></div>
+          <div class="live-chip"><i></i><span class="lang-de">Deine Hardware · eine Appliance</span><span class="lang-en">Your hardware · one appliance</span></div>
         </div>
       </section>
 
       <section class="trust-strip" aria-label="Produktmerkmale">
-        <div><strong>HTTPS WebUI</strong><span class="lang-de">im Paket enthalten</span><span class="lang-en">included in the package</span></div>
-        <div><strong>FUSE + SMB</strong><span class="lang-de">normale Dateien und Shares</span><span class="lang-en">normal files and shares</span></div>
-        <div><strong>Exact Dedup + Zstd</strong><span class="lang-de">transparente Datenreduktion</span><span class="lang-en">transparent data reduction</span></div>
-        <div><strong>Scrub + Recovery</strong><span class="lang-de">prüfbare Integrität</span><span class="lang-en">verifiable integrity</span></div>
+        <div><strong>Standard x86-64</strong><span class="lang-de">softwaredefinierte Appliance</span><span class="lang-en">software-defined appliance</span></div>
+        <div><strong class="lang-de">1.022,1 MiB/s</strong><strong class="lang-en">1,022.1 MiB/s</strong><span class="lang-de">aktueller SMB-Aggregatdurchsatz</span><span class="lang-en">current aggregate SMB throughput</span></div>
+        <div><strong class="lang-de">3,104×</strong><strong class="lang-en">3.104×</strong><span class="lang-de">gemessene Repository-Reduction</span><span class="lang-en">measured repository reduction</span></div>
+        <div><strong>HTTPS WebUI</strong><span class="lang-de">Provisionierung bis Telemetrie</span><span class="lang-en">provisioning through telemetry</span></div>
+      </section>
+
+      <section class="section-shell appliance-section">
+        <div class="section-heading">
+          <div class="eyebrow"><span></span> BRING YOUR OWN HARDWARE</div>
+          <h2 class="lang-de">Deine Hardware. Deine Platten. Deine Dedup-Appliance.</h2>
+          <h2 class="lang-en">Your hardware. Your drives. Your dedup appliance.</h2>
+          <p class="lang-de">fastdup ist keine Hardware-Appliance mit festem Chassis. Installiere Rocky Linux 10 auf einem geeigneten x86-64-System, stelle einen schnellen Metadata-Tier und einen separaten DATA-Tier bereit und verwandle die Maschine per RPM in einen FUSE-/SMB-Speicher mit transparenter Datenreduktion.</p>
+          <p class="lang-en">fastdup is not tied to a fixed appliance chassis. Install Rocky Linux 10 on a suitable x86-64 system, provide a fast metadata tier and a separate DATA tier, and turn the machine into FUSE/SMB storage with transparent data reduction by installing one RPM.</p>
+        </div>
+        <div class="appliance-flow" aria-label="Vom Server zur fastdup Appliance">
+          <article><span>01</span><strong class="lang-de">x86-64-Kiste</strong><strong class="lang-en">x86-64 box</strong><small class="lang-de">Server, Workstation oder Lab-System</small><small class="lang-en">server, workstation, or lab system</small></article>
+          <i>→</i>
+          <article><span>02</span><strong>Rocky Linux 10 + RPM</strong><small class="lang-de">keine Rust-/Node-Toolchain nötig</small><small class="lang-en">no Rust or Node toolchain required</small></article>
+          <i>→</i>
+          <article><span>03</span><strong>fastdup Appliance</strong><small>FUSE · SMB · WebUI · Scrub · GC</small></article>
+        </div>
+        <p class="hardware-note lang-de">Für den produktiven Schreibbetrieb verlangt fastdup zwei physisch getrennte XFS-Dateisysteme. Gerätespiegelung oder RAID bleiben bewusst Aufgabe des Block-Layers.</p>
+        <p class="hardware-note lang-en">Production writes require two physically separate XFS filesystems. Device mirroring or RAID deliberately remains the block layer's responsibility.</p>
+      </section>
+
+      <section id="performance" class="performance-section">
+        <div class="section-shell">
+          <div class="section-heading">
+            <div class="eyebrow"><span></span> MEASURED, NOT PROJECTED</div>
+            <h2 class="lang-de">Hoher Durchsatz auf einer kleinen Notebook-CPU-VM.</h2>
+            <h2 class="lang-en">High throughput on a small notebook-CPU VM.</h2>
+            <p class="lang-de">Der Messhost war keine große Storage-CPU: eine VM auf einem Intel Core i7-1370P aus der Notebook-Klasse, mit nur zehn sichtbaren logischen CPUs, AVX2/BMI2 und ohne AVX-512. Der aktuelle SMB-Lauf blieb dabei bei 569,5 MB Peak RSS und 0 Byte Prozess-Swap.</p>
+            <p class="lang-en">The measured host was not a large storage CPU: a VM on a notebook-class Intel Core i7-1370P, exposing only ten logical CPUs, with AVX2/BMI2 and no AVX-512. The current SMB run stayed at 569.5 MB peak RSS and zero bytes of process swap.</p>
+          </div>
+          <div class="metric-grid">
+            <article><span class="metric lang-de">1.022,1</span><span class="metric lang-en">1,022.1</span><strong>MiB/s</strong><h3 class="lang-de">SMB-Aggregat</h3><h3 class="lang-en">aggregate SMB</h3><p class="lang-de">Drei serielle ISO-Uploads im aktuellen Produktionspfad.</p><p class="lang-en">Three serial ISO uploads on the current production path.</p><small>END-TO-END · CURRENT RUN</small></article>
+            <article><span class="metric lang-de">601,0</span><span class="metric lang-en">601.0</span><strong>MiB/s</strong><h3 class="lang-de">Erster physischer Upload</h3><h3 class="lang-en">first physical upload</h3><p class="lang-de">Neue Chunks inklusive Container-Publication auf den DATA-Tier.</p><p class="lang-en">New chunks including container publication to the DATA tier.</p><small>END-TO-END · COPY 1</small></article>
+            <article><span class="metric lang-de">1.576,2</span><span class="metric lang-en">1,576.2</span><strong>MiB/s</strong><h3 class="lang-de">Exact-Wiederholung</h3><h3 class="lang-en">exact repeat</h3><p class="lang-de">Schnellste Einzelkopie im selben bytegenau geprüften SMB-Lauf.</p><p class="lang-en">Fastest individual copy in the same byte-verified SMB run.</p><small>END-TO-END · COPY 3</small></article>
+            <article class="accent"><span class="metric lang-de">3,104×</span><span class="metric lang-en">3.104×</span><strong class="lang-de">67,78 % gespart</strong><strong class="lang-en">67.78% saved</strong><h3 class="lang-de">Repository gesamt</h3><h3 class="lang-en">whole repository</h3><p class="lang-de">Logische Daten zu allokiertem Repository inklusive Metadaten.</p><p class="lang-en">Logical data versus allocated repository including metadata.</p><small>DURABLE SMB PATH · 3 LIVE COPIES</small></article>
+            <article><span class="metric lang-de">9.568</span><span class="metric lang-en">9,568</span><strong>MiB/s</strong><h3>SeqCDC AVX2/BMI2</h3><p class="lang-de">Isolierter 1-MiB-Slice-Scanner über die Rocky-ISO.</p><p class="lang-en">Isolated 1 MiB-slice scanner over the Rocky ISO.</p><small class="lang-de">MICROBENCHMARK · 6.223 MiB/s SKALAR</small><small class="lang-en">MICROBENCHMARK · 6,223 MiB/s SCALAR</small></article>
+            <article class="accent-soft"><span class="metric lang-de">42,95×</span><span class="metric lang-en">42.95×</span><strong class="lang-de">98,311 % Exact Hits</strong><strong class="lang-en">98.311% exact hits</strong><h3 class="lang-de">Versionierter ISO-Stresstest</h3><h3 class="lang-en">versioned ISO stress test</h3><p class="lang-de">601 Sekunden FUSE; logische Ingest-Daten zu DATA plus Metadaten.</p><p class="lang-en">601 seconds of FUSE; logical ingest data versus DATA plus metadata.</p><small>WORKLOAD RESULT · NOT LIVE CAPACITY</small></article>
+          </div>
+          <div class="evidence-row">
+            <p class="lang-de">Workload- und hostabhängige Messungen, keine SLA. Der SMB-Lauf nutzt ein ISO mit warmen Exact-Wiederholungen und virtuelle Testgeräte. 42,95× misst Ingest-Historie aus 50 minimal veränderten ISO-Versionen; der finale Namespace war leer und GC-Credit fehlte, daher ist es keine Live-Kapazitätsquote.</p>
+            <p class="lang-en">Workload- and host-specific measurements, not an SLA. The SMB run uses one ISO with warm exact repeats and virtual test devices. 42.95× measures ingest history from 50 minimally changed ISO versions; the final namespace was empty and no GC credit applied, so it is not a live-capacity ratio.</p>
+            <nav><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/hot-buffer-reuse-2026-09-01.md#singlestream-smb-ab">Current SMB run ↗</a><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/io-intensive-fuse-600s.md#incremental-streaming-and-bounded-recovery-600-second-rerun">601 s FUSE run ↗</a><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/adr/0054-use-seqcdc-v1-as-the-default-chunking-profile.md">SeqCDC decision ↗</a></nav>
+          </div>
+        </div>
+      </section>
+
+      <section id="reduction" class="section-shell reduction-section">
+        <div class="section-heading">
+          <div class="eyebrow"><span></span> MULTI-STAGE DATA REDUCTION</div>
+          <h2 class="lang-de">Mehr als die klassische Exact-Dedup-plus-Kompression-Pipeline.</h2>
+          <h2 class="lang-en">Beyond the classic exact-dedup-plus-compression pipeline.</h2>
+          <p class="lang-de">fastdup verbindet mehrere unabhängige Reduction-Stufen und veröffentlicht ihre Grenzen, Entscheidungen und Formate. Welche internen Verfahren proprietäre Legacy-Appliances kombinieren, ist nicht vollständig offengelegt und deshalb nicht seriös zählbar—vergleichbar ist hier die offen dokumentierte Pipeline.</p>
+          <p class="lang-en">fastdup combines several independent reduction stages and publishes their boundaries, decisions, and formats. Proprietary legacy appliances do not fully disclose every internal technique, so a numeric technique count would not be defensible—the meaningful difference is this openly documented pipeline.</p>
+        </div>
+        <div class="legacy-note">
+          <strong class="lang-de">Der belastbare Unterschied</strong><strong class="lang-en">The defensible difference</strong>
+          <p class="lang-de">Dell Data Domain und HPE StoreOnce heben öffentlich vor allem Inline-Deduplizierung plus Kompression hervor. fastdup dokumentiert zusätzlich Sparse-/FILL-Repräsentation, metadata-only Clone-Reuse und optional Similarity-geführte Depth-1-Zstd-Prefixes. Das ist ein breiter dokumentierter Stack—keine Behauptung über unbekannte proprietäre Interna.</p>
+          <p class="lang-en">Dell Data Domain and HPE StoreOnce publicly emphasize inline deduplication plus compression. fastdup additionally documents sparse/FILL representation, metadata-only clone reuse, and optional similarity-guided depth-1 Zstd prefixes. That is a broader documented stack—not a claim about unknown proprietary internals.</p>
+          <nav><a href="https://infohub.delltechnologies.com/en-us/l/dell-powerprotect-data-domain-sisl-scaling-architecture/no-data-available-191/">Dell SISL ↗</a><a href="https://www.hpe.com/us/en/collaterals/collateral.c04328820.html">HPE StoreOnce ↗</a><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/research/webpage-performance-reduction-claims-2026-09-02.md">Claim evidence ↗</a></nav>
+        </div>
+        <div class="reduction-grid">
+          <article><span class="stage live lang-de">AKTIV</span><span class="stage live lang-en">ACTIVE</span><h3>SeqCDC-v1</h3><p class="lang-de">Content-Defined Chunking findet stabile Grenzen trotz Einfügungen und Verschiebungen.</p><p class="lang-en">Content-defined chunking finds stable boundaries across insertions and shifts.</p></article>
+          <article><span class="stage live lang-de">AKTIV</span><span class="stage live lang-en">ACTIVE</span><h3>BLAKE3 Exact Dedup</h3><p class="lang-de">Identische Chunks werden bytegenau geprüft und nur einmal physisch referenziert.</p><p class="lang-en">Identical chunks are byte-verified and physically referenced only once.</p></article>
+          <article><span class="stage live lang-de">AKTIV</span><span class="stage live lang-en">ACTIVE</span><h3>HOLE + FILL</h3><p class="lang-de">Sparse Nullbereiche benötigen keinen DATA-Record; konstante Bytebereiche werden als FILL abgebildet.</p><p class="lang-en">Sparse zero ranges need no DATA record; constant-byte ranges become FILL extents.</p></article>
+          <article><span class="stage live lang-de">AKTIV</span><span class="stage live lang-en">ACTIVE</span><h3 class="lang-de">Gruppiertes Zstd</h3><h3 class="lang-en">Grouped Zstd</h3><p class="lang-de">Benachbarte Chunks teilen begrenzte Compression Regions; Zstd gewinnt nur oberhalb der versionierten Sparschwelle.</p><p class="lang-en">Neighboring chunks share bounded compression regions; Zstd wins only above the versioned saving threshold.</p></article>
+          <article><span class="stage workload">WORKLOAD</span><h3>Metadata Fast Clone</h3><p class="lang-de"><code>copy_file_range</code> klont bereits unveränderliche Extents, ohne DATA erneut zu lesen oder zu speichern.</p><p class="lang-en"><code>copy_file_range</code> clones immutable extents without rereading or storing DATA again.</p></article>
+          <article><span class="stage optional">OPT-IN</span><h3>Similarity + ZSTD_PREFIX</h3><p class="lang-de">Ein rebuildbarer Similarity Index wählt unabhängig dekodierbare Depth-1-Prefix-Bases.</p><p class="lang-en">A rebuildable similarity index selects independently decodable depth-1 prefix bases.</p></article>
+          <article><span class="stage research">RESEARCH</span><h3 class="lang-de">Zstd-Dictionaries</h3><h3 class="lang-en">Zstd dictionaries</h3><p class="lang-de">Inhaltsidentifizierte Dictionaries für wiederkehrende strukturierte Datenfamilien.</p><p class="lang-en">Content-identified dictionaries for recurring structured-data families.</p></article>
+          <article><span class="stage research">RESEARCH</span><h3>Sparse-XOR Delta</h3><p class="lang-de">Begrenzte Depth-1-Deltas für ähnliche Chunks mit wenigen geänderten Bytes.</p><p class="lang-en">Bounded depth-1 deltas for similar chunks with only a few changed bytes.</p></article>
+        </div>
+        <div class="pipeline-note">
+          <strong class="lang-de">Auf Performance ausgelegt:</strong><strong class="lang-en">Designed for performance:</strong>
+          <p class="lang-de">AVX2/BMI2-SeqCDC, paralleles BLAKE3, worker-lokale Zstd-Kontexte, mmap-basierte Indizes, <code>io_uring</code>-Publication und begrenzte Worker-/Speicherbudgets parallelisieren und begrenzen die Pipeline.</p>
+          <p class="lang-en">AVX2/BMI2 SeqCDC, parallel BLAKE3, worker-local Zstd contexts, mmap-backed indexes, <code>io_uring</code> publication, and bounded worker/memory budgets parallelize and bound the pipeline.</p>
+        </div>
       </section>
 
       <section id="webui" class="section-shell feature-intro">

@@ -5,8 +5,8 @@ function setLanguage(language) {
   root.dataset.language = language;
   root.lang = language;
   document.title = language === "de"
-    ? "fastdup · Deduplizierender POSIX-Speicher mit WebUI"
-    : "fastdup · Deduplicating POSIX storage with a WebUI";
+    ? "fastdup · Aus x86-64-Hardware wird eine High-Performance Dedup-Appliance"
+    : "fastdup · Turn x86-64 hardware into a high-performance dedup appliance";
   buttons.forEach((button) => {
     button.setAttribute("aria-pressed", String(button.dataset.language === language));
   });
