@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>fastdup · Deduplizierender POSIX-Speicher mit WebUI</title>
+    <meta name="description" content="fastdup ist eine experimentelle POSIX-Storage-Appliance für Rocky Linux mit Exact Dedup, Zstd, FUSE, SMB und einfacher HTTPS-WebUI.">
+    <meta name="keywords" content="deduplication, filesystem, storage appliance, POSIX, FUSE, SMB, Samba, Rust, Rocky Linux, Zstd, backup storage">
+    <meta name="theme-color" content="#071016">
+    <meta name="robots" content="index,follow">
+    <link rel="canonical" href="https://thatiscrazy.github.io/fastdup/">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="fastdup · POSIX Storage einfach verwalten">
+    <meta property="og:description" content="Als RPM installieren. Im Browser provisionieren, überwachen und verwalten.">
+    <meta property="og:url" content="https://thatiscrazy.github.io/fastdup/">
+    <meta property="og:image" content="https://thatiscrazy.github.io/fastdup/assets/webui-overview.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="stylesheet" href="site.css">
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "fastdup",
+        "applicationCategory": "StorageApplication",
+        "operatingSystem": "Rocky Linux 10 x86-64",
+        "softwareVersion": "0.5.0",
+        "license": "https://www.apache.org/licenses/LICENSE-2.0",
+        "downloadUrl": "https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm",
+        "codeRepository": "https://github.com/ThatIsCraZy/fastdup"
+      }
+    </script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="fastdup Startseite">
+        <span class="brand-mark" aria-hidden="true">◇</span>
+        <span><strong>fastdup</strong><small>STORAGE APPLIANCE</small></span>
+      </a>
+      <nav aria-label="Hauptnavigation">
+        <a class="lang-de" href="#webui">WebUI</a>
+        <a class="lang-en" href="#webui">WebUI</a>
+        <a class="lang-de" href="#installation">Installation</a>
+        <a class="lang-en" href="#installation">Install</a>
+        <a href="https://github.com/ThatIsCraZy/fastdup">GitHub</a>
+      </nav>
+      <div class="language-switch" aria-label="Sprache / Language">
+        <button type="button" data-language="de" aria-pressed="true">DE</button>
+        <button type="button" data-language="en" aria-pressed="false">EN</button>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="hero section-shell">
+        <div class="hero-copy">
+          <div class="eyebrow lang-de"><span></span> STORAGE VERWALTEN, NICHT ERFORSCHEN MÜSSEN</div>
+          <div class="eyebrow lang-en"><span></span> MANAGE STORAGE—WITHOUT HAVING TO STUDY IT</div>
+          <h1 class="lang-de">Deduplizierender POSIX-Speicher. <em>Einfach im Browser.</em></h1>
+          <h1 class="lang-en">Deduplicating POSIX storage. <em>Simple in your browser.</em></h1>
+          <p class="hero-lead lang-de">RPM installieren, zwei Storage-Geräte auswählen und Shares anlegen. fastdup verbindet Exact Dedup, Zstd, FUSE und SMB mit einer eingebetteten HTTPS-WebUI.</p>
+          <p class="hero-lead lang-en">Install one RPM, select two storage devices, and create shares. fastdup combines exact deduplication, Zstd, FUSE, and SMB with an embedded HTTPS WebUI.</p>
+          <div class="hero-actions">
+            <a class="button primary lang-de" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">RPM herunterladen <span>↓</span></a>
+            <a class="button primary lang-en" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">Download RPM <span>↓</span></a>
+            <a class="button secondary lang-de" href="#installation">Installation ansehen</a>
+            <a class="button secondary lang-en" href="#installation">View installation</a>
+          </div>
+          <div class="compatibility">
+            <span>v0.5.0</span><span>Rocky Linux 10</span><span>x86-64</span><span>Apache-2.0</span>
+          </div>
+        </div>
+        <div class="hero-visual">
+          <div class="browser-bar"><i></i><i></i><i></i><span>https://fastdup-appliance:8080</span></div>
+          <img src="assets/webui-overview.png" alt="fastdup WebUI mit Repository-Zustand, Durchsatz und Kapazität" width="1600" height="1000">
+          <div class="live-chip"><i></i><span class="lang-de">Eine Oberfläche für den Betrieb</span><span class="lang-en">One interface for operations</span></div>
+        </div>
+      </section>
+
+      <section class="trust-strip" aria-label="Produktmerkmale">
+        <div><strong>HTTPS WebUI</strong><span class="lang-de">im Paket enthalten</span><span class="lang-en">included in the package</span></div>
+        <div><strong>FUSE + SMB</strong><span class="lang-de">normale Dateien und Shares</span><span class="lang-en">normal files and shares</span></div>
+        <div><strong>Exact Dedup + Zstd</strong><span class="lang-de">transparente Datenreduktion</span><span class="lang-en">transparent data reduction</span></div>
+        <div><strong>Scrub + Recovery</strong><span class="lang-de">prüfbare Integrität</span><span class="lang-en">verifiable integrity</span></div>
+      </section>
+
+      <section id="webui" class="section-shell feature-intro">
+        <div class="section-heading">
+          <div class="eyebrow lang-de"><span></span> CONTROL PLANE</div>
+          <div class="eyebrow lang-en"><span></span> CONTROL PLANE</div>
+          <h2 class="lang-de">Die alltägliche Verwaltung bleibt in der WebUI.</h2>
+          <h2 class="lang-en">Everyday administration stays in the WebUI.</h2>
+          <p class="lang-de">Kein separater Management-Server und keine Gerätepfade per Copy-and-paste. Die lokale Control Plane zeigt nur erkannte Targets und schützt kritische Aktionen durch explizite Bestätigungen.</p>
+          <p class="lang-en">No separate management server and no copy-pasted device paths. The local control plane exposes only discovered targets and guards critical actions with explicit confirmation.</p>
+        </div>
+        <div class="feature-grid">
+          <article><span>01</span><h3 class="lang-de">Speicher provisionieren</h3><h3 class="lang-en">Provision storage</h3><p class="lang-de">Metadata und DATA anhand stabiler Identitäten auswählen. Root-, Boot-, Swap- und überlappende Geräte werden ausgeschlossen.</p><p class="lang-en">Select metadata and DATA by stable identity. Root, boot, swap, and overlapping devices are excluded.</p></article>
+          <article><span>02</span><h3 class="lang-de">Shares bereitstellen</h3><h3 class="lang-en">Publish shares</h3><p class="lang-de">SMB-Freigaben, Benutzer/Gruppen, Read-only, Verschlüsselung, ABE und logische Quotas zentral verwalten.</p><p class="lang-en">Manage SMB shares, users/groups, read-only state, encryption, ABE, and logical quotas centrally.</p></article>
+          <article><span>03</span><h3 class="lang-de">Betrieb überwachen</h3><h3 class="lang-en">Monitor operations</h3><p class="lang-de">Durchsatz, Reduktion, Kapazität, CPU/RAM, Disk-I/O, Checkpoints, Jobs und Alarme auf einen Blick.</p><p class="lang-en">See throughput, reduction, capacity, CPU/RAM, disk I/O, checkpoints, jobs, and alarms at a glance.</p></article>
+          <article><span>04</span><h3 class="lang-de">Sicher warten</h3><h3 class="lang-en">Maintain safely</h3><p class="lang-de">Mount, sauberer Unmount, Offline-Scrub, GC-Policy, Wartungsfenster, Audit-Export und TLS-Verwaltung.</p><p class="lang-en">Mount, clean unmount, offline scrub, GC policy, maintenance windows, audit export, and TLS management.</p></article>
+        </div>
+      </section>
+
+      <section class="screens section-shell">
+        <figure class="screen-card">
+          <div><span class="number">01</span><h3 class="lang-de">Sichere Laufwerksauswahl</h3><h3 class="lang-en">Safe drive selection</h3><p class="lang-de">Gerätemodell, Seriennummer, WWN, Kapazität und HBA-Pfad vor der Provisionierung kontrollieren.</p><p class="lang-en">Verify model, serial, WWN, capacity, and HBA path before provisioning.</p></div>
+          <img src="assets/webui-drives.png" alt="fastdup Laufwerksauswahl" width="1600" height="1000" loading="lazy">
+        </figure>
+        <figure class="screen-card reverse">
+          <div><span class="number">02</span><h3 class="lang-de">SMB-Shares ohne Konfigurationsdateien</h3><h3 class="lang-en">SMB shares without config files</h3><p class="lang-de">Freigaben und logische Quotas ändern, ohne Samba-Konfiguration manuell zu editieren oder die Appliance neu zu starten.</p><p class="lang-en">Change shares and logical quotas without manually editing Samba configuration or rebooting the appliance.</p></div>
+          <img src="assets/webui-shares.png" alt="fastdup Verwaltung von SMB-Freigaben" width="1600" height="1000" loading="lazy">
+        </figure>
+        <p class="preview-note lang-de">Screenshots aus der echten React-WebUI mit den mitgelieferten Preview-Daten.</p>
+        <p class="preview-note lang-en">Screenshots from the real React WebUI using its bundled preview data.</p>
+      </section>
+
+      <section id="installation" class="install-section">
+        <div class="section-shell install-layout">
+          <div class="install-copy">
+            <div class="eyebrow"><span></span> ROCKY LINUX 10 · X86-64</div>
+            <h2 class="lang-de">In drei Befehlen zur WebUI.</h2>
+            <h2 class="lang-en">Three commands to the WebUI.</h2>
+            <p class="lang-de">Das RPM bringt Runtime, Maintenance-CLI, Control Plane, WebUI, systemd-Policies und Samba-VFS-Modul mit. Node.js oder eine Rust-Toolchain sind auf dem Zielsystem nicht nötig.</p>
+            <p class="lang-en">The RPM includes the runtime, maintenance CLI, control plane, WebUI, systemd policy, and Samba VFS module. The target system needs neither Node.js nor a Rust toolchain.</p>
+            <ol>
+              <li><strong class="lang-de">Paket installieren</strong><strong class="lang-en">Install the package</strong><span class="lang-de">RPM herunterladen und mit DNF installieren.</span><span class="lang-en">Download the RPM and install it with DNF.</span></li>
+              <li><strong class="lang-de">Management starten</strong><strong class="lang-en">Start management</strong><span class="lang-de">Agent und HTTPS-Control-Plane aktivieren.</span><span class="lang-en">Enable the agent and HTTPS control plane.</span></li>
+              <li><strong class="lang-de">Im Browser einrichten</strong><strong class="lang-en">Set up in the browser</strong><span class="lang-de">Passwort ändern, zwei leere Geräte auswählen, Repository mounten und Share anlegen.</span><span class="lang-en">Change the password, select two empty devices, mount the repository, and add a share.</span></li>
+            </ol>
+          </div>
+          <div class="terminal" aria-label="Installationsbefehle">
+            <div class="terminal-head"><i></i><i></i><i></i><span>root@rocky:~</span><button type="button" data-copy="install"><span class="lang-de">Kopieren</span><span class="lang-en">Copy</span></button></div>
+            <pre id="install"><code><span class="prompt">$</span> curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm
+
+<span class="prompt">$</span> sudo dnf install ./fastdup-0.5.0-1.el10.x86_64.rpm
+
+<span class="prompt">$</span> sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code></pre>
+            <div class="terminal-result"><i></i><span class="lang-de">WebUI: https://&lt;appliance-host&gt;:8080/</span><span class="lang-en">WebUI: https://&lt;appliance-host&gt;:8080/</span></div>
+          </div>
+        </div>
+        <div class="section-shell caution"><strong class="lang-de">Vor der Provisionierung:</strong><strong class="lang-en">Before provisioning:</strong><p class="lang-de">Zwei leere, physisch getrennte Geräte bereitstellen. Die Initialisierung löscht Partitionstabellen und Inhalte der ausgewählten Geräte. Das Paket formatiert beim Installieren nichts automatisch.</p><p class="lang-en">Provide two empty, physically separate devices. Initialization erases partition tables and content on the selected devices. Package installation never formats anything automatically.</p></div>
+      </section>
+
+      <section class="section-shell honest-section">
+        <div>
+          <div class="eyebrow"><span></span> STATUS</div>
+          <h2 class="lang-de">Offen entwickelt. Ehrlich begrenzt.</h2>
+          <h2 class="lang-en">Openly developed. Honestly limited.</h2>
+          <p class="lang-de">fastdup ist ein Forschungsprototyp für Evaluation und Storage-Entwicklung, noch kein produktionsreifes Backup-Produkt.</p>
+          <p class="lang-en">fastdup is a research prototype for evaluation and storage development—not yet a production backup product.</p>
+          <a class="text-link lang-de" href="https://github.com/ThatIsCraZy/fastdup/blob/main/README.de.md#aktuelle-grenzen">Alle Grenzen in der README →</a>
+          <a class="text-link lang-en" href="https://github.com/ThatIsCraZy/fastdup#current-limits">Read all limits →</a>
+        </div>
+        <ul>
+          <li class="lang-de">Kein Schutz vor Geräteverlust, keine Replikation oder WORM-Garantie</li>
+          <li class="lang-en">No device-loss protection, replication, or WORM guarantee</li>
+          <li class="lang-de">POSIX-/Samba-Kompatibilitätsmatrix noch unvollständig</li>
+          <li class="lang-en">POSIX/Samba compatibility matrix remains incomplete</li>
+          <li class="lang-de">Samba Fast Clone experimentell und noch nicht Veeam-qualifiziert</li>
+          <li class="lang-en">Samba Fast Clone is experimental and not yet Veeam-qualified</li>
+          <li class="lang-de">Kein Produktions-Support oder Performance-SLA</li>
+          <li class="lang-en">No production support or performance SLA</li>
+        </ul>
+      </section>
+
+      <section class="final-cta section-shell">
+        <div><h2 class="lang-de">WebUI ansehen. RPM installieren. fastdup testen.</h2><h2 class="lang-en">See the WebUI. Install the RPM. Evaluate fastdup.</h2><p class="lang-de">Release 0.5.0 für Rocky Linux 10 auf x86-64.</p><p class="lang-en">Release 0.5.0 for Rocky Linux 10 on x86-64.</p></div>
+        <div><a class="button primary lang-de" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">RPM herunterladen <span>↓</span></a><a class="button primary lang-en" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">Download RPM <span>↓</span></a><a class="button secondary" href="https://github.com/ThatIsCraZy/fastdup">GitHub Repository</a></div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">◇</span><span><strong>fastdup</strong><small>STORAGE APPLIANCE</small></span></div>
+      <p>Apache-2.0 · Samba module GPL-3.0-or-later</p>
+      <nav><a href="https://github.com/ThatIsCraZy/fastdup/releases">Releases</a><a href="https://github.com/ThatIsCraZy/fastdup/tree/main/docs">Docs</a><a href="https://github.com/ThatIsCraZy/fastdup">Source</a></nav>
+    </footer>
+    <script src="site.js"></script>
+  </body>
+</html>

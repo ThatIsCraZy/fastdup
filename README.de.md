@@ -1,7 +1,7 @@
 # fastdup
 
 <p align="center">
-  <strong>Absturzsicherer, deduplizierender POSIX-Speicher für Linux — entwickelt in Rust.</strong>
+  <strong>Deduplizierender POSIX-Speicher: als RPM installieren und bequem im Browser verwalten.</strong>
 </p>
 
 <p align="center">
@@ -11,47 +11,128 @@
 <p align="center">
   <a href="https://github.com/ThatIsCraZy/fastdup/releases/latest"><img alt="Aktuelle Version" src="https://img.shields.io/github/v/release/ThatIsCraZy/fastdup"></a>
   <a href="LICENSE"><img alt="Apache-2.0-Lizenz" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
-  <img alt="Linux x86-64" src="https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey">
-  <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-orange">
+  <img alt="Rocky Linux 10 x86-64" src="https://img.shields.io/badge/platform-Rocky%20Linux%2010%20x86--64-lightgrey">
 </p>
 
-fastdup ist ein experimentelles Single-Node-**Dateisystem und Storage-Appliance
-mit Deduplizierung**. Es stellt über FUSE und optional SMB/Samba einen
-veränderbaren Linux-POSIX-Namensraum bereit und speichert identische,
-inhaltsabhängig gebildete Chunks nur einmal. Die Rust Storage Engine verbindet
-SeqCDC, BLAKE3, Zstd, unveränderliche Container, neu aufbaubare Indizes,
-Crash-Recovery, Integrity Scrubbing und adaptive Garbage Collection.
+<p align="center">
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
+  · <a href="https://thatiscrazy.github.io/fastdup/">Produktseite</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.5">Release-Informationen</a>
+</p>
+
+fastdup ist eine experimentelle Single-Node-Storage-Appliance für Linux. Sie
+stellt normale Dateien und Verzeichnisse über FUSE und SMB/Samba bereit und
+reduziert den physischen Speicherbedarf durch Exact Dedup und Zstd-Kompression.
+Administratoren bedienen die Appliance über eine eingebettete HTTPS-WebUI—ein
+separater Management-Stack ist nicht nötig.
 
 > [!WARNING]
 > fastdup ist ein Forschungsprototyp und kein produktionsreifes Backup-Produkt.
-> Es bietet keinen Schutz vor Geräteverlust, keine WORM-Garantie, keine
-> Replikation und keinen Hersteller-Support. Verwende es zur Evaluation und
-> Entwicklung, nicht als einzige Kopie wichtiger Daten.
+> Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
+> sind weiter unten aufgeführt.
 
-## Warum fastdup?
+## Auf Rocky Linux 10 installieren
 
-Die Storage-Semantik vieler Deduplizierungssysteme bleibt hinter einer
-proprietären Backup-Appliance verborgen. fastdup macht die interessanten Teile
-nachvollziehbar:
+Benötigt werden:
 
-- **Transparente Exact Dedup:** Identische Logical Chunks teilen physischen
-  Speicher, ohne das bytegenaue Dateiverhalten zu verändern.
-- **Echte POSIX-Semantik:** Random Writes, Sparse Files, Hardlinks, Symlinks,
-  xattrs/ACLs, Besitz, Zeitstempel, Record Locks und offene gelöschte Inodes.
-- **Absturzsichere Generationen:** Unveränderliche Manifeste und ein
-  gechecksummtes Commit-WAL wählen nach einem Crash den neuesten vollständig
-  dauerhaften Namensraum.
-- **Wahrheit bleibt von Beschleunigung getrennt:** Manifeste und geprüfte
-  Container sind maßgeblich; Exact-/Similarity-Indizes, Bloom-Filter und Read
-  Caches dürfen verworfen und neu aufgebaut werden.
-- **Prüfbare Haltbarkeit:** Writer, Recovery und Offline-Scrub erzwingen
-  dieselben versionierten Invarianten, belegt durch ADRs, Fault Injection und
-  Benchmarks.
-- **Begrenzter Ressourcenverbrauch:** `io_uring`, begrenzte Ingest-Lanes,
-  Cache-Steuerung und adaptive DATA-/Metadata-GC sind auf planbaren
-  Single-Node-Betrieb ausgelegt.
+- Rocky Linux 10 auf x86-64
+- Root-Rechte für die RPM-Installation
+- zwei leere, physisch getrennte Blockgeräte: eines für Metadata und eines für DATA
+- TCP 8080 aus dem Management-Netz erreichbar
 
-## Funktionsweise
+Aktuelles Binärpaket herunterladen und installieren:
+
+```bash
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+
+sudo dnf install ./fastdup-0.5.0-1.el10.x86_64.rpm
+sudo systemctl enable --now fastdup-agent.service fastdup-control.service
+```
+
+Danach im Browser öffnen:
+
+```text
+https://<appliance-host>:8080/
+```
+
+Das erste Zertifikat ist selbstsigniert. Mit `admin` / `fastdup01.` anmelden und
+das Startpasswort sofort ersetzen. Die WebUI verlangt mindestens zwölf Zeichen,
+bevor sie eine administrative Änderung annimmt.
+
+Das Paket startet absichtlich nur die Management-Dienste. Es formatiert **keine**
+Datenträger und mountet nicht automatisch ein Repository.
+
+> [!CAUTION]
+> Die Repository-Provisionierung löscht Partitionstabellen und sämtliche Daten
+> auf beiden ausgewählten Geräten. Vor dem Fortfahren Modell, Seriennummer, WWN,
+> Kapazität und HBA-Pfad in der WebUI prüfen.
+
+## Einfache Verwaltung über die WebUI
+
+Die WebUI ist im RPM enthalten und wird von der lokalen Control Plane
+ausgeliefert. Über eine einzige Browseroberfläche kann ein Administrator:
+
+- Metadata- und DATA-Geräte mit Schutz vor gefährlichen Auswahlen provisionieren
+- das Repository mounten, sauber aushängen, recovern und offline scrubben
+- SMB-Freigaben, Zugriffsregeln, Verschlüsselungsvorgaben und Quotas verwalten
+- Durchsatz, Kapazität, Deduplizierung, CPU/RAM, Disk-I/O und Checkpoints überwachen
+- Online-GC, Druckschwellen, Auto-Mount, Wartungsfenster, Small-File-Platzierung
+  und optionale Advanced Reduction konfigurieren
+- Jobs und Alarme prüfen, den Audit-Verlauf exportieren, TLS erneuern und
+  Passwörter ändern
+
+![fastdup-WebUI-Übersicht mit Beispieldaten](docs/assets/webui-overview.png)
+
+<p align="center"><em>WebUI-Vorschau mit Beispieldaten: Repository-Zustand, Durchsatz, Datenreduktion, Kapazität und Disk-I/O.</em></p>
+
+| Sichere Geräteauswahl und Provisionierung | SMB-Freigaben und logische Quotas |
+| --- | --- |
+| ![Laufwerksprovisionierung in der fastdup-WebUI](docs/assets/webui-drives.png) | ![Verwaltung von SMB-Freigaben in der fastdup-WebUI](docs/assets/webui-shares.png) |
+
+<p align="center"><em>Die Screenshots stammen automatisiert aus der echten React-WebUI und verwenden deren mitgelieferte Preview-Daten.</em></p>
+
+## Ersteinrichtung
+
+1. **RPM installieren** und `fastdup-agent` sowie `fastdup-control` wie oben starten.
+2. **WebUI öffnen**, das erste Zertifikat akzeptieren oder lokal als
+   vertrauenswürdig hinterlegen, anmelden und ein neues Admin-Passwort setzen.
+3. Unter **„Laufwerke“** ein zulässiges Metadata-Gerät und ein zulässiges
+   DATA-Gerät wählen. Die WebUI schließt Root-, Boot-, Swap-, gemountete,
+   gehaltene und physisch überlappende Targets aus.
+4. **Destruktive Bestätigung genau prüfen** und das Repository initialisieren.
+   fastdup erzeugt und mountet die erforderlichen XFS-Pools mit festen Rollen.
+5. Das **Repository mounten**.
+6. Unter **„SMB-Freigaben“** einen Share anlegen; Benutzer/Gruppen, Read-only,
+   Verschlüsselung, Access-Based Enumeration und optionale logische Quota wählen.
+7. Den Betrieb über **„Übersicht“**, **„Telemetrie“** und **„Ereignisse“** überwachen.
+
+TCP 8080 nur für das vorgesehene Management-Netz freigeben. Der SMB-Zugriff
+folgt der Samba- und Firewall-Policy des Hosts.
+
+## Tägliche Administration
+
+| Aufgabe | Bereich der WebUI | Hinweise |
+| --- | --- | --- |
+| Zustand und Kapazität prüfen | **Übersicht** | Live-Durchsatz, Reduktion, Reserve und Disk-I/O |
+| Mounten oder sauber aushängen | **Repository** | Unmount stoppt neue Mutationen und checkpointet zuerst |
+| Integrität prüfen | **Repository → Offline-Scrub** | Erfordert ein offline geschaltetes Repository |
+| Physische Targets verwalten | **Laufwerke** | Stabile Geräteidentitäten statt frei eingegebener Pfade |
+| SMB-Shares anlegen/begrenzen | **SMB-Freigaben** | Benutzer/Gruppen, Read-only, Encryption, ABE und logische Quota |
+| Historische Metriken ansehen | **Telemetrie** | Durchsatz, Ressourcen, Disk-I/O und Datenreduktion |
+| Jobs und Alarme prüfen | **Ereignisse** | Fortschritt, Fehler, Alerts und CSV-Audit-Export |
+| Runtime-Policy ändern | **Einstellungen** | GC, Druck, Platzierung, Wartung, TLS und Passwort |
+
+systemd-Slices trennen den Repository-Prozess von der Management Plane. Ein
+Neustart der WebUI oder ihres Agents stoppt das gemountete Repository nicht.
+Der Repository-Runtime läuft ohne Swap und führt beim Shutdown über `SIGINT`
+zuerst einen Checkpoint aus.
+
+## Was fastdup speichert
+
+Anwendungen sehen ein veränderbares POSIX-Dateisystem. Darunter speichert
+fastdup unveränderliche, inhaltsidentifizierte Container und Manifeste:
 
 ```text
 POSIX-/FUSE-/SMB-Write
@@ -68,75 +149,55 @@ POSIX-/FUSE-/SMB-Write
                                   Container ──► Manifest ──► Commit-WAL
 ```
 
-SeqCDC-v1 bildet inhaltsabhängige Chunks zwischen 16 KiB und 256 KiB.
-BLAKE3-256 identifiziert ihren Inhalt. Neue benachbarte Chunks werden zu
-höchstens 512 KiB großen Compression Regions zusammengefasst und unabhängig
-als RAW oder Zstd Level 3 gespeichert. Gleichförmige allokierte Bereiche werden
-FILL-Extents; nicht allokierte Nullbereiche bleiben HOLE-Extents und benötigen
-keinen DATA-Record.
+Die dauerhaften Formate bleiben maßgeblich. Exact-/Similarity-Indizes,
+Bloom-Filter und Read Caches sind nur Beschleunigung und können neu aufgebaut
+werden. Recovery, Offline-Scrub und Writer prüfen dieselben versionierten
+Invarianten.
 
-Der optionale Advanced-Reduction-Pfad ergänzt einen neu aufbaubaren Similarity
-Index und `ZSTD_PREFIX`-Records mit Tiefe eins. Er muss explizit aktiviert
-werden und fällt bei fehlendem oder veraltetem Beschleunigungszustand immer auf
-unabhängig dekodierbares RAW/Zstd zurück.
+Der aktuelle Dateisystemumfang enthält Random Writes, Sparse Files, Hardlinks,
+Symlinks, xattrs/ACLs, Record Locks, reine Metadatenklone über
+`copy_file_range`, Crash-Recovery, DATA-Tier-Recovery-Checkpoints, adaptive GC,
+logische Quotas pro Share und policygesteuerte Small-File-Platzierung.
 
-## Aktueller Funktionsumfang
+## Wartung über die Kommandozeile
 
-- Dateien anlegen, öffnen, lesen, schreiben, verkürzen, umbenennen und löschen
-- Random Writes, Append, `O_TRUNC`, `O_EXCL`, `RENAME_NOREPLACE`, `flush` und
-  `fsync`
-- Sparse DATA-/FILL-/HOLE-Extents, Hole Punch, Zero Range und DATA-/HOLE-Seeks
-- reine Metadatenklone über `copy_file_range`
-- Unterverzeichnisse, Hardlinks, Symlinks, xattrs/ACLs, Rechte und Besitz
-- Crash-Recovery auf die jüngste vollständige Commit-Generation
-- unabhängige DATA-Tier-Recovery-Checkpoints bei vollständigem Metadata-Verlust
-- neu aufbaubare Exact- und Similarity-Indizes
-- Offline-Scrub sowie adaptive Online-/Offline-GC für DATA und Metadaten
-- Kernel-Page-Cache und Readahead für Read-only-Handles mit gezielter
-  Bereichsinvalidierung
-- logische Quotas pro Share und policygesteuerte Small-File-Platzierung
-- HTTPS-Control-Plane mit eingebetteter WebUI
-- experimentelles Samba-VFS-Modul für SMB Fast Clone
-
-Der dauerhafte Pfad unterstützt Exact Dedup, RAW/Zstd, Sparse Files,
-Checkpoints, Recovery, Scrub und GC. Advanced Reduction bleibt opt-in, bis
-breitere Backup-Corpora ausgewertet sind. fastdup unterstützt ausschließlich
-**Linux auf x86-64**; AVX2-/BMI2-Pfade werden zur Laufzeit ausgewählt und
-besitzen skalare Gegenstücke.
-
-## Version 0.5 installieren
-
-Das native RPM ist für **Rocky Linux 10 auf x86-64** gebaut und enthält den
-FUSE-Runtime, die Maintenance-CLI, den privilegierten Appliance-Agent, die
-HTTPS-Control-Plane, die eingebettete WebUI, systemd-Policies und das
-Samba-VFS-Modul.
+Routinearbeiten gehören in die WebUI. Für Recovery oder skriptgesteuerte
+Offline-Wartung Repository vorher beenden und aushängen:
 
 ```bash
-curl -LO \
-  https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm
-sudo dnf install ./fastdup-0.5.0-1.el10.x86_64.rpm
-sudo systemctl enable --now fastdup-agent.service fastdup-control.service
+fastdup-maintenance --offline scrub METADATA_ROOT DATA_ROOT
+fastdup-maintenance --offline metadata-gc METADATA_ROOT DATA_ROOT
+fastdup-maintenance --offline rebuild-exact METADATA_ROOT DATA_ROOT
+fastdup-maintenance --offline rebuild-pool-indexes METADATA_ROOT DATA_ROOT
+fastdup-maintenance --offline scrub-gc METADATA_ROOT DATA_ROOT
 ```
 
-Öffne `https://<appliance-host>:8080/`. Das erste Zertifikat ist
-selbstsigniert. Die initialen Zugangsdaten lauten `admin` / `fastdup01.`; die
-WebUI verlangt sofort ein neues Passwort mit mindestens zwölf Zeichen.
+Der [Wartungsleitfaden](docs/operations/scrub-and-exact-index-rebuild.md)
+beschreibt Recovery, Scrub, Index-Rebuild und GC im Detail.
 
-Der Repository-Dienst startet erst, nachdem in der WebUI zwei leere, physisch
-getrennte Geräte für Metadata und DATA ausgewählt wurden.
+Software entfernen und Repository-Daten absichtlich behalten:
 
-> [!CAUTION]
-> Die Provisionierung löscht die Partitionstabelle und den gesamten Inhalt
-> beider ausgewählter Geräte. Prüfe die Geräteidentitäten vor der Bestätigung.
+```bash
+sudo dnf remove fastdup
+```
 
-Die Release-Seite enthält zusätzlich ein Source-RPM und SHA-256-Prüfsummen:
-[fastdup 0.5 Release](https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.5).
+## Aktuelle Grenzen
 
-## Bauen und testen
+- nur Linux x86-64; das veröffentlichte RPM zielt auf Rocky Linux 10
+- benötigt ehrlichen Stable Storage und zwei physisch getrennte XFS-Tiers
+- keine eingebaute Device Redundancy, Replikation, WORM, Encryption-at-Rest-
+  Policy, Cloud Tier oder Schutz vor Geräteverlust
+- POSIX-Umfang und breite Samba-/Client-Konformität noch unvollständig
+- Samba Fast Clone bleibt experimentell und ist noch nicht für Veeam qualifiziert
+- Advanced Similarity Reduction bleibt bis zu breiterer Workload-Evidenz opt-in
+- kein Produktions-Support, Performance-SLA oder Kapazitätsversprechen
 
-Vorausgesetzt werden Linux, eine aktuelle Rust-Toolchain und für reale
-Mount-Tests `/dev/fuse`. Alle erzeugten Artefakte müssen gemäß
-Repository-Policy unter `.artifacts/` bleiben:
+Kommerzielle Backup-Appliances wie Dell PowerProtect Data Domain und HPE
+StoreOnce bieten ausgereifte Integrationen, Retention, Cyber Resilience und
+Support, die fastdup nicht besitzt. fastdup ist eine offene Implementierung für
+Evaluation und Storage-Forschung, kein Drop-in-Ersatz.
+
+## Für Entwickler
 
 ```bash
 cd /source/fastdup
@@ -148,7 +209,6 @@ export TMPDIR=/source/fastdup/.artifacts/tmp
 export PATH=/source/fastdup/.artifacts/cargo/bin:$PATH
 
 mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$TMPDIR"
-
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release -p fastdup-appliance
@@ -157,121 +217,14 @@ cargo build --release -p fastdup-appliance
 Cargo legt `CARGO_TARGET_DIR` selbst an; dieses Verzeichnis nicht vorher
 erstellen.
 
-Für einen reproduzierbaren Rocky-Linux-RPM-Build werden Node.js/npm,
-`rpm-build`, `patchelf` und die Samba-Development-Pakete benötigt. Danach:
-
-```bash
-./packaging/build-rpm.sh
-```
-
-## Lokalen Lab-Mount starten
-
-Der Produktivbetrieb verlangt getrennte physische XFS-Dateisysteme. Für ein
-lokales Single-Disk-Lab genügen getrennte Verzeichnisse mit dem ausdrücklich
-gesetzten Lab-Override:
-
-```bash
-mkdir -p \
-  /source/fastdup/.artifacts/mount \
-  /source/fastdup/.artifacts/repository/metadata \
-  /source/fastdup/.artifacts/repository/containers
-
-FASTDUP_POOL_ISOLATION=lab-allow-shared \
-  /source/fastdup/.artifacts/target/release/fastdup-durable-fuse \
-  /source/fastdup/.artifacts/mount \
-  /source/fastdup/.artifacts/repository/metadata \
-  /source/fastdup/.artifacts/repository/containers
-```
-
-Der Daemon läuft im Vordergrund. `Ctrl-C` stoppt die Annahme neuer Mutationen,
-erstellt einen abschließenden Checkpoint und hängt sauber aus.
-
-### Advanced Reduction aktivieren
-
-Bei beendetem Daemon muss zuerst ein kohärentes Exact-/Similarity-Indexpaar
-aufgebaut werden:
-
-```bash
-BIN=/source/fastdup/.artifacts/target/release
-META=/source/fastdup/.artifacts/repository/metadata
-DATA=/source/fastdup/.artifacts/repository/containers
-
-"$BIN/fastdup-maintenance" --offline rebuild-pool-indexes "$META" "$DATA"
-FASTDUP_POOL_ISOLATION=lab-allow-shared \
-FASTDUP_ADVANCED_REDUCTION=prefix-v1 \
-  "$BIN/fastdup-durable-fuse" \
-  /source/fastdup/.artifacts/mount "$META" "$DATA"
-```
-
-Fehlt das Paar oder ist es veraltet, bleiben Writes verfügbar und fallen auf
-unabhängiges RAW/Zstd zurück.
-
-## Wartung
-
-Vor dem verpflichtenden `--offline`-Modus Daemon beenden und Mount aushängen:
-
-```bash
-BIN=/source/fastdup/.artifacts/target/release/fastdup-maintenance
-META=/source/fastdup/.artifacts/repository/metadata
-DATA=/source/fastdup/.artifacts/repository/containers
-
-"$BIN" --offline scrub "$META" "$DATA"
-"$BIN" --offline metadata-gc "$META" "$DATA"
-"$BIN" --offline rebuild-exact "$META" "$DATA"
-"$BIN" --offline rebuild-pool-indexes "$META" "$DATA"
-"$BIN" --offline scrub-gc "$META" "$DATA"
-```
-
-Der [Wartungsleitfaden](docs/operations/scrub-and-exact-index-rebuild.md)
-beschreibt Recovery, Scrub, Index-Rebuild und GC im Detail.
-
-## Repository-Übersicht
-
-| Pfad | Aufgabe |
-| --- | --- |
-| `crates/fastdup-format` | Versionierte Container-, Manifest-, Commit- und Indexformate |
-| `crates/fastdup-store` | SeqCDC, Reduktion, Container, Indizes, Scrub und GC |
-| `crates/fastdup-io-uring` | Begrenzte asynchrone Linux-Container-I/O |
-| `crates/fastdup-posix` | POSIX-Modell, Live-Dirty-Overlay und FUSE-Adapter |
-| `crates/fastdup-appliance` | Ingest, Checkpoints, Recovery und Programme |
-| `crates/fastdup-control` | HTTPS-API, WebUI, Provisionierung und Telemetrie |
-| `crates/fastdup-testkit` | Deterministische Fehler, Crash-Modell und Corpus-Werkzeuge |
-| `samba/vfs_fastdup` | Experimentelles Samba-VFS-Modul für Fast Clone |
-
-## Design und Nachweise
-
 - [Verbindliche Domain-Sprache](CONTEXT.md)
 - [Architecture Decision Records](docs/adr/)
 - [Spezifikationen dauerhafter Formate](docs/specs/)
 - [Testpläne](docs/testing/)
 - [Betriebsanleitungen](docs/operations/)
 - [Reproduzierbare Benchmarks](docs/benchmarks/)
-- [Methodik des Vergleichs mit kommerziellen Appliances](docs/research/commercial-backup-appliance-comparison.md)
+- [Architektur der Control Plane](docs/operations/control-plane.md)
 - [Status und Grenzen des Samba-VFS-Moduls](samba/vfs_fastdup/README.md)
-
-Ein Beispiel: Beim dokumentierten Rocky-ISO-Workload erreichte der isolierte
-AVX2-/BMI2-SeqCDC-Scanner 8.009 MiB/s (2,90× gegenüber dem skalaren Scanner),
-während der gepaarte Single-Stream-SMB-Benchmark den Median des
-End-to-End-Durchsatzes um 13,8 % verbesserte. Das sind host- und
-workloadspezifische Messungen, keine Leistungszusage; siehe den
-[vollständigen Benchmark](docs/benchmarks/seqcdc-prototype-2026-08-22.md).
-
-## Grenzen
-
-Vor dem produktiven Einsatz fehlen noch:
-
-- vollständige POSIX-Abdeckung und eine breitere Client-/Samba-Matrix
-- Schutz vor Geräteverlust, Replikation, Immutability und Encryption-Policy
-- Langzeit-, Random-Kill- und physische Power-Cut-Tests
-- breitere versionierte Backup-Corpora und ein Produktions-Gate für Advanced Reduction
-- reale Veeam-Protokollevidenz für das Samba-Modul
-- Kapazitäts- und Supportzusagen
-
-Kommerzielle Systeme wie Dell PowerProtect Data Domain und HPE StoreOnce lösen
-überlappende Backup-Storage-Probleme, bieten aber ausgereifte Integrationen,
-Replikation, Retention, Cyber Resilience und Support, die fastdup nicht besitzt.
-fastdup dient der Untersuchung und Erweiterung einer offenen POSIX-Dedup-Engine;
-es ist weder Überlegenheitsversprechen noch Drop-in-Ersatz.
 
 ## Lizenz
 
