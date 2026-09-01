@@ -78,6 +78,41 @@ fn contiguous_prehashed_input_is_byte_identical_without_a_second_join_buffer() {
 }
 
 #[test]
+fn gate_off_streams_borrowed_chunks_without_changing_logical_output() {
+    let first = b"fragmented-zstd-input\n"
+        .iter()
+        .copied()
+        .cycle()
+        .take(224 * 1_024)
+        .collect::<Vec<_>>();
+    let second = b"second-logical-chunk\n"
+        .iter()
+        .copied()
+        .cycle()
+        .take(224 * 1_024)
+        .collect::<Vec<_>>();
+    let identified = [
+        PrehashedChunk::new(ChunkId::of(&first), &first),
+        PrehashedChunk::new(ChunkId::of(&second), &second),
+    ];
+    let encoded = SealedContainer::encode_prehashed_adaptive_regions_parallel_profiled_with_gate(
+        ContainerId::new([0xC9; 16]).expect("container identity is nonzero"),
+        12,
+        &[&identified],
+        NonZeroUsize::MIN,
+        IncompressibilityGatePolicy::Off,
+    )
+    .expect("stream borrowed Chunk slices into one Zstd frame");
+
+    assert_eq!(encoded.metrics().disabled_regions(), 1);
+    assert_eq!(encoded.metrics().target_zstd_accepted(), 1);
+    let decoded = SealedContainer::decode(encoded.bytes()).expect("streamed frame verifies");
+    assert_eq!(decoded.zstd_record_count(), 1);
+    assert_eq!(decoded.chunk(ChunkId::of(&first)), Some(first.as_slice()));
+    assert_eq!(decoded.chunk(ChunkId::of(&second)), Some(second.as_slice()));
+}
+
+#[test]
 fn wrong_prehashed_identity_is_rejected_by_the_mandatory_reader() {
     let payload = vec![b'Q'; 192 * 1_024];
     let wrong = PrehashedChunk::new(ChunkId::from_bytes([0x55; 32]), &payload);

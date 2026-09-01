@@ -9,9 +9,11 @@ use fastdup_posix::{CommitCapacityAdmission, CommitCapacityClaim, CommitToken, P
 pub const COMMIT_METADATA_FLOOR_BYTES_V1: u64 = 64 * 1_024 * 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_field_names)]
 pub struct CommitCapacitySnapshot {
     metadata_available_bytes: u64,
     data_available_bytes: u64,
+    small_file_available_bytes: u64,
 }
 
 impl CommitCapacitySnapshot {
@@ -20,7 +22,14 @@ impl CommitCapacitySnapshot {
         Self {
             metadata_available_bytes,
             data_available_bytes,
+            small_file_available_bytes: u64::MAX,
         }
+    }
+
+    #[must_use]
+    pub const fn with_small_file_available_bytes(mut self, available_bytes: u64) -> Self {
+        self.small_file_available_bytes = available_bytes;
+        self
     }
 
     #[must_use]
@@ -31,6 +40,11 @@ impl CommitCapacitySnapshot {
     #[must_use]
     pub const fn data_available_bytes(self) -> u64 {
         self.data_available_bytes
+    }
+
+    #[must_use]
+    pub const fn small_file_available_bytes(self) -> u64 {
+        self.small_file_available_bytes
     }
 }
 
@@ -49,12 +63,14 @@ impl std::error::Error for CommitCapacityConfigurationError {}
 struct FrozenClaim {
     metadata_bytes: u64,
     data_bytes: u64,
+    small_file_bytes: u64,
     completed_after_observation: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct UncheckpointedDataClaim {
+struct UncheckpointedPhysicalClaim {
     data_bytes: u64,
+    small_file_bytes: u64,
     completed_after_observation: Option<u64>,
 }
 
@@ -66,13 +82,16 @@ struct UncheckpointedDataClaim {
 pub struct CommitCapacityGovernor {
     metadata_limit: AtomicU64,
     data_limit: AtomicU64,
+    small_file_limit: AtomicU64,
     metadata_reserved: AtomicU64,
     data_reserved: AtomicU64,
+    small_file_reserved: AtomicU64,
     active_metadata: AtomicU64,
     active_data: AtomicU64,
+    active_small_file: AtomicU64,
     observation_epoch: AtomicU64,
     frozen: Mutex<BTreeMap<CommitToken, FrozenClaim>>,
-    uncheckpointed_data: Mutex<UncheckpointedDataClaim>,
+    uncheckpointed_physical: Mutex<UncheckpointedPhysicalClaim>,
 }
 
 impl CommitCapacityGovernor {
@@ -90,13 +109,16 @@ impl CommitCapacityGovernor {
         Ok(Self {
             metadata_limit: AtomicU64::new(snapshot.metadata_available_bytes),
             data_limit: AtomicU64::new(snapshot.data_available_bytes),
+            small_file_limit: AtomicU64::new(snapshot.small_file_available_bytes),
             metadata_reserved: AtomicU64::new(COMMIT_METADATA_FLOOR_BYTES_V1),
             data_reserved: AtomicU64::new(0),
+            small_file_reserved: AtomicU64::new(0),
             active_metadata: AtomicU64::new(0),
             active_data: AtomicU64::new(0),
+            active_small_file: AtomicU64::new(0),
             observation_epoch: AtomicU64::new(0),
             frozen: Mutex::new(BTreeMap::new()),
-            uncheckpointed_data: Mutex::new(UncheckpointedDataClaim::default()),
+            uncheckpointed_physical: Mutex::new(UncheckpointedPhysicalClaim::default()),
         })
     }
 
@@ -130,6 +152,8 @@ impl CommitCapacityGovernor {
             .store(snapshot.metadata_available_bytes, Ordering::Release);
         self.data_limit
             .store(snapshot.data_available_bytes, Ordering::Release);
+        self.small_file_limit
+            .store(snapshot.small_file_available_bytes, Ordering::Release);
 
         let mut frozen = self
             .frozen
@@ -137,6 +161,7 @@ impl CommitCapacityGovernor {
             .expect("ASSERT: commit-capacity generation lock poisoned");
         let mut released_metadata = 0_u64;
         let mut released_data = 0_u64;
+        let mut released_small_file = 0_u64;
         frozen.retain(|_, claim| {
             if claim
                 .completed_after_observation
@@ -148,6 +173,9 @@ impl CommitCapacityGovernor {
                 released_data = released_data
                     .checked_add(claim.data_bytes)
                     .expect("ASSERT: frozen DATA claims fit reserved total");
+                released_small_file = released_small_file
+                    .checked_add(claim.small_file_bytes)
+                    .expect("ASSERT: frozen Small-File claims fit reserved total");
                 false
             } else {
                 true
@@ -155,22 +183,25 @@ impl CommitCapacityGovernor {
         });
         subtract_reserved(&self.metadata_reserved, released_metadata);
         subtract_reserved(&self.data_reserved, released_data);
+        subtract_reserved(&self.small_file_reserved, released_small_file);
 
         let mut uncheckpointed = self
-            .uncheckpointed_data
+            .uncheckpointed_physical
             .lock()
-            .expect("ASSERT: uncheckpointed DATA claim lock poisoned");
-        let released_uncheckpointed_data = if uncheckpointed
+            .expect("ASSERT: uncheckpointed physical claim lock poisoned");
+        let released_uncheckpointed = if uncheckpointed
             .completed_after_observation
             .is_some_and(|completed_epoch| completed_epoch < epoch)
         {
-            let released = uncheckpointed.data_bytes;
-            *uncheckpointed = UncheckpointedDataClaim::default();
+            let released = (uncheckpointed.data_bytes, uncheckpointed.small_file_bytes);
+            *uncheckpointed = UncheckpointedPhysicalClaim::default();
             released
         } else {
-            0
+            (0, 0)
         };
-        subtract_reserved(&self.data_reserved, released_uncheckpointed_data);
+        subtract_reserved(&self.data_reserved, released_uncheckpointed.0);
+        subtract_reserved(&self.small_file_reserved, released_uncheckpointed.1);
+        subtract_reserved(&self.metadata_reserved, released_uncheckpointed.1);
     }
 
     /// Closes new capacity admission after an observation failure while
@@ -187,6 +218,7 @@ impl CommitCapacityGovernor {
         );
         self.metadata_limit.store(0, Ordering::Release);
         self.data_limit.store(0, Ordering::Release);
+        self.small_file_limit.store(0, Ordering::Release);
     }
 
     #[must_use]
@@ -199,10 +231,13 @@ impl CommitCapacityGovernor {
         CommitCapacityStatus {
             metadata_limit_bytes: self.metadata_limit.load(Ordering::Acquire),
             data_limit_bytes: self.data_limit.load(Ordering::Acquire),
+            small_file_limit_bytes: self.small_file_limit.load(Ordering::Acquire),
             reserved_metadata_bytes: self.metadata_reserved.load(Ordering::Acquire),
             reserved_data_bytes: self.data_reserved.load(Ordering::Acquire),
+            reserved_small_file_bytes: self.small_file_reserved.load(Ordering::Acquire),
             active_metadata_bytes: self.active_metadata.load(Ordering::Acquire),
             active_data_bytes: self.active_data.load(Ordering::Acquire),
+            active_small_file_bytes: self.active_small_file.load(Ordering::Acquire),
             frozen_generations: self
                 .frozen
                 .lock()
@@ -225,12 +260,22 @@ impl CommitCapacityAdmission for CommitCapacityGovernor {
             subtract_reserved(&self.metadata_reserved, claim.metadata_bytes());
             return Err(error);
         }
+        if let Err(error) = reserve_bounded(
+            &self.small_file_reserved,
+            &self.small_file_limit,
+            claim.small_file_bytes(),
+        ) {
+            subtract_reserved(&self.data_reserved, claim.data_bytes());
+            subtract_reserved(&self.metadata_reserved, claim.metadata_bytes());
+            return Err(error);
+        }
         Ok(())
     }
 
     fn cancel(&self, claim: CommitCapacityClaim) {
         subtract_reserved(&self.metadata_reserved, claim.metadata_bytes());
         subtract_reserved(&self.data_reserved, claim.data_bytes());
+        subtract_reserved(&self.small_file_reserved, claim.small_file_bytes());
     }
 
     fn accept(&self, claim: CommitCapacityClaim) {
@@ -238,6 +283,8 @@ impl CommitCapacityAdmission for CommitCapacityGovernor {
             .fetch_add(claim.metadata_bytes(), Ordering::AcqRel);
         self.active_data
             .fetch_add(claim.data_bytes(), Ordering::AcqRel);
+        self.active_small_file
+            .fetch_add(claim.small_file_bytes(), Ordering::AcqRel);
     }
 
     fn release_active_metadata(&self, bytes: u64) {
@@ -249,6 +296,7 @@ impl CommitCapacityAdmission for CommitCapacityGovernor {
         let claim = FrozenClaim {
             metadata_bytes: self.active_metadata.swap(0, Ordering::AcqRel),
             data_bytes: self.active_data.swap(0, Ordering::AcqRel),
+            small_file_bytes: self.active_small_file.swap(0, Ordering::AcqRel),
             completed_after_observation: None,
         };
         let replaced = self
@@ -280,19 +328,28 @@ impl CommitCapacityAdmission for CommitCapacityGovernor {
     fn finish_uncheckpointed_active(&self) {
         let metadata = self.active_metadata.swap(0, Ordering::AcqRel);
         let data = self.active_data.swap(0, Ordering::AcqRel);
-        subtract_reserved(&self.metadata_reserved, metadata);
-        if data == 0 {
+        let small_file = self.active_small_file.swap(0, Ordering::AcqRel);
+        assert!(
+            metadata >= small_file,
+            "ASSERT: Small-File physical claims are also Metadata claims"
+        );
+        subtract_reserved(&self.metadata_reserved, metadata - small_file);
+        if data == 0 && small_file == 0 {
             return;
         }
         let completed_epoch = self.observation_epoch.load(Ordering::Acquire);
         let mut uncheckpointed = self
-            .uncheckpointed_data
+            .uncheckpointed_physical
             .lock()
-            .expect("ASSERT: uncheckpointed DATA claim lock poisoned");
+            .expect("ASSERT: uncheckpointed physical claim lock poisoned");
         uncheckpointed.data_bytes = uncheckpointed
             .data_bytes
             .checked_add(data)
             .expect("ASSERT: uncheckpointed DATA claims fit reserved total");
+        uncheckpointed.small_file_bytes = uncheckpointed
+            .small_file_bytes
+            .checked_add(small_file)
+            .expect("ASSERT: uncheckpointed Small-File claims fit reserved total");
         uncheckpointed.completed_after_observation = Some(
             uncheckpointed
                 .completed_after_observation
@@ -333,10 +390,13 @@ fn subtract_reserved(reserved: &AtomicU64, bytes: u64) {
 pub struct CommitCapacityStatus {
     metadata_limit_bytes: u64,
     data_limit_bytes: u64,
+    small_file_limit_bytes: u64,
     reserved_metadata_bytes: u64,
     reserved_data_bytes: u64,
+    reserved_small_file_bytes: u64,
     active_metadata_bytes: u64,
     active_data_bytes: u64,
+    active_small_file_bytes: u64,
     frozen_generations: usize,
 }
 
@@ -350,6 +410,10 @@ impl CommitCapacityStatus {
         self.data_limit_bytes
     }
     #[must_use]
+    pub const fn small_file_limit_bytes(self) -> u64 {
+        self.small_file_limit_bytes
+    }
+    #[must_use]
     pub const fn reserved_metadata_bytes(self) -> u64 {
         self.reserved_metadata_bytes
     }
@@ -358,12 +422,20 @@ impl CommitCapacityStatus {
         self.reserved_data_bytes
     }
     #[must_use]
+    pub const fn reserved_small_file_bytes(self) -> u64 {
+        self.reserved_small_file_bytes
+    }
+    #[must_use]
     pub const fn active_metadata_bytes(self) -> u64 {
         self.active_metadata_bytes
     }
     #[must_use]
     pub const fn active_data_bytes(self) -> u64 {
         self.active_data_bytes
+    }
+    #[must_use]
+    pub const fn active_small_file_bytes(self) -> u64 {
+        self.active_small_file_bytes
     }
     #[must_use]
     pub const fn frozen_generations(self) -> usize {

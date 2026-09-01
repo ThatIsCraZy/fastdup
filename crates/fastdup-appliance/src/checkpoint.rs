@@ -26,14 +26,15 @@ use fastdup_posix::{
 };
 use fastdup_store::{
     AdaptiveContainerPublishMetrics, CONTAINER_GENERATION_RESERVATION_SPAN_V1,
-    ContainerDescriptorCacheStatus, ContainerGenerationAllocator, ContainerRepository,
-    ExactIndexPageCacheStatus, ExactIndexRunRepository, ExactRunMembershipStatus, GenerationError,
-    GenerationRepository, IndexedRequiredChunkVerifier, ManifestReadError, ManifestSuccessorProof,
-    ManifestTreeSummary, PersistentChunkPlan, PersistentReductionIndex, PersistentReductionStatus,
-    RequiredChunkVerifier, SeqCdcConfig, SimilarityIndexPageCacheStatus, SimilarityIndexRepository,
-    StorageIo, StoreError, SuccessorPredecessor, VerifiedCommittedFile, VerifiedManifestFile,
-    VerifiedReadCache, VerifiedReadCacheError, VerifiedReadCacheStatus, seqcdc_cut,
-    seqcdc_cut_scalar, seqcdc_cut_segmented, seqcdc_cut_segmented_scalar,
+    ContainerDescriptorCacheStatus, ContainerGenerationAllocator, ContainerPlacement,
+    ContainerRepository, ExactIndexPageCacheStatus, ExactIndexRunRepository,
+    ExactRunMembershipStatus, GenerationError, GenerationRepository, IndexedRequiredChunkVerifier,
+    ManifestReadError, ManifestSuccessorProof, ManifestTreeSummary, PersistentChunkPlan,
+    PersistentReductionIndex, PersistentReductionStatus, RequiredChunkVerifier, SeqCdcConfig,
+    SimilarityIndexPageCacheStatus, SimilarityIndexRepository, StorageIo, StoreError,
+    SuccessorPredecessor, VerifiedCommittedFile, VerifiedManifestFile, VerifiedReadCache,
+    VerifiedReadCacheError, VerifiedReadCacheStatus, seqcdc_cut, seqcdc_cut_scalar,
+    seqcdc_cut_segmented, seqcdc_cut_segmented_scalar,
 };
 use rayon::prelude::*;
 
@@ -1233,6 +1234,7 @@ struct PendingWriteThroughChunk {
     offset: u64,
     chunk_id: ChunkId,
     bytes: ChunkFragments,
+    placement: ContainerPlacement,
 }
 
 struct CompressionRegionPlan<'a> {
@@ -1770,6 +1772,7 @@ fn contiguous_worker_shard(jobs: usize, workers: usize, worker: usize) -> (usize
 #[repr(align(64))]
 struct WriteThroughStream {
     inode: Option<InodeId>,
+    placement: Option<ContainerPlacement>,
     last_mutation_sequence: Option<u64>,
     next_offset: u64,
     tail_offset: u64,
@@ -1905,6 +1908,7 @@ struct IngestWriteFragment {
     offset: u64,
     bytes: MutationPayload,
     mutation_sequence: u64,
+    placement: ContainerPlacement,
 }
 
 #[derive(Debug)]
@@ -2711,6 +2715,7 @@ fn ingest_fragment_extends_batch(
                 )
                 .is_some_and(|next| next == fragment.offset)
                 && fragment.mutation_sequence >= last.mutation_sequence
+                && fragment.placement == last.placement
         });
         let fits = open
             .buffered_bytes
@@ -3189,6 +3194,7 @@ where
         inode: InodeId,
         offset: u64,
         mutation_sequence: u64,
+        placement: ContainerPlacement,
         bytes: &MutationPayload,
     ) {
         let mut consumed = 0_usize;
@@ -3209,6 +3215,7 @@ where
                     offset: job_offset,
                     bytes: chunk,
                     mutation_sequence,
+                    placement,
                 },
             );
         }
@@ -3447,12 +3454,14 @@ where
         let mut externalized = Vec::new();
         for fragment in fragments {
             let discontinuous = lane.inode != Some(inode)
+                || lane.placement != Some(fragment.placement)
                 || lane.next_offset != fragment.offset
                 || lane
                     .last_mutation_sequence
                     .is_some_and(|previous| fragment.mutation_sequence <= previous);
             if discontinuous {
                 lane.inode = Some(inode);
+                lane.placement = Some(fragment.placement);
                 lane.tail_offset = fragment.offset;
                 lane.tail.clear();
                 lane.pending_chunks.clear();
@@ -3587,6 +3596,7 @@ where
         registry.acquire_lane(inode)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn extract_stable_chunks(
         &self,
         state: &mut WriteThroughStream,
@@ -3688,6 +3698,9 @@ where
                     offset: chunk.offset,
                     chunk_id,
                     bytes: chunk.bytes,
+                    placement: state
+                        .placement
+                        .expect("ASSERT: active Write-Through stream has a placement"),
                 });
             }
         }
@@ -3802,6 +3815,12 @@ where
             !new_chunks.is_empty(),
             "ASSERT: a new-Chunk Container must contain at least one Chunk"
         );
+        assert!(
+            new_chunks
+                .iter()
+                .all(|chunk| chunk.placement == new_chunks[0].placement),
+            "ASSERT: one Container cannot cross physical placement tiers"
+        );
         let PreparedWriteThroughReduction {
             ordinary_chunks,
             independent,
@@ -3864,7 +3883,7 @@ where
         drop(worker_lease);
         let (verified, _) = self
             .containers
-            .publish_prepared_adaptive_profiled(prepared)?;
+            .publish_prepared_adaptive_profiled_with_placement(prepared, new_chunks[0].placement)?;
         let entries = verified
             .locations()
             .iter()
@@ -4024,9 +4043,20 @@ where
         inode: InodeId,
         offset: u64,
         mutation_sequence: u64,
+        small_file: bool,
         bytes: MutationPayload,
     ) -> Vec<ExternalizedExtent> {
-        self.enqueue_write(inode, offset, mutation_sequence, &bytes);
+        self.enqueue_write(
+            inode,
+            offset,
+            mutation_sequence,
+            if small_file {
+                ContainerPlacement::SmallFile
+            } else {
+                ContainerPlacement::Data
+            },
+            &bytes,
+        );
         Vec::new()
     }
 
@@ -4931,7 +4961,14 @@ where
             .lock()
             .expect("ASSERT: installed Manifest cache lock poisoned");
         for inode in commit.inodes() {
-            writer.begin_inode(inode.inode());
+            writer.begin_inode(
+                inode.inode(),
+                if inode.prefers_small_file_tier(commit.entries()) {
+                    ContainerPlacement::SmallFile
+                } else {
+                    ContainerPlacement::Data
+                },
+            )?;
             let previous = installed_manifests
                 .binary_search_by_key(&inode.inode().get(), |manifest| manifest.inode)
                 .ok()
@@ -6425,6 +6462,7 @@ struct AdaptiveCommitWriter<'a, C> {
     workers: NonZeroUsize,
     metrics: CheckpointReductionMetrics,
     current_inode: Option<u64>,
+    placement: ContainerPlacement,
     retained_ranges: RetainedManifestRanges,
     online_dependency_proofs: Arc<OnlineDependencyProofs>,
 }
@@ -6448,13 +6486,23 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             workers,
             metrics: CheckpointReductionMetrics::default(),
             current_inode: None,
+            placement: ContainerPlacement::Data,
             retained_ranges: BTreeMap::new(),
             online_dependency_proofs,
         }
     }
 
-    fn begin_inode(&mut self, inode: InodeId) {
+    fn begin_inode(
+        &mut self,
+        inode: InodeId,
+        placement: ContainerPlacement,
+    ) -> Result<(), DurableNamespaceError> {
+        if self.placement != placement {
+            self.flush()?;
+            self.placement = placement;
+        }
         self.current_inode = Some(inode.get());
+        Ok(())
     }
 
     fn record_prepared_chunk(
@@ -6668,12 +6716,14 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
         }
         let region_refs = regions.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let generation = self.container_generations.reserve_generation()?;
-        let (verified, publish_metrics) =
-            self.containers.publish_adaptive_regions_parallel_profiled(
+        let (verified, publish_metrics) = self
+            .containers
+            .publish_adaptive_regions_parallel_profiled_with_placement(
                 id,
                 generation,
                 &region_refs,
                 self.workers,
+                self.placement,
             )?;
         self.record_container_metrics(publish_metrics);
         self.level_zero_entries
@@ -7031,11 +7081,13 @@ mod tests {
                 offset: 0,
                 chunk_id: first.chunk_id(),
                 bytes: first,
+                placement: ContainerPlacement::Data,
             },
             PendingWriteThroughChunk {
                 offset: 22,
                 chunk_id: second.chunk_id(),
                 bytes: second,
+                placement: ContainerPlacement::Data,
             },
         ];
         let references = chunks.iter().collect::<Vec<_>>();
@@ -7226,6 +7278,7 @@ mod tests {
                 bytes: MutationPayload::try_copy_from_slice(&[1])
                     .expect("allocate fixture payload"),
                 mutation_sequence: 7,
+                placement: ContainerPlacement::Data,
             },
         );
         queue.enqueue(IngestJob {
@@ -7254,6 +7307,7 @@ mod tests {
                 bytes: MutationPayload::try_copy_from_slice(&[1])
                     .expect("allocate fixture payload"),
                 mutation_sequence: 1,
+                placement: ContainerPlacement::Data,
             },
         );
         let write = queue.next_job().expect("queued write exists");
@@ -7354,6 +7408,7 @@ mod tests {
                     ],
                     3,
                 ),
+                placement: ContainerPlacement::Data,
             }],
             pending_bytes: 2,
             ..WriteThroughStream::default()

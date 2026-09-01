@@ -1,6 +1,7 @@
 use core::fmt;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -115,6 +116,19 @@ pub struct SealedContainer {
     raw_record_count: usize,
     zstd_record_count: usize,
     zstd_prefix_record_count: usize,
+}
+
+/// One owned Container image whose decoded payloads and physical bytes were
+/// verified together.
+///
+/// The private fields prevent callers from pairing trusted decoded evidence
+/// with unrelated encoded bytes. Maintenance may therefore transplant an
+/// independent Record without recompression while ordinary recovery and scrub
+/// continue to validate the resulting Container normally.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedContainerImage {
+    container: SealedContainer,
+    bytes: Vec<u8>,
 }
 
 /// Payload-free Location evidence produced by the Container writer or a full
@@ -576,6 +590,35 @@ pub struct SealedContainerDescriptor {
     container_hash: [u8; 32],
 }
 
+/// One complete independently verified Encoding Record decode.
+///
+/// `requested` retains caller order while `all` contains every unique logical
+/// Chunk verified as part of the same physical Record. Both vectors share the
+/// decoder's one backing allocation. The type has no public constructor: only
+/// the format verifier can create this identity evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRecordPayloads {
+    requested: Vec<VerifiedChunkPayload>,
+    all: Vec<VerifiedChunkPayload>,
+}
+
+impl VerifiedRecordPayloads {
+    #[must_use]
+    pub fn requested(&self) -> &[VerifiedChunkPayload] {
+        &self.requested
+    }
+
+    #[must_use]
+    pub fn all(&self) -> &[VerifiedChunkPayload] {
+        &self.all
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<VerifiedChunkPayload>, Vec<VerifiedChunkPayload>) {
+        (self.requested, self.all)
+    }
+}
+
 /// Paired immutable Container envelope carrying payload-free recovery
 /// acceleration.
 ///
@@ -792,8 +835,34 @@ impl SealedContainerDescriptor {
         candidates: &[ExactIndexEntry],
         record_bytes: &[u8],
     ) -> Result<Vec<RawRecord>, FormatError> {
+        let verified = self.decode_candidate_payloads(candidates, record_bytes)?;
+        Ok(verified
+            .requested
+            .into_iter()
+            .map(RawRecord::from_verified_payload)
+            .collect())
+    }
+
+    /// Fully validates one independent Encoding Record and returns both the
+    /// requested Chunks and every verified sibling decoded with them.
+    ///
+    /// This is the bounded read-cache seam. Callers can retain all siblings
+    /// without copying the shared decoded Record backing or recomputing Chunk
+    /// identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::decode_candidates`].
+    pub fn decode_candidate_payloads(
+        self,
+        candidates: &[ExactIndexEntry],
+        record_bytes: &[u8],
+    ) -> Result<VerifiedRecordPayloads, FormatError> {
         let Some(&first) = candidates.first() else {
-            return Ok(Vec::new());
+            return Ok(VerifiedRecordPayloads {
+                requested: Vec::new(),
+                all: Vec::new(),
+            });
         };
         let range = self.record_range(first)?;
         let first_location = first.location();
@@ -854,29 +923,28 @@ impl SealedContainerDescriptor {
         }
 
         let decoded = decode_encoding_record(record_bytes)?;
-        let mut available = decoded.chunks.into_iter().map(Some).collect::<Vec<_>>();
-        let mut selected = Vec::new();
-        selected
+        let all = decoded
+            .chunks
+            .into_iter()
+            .map(RawRecord::into_verified_payload)
+            .collect::<Vec<_>>();
+        let mut requested = Vec::new();
+        requested
             .try_reserve_exact(candidates.len())
             .map_err(|_| FormatError::ArithmeticOverflow)?;
         for (&candidate, ordinal) in candidates.iter().zip(ordinals) {
-            let record = if let Some(record) = available[ordinal].take() {
-                record
-            } else {
-                selected
-                    .iter()
-                    .find(|record: &&RawRecord| record.chunk_id() == candidate.chunk_id())
-                    .cloned()
-                    .ok_or(FormatError::ExactLocationMismatch)?
-            };
-            if record.chunk_id() != candidate.chunk_id()
-                || usize::try_from(candidate.logical_length()) != Ok(record.payload().len())
+            let payload = all
+                .get(ordinal)
+                .ok_or(FormatError::ExactLocationMismatch)?
+                .clone();
+            if payload.chunk_id() != candidate.chunk_id()
+                || usize::try_from(candidate.logical_length()) != Ok(payload.len())
             {
                 return Err(FormatError::ExactLocationMismatch);
             }
-            selected.push(record);
+            requested.push(payload);
         }
-        Ok(selected)
+        Ok(VerifiedRecordPayloads { requested, all })
     }
 
     /// Fully validates one codec-3 Exact candidate using its resolved Base.
@@ -894,6 +962,33 @@ impl SealedContainerDescriptor {
         candidate: ExactIndexEntry,
         record_bytes: &[u8],
         base: &[u8],
+    ) -> Result<RawRecord, FormatError> {
+        self.decode_zstd_prefix_candidate_using(candidate, record_bytes, |bytes| {
+            ZstdPrefixRecord::decode(bytes, base)
+        })
+    }
+
+    /// Fully validates one codec-3 candidate while reusing the identity already
+    /// proven by an independent Base decode.
+    ///
+    /// The target is still decompressed and rehashed. Only the redundant second
+    /// full Base hash is replaced by an O(1) capability comparison.
+    pub fn decode_zstd_prefix_candidate_with_verified_base(
+        self,
+        candidate: ExactIndexEntry,
+        record_bytes: &[u8],
+        base: &VerifiedChunkPayload,
+    ) -> Result<RawRecord, FormatError> {
+        self.decode_zstd_prefix_candidate_using(candidate, record_bytes, |bytes| {
+            ZstdPrefixRecord::decode_with_verified_base(bytes, base)
+        })
+    }
+
+    fn decode_zstd_prefix_candidate_using(
+        self,
+        candidate: ExactIndexEntry,
+        record_bytes: &[u8],
+        decode: impl FnOnce(&[u8]) -> Result<RawRecord, FormatError>,
     ) -> Result<RawRecord, FormatError> {
         let location = candidate.location();
         if location.codec_id() != ZSTD_PREFIX_CODEC {
@@ -919,7 +1014,7 @@ impl SealedContainerDescriptor {
         {
             return Err(FormatError::ExactLocationMismatch);
         }
-        let record = ZstdPrefixRecord::decode(record_bytes, base)?;
+        let record = decode(record_bytes)?;
         if record.chunk_id() != candidate.chunk_id()
             || usize::try_from(candidate.logical_length()) != Ok(record.payload().len())
         {
@@ -1462,6 +1557,7 @@ impl SealedContainer {
             &inputs,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             workers,
             gate,
         )
@@ -1492,6 +1588,7 @@ impl SealedContainer {
             container_id,
             container_generation,
             &inputs,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             workers,
@@ -1531,6 +1628,43 @@ impl SealedContainer {
             container_id,
             container_generation,
             &inputs,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            workers,
+            gate,
+        )
+    }
+
+    /// Encodes prehashed partial Records together with byte-for-byte copied
+    /// independent Records from verified Container images.
+    ///
+    /// The copied Record CRC and codec parameters are retained. The enclosing
+    /// Container metadata and commitment are rebuilt for the new identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded format, allocation, compression, or worker errors.
+    pub fn encode_prehashed_adaptive_regions_with_transplants_parallel_profiled_with_gate(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[PrehashedChunk<'_>]],
+        transplanted: Vec<PreparedEncodedRecord>,
+        workers: NonZeroUsize,
+        gate: IncompressibilityGatePolicy,
+    ) -> Result<AdaptiveContainerEncoding, FormatError> {
+        let inputs = regions
+            .iter()
+            .map(|chunks| AdaptiveRegionInput {
+                chunks,
+                decoded: None,
+            })
+            .collect::<Vec<_>>();
+        Self::encode_adaptive_region_inputs_parallel_profiled_with_gate(
+            container_id,
+            container_generation,
+            &inputs,
+            transplanted,
             Vec::new(),
             Vec::new(),
             workers,
@@ -1603,6 +1737,7 @@ impl SealedContainer {
             container_id,
             container_generation,
             &inputs,
+            Vec::new(),
             independent,
             prefixes,
             workers,
@@ -1614,12 +1749,17 @@ impl SealedContainer {
         container_id: ContainerId,
         container_generation: u64,
         regions: &[AdaptiveRegionInput<'_>],
+        transplanted: Vec<PreparedEncodedRecord>,
         independent: Vec<PreparedIndependentRecord>,
         prefixes: Vec<PreparedZstdPrefixRecord>,
         workers: NonZeroUsize,
         gate: IncompressibilityGatePolicy,
     ) -> Result<AdaptiveContainerEncoding, FormatError> {
-        if regions.is_empty() && independent.is_empty() && prefixes.is_empty() {
+        if regions.is_empty()
+            && transplanted.is_empty()
+            && independent.is_empty()
+            && prefixes.is_empty()
+        {
             return Err(FormatError::InvalidContainerLayout);
         }
         let worker_count = workers.get().min(regions.len().max(1));
@@ -1663,6 +1803,11 @@ impl SealedContainer {
             gate_metrics.checked_merge(encoded.metrics)?;
             encoded_records.extend(encoded.records);
         }
+        encoded_records.extend(
+            transplanted
+                .into_iter()
+                .map(AdaptiveRecordPlan::PreparedEncoded),
+        );
         encoded_records.extend(
             independent
                 .into_iter()
@@ -1811,7 +1956,7 @@ impl SealedContainer {
                 let record = ZstdPrefixRecord::decode(encoded, &base)?;
                 DecodedEncodingRecord {
                     codec: EncodingCodec::ZstdPrefix,
-                    logical_bytes: u64::try_from(record.payload.len())
+                    logical_bytes: u64::try_from(record.payload().len())
                         .map_err(|_| FormatError::ArithmeticOverflow)?,
                     chunks: vec![record],
                 }
@@ -1922,7 +2067,24 @@ impl SealedContainer {
         bytes: &[u8],
         _permitted_workers: NonZeroUsize,
     ) -> Result<VerifiedContainerPublication, FormatError> {
-        Self::verify_publication(bytes, PublicationContainerProof::RecomputedHash)
+        Self::verify_publication(bytes, PublicationContainerProof::RecomputedHash, None)
+    }
+
+    /// Fully validates a Container without retaining logical payloads while
+    /// resolving codec-3 Bases through one caller-owned adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first Container, resolver, Base, or target-integrity error.
+    pub fn verify_publication_with_zstd_prefix_resolver(
+        bytes: &[u8],
+        resolve: &mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>,
+    ) -> Result<VerifiedContainerPublication, FormatError> {
+        Self::verify_publication(
+            bytes,
+            PublicationContainerProof::RecomputedHash,
+            Some(resolve),
+        )
     }
 
     /// Fully validates a publication reread against the exact sealed image
@@ -1950,6 +2112,7 @@ impl SealedContainer {
         Self::verify_publication(
             bytes,
             PublicationContainerProof::ExactWriterImage(writer_image),
+            None,
         )
     }
 
@@ -1957,6 +2120,7 @@ impl SealedContainer {
     fn verify_publication(
         bytes: &[u8],
         container_proof: PublicationContainerProof<'_>,
+        mut resolve: Option<&mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>>,
     ) -> Result<VerifiedContainerPublication, FormatError> {
         if let PublicationContainerProof::ExactWriterImage(writer_image) = container_proof
             && bytes != writer_image
@@ -2002,6 +2166,7 @@ impl SealedContainer {
         let mut logical_bytes = 0_u64;
         let mut raw_record_count = 0_usize;
         let mut zstd_record_count = 0_usize;
+        let mut zstd_prefix_record_count = 0_usize;
         let mut intrinsic_summary = IntrinsicSummaryAccumulator::with_record_capacity(
             usize::try_from(header.layout.record_count)
                 .map_err(|_| FormatError::ArithmeticOverflow)?,
@@ -2024,7 +2189,22 @@ impl SealedContainer {
             }
             let encoded = &bytes[cursor..end];
             intrinsic_summary.observe_encoded_record(encoded)?;
-            let decoded = verify_encoding_record(encoded)?;
+            let decoded = if encoded.len() >= 14 && get_u16(encoded, 12) == ZSTD_PREFIX_CODEC {
+                let dependency = ZstdPrefixRecord::dependency(encoded)?;
+                let resolver = resolve
+                    .as_deref_mut()
+                    .ok_or(FormatError::ZstdPrefixBaseRequired)?;
+                let base = resolver(dependency)?;
+                let record = ZstdPrefixRecord::decode(encoded, &base)?;
+                DecodedEncodingRecord {
+                    codec: EncodingCodec::ZstdPrefix,
+                    logical_bytes: u64::try_from(record.payload().len())
+                        .map_err(|_| FormatError::ArithmeticOverflow)?,
+                    chunks: Vec::new(),
+                }
+            } else {
+                verify_encoding_record(encoded)?
+            };
             logical_bytes = logical_bytes
                 .checked_add(decoded.logical_bytes)
                 .ok_or(FormatError::ArithmeticOverflow)?;
@@ -2071,7 +2251,9 @@ impl SealedContainer {
                         .ok_or(FormatError::ArithmeticOverflow)?;
                 }
                 EncodingCodec::ZstdPrefix => {
-                    return Err(FormatError::ZstdPrefixBaseRequired);
+                    zstd_prefix_record_count = zstd_prefix_record_count
+                        .checked_add(1)
+                        .ok_or(FormatError::ArithmeticOverflow)?;
                 }
             }
             expected_entries.extend(index_entries);
@@ -2110,7 +2292,7 @@ impl SealedContainer {
             logical_bytes,
             raw_record_count,
             zstd_record_count,
-            zstd_prefix_record_count: 0,
+            zstd_prefix_record_count,
         })
     }
 
@@ -2183,8 +2365,112 @@ impl SealedContainer {
     pub fn chunk(&self, chunk_id: ChunkId) -> Option<&[u8]> {
         self.records
             .iter()
-            .find(|record| record.chunk_id == chunk_id)
+            .find(|record| record.chunk_id() == chunk_id)
             .map(RawRecord::payload)
+    }
+
+    /// Returns shared ownership of one logical Chunk already verified as part
+    /// of this complete immutable Container decode.
+    #[must_use]
+    pub fn verified_chunk(&self, chunk_id: ChunkId) -> Option<VerifiedChunkPayload> {
+        self.records
+            .iter()
+            .find(|record| record.chunk_id() == chunk_id)
+            .map(|record| record.payload.clone())
+    }
+}
+
+impl VerifiedContainerImage {
+    /// Owns an image only after complete independent verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structural, checksum, or content-integrity error as
+    /// [`SealedContainer::decode`].
+    pub fn decode(bytes: Vec<u8>) -> Result<Self, FormatError> {
+        let container = SealedContainer::decode(&bytes)?;
+        Ok(Self { container, bytes })
+    }
+
+    /// Owns an image after complete verification with Depth-1 Prefix Base
+    /// resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as
+    /// [`SealedContainer::decode_with_zstd_prefix_resolver`].
+    pub fn decode_with_zstd_prefix_resolver(
+        bytes: Vec<u8>,
+        resolve: &mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>,
+    ) -> Result<Self, FormatError> {
+        let container = SealedContainer::decode_with_zstd_prefix_resolver(&bytes, resolve)?;
+        Ok(Self { container, bytes })
+    }
+
+    #[must_use]
+    pub const fn container(&self) -> &SealedContainer {
+        &self.container
+    }
+
+    #[must_use]
+    pub fn into_container(self) -> SealedContainer {
+        self.container
+    }
+
+    /// Extracts one dependency-free RAW/Zstd Record from this verified image.
+    /// Prefix Records are intentionally excluded because their durable Base
+    /// closure is not automatically carried into a replacement Container.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown offsets, dependent codecs, or inconsistent verified
+    /// location geometry.
+    pub fn prepare_encoded_record(
+        &self,
+        record_offset: u64,
+    ) -> Result<PreparedEncodedRecord, FormatError> {
+        let first = self
+            .container
+            .locations
+            .iter()
+            .find(|location| location.record_offset == record_offset)
+            .ok_or(FormatError::InvalidContainerLayout)?;
+        if first.dependency_id != [0; 32]
+            || (first.codec_id != RAW_CODEC && first.codec_id != ZSTD_CODEC)
+        {
+            return Err(FormatError::InvalidContainerLayout);
+        }
+        let start = usize::try_from(record_offset).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let length =
+            usize::try_from(first.record_length).map_err(|_| FormatError::ArithmeticOverflow)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        let bytes = self
+            .bytes
+            .get(start..end)
+            .ok_or(FormatError::InvalidContainerLayout)?;
+        let chunk_count = self
+            .container
+            .locations
+            .iter()
+            .filter(|location| location.record_offset == record_offset)
+            .count();
+        if chunk_count == 0
+            || usize::try_from(get_u32(bytes, 56)) != Ok(chunk_count)
+            || self.container.locations.iter().any(|location| {
+                location.record_offset == record_offset
+                    && (location.record_length != first.record_length
+                        || location.codec_id != first.codec_id
+                        || location.dependency_id != [0; 32])
+            })
+        {
+            return Err(FormatError::InvalidContainerLayout);
+        }
+        Ok(PreparedEncodedRecord {
+            bytes: bytes.to_vec(),
+            chunk_count,
+        })
     }
 }
 
@@ -2502,6 +2788,17 @@ pub struct PreparedIndependentRecord {
     bytes: Vec<u8>,
 }
 
+/// One already verified, position-independent RAW/Zstd Encoding Record.
+///
+/// Only [`VerifiedContainerImage`] can produce this capability. The Container
+/// builder copies the serialized fields byte-for-byte and constructs a new
+/// Header, Recovery Index, structural commitment, and Footer around it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedEncodedRecord {
+    bytes: Vec<u8>,
+    chunk_count: usize,
+}
+
 impl PreparedIndependentRecord {
     #[must_use]
     pub fn encoded_payload_bytes(&self) -> usize {
@@ -2513,6 +2810,18 @@ impl PreparedIndependentRecord {
         let mut id = [0_u8; 32];
         id.copy_from_slice(&self.bytes[RECORD_HEADER_BYTES..RECORD_HEADER_BYTES + 32]);
         ChunkId::from_bytes(id)
+    }
+}
+
+impl PreparedEncodedRecord {
+    #[must_use]
+    pub fn encoded_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[must_use]
+    pub const fn chunk_count(&self) -> usize {
+        self.chunk_count
     }
 }
 
@@ -2607,6 +2916,7 @@ enum AdaptiveRecordPlan<'a> {
         payload: Vec<u8>,
         level: i32,
     },
+    PreparedEncoded(PreparedEncodedRecord),
     PreparedIndependent(PreparedIndependentRecord),
     ZstdPrefix(PreparedZstdPrefixRecord),
 }
@@ -2618,6 +2928,7 @@ impl AdaptiveRecordPlan<'_> {
             Self::Zstd {
                 chunks, payload, ..
             } => zstd_record_length(chunks.len(), payload.len()),
+            Self::PreparedEncoded(record) => Ok(record.bytes.len()),
             Self::PreparedIndependent(record) => Ok(record.bytes.len()),
             Self::ZstdPrefix(record) => record.record_length(),
         }
@@ -2626,6 +2937,7 @@ impl AdaptiveRecordPlan<'_> {
     fn chunk_count(&self) -> usize {
         match self {
             Self::Zstd { chunks, .. } => chunks.len(),
+            Self::PreparedEncoded(record) => record.chunk_count,
             Self::Raw(_) | Self::PreparedIndependent(_) | Self::ZstdPrefix(_) => 1,
         }
     }
@@ -2649,6 +2961,7 @@ impl AdaptiveRecordPlan<'_> {
                 chunks.len(),
                 None,
             ),
+            Self::PreparedEncoded(record) => summary.observe_encoded_record(&record.bytes),
             Self::PreparedIndependent(record) => summary.observe_encoded_record(&record.bytes),
             Self::ZstdPrefix(record) => summary.observe(
                 ZSTD_PREFIX_CODEC,
@@ -2676,6 +2989,13 @@ impl AdaptiveRecordPlan<'_> {
                 *level,
                 destination,
             ),
+            Self::PreparedEncoded(record) => {
+                if destination.len() != record.bytes.len() {
+                    return Err(FormatError::InvalidRecordLength(destination.len()));
+                }
+                destination.copy_from_slice(&record.bytes);
+                Ok(())
+            }
             Self::PreparedIndependent(record) => {
                 if destination.len() != record.bytes.len() {
                     return Err(FormatError::InvalidRecordLength(destination.len()));
@@ -2703,6 +3023,10 @@ fn encode_adaptive_region<'a>(
     if region.is_empty() {
         return Err(FormatError::InvalidZstdRecord);
     }
+    if gate == IncompressibilityGatePolicy::Off {
+        let decoded_length = prehashed_decoded_length(region)?;
+        return encode_adaptive_region_from_input(region, None, decoded_length, gate);
+    }
     let decoded = collect_prehashed_decoded(region)?;
     encode_adaptive_region_from_decoded(region, &decoded, gate)
 }
@@ -2711,6 +3035,20 @@ fn encode_adaptive_region<'a>(
 fn encode_adaptive_region_from_decoded<'a>(
     region: &'a [PrehashedChunk<'a>],
     decoded: &[u8],
+    gate: IncompressibilityGatePolicy,
+) -> Result<EncodedAdaptiveRegion<'a>, FormatError> {
+    let decoded_length = prehashed_decoded_length(region)?;
+    if decoded.len() != decoded_length {
+        return Err(FormatError::InvalidZstdRecord);
+    }
+    encode_adaptive_region_from_input(region, Some(decoded), decoded_length, gate)
+}
+
+#[allow(clippy::too_many_lines)]
+fn encode_adaptive_region_from_input<'a>(
+    region: &'a [PrehashedChunk<'a>],
+    decoded: Option<&[u8]>,
+    decoded_length: usize,
     gate: IncompressibilityGatePolicy,
 ) -> Result<EncodedAdaptiveRegion<'a>, FormatError> {
     let raw_bytes = region.iter().try_fold(0_usize, |total, chunk| {
@@ -2730,10 +3068,11 @@ fn encode_adaptive_region_from_decoded<'a>(
     let should_try_target = if gate == IncompressibilityGatePolicy::Off {
         metrics.disabled_regions = 1;
         true
-    } else if decoded.len() < INCOMPRESSIBILITY_GATE_MIN_BYTES_V1 {
+    } else if decoded_length < INCOMPRESSIBILITY_GATE_MIN_BYTES_V1 {
         metrics.size_bypassed_regions = 1;
         true
     } else {
+        let decoded = decoded.ok_or(FormatError::InvalidZstdRecord)?;
         metrics.eligible_regions = 1;
         with_adaptive_encoder_v1(|encoder| {
             if encoder.lz4_fits(decoded, payload_cap)? {
@@ -2756,24 +3095,26 @@ fn encode_adaptive_region_from_decoded<'a>(
 
     if should_try_target {
         metrics.target_zstd_trials = 1;
-        let zstd = with_adaptive_encoder_v1(|encoder| {
-            let Some(payload) = encoder.zstd_owned_payload(decoded, ZSTD_LEVEL_V1, payload_cap)?
-            else {
-                return Ok(None);
-            };
-            let record_length = zstd_record_length(region.len(), payload.len())?;
-            Ok(Some((payload, record_length)))
+        let payload = with_adaptive_encoder_v1(|encoder| match decoded {
+            Some(decoded) => encoder.zstd_owned_payload(decoded, ZSTD_LEVEL_V1, payload_cap),
+            None => encoder.zstd_fragmented_owned_payload(
+                region,
+                decoded_length,
+                ZSTD_LEVEL_V1,
+                payload_cap,
+            ),
         })?;
-        if let Some((payload, zstd_length)) = zstd {
+        if let Some(payload) = payload {
+            let record_length = zstd_record_length(region.len(), payload.len())?;
             assert!(
-                zstd_record_wins(raw_bytes, zstd_length)?,
+                zstd_record_wins(raw_bytes, record_length)?,
                 "ASSERT: a payload bounded by the v1 useful cap must beat RAW"
             );
             metrics.target_zstd_accepted = 1;
             return Ok(EncodedAdaptiveRegion {
                 records: vec![AdaptiveRecordPlan::Zstd {
                     chunks: region,
-                    decoded_length: decoded.len(),
+                    decoded_length,
                     payload,
                     level: ZSTD_LEVEL_V1,
                 }],
@@ -2840,6 +3181,19 @@ fn encode_prehashed_zstd_record(
 }
 
 fn collect_prehashed_decoded(chunks: &[PrehashedChunk<'_>]) -> Result<Vec<u8>, FormatError> {
+    let decoded_length = prehashed_decoded_length(chunks)?;
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(decoded_length)
+        .map_err(|_| FormatError::ArithmeticOverflow)?;
+    for chunk in chunks {
+        decoded.extend_from_slice(chunk.bytes);
+    }
+    record_copy(CopyClass::CompressionRegionMaterialization, decoded.len());
+    Ok(decoded)
+}
+
+fn prehashed_decoded_length(chunks: &[PrehashedChunk<'_>]) -> Result<usize, FormatError> {
     let mut decoded_length = 0_usize;
     for chunk in chunks {
         validate_logical_chunk_length(chunk.bytes.len())?;
@@ -2850,15 +3204,7 @@ fn collect_prehashed_decoded(chunks: &[PrehashedChunk<'_>]) -> Result<Vec<u8>, F
     if decoded_length > MAX_DECODED_RECORD_BYTES {
         return Err(FormatError::InvalidZstdRecord);
     }
-    let mut decoded = Vec::new();
-    decoded
-        .try_reserve_exact(decoded_length)
-        .map_err(|_| FormatError::ArithmeticOverflow)?;
-    for chunk in chunks {
-        decoded.extend_from_slice(chunk.bytes);
-    }
-    record_copy(CopyClass::CompressionRegionMaterialization, decoded.len());
-    Ok(decoded)
+    Ok(decoded_length)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3130,6 +3476,85 @@ impl AdaptiveEncoderV1 {
             Err(_) => Err(FormatError::ZstdFailure),
         }
     }
+
+    fn zstd_fragmented_owned_payload(
+        &mut self,
+        chunks: &[PrehashedChunk<'_>],
+        decoded_length: usize,
+        level: i32,
+        payload_cap: usize,
+    ) -> Result<Option<Vec<u8>>, FormatError> {
+        use zstd::zstd_safe::{InBuffer, OutBuffer};
+
+        // The context keeps one Zstd frame open while each logical Chunk is
+        // supplied as the next input slice. The pledged total binds the same
+        // decoded length that is serialized into the Record header.
+        if payload_cap == 0 {
+            return Ok(None);
+        }
+        self.zstd
+            .context_mut()
+            .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+            .map_err(|_| FormatError::ZstdFailure)?;
+        self.zstd
+            .set_compression_level(level)
+            .map_err(|_| FormatError::ZstdFailure)?;
+        self.zstd
+            .context_mut()
+            .set_pledged_src_size(Some(
+                u64::try_from(decoded_length).map_err(|_| FormatError::ArithmeticOverflow)?,
+            ))
+            .map_err(|_| FormatError::ZstdFailure)?;
+
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(payload_cap)
+            .map_err(|_| FormatError::ArithmeticOverflow)?;
+        let written = {
+            let mut output_buffer = OutBuffer::around(&mut output);
+            for chunk in chunks {
+                let mut input = InBuffer::around(chunk.bytes);
+                while input.pos < input.src.len() {
+                    let input_before = input.pos;
+                    let output_before = output_buffer.pos();
+                    self.zstd
+                        .context_mut()
+                        .compress_stream(&mut output_buffer, &mut input)
+                        .map_err(|_| FormatError::ZstdFailure)?;
+                    if input.pos == input_before && output_buffer.pos() == output_before {
+                        return Err(FormatError::ZstdFailure);
+                    }
+                    // Zstd output is append-only. Once the useful-payload cap
+                    // is full with input left, this frame cannot beat RAW.
+                    if output_buffer.pos() == output_buffer.capacity()
+                        && input.pos < input.src.len()
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+            loop {
+                let remaining = self
+                    .zstd
+                    .context_mut()
+                    .end_stream(&mut output_buffer)
+                    .map_err(|_| FormatError::ZstdFailure)?;
+                if remaining == 0 {
+                    break;
+                }
+                if output_buffer.pos() == output_buffer.capacity() {
+                    return Ok(None);
+                }
+            }
+            output_buffer.pos()
+        };
+        assert_eq!(
+            output.len(),
+            written,
+            "ASSERT: Zstd initializes exactly its reported output prefix"
+        );
+        Ok(Some(output))
+    }
 }
 
 fn zstd_record_wins(raw_bytes: usize, zstd_bytes: usize) -> Result<bool, FormatError> {
@@ -3195,8 +3620,7 @@ fn decode_encoding_record_mode(
             u64::try_from(payload.len()).map_err(|_| FormatError::ArithmeticOverflow)?;
         let chunks = if retain_payloads {
             vec![RawRecord {
-                chunk_id,
-                payload: payload.to_vec(),
+                payload: VerifiedChunkPayload::from_owned(chunk_id, payload.to_vec()),
             }]
         } else {
             Vec::new()
@@ -3264,8 +3688,8 @@ fn decode_encoding_record_mode(
     if decoded.len() != decoded_length {
         return Err(FormatError::InvalidZstdRecord);
     }
-    let mut chunks = Vec::new();
-    chunks
+    let mut verified_chunks = Vec::new();
+    verified_chunks
         .try_reserve_exact(chunk_count)
         .map_err(|_| FormatError::ArithmeticOverflow)?;
     let mut expected_decoded_offset = 0_usize;
@@ -3301,16 +3725,31 @@ fn decode_encoding_record_mode(
             return Err(FormatError::ChunkHashMismatch);
         }
         if retain_payloads {
-            chunks.push(RawRecord {
-                chunk_id,
-                payload: payload.to_vec(),
-            });
+            verified_chunks.push((chunk_id, decoded_offset, logical_length));
         }
         expected_decoded_offset = decoded_end;
     }
     if expected_decoded_offset != decoded_length {
         return Err(FormatError::InvalidZstdRecord);
     }
+    let chunks = if retain_payloads {
+        let backing = Arc::new(decoded);
+        verified_chunks
+            .into_iter()
+            .map(|(chunk_id, offset, length)| {
+                Ok(RawRecord {
+                    payload: VerifiedChunkPayload::from_shared(
+                        chunk_id,
+                        Arc::clone(&backing),
+                        offset,
+                        length,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, FormatError>>()?
+    } else {
+        Vec::new()
+    };
     Ok(DecodedEncodingRecord {
         codec: EncodingCodec::Zstd,
         chunks,
@@ -3521,6 +3960,30 @@ impl ZstdPrefixRecord {
         {
             return Err(FormatError::ZstdPrefixBaseMismatch);
         }
+        Self::decode_after_base_verification(bytes, base)
+    }
+
+    /// Decodes one target using a Base whose length and BLAKE3 identity were
+    /// already established by the independent record verifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Base pairing, record, Zstd, decoded-length, or target-integrity
+    /// error. The target identity is always recomputed.
+    pub fn decode_with_verified_base(
+        bytes: &[u8],
+        base: &VerifiedChunkPayload,
+    ) -> Result<RawRecord, FormatError> {
+        let dependency = Self::dependency(bytes)?;
+        if usize::try_from(dependency.logical_length) != Ok(base.len())
+            || dependency.chunk_id != base.chunk_id()
+        {
+            return Err(FormatError::ZstdPrefixBaseMismatch);
+        }
+        Self::decode_after_base_verification(bytes, base.as_slice())
+    }
+
+    fn decode_after_base_verification(bytes: &[u8], base: &[u8]) -> Result<RawRecord, FormatError> {
         let decoded_length =
             usize::try_from(get_u32(bytes, 36)).map_err(|_| FormatError::ArithmeticOverflow)?;
         let payload_offset =
@@ -3554,8 +4017,7 @@ impl ZstdPrefixRecord {
             return Err(FormatError::ChunkHashMismatch);
         }
         Ok(RawRecord {
-            chunk_id: target_id,
-            payload: decoded,
+            payload: VerifiedChunkPayload::from_owned(target_id, decoded),
         })
     }
 }
@@ -3707,10 +4169,125 @@ fn validate_zstd_prefix_record(bytes: &[u8]) -> Result<(), FormatError> {
     Ok(())
 }
 
+/// One decoded logical Chunk whose complete stored Encoding Record and BLAKE3
+/// identity were independently verified.
+///
+/// Multi-Chunk records share one backing allocation. The private constructors
+/// keep this type as verification evidence rather than a caller-supplied claim.
+#[derive(Clone)]
+pub struct VerifiedChunkPayload {
+    chunk_id: ChunkId,
+    backing: Arc<Vec<u8>>,
+    offset: usize,
+    length: usize,
+}
+
+impl VerifiedChunkPayload {
+    fn from_owned(chunk_id: ChunkId, bytes: Vec<u8>) -> Self {
+        let length = bytes.len();
+        Self {
+            chunk_id,
+            backing: Arc::new(bytes),
+            offset: 0,
+            length,
+        }
+    }
+
+    fn from_shared(
+        chunk_id: ChunkId,
+        backing: Arc<Vec<u8>>,
+        offset: usize,
+        length: usize,
+    ) -> Result<Self, FormatError> {
+        let end = offset
+            .checked_add(length)
+            .ok_or(FormatError::ArithmeticOverflow)?;
+        if end > backing.len() {
+            return Err(FormatError::InvalidZstdRecord);
+        }
+        Ok(Self {
+            chunk_id,
+            backing,
+            offset,
+            length,
+        })
+    }
+
+    #[must_use]
+    pub const fn chunk_id(&self) -> ChunkId {
+        self.chunk_id
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.length
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Offset of this logical Chunk inside its verified decoded Record
+    /// backing. Exact-location waiters use it to pair a shared Singleflight
+    /// result with the requested Chunk-table coordinate in O(1).
+    #[must_use]
+    pub const fn decoded_offset(&self) -> usize {
+        self.offset
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.backing[self.offset..self.offset + self.length]
+    }
+
+    /// Returns the one allocation retained by this payload and every sibling
+    /// view from the same Encoding Record.
+    #[must_use]
+    pub fn backing_allocation_bytes(&self) -> usize {
+        self.backing.capacity()
+    }
+
+    #[must_use]
+    pub fn shares_backing_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.backing, &other.backing)
+    }
+
+    #[must_use]
+    pub fn into_payload(self) -> Vec<u8> {
+        if self.offset == 0 && self.length == self.backing.len() {
+            match Arc::try_unwrap(self.backing) {
+                Ok(bytes) => bytes,
+                Err(backing) => backing.as_slice().to_vec(),
+            }
+        } else {
+            self.as_slice().to_vec()
+        }
+    }
+}
+
+impl fmt::Debug for VerifiedChunkPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedChunkPayload")
+            .field("chunk_id", &self.chunk_id)
+            .field("length", &self.length)
+            .field("backing_bytes", &self.backing.capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for VerifiedChunkPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.chunk_id == other.chunk_id && self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for VerifiedChunkPayload {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawRecord {
-    chunk_id: ChunkId,
-    payload: Vec<u8>,
+    payload: VerifiedChunkPayload,
 }
 
 impl RawRecord {
@@ -3738,24 +4315,37 @@ impl RawRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
         let (chunk_id, payload) = decode_raw_record_view(bytes)?;
         Ok(Self {
-            chunk_id,
-            payload: payload.to_vec(),
+            payload: VerifiedChunkPayload::from_owned(chunk_id, payload.to_vec()),
         })
+    }
+
+    fn from_verified_payload(payload: VerifiedChunkPayload) -> Self {
+        Self { payload }
     }
 
     #[must_use]
     pub const fn chunk_id(&self) -> ChunkId {
-        self.chunk_id
+        self.payload.chunk_id()
     }
 
     #[must_use]
     pub fn payload(&self) -> &[u8] {
-        &self.payload
+        self.payload.as_slice()
     }
 
     #[must_use]
     pub fn into_payload(self) -> Vec<u8> {
+        self.payload.into_payload()
+    }
+
+    #[must_use]
+    pub fn into_verified_payload(self) -> VerifiedChunkPayload {
         self.payload
+    }
+
+    #[must_use]
+    pub fn verified_payload(&self) -> VerifiedChunkPayload {
+        self.payload.clone()
     }
 }
 

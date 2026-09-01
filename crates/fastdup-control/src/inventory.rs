@@ -192,6 +192,7 @@ fn backing_disk(device: &LsblkDevice, ports: &BTreeMap<String, String>) -> Backi
     };
     BackingDisk {
         stable_id: URL_SAFE_NO_PAD.encode(Sha256::digest(material.as_bytes())),
+        kernel_name: device.kname.clone(),
         model: clean(device.model.as_deref()).if_empty_then(&device.name),
         serial,
         hba_port: ports
@@ -355,5 +356,6 @@ mod tests {
             .find(|target| target.kernel_name == "dm-2")
             .expect("lvm");
         assert_eq!(lvm.backing_disks, disk.backing_disks);
+        assert_eq!(lvm.backing_disks[0].kernel_name, "sdb");
     }
 }

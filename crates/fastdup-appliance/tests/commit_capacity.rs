@@ -213,6 +213,97 @@ fn rejected_write_never_enters_the_live_namespace() {
 }
 
 #[test]
+fn policy_selected_small_file_reserves_metadata_and_its_own_quota_not_data() {
+    const SMALL_WRITE_CLAIM: u64 = 2 * 256 * 1_024 + 4 * 1_024;
+    let governor = Arc::new(
+        CommitCapacityGovernor::new(
+            CommitCapacitySnapshot::new(COMMIT_METADATA_FLOOR_BYTES_V1 + 32 * 1_024 * 1_024, 0)
+                .with_small_file_available_bytes(SMALL_WRITE_CLAIM),
+        )
+        .expect("capacity floor fits"),
+    );
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    namespace.install_commit_capacity_admission(governor.clone());
+    let Reply::Created { entry, handle } = namespace
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"policy.json",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("commit-critical create fits without DATA")
+    else {
+        panic!("create reply")
+    };
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: 0,
+                data: &[0x5a; 1_024],
+            },
+        )
+        .expect("Small-File quota admits the first write");
+    let status = governor.status();
+    assert_eq!(status.reserved_data_bytes(), 0);
+    assert_eq!(status.active_data_bytes(), 0);
+    assert_eq!(status.reserved_small_file_bytes(), SMALL_WRITE_CLAIM);
+    assert_eq!(status.active_small_file_bytes(), SMALL_WRITE_CLAIM);
+
+    let error = namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: 1_024,
+                data: &[0x6b; 1_024],
+            },
+        )
+        .expect_err("the independent Small-File bucket is exhausted");
+    assert_eq!(error, PosixError::NoSpace);
+}
+
+#[test]
+fn uncheckpointed_small_file_physical_claim_stays_charged_to_metadata_until_observed() {
+    let physical = 512 * 1_024;
+    let structural = 2 * 1_024 * 1_024;
+    let snapshot =
+        CommitCapacitySnapshot::new(COMMIT_METADATA_FLOOR_BYTES_V1 + 8 * 1_024 * 1_024, 0)
+            .with_small_file_available_bytes(physical);
+    let governor = CommitCapacityGovernor::new(snapshot).expect("capacity floor fits");
+    let claim = CommitCapacityClaim::with_small_file_bytes(structural + physical, physical);
+    governor.try_reserve(claim).expect("claim fits both tiers");
+    governor.accept(claim);
+    governor.finish_uncheckpointed_active();
+
+    let pending = governor.status();
+    assert_eq!(pending.active_metadata_bytes(), 0);
+    assert_eq!(pending.active_small_file_bytes(), 0);
+    assert_eq!(
+        pending.reserved_metadata_bytes(),
+        COMMIT_METADATA_FLOOR_BYTES_V1 + physical
+    );
+    assert_eq!(pending.reserved_small_file_bytes(), physical);
+
+    let observation = governor.begin_observation();
+    governor.finish_observation(observation, snapshot);
+    let observed = governor.status();
+    assert_eq!(
+        observed.reserved_metadata_bytes(),
+        COMMIT_METADATA_FLOOR_BYTES_V1
+    );
+    assert_eq!(observed.reserved_small_file_bytes(), 0);
+}
+
+#[test]
 fn completed_commit_claim_waits_for_a_new_capacity_observation() {
     let governor = Arc::new(
         CommitCapacityGovernor::new(CommitCapacitySnapshot::new(

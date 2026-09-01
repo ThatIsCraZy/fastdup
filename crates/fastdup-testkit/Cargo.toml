@@ -9,6 +9,7 @@ blake3.workspace = true
 crc32c.workspace = true
 fastdup-format.workspace = true
 fastdup-store.workspace = true
+rustix.workspace = true
 
 [lints]
 workspace = true

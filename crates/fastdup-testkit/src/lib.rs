@@ -3,10 +3,13 @@
 //! Deterministic corpora and fault-injection adapters for public store seams.
 
 mod corpus;
+mod full_tier_harness;
 mod sigkill_harness;
 
 pub use corpus::{ByteMutation, generate_structured_corpus, minimal_variant_plan};
+pub use full_tier_harness::{FullTierEnospcConfig, FullTierEnospcError, FullTierEnospcReport};
 pub use sigkill_harness::{
+    RandomizedSigkillCaseReport, RandomizedSigkillConfig, RandomizedSigkillReport,
     SigkillCaseReport, SigkillHarnessError, SigkillRemountConfig, SigkillRemountReport,
 };
 
@@ -269,6 +272,42 @@ impl MemoryStorageIo {
         for file in state.files.values_mut() {
             file.live.clone_from(&file.durable);
         }
+    }
+
+    /// Truncates only the durable image of one already published object before
+    /// the next modeled power loss. This represents a block-device torn write,
+    /// not an orderly filesystem `set_len` operation, and deliberately bypasses
+    /// the normal [`StorageIo`] operation log.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` for an absent durable object or `InvalidInput` when
+    /// the retained prefix exceeds its durable length.
+    pub fn inject_durable_torn_write(
+        &self,
+        name: &str,
+        retained_prefix_bytes: usize,
+    ) -> io::Result<()> {
+        validate_name(name)?;
+        let mut state = self.lock();
+        let file_id = state.durable_directory.get(name).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "durable fault target does not exist",
+            )
+        })?;
+        let file = state
+            .files
+            .get_mut(&file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "durable inode is absent"))?;
+        if retained_prefix_bytes >= file.durable.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "torn-write prefix must remove at least one durable byte",
+            ));
+        }
+        file.durable.truncate(retained_prefix_bytes);
+        Ok(())
     }
 
     #[must_use]

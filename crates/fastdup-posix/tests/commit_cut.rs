@@ -112,6 +112,7 @@ impl MutationObserver for BlockingMutationObserver {
         _inode: InodeId,
         _offset: u64,
         _mutation_sequence: u64,
+        _small_file: bool,
         _bytes: MutationPayload,
     ) -> Vec<ExternalizedExtent> {
         if let Some(entered) = self
@@ -144,6 +145,7 @@ impl MutationObserver for RetainingMutationObserver {
         _inode: InodeId,
         _offset: u64,
         _mutation_sequence: u64,
+        _small_file: bool,
         bytes: MutationPayload,
     ) -> Vec<ExternalizedExtent> {
         self.payloads

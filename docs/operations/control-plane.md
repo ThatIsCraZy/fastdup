@@ -10,6 +10,15 @@ The appliance runs three local systemd services:
   `MemorySwapMax=0`, sends `SIGINT` for a checkpointed unmount, and is
   configured never to escalate to `SIGKILL`.
 
+The agent and Repository Runtime intentionally share the host mount namespace:
+the agent must publish the Metadata and DATA XFS mounts, and the Runtime must
+publish the FUSE mount consumed by Samba. Filesystem namespace directives such
+as `ProtectSystem=`, `PrivateTmp=`, `ProtectHome=` or `ReadWritePaths=` must not
+be added to these two units because systemd would prevent their mounts from
+propagating to the host. The network-facing `fastdup-control` process retains
+those filesystem restrictions and can reach the root agent only through the
+typed, credential-checked Unix socket.
+
 The process and resource seams are independent:
 
 - `fastdup-control` and `fastdup-agent` are children of
@@ -52,9 +61,11 @@ Online-GC enablement, pressure watermarks, and per-Share Logical Share quotas
 rules live. Each Share uses `/srv/fastdup/repository/.fastdup-shares/<share-id>`
 as its stable root; changing the visible Share name therefore never changes its
 data path. The UI accepts an optional integer from 1 through 999 and a decimal
-GB/TB/PB unit. This changes `statfs` reporting at the Share root only: it is not
-a reservation or hard write quota. stderr remains diagnostic output and is
-never parsed for telemetry.
+GB/TB/PB unit. The same rule drives both `statfs` reporting and the hard logical
+subtree quota; writes, allocation, clones and size growth return `ENOSPC` when
+their logical allocation would cross the limit. It is not a physical-space
+reservation. stderr remains diagnostic output and is never parsed for
+telemetry.
 
 The React application is built with Node.js but Node is not present in the
 runtime. Build it first with `npm run build` in `web/fastdup-ui`; the Rust

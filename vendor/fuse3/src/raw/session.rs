@@ -16,10 +16,9 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::task::Context;
 use std::task::Poll;
-use std::thread;
 
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
 use async_fs::read_dir;
@@ -740,6 +739,21 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             Ok(in_header) => in_header,
         };
+        if usize::try_from(in_header.len) != Ok(n) {
+            error!(
+                n,
+                declared = in_header.len,
+                "FUSE request length disagrees with the completed receive"
+            );
+            return ReadResult::Request {
+                in_header: Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "FUSE request length disagrees with completed receive",
+                )),
+                header_buffer,
+                data_buffer,
+            };
+        }
 
         ReadResult::Request {
             in_header: Ok(in_header),
@@ -755,7 +769,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         let max_write = self.init_filesystem(&fs, &fuse_connection).await?.get() as usize;
         let buffer_size = (max_write + FUSE_WRITE_IN_SIZE).max(FUSE_MIN_READ_BUFFER_SIZE);
 
-        let receive_buffers = ReceiveBufferProducer::new(buffer_size);
+        let receive_buffers = ReceiveBufferPool::new(buffer_size);
         let mut header_buffer = vec![0; FUSE_IN_HEADER_SIZE];
         let mut data_buffer = receive_buffer(buffer_size);
 
@@ -889,8 +903,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
                 fuse_opcode::FUSE_WRITE => {
                     let owned_buffer = std::mem::replace(&mut data_buffer, receive_buffers.take());
-                    self.handle_write(request, in_header, owned_buffer, data_size, &fs)
-                        .await;
+                    self.handle_write(
+                        request,
+                        in_header,
+                        owned_buffer,
+                        data_size,
+                        receive_buffers.returner(),
+                        &fs,
+                    )
+                    .await;
                 }
 
                 fuse_opcode::FUSE_STATFS => {
@@ -2199,6 +2220,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         in_header: fuse_in_header,
         data: Vec<u8>,
         data_size: usize,
+        returner: SyncSender<Vec<u8>>,
         fs: &Arc<FS>,
     ) {
         let request_data = match data.get(..data_size) {
@@ -2239,7 +2261,12 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         let payload_start = payload.as_ptr() as usize - request_data.as_ptr() as usize;
         let payload_end = payload_start + payload.len();
-        let data = OwnedRequestPayload::from_request_buffer(data, payload_start, payload_end);
+        let data = OwnedRequestPayload::from_recyclable_request_buffer(
+            data,
+            payload_start,
+            payload_end,
+            returner,
+        );
 
         let resp_sender = self.response_sender().clone();
         let fs = fs.clone();
@@ -4142,22 +4169,22 @@ fn receive_buffer(buffer_size: usize) -> Vec<u8> {
 
 const RECEIVE_BUFFER_PREFETCH: usize = 2;
 
-struct ReceiveBufferProducer {
+struct ReceiveBufferPool {
+    returner: SyncSender<Vec<u8>>,
     receiver: Receiver<Vec<u8>>,
     buffer_size: usize,
 }
 
-impl ReceiveBufferProducer {
+impl ReceiveBufferPool {
     fn new(buffer_size: usize) -> Self {
-        let (sender, receiver) = sync_channel(RECEIVE_BUFFER_PREFETCH);
-        let _ = thread::Builder::new()
-            .name("fuse-recv-buf".to_owned())
-            .spawn(
-                move || {
-                    while sender.send(receive_buffer(buffer_size)).is_ok() {}
-                },
-            );
+        let (returner, receiver) = sync_channel(RECEIVE_BUFFER_PREFETCH);
+        for _ in 0..RECEIVE_BUFFER_PREFETCH {
+            returner
+                .send(receive_buffer(buffer_size))
+                .expect("fresh receive-buffer pool is connected");
+        }
         Self {
+            returner,
             receiver,
             buffer_size,
         }
@@ -4167,6 +4194,10 @@ impl ReceiveBufferProducer {
         self.receiver
             .try_recv()
             .unwrap_or_else(|_| receive_buffer(self.buffer_size))
+    }
+
+    fn returner(&self) -> SyncSender<Vec<u8>> {
+        self.returner.clone()
     }
 }
 
@@ -4185,8 +4216,7 @@ where
 
 #[cfg(test)]
 mod receive_buffer_tests {
-    use super::{ReceiveBufferProducer, receive_buffer};
-    use std::time::Duration;
+    use super::{ReceiveBufferPool, receive_buffer};
 
     #[test]
     fn receive_buffer_has_the_complete_initialized_read_range() {
@@ -4196,14 +4226,11 @@ mod receive_buffer_tests {
     }
 
     #[test]
-    fn receive_buffer_producer_prepares_a_second_buffer_off_thread() {
-        let producer = ReceiveBufferProducer::new(1024 * 1024);
+    fn receive_buffer_pool_starts_with_two_initialized_replacements() {
+        let pool = ReceiveBufferPool::new(1024 * 1024);
 
-        let buffer = producer
-            .receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("background producer prepares a receive buffer");
-
-        assert_eq!(buffer.len(), 1024 * 1024);
+        assert_eq!(pool.take().len(), 1024 * 1024);
+        assert_eq!(pool.take().len(), 1024 * 1024);
+        assert!(pool.receiver.try_recv().is_err());
     }
 }

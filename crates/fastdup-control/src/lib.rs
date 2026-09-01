@@ -56,6 +56,7 @@ pub enum TargetRole {
 #[serde(rename_all = "camelCase")]
 pub struct BackingDisk {
     pub stable_id: String,
+    pub kernel_name: String,
     pub model: String,
     pub serial: String,
     pub hba_port: String,
@@ -208,6 +209,8 @@ pub struct TelemetrySnapshot {
     pub sequence: u64,
     pub observed_at: String,
     pub repository_state: RepositoryState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_generation: Option<u64>,
     pub frontend_read_mbps: f64,
     pub frontend_write_mbps: f64,
     pub dedup_rate: f64,
@@ -216,7 +219,8 @@ pub struct TelemetrySnapshot {
     pub ram_percent: f64,
     pub data_used_bytes: u64,
     pub data_capacity_bytes: u64,
-    pub last_checkpoint_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_seconds: Option<u64>,
     pub disks: Vec<DiskTelemetry>,
     pub series: Vec<SeriesPoint>,
 }
@@ -227,6 +231,7 @@ impl Default for TelemetrySnapshot {
             sequence: 0,
             observed_at: unix_seconds().to_string(),
             repository_state: RepositoryState::Uninitialized,
+            commit_generation: None,
             frontend_read_mbps: 0.0,
             frontend_write_mbps: 0.0,
             dedup_rate: 0.0,
@@ -235,7 +240,7 @@ impl Default for TelemetrySnapshot {
             ram_percent: 0.0,
             data_used_bytes: 0,
             data_capacity_bytes: 0,
-            last_checkpoint_seconds: 0,
+            last_checkpoint_seconds: None,
             disks: Vec::new(),
             series: Vec::new(),
         }
@@ -263,11 +268,23 @@ pub struct JobStatus {
     pub updated_at: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEvent {
+    pub id: i64,
+    pub timestamp: i64,
+    pub actor: String,
+    pub action: String,
+    pub outcome: String,
+    pub detail: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplianceSnapshot {
     pub telemetry: TelemetrySnapshot,
     pub targets: Vec<BlockTarget>,
+    pub repository: Option<RepositoryBinding>,
     pub settings: RepositorySettings,
     pub shares: Vec<ShareSettings>,
     pub jobs: Vec<JobStatus>,
@@ -355,7 +372,7 @@ pub struct AgentResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentResult {
-    Snapshot { snapshot: ApplianceSnapshot },
+    Snapshot { snapshot: Box<ApplianceSnapshot> },
     Job { job: JobStatus },
 }
 
@@ -386,4 +403,25 @@ pub fn unix_seconds() -> i64 {
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uninitialized_telemetry_does_not_claim_repository_durability() {
+        let snapshot = TelemetrySnapshot {
+            sequence: 216,
+            ..TelemetrySnapshot::default()
+        };
+        let value = serde_json::to_value(snapshot).expect("serialize telemetry snapshot");
+
+        assert_eq!(
+            value.get("sequence").and_then(serde_json::Value::as_u64),
+            Some(216)
+        );
+        assert!(value.get("commitGeneration").is_none());
+        assert!(value.get("lastCheckpointSeconds").is_none());
+    }
 }

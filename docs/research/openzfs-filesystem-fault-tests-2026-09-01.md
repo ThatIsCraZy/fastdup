@@ -44,12 +44,18 @@ deterministic P0 boundary oracles that were not previously expressed together:
   reports the damaged retained generation; and
 - a deliberately suspended DATA sync preserves live acknowledged bytes, then
   resumes to exactly one Commit and recovers the byte-exact file after a modeled
-  crash and remount.
+  crash and remount;
+- a newest-Container durable torn write rejects the damaged generation,
+  recovers a Container-independent previous generation, and remains visible to
+  exhaustive scrub;
+- a fixed-seed real-process SIGKILL soak exercises mixed namespace and sparse
+  file mutations and accepts only acknowledged public-view prefixes; and
+- a privileged real-XFS/FUSE harness fills DATA and the independent Small-File
+  project quota, proves stable `ENOSPC`, cleanup, scrub, and byte-exact remount.
 
-The real XFS/FUSE quota case, randomized SIGKILL soak, ambiguous-sync
+Scheduled longevity execution, real block-device power cut, the ambiguous-sync
 cross-product, and persistent scrub-attribution lifecycle remain qualification
-or longevity work because they require privileged infrastructure or a stable
-reporting seam beyond the deterministic repository interfaces.
+work.
 
 Mirror repair, RAIDZ/dRAID tolerance, spares, resilvering, ZED policy,
 encryption, and arbitrary historical pool rewind are not fastdup MVP test

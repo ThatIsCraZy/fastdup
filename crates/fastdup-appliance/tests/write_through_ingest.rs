@@ -8,7 +8,8 @@ use fastdup_posix::{
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, GenerationRepository, MaintenanceRepository,
-    PersistentReductionStatus, SeqCdcConfig, SimilarityIndexRepository, StorageIo, seqcdc_cut,
+    PersistentReductionStatus, SeqCdcConfig, SimilarityIndexRepository, StorageIo, TieredStorageIo,
+    seqcdc_cut,
 };
 use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
 use std::ops::Range;
@@ -23,6 +24,94 @@ const CALLER: RequestContext = RequestContext {
 const STORAGE_REACH_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Appliance = DurableNamespace<MemoryStorageIo, MemoryStorageIo>;
+
+#[test]
+fn policy_selected_small_file_publishes_through_the_tier_neutral_store() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let small = MemoryStorageIo::new();
+    let indexes = MemoryStorageIo::new();
+    let storage = TieredStorageIo::new(data.clone(), small.clone());
+    let appliance = DurableNamespace::open_with_index(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
+        ContainerRepository::new(storage.clone()),
+        &ExactIndexRunRepository::new(indexes),
+        32,
+    )
+    .expect("open tiered write-through appliance");
+    let (inode, handle) = create_file(&appliance, b"inventory.JSON");
+    assert!(appliance.namespace().prefers_small_file_tier(inode));
+    let payload = pseudo_random_bytes(1_024 * 1_024);
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 0,
+                data: &payload,
+            },
+        )
+        .expect("write Small-File payload");
+    assert!(appliance.namespace().prefers_small_file_tier(inode));
+    appliance
+        .checkpoint()
+        .expect("checkpoint Small-File placement")
+        .expect("Small-File mutation publishes one generation");
+
+    let data_names = data.list_names().expect("list DATA tier");
+    let small_names = small.list_names().expect("list Small-File tier");
+    assert!(
+        data_names.iter().all(|name| {
+            std::path::Path::new(name).extension() != Some(std::ffi::OsStr::new("fdc"))
+        }),
+        "unexpected DATA containers: {data_names:?}; Small-File names: {small_names:?}"
+    );
+    assert!(small_names.iter().any(|name| {
+        std::path::Path::new(name).extension() == Some(std::ffi::OsStr::new("fdc"))
+    }));
+
+    metadata.crash();
+    data.crash();
+    small.crash();
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, checkpoint_policy_set()),
+        &ContainerRepository::new(TieredStorageIo::new(data, small)),
+    )
+    .expect("recover tiered namespace")
+    .expect("committed Small File exists");
+    let Reply::Opened(reader) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open recovered Small File")
+    else {
+        panic!("ASSERT: open returns a handle")
+    };
+    let Reply::Data(bytes) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Read {
+                inode,
+                handle: reader,
+                offset: 0,
+                length: u32::try_from(payload.len()).expect("payload length"),
+            },
+        )
+        .expect("read recovered Small File")
+    else {
+        panic!("ASSERT: read returns payload bytes")
+    };
+    assert_eq!(bytes, payload);
+}
 
 fn open_appliance() -> Appliance {
     open_appliance_on(

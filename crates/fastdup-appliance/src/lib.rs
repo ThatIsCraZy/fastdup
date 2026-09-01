@@ -12,6 +12,7 @@ mod online_gc;
 mod pool_binding;
 mod pool_isolation;
 mod proof_cache_trace;
+mod small_file_tier;
 mod statfs;
 
 pub use appliance_lease::{APPLIANCE_LEASE_FILE_NAME, ApplianceLease, ApplianceLeaseOwner};
@@ -53,6 +54,10 @@ pub use online_gc::{
 pub use proof_cache_trace::{
     ProofCacheEvent, ProofCachePolicy, ProofCacheReplayError, ProofCacheReplayReport,
     ProofCacheTrace, ProofKey, replay_proof_cache_trace,
+};
+pub use small_file_tier::{
+    SMALL_FILE_PROJECT_ID_ENV, SMALL_FILE_QUOTA_BYTES_ENV, SmallFileTierIsolation,
+    SmallFileTierIsolationError, small_file_container_root,
 };
 pub use statfs::{
     STATFS_RESERVE_BASIS_POINTS, StatFsOverride, StatFsOverrideError, TieredStatFsSource,

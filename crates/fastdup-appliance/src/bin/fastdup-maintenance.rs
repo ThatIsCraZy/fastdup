@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use fastdup_appliance::{
     ApplianceLease, ApplianceLeaseOwner, AppliancePoolBinding, ApplianceRecoveryLatch,
     ApplianceRecoveryState, checkpoint_exact_index_profile_v1, checkpoint_policy_set,
-    request_online_gc_now,
+    request_online_gc_now, small_file_container_root,
 };
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo, GenerationRepository,
-    MaintenanceExecutionMode, MaintenanceRepository, SimilarityIndexRepository,
+    MaintenanceExecutionMode, MaintenanceRepository, SimilarityIndexRepository, TieredStorageIo,
 };
 
 mod common;
@@ -64,7 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "recovery-required repository needs a successful offline scrub before mutation".into(),
         );
     }
-    let containers = ContainerRepository::new(data);
+    let small_file = FsStorageIo::open(small_file_container_root(&metadata_root))?;
+    let containers = ContainerRepository::new(TieredStorageIo::new(data, small_file));
     let indexes = ExactIndexRunRepository::new(metadata.clone());
     let maintenance = MaintenanceRepository::new(
         GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),

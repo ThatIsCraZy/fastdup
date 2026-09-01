@@ -5,7 +5,8 @@ use crate::manifest_tree::{
 use crate::{
     ActivatedExactIndex, ContainerRepository, ExactIndexGenerationPin,
     ExactIndexGenerationSnapshot, StorageIo, StoreError, VerifiedReadCache,
-    generation::MetadataRootPin, read_cache::VerifiedChunkPayload,
+    generation::MetadataRootPin,
+    read_cache::{VerifiedChunkPayload, VerifiedChunkRead},
 };
 use fastdup_format::{
     ChunkId, MAX_METADATA_OBJECT_BYTES, ManifestExtent, ManifestLeaf, MetadataObjectId,
@@ -174,12 +175,12 @@ trait VerifiedChunkReader: fmt::Debug + Send + Sync {
         &self,
         chunk_id: ChunkId,
         logical_length: u64,
-    ) -> Result<VerifiedChunkPayload, StoreError>;
+    ) -> Result<VerifiedChunkRead, StoreError>;
 
     fn read_verified_chunks(
         &self,
         requests: &[(ChunkId, u64)],
-    ) -> Result<Vec<VerifiedChunkPayload>, StoreError> {
+    ) -> Result<VerifiedChunkRead, StoreError> {
         read_chunks_scalar(requests, |chunk_id, logical_length| {
             self.read_verified_chunk(chunk_id, logical_length)
         })
@@ -208,37 +209,28 @@ where
         &self,
         chunk_id: ChunkId,
         logical_length: u64,
-    ) -> Result<VerifiedChunkPayload, StoreError> {
+    ) -> Result<VerifiedChunkRead, StoreError> {
         let Some(index) = self.index.try_pin() else {
             return self
                 .containers
-                .read_verified_chunk(chunk_id, logical_length)
-                .map(VerifiedChunkPayload::from_verified_store);
+                .read_verified_chunk_payload(chunk_id, logical_length);
         };
         self.containers
-            .read_verified_chunk_with_index(&index, chunk_id, logical_length)
-            .map(VerifiedChunkPayload::from_verified_store)
+            .read_verified_chunk_payload_with_index(&index, chunk_id, logical_length)
     }
 
     fn read_verified_chunks(
         &self,
         requests: &[(ChunkId, u64)],
-    ) -> Result<Vec<VerifiedChunkPayload>, StoreError> {
+    ) -> Result<VerifiedChunkRead, StoreError> {
         let Some(index) = self.index.try_pin() else {
             return read_chunks_scalar(requests, |chunk_id, logical_length| {
                 self.containers
-                    .read_verified_chunk(chunk_id, logical_length)
-                    .map(VerifiedChunkPayload::from_verified_store)
+                    .read_verified_chunk_payload(chunk_id, logical_length)
             });
         };
         self.containers
             .read_verified_chunks_with_index(&index, requests)
-            .map(|payloads| {
-                payloads
-                    .into_iter()
-                    .map(VerifiedChunkPayload::from_verified_store)
-                    .collect()
-            })
     }
 }
 
@@ -428,14 +420,12 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
                 length,
                 |chunk_id, logical_length| {
                     self.containers
-                        .read_verified_chunk(chunk_id, logical_length)
-                        .map(VerifiedChunkPayload::from_verified_store)
+                        .read_verified_chunk_payload(chunk_id, logical_length)
                 },
                 |requests| {
                     read_chunks_scalar(requests, |chunk_id, logical_length| {
                         self.containers
-                            .read_verified_chunk(chunk_id, logical_length)
-                            .map(VerifiedChunkPayload::from_verified_store)
+                            .read_verified_chunk_payload(chunk_id, logical_length)
                     })
                 },
             )
@@ -465,19 +455,15 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             offset,
             length,
             |chunk_id, logical_length| {
-                self.containers
-                    .read_verified_chunk_with_index(index, chunk_id, logical_length)
-                    .map(VerifiedChunkPayload::from_verified_store)
+                self.containers.read_verified_chunk_payload_with_index(
+                    index,
+                    chunk_id,
+                    logical_length,
+                )
             },
             |requests| {
                 self.containers
                     .read_verified_chunks_with_index(index, requests)
-                    .map(|payloads| {
-                        payloads
-                            .into_iter()
-                            .map(VerifiedChunkPayload::from_verified_store)
-                            .collect()
-                    })
             },
         )
     }
@@ -489,17 +475,31 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         read_verified: F,
     ) -> Result<VerifiedChunkPayload, StoreError>
     where
-        F: FnOnce() -> Result<VerifiedChunkPayload, StoreError>,
+        F: FnOnce() -> Result<VerifiedChunkRead, StoreError>,
     {
         let Some(cache) = &self.read_cache else {
-            return read_verified();
+            let (mut requested, _) = read_verified()?.into_parts();
+            return requested.pop().ok_or(StoreError::MissingVerifiedChunk {
+                chunk_id,
+                logical_length,
+            });
         };
         if let Some(bytes) = cache.get(chunk_id, logical_length) {
             return Ok(bytes);
         }
-        let bytes = read_verified()?;
-        cache.admit_verified(chunk_id, logical_length, bytes.clone());
-        Ok(bytes)
+        let (mut requested, admission_groups) = read_verified()?.into_parts();
+        let payload = requested.pop().ok_or(StoreError::MissingVerifiedChunk {
+            chunk_id,
+            logical_length,
+        })?;
+        assert!(
+            requested.is_empty(),
+            "ASSERT: one verified Chunk read returns one requested payload"
+        );
+        for group in admission_groups {
+            cache.admit_decoded_group(group);
+        }
+        Ok(payload)
     }
 
     fn read_cached_many<F>(
@@ -508,10 +508,10 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         read_verified: F,
     ) -> Result<Vec<VerifiedChunkPayload>, StoreError>
     where
-        F: FnOnce(&[(ChunkId, u64)]) -> Result<Vec<VerifiedChunkPayload>, StoreError>,
+        F: FnOnce(&[(ChunkId, u64)]) -> Result<VerifiedChunkRead, StoreError>,
     {
         let Some(cache) = &self.read_cache else {
-            return read_verified(requests);
+            return Ok(read_verified(requests)?.into_parts().0);
         };
         let mut resolved = Vec::new();
         resolved
@@ -535,16 +535,18 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             }
         }
         if !missing.is_empty() {
-            let payloads = read_verified(&missing)?;
+            let (payloads, admission_groups) = read_verified(&missing)?.into_parts();
             assert_eq!(
                 payloads.len(),
                 missing.len(),
                 "ASSERT: a verified Read Plan returns one payload per request"
             );
-            for ((ordinal, (chunk_id, logical_length)), payload) in
+            for group in admission_groups {
+                cache.admit_decoded_group(group);
+            }
+            for ((ordinal, (_chunk_id, _logical_length)), payload) in
                 missing_ordinals.into_iter().zip(missing).zip(payloads)
             {
-                cache.admit_verified(chunk_id, logical_length, payload.clone());
                 resolved[ordinal] = Some(payload);
             }
         }
@@ -562,8 +564,8 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         read_chunks: G,
     ) -> Result<Vec<u8>, ManifestReadError>
     where
-        F: FnMut(ChunkId, u64) -> Result<VerifiedChunkPayload, StoreError>,
-        G: FnOnce(&[(ChunkId, u64)]) -> Result<Vec<VerifiedChunkPayload>, StoreError>,
+        F: FnMut(ChunkId, u64) -> Result<VerifiedChunkRead, StoreError>,
+        G: FnOnce(&[(ChunkId, u64)]) -> Result<VerifiedChunkRead, StoreError>,
     {
         if length > MAX_MANIFEST_READ_BYTES {
             return Err(ManifestReadError::RequestTooLarge(length));
@@ -623,7 +625,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
                     .next()
                     .expect("ASSERT: every planned DATA extent has one payload");
                 assert_eq!(
-                    ChunkId::of(payload.as_slice()),
+                    payload.chunk_id(),
                     chunk_id,
                     "ASSERT: a verified Read Plan cannot change Chunk identity"
                 );
@@ -645,18 +647,29 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
 fn read_chunks_scalar<F>(
     requests: &[(ChunkId, u64)],
     mut read_chunk: F,
-) -> Result<Vec<VerifiedChunkPayload>, StoreError>
+) -> Result<VerifiedChunkRead, StoreError>
 where
-    F: FnMut(ChunkId, u64) -> Result<VerifiedChunkPayload, StoreError>,
+    F: FnMut(ChunkId, u64) -> Result<VerifiedChunkRead, StoreError>,
 {
     let mut payloads = Vec::new();
+    let mut admission_groups = Vec::new();
     payloads
         .try_reserve_exact(requests.len())
         .map_err(|_| StoreError::from(std::io::Error::from(std::io::ErrorKind::OutOfMemory)))?;
     for &(chunk_id, logical_length) in requests {
-        payloads.push(read_chunk(chunk_id, logical_length)?);
+        let (mut requested, groups) = read_chunk(chunk_id, logical_length)?.into_parts();
+        let payload = requested.pop().ok_or(StoreError::MissingVerifiedChunk {
+            chunk_id,
+            logical_length,
+        })?;
+        assert!(
+            requested.is_empty(),
+            "ASSERT: scalar verified read returns one requested Chunk"
+        );
+        payloads.push(payload);
+        admission_groups.extend(groups);
     }
-    Ok(payloads)
+    Ok(VerifiedChunkRead::new(payloads, admission_groups))
 }
 
 fn assemble_manifest_read<F>(

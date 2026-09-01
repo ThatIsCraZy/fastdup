@@ -1953,6 +1953,20 @@ impl ReadPlan {
         if self.read_start >= self.read_end {
             return Ok(Vec::new());
         }
+        if self.read_end <= self.committed.logical_size()
+            && self
+                .epochs
+                .iter()
+                .all(|epoch| !epoch.affects(self.read_end))
+        {
+            let length = u32::try_from(self.read_end - self.read_start)
+                .expect("ASSERT: a planned read length originated from u32");
+            let bytes = self.committed.read_at(self.read_start, length)?;
+            if bytes.len() != usize::try_from(length).expect("ASSERT: u32 read length fits usize") {
+                return Err(PosixError::Io);
+            }
+            return Ok(bytes);
+        }
         let output_length = usize::try_from(self.read_end - self.read_start)
             .map_err(|_| PosixError::FileTooLarge)?;
         let mut output = Vec::new();
@@ -1978,6 +1992,12 @@ impl ReadPlan {
             epoch.apply(&mut output, self.read_start, self.read_end);
         }
         Ok(output)
+    }
+}
+
+impl PlannedEpoch {
+    fn affects(&self, read_end: u64) -> bool {
+        self.result_size < read_end || !self.data.is_empty() || !self.holes.is_empty()
     }
 }
 
@@ -2079,6 +2099,7 @@ fn zero_range(output: &mut [u8], read_start: u64, read_end: u64, zero_start: u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
@@ -2529,6 +2550,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn clean_read_returns_the_committed_allocation_directly() {
+        #[derive(Debug)]
+        struct AddressReader {
+            returned_address: Arc<AtomicUsize>,
+        }
+
+        impl CommittedFile for AddressReader {
+            fn logical_size(&self) -> u64 {
+                1024 * 1024
+            }
+
+            fn allocated_bytes(&self) -> u64 {
+                self.logical_size()
+            }
+
+            fn allocated_bytes_in_range(
+                &self,
+                offset: u64,
+                length: u64,
+            ) -> Result<u64, PosixError> {
+                Ok(offset.saturating_add(length).min(self.logical_size())
+                    - offset.min(self.logical_size()))
+            }
+
+            fn read_at(&self, _offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+                let bytes = vec![0x5a; usize::try_from(length).expect("u32 fits usize")];
+                self.returned_address
+                    .store(bytes.as_ptr().addr(), Ordering::Release);
+                Ok(bytes)
+            }
+        }
+
+        let returned_address = Arc::new(AtomicUsize::new(0));
+        let file = VersionedFile::from_committed(
+            Arc::new(AddressReader {
+                returned_address: Arc::clone(&returned_address),
+            }),
+            0,
+        );
+        let bytes = file
+            .plan_read(0, 1024 * 1024)
+            .expect("clean read plans")
+            .execute()
+            .expect("clean read succeeds");
+        assert_eq!(
+            bytes.as_ptr().addr(),
+            returned_address.load(Ordering::Acquire),
+            "clean read must not replace the committed reader's allocation"
+        );
     }
 
     #[test]

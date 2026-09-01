@@ -1,5 +1,6 @@
 //! Real-process SIGKILL, remount, and durability-window harness.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -8,6 +9,8 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +20,140 @@ const MOUNT_POLL: Duration = Duration::from_millis(25);
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGKILL_NUMBER: i32 = 9;
+const RANDOM_FILE_NAMES: [&str; 3] = ["alpha.bin", "beta.bin", "gamma.bin"];
+
+/// Reproducible real-process crash soak with mixed namespace and file
+/// mutations. Every successful syscall is captured as a public-view snapshot;
+/// recovery must equal one acknowledged prefix and may never expose a future
+/// or mixed state.
+#[derive(Clone, Debug)]
+pub struct RandomizedSigkillConfig {
+    daemon: PathBuf,
+    run_root: PathBuf,
+    seed: u64,
+    cases: usize,
+    operations_per_case: usize,
+    maximum_kill_delay: Duration,
+    durability_window: Duration,
+}
+
+impl RandomizedSigkillConfig {
+    #[must_use]
+    pub fn v1(daemon: PathBuf, run_root: PathBuf, seed: u64) -> Self {
+        Self {
+            daemon,
+            run_root,
+            seed,
+            cases: 32,
+            operations_per_case: 256,
+            maximum_kill_delay: Duration::from_millis(750),
+            durability_window: Duration::from_secs(10),
+        }
+    }
+
+    #[must_use]
+    pub const fn with_cases(mut self, cases: usize) -> Self {
+        self.cases = cases;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_operations_per_case(mut self, operations: usize) -> Self {
+        self.operations_per_case = operations;
+        self
+    }
+
+    /// Runs all configured crash cases and retains their repositories and logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns configuration, process, mount, syscall, recovery-prefix, or
+    /// durability-deadline failures.
+    pub fn run(self) -> Result<RandomizedSigkillReport, SigkillHarnessError> {
+        if self.seed == 0
+            || self.cases == 0
+            || self.operations_per_case == 0
+            || self.maximum_kill_delay.is_zero()
+        {
+            return Err(SigkillHarnessError::InvalidConfiguration);
+        }
+        let daemon = canonical_file(&self.daemon)?;
+        let run_root = create_new_run_root(&self.run_root)?;
+        let mut state = self.seed;
+        let mut reports = Vec::new();
+        reports
+            .try_reserve_exact(self.cases)
+            .map_err(|_| SigkillHarnessError::OutOfMemory)?;
+        for ordinal in 0..self.cases {
+            let case_seed = next_random(&mut state);
+            let maximum_ms = u64::try_from(self.maximum_kill_delay.as_millis())
+                .map_err(|_| SigkillHarnessError::InvalidConfiguration)?;
+            let delay_ms = next_random(&mut state) % maximum_ms.max(1);
+            reports.push(run_randomized_case(
+                &daemon,
+                &run_root,
+                ordinal,
+                case_seed,
+                self.operations_per_case,
+                Duration::from_millis(delay_ms),
+                self.durability_window,
+            )?);
+        }
+        Ok(RandomizedSigkillReport {
+            run_root,
+            seed: self.seed,
+            cases: reports,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RandomizedSigkillReport {
+    run_root: PathBuf,
+    seed: u64,
+    cases: Vec<RandomizedSigkillCaseReport>,
+}
+
+impl RandomizedSigkillReport {
+    #[must_use]
+    pub fn run_root(&self) -> &Path {
+        &self.run_root
+    }
+
+    #[must_use]
+    pub const fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    #[must_use]
+    pub fn cases(&self) -> &[RandomizedSigkillCaseReport] {
+        &self.cases
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RandomizedSigkillCaseReport {
+    seed: u64,
+    acknowledged_operations: usize,
+    recovered_prefix: usize,
+}
+
+impl RandomizedSigkillCaseReport {
+    #[must_use]
+    pub const fn seed(self) -> u64 {
+        self.seed
+    }
+
+    #[must_use]
+    pub const fn acknowledged_operations(self) -> usize {
+        self.acknowledged_operations
+    }
+
+    #[must_use]
+    pub const fn recovered_prefix(self) -> usize {
+        self.recovered_prefix
+    }
+}
 
 /// Real-process crash matrix using the accepted ten-second durability window.
 #[derive(Clone, Debug)]
@@ -271,6 +408,261 @@ fn run_case(
     })
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PublicSnapshot {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_randomized_case(
+    daemon: &Path,
+    run_root: &Path,
+    ordinal: usize,
+    seed: u64,
+    operations: usize,
+    kill_delay: Duration,
+    durability_window: Duration,
+) -> Result<RandomizedSigkillCaseReport, SigkillHarnessError> {
+    // The daemon creates Unix-domain control sockets below Metadata; keep the
+    // per-case component short enough to preserve Linux SUN_LEN headroom.
+    let case_root = run_root.join(format!("r-{ordinal:04}"));
+    let mount = case_root.join("mount");
+    let metadata = case_root.join("metadata");
+    let data = case_root.join("data");
+    std::fs::create_dir(&case_root)?;
+    for directory in [&mount, &metadata, &data] {
+        std::fs::create_dir(directory)?;
+    }
+    let mut process = MountedDaemon::start(
+        daemon,
+        &mount,
+        &metadata,
+        &data,
+        &case_root.join("ingest-daemon.log"),
+    )?;
+    let observations = Arc::new(Mutex::new(vec![(Instant::now(), snapshot(&mount)?)]));
+    let gate = Arc::new(Mutex::new(()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_mount = mount.clone();
+    let worker_observations = Arc::clone(&observations);
+    let worker_gate = Arc::clone(&gate);
+    let worker_stop = Arc::clone(&stop);
+    let operation_log = case_root.join("operations.log");
+    let worker = thread::spawn(move || -> Result<(), SigkillHarnessError> {
+        let mut random = seed;
+        let mut log = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(operation_log)?;
+        for operation in 0..operations {
+            let _between_operations = worker_gate
+                .lock()
+                .expect("ASSERT: randomized SIGKILL gate lock poisoned");
+            if worker_stop.load(Ordering::Acquire) {
+                break;
+            }
+            let description = apply_random_operation(&worker_mount, &mut random, operation)?;
+            let observed = snapshot(&worker_mount)?;
+            writeln!(
+                log,
+                "operation={operation} seed={random:016x} {description}"
+            )?;
+            log.flush()?;
+            worker_observations
+                .lock()
+                .expect("ASSERT: randomized observation lock poisoned")
+                .push((Instant::now(), observed));
+        }
+        Ok(())
+    });
+
+    thread::sleep(kill_delay);
+    let kill_instant;
+    {
+        let _between_operations = gate
+            .lock()
+            .expect("ASSERT: randomized SIGKILL gate lock poisoned");
+        stop.store(true, Ordering::Release);
+        kill_instant = Instant::now();
+        process.sigkill_and_detach()?;
+    }
+    worker
+        .join()
+        .map_err(|_| SigkillHarnessError::WorkerPanicked)??;
+    let observations = Arc::try_unwrap(observations)
+        .map_err(|_| SigkillHarnessError::InvalidConfiguration)?
+        .into_inner()
+        .map_err(|_| SigkillHarnessError::WorkerPanicked)?;
+
+    let mut recovery = MountedDaemon::start(
+        daemon,
+        &mount,
+        &metadata,
+        &data,
+        &case_root.join("recovery-daemon.log"),
+    )?;
+    let recovered = snapshot(&mount)?;
+    recovery.sigkill_and_detach()?;
+    let recovered_prefix = observations
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, candidate))| *candidate == recovered)
+        .map(|(index, _)| index)
+        .max()
+        .ok_or(SigkillHarnessError::NonAtomicRandomizedRecovery { case: ordinal })?;
+    let required_prefix = observations
+        .iter()
+        .skip(1)
+        .take_while(|(acknowledged, _)| {
+            kill_instant.duration_since(*acknowledged) >= durability_window
+        })
+        .count();
+    if recovered_prefix < required_prefix {
+        return Err(SigkillHarnessError::DurabilityDeadlineMiss {
+            case: ordinal,
+            required_records: required_prefix,
+            recovered_records: recovered_prefix,
+            acknowledged_to_kill: durability_window,
+        });
+    }
+    Ok(RandomizedSigkillCaseReport {
+        seed,
+        acknowledged_operations: observations.len().saturating_sub(1),
+        recovered_prefix,
+    })
+}
+
+fn apply_random_operation(
+    mount: &Path,
+    random: &mut u64,
+    ordinal: usize,
+) -> Result<String, SigkillHarnessError> {
+    let existing = RANDOM_FILE_NAMES
+        .iter()
+        .copied()
+        .filter(|name| mount.join(name).exists())
+        .collect::<Vec<_>>();
+    if existing.is_empty() {
+        let name = RANDOM_FILE_NAMES[next_index(random, RANDOM_FILE_NAMES.len())];
+        OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(mount.join(name))?;
+        return Ok(format!("create={name}"));
+    }
+    let name = existing[next_index(random, existing.len())];
+    let path = mount.join(name);
+    match next_random(random) % 6 {
+        0 => {
+            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            let offset = file.metadata()?.len();
+            let frame = randomized_frame(*random, ordinal, 4 * 1_024);
+            let written = file.write_at(&frame, offset)?;
+            if written != frame.len() {
+                return Err(SigkillHarnessError::ShortWrite {
+                    expected: frame.len(),
+                    observed: written,
+                });
+            }
+            Ok(format!("append={name} offset={offset} bytes={written}"))
+        }
+        1 => {
+            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            let length = file.metadata()?.len();
+            let offset = if length == 0 {
+                0
+            } else {
+                next_random(random) % length
+            };
+            let frame = randomized_frame(*random, ordinal, 512);
+            let written = file.write_at(&frame, offset)?;
+            if written != frame.len() {
+                return Err(SigkillHarnessError::ShortWrite {
+                    expected: frame.len(),
+                    observed: written,
+                });
+            }
+            Ok(format!("overwrite={name} offset={offset} bytes={written}"))
+        }
+        2 => {
+            let file = OpenOptions::new().write(true).open(&path)?;
+            let current = file.metadata()?.len();
+            let length = if next_random(random).is_multiple_of(2) {
+                current / 2
+            } else {
+                current.saturating_add(8 * 1_024).min(2 * 1_024 * 1_024)
+            };
+            file.set_len(length)?;
+            Ok(format!("truncate={name} length={length}"))
+        }
+        3 if existing.len() < RANDOM_FILE_NAMES.len() => {
+            let target = RANDOM_FILE_NAMES
+                .iter()
+                .copied()
+                .find(|candidate| !mount.join(candidate).exists())
+                .expect("ASSERT: one randomized target is absent");
+            std::fs::rename(&path, mount.join(target))?;
+            Ok(format!("rename={name}->{target}"))
+        }
+        4 => {
+            std::fs::remove_file(&path)?;
+            Ok(format!("unlink={name}"))
+        }
+        _ => {
+            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            let offset = file.metadata()?.len().saturating_add(64 * 1_024);
+            let frame = randomized_frame(*random, ordinal, 1_024);
+            let written = file.write_at(&frame, offset)?;
+            if written != frame.len() {
+                return Err(SigkillHarnessError::ShortWrite {
+                    expected: frame.len(),
+                    observed: written,
+                });
+            }
+            Ok(format!(
+                "sparse_write={name} offset={offset} bytes={written}"
+            ))
+        }
+    }
+}
+
+fn snapshot(mount: &Path) -> io::Result<PublicSnapshot> {
+    let mut files = BTreeMap::new();
+    for name in RANDOM_FILE_NAMES {
+        match std::fs::read(mount.join(name)) {
+            Ok(bytes) => {
+                files.insert(name.to_owned(), bytes);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(PublicSnapshot { files })
+}
+
+fn next_index(random: &mut u64, length: usize) -> usize {
+    usize::try_from(next_random(random) % u64::try_from(length).expect("bounded length fits u64"))
+        .expect("randomized index fits usize")
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+fn randomized_frame(seed: u64, ordinal: usize, length: usize) -> Vec<u8> {
+    let mut state = seed
+        ^ u64::try_from(ordinal)
+            .expect("bounded operation ordinal fits u64")
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (0..length)
+        .map(|_| next_random(&mut state).to_le_bytes()[0])
+        .collect()
+}
+
 fn deterministic_frame(case: usize, record: usize) -> Vec<u8> {
     let mut bytes = vec![0_u8; RECORD_BYTES];
     bytes[..8].copy_from_slice(b"FASTKILL");
@@ -300,26 +692,41 @@ fn deterministic_frame(case: usize, record: usize) -> Vec<u8> {
     bytes
 }
 
-struct MountedDaemon {
+pub(crate) struct MountedDaemon {
     child: Option<Child>,
     mount: PathBuf,
     log: PathBuf,
 }
 
 impl MountedDaemon {
-    fn start(
+    pub(crate) fn start(
         daemon: &Path,
         mount: &Path,
         metadata: &Path,
         data: &Path,
         log: &Path,
     ) -> Result<Self, SigkillHarnessError> {
+        Self::start_with_environment(daemon, mount, metadata, data, log, true, &[])
+    }
+
+    pub(crate) fn start_with_environment(
+        daemon: &Path,
+        mount: &Path,
+        metadata: &Path,
+        data: &Path,
+        log: &Path,
+        lab_pool_isolation: bool,
+        environment: &[(&str, &str)],
+    ) -> Result<Self, SigkillHarnessError> {
         let output = OpenOptions::new().create_new(true).write(true).open(log)?;
         let error_output = output.try_clone()?;
-        let child = Command::new(daemon)
-            .arg(mount)
-            .arg(metadata)
-            .arg(data)
+        let mut command = Command::new(daemon);
+        command.arg(mount).arg(metadata).arg(data);
+        if lab_pool_isolation {
+            command.env("FASTDUP_POOL_ISOLATION", "lab-allow-shared");
+        }
+        command.envs(environment.iter().copied());
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(error_output))
@@ -356,7 +763,7 @@ impl MountedDaemon {
         }
     }
 
-    fn sigkill_and_detach(&mut self) -> Result<(), SigkillHarnessError> {
+    pub(crate) fn sigkill_and_detach(&mut self) -> Result<(), SigkillHarnessError> {
         let mut child = self
             .child
             .take()
@@ -372,6 +779,39 @@ impl MountedDaemon {
             });
         }
         detach_mount(&self.mount)
+    }
+
+    pub(crate) fn stop_gracefully(&mut self) -> Result<(), SigkillHarnessError> {
+        let child = self
+            .child
+            .as_mut()
+            .expect("ASSERT: mounted daemon is stopped exactly once");
+        let status = Command::new("kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status()?;
+        if !status.success() {
+            return Err(SigkillHarnessError::SignalFailed(status));
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.child = None;
+                if !status.success() {
+                    return Err(SigkillHarnessError::UnexpectedExit {
+                        status,
+                        log: self.log.clone(),
+                    });
+                }
+                return detach_mount(&self.mount);
+            }
+            if Instant::now() >= deadline {
+                return Err(SigkillHarnessError::ShutdownTimeout {
+                    log: self.log.clone(),
+                });
+            }
+            thread::sleep(MOUNT_POLL);
+        }
     }
 }
 
@@ -454,7 +894,7 @@ fn decode_mountinfo_field(encoded: &[u8]) -> io::Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn canonical_file(path: &Path) -> Result<PathBuf, SigkillHarnessError> {
+pub(crate) fn canonical_file(path: &Path) -> Result<PathBuf, SigkillHarnessError> {
     let canonical = std::fs::canonicalize(path)?;
     if !canonical.is_file() {
         return Err(SigkillHarnessError::DaemonNotFile(canonical));
@@ -462,7 +902,7 @@ fn canonical_file(path: &Path) -> Result<PathBuf, SigkillHarnessError> {
     Ok(canonical)
 }
 
-fn create_new_run_root(path: &Path) -> Result<PathBuf, SigkillHarnessError> {
+pub(crate) fn create_new_run_root(path: &Path) -> Result<PathBuf, SigkillHarnessError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -516,6 +956,14 @@ pub enum SigkillHarnessError {
     NonAtomicRecoveredPrefix {
         case: usize,
         recovered_bytes: usize,
+    },
+    NonAtomicRandomizedRecovery {
+        case: usize,
+    },
+    WorkerPanicked,
+    SignalFailed(ExitStatus),
+    ShutdownTimeout {
+        log: PathBuf,
     },
     DurabilityDeadlineMiss {
         case: usize,

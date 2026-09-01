@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::sync::mpsc::SyncSender;
 
 use bytes::Bytes;
 use futures_util::stream::{Empty, Stream};
@@ -16,17 +17,22 @@ pub struct OwnedRequestPayload {
 }
 
 impl OwnedRequestPayload {
-    pub(crate) fn from_request_buffer(
+    pub(crate) fn from_recyclable_request_buffer(
         buffer: Vec<u8>,
         payload_start: usize,
         payload_end: usize,
+        returner: SyncSender<Vec<u8>>,
     ) -> Self {
         assert!(
             payload_start <= payload_end && payload_end <= buffer.len(),
             "request payload range must lie inside its owned FUSE buffer"
         );
         let backing_bytes = buffer.capacity().max(buffer.len());
-        let bytes = Bytes::from(buffer).slice(payload_start..payload_end);
+        let bytes = Bytes::from_owner(RecyclableRequestBuffer {
+            buffer: Some(buffer),
+            returner,
+        })
+        .slice(payload_start..payload_end);
         Self {
             bytes,
             backing_bytes,
@@ -44,6 +50,29 @@ impl OwnedRequestPayload {
     #[must_use]
     pub fn into_parts(self) -> (Bytes, usize) {
         (self.bytes, self.backing_bytes)
+    }
+}
+
+struct RecyclableRequestBuffer {
+    buffer: Option<Vec<u8>>,
+    returner: SyncSender<Vec<u8>>,
+}
+
+impl AsRef<[u8]> for RecyclableRequestBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer
+            .as_deref()
+            .expect("request buffer owner retains its allocation until drop")
+    }
+}
+
+impl Drop for RecyclableRequestBuffer {
+    fn drop(&mut self) {
+        let buffer = self
+            .buffer
+            .take()
+            .expect("request buffer owner returns its allocation exactly once");
+        let _ = self.returner.try_send(buffer);
     }
 }
 
@@ -636,17 +665,24 @@ pub trait Filesystem {
 #[cfg(test)]
 mod tests {
     use super::OwnedRequestPayload;
+    use std::sync::mpsc::sync_channel;
 
     #[test]
-    fn owned_request_payload_retains_the_receive_allocation_without_copying() {
+    fn recyclable_request_buffer_returns_only_after_the_final_byte_owner_drops() {
+        let (returner, returned) = sync_channel(1);
         let buffer = vec![0x5a; 4096];
-        let expected = buffer.as_ptr().wrapping_add(128);
-
-        let payload = OwnedRequestPayload::from_request_buffer(buffer, 128, 3072);
-
-        assert_eq!(payload.as_bytes().as_ptr(), expected);
-        assert_eq!(payload.as_bytes(), vec![0x5a; 2944]);
-        let (_, backing_bytes) = payload.into_parts();
-        assert_eq!(backing_bytes, 4096);
+        let expected = buffer.as_ptr();
+        let payload =
+            OwnedRequestPayload::from_recyclable_request_buffer(buffer, 128, 3072, returner);
+        let (bytes, _) = payload.into_parts();
+        let retained = bytes.clone();
+        drop(bytes);
+        assert!(returned.try_recv().is_err());
+        drop(retained);
+        let returned = returned
+            .try_recv()
+            .expect("final byte owner returns the receive buffer");
+        assert_eq!(returned.as_ptr(), expected);
+        assert_eq!(returned.len(), 4096);
     }
 }

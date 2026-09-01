@@ -37,6 +37,7 @@ struct AppState {
     telemetry: TelemetryStore,
     fingerprint: Arc<RwLock<String>>,
     tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    secure_cookie: bool,
     tls_directory: PathBuf,
     hostnames: Vec<String>,
 }
@@ -129,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         telemetry,
         fingerprint: Arc::new(RwLock::new(identity.fingerprint)),
         tls: tls.clone(),
+        secure_cookie: !insecure,
         tls_directory,
         hostnames,
     };
@@ -136,9 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(CompressionLayer::new())
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http());
-    let address: SocketAddr = std::env::var("FASTDUP_CONTROL_LISTEN")
-        .unwrap_or_else(|_| "0.0.0.0:8443".to_owned())
-        .parse()?;
+    let address = SocketAddr::from(([0, 0, 0, 0], 8080));
     if insecure {
         let listener = tokio::net::TcpListener::bind(address).await?;
         axum::serve(listener, application).await?;
@@ -164,6 +164,7 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/shares/{id}", delete(delete_share))
         .route("/api/v1/samba/principals", get(samba_principals))
         .route("/api/v1/telemetry/history", get(history))
+        .route("/api/v1/audit", get(audit_log))
         .route("/api/v1/events", get(events))
         .fallback(static_asset)
         .with_state(state)
@@ -208,7 +209,8 @@ async fn login(
     let mut response = Json(body).into_response();
     response.headers_mut().insert(
         SET_COOKIE,
-        HeaderValue::from_str(&session_cookie(&result.session_token)).map_err(internal_error)?,
+        HeaderValue::from_str(&session_cookie(&result.session_token, state.secure_cookie))
+            .map_err(internal_error)?,
     );
     Ok(response)
 }
@@ -243,7 +245,8 @@ async fn change_password(
     let mut response = Json(body).into_response();
     response.headers_mut().insert(
         SET_COOKIE,
-        HeaderValue::from_str(&session_cookie(&result.session_token)).map_err(internal_error)?,
+        HeaderValue::from_str(&session_cookie(&result.session_token, state.secure_cookie))
+            .map_err(internal_error)?,
     );
     Ok(response)
 }
@@ -259,9 +262,8 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         SET_COOKIE,
-        HeaderValue::from_static(
-            "fastdup_session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict",
-        ),
+        HeaderValue::from_str(&expired_session_cookie(state.secure_cookie))
+            .map_err(internal_error)?,
     );
     Ok(response)
 }
@@ -432,6 +434,14 @@ async fn history(
     .into_response())
 }
 
+async fn audit_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authenticate(&state, &headers, false)?;
+    Ok(Json(state.store.recent_audit(10_000).map_err(store_error)?).into_response())
+}
+
 async fn events(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -550,8 +560,16 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
         .find_map(|(name, value)| (name == "fastdup_session").then(|| value.to_owned()))
 }
 
-fn session_cookie(token: &str) -> String {
-    format!("fastdup_session={token}; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=Strict")
+fn session_cookie(token: &str, secure: bool) -> String {
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    format!(
+        "fastdup_session={token}; Path=/; Max-Age=28800{secure_attribute}; HttpOnly; SameSite=Strict"
+    )
+}
+
+fn expired_session_cookie(secure: bool) -> String {
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    format!("fastdup_session=; Path=/; Max-Age=0{secure_attribute}; HttpOnly; SameSite=Strict")
 }
 
 fn auth_error(error: fastdup_control::AuthError) -> ApiError {
@@ -621,4 +639,19 @@ fn local_principals(path: &str, numeric_field: usize) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_cookie;
+
+    #[test]
+    fn session_cookie_matches_transport_security() {
+        let insecure = session_cookie("token", false);
+        assert!(!insecure.contains("; Secure"));
+        assert!(insecure.contains("; HttpOnly; SameSite=Strict"));
+
+        let secure = session_cookie("token", true);
+        assert!(secure.contains("; Secure; HttpOnly; SameSite=Strict"));
+    }
 }

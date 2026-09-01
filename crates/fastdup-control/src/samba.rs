@@ -127,6 +127,28 @@ impl SambaConfig {
         }
         std::fs::rename(&stage, &self.managed_file)?;
         sync_directory(parent)?;
+        if shares.iter().any(|share| share.enabled) {
+            let start = Command::new("systemctl")
+                .args(["enable", "--now", "smb.service"])
+                .output()?;
+            if !start.status.success() {
+                if backup.exists() {
+                    std::fs::rename(&backup, &self.managed_file)?;
+                    sync_directory(parent)?;
+                }
+                return Err(SambaError::Reload(
+                    String::from_utf8_lossy(&start.stderr).trim().to_owned(),
+                ));
+            }
+        } else {
+            let active = Command::new("systemctl")
+                .args(["is-active", "--quiet", "smb.service"])
+                .status()?;
+            if !active.success() {
+                let _ = std::fs::remove_file(backup);
+                return Ok(());
+            }
+        }
         let reload = Command::new("smbcontrol")
             .args(["all", "reload-config"])
             .output()?;

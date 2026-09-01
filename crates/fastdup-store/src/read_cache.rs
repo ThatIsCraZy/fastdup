@@ -1,4 +1,5 @@
 use fastdup_format::ChunkId;
+pub(crate) use fastdup_format::VerifiedChunkPayload;
 use std::array;
 use std::fmt;
 use std::io;
@@ -193,45 +194,45 @@ struct CacheKey {
 struct CacheEntry {
     key: CacheKey,
     payload: VerifiedChunkPayload,
+    backing_charge: Arc<CacheBackingCharge>,
 }
 
-/// Shared ownership of one already verified decoded Chunk payload.
+#[derive(Debug)]
+struct CacheBackingCharge {
+    bytes: usize,
+}
+
+/// Result of one verified read operation.
 ///
-/// The owner adopts a decoder-produced `Vec` without copying its payload.
-/// Clones share those exact bytes until the final Manifest assembly copies the
-/// requested slice into the frontend reply.
-#[derive(Clone, Eq, PartialEq)]
-pub(crate) struct VerifiedChunkPayload(Arc<Vec<u8>>);
-
-impl VerifiedChunkPayload {
-    pub(crate) fn from_verified_store(bytes: Vec<u8>) -> Self {
-        Self(Arc::new(bytes))
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-
-    fn allocation_bytes(&self) -> usize {
-        self.0.capacity()
-    }
-
-    #[cfg(test)]
-    fn payload_address(&self) -> *const u8 {
-        self.0.as_ptr()
-    }
+/// Requested payloads retain logical caller order. Admission groups retain all
+/// unique Chunk views sharing one decoded Encoding Record backing so the cache
+/// can account and admit that allocation exactly once.
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedChunkRead {
+    requested: Vec<VerifiedChunkPayload>,
+    admission_groups: Vec<Vec<VerifiedChunkPayload>>,
 }
 
-impl fmt::Debug for VerifiedChunkPayload {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("VerifiedChunkPayload")
-            .field("len", &self.len())
-            .finish_non_exhaustive()
+impl VerifiedChunkRead {
+    pub(crate) fn new(
+        requested: Vec<VerifiedChunkPayload>,
+        admission_groups: Vec<Vec<VerifiedChunkPayload>>,
+    ) -> Self {
+        Self {
+            requested,
+            admission_groups,
+        }
+    }
+
+    pub(crate) fn single(
+        requested: VerifiedChunkPayload,
+        admission_group: Vec<VerifiedChunkPayload>,
+    ) -> Self {
+        Self::new(vec![requested], vec![admission_group])
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<VerifiedChunkPayload>, Vec<Vec<VerifiedChunkPayload>>) {
+        (self.requested, self.admission_groups)
     }
 }
 
@@ -514,21 +515,60 @@ impl VerifiedReadCache {
         None
     }
 
+    #[cfg(test)]
     pub(crate) fn admit_verified(
         &self,
         chunk_id: ChunkId,
         logical_length: u64,
         payload: VerifiedChunkPayload,
     ) {
+        self.admit_verified_group(vec![(chunk_id, logical_length, payload)]);
+    }
+
+    pub(crate) fn admit_decoded_group(&self, payloads: Vec<VerifiedChunkPayload>) {
+        let keyed = payloads
+            .into_iter()
+            .map(|payload| {
+                let logical_length = u64::try_from(payload.len())
+                    .expect("ASSERT: verified logical Chunk length fits u64");
+                (payload.chunk_id(), logical_length, payload)
+            })
+            .collect();
+        self.admit_verified_group(keyed);
+    }
+
+    /// Atomically accounts one decoder backing while admitting any number of
+    /// verified Chunk views from that Encoding Record.
+    pub(crate) fn admit_verified_group(&self, payloads: Vec<(ChunkId, u64, VerifiedChunkPayload)>) {
+        let Some((_, _, first)) = payloads.first() else {
+            return;
+        };
+        let allocation_bytes = first.backing_allocation_bytes();
+        for (chunk_id, logical_length, payload) in &payloads {
+            assert_eq!(
+                u64::try_from(payload.len()).ok(),
+                Some(*logical_length),
+                "ASSERT: Store returned a verified Chunk with the wrong length"
+            );
+            assert_eq!(
+                payload.chunk_id(),
+                *chunk_id,
+                "ASSERT: Store returned bytes under the wrong verified Chunk ID"
+            );
+            assert!(
+                first.shares_backing_with(payload),
+                "ASSERT: one cache admission group must share one decoded Record backing"
+            );
+            assert_eq!(
+                payload.backing_allocation_bytes(),
+                allocation_bytes,
+                "ASSERT: shared decoded Record views report one allocation"
+            );
+        }
         assert_eq!(
-            u64::try_from(payload.len()).ok(),
-            Some(logical_length),
-            "ASSERT: Store returned a verified Chunk with the wrong length"
-        );
-        assert_eq!(
-            ChunkId::of(payload.as_slice()),
-            chunk_id,
-            "ASSERT: Store returned bytes under the wrong verified Chunk ID"
+            first.chunk_id(),
+            payloads[0].0,
+            "ASSERT: first admission key retains verified identity"
         );
         self.maybe_refresh_pressure();
         let _admission = self
@@ -540,59 +580,85 @@ impl VerifiedReadCache {
             self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if payload.allocation_bytes() > target {
+        if allocation_bytes > target {
             self.oversized_rejections.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let key = CacheKey {
-            chunk_id,
-            logical_length,
-        };
-        let hash = cache_hash(key);
-        let shard = &self.shards[hash & (self.shards.len() - 1)];
-        let mut state = shard
-            .state
-            .lock()
-            .expect("ASSERT: verified read-cache shard lock poisoned");
-        let set_index = (hash / self.shards.len()) % state.sets.len();
-        let set = &mut state.sets[set_index];
-        if set.ways.iter().flatten().any(|entry| entry.key == key) {
-            return;
+        let backing_charge = Arc::new(CacheBackingCharge {
+            bytes: allocation_bytes,
+        });
+        let mut admitted_group_refs = 0_usize;
+        for (chunk_id, logical_length, payload) in payloads {
+            let key = CacheKey {
+                chunk_id,
+                logical_length,
+            };
+            let hash = cache_hash(key);
+            let shard = &self.shards[hash & (self.shards.len() - 1)];
+            let mut state = shard
+                .state
+                .lock()
+                .expect("ASSERT: verified read-cache shard lock poisoned");
+            let set_index = (hash / self.shards.len()) % state.sets.len();
+            let set = &mut state.sets[set_index];
+            if set.ways.iter().flatten().any(|entry| entry.key == key) {
+                continue;
+            }
+            let victim = set
+                .ways
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or(set.next_victim);
+            let victim_is_group = set.ways[victim]
+                .as_ref()
+                .is_some_and(|entry| Arc::ptr_eq(&entry.backing_charge, &backing_charge));
+            let victim_bytes = set.ways[victim].as_ref().map_or(0, |entry| {
+                if victim_is_group {
+                    usize::from(admitted_group_refs == 1) * entry.backing_charge.bytes
+                } else if Arc::strong_count(&entry.backing_charge) == 1 {
+                    entry.backing_charge.bytes
+                } else {
+                    0
+                }
+            });
+            let remaining_group_refs = admitted_group_refs - usize::from(victim_is_group);
+            let added_bytes = if remaining_group_refs == 0 {
+                backing_charge.bytes
+            } else {
+                0
+            };
+            let resident = self.resident_bytes.load(Ordering::Acquire);
+            let proposed = resident
+                .checked_sub(victim_bytes)
+                .and_then(|remaining| remaining.checked_add(added_bytes))
+                .expect("ASSERT: verified read-cache resident accounting overflowed");
+            if proposed > target {
+                self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let replaced = set.ways[victim].replace(CacheEntry {
+                key,
+                payload,
+                backing_charge: Arc::clone(&backing_charge),
+            });
+            admitted_group_refs = remaining_group_refs + 1;
+            set.next_victim = (victim + 1) % CACHE_WAYS;
+            self.resident_bytes.store(proposed, Ordering::Release);
+            if replaced.is_some() {
+                state.counters.evictions = state.counters.evictions.saturating_add(1);
+            } else {
+                self.entry_count.fetch_add(1, Ordering::Release);
+            }
+            state.counters.admissions = state.counters.admissions.saturating_add(1);
+            assert!(
+                proposed <= target,
+                "ASSERT: verified read cache exceeded its current payload target"
+            );
+            assert!(
+                proposed.saturating_add(self.metadata_bytes) <= self.config.hard_limit_bytes,
+                "ASSERT: verified read cache exceeded its hard RAM limit"
+            );
         }
-        let victim = set
-            .ways
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or(set.next_victim);
-        let victim_bytes = set.ways[victim]
-            .as_ref()
-            .map_or(0, |entry| entry.payload.allocation_bytes());
-        let resident = self.resident_bytes.load(Ordering::Acquire);
-        let proposed = resident
-            .checked_sub(victim_bytes)
-            .and_then(|remaining| remaining.checked_add(payload.allocation_bytes()))
-            .expect("ASSERT: verified read-cache resident accounting overflowed");
-        if proposed > target {
-            self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let replaced = set.ways[victim].replace(CacheEntry { key, payload });
-        set.next_victim = (victim + 1) % CACHE_WAYS;
-        self.resident_bytes.store(proposed, Ordering::Release);
-        if replaced.is_some() {
-            state.counters.evictions = state.counters.evictions.saturating_add(1);
-        } else {
-            self.entry_count.fetch_add(1, Ordering::Release);
-        }
-        state.counters.admissions = state.counters.admissions.saturating_add(1);
-        assert!(
-            proposed <= target,
-            "ASSERT: verified read cache exceeded its current payload target"
-        );
-        assert!(
-            proposed.saturating_add(self.metadata_bytes) <= self.config.hard_limit_bytes,
-            "ASSERT: verified read cache exceeded its hard RAM limit"
-        );
     }
 
     fn maybe_refresh_pressure(&self) {
@@ -683,6 +749,13 @@ fn cache_hash(key: CacheKey) -> usize {
 mod tests {
     use super::*;
 
+    fn verified_payload(bytes: &[u8]) -> VerifiedChunkPayload {
+        let encoded = fastdup_format::RawRecord::encode(bytes).expect("encode fixture Record");
+        fastdup_format::RawRecord::decode(&encoded)
+            .expect("decode and verify fixture Record")
+            .into_verified_payload()
+    }
+
     #[test]
     fn shards_are_cache_line_separated_and_total_memory_is_hard_bounded() {
         let config = VerifiedReadCacheConfig::new(
@@ -742,7 +815,7 @@ mod tests {
             cache.admit_verified(
                 *chunk_id,
                 u64::try_from(bytes.len()).expect("fixture length fits u64"),
-                VerifiedChunkPayload::from_verified_store(bytes.clone()),
+                verified_payload(bytes),
             );
         }
 
@@ -761,13 +834,13 @@ mod tests {
                     *chunk_id,
                     u64::try_from(bytes.len()).expect("fixture length fits u64")
                 ),
-                Some(VerifiedChunkPayload::from_verified_store(bytes.clone()))
+                Some(verified_payload(bytes))
             );
         }
     }
 
     #[test]
-    fn admission_and_hit_retain_the_decoder_owned_payload_allocation() {
+    fn admission_and_hit_share_and_charge_the_decoder_owned_payload_allocation_once() {
         let cache = VerifiedReadCache::new_with_snapshot(
             VerifiedReadCacheConfig::new(2 * 1_024 * 1_024, 0, NonZeroUsize::MIN)
                 .expect("valid cache geometry"),
@@ -777,20 +850,17 @@ mod tests {
         let mut bytes = Vec::with_capacity(128 * 1_024);
         bytes.extend_from_slice(&b"decoder-owned verified payload".repeat(1_024));
         assert!(bytes.capacity() > bytes.len());
-        let allocation_bytes = bytes.capacity();
-        let address = bytes.as_ptr();
         let chunk_id = ChunkId::of(&bytes);
         let logical_length = u64::try_from(bytes.len()).expect("fixture length fits u64");
-        let payload = VerifiedChunkPayload::from_verified_store(bytes);
-        assert_eq!(payload.payload_address(), address);
+        let payload = verified_payload(&bytes);
+        let allocation_bytes = payload.backing_allocation_bytes();
 
         cache.admit_verified(chunk_id, logical_length, payload.clone());
         let hit = cache
             .get(chunk_id, logical_length)
             .expect("admitted verified payload is resident");
 
-        assert_eq!(payload.payload_address(), address);
-        assert_eq!(hit.payload_address(), address);
+        assert!(payload.shares_backing_with(&hit));
         assert_eq!(cache.status().resident_bytes(), allocation_bytes);
     }
 

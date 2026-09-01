@@ -886,6 +886,7 @@ dependencies = [
  "crc32c",
  "fastdup-format",
  "fastdup-store",
+ "rustix",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use rcgen::generate_simple_self_signed;
@@ -32,6 +32,8 @@ impl TlsIdentity {
         if !certificate_path.exists() || !private_key_path.exists() {
             generate(&certificate_path, &private_key_path, hostnames)?;
         }
+        ensure_private_mode(&certificate_path)?;
+        ensure_private_mode(&private_key_path)?;
         let certificate = std::fs::read(&certificate_path)?;
         Ok(Self {
             certificate_path,
@@ -78,13 +80,23 @@ fn publish_private(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
         .create(true)
         .truncate(true)
         .write(true)
-        .mode(0o600)
+        .mode(0o640)
         .open(&stage)?;
     file.write_all(contents)?;
     file.sync_all()?;
     std::fs::rename(stage, path)?;
     if let Some(parent) = path.parent() {
         std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn ensure_private_mode(path: &Path) -> Result<(), std::io::Error> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.permissions().mode() & 0o777 != 0o640 {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o640);
+        std::fs::set_permissions(path, permissions)?;
     }
     Ok(())
 }
@@ -113,6 +125,14 @@ mod tests {
         let second = TlsIdentity::load_or_generate(directory.path(), &["changed.test".to_owned()])
             .expect("load identity");
         assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(
+            std::fs::metadata(&first.private_key_path)
+                .expect("key metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
         let replacement = TlsIdentity::regenerate(directory.path(), &["fastdup.test".to_owned()])
             .expect("regenerate identity");
         assert_ne!(first.fingerprint, replacement.fingerprint);

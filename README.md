@@ -230,11 +230,15 @@ Upgrade-/Allocator-Grenzen geschlossen:
 
 ## Empfohlener nächster Entwicklungsabschnitt
 
-Die Kapazitätsentscheidungen aus ADR 0081 bis 0083 sind umgesetzt. Als Nächstes
-sollte die policy-gesteuerte Small-File-Platzierung aus ADR 0084 ihre eigene
-XFS-Projektquota erhalten, ohne die geschützte Metadata-Reserve ausleihen zu
-können. Parallel bleibt der HDD-Lesepfad auf echter rotierender Hardware zu
-qualifizieren. Der korrigierte A/B nutzt den produktiven
+Die Kapazitätsentscheidungen aus ADR 0081 bis 0084 sind umgesetzt. Policy-
+bekannte `.xml`/`.json`-Dateien und der explizite Placement-Hint wählen bis
+8 MiB den Small-File-Tier; neue Records darüber gehen auf DATA. Der Tier besitzt
+eine eigene XFS-Projekt-Hard-Quota und einen eigenen synchronen Admission-
+Bucket, während sein physischer Footprint zugleich gegen Metadata gerechnet
+wird. Der privilegierte XFS/FUSE-Test füllt DATA und Small-File-Quota, prüft
+stabiles `ENOSPC`, Cleanup, Offline-Scrub und bytegenauen Remount. Parallel
+bleibt der HDD-Lesepfad auf echter rotierender Hardware zu qualifizieren. Der
+korrigierte A/B nutzt den produktiven
 `IoUringStorageIo`-Adapter: Bei 64-KiB-Chunks sinken Ring-Submissions von 128
 auf 16 und der Planned-Pfad ist im Median 25,7 Prozent schneller. Beide Pfade
 erzeugen wegen Kernel-Readahead trotzdem dieselben zehn sequenziellen Block-
@@ -250,10 +254,11 @@ Der Abschnitt ist abgeschlossen, wenn:
 1. ein alternierender Cold-Restore-A/B auf physischer HDD oder dem geplanten
    redundanten HDD-Array sequenzielle, fragmentierte und Container-übergreifende
    Dateien abdeckt;
-2. Small-File-Workloads Suchwege, IOPS, Platzverbrauch und Write Amplification
-   messen, bevor ein dauerhaftes Platzierungsformat festgelegt wird;
-3. gefüllte Cache- und Small-File-Quoten die Metadata-Reserve nicht verbrauchen
-   und jede zugelassene Mutation ihren bounded Commit abschließen kann;
+2. breitere Small-File-Workloads Suchwege, IOPS, Platzverbrauch und Write
+   Amplification auf Produktions-NVMe messen;
+3. die jetzt automatisierte volle Small-File-Quota regelmäßig auf der
+   Produktions-XFS-Version qualifizieren und eine künftige Cache-Quota in
+   denselben Metadata-Reserve-Beweis aufnehmen;
 4. mehrere versionierte Backup-Familien Exact-, Similarity- und Fallback-
    Entscheidungen reproduzierbar auslösen und ABBA-Läufe Kapazität,
    SMB-Durchsatz, completed-write-p99, Restore und Swap gemeinsam ausweisen;
@@ -263,8 +268,9 @@ Der Abschnitt ist abgeschlossen, wenn:
    neue Locks, Syscalls oder Speicher-Samples in die Ingest- und Candidate-
    Hot-Loops einführen.
 
-Danach folgen die randomisierte Process-Kill-Kampagne, Blockgeräte-Power-Cut-/
-Torn-Write-Tests und die offenen POSIX-/Samba-Matrizen.
+Der fixed-seed Process-Kill-Harness und die modellierte Torn-Write-
+Vorgängergeneration sind vorhanden. Offen bleiben scheduled Longevity-Läufe,
+echte Blockgeräte-Power-Cuts und die POSIX-/Samba-Matrizen.
 
 ## Ingest-Pipeline
 

@@ -34,6 +34,7 @@ export interface TelemetrySnapshot {
   sequence: number;
   observedAt: string;
   repositoryState: RepositoryState;
+  commitGeneration?: number;
   frontendReadMbps: number;
   frontendWriteMbps: number;
   dedupRate: number;
@@ -42,13 +43,14 @@ export interface TelemetrySnapshot {
   ramPercent: number;
   dataUsedBytes: number;
   dataCapacityBytes: number;
-  lastCheckpointSeconds: number;
+  lastCheckpointSeconds?: number;
   disks: DiskTelemetry[];
   series: SeriesPoint[];
 }
 
 export interface BackingDisk {
   stableId: string;
+  kernelName: string;
   model: string;
   serial: string;
   hbaPort: string;
@@ -105,19 +107,69 @@ export interface JobStatus {
   createdAt: number;
   updatedAt: number;
 }
+export interface AuditEvent {
+  id: number;
+  timestamp: number;
+  actor: string;
+  action: string;
+  outcome: string;
+  detail: string;
+}
 export interface ApplianceSnapshot {
   telemetry: TelemetrySnapshot;
   targets: BlockTarget[];
+  repository?: RepositoryBinding;
   settings: RepositorySettings;
   shares: ShareSettings[];
   jobs: JobStatus[];
   certificateFingerprint: string;
+}
+export interface RepositoryBinding {
+  metadataTarget: string;
+  dataTarget: string;
+  metadataUuid: string;
+  dataUuid: string;
+  metadataKernelName: string;
+  dataKernelName: string;
+  state: RepositoryState;
 }
 export interface SessionInfo {
   username: string;
   csrfToken: string;
   mustChangePassword: boolean;
   certificateFingerprint: string;
+}
+
+export function emptyApplianceSnapshot(): ApplianceSnapshot {
+  return {
+    telemetry: {
+      sequence: 0,
+      observedAt: "",
+      repositoryState: "uninitialized",
+      frontendReadMbps: 0,
+      frontendWriteMbps: 0,
+      dedupRate: 0,
+      reductionRatio: 0,
+      cpuPercent: 0,
+      ramPercent: 0,
+      dataUsedBytes: 0,
+      dataCapacityBytes: 0,
+      disks: [],
+      series: [],
+    },
+    targets: [],
+    settings: {
+      revision: 1,
+      autoMount: true,
+      advancedReduction: "off",
+      onlineGcEnabled: true,
+      pressureLowBasisPoints: 8500,
+      pressureHighBasisPoints: 9000,
+    },
+    shares: [],
+    jobs: [],
+    certificateFingerprint: "",
+  };
 }
 
 const series = Array.from({ length: 90 }, (_, index) => ({
@@ -130,6 +182,7 @@ export const previewTelemetry: TelemetrySnapshot = {
   sequence: 18427,
   observedAt: new Date().toISOString(),
   repositoryState: "online",
+  commitGeneration: 18427,
   frontendReadMbps: 842.6,
   frontendWriteMbps: 611.4,
   dedupRate: 72.8,
@@ -174,6 +227,15 @@ export const previewTelemetry: TelemetrySnapshot = {
 
 export const previewSnapshot: ApplianceSnapshot = {
   telemetry: previewTelemetry,
+  repository: {
+    metadataTarget: "wwn-meta",
+    dataTarget: "wwn-data",
+    metadataUuid: "preview-metadata",
+    dataUuid: "preview-data",
+    metadataKernelName: "nvme0n1",
+    dataKernelName: "dm-4",
+    state: "online",
+  },
   targets: [
     {
       stableId: "wwn-meta",
@@ -202,6 +264,7 @@ export const previewSnapshot: ApplianceSnapshot = {
       eligible: true,
       backingDisks: Array.from({ length: 12 }, (_, i) => ({
         stableId: `sas-${i}`,
+        kernelName: `sd${String.fromCharCode(97 + i)}`,
         model: "Exos X20",
         serial: `ZVT${1000 + i}`,
         hbaPort: `phy ${i}`,

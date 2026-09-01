@@ -35,10 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     runtime.start_sampler();
     let listener = bind_socket(&socket_path)?;
-    let allowed_uid = std::env::var("FASTDUP_CONTROL_UID")
+    runtime.reconcile_startup();
+    let control_user = std::env::var("FASTDUP_CONTROL_UID")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
+    let control_group = rustix::process::getegid().as_raw();
     tracing::info!(path = %socket_path.display(), "fastdup agent ready");
     loop {
         tokio::select! {
@@ -46,7 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (stream, _) = accepted?;
                 let runtime = Arc::clone(&runtime);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, runtime, allowed_uid).await {
+                    if let Err(error) =
+                        handle_client(stream, runtime, control_user, control_group).await
+                    {
                         tracing::warn!(%error, "agent request rejected");
                     }
                 });
@@ -81,10 +85,16 @@ fn bind_socket(path: &Path) -> Result<UnixListener, std::io::Error> {
 async fn handle_client(
     stream: UnixStream,
     runtime: Arc<AgentRuntime>,
-    allowed_uid: u32,
+    control_user: u32,
+    control_group: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let credentials = stream.peer_cred()?;
-    if !peer_allowed(credentials.uid(), allowed_uid) {
+    if !peer_allowed(
+        credentials.uid(),
+        credentials.gid(),
+        control_user,
+        control_group,
+    ) {
         return Err("Unix peer is not the configured Control Plane user".into());
     }
     let (reader, mut writer) = stream.into_split();
@@ -107,8 +117,13 @@ async fn handle_client(
     Ok(())
 }
 
-fn peer_allowed(peer_uid: u32, allowed_uid: u32) -> bool {
-    peer_uid == 0 || peer_uid == allowed_uid
+fn peer_allowed(
+    caller_user: u32,
+    caller_group: u32,
+    control_user: u32,
+    control_group: u32,
+) -> bool {
+    caller_user == 0 || caller_user == control_user || caller_group == control_group
 }
 
 fn hostname() -> String {
@@ -123,9 +138,10 @@ mod tests {
     use super::peer_allowed;
 
     #[test]
-    fn agent_accepts_only_root_or_the_configured_control_uid() {
-        assert!(peer_allowed(0, 991));
-        assert!(peer_allowed(991, 991));
-        assert!(!peer_allowed(1_000, 991));
+    fn agent_accepts_only_root_or_the_configured_control_identity() {
+        assert!(peer_allowed(0, 0, 991, 990));
+        assert!(peer_allowed(991, 1_000, 991, 990));
+        assert!(peer_allowed(1_000, 990, 991, 990));
+        assert!(!peer_allowed(1_000, 1_000, 991, 990));
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Weak};
 use std::thread;
@@ -79,6 +80,12 @@ struct PresentedCapacities {
     by_inode: BTreeMap<u64, u64>,
 }
 
+#[derive(Clone, Debug)]
+struct SmallFileCapacitySource {
+    root: PathBuf,
+    hard_limit_bytes: u64,
+}
+
 impl TieredStatFsSource {
     /// Opens a cached tier-capacity source.
     ///
@@ -96,9 +103,55 @@ impl TieredStatFsSource {
         metadata_root: impl Into<PathBuf>,
         capacity_override: Option<StatFsOverride>,
     ) -> io::Result<Self> {
+        Self::open_inner(data_root, metadata_root, capacity_override, None)
+    }
+
+    /// Opens the physical capacity source with a separately bounded Small-File
+    /// project. Its cached headroom participates in synchronous mutation
+    /// admission while the client-visible `statfs` view remains DATA-based.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid limits, filesystem sampling failures, a Metadata tier
+    /// without the protected commit floor, or refresher-thread spawn failures.
+    pub fn open_with_small_file_tier(
+        data_root: impl Into<PathBuf>,
+        metadata_root: impl Into<PathBuf>,
+        small_file_root: impl Into<PathBuf>,
+        small_file_hard_limit_bytes: u64,
+        capacity_override: Option<StatFsOverride>,
+    ) -> io::Result<Self> {
+        if small_file_hard_limit_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Small-File hard limit must be nonzero",
+            ));
+        }
+        Self::open_inner(
+            data_root,
+            metadata_root,
+            capacity_override,
+            Some(SmallFileCapacitySource {
+                root: small_file_root.into(),
+                hard_limit_bytes: small_file_hard_limit_bytes,
+            }),
+        )
+    }
+
+    fn open_inner(
+        data_root: impl Into<PathBuf>,
+        metadata_root: impl Into<PathBuf>,
+        capacity_override: Option<StatFsOverride>,
+        small_file: Option<SmallFileCapacitySource>,
+    ) -> io::Result<Self> {
         let data_root = data_root.into();
         let metadata_root = metadata_root.into();
-        let (initial, capacity) = sample_paths(&data_root, &metadata_root, capacity_override)?;
+        let (initial, capacity) = sample_paths(
+            &data_root,
+            &metadata_root,
+            capacity_override,
+            small_file.as_ref(),
+        )?;
         let governor = Arc::new(
             CommitCapacityGovernor::new(capacity)
                 .map_err(|error| io::Error::new(io::ErrorKind::StorageFull, error))?,
@@ -110,6 +163,7 @@ impl TieredStatFsSource {
             data_root,
             metadata_root,
             capacity_override,
+            small_file,
         )?;
         Ok(Self {
             snapshot,
@@ -196,12 +250,15 @@ fn sample_paths(
     data_root: &Path,
     metadata_root: &Path,
     capacity_override: Option<StatFsOverride>,
+    small_file: Option<&SmallFileCapacitySource>,
 ) -> io::Result<(StatFsSnapshot, CommitCapacitySnapshot)> {
     let metadata = TierCapacity::read(metadata_root)?;
     let data = TierCapacity::read(data_root)?;
     Ok((
         snapshot_from_tiers(Some(data), metadata, capacity_override)?,
-        commit_capacity_from_tiers(data, metadata)?,
+        commit_capacity_from_tiers(data, metadata)?.with_small_file_available_bytes(
+            small_file.map_or(Ok(u64::MAX), small_file_available_bytes)?,
+        ),
     ))
 }
 
@@ -211,6 +268,7 @@ fn spawn_refresher(
     data_root: PathBuf,
     metadata_root: PathBuf,
     capacity_override: Option<StatFsOverride>,
+    small_file: Option<SmallFileCapacitySource>,
 ) -> io::Result<()> {
     let weak_snapshot = Arc::downgrade(snapshot);
     let weak_governor = Arc::downgrade(governor);
@@ -223,6 +281,7 @@ fn spawn_refresher(
                 &data_root,
                 &metadata_root,
                 capacity_override,
+                small_file.as_ref(),
             );
         })?;
     Ok(())
@@ -234,6 +293,7 @@ fn refresh_loop(
     data_root: &Path,
     metadata_root: &Path,
     capacity_override: Option<StatFsOverride>,
+    small_file: Option<&SmallFileCapacitySource>,
 ) {
     loop {
         thread::sleep(STATFS_REFRESH_INTERVAL);
@@ -244,7 +304,7 @@ fn refresh_loop(
             return;
         };
         let observation_epoch = governor.begin_observation();
-        let sampled = sample_paths(data_root, metadata_root, capacity_override);
+        let sampled = sample_paths(data_root, metadata_root, capacity_override, small_file);
         let Ok(mut cached) = snapshot.write() else {
             return;
         };
@@ -323,6 +383,36 @@ fn commit_capacity_from_tiers(
         metadata.available_bytes.saturating_sub(metadata_reserve),
         data.available_bytes.saturating_sub(data_reserve),
     ))
+}
+
+fn small_file_available_bytes(source: &SmallFileCapacitySource) -> io::Result<u64> {
+    let reserve = reserve_bytes(source.hard_limit_bytes)?;
+    let usable = source.hard_limit_bytes.saturating_sub(reserve);
+    let mut allocated = source
+        .root
+        .metadata()?
+        .blocks()
+        .checked_mul(512)
+        .ok_or_else(|| io::Error::other("Small-File allocated bytes overflow u64"))?;
+    for entry in std::fs::read_dir(&source.root)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Small-File Container root contains a non-file entry",
+            ));
+        }
+        allocated = allocated
+            .checked_add(
+                metadata
+                    .blocks()
+                    .checked_mul(512)
+                    .ok_or_else(|| io::Error::other("Small-File file blocks overflow u64"))?,
+            )
+            .ok_or_else(|| io::Error::other("Small-File allocated bytes overflow u64"))?;
+    }
+    Ok(usable.saturating_sub(allocated))
 }
 
 impl StatFsSource for TieredStatFsSource {

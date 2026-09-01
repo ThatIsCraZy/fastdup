@@ -31,6 +31,9 @@ use logical_quota::LogicalQuotaTable;
 pub use logical_quota::{LogicalQuotaRule, LogicalQuotaStatus};
 pub use versioned_file::CommittedFile;
 
+pub const SMALL_FILE_SPILL_BYTES_V1: u64 = 8 * 1_024 * 1_024;
+pub const SMALL_FILE_PLACEMENT_XATTR: &[u8] = b"user.fastdup.placement";
+
 /// Format-independent reduction recipe retained by verified write-through DATA.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreparedDataRecipe {
@@ -728,17 +731,27 @@ impl Operation<'_> {
 fn write_capacity_claim(
     payload_bytes: usize,
     metadata_bytes: u64,
+    small_file: bool,
 ) -> Result<CommitCapacityClaim, PosixError> {
     if payload_bytes == 0 {
         return Ok(CommitCapacityClaim::default());
     }
     let payload_bytes = u64::try_from(payload_bytes).map_err(|_| PosixError::NoSpace)?;
-    let data_bytes = payload_bytes
+    let physical_bytes = payload_bytes
         .max(DATA_RECHUNK_MINIMUM_BYTES_V1)
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(DATA_RECORD_SAFETY_BYTES_V1))
         .ok_or(PosixError::NoSpace)?;
-    Ok(CommitCapacityClaim::new(metadata_bytes, data_bytes))
+    if small_file {
+        Ok(CommitCapacityClaim::with_small_file_bytes(
+            metadata_bytes
+                .checked_add(physical_bytes)
+                .ok_or(PosixError::NoSpace)?,
+            physical_bytes,
+        ))
+    } else {
+        Ok(CommitCapacityClaim::new(metadata_bytes, physical_bytes))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -847,6 +860,7 @@ pub trait MutationObserver: std::fmt::Debug + Send + Sync {
         inode: InodeId,
         offset: u64,
         mutation_sequence: u64,
+        small_file: bool,
         bytes: MutationPayload,
     ) -> Vec<ExternalizedExtent>;
 
@@ -863,9 +877,11 @@ pub trait MutationObserver: std::fmt::Debug + Send + Sync {
 /// Cleanup operations therefore use a zero claim and consume the separately
 /// protected Metadata floor when they eventually checkpoint.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_field_names)]
 pub struct CommitCapacityClaim {
     metadata_bytes: u64,
     data_bytes: u64,
+    small_file_bytes: u64,
 }
 
 impl CommitCapacityClaim {
@@ -874,6 +890,16 @@ impl CommitCapacityClaim {
         Self {
             metadata_bytes,
             data_bytes,
+            small_file_bytes: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_small_file_bytes(metadata_bytes: u64, small_file_bytes: u64) -> Self {
+        Self {
+            metadata_bytes,
+            data_bytes: 0,
+            small_file_bytes,
         }
     }
 
@@ -887,8 +913,13 @@ impl CommitCapacityClaim {
         self.data_bytes
     }
 
+    #[must_use]
+    pub const fn small_file_bytes(self) -> u64 {
+        self.small_file_bytes
+    }
+
     const fn is_empty(self) -> bool {
-        self.metadata_bytes == 0 && self.data_bytes == 0
+        self.metadata_bytes == 0 && self.data_bytes == 0 && self.small_file_bytes == 0
     }
 }
 
@@ -1351,6 +1382,19 @@ impl CommitInode {
     #[must_use]
     pub fn allocated_bytes(&self) -> u64 {
         self.file.allocated_bytes()
+    }
+
+    /// Evaluates Small-File placement against the exact frozen namespace cut.
+    #[must_use]
+    pub fn prefers_small_file_tier(&self, entries: &[CommitEntry]) -> bool {
+        small_file_policy(
+            self.logical_size(),
+            &self.metadata,
+            entries
+                .iter()
+                .filter(|entry| entry.target == self.inode)
+                .map(|entry| entry.name.as_slice()),
+        )
     }
 
     /// Returns the coalesced DATA/HOLE ranges changed since the immediately
@@ -3114,6 +3158,43 @@ impl Namespace {
         self.logical_quotas.status_for_inode(inode)
     }
 
+    /// Applies the v1 Small-File placement policy to one live regular inode.
+    ///
+    /// A `user.fastdup.placement` value of `metadata` or `data` is an explicit
+    /// hint. Without a hint, any current hardlink name ending in `.xml` or
+    /// `.json` (ASCII case-insensitive) selects the Small-File tier. New
+    /// records spill to DATA once the live logical size exceeds 8 MiB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an earlier invariant violation poisoned a namespace lock.
+    #[must_use]
+    pub fn prefers_small_file_tier(&self, inode: InodeId) -> bool {
+        let catalog = self
+            .catalog
+            .read()
+            .expect("ASSERT: namespace catalog lock poisoned");
+        let Some(object) = catalog.inodes.get(&inode) else {
+            return false;
+        };
+        let state = object
+            .state
+            .read()
+            .expect("ASSERT: inode state lock poisoned");
+        if state.kind != FileKind::Regular {
+            return false;
+        }
+        small_file_policy(
+            state.data.logical_size(),
+            &state.metadata,
+            catalog
+                .entries
+                .iter()
+                .filter(|(_, target)| **target == inode)
+                .map(|((_, name), _)| name.as_slice()),
+        )
+    }
+
     fn notify_write_handle_opened(&self, inode: InodeId) {
         if let Some(observer) = self
             .mutation_observer
@@ -4452,6 +4533,16 @@ impl Namespace {
     ) -> Result<WriteResult, PosixError> {
         let written = u32::try_from(payload.len()).map_err(|_| PosixError::FileTooLarge)?;
         let (object, open) = self.resolve_open_file(inode, handle)?;
+        let policy_name_matches = self
+            .catalog
+            .read()
+            .expect("ASSERT: namespace catalog lock poisoned")
+            .entries
+            .iter()
+            .any(|((_, name), target)| {
+                *target == inode
+                    && (ascii_suffix_eq(name, b".xml") || ascii_suffix_eq(name, b".json"))
+            });
         if open.options.access == AccessMode::ReadOnly {
             return Err(PosixError::BadHandle);
         }
@@ -4491,9 +4582,15 @@ impl Namespace {
             return Err(PosixError::FileTooLarge);
         }
         let capacity = state.data.plan_write_capacity(offset, data_length)?;
+        let small_file = small_file_policy_with_name_match(
+            state.data.logical_size().max(end),
+            &state.metadata,
+            policy_name_matches,
+        );
         let reservation = self.reserve_commit_capacity(write_capacity_claim(
             payload.len(),
             capacity.metadata_bytes(),
+            small_file,
         )?)?;
         let logical_before = state.data.allocated_bytes();
         let overwritten_end = end.min(state.data.logical_size());
@@ -4543,7 +4640,7 @@ impl Namespace {
             .as_ref()
             .cloned()
             .map_or_else(Vec::new, |observer| {
-                observer.accepted_write(inode, offset, next_sequence, payload)
+                observer.accepted_write(inode, offset, next_sequence, small_file, payload)
             });
         drop(observer_order);
         self.externalize_verified_extents(externalized);
@@ -5912,6 +6009,41 @@ fn validate_component(config: &NamespaceConfig, name: &[u8]) -> Result<(), Posix
         return Err(PosixError::InvalidName);
     }
     Ok(())
+}
+
+fn ascii_suffix_eq(value: &[u8], suffix: &[u8]) -> bool {
+    value
+        .get(value.len().saturating_sub(suffix.len())..)
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(suffix))
+}
+
+fn small_file_policy<'a>(
+    logical_size: u64,
+    metadata: &InodeMetadata,
+    mut names: impl Iterator<Item = &'a [u8]>,
+) -> bool {
+    small_file_policy_with_name_match(
+        logical_size,
+        metadata,
+        names.any(|name| ascii_suffix_eq(name, b".xml") || ascii_suffix_eq(name, b".json")),
+    )
+}
+
+fn small_file_policy_with_name_match(
+    logical_size: u64,
+    metadata: &InodeMetadata,
+    policy_name_matches: bool,
+) -> bool {
+    if logical_size > SMALL_FILE_SPILL_BYTES_V1 {
+        return false;
+    }
+    match metadata.get_xattr(SMALL_FILE_PLACEMENT_XATTR) {
+        Ok(value) if value == b"metadata" => return true,
+        Ok(value) if value == b"data" => return false,
+        Ok(_) | Err(PosixError::NoData) => {}
+        Err(_) => return false,
+    }
+    policy_name_matches
 }
 
 fn authorize_xattr_mutation(

@@ -548,6 +548,10 @@ pub fn volatile_mount_options() -> MountOptions {
     options
         .fs_name("fastdup")
         .default_permissions(true)
+        // Samba workers and local POSIX clients do not run as the process
+        // that owns the FUSE session. Kernel DAC checks still enforce inode
+        // permissions; this only permits those identities to reach them.
+        .allow_other(true)
         .dont_mask(true)
         .write_back(false);
     #[cfg(target_os = "linux")]

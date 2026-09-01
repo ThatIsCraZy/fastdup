@@ -74,17 +74,29 @@ passed. No daemon or FUSE mount remained after either run.
 
 ## Scope and remaining gates
 
+`RandomizedSigkillConfig` now adds the zloop-style companion: a fixed seed
+drives create, append, overwrite, truncate/grow, rename, unlink, and sparse
+writes while every acknowledged public view is recorded. A random real
+`SIGKILL` is valid only when remount equals one acknowledged snapshot prefix.
+The seed, operation log, daemon logs, and repository directories are retained.
+The ignored integration test defaults to 32 cases and 256 operations per case;
+`FASTDUP_RANDOM_SIGKILL_CASES` and `FASTDUP_RANDOM_SIGKILL_OPERATIONS` allow a
+short local proof. A four-case/64-operation run passed on 2026-09-01.
+
 This is real daemon-crash and remount evidence, not a block-device power-cut
-model. It does not inject torn writes, lost device caches, transient I/O stalls,
-or single-device loss. It also does not prove deadline behavior while the
-system is under sustained memory, CPU, or storage pressure. Lazy unmount only
-removes the dead daemon's mount attachment; it cannot flush daemon state.
+model. Deterministic `MemoryStorageIo::inject_durable_torn_write` coverage now
+models a newest-Container torn write and proves previous-generation fallback
+plus a scrub finding. Lost device caches, transient physical I/O stalls, and
+single-device loss remain outside this harness. It also does not prove deadline
+behavior while the system is under sustained memory, CPU, or storage pressure.
+Lazy unmount only removes the dead daemon's mount attachment; it cannot flush
+daemon state.
 
 Deterministic fake-clock tests now deliberately stall Metadata and DATA sync,
 close mutation admission at the five-second guard, and preserve priority and
 live visibility for already admitted mutations. A durable Appliance Recovery
 Latch survives process loss and requires complete startup recovery or a
-successful offline Scrub before it can be cleared. Remaining gates are
-randomized kill offsets during long ingest, block-device power-cut fault
-injection, and sustained-pressure deadline evidence. Commit Record v2 now
-supplies the stable downgrade/format-epoch fence.
+successful offline Scrub before it can be cleared. Remaining gates are a
+scheduled long-running execution of the randomized soak, real block-device
+power-cut fault injection, and sustained-pressure deadline evidence. Commit
+Record v2 supplies the stable downgrade/format-epoch fence.

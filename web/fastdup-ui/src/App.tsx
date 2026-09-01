@@ -13,6 +13,7 @@ import {
   Bell,
   Box,
   Check,
+  CheckCircle2,
   ChevronDown,
   CircleGauge,
   Clock3,
@@ -24,6 +25,7 @@ import {
   KeyRound,
   LayoutDashboard,
   LockKeyhole,
+  LoaderCircle,
   LogOut,
   MemoryStick,
   Network,
@@ -45,14 +47,16 @@ import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader } from "./components/ui/card";
 import {
+  type AuditEvent,
   type ApplianceSnapshot,
   type BlockTarget,
+  type DiskTelemetry,
   type JobStatus,
   type RepositorySettings,
   type SessionInfo,
   type ShareSettings,
   type TelemetrySnapshot,
-  previewSnapshot,
+  emptyApplianceSnapshot,
 } from "./types";
 
 const navigation = [
@@ -77,6 +81,61 @@ const stateLabels: Record<string, string> = {
   error: "Fehler",
 };
 
+const jobLabels: Record<string, string> = {
+  provision: "Provisionierung",
+  adopt: "Repository-Übernahme",
+  mount: "Mount",
+  unmount: "Unmount",
+  offline_scrub: "Offline-Scrub",
+  update_settings: "Einstellungen",
+  upsert_share: "SMB-Freigabe",
+  delete_share: "Share-Löschung",
+};
+
+type NoticeTone = "working" | "success" | "error";
+
+interface Notice {
+  id: string;
+  tone: NoticeTone;
+  title: string;
+  message: string;
+}
+
+function NotificationCenter({
+  notices,
+  dismiss,
+}: {
+  notices: Notice[];
+  dismiss: (id: string) => void;
+}) {
+  return (
+    <div className="notice-stack" aria-live="polite">
+      {notices.map((notice) => (
+        <section
+          className={`notice notice-${notice.tone}`}
+          role={notice.tone === "error" ? "alert" : "status"}
+          key={notice.id}
+        >
+          {notice.tone === "success" ? (
+            <CheckCircle2 />
+          ) : notice.tone === "error" ? (
+            <AlertTriangle />
+          ) : (
+            <LoaderCircle className="notice-spinner" />
+          )}
+          <span>
+            <strong>{notice.title}</strong>
+            <small>{notice.message}</small>
+          </span>
+          <button onClick={() => dismiss(notice.id)} aria-label="Meldung schließen">
+            <X />
+          </button>
+        </section>
+      ))}
+    </div>
+  );
+}
+
 function formatBytes(value: number) {
   if (!Number.isFinite(value)) return "—";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
@@ -87,6 +146,25 @@ function formatBytes(value: number) {
     unit += 1;
   }
   return `${new Intl.NumberFormat("de-DE", { maximumFractionDigits: 1 }).format(current)} ${units[unit]}`;
+}
+
+function repositoryDisks(snapshot: ApplianceSnapshot): DiskTelemetry[] {
+  if (!snapshot.repository) return [];
+  const roles = new Map<string, string>();
+  for (const [targetId, role] of [
+    [snapshot.repository.metadataTarget, "Metadata"],
+    [snapshot.repository.dataTarget, "DATA"],
+  ] as const) {
+    const target = snapshot.targets.find((item) => item.stableId === targetId);
+    if (!target) continue;
+    const kernelNames = target.backingDisks.length
+      ? target.backingDisks.map((disk) => disk.kernelName)
+      : [target.kernelName];
+    for (const kernelName of kernelNames) roles.set(kernelName, role);
+  }
+  return snapshot.telemetry.disks
+    .filter((disk) => roles.has(disk.id))
+    .map((disk) => ({ ...disk, role: roles.get(disk.id) ?? disk.role }));
 }
 
 function api<T>(
@@ -243,11 +321,18 @@ function ConfirmDialog({
 function RepositoryHero({
   telemetry,
   runCommand,
+  busy,
 }: {
   telemetry: TelemetrySnapshot;
   runCommand: (kind: "mount" | "unmount" | "offline_scrub") => void;
+  busy: boolean;
 }) {
   const online = telemetry.repositoryState === "online";
+  const mountable = ["unmounted", "error"].includes(
+    telemetry.repositoryState,
+  );
+  const generation = telemetry.commitGeneration;
+  const checkpointAge = telemetry.lastCheckpointSeconds;
   return (
     <section className="repo-hero">
       <div className="repo-identity">
@@ -262,8 +347,14 @@ function RepositoryHero({
               <span className="status-dot" />
               {stateLabels[telemetry.repositoryState]}
             </Badge>
-            <span>Generation {telemetry.sequence.toLocaleString("de-DE")}</span>
-            <span>Checkpoint vor {telemetry.lastCheckpointSeconds} s</span>
+            <span>
+              Generation {generation?.toLocaleString("de-DE") ?? "—"}
+            </span>
+            <span>
+              {checkpointAge === undefined
+                ? "Checkpoint —"
+                : `Checkpoint vor ${checkpointAge} s`}
+            </span>
           </p>
         </div>
       </div>
@@ -271,16 +362,24 @@ function RepositoryHero({
         <Button
           variant="secondary"
           onClick={() => runCommand("offline_scrub")}
-          disabled={!online}
+          disabled={!online || busy}
         >
           <TerminalSquare size={16} /> Offline-Scrub
         </Button>
         {online ? (
-          <Button variant="danger" onClick={() => runCommand("unmount")}>
+          <Button
+            variant="danger"
+            onClick={() => runCommand("unmount")}
+            disabled={busy}
+          >
             <Unplug size={16} /> Unmount
           </Button>
         ) : (
-          <Button variant="secondary" onClick={() => runCommand("mount")}>
+          <Button
+            variant="secondary"
+            onClick={() => runCommand("mount")}
+            disabled={!mountable || busy}
+          >
             <Play size={16} /> Mount
           </Button>
         )}
@@ -352,10 +451,14 @@ function throughputOption(snapshot: TelemetrySnapshot, extended = false) {
 
 function Overview({
   snapshot,
+  disks,
   runCommand,
+  busy,
 }: {
   snapshot: TelemetrySnapshot;
+  disks: DiskTelemetry[];
   runCommand: (kind: "mount" | "unmount" | "offline_scrub") => void;
+  busy: boolean;
 }) {
   const chartOption = useMemo(() => throughputOption(snapshot), [snapshot]);
   const usedPercent = snapshot.dataCapacityBytes
@@ -363,7 +466,7 @@ function Overview({
     : 0;
   return (
     <>
-      <RepositoryHero telemetry={snapshot} runCommand={runCommand} />
+      <RepositoryHero telemetry={snapshot} runCommand={runCommand} busy={busy} />
       <section className="metric-grid">
         <MetricCard
           icon={Activity}
@@ -403,9 +506,7 @@ function Overview({
             <div className="legend">
               <span className="read">Read</span>
               <span className="write">Write</span>
-              <button>
-                Letzte 15 min <ChevronDown size={14} />
-              </button>
+              <span className="range-label">Letzte 15 min</span>
             </div>
           </CardHeader>
           <CardContent>
@@ -461,12 +562,12 @@ function Overview({
           </CardContent>
         </Card>
       </section>
-      <DiskTelemetryTable snapshot={snapshot} />
+      <DiskTelemetryTable disks={disks} />
     </>
   );
 }
 
-function DiskTelemetryTable({ snapshot }: { snapshot: TelemetrySnapshot }) {
+function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
   return (
     <Card className="disk-card">
       <CardHeader>
@@ -487,7 +588,7 @@ function DiskTelemetryTable({ snapshot }: { snapshot: TelemetrySnapshot }) {
           <span>Outstanding I/O</span>
           <span>Status</span>
         </div>
-        {snapshot.disks.map((disk) => (
+        {disks.map((disk) => (
           <div className="disk-table" key={disk.id}>
             <span className="disk-name">
               <i>
@@ -528,6 +629,11 @@ function DiskTelemetryTable({ snapshot }: { snapshot: TelemetrySnapshot }) {
             </span>
           </div>
         ))}
+        {disks.length === 0 && (
+          <div className="disk-empty">
+            Kein Repository gebunden – keine relevanten Targets.
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -536,13 +642,20 @@ function DiskTelemetryTable({ snapshot }: { snapshot: TelemetrySnapshot }) {
 function RepositoryPage({
   snapshot,
   runCommand,
+  busy,
 }: {
   snapshot: ApplianceSnapshot;
   runCommand: (kind: "mount" | "unmount" | "offline_scrub") => void;
+  busy: boolean;
 }) {
+  const online = snapshot.telemetry.repositoryState === "online";
   return (
     <>
-      <RepositoryHero telemetry={snapshot.telemetry} runCommand={runCommand} />
+      <RepositoryHero
+        telemetry={snapshot.telemetry}
+        runCommand={runCommand}
+        busy={busy}
+      />
       <div className="two-column">
         <Card>
           <CardHeader>
@@ -584,13 +697,16 @@ function RepositoryPage({
             <p>
               <span>Aktive Generation</span>
               <strong>
-                {snapshot.telemetry.sequence.toLocaleString("de-DE")}
+                {snapshot.telemetry.commitGeneration?.toLocaleString("de-DE") ??
+                  "—"}
               </strong>
             </p>
             <p>
               <span>Checkpoint-Alter</span>
               <strong>
-                {snapshot.telemetry.lastCheckpointSeconds} Sekunden
+                {snapshot.telemetry.lastCheckpointSeconds === undefined
+                  ? "—"
+                  : `${snapshot.telemetry.lastCheckpointSeconds} Sekunden`}
               </strong>
             </p>
             <p>
@@ -624,6 +740,7 @@ function RepositoryPage({
             <Button
               variant="secondary"
               onClick={() => runCommand("offline_scrub")}
+              disabled={!online || busy}
             >
               Starten
             </Button>
@@ -637,7 +754,11 @@ function RepositoryPage({
                 Appliance-Reboot.
               </small>
             </span>
-            <Button variant="secondary" onClick={() => runCommand("unmount")}>
+            <Button
+              variant="secondary"
+              onClick={() => runCommand("unmount")}
+              disabled={!online || busy}
+            >
               Unmount
             </Button>
           </div>
@@ -691,13 +812,22 @@ function TargetCard({
 function DrivesPage({
   snapshot,
   submit,
+  busy,
 }: {
   snapshot: ApplianceSnapshot;
   submit: (body: unknown) => Promise<void>;
+  busy: boolean;
 }) {
   const [metadata, setMetadata] = useState("");
   const [data, setData] = useState("");
   const [confirm, setConfirm] = useState(false);
+  const sortedTargets = useMemo(
+    () => [
+      ...snapshot.targets.filter((target) => target.eligible),
+      ...snapshot.targets.filter((target) => !target.eligible),
+    ],
+    [snapshot.targets],
+  );
   const selectedMeta = snapshot.targets.find(
     (target) => target.stableId === metadata,
   );
@@ -731,7 +861,7 @@ function DrivesPage({
             </div>
           </CardHeader>
           <CardContent className="target-list">
-            {snapshot.targets.map((target) => (
+            {sortedTargets.map((target) => (
               <TargetCard
                 key={`meta-${target.stableId}`}
                 target={target}
@@ -750,7 +880,7 @@ function DrivesPage({
             </div>
           </CardHeader>
           <CardContent className="target-list">
-            {snapshot.targets.map((target) => (
+            {sortedTargets.map((target) => (
               <TargetCard
                 key={`data-${target.stableId}`}
                 target={target}
@@ -775,7 +905,13 @@ function DrivesPage({
         </span>
         <Button
           variant="danger"
-          disabled={!metadata || !data || metadata === data}
+          disabled={
+            Boolean(snapshot.repository) ||
+            busy ||
+            !metadata ||
+            !data ||
+            metadata === data
+          }
           onClick={() => setConfirm(true)}
         >
           <Trash2 size={15} /> Neues Repository initialisieren
@@ -1211,8 +1347,18 @@ function PrincipalPicker({
   );
 }
 
-function TelemetryPage({ snapshot }: { snapshot: TelemetrySnapshot }) {
+function TelemetryPage({
+  snapshot,
+  disks,
+  loadHistory,
+}: {
+  snapshot: TelemetrySnapshot;
+  disks: DiskTelemetry[];
+  loadHistory: (seconds: number) => Promise<TelemetrySnapshot[]>;
+}) {
   const [range, setRange] = useState("15 min");
+  const [history, setHistory] = useState<TelemetrySnapshot[] | null>(null);
+  const [loading, setLoading] = useState(false);
   const ranges = [
     "Live",
     "15 min",
@@ -1223,9 +1369,50 @@ function TelemetryPage({ snapshot }: { snapshot: TelemetrySnapshot }) {
     "30 d",
     "90 d",
   ];
+  const rangeSeconds: Record<string, number> = {
+    "15 min": 15 * 60,
+    "1 h": 60 * 60,
+    "6 h": 6 * 60 * 60,
+    "24 h": 24 * 60 * 60,
+    "7 d": 7 * 24 * 60 * 60,
+    "30 d": 30 * 24 * 60 * 60,
+    "90 d": 90 * 24 * 60 * 60,
+  };
+  const displayedSnapshot = useMemo(
+    () =>
+      history
+        ? {
+            ...snapshot,
+            series: history.map((sample) => ({
+              time: sample.observedAt,
+              read: sample.frontendReadMbps,
+              write: sample.frontendWriteMbps,
+            })),
+          }
+        : snapshot,
+    [history, snapshot],
+  );
+  const resourceSamples = history ?? [snapshot];
+  const selectRange = (item: string) => {
+    setRange(item);
+    if (item === "Live") {
+      setHistory(null);
+      return;
+    }
+    setLoading(true);
+    void loadHistory(rangeSeconds[item] ?? 900)
+      .then(setHistory)
+      .finally(() => setLoading(false));
+  };
   const resourceOption = useMemo(
     () => ({
-      ...throughputOption(snapshot, true),
+      ...throughputOption(displayedSnapshot, true),
+      xAxis: {
+        type: "category",
+        data: resourceSamples.map((sample) => sample.observedAt),
+        axisLabel: { color: "#70838d" },
+        axisLine: { lineStyle: { color: "#324650" } },
+      },
       yAxis: {
         type: "value",
         max: 100,
@@ -1238,23 +1425,19 @@ function TelemetryPage({ snapshot }: { snapshot: TelemetrySnapshot }) {
           name: "CPU",
           type: "line",
           showSymbol: false,
-          data: snapshot.series.map(
-            (_, index) => snapshot.cpuPercent + Math.sin(index / 6) * 9,
-          ),
+          data: resourceSamples.map((sample) => sample.cpuPercent),
           lineStyle: { color: "#f5b84b" },
         },
         {
           name: "RAM",
           type: "line",
           showSymbol: false,
-          data: snapshot.series.map(
-            (_, index) => snapshot.ramPercent + Math.cos(index / 13) * 3,
-          ),
+          data: resourceSamples.map((sample) => sample.ramPercent),
           lineStyle: { color: "#3ddc97" },
         },
       ],
     }),
-    [snapshot],
+    [displayedSnapshot, resourceSamples],
   );
   return (
     <>
@@ -1271,7 +1454,7 @@ function TelemetryPage({ snapshot }: { snapshot: TelemetrySnapshot }) {
           {ranges.map((item) => (
             <button
               className={range === item ? "active" : ""}
-              onClick={() => setRange(item)}
+              onClick={() => selectRange(item)}
               key={item}
             >
               {item}
@@ -1303,7 +1486,11 @@ function TelemetryPage({ snapshot }: { snapshot: TelemetrySnapshot }) {
         <MetricCard
           icon={Clock3}
           label="Checkpoint"
-          value={`${snapshot.lastCheckpointSeconds} s`}
+          value={
+            snapshot.lastCheckpointSeconds === undefined
+              ? "—"
+              : `${snapshot.lastCheckpointSeconds} s`
+          }
           detail="Alter der aktiven Generation"
           tone="amber"
         />
@@ -1316,14 +1503,14 @@ function TelemetryPage({ snapshot }: { snapshot: TelemetrySnapshot }) {
             </span>
             <h2>POSIX Throughput & gemeinsamer Zeitcursor</h2>
           </div>
-          <Badge className="live">
+          <Badge className={loading ? "warning" : "live"}>
             <span className="pulse" />
-            LIVE
+            {loading ? "LÄDT" : range === "Live" ? "LIVE" : range.toUpperCase()}
           </Badge>
         </CardHeader>
         <CardContent>
           <ReactECharts
-            option={throughputOption(snapshot, true)}
+            option={throughputOption(displayedSnapshot, true)}
             style={{ height: 330 }}
           />
         </CardContent>
@@ -1379,7 +1566,7 @@ function TelemetryPage({ snapshot }: { snapshot: TelemetrySnapshot }) {
           </CardContent>
         </Card>
       </div>
-      <DiskTelemetryTable snapshot={snapshot} />
+      <DiskTelemetryTable disks={disks} />
       <div className="telemetry-tabs">
         <span>Latenzen p50/p95/p99</span>
         <span>io_uring In-Flight</span>
@@ -1391,8 +1578,15 @@ function TelemetryPage({ snapshot }: { snapshot: TelemetrySnapshot }) {
   );
 }
 
-function EventsPage({ jobs, alerts }: { jobs: JobStatus[]; alerts: string[] }) {
-  const allJobs = jobs.length ? jobs : previewSnapshot.jobs;
+function EventsPage({
+  jobs,
+  alerts,
+  exportAudit,
+}: {
+  jobs: JobStatus[];
+  alerts: string[];
+  exportAudit: () => void;
+}) {
   return (
     <>
       <div className="page-title">
@@ -1403,7 +1597,7 @@ function EventsPage({ jobs, alerts }: { jobs: JobStatus[]; alerts: string[] }) {
             Nachvollziehbare Managementaktionen, Jobs, Warnungen und Alarme.
           </p>
         </div>
-        <Button variant="secondary">
+        <Button variant="secondary" onClick={exportAudit}>
           <FileStack size={15} /> Audit exportieren
         </Button>
       </div>
@@ -1431,7 +1625,7 @@ function EventsPage({ jobs, alerts }: { jobs: JobStatus[]; alerts: string[] }) {
             <span>Fortschritt</span>
             <span>Ergebnis</span>
           </div>
-          {allJobs.map((job) => (
+          {jobs.map((job) => (
             <div className="event-row" key={job.id}>
               <span>
                 {new Date(job.updatedAt * 1000).toLocaleString("de-DE")}
@@ -1457,6 +1651,9 @@ function EventsPage({ jobs, alerts }: { jobs: JobStatus[]; alerts: string[] }) {
               <span>{job.message}</span>
             </div>
           ))}
+          {jobs.length === 0 && (
+            <div className="event-empty">Noch keine Managementvorgänge.</div>
+          )}
         </CardContent>
       </Card>
     </>
@@ -1812,46 +2009,54 @@ function Login({ onLogin }: { onLogin: (session: SessionInfo) => void }) {
 
 export function App() {
   const [active, setActive] = useState("Übersicht");
-  const [snapshot, setSnapshot] = useState<ApplianceSnapshot>(previewSnapshot);
+  const [snapshot, setSnapshot] = useState<ApplianceSnapshot>(() =>
+    emptyApplianceSnapshot(),
+  );
   const [session, setSession] = useState<SessionInfo | null | undefined>(
     undefined,
   );
-  const [fresh, setFresh] = useState(true);
+  const [fresh, setFresh] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [confirmAction, setConfirmAction] = useState<
     "mount" | "unmount" | "offline_scrub" | null
   >(null);
   const [alerts, setAlerts] = useState<string[]>([]);
+  const [notices, setNotices] = useState<Notice[]>([]);
   const [principals, setPrincipals] = useState({
-    users: ["backup", "administrator", "replication"],
-    groups: ["storage-admins", "backup-operators", "auditors"],
+    users: [] as string[],
+    groups: [] as string[],
   });
-  const lastSample = useRef(Date.now());
+  const lastSample = useRef(0);
+  const notify = useCallback((notice: Notice) => {
+    setNotices((current) => [
+      notice,
+      ...current.filter((item) => item.id !== notice.id),
+    ].slice(0, 5));
+  }, []);
 
   const refresh = useCallback(
-    () => api<ApplianceSnapshot>("/api/v1/snapshot").then(setSnapshot),
+    () =>
+      api<ApplianceSnapshot>("/api/v1/snapshot")
+        .then((value) => {
+          setSnapshot(value);
+          setFresh(true);
+        })
+        .catch(() => setFresh(false)),
     [],
   );
   useEffect(() => {
     api<SessionInfo>("/api/v1/session")
       .then((value) => {
         setSession(value);
-      if (!value.mustChangePassword) void refresh();
-      if (!value.mustChangePassword)
-        void api<{ users: string[]; groups: string[] }>(
-          "/api/v1/samba/principals",
-        ).then(setPrincipals);
+        if (!value.mustChangePassword) void refresh();
+        if (!value.mustChangePassword)
+          void api<{ users: string[]; groups: string[] }>(
+            "/api/v1/samba/principals",
+          )
+            .then(setPrincipals)
+            .catch(() => setPrincipals({ users: [], groups: [] }));
       })
-      .catch(() => {
-        if (import.meta.env.DEV)
-          setSession({
-            username: "admin",
-            csrfToken: "preview",
-            mustChangePassword: false,
-            certificateFingerprint: previewSnapshot.certificateFingerprint,
-          });
-        else setSession(null);
-      });
+      .catch(() => setSession(null));
   }, [refresh]);
   useEffect(() => {
     if (!session || session.mustChangePassword) return;
@@ -1870,6 +2075,23 @@ export function App() {
         ...current,
         jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)],
       }));
+      notify({
+        id: `job-${job.id}`,
+        tone:
+          job.state === "failed"
+            ? "error"
+            : job.state === "succeeded"
+              ? "success"
+              : "working",
+        title: `${jobLabels[job.kind] ?? job.kind} ${
+          job.state === "failed"
+            ? "fehlgeschlagen"
+            : job.state === "succeeded"
+              ? "abgeschlossen"
+              : "läuft"
+        }`,
+        message: job.message,
+      });
       if (job.state === "succeeded") void refresh();
     });
     source.addEventListener("alert", (event) => {
@@ -1877,6 +2099,12 @@ export function App() {
         message: string;
       };
       setAlerts((current) => [alert.message, ...current]);
+      notify({
+        id: `alert-${Date.now()}`,
+        tone: "error",
+        title: "Appliance-Alarm",
+        message: alert.message,
+      });
     });
     source.onerror = () => setFresh(false);
     const stale = window.setInterval(
@@ -1887,35 +2115,67 @@ export function App() {
       source.close();
       window.clearInterval(stale);
     };
-  }, [refresh, session]);
+  }, [notify, refresh, session]);
 
   const submit = async (command: unknown) => {
     if (!session) return;
-    const job = await api<JobStatus>(
-      "/api/v1/repository/commands",
-      {
-        method: "POST",
-        headers: { "idempotency-key": crypto.randomUUID() },
-        body: JSON.stringify(command),
-      },
-      session.csrfToken,
-    );
-    setSnapshot((current) => ({ ...current, jobs: [job, ...current.jobs] }));
+    try {
+      const job = await api<JobStatus>(
+        "/api/v1/repository/commands",
+        {
+          method: "POST",
+          headers: { "idempotency-key": crypto.randomUUID() },
+          body: JSON.stringify(command),
+        },
+        session.csrfToken,
+      );
+      setSnapshot((current) => ({ ...current, jobs: [job, ...current.jobs] }));
+      notify({
+        id: `job-${job.id}`,
+        tone: "working",
+        title: `${jobLabels[job.kind] ?? job.kind} gestartet`,
+        message: job.message,
+      });
+    } catch (reason) {
+      notify({
+        id: `request-${Date.now()}`,
+        tone: "error",
+        title: "Aktion nicht gestartet",
+        message:
+          reason instanceof Error
+            ? reason.message
+            : "Die Appliance-Anfrage ist fehlgeschlagen",
+      });
+    }
   };
   const runCommand = (kind: "mount" | "unmount" | "offline_scrub") =>
     kind === "mount" ? void submit({ kind }) : setConfirmAction(kind);
   const saveShare = async (share: ShareSettings) => {
     if (!session) return;
-    const job = await api<JobStatus>(
-      "/api/v1/shares",
-      { method: "POST", body: JSON.stringify(share) },
-      session.csrfToken,
-    );
-    setSnapshot((current) => ({
-      ...current,
-      shares: [...current.shares.filter((item) => item.id !== share.id), share],
-      jobs: [job, ...current.jobs],
-    }));
+    try {
+      const job = await api<JobStatus>(
+        "/api/v1/shares",
+        { method: "POST", body: JSON.stringify(share) },
+        session.csrfToken,
+      );
+      setSnapshot((current) => ({
+        ...current,
+        jobs: [job, ...current.jobs],
+      }));
+      notify({
+        id: `job-${job.id}`,
+        tone: "working",
+        title: "SMB-Freigabe wird aktiviert",
+        message: job.message,
+      });
+    } catch (reason) {
+      notify({
+        id: `share-${Date.now()}`,
+        tone: "error",
+        title: "Freigabe nicht geändert",
+        message: reason instanceof Error ? reason.message : "Unbekannter Fehler",
+      });
+    }
   };
   const removeShare = (share: ShareSettings) => {
     if (
@@ -1929,13 +2189,27 @@ export function App() {
       `/api/v1/shares/${encodeURIComponent(share.id)}`,
       { method: "DELETE", headers: { "if-match": String(share.revision) } },
       session.csrfToken,
-    ).then((job) =>
-      setSnapshot((current) => ({
-        ...current,
-        shares: current.shares.filter((item) => item.id !== share.id),
-        jobs: [job, ...current.jobs],
-      })),
-    );
+    )
+      .then((job) => {
+        setSnapshot((current) => ({
+          ...current,
+          jobs: [job, ...current.jobs],
+        }));
+        notify({
+          id: `job-${job.id}`,
+          tone: "working",
+          title: "Share-Löschung gestartet",
+          message: job.message,
+        });
+      })
+      .catch((reason: Error) =>
+        notify({
+          id: `share-delete-${Date.now()}`,
+          tone: "error",
+          title: "Freigabe nicht gelöscht",
+          message: reason.message,
+        }),
+      );
   };
   const saveSettings = (settings: RepositorySettings) =>
     void submit({
@@ -1943,13 +2217,78 @@ export function App() {
       expected_revision: settings.revision,
       settings,
     });
+  const exportAudit = async () => {
+    try {
+      const records = await api<AuditEvent[]>("/api/v1/audit");
+      const cell = (value: string | number) =>
+        `"${String(value).replaceAll('"', '""')}"`;
+      const csv = [
+        ["Zeit", "Akteur", "Aktion", "Ergebnis", "Details"],
+        ...records.map((record) => [
+          new Date(record.timestamp * 1000).toISOString(),
+          record.actor,
+          record.action,
+          record.outcome,
+          record.detail,
+        ]),
+      ]
+        .map((row) => row.map(cell).join(";"))
+        .join("\n");
+      const url = URL.createObjectURL(
+        new Blob([`\uFEFF${csv}\n`], { type: "text/csv;charset=utf-8" }),
+      );
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `fastdup-audit-${new Date().toISOString().slice(0, 10)}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+      notify({
+        id: "audit-export",
+        tone: "success",
+        title: "Audit exportiert",
+        message: `${records.length} Audit-Einträge wurden als CSV bereitgestellt.`,
+      });
+    } catch (reason) {
+      notify({
+        id: "audit-export",
+        tone: "error",
+        title: "Audit-Export fehlgeschlagen",
+        message: reason instanceof Error ? reason.message : "Unbekannter Fehler",
+      });
+    }
+  };
+  const loadTelemetryHistory = async (seconds: number) => {
+    const now = Math.floor(Date.now() / 1000);
+    try {
+      return await api<TelemetrySnapshot[]>(
+        `/api/v1/telemetry/history?from=${now - seconds}&to=${now}&limit=50000`,
+      );
+    } catch (reason) {
+      notify({
+        id: "telemetry-history",
+        tone: "error",
+        title: "Telemetrie-Zeitraum nicht geladen",
+        message: reason instanceof Error ? reason.message : "Unbekannter Fehler",
+      });
+      return [];
+    }
+  };
   const logout = () => {
     if (!session) return;
     api<void>(
       "/api/v1/session/logout",
       { method: "POST" },
       session.csrfToken,
-    ).finally(() => setSession(null));
+    )
+      .then(() => setSession(null))
+      .catch((reason: Error) =>
+        notify({
+          id: "logout",
+          tone: "error",
+          title: "Abmeldung fehlgeschlagen",
+          message: reason.message,
+        }),
+      );
   };
 
   if (session === undefined)
@@ -1963,6 +2302,10 @@ export function App() {
     );
   if (!session) return <Login onLogin={setSession} />;
 
+  const operationBusy = snapshot.jobs.some(
+    (job) => job.state === "queued" || job.state === "running",
+  );
+
   let content: React.ReactNode;
   if (session.mustChangePassword)
     content = (
@@ -1974,12 +2317,25 @@ export function App() {
     );
   else if (active === "Übersicht")
     content = (
-      <Overview snapshot={snapshot.telemetry} runCommand={runCommand} />
+      <Overview
+        snapshot={snapshot.telemetry}
+        disks={repositoryDisks(snapshot)}
+        runCommand={runCommand}
+        busy={operationBusy}
+      />
     );
   else if (active === "Repository")
-    content = <RepositoryPage snapshot={snapshot} runCommand={runCommand} />;
+    content = (
+      <RepositoryPage
+        snapshot={snapshot}
+        runCommand={runCommand}
+        busy={operationBusy}
+      />
+    );
   else if (active === "Laufwerke")
-    content = <DrivesPage snapshot={snapshot} submit={submit} />;
+    content = (
+      <DrivesPage snapshot={snapshot} submit={submit} busy={operationBusy} />
+    );
   else if (active === "SMB-Freigaben")
     content = (
       <SharesPage
@@ -1990,9 +2346,17 @@ export function App() {
       />
     );
   else if (active === "Telemetrie")
-    content = <TelemetryPage snapshot={snapshot.telemetry} />;
+    content = (
+      <TelemetryPage
+        snapshot={snapshot.telemetry}
+        disks={repositoryDisks(snapshot)}
+        loadHistory={loadTelemetryHistory}
+      />
+    );
   else if (active === "Ereignisse")
-    content = <EventsPage jobs={snapshot.jobs} alerts={alerts} />;
+    content = (
+      <EventsPage jobs={snapshot.jobs} alerts={alerts} exportAudit={exportAudit} />
+    );
   else
     content = (
       <SettingsPage
@@ -2007,12 +2371,27 @@ export function App() {
             "/api/v1/tls/regenerate",
             { method: "POST" },
             session.csrfToken,
-          ).then(({ certificateFingerprint }) =>
-            setSnapshot((current) => ({
-              ...current,
-              certificateFingerprint,
-            })),
-          );
+          )
+            .then(({ certificateFingerprint }) => {
+              setSnapshot((current) => ({
+                ...current,
+                certificateFingerprint,
+              }));
+              notify({
+                id: "tls-regenerate",
+                tone: "success",
+                title: "TLS-Zertifikat erneuert",
+                message: "Das neue Zertifikat ist ohne Reboot aktiv.",
+              });
+            })
+            .catch((reason: Error) =>
+              notify({
+                id: "tls-regenerate",
+                tone: "error",
+                title: "TLS-Zertifikat nicht erneuert",
+                message: reason.message,
+              }),
+            );
         }}
       />
     );
@@ -2107,6 +2486,12 @@ export function App() {
           </p>
         </ConfirmDialog>
       )}
+      <NotificationCenter
+        notices={notices}
+        dismiss={(id) =>
+          setNotices((current) => current.filter((notice) => notice.id !== id))
+        }
+      />
     </div>
   );
 }

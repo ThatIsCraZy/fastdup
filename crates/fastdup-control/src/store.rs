@@ -1,11 +1,12 @@
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::{
-    JobState, JobStatus, RepositoryBinding, RepositorySettings, ShareSettings, TelemetrySnapshot,
-    unix_seconds,
+    AuditEvent, JobState, JobStatus, RepositoryBinding, RepositorySettings, ShareSettings,
+    TelemetrySnapshot, unix_seconds,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +104,7 @@ impl ControlStore {
             PRAGMA optimize;
             ",
         )?;
+        make_database_group_writable(path)?;
         let store = Self {
             connection: Arc::new(Mutex::new(connection)),
         };
@@ -294,6 +296,26 @@ impl ControlStore {
         Ok(())
     }
 
+    pub fn recent_audit(&self, limit: usize) -> Result<Vec<AuditEvent>, StoreError> {
+        let connection = self.locked()?;
+        let mut statement = connection.prepare(
+            "SELECT id, timestamp, actor, action, outcome, detail FROM audit_log ORDER BY timestamp DESC, id DESC LIMIT ?1",
+        )?;
+        statement
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(AuditEvent {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    actor: row.get(2)?,
+                    action: row.get(3)?,
+                    outcome: row.get(4)?,
+                    detail: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn begin_provisioning(
         &self,
         metadata_target: &str,
@@ -408,6 +430,7 @@ impl TelemetryStore {
             PRAGMA optimize;
             ",
         )?;
+        make_database_group_writable(path)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -483,6 +506,32 @@ impl TelemetryStore {
         )?;
         Ok(())
     }
+}
+
+fn make_database_group_writable(path: &Path) -> Result<(), StoreError> {
+    let mut paths = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        paths.push(sidecar.into());
+    }
+    for candidate in paths {
+        let metadata = match std::fs::metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_store_error(error)),
+        };
+        let mut permissions = metadata.permissions();
+        if permissions.mode() & 0o777 != 0o660 {
+            permissions.set_mode(0o660);
+            std::fs::set_permissions(candidate, permissions).map_err(io_store_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn io_store_error(error: std::io::Error) -> StoreError {
+    StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
 fn roll_up(
@@ -569,6 +618,22 @@ mod tests {
             store.update_settings(current.revision, current),
             Err(StoreError::RevisionConflict)
         ));
+    }
+
+    #[test]
+    fn audit_export_preserves_operator_feedback_fields() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ControlStore::open(&directory.path().join("control.db")).expect("open store");
+        store
+            .audit("admin", "mount", "accepted", "job-42")
+            .expect("write audit event");
+
+        let events = store.recent_audit(10).expect("read audit events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "admin");
+        assert_eq!(events[0].action, "mount");
+        assert_eq!(events[0].outcome, "accepted");
+        assert_eq!(events[0].detail, "job-42");
     }
 
     #[test]

@@ -11,9 +11,10 @@ use fastdup_appliance::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction, CheckpointProgressAction,
     DurabilityObservation, DurabilitySupervisor, DurableNamespace, INODE_RESERVATION_SPAN_V1,
     ONLINE_GC_CONTROL_REQUEST, OnlineGcPolicy, OnlineGcScheduler, PhysicalPoolIsolation,
-    PoolIsolationPolicy, ProfiledCheckpoint, STATFS_RESERVE_BASIS_POINTS, StatFsOverride,
-    TieredStatFsSource, bind_online_gc_control_socket, checkpoint_exact_index_profile_v1,
-    checkpoint_policy_set, online_gc_control_path,
+    PoolIsolationPolicy, ProfiledCheckpoint, SMALL_FILE_PROJECT_ID_ENV, SMALL_FILE_QUOTA_BYTES_ENV,
+    STATFS_RESERVE_BASIS_POINTS, SmallFileTierIsolation, StatFsOverride, TieredStatFsSource,
+    bind_online_gc_control_socket, checkpoint_exact_index_profile_v1, checkpoint_policy_set,
+    online_gc_control_path,
 };
 use fastdup_copy_metrics::copy_telemetry;
 use fastdup_format::{HEADER_BYTES, VerifiedContainerPublication};
@@ -27,7 +28,7 @@ use fastdup_store::{
     GcCandidateCatalogRepository, GenerationRepository, IndexedRequiredChunkVerifier,
     MaintenanceRepository, OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport,
     OnlineGcRunMode, OwnedContainerPublication, RecoveryCheckpointRepository,
-    SimilarityIndexRepository, StorageIo, StoreError, publication_sample_ranges,
+    SimilarityIndexRepository, StorageIo, StoreError, TieredStorageIo, publication_sample_ranges,
     system_memory_budget_governor,
 };
 
@@ -67,8 +68,11 @@ struct StartupPolicies {
     pool_isolation: PoolIsolationPolicy,
 }
 
-type FsAppliance = DurableNamespace<FsStorageIo, TelemetryStorageIo>;
-type FsOnlineMaintenance = MaintenanceRepository<FsStorageIo, FsStorageIo, FsStorageIo>;
+type FrontendContainerStorage = TieredStorageIo<TelemetryStorageIo, FsStorageIo>;
+type MaintenanceContainerStorage = TieredStorageIo<FsStorageIo, FsStorageIo>;
+type FsAppliance = DurableNamespace<FsStorageIo, FrontendContainerStorage>;
+type FsOnlineMaintenance =
+    MaintenanceRepository<FsStorageIo, MaintenanceContainerStorage, FsStorageIo>;
 type FsGcCatalog = GcCandidateCatalogRepository<FsStorageIo>;
 
 struct RecoveredAppliance {
@@ -77,7 +81,7 @@ struct RecoveredAppliance {
     online_maintenance: FsOnlineMaintenance,
     gc_catalog: FsGcCatalog,
     recovery_generations: GenerationRepository<FsStorageIo>,
-    recovery_containers: ContainerRepository<FsStorageIo>,
+    recovery_containers: ContainerRepository<MaintenanceContainerStorage>,
     recovery_indexes: ExactIndexRunRepository<FsStorageIo>,
     recovery_checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 }
@@ -269,14 +273,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     AppliancePoolBinding::initialize_or_open_filesystem(&metadata_pool, &data_pool)?;
-    let capacity_source =
-        TieredStatFsSource::open(&container_root, &metadata_root, statfs_override)?;
+    let small_file_isolation =
+        SmallFileTierIsolation::prepare(&metadata_root, pool_isolation_policy)?;
+    emit_small_file_tier(&small_file_isolation);
+    let small_file_root = small_file_isolation.root().to_path_buf();
+    let capacity_source = TieredStatFsSource::open_with_small_file_tier(
+        &container_root,
+        &metadata_root,
+        &small_file_root,
+        small_file_isolation.hard_limit_bytes(),
+        statfs_override,
+    )?;
     let (control_listener, _control_guard) = bind_online_gc_control(&metadata_root)?;
     let (management_listener, _management_guard) = bind_management_control(&metadata_root)?;
 
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
     let data_storage = open_data_storage(&container_root, io_telemetry_enabled)?;
-    let recovered = recover_appliance(&metadata_root, &data_storage, advanced_reduction)?;
+    let small_file_storage = FsStorageIo::open(&small_file_root)?;
+    let recovered = recover_appliance(
+        &metadata_root,
+        &data_storage,
+        &small_file_storage,
+        advanced_reduction,
+    )?;
     emit_online_gc_recovery(recovered.online_gc_recovery);
     let appliance = Arc::new(recovered.appliance);
     let namespace = appliance.namespace_arc();
@@ -519,14 +538,20 @@ fn advanced_reduction_policy_from_environment()
 fn recover_appliance(
     metadata_root: &std::path::Path,
     data_storage: &TelemetryStorageIo,
+    small_file_storage: &FsStorageIo,
     advanced_reduction: AdvancedReductionPolicy,
 ) -> Result<RecoveredAppliance, Box<dyn std::error::Error>> {
     let metadata_storage = FsStorageIo::open(metadata_root)?;
     let generations = GenerationRepository::new(metadata_storage.clone(), checkpoint_policy_set());
-    let containers = ContainerRepository::new(data_storage.clone());
+    let containers = ContainerRepository::new(TieredStorageIo::new(
+        data_storage.clone(),
+        small_file_storage.clone(),
+    ));
     let indexes = ExactIndexRunRepository::new(metadata_storage.clone());
-    let maintenance_containers =
-        containers.with_maintenance_storage(FsStorageIo::open(data_storage.inner.root())?);
+    let maintenance_containers = containers.with_maintenance_storage(TieredStorageIo::new(
+        FsStorageIo::open(data_storage.inner.root())?,
+        small_file_storage.clone(),
+    ));
     let recovery_checkpoints =
         RecoveryCheckpointRepository::new(FsStorageIo::open(data_storage.inner.root())?);
     let restored_from_data_tier = if generations.has_committed_generation()? {
@@ -607,7 +632,7 @@ fn recover_appliance(
 
 fn start_recovery_checkpoint_runtime(
     generations: GenerationRepository<FsStorageIo>,
-    containers: ContainerRepository<FsStorageIo>,
+    containers: ContainerRepository<MaintenanceContainerStorage>,
     indexes: ExactIndexRunRepository<FsStorageIo>,
     checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 ) -> RecoveryCheckpointRuntimeHandle {
@@ -642,7 +667,7 @@ fn start_recovery_checkpoint_runtime(
 
 async fn publish_recovery_checkpoint_background(
     generations: GenerationRepository<FsStorageIo>,
-    containers: ContainerRepository<FsStorageIo>,
+    containers: ContainerRepository<MaintenanceContainerStorage>,
     indexes: ExactIndexRunRepository<FsStorageIo>,
     checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 ) {
@@ -662,7 +687,7 @@ async fn publish_recovery_checkpoint_background(
 
 async fn publish_recovery_checkpoint_once(
     generations: GenerationRepository<FsStorageIo>,
-    containers: ContainerRepository<FsStorageIo>,
+    containers: ContainerRepository<MaintenanceContainerStorage>,
     indexes: ExactIndexRunRepository<FsStorageIo>,
     checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 ) -> Result<Option<fastdup_store::RecoveryCheckpointSummary>, String> {
@@ -1311,6 +1336,18 @@ fn emit_statfs_state(capacity_override: Option<StatFsOverride>) {
 fn open_data_storage(root: &std::path::Path, telemetry: bool) -> io::Result<TelemetryStorageIo> {
     let storage = IoUringStorageIo::open(root, IoUringStorageConfig::default())?;
     Ok(TelemetryStorageIo::new(storage, telemetry))
+}
+
+fn emit_small_file_tier(isolation: &SmallFileTierIsolation) {
+    eprintln!(
+        "small_file_tier enabled=true enforced={} project_id={} hard_limit_bytes={} root={} quota_env={} project_env={}",
+        isolation.enforced(),
+        isolation.project_id(),
+        isolation.hard_limit_bytes(),
+        isolation.root().display(),
+        SMALL_FILE_QUOTA_BYTES_ENV,
+        SMALL_FILE_PROJECT_ID_ENV,
+    );
 }
 
 fn emit_io_telemetry_state(enabled: bool) {

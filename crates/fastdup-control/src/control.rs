@@ -128,7 +128,7 @@ impl AgentControl {
 
     async fn inspect_remote(&self) -> Result<ApplianceSnapshot, ControlProblem> {
         match self.request(AgentOperation::Inspect).await? {
-            AgentResult::Snapshot { snapshot } => Ok(snapshot),
+            AgentResult::Snapshot { snapshot } => Ok(*snapshot),
             AgentResult::Job { .. } => Err(ControlProblem::new(
                 "protocol_mismatch",
                 "Expected snapshot",
@@ -269,6 +269,36 @@ impl AgentRuntime {
         });
     }
 
+    /// Reconciles persisted Auto-Mount policy with the host-visible Runtime.
+    /// The resulting mount is submitted as a normal serialized Job so the UI
+    /// and Audit trail report the automatic action exactly like an operator
+    /// action.
+    pub fn reconcile_startup(self: &Arc<Self>) {
+        if dry_run() {
+            return;
+        }
+        let Ok(Some(binding)) = self.store.repository_binding() else {
+            return;
+        };
+        if repository_mount_is_active() {
+            if binding.state != RepositoryState::Online {
+                let _ = self.set_state(RepositoryState::Online);
+            }
+            return;
+        }
+        let Ok(settings) = self.store.settings() else {
+            return;
+        };
+        if settings.auto_mount {
+            let _ = self.submit(
+                Command::Mount,
+                &format!("startup-auto-mount-{}", Uuid::new_v4()),
+            );
+        } else if binding.state != RepositoryState::Unmounted {
+            let _ = self.set_state(RepositoryState::Unmounted);
+        }
+    }
+
     fn sample_once(&self) {
         let binding = self.store.repository_binding().ok().flatten();
         let state = binding
@@ -330,6 +360,10 @@ impl AgentRuntime {
                 .inventory
                 .discover()
                 .map_err(problem("inventory_failed"))?,
+            repository: self
+                .store
+                .repository_binding()
+                .map_err(problem("binding_failed"))?,
             settings: self.store.settings().map_err(problem("settings_failed"))?,
             shares: self.store.shares().map_err(problem("shares_failed"))?,
             jobs: self.store.recent_jobs(20).map_err(problem("jobs_failed"))?,
@@ -430,13 +464,25 @@ impl AgentRuntime {
             }
             Command::Mount => {
                 self.set_state(RepositoryState::Mounting)?;
-                self.start_repository()?;
+                if let Err(error) = self.start_repository() {
+                    let _ = self.set_state(RepositoryState::Error);
+                    return Err(error);
+                }
                 self.set_state(RepositoryState::Online)?;
+                // A successful Runtime health check also completes a
+                // provisioning attempt that reached durable Pool identity but
+                // was interrupted before its final journal deletion.
+                self.store
+                    .finish_provisioning()
+                    .map_err(problem("provisioning_journal"))?;
                 Ok("Repository ist online".to_owned())
             }
             Command::Unmount => {
                 self.set_state(RepositoryState::Unmounting)?;
-                systemctl("stop", REPOSITORY_UNIT)?;
+                if let Err(error) = systemctl("stop", REPOSITORY_UNIT) {
+                    let _ = self.set_state(RepositoryState::Error);
+                    return Err(error);
+                }
                 self.set_state(RepositoryState::Unmounted)?;
                 Ok("Repository wurde sauber ausgehängt".to_owned())
             }
@@ -552,15 +598,30 @@ impl AgentRuntime {
     }
 
     fn start_repository(&self) -> Result<(), ControlProblem> {
-        systemctl("start", REPOSITORY_UNIT)?;
         if dry_run() {
             return Ok(());
         }
+        let binding = self
+            .store
+            .repository_binding()
+            .map_err(problem("binding_failed"))?
+            .ok_or_else(|| {
+                ControlProblem::new(
+                    "repository_uninitialized",
+                    "Repository ist nicht initialisiert",
+                )
+            })?;
+        ensure_filesystem_mounted(&binding.metadata_uuid, Path::new(METADATA_ROOT))?;
+        ensure_filesystem_mounted(&binding.data_uuid, Path::new(DATA_ROOT))?;
+        systemctl("start", REPOSITORY_UNIT)?;
         let shares = self.store.shares().map_err(problem("shares_failed"))?;
         let deadline = std::time::Instant::now() + SHARE_SYNC_TIMEOUT;
         loop {
             match sync_share_capacities(&shares) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    apply_samba(&self.samba, &shares)?;
+                    return Ok(());
+                }
                 Err(_) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -714,7 +775,10 @@ impl AgentRuntime {
             .set_repository_binding(&binding)
             .map_err(problem("binding_failed"))?;
         write_runtime_environment(&self.store.settings().map_err(problem("settings_failed"))?)?;
-        self.start_repository()?;
+        if let Err(error) = self.start_repository() {
+            let _ = self.set_state(RepositoryState::Error);
+            return Err(error);
+        }
         self.set_state(RepositoryState::Online)?;
         self.store
             .finish_provisioning()
@@ -776,7 +840,10 @@ impl AgentRuntime {
             return Err(error);
         }
         if was_online {
-            self.start_repository()?;
+            if let Err(error) = self.start_repository() {
+                let _ = self.set_state(RepositoryState::Error);
+                return Err(error);
+            }
             self.set_state(RepositoryState::Online)?;
         } else {
             self.set_state(RepositoryState::Unmounted)?;
@@ -805,9 +872,9 @@ impl AgentRuntime {
         let request_id = request.request_id.clone();
         let result = if request.version == AGENT_PROTOCOL_VERSION {
             match request.operation {
-                AgentOperation::Inspect => self
-                    .inspect()
-                    .map(|snapshot| AgentResult::Snapshot { snapshot }),
+                AgentOperation::Inspect => self.inspect().map(|snapshot| AgentResult::Snapshot {
+                    snapshot: Box::new(snapshot),
+                }),
                 AgentOperation::Submit {
                     command,
                     idempotency_key,
@@ -993,6 +1060,43 @@ fn mount_filesystem(uuid: &str, target: &Path) -> Result<(), ControlProblem> {
         ],
     )?;
     Ok(())
+}
+
+fn ensure_filesystem_mounted(uuid: &str, target: &Path) -> Result<(), ControlProblem> {
+    if filesystem_mount_uuid(target).as_deref() == Some(uuid) {
+        return Ok(());
+    }
+    if filesystem_mount_uuid(target).is_some() {
+        return Err(ControlProblem::new(
+            "mount_target_occupied",
+            format!(
+                "Der Mountpoint {} ist bereits mit einem anderen Dateisystem belegt",
+                target.display()
+            ),
+        ));
+    }
+    mount_filesystem(uuid, target)?;
+    if filesystem_mount_uuid(target).as_deref() != Some(uuid) {
+        return Err(ControlProblem::new(
+            "mount_not_visible",
+            format!(
+                "XFS-Mount {} ist im Host-Mount-Namespace nicht sichtbar",
+                target.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn filesystem_mount_uuid(target: &Path) -> Option<String> {
+    let target = target.to_string_lossy();
+    let output = run_process("findmnt", &["-rn", "-T", &target, "-o", "UUID,TARGET"]).ok()?;
+    output.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let uuid = fields.next()?;
+        let mounted_target = fields.next()?;
+        (mounted_target == target && uuid != "-").then(|| uuid.to_owned())
+    })
 }
 
 fn write_runtime_environment(settings: &crate::RepositorySettings) -> Result<(), ControlProblem> {
@@ -1251,6 +1355,32 @@ fn problem<E: std::fmt::Display>(code: &'static str) -> impl FnOnce(E) -> Contro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_owners_share_the_host_mount_namespace() {
+        const AGENT_UNIT: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/fastdup-agent.service"
+        ));
+        const REPOSITORY_UNIT: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/fastdup-repository.service"
+        ));
+
+        for (name, unit) in [("agent", AGENT_UNIT), ("repository", REPOSITORY_UNIT)] {
+            for isolation in [
+                "ProtectSystem=",
+                "ProtectHome=",
+                "PrivateTmp=",
+                "ReadWritePaths=",
+            ] {
+                assert!(
+                    !unit.lines().any(|line| line.starts_with(isolation)),
+                    "{name} creates or consumes host-visible mounts and cannot use {isolation}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn gc_pressure_is_fail_closed() {

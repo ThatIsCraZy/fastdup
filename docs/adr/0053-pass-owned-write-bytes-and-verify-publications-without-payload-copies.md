@@ -20,12 +20,15 @@ write API, so other `Filesystem` implementations remain source-compatible.
 The receive-allocation test compares pointers before and after dispatch to
 prove that the fastdup path does not copy the payload.
 
-A dedicated `fuse-recv-buf` producer keeps two initialized replacement buffers
-ready. Moving a write buffer into ingest therefore does not allocate and zero
-its successor on the Tokio dispatch thread. The producer refills the bounded
-queue in parallel and blocks when both spares are ready. If thread creation or
-prefetch falls behind, dispatch uses the original synchronous allocation as a
-correctness fallback.
+A bounded recycler starts with two initialized replacement buffers. Moving a
+write buffer into ingest therefore normally does not allocate and zero its
+successor on the Tokio dispatch thread. The immutable `bytes::Bytes` owner
+returns the complete allocation only after its final clone is dropped; a full
+or disconnected recycler drops that surplus allocation instead. If more than
+two writes retain their request backing at once, dispatch uses the original
+synchronous allocation as a correctness fallback. Recycled request buffers
+may contain stale suffix bytes, so dispatch requires the decoded FUSE header
+length to equal the completed vectored-read length before exposing a payload.
 
 The memory budget charges the complete receive allocation, not just the
 payload slice. This matters for short writes because the immutable slice keeps

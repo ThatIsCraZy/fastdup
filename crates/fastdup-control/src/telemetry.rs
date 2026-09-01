@@ -190,6 +190,7 @@ impl SystemSampler {
             sequence: self.sequence,
             observed_at,
             repository_state: self.repository_state.clone(),
+            commit_generation: None,
             frontend_read_mbps: self.frontend_read_mbps,
             frontend_write_mbps: self.frontend_write_mbps,
             dedup_rate: dedup_rate(self.exact_hit_bytes, self.new_chunk_bytes),
@@ -198,7 +199,7 @@ impl SystemSampler {
             ram_percent,
             data_used_bytes,
             data_capacity_bytes,
-            last_checkpoint_seconds: 0,
+            last_checkpoint_seconds: None,
             disks,
             series: self.series.iter().cloned().collect(),
         }

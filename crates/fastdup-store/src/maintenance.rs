@@ -12,7 +12,8 @@ use fastdup_format::{
     ChunkId, ContainerId, ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError,
     ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError,
     ExactIndexRunSetId, GcCandidateCatalogDescriptor, GcCandidateCatalogRow,
-    MAX_LOGICAL_CHUNK_BYTES, SealedContainer,
+    MAX_LOGICAL_CHUNK_BYTES, PrehashedChunk, PreparedEncodedRecord, SealedContainer,
+    VerifiedChunkPayload, VerifiedContainerImage,
 };
 
 use crate::generation::GenerationLivenessProof;
@@ -39,6 +40,38 @@ const GC_CANDIDATE_PROOF_MAX_VICTIMS: usize = 64;
 const GC_CANDIDATE_PROOF_MAX_RAW_REPLACEMENT_BYTES: u64 = 64 * 1_024 * 1_024;
 const ONLINE_GC_BACKGROUND_SHORTLIST: usize = 16;
 const ONLINE_GC_URGENT_SHORTLIST: usize = 64;
+
+enum GcReplacementItem {
+    Chunk(VerifiedChunkPayload),
+    Transplanted {
+        record: PreparedEncodedRecord,
+        identities: Vec<(ChunkId, u64)>,
+    },
+}
+
+impl GcReplacementItem {
+    fn logical_bytes(&self) -> Result<u64, MaintenanceError> {
+        match self {
+            Self::Chunk(payload) => {
+                u64::try_from(payload.len()).map_err(|_| MaintenanceError::ArithmeticOverflow)
+            }
+            Self::Transplanted { identities, .. } => {
+                identities.iter().try_fold(0_u64, |total, (_, length)| {
+                    total
+                        .checked_add(*length)
+                        .ok_or(MaintenanceError::ArithmeticOverflow)
+                })
+            }
+        }
+    }
+
+    fn chunk_count(&self) -> usize {
+        match self {
+            Self::Chunk(_) => 1,
+            Self::Transplanted { identities, .. } => identities.len(),
+        }
+    }
+}
 
 /// Scheduling class for one maintenance phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1062,7 +1095,7 @@ where
         if !self.generations.gc_proof_is_current(&generation_proof)? {
             return Err(MaintenanceError::StaleGcPlan);
         }
-        let exact = self
+        let _exact = self
             .indexes
             .recover_active()?
             .filter(|active| active.record() == exact_activation)
@@ -1071,7 +1104,7 @@ where
             &victims,
             &replacement_chunks,
             thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
-            |container_id| Ok(self.containers.read_with_index(container_id, &exact)?),
+            |container_id| Ok(self.containers.read_verified_image(container_id)?),
         )?;
         if !self.generations.gc_proof_is_current(&generation_proof)?
             || !self.gc_exact_binding_is_current(exact_activation)?
@@ -1170,7 +1203,7 @@ where
         if !self.generations.gc_proof_is_current(&generation_proof)? {
             return Err(MaintenanceError::StaleGcPlan);
         }
-        let exact = self
+        let _exact = self
             .indexes
             .recover_active_generation()?
             .filter(|active| active.record() == exact_activation)
@@ -1181,7 +1214,8 @@ where
             &replacement_chunks,
             relocation_workers,
             |container_id| {
-                let container = self.containers.read_with_index(container_id, &exact)?;
+                let image = self.containers.read_verified_image(container_id)?;
+                let container = image.container();
                 retiring_entries
                     .try_reserve(container.locations().len())
                     .map_err(|_| MaintenanceError::OutOfMemory)?;
@@ -1190,7 +1224,7 @@ where
                     let retiring = ExactIndexEntry::retiring(active)?;
                     retiring_entries.push(retiring);
                 }
-                Ok(container)
+                Ok(image)
             },
         )?;
         let transition = self
@@ -1550,7 +1584,7 @@ where
         relocation_workers: NonZeroUsize,
     ) -> Result<ReplacementPublication, MaintenanceError> {
         self.publish_gc_replacements_using(victims, required, relocation_workers, |container_id| {
-            Ok(self.containers.read(container_id)?)
+            Ok(self.containers.read_verified_image(container_id)?)
         })
     }
 
@@ -1559,11 +1593,12 @@ where
         victims: &BTreeMap<[u8; 16], ContainerId>,
         required: &BTreeMap<ChunkId, u64>,
         relocation_workers: NonZeroUsize,
-        mut read_victim: impl FnMut(ContainerId) -> Result<SealedContainer, MaintenanceError>,
+        mut read_victim: impl FnMut(ContainerId) -> Result<VerifiedContainerImage, MaintenanceError>,
     ) -> Result<ReplacementPublication, MaintenanceError> {
         let mut seen = BTreeSet::new();
-        let mut batch = Vec::<Vec<u8>>::new();
+        let mut batch = Vec::<GcReplacementItem>::new();
         let mut batch_bytes = 0_u64;
+        let mut batch_chunks = 0_usize;
         let mut generations = None;
         let mut reserve_generation = || -> Result<u64, MaintenanceError> {
             if generations.is_none() {
@@ -1580,57 +1615,139 @@ where
         };
         let mut published = ReplacementPublication::default();
         for container_id in victims.values().copied() {
-            let container = read_victim(container_id)?;
-            for record in container.records() {
-                let chunk_id = record.chunk_id();
-                let Some(expected_length) = required.get(&chunk_id).copied() else {
-                    continue;
-                };
-                if !seen.insert(chunk_id) {
-                    continue;
-                }
-                let observed_length = u64::try_from(record.payload().len())
-                    .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
-                if observed_length != expected_length {
-                    return Err(MaintenanceError::OnlineChunkLengthMismatch {
+            let image = read_victim(container_id)?;
+            let container = image.container();
+            assert_eq!(
+                container.records().len(),
+                container.locations().len(),
+                "ASSERT: verified Container has one Location per logical Chunk"
+            );
+            let mut group_start = 0_usize;
+            while group_start < container.locations().len() {
+                let record_offset = container.locations()[group_start].record_offset();
+                let group_end = group_start
+                    + container.locations()[group_start..]
+                        .iter()
+                        .take_while(|location| location.record_offset() == record_offset)
+                        .count();
+                let locations = &container.locations()[group_start..group_end];
+                let records = &container.records()[group_start..group_end];
+                let mut group_ids = BTreeSet::new();
+                let mut full_live = true;
+                let mut identities = Vec::new();
+                identities
+                    .try_reserve_exact(records.len())
+                    .map_err(|_| MaintenanceError::OutOfMemory)?;
+                for (location, record) in locations.iter().zip(records) {
+                    let chunk_id = record.chunk_id();
+                    assert_eq!(
+                        location.chunk_id(),
                         chunk_id,
-                        expected: expected_length,
-                        observed: observed_length,
-                    });
+                        "ASSERT: verified Record order matches verified Locations"
+                    );
+                    let observed_length = u64::try_from(record.payload().len())
+                        .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+                    match required.get(&chunk_id).copied() {
+                        Some(expected_length) if expected_length == observed_length => {}
+                        Some(expected_length) => {
+                            return Err(MaintenanceError::OnlineChunkLengthMismatch {
+                                chunk_id,
+                                expected: expected_length,
+                                observed: observed_length,
+                            });
+                        }
+                        None => full_live = false,
+                    }
+                    if seen.contains(&chunk_id) || !group_ids.insert(chunk_id) {
+                        full_live = false;
+                    }
+                    identities.push((chunk_id, observed_length));
                 }
-                let would_exceed_bytes = batch_bytes
-                    .checked_add(observed_length)
-                    .ok_or(MaintenanceError::ArithmeticOverflow)?
-                    > GC_REPLACEMENT_LOGICAL_TARGET_BYTES;
-                if !batch.is_empty()
-                    && (would_exceed_bytes || batch.len() == GC_REPLACEMENT_CHUNK_LIMIT)
-                {
-                    let generation = reserve_generation()?;
-                    let completed =
-                        self.publish_gc_replacement_batch(generation, &batch, relocation_workers)?;
-                    published.add(completed)?;
-                    batch.clear();
-                    batch_bytes = 0;
+
+                let transplanted = if full_live && records.len() <= GC_REPLACEMENT_CHUNK_LIMIT {
+                    image.prepare_encoded_record(record_offset).ok()
+                } else {
+                    None
+                };
+                if let Some(record) = transplanted {
+                    let item = GcReplacementItem::Transplanted { record, identities };
+                    let item_bytes = item.logical_bytes()?;
+                    let item_chunks = item.chunk_count();
+                    let would_exceed_bytes = batch_bytes
+                        .checked_add(item_bytes)
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?
+                        > GC_REPLACEMENT_LOGICAL_TARGET_BYTES;
+                    let would_exceed_chunks = batch_chunks
+                        .checked_add(item_chunks)
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?
+                        > GC_REPLACEMENT_CHUNK_LIMIT;
+                    if !batch.is_empty() && (would_exceed_bytes || would_exceed_chunks) {
+                        let generation = reserve_generation()?;
+                        published.add(self.publish_gc_replacement_batch(
+                            generation,
+                            std::mem::take(&mut batch),
+                            relocation_workers,
+                        )?)?;
+                        batch_bytes = 0;
+                        batch_chunks = 0;
+                    }
+                    for (chunk_id, _) in match &item {
+                        GcReplacementItem::Transplanted { identities, .. } => identities,
+                        GcReplacementItem::Chunk(_) => unreachable!(),
+                    } {
+                        assert!(
+                            seen.insert(*chunk_id),
+                            "ASSERT: full Record transplant contains unique unseen Chunks"
+                        );
+                    }
+                    batch_bytes = batch_bytes
+                        .checked_add(item_bytes)
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                    batch_chunks = batch_chunks
+                        .checked_add(item_chunks)
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                    batch.push(item);
+                } else {
+                    for record in records {
+                        let chunk_id = record.chunk_id();
+                        if !required.contains_key(&chunk_id) || !seen.insert(chunk_id) {
+                            continue;
+                        }
+                        let item = GcReplacementItem::Chunk(record.verified_payload());
+                        let item_bytes = item.logical_bytes()?;
+                        let would_exceed_bytes = batch_bytes
+                            .checked_add(item_bytes)
+                            .ok_or(MaintenanceError::ArithmeticOverflow)?
+                            > GC_REPLACEMENT_LOGICAL_TARGET_BYTES;
+                        if !batch.is_empty()
+                            && (would_exceed_bytes || batch_chunks == GC_REPLACEMENT_CHUNK_LIMIT)
+                        {
+                            let generation = reserve_generation()?;
+                            published.add(self.publish_gc_replacement_batch(
+                                generation,
+                                std::mem::take(&mut batch),
+                                relocation_workers,
+                            )?)?;
+                            batch_bytes = 0;
+                            batch_chunks = 0;
+                        }
+                        batch_bytes = batch_bytes
+                            .checked_add(item_bytes)
+                            .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                        batch_chunks = batch_chunks
+                            .checked_add(1)
+                            .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                        batch.push(item);
+                    }
                 }
-                batch_bytes = batch_bytes
-                    .checked_add(observed_length)
-                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
-                batch
-                    .try_reserve(1)
-                    .map_err(|_| MaintenanceError::OutOfMemory)?;
-                let mut payload = Vec::new();
-                payload
-                    .try_reserve_exact(record.payload().len())
-                    .map_err(|_| MaintenanceError::OutOfMemory)?;
-                payload.extend_from_slice(record.payload());
-                batch.push(payload);
+                group_start = group_end;
             }
         }
         if !batch.is_empty() {
             let generation = reserve_generation()?;
             published.add(self.publish_gc_replacement_batch(
                 generation,
-                &batch,
+                batch,
                 relocation_workers,
             )?)?;
         }
@@ -1653,15 +1770,39 @@ where
     fn publish_gc_replacement_batch(
         &self,
         generation: u64,
-        chunks: &[Vec<u8>],
+        items: Vec<GcReplacementItem>,
         relocation_workers: NonZeroUsize,
     ) -> Result<ReplacementPublication, MaintenanceError> {
         assert!(
-            !chunks.is_empty(),
+            !items.is_empty(),
             "ASSERT: GC never publishes an empty Container"
         );
-        let container_id = gc_replacement_container_id(generation, chunks)?;
-        let regions = gc_compression_regions(chunks)?;
+        let container_id = gc_replacement_container_id(generation, &items)?;
+        let mut chunks = Vec::new();
+        let mut transplanted = Vec::new();
+        let mut chunk_count = 0_usize;
+        for item in items {
+            match item {
+                GcReplacementItem::Chunk(payload) => {
+                    chunk_count = chunk_count
+                        .checked_add(1)
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                    chunks.push(payload);
+                }
+                GcReplacementItem::Transplanted { record, identities } => {
+                    chunk_count = chunk_count
+                        .checked_add(identities.len())
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                    assert_eq!(
+                        record.chunk_count(),
+                        identities.len(),
+                        "ASSERT: transplant identity table covers the complete Record"
+                    );
+                    transplanted.push(record);
+                }
+            }
+        }
+        let regions = gc_compression_regions(&chunks)?;
         let mut region_refs = Vec::new();
         region_refs
             .try_reserve_exact(regions.len())
@@ -1671,11 +1812,12 @@ where
             container_id,
             generation,
             &region_refs,
+            transplanted,
             relocation_workers,
         )?;
         assert_eq!(
             verified.chunk_count(),
-            chunks.len(),
+            chunk_count,
             "ASSERT: replacement writer reread must cover the planned Chunk batch"
         );
         let mut locations = Vec::new();
@@ -1688,8 +1830,7 @@ where
         Ok(ReplacementPublication {
             containers: 1,
             bytes: verified.header().layout().file_length,
-            chunks: u64::try_from(chunks.len())
-                .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
+            chunks: u64::try_from(chunk_count).map_err(|_| MaintenanceError::ArithmeticOverflow)?,
             locations,
         })
     }
@@ -1807,7 +1948,7 @@ where
             .lock()
             .expect("ASSERT: Exact-Index rebuild lock poisoned");
         let run_set_generation = self.next_exact_run_set_generation()?;
-        let staged = self.stage_exact_index_excluding(run_set_generation, excluded, |_| Ok(()))?;
+        let staged = self.stage_exact_publications_excluding(run_set_generation, excluded)?;
         self.activate_staged_exact(&staged)
     }
 
@@ -1855,6 +1996,86 @@ where
                     .try_reserve_exact(container.locations().len())
                     .map_err(|_| MaintenanceError::OutOfMemory)?;
                 for location in container.locations().iter().copied() {
+                    entries.push(ExactIndexEntry::from_verified(location)?);
+                }
+                entries_rebuilt = entries_rebuilt
+                    .checked_add(
+                        u64::try_from(entries.len())
+                            .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
+                    )
+                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                if entries.is_empty() {
+                    return Ok(());
+                }
+                newest_run_generation = newest_run_generation
+                    .checked_add(1)
+                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                let run = ExactIndexRun::new(self.exact_profile, newest_run_generation, entries)?;
+                let descriptor = self.indexes.publish(&run)?;
+                run_refs
+                    .try_reserve(1)
+                    .map_err(|_| MaintenanceError::OutOfMemory)?;
+                run_refs.push(ExactIndexRunRef::new(0, descriptor)?);
+                while let Some((source_level, inputs)) = select_compaction_inputs(&run_refs) {
+                    let first_output_generation = newest_run_generation
+                        .checked_add(1)
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                    let target_level = source_level
+                        .checked_add(1)
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                    let compacted = self.indexes.compact_family(
+                        &inputs,
+                        target_level,
+                        first_output_generation,
+                    )?;
+                    newest_run_generation = compacted.last_generation();
+                    run_refs.retain(|run| {
+                        !inputs
+                            .iter()
+                            .any(|input| input.generation() == run.generation())
+                    });
+                    run_refs
+                        .try_reserve(compacted.runs().len())
+                        .map_err(|_| MaintenanceError::OutOfMemory)?;
+                    run_refs.extend_from_slice(compacted.runs());
+                }
+                Ok(())
+            })?;
+        let run_set = ExactIndexRunSet::new(self.exact_profile, run_set_generation, run_refs)?;
+        self.indexes.audit_run_set_global_invariants(&run_set)?;
+        let physical_runs = run_set.runs().len();
+        let run_families = run_set.family_count();
+        Ok(StagedExactIndexRebuild {
+            containers_scanned: containers.containers(),
+            entries_rebuilt,
+            run_families,
+            physical_runs,
+            run_set,
+        })
+    }
+
+    fn stage_exact_publications_excluding(
+        &self,
+        run_set_generation: u64,
+        excluded: &BTreeMap<[u8; 16], ContainerId>,
+    ) -> Result<StagedExactIndexRebuild, MaintenanceError> {
+        let mut newest_run_generation = self
+            .indexes
+            .discover_run_generation_high_water(self.exact_profile)?
+            .unwrap_or(0);
+        let mut run_refs = Vec::new();
+        let mut entries_rebuilt = 0_u64;
+        let containers = self
+            .containers
+            .visit_verified_publications_pipelined::<MaintenanceError, _>(|publication| {
+                if excluded.contains_key(&publication.header().container_id().bytes()) {
+                    return Ok(());
+                }
+                let mut entries = Vec::new();
+                entries
+                    .try_reserve_exact(publication.locations().len())
+                    .map_err(|_| MaintenanceError::OutOfMemory)?;
+                for location in publication.locations().iter().copied() {
                     entries.push(ExactIndexEntry::from_verified(location)?);
                 }
                 entries_rebuilt = entries_rebuilt
@@ -2080,18 +2301,28 @@ fn replacement_file_bytes_upper_bound(
 
 fn gc_replacement_container_id(
     generation: u64,
-    chunks: &[Vec<u8>],
+    items: &[GcReplacementItem],
 ) -> Result<ContainerId, MaintenanceError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"fastdup-gc-replacement-container-v1\0");
     hasher.update(&generation.to_le_bytes());
-    for chunk in chunks {
-        hasher.update(&ChunkId::of(chunk).bytes());
-        hasher.update(
-            &u64::try_from(chunk.len())
-                .map_err(|_| MaintenanceError::ArithmeticOverflow)?
-                .to_le_bytes(),
-        );
+    for item in items {
+        match item {
+            GcReplacementItem::Chunk(payload) => {
+                hasher.update(&payload.chunk_id().bytes());
+                hasher.update(
+                    &u64::try_from(payload.len())
+                        .map_err(|_| MaintenanceError::ArithmeticOverflow)?
+                        .to_le_bytes(),
+                );
+            }
+            GcReplacementItem::Transplanted { identities, .. } => {
+                for (chunk_id, logical_length) in identities {
+                    hasher.update(&chunk_id.bytes());
+                    hasher.update(&logical_length.to_le_bytes());
+                }
+            }
+        }
     }
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
@@ -2101,8 +2332,10 @@ fn gc_replacement_container_id(
     ContainerId::new(bytes).map_err(|_| MaintenanceError::ReplacementIdentity)
 }
 
-fn gc_compression_regions(chunks: &[Vec<u8>]) -> Result<Vec<Vec<&[u8]>>, MaintenanceError> {
-    let mut regions = Vec::<Vec<&[u8]>>::new();
+fn gc_compression_regions(
+    chunks: &[VerifiedChunkPayload],
+) -> Result<Vec<Vec<PrehashedChunk<'_>>>, MaintenanceError> {
+    let mut regions = Vec::<Vec<PrehashedChunk<'_>>>::new();
     let mut current = Vec::new();
     let mut current_bytes = 0_usize;
     for chunk in chunks {
@@ -2124,7 +2357,7 @@ fn gc_compression_regions(chunks: &[Vec<u8>]) -> Result<Vec<Vec<&[u8]>>, Mainten
         current
             .try_reserve(1)
             .map_err(|_| MaintenanceError::OutOfMemory)?;
-        current.push(chunk.as_slice());
+        current.push(PrehashedChunk::new(chunk.chunk_id(), chunk.as_slice()));
     }
     if !current.is_empty() {
         regions

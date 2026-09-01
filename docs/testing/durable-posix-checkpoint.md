@@ -521,8 +521,10 @@ bytes, maximum eviction steps, available RAM, and Swap use after checkpoints.
   maintenance process from opening the repository. Fake-clock stalled-I/O
   proofs now cover both Metadata and DATA sync stalls, and a durable Recovery
   Latch makes an unproven shutdown explicit. Commit Record v2 now supplies the
-  stable format-epoch fence. Broad randomized process-kill/power-cut campaigns
-  remain open.
+  stable format-epoch fence. A fixed-seed randomized real-process SIGKILL soak
+  and modeled newest-Container torn-write fallback now cover the next layer;
+  scheduled longevity and real block-device power-cut campaigns remain open.
 
-The next recovery-hardening slice is a broader randomized real-process-kill
-campaign, followed by block-device power-cut and torn-write campaigns.
+The next recovery-hardening slice is scheduled longevity execution of the
+randomized process-kill campaign, followed by real block-device power-cut
+qualification.

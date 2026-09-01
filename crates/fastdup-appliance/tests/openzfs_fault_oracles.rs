@@ -2,6 +2,7 @@
 //! recovery suites. Durable-format offsets below only construct authenticated
 //! corrupt fixtures; every behavioral assertion uses public mount/read/scrub seams.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -258,6 +259,115 @@ fn newest_namespace_metadata_fault_recovers_only_the_complete_previous_generatio
 }
 
 #[test]
+fn modeled_power_cut_with_torn_newest_container_recovers_previous_complete_generation() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0xE7; 32]).expect("policy identity is nonzero");
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), policy),
+        ContainerRepository::new(data.clone()),
+        1_024,
+    )
+    .expect("open modeled power-cut fixture");
+    let Reply::Created { entry, handle } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"power-cut.bin",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("create power-cut fixture")
+    else {
+        panic!("ASSERT: create returned the wrong reply variant")
+    };
+    // A Fill-backed previous generation has no Container dependency. The
+    // fault target can therefore only invalidate the newer DATA-backed view,
+    // making the fallback oracle independent of asynchronous Container
+    // generation allocation order.
+    let first = vec![0x41; 256 * 1_024];
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: 0,
+                data: &first,
+            },
+        )
+        .expect("write previous complete generation");
+    appliance
+        .checkpoint()
+        .expect("checkpoint previous generation")
+        .expect("previous generation is nonempty");
+    let previous_containers = data
+        .list_names()
+        .expect("list previous-generation DATA objects")
+        .into_iter()
+        .filter(|name| std::path::Path::new(name).extension() == Some(std::ffi::OsStr::new("fdc")))
+        .collect::<BTreeSet<_>>();
+
+    let second = pseudo_random_payload(0x92, first.len());
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: entry.attr.inode,
+                handle,
+                offset: 0,
+                data: &second,
+            },
+        )
+        .expect("write newest generation");
+    appliance
+        .checkpoint()
+        .expect("checkpoint newest generation")
+        .expect("newest generation is nonempty");
+    drop(appliance);
+
+    let newest = data
+        .list_names()
+        .expect("list DATA objects")
+        .into_iter()
+        .filter(|name| std::path::Path::new(name).extension() == Some(std::ffi::OsStr::new("fdc")))
+        .filter(|name| !previous_containers.contains(name))
+        .map(|name| {
+            let bytes = data.read(&name).expect("read Container fixture");
+            let generation = SealedContainer::decode(&bytes)
+                .expect("healthy Container before power cut")
+                .header()
+                .container_generation();
+            (generation, name, bytes.len())
+        })
+        .max_by_key(|(generation, _, _)| *generation)
+        .expect("newest generation publishes a new DATA Container");
+    data.inject_durable_torn_write(&newest.1, newest.2 / 2)
+        .expect("inject half-written durable Container image");
+    metadata.crash();
+    data.crash();
+
+    let generations = GenerationRepository::new(metadata.clone(), policy);
+    let containers = ContainerRepository::new(data.clone());
+    let recovered = recover_mount(NamespaceConfig::default(), &generations, &containers)
+        .expect("power-cut recovery selects a complete generation")
+        .expect("previous complete generation remains available");
+    assert_recovered_bytes(&recovered, b"power-cut.bin", &first);
+    assert!(
+        generations.scrub_all_with_data(&containers).is_err(),
+        "scrub must retain evidence of the torn newest Container"
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn resumed_data_sync_recovers_one_byte_exact_generation_after_remount() {
     let metadata = MemoryStorageIo::new();
@@ -495,6 +605,58 @@ fn assert_recovered_fill(
                 .expect("fixture length fits usize")
         ])),
         "{fault:?}: recovery exposed a mixed or newest generation"
+    );
+}
+
+fn pseudo_random_payload(seed: u8, length: usize) -> Vec<u8> {
+    let mut state = u64::from(seed) | 1;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+fn assert_recovered_bytes(namespace: &fastdup_posix::Namespace, name: &[u8], expected: &[u8]) {
+    let Reply::Entry(entry) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Lookup {
+                parent: ROOT_INODE,
+                name,
+            },
+        )
+        .expect("look up recovered power-cut file")
+    else {
+        panic!("ASSERT: recovered lookup returns an entry")
+    };
+    let Reply::Opened(handle) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: entry.attr.inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("open recovered power-cut file")
+    else {
+        panic!("ASSERT: recovered open returns a handle")
+    };
+    assert_eq!(
+        namespace.dispatch(
+            CALLER,
+            Operation::Read {
+                inode: entry.attr.inode,
+                handle,
+                offset: 0,
+                length: u32::try_from(expected.len()).expect("fixture read fits u32"),
+            },
+        ),
+        Ok(Reply::Data(expected.to_vec()))
     );
 }
 

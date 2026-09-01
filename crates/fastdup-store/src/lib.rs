@@ -33,6 +33,7 @@ mod similarity_external_sort;
 mod similarity_index_repository;
 mod similarity_mmap;
 mod similarity_simd;
+mod tiered_storage;
 pub use fastdup_format::{SimilarityIndexPartitionRef, SimilarityIndexRunFamily};
 pub use similarity_external_sort::SIMILARITY_PARTITION_TARGET_REFERENCES;
 
@@ -107,6 +108,7 @@ pub use similarity_index_repository::{
     SimilarityIndexPageCacheStatus, SimilarityIndexReadMode, SimilarityIndexRebuildStatus,
     SimilarityIndexRepository, SimilarityIndexStoreError, similarity_index_entry_v1,
 };
+pub use tiered_storage::{TieredStorageError, TieredStorageIo};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -115,16 +117,17 @@ use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
+use crate::read_cache::VerifiedChunkRead;
 use fastdup_format::{
     AlignedContainerBytes, BuildingContainerHeader, ChunkId, ContainerId,
     ContainerIntrinsicSummary, ContainerRecoveryEnvelope, ExactIndexEntry, ExactIndexLocation,
     ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
     IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, PrehashedAdaptiveRegion, PrehashedChunk,
-    PrehashedContiguousRegion, SealedContainer, SealedContainerDescriptor,
-    VerifiedContainerPublication,
+    PrehashedContiguousRegion, PreparedEncodedRecord, SealedContainer, SealedContainerDescriptor,
+    VerifiedChunkPayload, VerifiedContainerImage, VerifiedContainerPublication,
 };
 use rayon::prelude::*;
 
@@ -518,6 +521,19 @@ impl PublishedContainerSummary {
 /// directory sync makes the no-replace name durable. Implementations must
 /// preserve the Building -> Body -> Sealed -> sampled VERIFY -> file sync ->
 /// rename -> root sync order encoded by [`StorageIo::publish_owned_container`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContainerPlacement {
+    #[default]
+    Data,
+    SmallFile,
+}
+
+/// One complete immutable Container image transferred into its publication
+/// adapter exactly once.
+///
+/// `placement` is writer policy rather than durable identity. Once published,
+/// readers locate the globally unique Container ID through their storage
+/// adapter and verify the ordinary Container envelope and payload.
 #[derive(Debug)]
 pub struct OwnedContainerPublication {
     container_id: ContainerId,
@@ -527,6 +543,7 @@ pub struct OwnedContainerPublication {
     publication: VerifiedContainerPublication,
     temporary_name: String,
     published_name: String,
+    placement: ContainerPlacement,
 }
 
 impl OwnedContainerPublication {
@@ -553,6 +570,17 @@ impl OwnedContainerPublication {
     #[must_use]
     pub fn published_name(&self) -> &str {
         &self.published_name
+    }
+
+    #[must_use]
+    pub const fn placement(&self) -> ContainerPlacement {
+        self.placement
+    }
+
+    #[must_use]
+    pub const fn with_placement(mut self, placement: ContainerPlacement) -> Self {
+        self.placement = placement;
+        self
     }
 
     /// Consumes the capability into the exact writer inputs.
@@ -761,10 +789,136 @@ impl Drop for ImmutableFileLease {
 pub struct ContainerRepository<I> {
     storage: I,
     descriptors: Arc<container_descriptor_cache::ContainerDescriptorCache>,
+    record_reads: Arc<RecordReadCoordinator>,
     retiring: Arc<RwLock<BTreeMap<[u8; 16], usize>>>,
     generation_allocator_barrier: Arc<Mutex<()>>,
     generation_allocator_registry:
         Arc<container_generation_allocator::ContainerGenerationAllocatorRegistry>,
+}
+
+const RECORD_READ_SHARDS: usize = 64;
+const MAX_INFLIGHT_RECORDS_PER_SHARD: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RecordReadKey {
+    container_id: [u8; 16],
+    container_generation: u64,
+    record_offset: u64,
+    record_length: u32,
+    record_crc32c: u32,
+    record_decoded_length: u32,
+    record_payload_length: u32,
+    codec_id: u16,
+    dependency_id: [u8; 32],
+}
+
+#[derive(Debug)]
+struct RecordReadFlight {
+    state: Mutex<RecordReadFlightState>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+enum RecordReadFlightState {
+    Reading,
+    Ready(Arc<Vec<VerifiedChunkPayload>>),
+    Failed,
+}
+
+#[derive(Debug)]
+struct RecordReadCoordinator {
+    shards: [Mutex<BTreeMap<RecordReadKey, Arc<RecordReadFlight>>>; RECORD_READ_SHARDS],
+}
+
+enum RecordReadJoin {
+    Bypass,
+    Leader(Arc<RecordReadFlight>),
+    Follower(Arc<RecordReadFlight>),
+}
+
+impl RecordReadCoordinator {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn key(candidate: ExactIndexEntry) -> RecordReadKey {
+        let location = candidate.location();
+        RecordReadKey {
+            container_id: location.container_id().bytes(),
+            container_generation: location.container_generation(),
+            record_offset: location.record_offset(),
+            record_length: location.record_length(),
+            record_crc32c: location.record_crc32c(),
+            record_decoded_length: location.record_decoded_length(),
+            record_payload_length: location.record_payload_length(),
+            codec_id: location.codec_id(),
+            dependency_id: location.dependency_id(),
+        }
+    }
+
+    fn shard(key: RecordReadKey) -> usize {
+        let id_word = u64::from_le_bytes(
+            key.container_id[..8]
+                .try_into()
+                .expect("ASSERT: Container ID has eight prefix bytes"),
+        );
+        usize::try_from(id_word ^ key.container_generation ^ key.record_offset)
+            .unwrap_or(usize::MAX)
+            & (RECORD_READ_SHARDS - 1)
+    }
+
+    fn join(&self, key: RecordReadKey) -> RecordReadJoin {
+        let shard = &self.shards[Self::shard(key)];
+        let Ok(mut flights) = shard.lock() else {
+            return RecordReadJoin::Bypass;
+        };
+        if let Some(flight) = flights.get(&key) {
+            return RecordReadJoin::Follower(Arc::clone(flight));
+        }
+        if flights.len() >= MAX_INFLIGHT_RECORDS_PER_SHARD {
+            return RecordReadJoin::Bypass;
+        }
+        let flight = Arc::new(RecordReadFlight {
+            state: Mutex::new(RecordReadFlightState::Reading),
+            ready: Condvar::new(),
+        });
+        flights.insert(key, Arc::clone(&flight));
+        RecordReadJoin::Leader(flight)
+    }
+
+    fn complete(
+        &self,
+        key: RecordReadKey,
+        flight: &RecordReadFlight,
+        payloads: Option<Arc<Vec<VerifiedChunkPayload>>>,
+    ) {
+        if let Ok(mut state) = flight.state.lock() {
+            *state = payloads.map_or(RecordReadFlightState::Failed, RecordReadFlightState::Ready);
+            flight.ready.notify_all();
+        }
+        if let Ok(mut flights) = self.shards[Self::shard(key)].lock()
+            && flights
+                .get(&key)
+                .is_some_and(|active| std::ptr::eq(active.as_ref(), flight))
+        {
+            flights.remove(&key);
+        }
+    }
+
+    fn wait(flight: &RecordReadFlight) -> Option<Arc<Vec<VerifiedChunkPayload>>> {
+        let mut state = flight.state.lock().ok()?;
+        loop {
+            match &*state {
+                RecordReadFlightState::Reading => {
+                    state = flight.ready.wait(state).ok()?;
+                }
+                RecordReadFlightState::Ready(payloads) => return Some(Arc::clone(payloads)),
+                RecordReadFlightState::Failed => return None,
+            }
+        }
+    }
 }
 
 struct RetiringSelectionBarrier {
@@ -885,6 +1039,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             descriptors: Arc::new(
                 container_descriptor_cache::ContainerDescriptorCache::new_system(),
             ),
+            record_reads: Arc::new(RecordReadCoordinator::new()),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
             generation_allocator_barrier: Arc::new(Mutex::new(())),
             generation_allocator_registry: Arc::new(
@@ -950,6 +1105,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         ContainerRepository {
             storage,
             descriptors: Arc::clone(&self.descriptors),
+            record_reads: Arc::clone(&self.record_reads),
             retiring: Arc::clone(&self.retiring),
             generation_allocator_barrier: Arc::clone(&self.generation_allocator_barrier),
             generation_allocator_registry: Arc::clone(&self.generation_allocator_registry),
@@ -971,6 +1127,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             descriptors: Arc::new(
                 container_descriptor_cache::ContainerDescriptorCache::new_with_snapshot(snapshot),
             ),
+            record_reads: Arc::new(RecordReadCoordinator::new()),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
             generation_allocator_barrier: Arc::new(Mutex::new(())),
             generation_allocator_registry: Arc::new(
@@ -1072,8 +1229,14 @@ impl<I: StorageIo> ContainerRepository<I> {
             chunks,
         )?;
         let (sealed, publication) = encoded.into_aligned_publication_parts();
-        self.publish_sealed(container_id, container_generation, sealed, publication)
-            .map(drop)
+        self.publish_sealed(
+            container_id,
+            container_generation,
+            sealed,
+            publication,
+            ContainerPlacement::Data,
+        )
+        .map(drop)
     }
 
     /// Publishes codec-3 targets whose named Base Chunks are already durable.
@@ -1095,7 +1258,13 @@ impl<I: StorageIo> ContainerRepository<I> {
         let encoded =
             SealedContainer::encode_zstd_prefix_pairs(container_id, container_generation, pairs)?;
         let (sealed, publication) = encoded.into_aligned_publication_parts();
-        self.publish_sealed(container_id, container_generation, sealed, publication)
+        self.publish_sealed(
+            container_id,
+            container_generation,
+            sealed,
+            publication,
+            ContainerPlacement::Data,
+        )
     }
 
     /// Runs adaptive RAW/Zstd region encoding and the same ordered durable
@@ -1123,8 +1292,14 @@ impl<I: StorageIo> ContainerRepository<I> {
             NonZeroUsize::MIN,
         )?;
         let (sealed, publication) = encoded.into_aligned_publication_parts();
-        self.publish_sealed(container_id, container_generation, sealed, publication)
-            .map(drop)
+        self.publish_sealed(
+            container_id,
+            container_generation,
+            sealed,
+            publication,
+            ContainerPlacement::Data,
+        )
+        .map(drop)
     }
 
     /// Publishes adaptive RAW/Zstd regions and returns writer-produced Location
@@ -1185,16 +1360,19 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         container_id: ContainerId,
         container_generation: u64,
-        regions: &[&[&[u8]]],
+        regions: &[&[PrehashedChunk<'_>]],
+        transplanted: Vec<PreparedEncodedRecord>,
         workers: NonZeroUsize,
     ) -> Result<SealedContainer, StoreError> {
-        let encoded = SealedContainer::encode_adaptive_regions_parallel_profiled_with_gate(
-            container_id,
-            container_generation,
-            regions,
-            workers,
-            IncompressibilityGatePolicy::Off,
-        )?;
+        let encoded = SealedContainer::
+            encode_prehashed_adaptive_regions_with_transplants_parallel_profiled_with_gate(
+                container_id,
+                container_generation,
+                regions,
+                transplanted,
+                workers,
+                IncompressibilityGatePolicy::Off,
+            )?;
         let sealed = encoded.into_bytes();
         self.publish_sealed_resumable(container_id, container_generation, &sealed)
     }
@@ -1228,13 +1406,42 @@ impl<I: StorageIo> ContainerRepository<I> {
         ),
         StoreError,
     > {
+        self.publish_adaptive_regions_parallel_profiled_with_placement(
+            container_id,
+            container_generation,
+            regions,
+            workers,
+            ContainerPlacement::Data,
+        )
+    }
+
+    /// Publishes adaptive regions in the selected physical tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns encoding, allocation, publication, durability, or verification
+    /// failures.
+    pub fn publish_adaptive_regions_parallel_profiled_with_placement(
+        &self,
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[&[&[u8]]],
+        workers: NonZeroUsize,
+        placement: ContainerPlacement,
+    ) -> Result<
+        (
+            VerifiedContainerPublication,
+            AdaptiveContainerPublishMetrics,
+        ),
+        StoreError,
+    > {
         let prepared = Self::prepare_adaptive_regions_parallel(
             container_id,
             container_generation,
             regions,
             workers,
         )?;
-        self.publish_prepared_adaptive_profiled(prepared)
+        self.publish_prepared_adaptive_profiled_with_placement(prepared, placement)
     }
 
     /// Encodes adaptive Compression Regions without performing storage I/O.
@@ -1455,6 +1662,34 @@ impl<I: StorageIo> ContainerRepository<I> {
         ),
         StoreError,
     > {
+        self.publish_prepared_adaptive_profiled_with_placement(prepared, ContainerPlacement::Data)
+    }
+
+    /// Publishes one prepared Container in the policy-selected physical tier.
+    ///
+    /// The tier choice is consumed at the storage seam. Container identity,
+    /// reader verification, Exact acceleration, recovery, scrub, and GC remain
+    /// independent of physical placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns publication I/O, durability, sampling, or integrity failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a validated Container image violates its bounded length
+    /// or decoded-byte accounting invariants.
+    pub fn publish_prepared_adaptive_profiled_with_placement(
+        &self,
+        prepared: PreparedAdaptiveContainer,
+        placement: ContainerPlacement,
+    ) -> Result<
+        (
+            VerifiedContainerPublication,
+            AdaptiveContainerPublishMetrics,
+        ),
+        StoreError,
+    > {
         let PreparedAdaptiveContainer {
             container_id,
             container_generation,
@@ -1468,8 +1703,13 @@ impl<I: StorageIo> ContainerRepository<I> {
             u64::try_from(sealed.len()).expect("ASSERT: a Container image length fits u64");
         let publish_wall_started = Instant::now();
         let publish_cpu_started = process_cpu_time();
-        let verified =
-            self.publish_sealed(container_id, container_generation, sealed, publication)?;
+        let verified = self.publish_sealed(
+            container_id,
+            container_generation,
+            sealed,
+            publication,
+            placement,
+        )?;
         let publish_wall = publish_wall_started.elapsed();
         let publish_process_cpu = process_cpu_elapsed(publish_cpu_started);
         let logical_bytes = verified.logical_bytes();
@@ -1493,6 +1733,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_generation: u64,
         sealed: AlignedContainerBytes,
         publication: VerifiedContainerPublication,
+        placement: ContainerPlacement,
     ) -> Result<VerifiedContainerPublication, StoreError> {
         let building = BuildingContainerHeader::new(container_id, container_generation)?.encode();
         let temporary_name = temporary_name(container_id);
@@ -1517,6 +1758,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                 publication,
                 temporary_name,
                 published_name,
+                placement,
             })
     }
 
@@ -1585,6 +1827,37 @@ impl<I: StorageIo> ContainerRepository<I> {
         self.decode_published_bytes(container_id, &bytes)
     }
 
+    fn read_verified_image(
+        &self,
+        container_id: ContainerId,
+    ) -> Result<VerifiedContainerImage, StoreError> {
+        let bytes = self.storage.read(&published_name(container_id))?;
+        let mut base_resolver = ContainerBaseResolver::new(self);
+        let mut resolver_error = None;
+        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| match base_resolver
+            .resolve(dependency)
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                resolver_error = Some(error);
+                Err(FormatError::ZstdPrefixBaseRequired)
+            }
+        };
+        let decoded = VerifiedContainerImage::decode_with_zstd_prefix_resolver(bytes, &mut resolve);
+        if let Some(error) = resolver_error {
+            return Err(error);
+        }
+        let image = decoded?;
+        let embedded_id = image.container().header().container_id();
+        if embedded_id != container_id {
+            return Err(StoreError::PublishedIdentityMismatch {
+                name: container_id,
+                header: embedded_id,
+            });
+        }
+        Ok(image)
+    }
+
     fn decode_published_bytes(
         &self,
         expected_id: ContainerId,
@@ -1616,6 +1889,38 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(container)
     }
 
+    fn verify_published_bytes(
+        &self,
+        expected_id: ContainerId,
+        bytes: &[u8],
+    ) -> Result<VerifiedContainerPublication, StoreError> {
+        let mut base_resolver = ContainerBaseResolver::new(self);
+        let mut resolver_error = None;
+        let mut resolve = |dependency: fastdup_format::ZstdPrefixDependency| match base_resolver
+            .resolve(dependency)
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                resolver_error = Some(error);
+                Err(FormatError::ZstdPrefixBaseRequired)
+            }
+        };
+        let verified =
+            SealedContainer::verify_publication_with_zstd_prefix_resolver(bytes, &mut resolve);
+        if let Some(error) = resolver_error {
+            return Err(error);
+        }
+        let publication = verified?;
+        let embedded_id = publication.header().container_id();
+        if embedded_id != expected_id {
+            return Err(StoreError::PublishedIdentityMismatch {
+                name: expected_id,
+                header: embedded_id,
+            });
+        }
+        Ok(publication)
+    }
+
     fn find_independent_base_in_names(
         &self,
         names: &[(String, ContainerId)],
@@ -1641,7 +1946,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             {
                 return Err(StoreError::ExactLocationMismatch);
             }
-            return Ok(Some(record.payload().to_vec()));
+            return Ok(Some(record.into_payload()));
         }
         Ok(None)
     }
@@ -1761,6 +2066,23 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u64,
     ) -> Result<Vec<u8>, StoreError> {
+        let (mut requested, _) = self
+            .read_verified_chunk_payload(chunk_id, logical_length)?
+            .into_parts();
+        requested
+            .pop()
+            .map(VerifiedChunkPayload::into_payload)
+            .ok_or(StoreError::MissingVerifiedChunk {
+                chunk_id,
+                logical_length,
+            })
+    }
+
+    fn read_verified_chunk_payload(
+        &self,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+    ) -> Result<VerifiedChunkRead, StoreError> {
         let mut names = self.storage.list_names()?;
         names.sort_unstable();
         for name in names {
@@ -1772,12 +2094,22 @@ impl<I: StorageIo> ContainerRepository<I> {
             }
             let bytes = self.storage.read(&name)?;
             let container = self.decode_published_bytes(expected_id, &bytes)?;
-            let Some(payload) = container.chunk(chunk_id) else {
+            let Some(record_ordinal) = container.records().iter().position(|record| {
+                record.chunk_id() == chunk_id
+                    && u64::try_from(record.payload().len()) == Ok(logical_length)
+            }) else {
                 continue;
             };
-            if u64::try_from(payload.len()) == Ok(logical_length) {
-                return Ok(payload.to_vec());
-            }
+            let requested = container.records()[record_ordinal].verified_payload();
+            let record_offset = container.locations()[record_ordinal].record_offset();
+            let admission_group = container
+                .records()
+                .iter()
+                .zip(container.locations())
+                .filter(|(_, location)| location.record_offset() == record_offset)
+                .map(|(record, _)| record.verified_payload())
+                .collect();
+            return Ok(VerifiedChunkRead::single(requested, admission_group));
         }
         Err(StoreError::MissingVerifiedChunk {
             chunk_id,
@@ -1803,11 +2135,58 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         candidate: ExactIndexEntry,
     ) -> Result<Vec<u8>, StoreError> {
-        let (descriptor, encoded_record) = self.read_candidate_record(candidate)?;
-        let record = descriptor
-            .decode_candidate(candidate, &encoded_record)
-            .map_err(map_exact_location_error)?;
-        Ok(record.payload().to_vec())
+        let (mut requested, _) = self.read_verified_location_payload(candidate)?.into_parts();
+        requested
+            .pop()
+            .map(VerifiedChunkPayload::into_payload)
+            .ok_or(StoreError::ExactLocationMismatch)
+    }
+
+    fn read_verified_location_payload(
+        &self,
+        candidate: ExactIndexEntry,
+    ) -> Result<VerifiedChunkRead, StoreError> {
+        if candidate.transition() != ExactLocationTransition::Active {
+            return Err(StoreError::ExactLocationMismatch);
+        }
+        let descriptor = self.read_candidate_descriptor(candidate)?;
+        let key = RecordReadCoordinator::key(candidate);
+        match self.record_reads.join(key) {
+            RecordReadJoin::Follower(flight) => {
+                let payloads = RecordReadCoordinator::wait(&flight)
+                    .ok_or(StoreError::ExactLocationMismatch)?;
+                verified_record_read(candidate, payloads.as_slice())
+            }
+            RecordReadJoin::Leader(flight) => {
+                let decoded = self
+                    .read_candidate_record_with_descriptor(candidate, descriptor)
+                    .and_then(|encoded_record| {
+                        descriptor
+                            .decode_candidate_payloads(&[candidate], &encoded_record)
+                            .map_err(map_exact_location_error)
+                    })
+                    .map(|verified| Arc::new(verified.into_parts().1));
+                match decoded {
+                    Ok(payloads) => {
+                        self.record_reads
+                            .complete(key, &flight, Some(Arc::clone(&payloads)));
+                        verified_record_read(candidate, payloads.as_slice())
+                    }
+                    Err(error) => {
+                        self.record_reads.complete(key, &flight, None);
+                        Err(error)
+                    }
+                }
+            }
+            RecordReadJoin::Bypass => {
+                let encoded_record =
+                    self.read_candidate_record_with_descriptor(candidate, descriptor)?;
+                let verified = descriptor
+                    .decode_candidate_payloads(&[candidate], &encoded_record)
+                    .map_err(map_exact_location_error)?;
+                verified_record_read(candidate, &verified.into_parts().1)
+            }
+        }
     }
 
     /// Resolves one codec-3 target after its named Base was independently
@@ -1831,7 +2210,24 @@ impl<I: StorageIo> ContainerRepository<I> {
         let record = descriptor
             .decode_zstd_prefix_candidate(candidate, &encoded_record, verified_base)
             .map_err(map_exact_location_error)?;
-        Ok(record.payload().to_vec())
+        Ok(record.into_payload())
+    }
+
+    fn read_verified_zstd_prefix_location_payload(
+        &self,
+        candidate: ExactIndexEntry,
+        verified_base: &VerifiedChunkPayload,
+    ) -> Result<VerifiedChunkRead, StoreError> {
+        let (descriptor, encoded_record) = self.read_candidate_record(candidate)?;
+        let record = descriptor
+            .decode_zstd_prefix_candidate_with_verified_base(
+                candidate,
+                &encoded_record,
+                verified_base,
+            )
+            .map_err(map_exact_location_error)?;
+        let payload = record.into_verified_payload();
+        Ok(VerifiedChunkRead::single(payload.clone(), vec![payload]))
     }
 
     fn read_candidate_record(
@@ -1971,6 +2367,21 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u64,
     ) -> Option<(ExactIndexEntry, Vec<u8>)> {
+        let (candidate, read) =
+            self.find_verified_candidate_payload_with_index(index, chunk_id, logical_length)?;
+        let (mut requested, _) = read.into_parts();
+        requested
+            .pop()
+            .map(VerifiedChunkPayload::into_payload)
+            .map(|bytes| (candidate, bytes))
+    }
+
+    fn find_verified_candidate_payload_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+    ) -> Option<(ExactIndexEntry, VerifiedChunkRead)> {
         let Ok(index_length) = u32::try_from(logical_length) else {
             return None;
         };
@@ -2010,18 +2421,29 @@ impl<I: StorageIo> ContainerRepository<I> {
             }
             attempted += 1;
             let verified = if location.dependency_id() == [0; 32] {
-                self.read_verified_location(candidate)
+                self.read_verified_location_payload(candidate)
             } else {
                 let base_id = fastdup_format::ChunkId::from_bytes(location.dependency_id());
-                let Some(base) =
-                    self.find_verified_independent_base_with_index(index, base_id, index_length)
-                else {
+                let Some(base_read) = self.find_verified_independent_base_read_with_index(
+                    index,
+                    base_id,
+                    index_length,
+                ) else {
                     continue;
                 };
-                self.read_verified_zstd_prefix_location(candidate, &base)
+                let (mut base_requested, mut groups) = base_read.into_parts();
+                let Some(base) = base_requested.pop() else {
+                    continue;
+                };
+                self.read_verified_zstd_prefix_location_payload(candidate, &base)
+                    .map(|target_read| {
+                        let (requested, target_groups) = target_read.into_parts();
+                        groups.extend(target_groups);
+                        VerifiedChunkRead::new(requested, groups)
+                    })
             };
-            if let Ok(bytes) = verified {
-                return Some((candidate, bytes));
+            if let Ok(read) = verified {
+                return Some((candidate, read));
             }
         }
         None
@@ -2033,6 +2455,28 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u32,
     ) -> Option<Vec<u8>> {
+        self.find_verified_independent_base_payload_with_index(index, chunk_id, logical_length)
+            .map(VerifiedChunkPayload::into_payload)
+    }
+
+    fn find_verified_independent_base_payload_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u32,
+    ) -> Option<VerifiedChunkPayload> {
+        let read =
+            self.find_verified_independent_base_read_with_index(index, chunk_id, logical_length)?;
+        let (mut requested, _) = read.into_parts();
+        requested.pop()
+    }
+
+    fn find_verified_independent_base_read_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u32,
+    ) -> Option<VerifiedChunkRead> {
         let lookup = index.lookup_transitions(chunk_id, logical_length).ok()?;
         let mut seen_locations: [Option<ExactIndexLocation>; MAX_EXACT_LOOKUP_CANDIDATES] =
             [None; MAX_EXACT_LOOKUP_CANDIDATES];
@@ -2068,8 +2512,8 @@ impl<I: StorageIo> ContainerRepository<I> {
                 break;
             }
             attempted += 1;
-            if let Ok(bytes) = self.read_verified_location(candidate) {
-                return Some(bytes);
+            if let Ok(read) = self.read_verified_location_payload(candidate) {
+                return Some(read);
             }
         }
         None
@@ -2100,10 +2544,30 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u64,
     ) -> Result<Vec<u8>, StoreError> {
-        if let Some(bytes) = self.find_verified_chunk_with_index(index, chunk_id, logical_length)? {
-            return Ok(bytes);
+        let (mut requested, _) = self
+            .read_verified_chunk_payload_with_index(index, chunk_id, logical_length)?
+            .into_parts();
+        requested
+            .pop()
+            .map(VerifiedChunkPayload::into_payload)
+            .ok_or(StoreError::MissingVerifiedChunk {
+                chunk_id,
+                logical_length,
+            })
+    }
+
+    fn read_verified_chunk_payload_with_index<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+    ) -> Result<VerifiedChunkRead, StoreError> {
+        if let Some((_, read)) =
+            self.find_verified_candidate_payload_with_index(index, chunk_id, logical_length)
+        {
+            return Ok(read);
         }
-        self.read_verified_chunk(chunk_id, logical_length)
+        self.read_verified_chunk_payload(chunk_id, logical_length)
     }
 
     /// Resolves one bounded logical read as a physical Record plan.
@@ -2122,18 +2586,17 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         index: &ActivatedExactIndex<J>,
         requests: &[(fastdup_format::ChunkId, u64)],
-    ) -> Result<Vec<Vec<u8>>, StoreError> {
+    ) -> Result<VerifiedChunkRead, StoreError> {
         if requests.len() == 1 {
             let (chunk_id, logical_length) = requests[0];
-            return self
-                .read_verified_chunk_with_index(index, chunk_id, logical_length)
-                .map(|bytes| vec![bytes]);
+            return self.read_verified_chunk_payload_with_index(index, chunk_id, logical_length);
         }
         let mut resolved = Vec::new();
         resolved
             .try_reserve_exact(requests.len())
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         resolved.resize_with(requests.len(), || None);
+        let mut admission_groups = Vec::new();
         let mut planned = Vec::<(([u8; 16], u64, u64, u32), usize, ExactIndexEntry)>::new();
         planned
             .try_reserve_exact(requests.len())
@@ -2388,34 +2851,98 @@ impl<I: StorageIo> ContainerRepository<I> {
                     .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
                 exact_candidates
                     .extend(record_candidates.iter().map(|(_, _, candidate)| *candidate));
-                let Ok(records) = descriptor.decode_candidates(&exact_candidates, encoded_record)
+                let Ok(verified) =
+                    descriptor.decode_candidate_payloads(&exact_candidates, encoded_record)
                 else {
                     record_start = record_end;
                     continue;
                 };
+                let (records, all) = verified.into_parts();
                 assert_eq!(
                     records.len(),
                     record_candidates.len(),
                     "ASSERT: a verified Record group returns one Chunk per candidate"
                 );
-                for (&(_, request_ordinal, _), record) in record_candidates.iter().zip(records) {
-                    resolved[request_ordinal] = Some(record.into_payload());
+                admission_groups.push(all);
+                for (&(_, request_ordinal, _), payload) in record_candidates.iter().zip(records) {
+                    resolved[request_ordinal] = Some(payload);
                 }
                 record_start = record_end;
             }
             group_start = batch_end;
         }
 
-        for (request_ordinal, &(chunk_id, logical_length)) in requests.iter().enumerate() {
-            if resolved[request_ordinal].is_none() {
-                resolved[request_ordinal] =
-                    Some(self.read_verified_chunk_with_index(index, chunk_id, logical_length)?);
+        // Resolve the dependent half of the batch as a tiny request-local DAG.
+        // Multiple Prefix targets commonly name the same Base; resolving that
+        // Base once avoids repeating both its physical Record read and decode.
+        let mut verified_bases =
+            BTreeMap::<(fastdup_format::ChunkId, u32), Option<VerifiedChunkPayload>>::new();
+        for (request_ordinal, active) in active_candidates.iter().copied().enumerate() {
+            if resolved[request_ordinal].is_some() {
+                continue;
+            }
+            let (_, logical_length) = requests[request_ordinal];
+            let Ok(index_length) = u32::try_from(logical_length) else {
+                continue;
+            };
+            for candidate in active.into_iter().flatten() {
+                let dependency = candidate.location().dependency_id();
+                if dependency == [0; 32] {
+                    continue;
+                }
+                let base_id = fastdup_format::ChunkId::from_bytes(dependency);
+                let base_key = (base_id, index_length);
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    verified_bases.entry(base_key)
+                {
+                    let base = self
+                        .find_verified_independent_base_read_with_index(
+                            index,
+                            base_id,
+                            index_length,
+                        )
+                        .and_then(|read| {
+                            let (mut requested, groups) = read.into_parts();
+                            let payload = requested.pop()?;
+                            admission_groups.extend(groups);
+                            Some(payload)
+                        });
+                    entry.insert(base);
+                }
+                let Some(base) = verified_bases.get(&base_key).and_then(Option::as_ref) else {
+                    continue;
+                };
+                let Ok(target_read) =
+                    self.read_verified_zstd_prefix_location_payload(candidate, base)
+                else {
+                    continue;
+                };
+                let (mut requested, groups) = target_read.into_parts();
+                let Some(payload) = requested.pop() else {
+                    continue;
+                };
+                resolved[request_ordinal] = Some(payload);
+                admission_groups.extend(groups);
+                break;
             }
         }
-        Ok(resolved
-            .into_iter()
-            .map(|payload| payload.expect("ASSERT: every planned Chunk resolved or returned"))
-            .collect())
+
+        for (request_ordinal, &(chunk_id, logical_length)) in requests.iter().enumerate() {
+            if resolved[request_ordinal].is_none() {
+                let (mut requested, groups) = self
+                    .read_verified_chunk_payload_with_index(index, chunk_id, logical_length)?
+                    .into_parts();
+                resolved[request_ordinal] = requested.pop();
+                admission_groups.extend(groups);
+            }
+        }
+        Ok(VerifiedChunkRead::new(
+            resolved
+                .into_iter()
+                .map(|payload| payload.expect("ASSERT: every planned Chunk resolved or returned"))
+                .collect(),
+            admission_groups,
+        ))
     }
 
     /// Discovers published names and verifies every complete container.
@@ -2604,15 +3131,15 @@ impl<I: StorageIo> ContainerRepository<I> {
                 continue;
             };
             let bytes = self.storage.read(&name)?;
-            let container = self.decode_published_bytes(expected_id, &bytes)?;
-            let header = container.header();
+            let publication = self.verify_published_bytes(expected_id, &bytes)?;
+            let header = publication.header();
             let embedded_id = header.container_id();
             verified.push(PublishedContainerSummary {
                 container_id: embedded_id,
                 container_generation: header.container_generation(),
-                chunk_count: container.chunk_count(),
-                raw_record_count: container.raw_record_count(),
-                zstd_record_count: container.zstd_record_count(),
+                chunk_count: publication.locations().len(),
+                raw_record_count: publication.raw_record_count(),
+                zstd_record_count: publication.zstd_record_count(),
                 file_length: header.layout().file_length,
             });
         }
@@ -2630,7 +3157,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     where
         I: Sync,
     {
-        self.visit_verified_published_pipelined::<StoreError, _>(|_| Ok(()))
+        self.visit_verified_publications_pipelined::<StoreError, _>(|_| Ok(()))
     }
 
     pub(crate) fn remove_verified_published(
@@ -2749,6 +3276,82 @@ impl<I: StorageIo> ContainerRepository<I> {
             self.storage.sync_root()?;
         }
         Ok(report)
+    }
+
+    pub(crate) fn visit_verified_publications_pipelined<E, F>(
+        &self,
+        mut visitor: F,
+    ) -> Result<ContainerAuditSummary, E>
+    where
+        I: Sync,
+        E: From<StoreError>,
+        F: FnMut(&VerifiedContainerPublication) -> Result<(), E>,
+    {
+        let mut names = self
+            .storage
+            .list_names()
+            .map_err(|error| E::from(StoreError::from(error)))?;
+        names.sort_unstable();
+        let worker_limit = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let mut summary = ContainerAuditSummary::default();
+        let mut cursor = 0_usize;
+        while cursor < names.len() {
+            let mut encoded = Vec::new();
+            let mut encoded_bytes = 0_u64;
+            while cursor < names.len() && encoded.len() < worker_limit {
+                let name = &names[cursor];
+                let Some(expected_id) = parse_published_name(name).map_err(E::from)? else {
+                    cursor += 1;
+                    continue;
+                };
+                let length = self
+                    .storage
+                    .object_len(name)
+                    .map_err(|error| E::from(StoreError::from(error)))?;
+                if !encoded.is_empty()
+                    && encoded_bytes
+                        .checked_add(length)
+                        .is_none_or(|total| total > MAINTENANCE_VERIFY_WINDOW_BYTES)
+                {
+                    break;
+                }
+                let bytes = self
+                    .storage
+                    .read(name)
+                    .map_err(|error| E::from(StoreError::from(error)))?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(
+                        u64::try_from(bytes.len())
+                            .map_err(|_| E::from(audit_counter_overflow()))?,
+                    )
+                    .ok_or_else(audit_counter_overflow)
+                    .map_err(E::from)?;
+                encoded.push((expected_id, bytes));
+                cursor += 1;
+            }
+            if encoded.is_empty() {
+                assert_eq!(
+                    cursor,
+                    names.len(),
+                    "ASSERT: an empty maintenance verification window is valid only at namespace EOF"
+                );
+                break;
+            }
+            assert!(
+                encoded_bytes <= MAINTENANCE_VERIFY_WINDOW_BYTES,
+                "ASSERT: one Container cannot exceed the maintenance verification window"
+            );
+            let decoded = encoded
+                .into_par_iter()
+                .map(|(expected_id, bytes)| self.verify_published_bytes(expected_id, &bytes))
+                .collect::<Result<Vec<_>, StoreError>>()
+                .map_err(E::from)?;
+            for publication in decoded {
+                add_publication_to_audit_summary(&mut summary, &publication).map_err(E::from)?;
+                visitor(&publication)?;
+            }
+        }
+        Ok(summary)
     }
 
     pub(crate) fn visit_verified_published_pipelined<E, F>(
@@ -3377,6 +3980,47 @@ fn add_container_to_audit_summary(
     Ok(())
 }
 
+fn add_publication_to_audit_summary(
+    summary: &mut ContainerAuditSummary,
+    publication: &VerifiedContainerPublication,
+) -> Result<(), StoreError> {
+    let header = publication.header();
+    summary.containers = summary
+        .containers
+        .checked_add(1)
+        .ok_or_else(audit_counter_overflow)?;
+    summary.chunks = summary
+        .chunks
+        .checked_add(
+            u64::try_from(publication.locations().len()).map_err(|_| audit_counter_overflow())?,
+        )
+        .ok_or_else(audit_counter_overflow)?;
+    summary.raw_records = summary
+        .raw_records
+        .checked_add(
+            u64::try_from(publication.raw_record_count()).map_err(|_| audit_counter_overflow())?,
+        )
+        .ok_or_else(audit_counter_overflow)?;
+    summary.zstd_records = summary
+        .zstd_records
+        .checked_add(
+            u64::try_from(publication.zstd_record_count()).map_err(|_| audit_counter_overflow())?,
+        )
+        .ok_or_else(audit_counter_overflow)?;
+    summary.file_bytes = summary
+        .file_bytes
+        .checked_add(header.layout().file_length)
+        .ok_or_else(audit_counter_overflow)?;
+    summary.generation_high_water = Some(
+        summary
+            .generation_high_water
+            .map_or(header.container_generation(), |generation| {
+                generation.max(header.container_generation())
+            }),
+    );
+    Ok(())
+}
+
 fn audit_counter_overflow() -> StoreError {
     StoreError::Io(io::Error::other("Container audit counter overflow"))
 }
@@ -3411,6 +4055,25 @@ fn exact_entry_location_order(
                 .chunk_ordinal()
                 .cmp(&right_location.chunk_ordinal())
         })
+}
+
+fn verified_record_read(
+    candidate: ExactIndexEntry,
+    payloads: &[VerifiedChunkPayload],
+) -> Result<VerifiedChunkRead, StoreError> {
+    let ordinal = usize::try_from(candidate.location().chunk_ordinal())
+        .map_err(|_| StoreError::ExactLocationMismatch)?;
+    let requested = payloads
+        .get(ordinal)
+        .filter(|payload| {
+            payload.chunk_id() == candidate.chunk_id()
+                && u64::try_from(payload.len()) == Ok(u64::from(candidate.logical_length()))
+                && usize::try_from(candidate.location().decoded_offset())
+                    == Ok(payload.decoded_offset())
+        })
+        .cloned()
+        .ok_or(StoreError::ExactLocationMismatch)?;
+    Ok(VerifiedChunkRead::single(requested, payloads.to_vec()))
 }
 
 fn map_exact_location_error(error: FormatError) -> StoreError {

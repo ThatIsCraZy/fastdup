@@ -23,10 +23,6 @@ IOWeight=1000
 OOMScoreAdjust=-900
 LimitNOFILE=1048576
 NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectHome=yes
-ProtectSystem=strict
-ReadWritePaths=/srv/fastdup/repository /var/lib/fastdup/repository
 Restart=on-failure
 RestartSec=3s
 

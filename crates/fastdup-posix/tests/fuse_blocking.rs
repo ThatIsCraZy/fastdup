@@ -33,6 +33,7 @@ impl MutationObserver for PayloadPointerObserver {
         _inode: InodeId,
         _offset: u64,
         _mutation_sequence: u64,
+        _small_file: bool,
         bytes: MutationPayload,
     ) -> Vec<fastdup_posix::ExternalizedExtent> {
         self.0
@@ -50,6 +51,7 @@ impl MutationObserver for SlowWriteObserver {
         _inode: InodeId,
         _offset: u64,
         _mutation_sequence: u64,
+        _small_file: bool,
         _bytes: MutationPayload,
     ) -> Vec<fastdup_posix::ExternalizedExtent> {
         std::thread::sleep(Duration::from_millis(300));
@@ -65,6 +67,7 @@ impl MutationObserver for SlowFenceObserver {
         _inode: InodeId,
         _offset: u64,
         _mutation_sequence: u64,
+        _small_file: bool,
         _bytes: MutationPayload,
     ) -> Vec<fastdup_posix::ExternalizedExtent> {
         Vec::new()
