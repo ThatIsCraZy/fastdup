@@ -45,6 +45,87 @@ pub(crate) fn update_votes(votes: &mut [i32; 512], words: [u64; 8]) {
     unsafe { update_votes_avx2(votes, words) };
 }
 
+/// Finds the exact differing-byte runs and their concatenated XOR payload.
+///
+/// The safe caller has already selected AVX2 and proved equal input lengths.
+/// Durable run semantics remain defined by the scalar implementation in the
+/// parent module; differential tests exercise both implementations.
+pub(crate) fn scan_sparse_xor(
+    base: &[u8],
+    target: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+    xor_bytes: &mut Vec<u8>,
+) {
+    assert!(
+        available(),
+        "ASSERT: sparse-XOR AVX2 dispatch is feature-gated"
+    );
+    assert_eq!(
+        base.len(),
+        target.len(),
+        "ASSERT: sparse-XOR AVX2 inputs have equal lengths"
+    );
+    // SAFETY: runtime detection above establishes AVX2. The kernel bounds
+    // every unaligned load by the equal input lengths and uses safe Vec pushes
+    // for all emitted run and payload bytes.
+    unsafe { scan_sparse_xor_avx2(base, target, runs, xor_bytes) };
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn scan_sparse_xor_avx2(
+    base: &[u8],
+    target: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+    xor_bytes: &mut Vec<u8>,
+) {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+
+    runs.clear();
+    xor_bytes.clear();
+    let mut cursor = 0_usize;
+    let mut run_start = None;
+    while cursor.saturating_add(32) <= target.len() {
+        // SAFETY: the loop condition and equal input lengths prove both
+        // unaligned 32-byte loads lie inside their respective slices.
+        let (base_lane, target_lane) = unsafe {
+            (
+                _mm256_loadu_si256(base.as_ptr().add(cursor).cast::<__m256i>()),
+                _mm256_loadu_si256(target.as_ptr().add(cursor).cast::<__m256i>()),
+            )
+        };
+        let equal_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(base_lane, target_lane)) as u32;
+        if equal_mask == u32::MAX {
+            if let Some(start) = run_start.take() {
+                runs.push((start, cursor - start));
+            }
+            cursor += 32;
+            continue;
+        }
+
+        for lane in 0..32 {
+            if equal_mask & (1_u32 << lane) == 0 {
+                run_start.get_or_insert(cursor);
+                xor_bytes.push(base[cursor] ^ target[cursor]);
+            } else if let Some(start) = run_start.take() {
+                runs.push((start, cursor - start));
+            }
+            cursor += 1;
+        }
+    }
+    while cursor < target.len() {
+        if base[cursor] != target[cursor] {
+            run_start.get_or_insert(cursor);
+            xor_bytes.push(base[cursor] ^ target[cursor]);
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, cursor - start));
+        }
+        cursor += 1;
+    }
+    if let Some(start) = run_start {
+        runs.push((start, cursor - start));
+    }
+}
+
 #[target_feature(enable = "avx2")]
 #[allow(clippy::cast_ptr_alignment)]
 unsafe fn update_votes_avx2(votes: &mut [i32; 512], words: [u64; 8]) {

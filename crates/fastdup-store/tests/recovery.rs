@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use fastdup_format::{ChunkId, ContainerId};
+use fastdup_format::{ChunkId, ContainerId, FormatError};
 use fastdup_store::{ContainerRepository, ContainerStore, FsStorageIo, StoreError};
 
 fn test_root(name: &str) -> PathBuf {
@@ -146,4 +146,45 @@ fn recovery_rejects_a_malformed_published_name() {
         store.recover_published(),
         Err(StoreError::InvalidPublishedName(_))
     ));
+}
+
+#[test]
+fn recovery_and_offline_audit_reject_nonzero_container_padding() {
+    let root = test_root("recover-padding-fault");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let store = ContainerStore::open(&root).expect("create workspace-local store");
+    let container_id = id(0xf1);
+    store
+        .publish_raw(container_id, 31, &[b"padding fault injection".as_slice()])
+        .expect("publish fixture");
+    let path = root.join(format!("{}.fdc", encoded_id(0xf1)));
+    let mut encoded = std::fs::read(&path).expect("read published fixture for fault injection");
+    let index_offset = usize::try_from(read_u64(&encoded, 72)).expect("index offset fits usize");
+    let index_length = usize::try_from(read_u64(&encoded, 80)).expect("index length fits usize");
+    let footer_offset = usize::try_from(read_u64(&encoded, 88)).expect("footer offset fits usize");
+    let fault_offset = index_offset + index_length;
+    assert!(fault_offset < footer_offset, "fixture has a padding range");
+    encoded[fault_offset] = 1;
+    std::fs::write(path, encoded).expect("inject one nonzero padding byte");
+
+    assert!(matches!(
+        store.recover_published(),
+        Err(StoreError::Format(FormatError::NonZeroContainerPadding))
+    ));
+    assert!(matches!(
+        store.verify_published(),
+        Err(StoreError::Format(FormatError::NonZeroContainerPadding))
+    ));
+
+    std::fs::remove_dir_all(root).expect("remove only this test repository");
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("worked fixture field is eight bytes"),
+    )
 }

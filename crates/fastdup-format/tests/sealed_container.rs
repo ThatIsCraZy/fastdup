@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use fastdup_format::{
     ContainerId, ExactIndexEntry, FormatError, SealedContainer, SealedContainerDescriptor,
 };
@@ -77,6 +79,37 @@ fn sealed_container_rejects_recovery_index_corruption() {
     assert_eq!(
         SealedContainer::decode(&encoded),
         Err(FormatError::IndexChecksumMismatch)
+    );
+}
+
+#[test]
+fn writer_zeroes_container_padding_and_every_independent_reader_rejects_a_fault() {
+    let mut encoded = SealedContainer::encode(
+        ContainerId::new([0x4a; 16]).expect("nonzero container id"),
+        20,
+        &[b"padding invariant"],
+    )
+    .expect("valid container");
+    let index_offset = usize::try_from(read_u64(&encoded, 72)).expect("index offset fits usize");
+    let index_length = usize::try_from(read_u64(&encoded, 80)).expect("index length fits usize");
+    let footer_offset = usize::try_from(read_u64(&encoded, 88)).expect("footer offset fits usize");
+    let index_end = index_offset + index_length;
+
+    assert!(index_end < footer_offset, "fixture has a padding range");
+    assert!(
+        encoded[index_end..footer_offset]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+
+    encoded[index_end] = 1;
+    assert_eq!(
+        SealedContainer::decode(&encoded),
+        Err(FormatError::NonZeroContainerPadding)
+    );
+    assert_eq!(
+        SealedContainer::verify_publication_with_hash_workers(&encoded, NonZeroUsize::MIN),
+        Err(FormatError::NonZeroContainerPadding)
     );
 }
 

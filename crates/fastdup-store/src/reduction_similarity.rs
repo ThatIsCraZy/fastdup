@@ -1023,6 +1023,20 @@ impl SparseXorDelta {
         base_bytes: &[u8],
         target_bytes: &[u8],
     ) -> Result<DeltaTrial, SimilarityError> {
+        Self::encode_trial_with_vector(
+            base,
+            base_bytes,
+            target_bytes,
+            crate::similarity_simd::available(),
+        )
+    }
+
+    fn encode_trial_with_vector(
+        base: IndependentBaseRef,
+        base_bytes: &[u8],
+        target_bytes: &[u8],
+        vector: bool,
+    ) -> Result<DeltaTrial, SimilarityError> {
         base.verify(base_bytes)?;
         validate_chunk_length(target_bytes.len())?;
         if base_bytes.len() != target_bytes.len() {
@@ -1031,32 +1045,27 @@ impl SparseXorDelta {
 
         let logical_length =
             u32::try_from(target_bytes.len()).map_err(|_| SimilarityError::ArithmeticOverflow)?;
-        let mut runs = Vec::new();
-        let mut xor_bytes = Vec::new();
-        let mut cursor = 0_usize;
-        while cursor < target_bytes.len() {
-            if base_bytes[cursor] == target_bytes[cursor] {
-                cursor += 1;
-                continue;
-            }
-
-            let run_start = cursor;
-            let payload_start = xor_bytes.len();
-            while cursor < target_bytes.len() && base_bytes[cursor] != target_bytes[cursor] {
-                xor_bytes.push(base_bytes[cursor] ^ target_bytes[cursor]);
-                cursor += 1;
-            }
-            let run_length = cursor
-                .checked_sub(run_start)
-                .ok_or(SimilarityError::ArithmeticOverflow)?;
-            runs.push(DeltaRun {
-                logical_offset: u32::try_from(run_start)
-                    .map_err(|_| SimilarityError::ArithmeticOverflow)?,
-                payload_offset: u32::try_from(payload_start)
-                    .map_err(|_| SimilarityError::ArithmeticOverflow)?,
-                length: u32::try_from(run_length)
-                    .map_err(|_| SimilarityError::ArithmeticOverflow)?,
-            });
+        let (run_ranges, xor_bytes) = sparse_xor_parts(base_bytes, target_bytes, vector);
+        let mut payload_start = 0_usize;
+        let runs = run_ranges
+            .into_iter()
+            .map(|(run_start, run_length)| {
+                let run = DeltaRun {
+                    logical_offset: u32::try_from(run_start)
+                        .map_err(|_| SimilarityError::ArithmeticOverflow)?,
+                    payload_offset: u32::try_from(payload_start)
+                        .map_err(|_| SimilarityError::ArithmeticOverflow)?,
+                    length: u32::try_from(run_length)
+                        .map_err(|_| SimilarityError::ArithmeticOverflow)?,
+                };
+                payload_start = payload_start
+                    .checked_add(run_length)
+                    .ok_or(SimilarityError::ArithmeticOverflow)?;
+                Ok(run)
+            })
+            .collect::<Result<Vec<_>, SimilarityError>>()?;
+        if payload_start != xor_bytes.len() {
+            return Err(SimilarityError::ArithmeticOverflow);
         }
 
         let run_count =
@@ -1166,6 +1175,31 @@ impl SparseXorDelta {
         }
         Ok(restored)
     }
+}
+
+fn sparse_xor_parts(base: &[u8], target: &[u8], vector: bool) -> (Vec<(usize, usize)>, Vec<u8>) {
+    let mut runs = Vec::new();
+    let mut xor_bytes = Vec::new();
+    if vector {
+        crate::similarity_simd::scan_sparse_xor(base, target, &mut runs, &mut xor_bytes);
+        return (runs, xor_bytes);
+    }
+
+    let mut cursor = 0_usize;
+    while cursor < target.len() {
+        if base[cursor] == target[cursor] {
+            cursor += 1;
+            continue;
+        }
+
+        let run_start = cursor;
+        while cursor < target.len() && base[cursor] != target[cursor] {
+            xor_bytes.push(base[cursor] ^ target[cursor]);
+            cursor += 1;
+        }
+        runs.push((run_start, cursor - run_start));
+    }
+    (runs, xor_bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1762,6 +1796,128 @@ mod tests {
             );
             assert_eq!(trial.encoding().decode(&base_bytes), Ok(target));
         }
+    }
+
+    #[test]
+    fn sparse_xor_avx2_matches_scalar_runs_at_every_lane_edge() {
+        if !crate::similarity_simd::available() {
+            return;
+        }
+        for length in [1, 31, 32, 33, 63, 64, 65, 4_096, 256 * 1_024] {
+            let base = fixture_bytes(length, 0xd311_a5e0 + length as u64);
+            let mut targets = vec![base.clone()];
+
+            let mut lane_edges = base.clone();
+            for offset in [0, 1, 30, 31, 32, 33, 62, 63, 64, length - 1] {
+                if let Some(byte) = lane_edges.get_mut(offset) {
+                    *byte ^= 0xa5;
+                }
+            }
+            targets.push(lane_edges);
+
+            let mut alternating = base.clone();
+            for byte in alternating.iter_mut().step_by(2) {
+                *byte ^= 0x3c;
+            }
+            targets.push(alternating);
+
+            let mut complete_run = base.clone();
+            for byte in &mut complete_run {
+                *byte ^= 0xff;
+            }
+            targets.push(complete_run);
+
+            for target in targets {
+                assert_eq!(
+                    sparse_xor_parts(&base, &target, true),
+                    sparse_xor_parts(&base, &target, false),
+                    "AVX2 sparse-XOR changed run semantics at length {length}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode sparse-XOR AVX2 microbenchmark"]
+    fn sparse_xor_scalar_and_avx2_microbenchmark() {
+        if !crate::similarity_simd::available() {
+            eprintln!("AVX2 unavailable on this x86-64 host");
+            return;
+        }
+        let base_bytes = fixture_bytes(256 * 1_024, 0x5a17_2026_0901);
+        let mut target = base_bytes.clone();
+        for offset in (0..target.len()).step_by(4_096) {
+            target[offset] ^= 0xa5;
+        }
+        assert_eq!(
+            sparse_xor_parts(&base_bytes, &target, true),
+            sparse_xor_parts(&base_bytes, &target, false)
+        );
+        let base = IndependentBaseRef::from_verified_bytes(&base_bytes).expect("valid base");
+        assert_eq!(
+            SparseXorDelta::encode_trial_with_vector(base, &base_bytes, &target, true),
+            SparseXorDelta::encode_trial_with_vector(base, &base_bytes, &target, false)
+        );
+
+        let samples = 7_usize;
+        let scan_rounds = 256_u32;
+        let trial_rounds = 16_u32;
+        let measure_scan = |vector| {
+            let started = Instant::now();
+            for _ in 0..scan_rounds {
+                black_box(sparse_xor_parts(
+                    black_box(&base_bytes),
+                    black_box(&target),
+                    vector,
+                ));
+            }
+            started.elapsed()
+        };
+        let measure_trial = |vector| {
+            let started = Instant::now();
+            for _ in 0..trial_rounds {
+                black_box(
+                    SparseXorDelta::encode_trial_with_vector(
+                        base,
+                        black_box(&base_bytes),
+                        black_box(&target),
+                        vector,
+                    )
+                    .expect("benchmark trial is valid"),
+                );
+            }
+            started.elapsed()
+        };
+        let alternating_median = |measure: &dyn Fn(bool) -> std::time::Duration| {
+            let mut scalar = Vec::with_capacity(samples);
+            let mut avx2 = Vec::with_capacity(samples);
+            for sample in 0..samples {
+                if sample % 2 == 0 {
+                    scalar.push(measure(false));
+                    avx2.push(measure(true));
+                } else {
+                    avx2.push(measure(true));
+                    scalar.push(measure(false));
+                }
+            }
+            scalar.sort_unstable();
+            avx2.sort_unstable();
+            (scalar[samples / 2], avx2[samples / 2])
+        };
+        let (scalar_scan, avx2_scan) = alternating_median(&measure_scan);
+        let (scalar_trial, avx2_trial) = alternating_median(&measure_trial);
+        println!(
+            "sparse_xor_scan median_samples={samples} scalar_ns_per_chunk={:.1} avx2_ns_per_chunk={:.1} speedup={:.3}x",
+            scalar_scan.as_secs_f64() * 1_000_000_000.0 / f64::from(scan_rounds),
+            avx2_scan.as_secs_f64() * 1_000_000_000.0 / f64::from(scan_rounds),
+            scalar_scan.as_secs_f64() / avx2_scan.as_secs_f64(),
+        );
+        println!(
+            "sparse_xor_trial median_samples={samples} scalar_ns_per_chunk={:.1} avx2_ns_per_chunk={:.1} speedup={:.3}x",
+            scalar_trial.as_secs_f64() * 1_000_000_000.0 / f64::from(trial_rounds),
+            avx2_trial.as_secs_f64() * 1_000_000_000.0 / f64::from(trial_rounds),
+            scalar_trial.as_secs_f64() / avx2_trial.as_secs_f64(),
+        );
     }
 
     #[test]

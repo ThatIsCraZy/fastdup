@@ -375,6 +375,19 @@ pub struct AlignedContainerBytes {
     length: usize,
 }
 
+/// Builds one page-aligned image without first zeroing ranges that later hold
+/// already initialized Records or the Recovery Index.
+///
+/// The backing allocation never reallocates beyond its initial capacity, so
+/// its aligned start remains stable while safe `Vec` appends initialize the
+/// image in durable byte order. An `AlignedContainerBytes` is exposed only
+/// after the complete declared image has been initialized.
+struct AlignedContainerBuilder {
+    allocation: Vec<u8>,
+    start: usize,
+    length: usize,
+}
+
 impl AlignedContainerBytes {
     /// Returns an allocation-free consumed-image sentinel.
     #[must_use]
@@ -412,6 +425,59 @@ impl AlignedContainerBytes {
     #[must_use]
     pub fn into_vec(self) -> Vec<u8> {
         self.as_ref().to_vec()
+    }
+}
+
+impl AlignedContainerBuilder {
+    fn new(length: usize) -> Self {
+        assert!(length != 0 && length.is_multiple_of(HEADER_BYTES));
+        let allocation_length = length
+            .checked_add(HEADER_BYTES - 1)
+            .expect("ASSERT: bounded Container alignment allocation cannot overflow");
+        let mut allocation: Vec<u8> = Vec::with_capacity(allocation_length);
+        let misalignment = allocation.as_ptr().addr() % HEADER_BYTES;
+        let start = (HEADER_BYTES - misalignment) % HEADER_BYTES;
+        allocation.resize(start, 0);
+        Self {
+            allocation,
+            start,
+            length,
+        }
+    }
+
+    fn image_length(&self) -> usize {
+        self.allocation.len() - self.start
+    }
+
+    fn append(&mut self, bytes: &mut Vec<u8>) {
+        let next_length = self
+            .image_length()
+            .checked_add(bytes.len())
+            .expect("ASSERT: bounded Container append length cannot overflow");
+        assert!(next_length <= self.length);
+        self.allocation.append(bytes);
+    }
+
+    fn append_zeroed(&mut self, length: usize) {
+        let next_length = self
+            .image_length()
+            .checked_add(length)
+            .expect("ASSERT: bounded Container padding length cannot overflow");
+        assert!(next_length <= self.length);
+        self.allocation.resize(self.start + next_length, 0);
+    }
+
+    fn finish(self) -> AlignedContainerBytes {
+        assert_eq!(self.image_length(), self.length);
+        assert_eq!(
+            self.allocation[self.start..].as_ptr().addr() % HEADER_BYTES,
+            0
+        );
+        AlignedContainerBytes {
+            allocation: self.allocation,
+            start: self.start,
+            length: self.length,
+        }
     }
 }
 
@@ -5012,27 +5078,35 @@ fn encode_container_from_records(
             .ok_or(FormatError::ArithmeticOverflow)?;
     }
     index_entries.sort_unstable();
-    let index = encode_index(&index_entries)?;
+    let mut index = encode_index(&index_entries)?;
     assert_eq!(record_offset, layout.index_offset);
     assert_eq!(u64::try_from(index.len()), Ok(layout.index_length));
     let file_length_usize =
         usize::try_from(layout.file_length).map_err(|_| FormatError::ArithmeticOverflow)?;
     let footer_offset_usize =
         usize::try_from(layout.footer_offset).map_err(|_| FormatError::ArithmeticOverflow)?;
-    let mut container = AlignedContainerBytes::zeroed(file_length_usize);
-    let mut cursor = HEADER_BYTES;
-    for record in encoded_records {
-        let end = cursor
-            .checked_add(record.len())
-            .ok_or(FormatError::ArithmeticOverflow)?;
+    let mut container = AlignedContainerBuilder::new(file_length_usize);
+    container.append_zeroed(HEADER_BYTES);
+    for mut record in encoded_records {
         record_copy(CopyClass::ContainerAssembly, record.len());
-        container[cursor..end].copy_from_slice(&record);
-        cursor = end;
+        container.append(&mut record);
     }
-    let index_end = cursor
+    assert_eq!(
+        u64::try_from(container.image_length()),
+        Ok(layout.index_offset),
+        "ASSERT: encoded Records exactly fill the declared record region"
+    );
+    let index_end = container
+        .image_length()
         .checked_add(index.len())
         .ok_or(FormatError::ArithmeticOverflow)?;
-    container[cursor..index_end].copy_from_slice(&index);
+    container.append(&mut index);
+    let padding_length = footer_offset_usize
+        .checked_sub(index_end)
+        .ok_or(FormatError::ArithmeticOverflow)?;
+    container.append_zeroed(padding_length);
+    container.append_zeroed(FOOTER_BYTES_USIZE);
+    let mut container = container.finish();
     seal_container_envelope(
         &mut container,
         &header,
