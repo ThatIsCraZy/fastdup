@@ -12,6 +12,17 @@ each CQE. `SINGLE_ISSUER` is enabled because that thread also creates the ring.
 `DEFER_TASKRUN` is not enabled: on the Linux 6.12 XFS benchmark it reduced the
 1,000-by-128-KiB publisher by 7.3 and 17.8 percent in two alternating pairs.
 
+The short-lived Container publication descriptor uses `O_DIRECT` only when
+the sealed image is at least 4 MiB. Smaller publications remain buffered. The
+writer allocates the complete image at a 4-KiB-aligned address, so Direct mode
+does not add a full-image alignment copy. Building, Body, Sealed Header, and
+the three publication samples use the selected descriptor; file fsync,
+no-replace rename, and root-directory fsync remain mandatory. After rename the
+descriptor is dropped, and ordinary demand reads use buffered descriptors with
+kernel readahead. The threshold is the first tested size without a throughput
+or p99 regression on the Linux 6.12 XFS A/B series recorded in
+`docs/benchmarks/direct-io-publication-2026-09-01.md`.
+
 Writer-image verification at or above 1 MiB runs asynchronously through a
 bounded queue on the existing process Rayon pool. Smaller images remain inline
 because dispatch costs exceed their short verification time. The ring owner

@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fastdup_appliance::{APPLIANCE_RECOVERY_LATCH_FILE_NAME, checkpoint_policy_set};
+use fastdup_appliance::{
+    APPLIANCE_RECOVERY_LATCH_FILE_NAME, AppliancePoolBinding, checkpoint_policy_set,
+};
 use fastdup_format::{ManifestExtent, ManifestLeaf, MetadataObjectId, NamespaceRoot};
 use fastdup_store::{FsStorageIo, GenerationRepository};
 
@@ -27,12 +29,19 @@ fn metadata_path(root: &Path, object_id: MetadataObjectId) -> PathBuf {
     root.join(name)
 }
 
+fn initialize_pool_binding(metadata_root: &Path, data_root: &Path) {
+    let metadata = FsStorageIo::open(metadata_root).expect("open Metadata Pool");
+    let data = FsStorageIo::open(data_root).expect("open Data Pool");
+    AppliancePoolBinding::initialize_or_open(&metadata, &data)
+        .expect("initialize current Pool identities");
+}
+
 #[test]
 fn offline_metadata_gc_cli_removes_an_orphan_and_scrubs_the_retained_graph() {
     let root = unique_test_root("metadata-gc-cli");
     let metadata_root = root.join("metadata");
     let container_root = root.join("containers");
-    std::fs::create_dir_all(&container_root).expect("create workspace-local container root");
+    initialize_pool_binding(&metadata_root, &container_root);
 
     let generations = GenerationRepository::new(
         FsStorageIo::open(&metadata_root).expect("create workspace-local metadata repository"),
@@ -113,7 +122,7 @@ fn offline_pool_rebuild_cli_publishes_a_coherent_exact_similarity_pair() {
     let root = unique_test_root("pool-rebuild-cli");
     let metadata_root = root.join("metadata");
     let container_root = root.join("containers");
-    std::fs::create_dir_all(&container_root).expect("create container root");
+    initialize_pool_binding(&metadata_root, &container_root);
     let generations = GenerationRepository::new(
         FsStorageIo::open(&metadata_root).expect("create metadata repository"),
         checkpoint_policy_set(),
@@ -161,7 +170,7 @@ fn recovery_required_repository_allows_scrub_before_other_offline_mutation() {
     let root = unique_test_root("recovery-required-cli");
     let metadata_root = root.join("metadata");
     let container_root = root.join("containers");
-    std::fs::create_dir_all(&container_root).expect("create container root");
+    initialize_pool_binding(&metadata_root, &container_root);
     let generations = GenerationRepository::new(
         FsStorageIo::open(&metadata_root).expect("create metadata repository"),
         checkpoint_policy_set(),

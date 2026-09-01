@@ -41,7 +41,7 @@ Two pre-created names fit the existing storage seam:
   point.
 
 No mutable head pointer, deletion, rename-over-existing, or assumed atomic
-sector write is required. Slot choice, overlap, migration, bounds, and recovery
+sector write is required. Slot choice, overlap, bounds, and recovery
 remain behind the existing `ExactIndexRunRepository` interface.
 
 ## Slot invariants
@@ -108,7 +108,7 @@ slot even if the call returned an ambiguous error. No mixed Run Set is valid.
 Retrying an already-selected Run Set audits its immutable dependencies and
 synchronizes the selected slot without appending another record.
 
-## Recovery, migration, and scrub
+## Recovery and scrub
 
 Recovery reads and validates both slot files, selects their unique overlapping
 head, then pairs that record with its exact content-addressed Run Set and every
@@ -116,13 +116,10 @@ referenced immutable Run before exposing an active reader. A corrupt or missing
 activation graph disables index acceleration but does not roll back the
 Namespace Commit WAL.
 
-For migration only, `exact-index.activation.wal` may contain the former valid
-single-file chain up to its 64-MiB limit. The first subsequent activation copies
-its last record into the second slot and appends the successor. Every later
-selected slot is bounded. Once the first slot is reused, an older writer cannot
-safely append. The authoritative Commit-chain fence from
-[ADR 0071](0071-fence-writer-downgrade-in-the-commit-chain.md) now prevents an
-older writable appliance from reaching this publication path.
+Both activation slots are bounded to 64 records from creation. A former 64-MiB
+single-slot chain is unsupported pre-production state and is not a migration
+input. The authoritative Commit-chain fence from ADR 0071 is present from the
+first repository Commit.
 
 Offline `audit_activation_log` repeats both local chain and cross-slot overlap
 checks and fully audits the selected Run Set dependency graph. Discarded
@@ -139,14 +136,13 @@ activation history is not a snapshot and does not pin old Runs or DATA.
 - Fault injection: fails before and after every rotation operation and accepts
   only the previous or complete new Run Set. Only an effective final slot sync
   may expose the new activation.
-- Lifetime gate: migrates a complete legacy 16,384-record file, then separately
-  performs repeated rotations while requiring both ordinary slots to remain at
-  or below 256 KiB.
+- Lifetime gate: performs repeated rotations while requiring both slots to
+  remain at or below 256 KiB.
 
 ## Consequences
 
-Activation-log I/O and memory are lifetime-bounded after the one-time legacy
-migration. Rotation occurs every 63 successor activations because one of each
+Activation-log I/O and memory are lifetime-bounded. Rotation occurs every 63
+successor activations because one of each
 64 records is the bridge. The record byte format is unchanged. This decision
 does not solve large Exact-Run compaction or index-object garbage collection.
 Repository-wide format-epoch fencing is supplied separately by ADR 0071.

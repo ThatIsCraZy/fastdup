@@ -89,49 +89,6 @@ fn metadata_mark_addition_binds_its_immediate_catalog_base() {
 }
 
 #[test]
-fn metadata_mark_catalog_decoder_accepts_legacy_v1_snapshots() {
-    fn envelope(magic: [u8; 8]) -> [u8; METADATA_MARK_CATALOG_HEADER_BYTES] {
-        let mut bytes = [0_u8; METADATA_MARK_CATALOG_HEADER_BYTES];
-        bytes[0..8].copy_from_slice(&magic);
-        bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[10..12].copy_from_slice(&4_096_u16.to_le_bytes());
-        bytes[12..14].copy_from_slice(&32_u16.to_le_bytes());
-        bytes[16..24].copy_from_slice(&9_u64.to_le_bytes());
-        bytes[24..56].copy_from_slice(&[0x66; 32]);
-        bytes[56..64].copy_from_slice(&0_u64.to_le_bytes());
-        bytes[64..72].copy_from_slice(&4_096_u64.to_le_bytes());
-        bytes[72..80].copy_from_slice(&4_096_u64.to_le_bytes());
-        bytes[80..88].copy_from_slice(&8_192_u64.to_le_bytes());
-        let mut rows = blake3::Hasher::new();
-        rows.update(b"fastdup-metadata-mark-rows-v1\0");
-        rows.update(&9_u64.to_le_bytes());
-        rows.update(&[0x66; 32]);
-        rows.update(&0_u64.to_le_bytes());
-        bytes[88..120].copy_from_slice(rows.finalize().as_bytes());
-        let mut envelope = blake3::Hasher::new();
-        envelope.update(b"fastdup-metadata-mark-envelope-v1\0");
-        envelope.update(&bytes[..128]);
-        envelope.update(&[0; 32]);
-        envelope.update(&bytes[160..]);
-        bytes[128..160].copy_from_slice(envelope.finalize().as_bytes());
-        bytes
-    }
-
-    let header = envelope(*b"FDMMARK1");
-    let footer = envelope(*b"FDMMARKF");
-    let decoded = MetadataMarkCatalogDescriptor::decode(&header, &footer, 8_192)
-        .expect("legacy v1 snapshot remains readable");
-
-    assert_eq!(decoded.run_kind(), MetadataMarkCatalogRunKind::Snapshot);
-    assert_eq!(decoded.generation(), 9);
-    assert_eq!(decoded.base_generation(), 0);
-    decoded
-        .start_audit()
-        .finish()
-        .expect("legacy empty row stream remains auditable");
-}
-
-#[test]
 fn metadata_mark_catalog_rejects_noncanonical_order_and_envelope_mutation() {
     let first = MetadataObjectId::new([0x11; 32]).expect("object ID is nonzero");
     let second = MetadataObjectId::new([0x22; 32]).expect("object ID is nonzero");

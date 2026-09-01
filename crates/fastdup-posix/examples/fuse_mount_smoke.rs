@@ -18,7 +18,7 @@ const SMOKE_AVAILABLE_BYTES: u64 = 12 * 1_024 * 1_024 * 1_024;
 struct SmokeStatFs;
 
 impl StatFsSource for SmokeStatFs {
-    fn snapshot(&self) -> io::Result<StatFsSnapshot> {
+    fn snapshot(&self, _inode: u64) -> io::Result<StatFsSnapshot> {
         StatFsSnapshot::new(
             SMOKE_CAPACITY_BYTES,
             SMOKE_AVAILABLE_BYTES,

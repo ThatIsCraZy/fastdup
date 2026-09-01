@@ -27,6 +27,93 @@ const ROOT_CALLER: RequestContext = RequestContext {
 const CHUNK_BYTES: usize = 256 * 1_024;
 
 #[test]
+fn namespace_larger_than_one_metadata_object_checkpoints_recovers_and_scrubs() {
+    const FILE_COUNT: usize = 280;
+    const XATTR_BYTES: usize = 60 * 1_024;
+
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0xD8; 32]).expect("policy identity is nonzero");
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata.clone(), policy),
+        ContainerRepository::new(containers.clone()),
+        1_024,
+    )
+    .expect("open large namespace fixture");
+    let value = vec![0xA5; XATTR_BYTES];
+    let mut selected_inodes = Vec::new();
+
+    for ordinal in 0..FILE_COUNT {
+        let name = format!("large-xattr-{ordinal:04}");
+        let Reply::Created { entry, .. } = appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Create {
+                    parent: ROOT_INODE,
+                    name: name.as_bytes(),
+                    mode: 0o600,
+                    options: OpenOptions::READ_WRITE,
+                    exclusive: true,
+                    truncate: false,
+                },
+            )
+            .expect("create large namespace member")
+        else {
+            panic!("ASSERT: create reply");
+        };
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::SetXattr {
+                    inode: entry.attr.inode,
+                    name: b"user.large",
+                    value: &value,
+                    mode: XattrSetMode::Create,
+                },
+            )
+            .expect("attach bounded large xattr");
+        if matches!(ordinal, 0 | 139 | 279) {
+            selected_inodes.push(entry.attr.inode);
+        }
+    }
+
+    appliance
+        .checkpoint()
+        .expect("checkpoint namespace whose canonical state exceeds 16 MiB")
+        .expect("large namespace mutation produces a generation");
+    metadata.crash();
+    containers.crash();
+
+    let generations = GenerationRepository::new(metadata.clone(), policy);
+    let container_repository = ContainerRepository::new(containers.clone());
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &generations,
+        &container_repository,
+    )
+    .expect("recover sharded namespace graph")
+    .expect("large namespace generation exists");
+    for inode in selected_inodes {
+        assert_eq!(
+            recovered.dispatch(
+                CALLER,
+                Operation::GetXattr {
+                    inode,
+                    name: b"user.large",
+                },
+            ),
+            Ok(Reply::Xattr(value.clone()))
+        );
+    }
+    generations
+        .scrub_all_with_data(&container_repository)
+        .expect("offline scrub accepts the complete large namespace graph");
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn hardlinks_symlinks_ownership_and_times_survive_checkpoint_recovery() {
     let metadata = MemoryStorageIo::new();

@@ -6,8 +6,11 @@ mod appliance_lease;
 mod appliance_recovery_latch;
 mod checkpoint;
 mod checkpoint_trigger;
+mod commit_capacity;
 mod historical_proof_cache;
 mod online_gc;
+mod pool_binding;
+mod pool_isolation;
 mod proof_cache_trace;
 mod statfs;
 
@@ -15,16 +18,26 @@ pub use appliance_lease::{APPLIANCE_LEASE_FILE_NAME, ApplianceLease, ApplianceLe
 pub use appliance_recovery_latch::{
     APPLIANCE_RECOVERY_LATCH_FILE_NAME, ApplianceRecoveryLatch, ApplianceRecoveryState,
 };
+pub use pool_binding::{AppliancePoolBinding, AppliancePoolBindingError, POOL_IDENTITY_FILE_NAME};
+pub use pool_isolation::{
+    POOL_ISOLATION_POLICY_ENV, PhysicalPoolIsolation, PoolIsolationError, PoolIsolationObservation,
+    PoolIsolationPolicy, PoolIsolationPolicyError,
+};
 
 pub use checkpoint::{
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, CpuPhaseStatus,
-    DurableNamespace, DurableNamespaceError, GenerationProofSetStatus, ProfiledCheckpoint,
-    WriteThroughStatus, checkpoint_exact_index_profile_v1, checkpoint_policy_set,
+    DurableNamespace, DurableNamespaceError, GenerationProofSetStatus, INODE_RESERVATION_SPAN_V1,
+    ProfiledCheckpoint, WriteThroughStatus, checkpoint_exact_index_profile_v1,
+    checkpoint_policy_set,
 };
 pub use checkpoint_trigger::{
     CONTAINER_COMMIT_COALESCE, CheckpointAction, CheckpointPressure, CheckpointProgressAction,
     CheckpointTrigger, DurabilityObservation, DurabilitySupervisor, MUTATION_ADMISSION_GUARD,
     MUTATION_COMMIT_TARGET, SEALED_CONTAINER_COMMIT_LIMIT, checkpoint_action,
+};
+pub use commit_capacity::{
+    COMMIT_METADATA_FLOOR_BYTES_V1, CommitCapacityConfigurationError, CommitCapacityGovernor,
+    CommitCapacitySnapshot, CommitCapacityStatus,
 };
 pub use historical_proof_cache::HistoricalProofCacheStatus;
 pub use online_gc::{

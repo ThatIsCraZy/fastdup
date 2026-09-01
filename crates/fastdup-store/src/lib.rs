@@ -5,6 +5,7 @@
 mod container_descriptor_cache;
 mod container_generation_allocator;
 mod exact_activation_log;
+mod exact_index_mmap;
 mod exact_index_repository;
 mod gc_candidate_catalog;
 mod gc_candidate_mmap;
@@ -20,6 +21,7 @@ mod maintenance_ioprio;
 mod memory_budget;
 mod persistent_reduction;
 mod read_cache;
+mod recovery_checkpoint;
 mod reduction;
 mod reduction_codec;
 mod reduction_dictionary;
@@ -54,8 +56,8 @@ pub use generation::{
     CommittedDataGeneration, GenerationError, GenerationLivenessDelta, GenerationRepository,
     GenerationScrubSummary, IndexedRequiredChunkVerifier, ManifestSuccessorProof,
     MetadataGcExactReason, MetadataGcMarkMode, MetadataGcMetrics, RecoveredDataGeneration,
-    RecoveredGeneration, RepositoryFormatSupport, RequiredChunkVerifier, SuccessorPredecessor,
-    VerifiedCommittedFile, WalTail,
+    RecoveredGeneration, RequiredChunkVerifier, SuccessorPredecessor, VerifiedCommittedFile,
+    WalTail,
 };
 pub use maintenance::{
     BackgroundMaintenanceJob, BackgroundMaintenanceReport, DataPoolUsage, DataPoolUsageError,
@@ -78,6 +80,10 @@ pub use persistent_reduction::{
 pub use read_cache::{
     VerifiedReadCache, VerifiedReadCacheConfig, VerifiedReadCacheError, VerifiedReadCacheStatus,
     shared_cache_reserve_bytes,
+};
+pub use recovery_checkpoint::{
+    RecoveryCheckpointError, RecoveryCheckpointRepository, RecoveryCheckpointScrubSummary,
+    RecoveryCheckpointSummary,
 };
 pub use reduction::{
     ReducedObject, ReductionAuditReport, ReductionEngine, ReductionError, ReductionFeatures,
@@ -113,9 +119,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use fastdup_format::{
-    BuildingContainerHeader, ChunkId, ContainerId, ContainerIntrinsicSummary,
-    ContainerRecoveryEnvelope, ExactIndexEntry, ExactIndexLocation, ExactLocationTransition,
-    FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
+    AlignedContainerBytes, BuildingContainerHeader, ChunkId, ContainerId,
+    ContainerIntrinsicSummary, ContainerRecoveryEnvelope, ExactIndexEntry, ExactIndexLocation,
+    ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
     IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, PrehashedAdaptiveRegion, PrehashedChunk,
     PrehashedContiguousRegion, SealedContainer, SealedContainerDescriptor,
     VerifiedContainerPublication,
@@ -267,7 +273,7 @@ pub struct AdaptiveContainerPublishMetrics {
 pub struct PreparedAdaptiveContainer {
     container_id: ContainerId,
     container_generation: u64,
-    sealed: Vec<u8>,
+    sealed: AlignedContainerBytes,
     publication: VerifiedContainerPublication,
     encode_wall: Duration,
     encode_process_cpu: Duration,
@@ -516,8 +522,8 @@ impl PublishedContainerSummary {
 pub struct OwnedContainerPublication {
     container_id: ContainerId,
     container_generation: u64,
-    building_header: Box<[u8; HEADER_BYTES]>,
-    sealed: Vec<u8>,
+    building_header: AlignedContainerBytes,
+    sealed: AlignedContainerBytes,
     publication: VerifiedContainerPublication,
     temporary_name: String,
     published_name: String,
@@ -556,8 +562,8 @@ impl OwnedContainerPublication {
     ) -> (
         ContainerId,
         u64,
-        Box<[u8; HEADER_BYTES]>,
-        Vec<u8>,
+        AlignedContainerBytes,
+        AlignedContainerBytes,
         VerifiedContainerPublication,
         String,
         String,
@@ -889,9 +895,9 @@ impl<I: StorageIo> ContainerRepository<I> {
 
     /// Opens the durable Container-generation allocator.
     ///
-    /// A legacy repository performs one paired-envelope migration scan. Once
-    /// the high-water slots exist, healthy reopen reads only those fixed
-    /// records and skips every previously reserved generation after a crash.
+    /// The fixed high-water slots may be initialized only while the DATA
+    /// repository is empty. Healthy reopen reads only those records and skips
+    /// every previously reserved generation after a crash.
     ///
     /// # Errors
     ///
@@ -910,9 +916,9 @@ impl<I: StorageIo> ContainerRepository<I> {
 
     /// Audits the durable allocator against completely verified Containers.
     ///
-    /// An absent pair is an accepted legacy repository. Once either canonical
-    /// slot exists, both slots and their selected hash chain must validate and
-    /// the durable reservation must cover the greatest observed generation.
+    /// Once either canonical slot exists, both slots and their selected hash
+    /// chain must validate and the durable reservation must cover the greatest
+    /// observed generation.
     ///
     /// # Errors
     ///
@@ -1065,7 +1071,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             container_generation,
             chunks,
         )?;
-        let (sealed, publication) = encoded.into_publication_parts();
+        let (sealed, publication) = encoded.into_aligned_publication_parts();
         self.publish_sealed(container_id, container_generation, sealed, publication)
             .map(drop)
     }
@@ -1088,7 +1094,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Result<VerifiedContainerPublication, StoreError> {
         let encoded =
             SealedContainer::encode_zstd_prefix_pairs(container_id, container_generation, pairs)?;
-        let (sealed, publication) = encoded.into_publication_parts();
+        let (sealed, publication) = encoded.into_aligned_publication_parts();
         self.publish_sealed(container_id, container_generation, sealed, publication)
     }
 
@@ -1116,7 +1122,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             regions,
             NonZeroUsize::MIN,
         )?;
-        let (sealed, publication) = encoded.into_publication_parts();
+        let (sealed, publication) = encoded.into_aligned_publication_parts();
         self.publish_sealed(container_id, container_generation, sealed, publication)
             .map(drop)
     }
@@ -1257,7 +1263,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
         let incompressibility_gate = encoded.metrics();
-        let (sealed, publication) = encoded.into_publication_parts();
+        let (sealed, publication) = encoded.into_aligned_publication_parts();
         Ok(PreparedAdaptiveContainer {
             container_id,
             container_generation,
@@ -1298,7 +1304,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
         let incompressibility_gate = encoded.metrics();
-        let (sealed, publication) = encoded.into_publication_parts();
+        let (sealed, publication) = encoded.into_aligned_publication_parts();
         Ok(PreparedAdaptiveContainer {
             container_id,
             container_generation,
@@ -1335,7 +1341,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
         let incompressibility_gate = encoded.metrics();
-        let (sealed, publication) = encoded.into_publication_parts();
+        let (sealed, publication) = encoded.into_aligned_publication_parts();
         Ok(PreparedAdaptiveContainer {
             container_id,
             container_generation,
@@ -1372,7 +1378,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
         let incompressibility_gate = encoded.metrics();
-        let (sealed, publication) = encoded.into_publication_parts();
+        let (sealed, publication) = encoded.into_aligned_publication_parts();
         Ok(PreparedAdaptiveContainer {
             container_id,
             container_generation,
@@ -1416,7 +1422,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
         let incompressibility_gate = encoded.metrics();
-        let (sealed, publication) = encoded.into_publication_parts();
+        let (sealed, publication) = encoded.into_aligned_publication_parts();
         Ok(PreparedAdaptiveContainer {
             container_id,
             container_generation,
@@ -1485,7 +1491,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         container_id: ContainerId,
         container_generation: u64,
-        sealed: Vec<u8>,
+        sealed: AlignedContainerBytes,
         publication: VerifiedContainerPublication,
     ) -> Result<VerifiedContainerPublication, StoreError> {
         let building = BuildingContainerHeader::new(container_id, container_generation)?.encode();
@@ -1502,7 +1508,11 @@ impl<I: StorageIo> ContainerRepository<I> {
             .publish_owned_container(OwnedContainerPublication {
                 container_id,
                 container_generation,
-                building_header: Box::new(building),
+                building_header: {
+                    let mut aligned = AlignedContainerBytes::zeroed(HEADER_BYTES);
+                    aligned.copy_from_slice(&building);
+                    aligned
+                },
                 sealed,
                 publication,
                 temporary_name,
@@ -2099,10 +2109,12 @@ impl<I: StorageIo> ContainerRepository<I> {
     /// Resolves one bounded logical read as a physical Record plan.
     ///
     /// Independent Chunks whose preferred ACTIVE Exact Locations name the
-    /// same immutable Encoding Record share one range read. Record groups are
-    /// visited in Container/offset order, while returned payloads retain the
-    /// caller's logical order. Any unusable preferred candidate falls back to
-    /// the ordinary bounded candidate and verified-scan path for that Chunk.
+    /// same immutable Encoding Record share one decode. Physically adjacent
+    /// Record groups in the same Container share one range read up to the
+    /// bounded storage-range limit. Groups are visited in Container/offset
+    /// order, while returned payloads retain the caller's logical order. Any
+    /// unusable preferred candidate falls back to the ordinary bounded
+    /// candidate and verified-scan path for that Chunk.
     ///
     /// A one-Chunk request takes the scalar path without constructing a plan.
     #[allow(clippy::too_many_lines)]
@@ -2283,30 +2295,115 @@ impl<I: StorageIo> ContainerRepository<I> {
                     current_descriptor = Some((descriptor_key.0, descriptor_key.1, descriptor));
                     descriptor
                 };
-            let Ok(encoded_record) = self.read_candidate_record_with_descriptor(first, descriptor)
+            let Ok(first_range) = descriptor.record_range(first) else {
+                group_start = group_end;
+                continue;
+            };
+            let Some(mut physical_end) = first_range
+                .offset()
+                .checked_add(u64::try_from(first_range.length()).unwrap_or(u64::MAX))
             else {
                 group_start = group_end;
                 continue;
             };
-            exact_candidates.clear();
-            exact_candidates
-                .try_reserve(candidates.len())
-                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-            exact_candidates.extend(candidates.iter().map(|(_, _, candidate)| *candidate));
-            let Ok(records) = descriptor.decode_candidates(&exact_candidates, &encoded_record)
-            else {
-                group_start = group_end;
-                continue;
-            };
-            assert_eq!(
-                records.len(),
-                candidates.len(),
-                "ASSERT: a verified Record group returns one Chunk per candidate"
-            );
-            for (&(_, request_ordinal, _), record) in candidates.iter().zip(records) {
-                resolved[request_ordinal] = Some(record.into_payload());
+            let mut batch_end = group_end;
+            while batch_end < planned.len() {
+                let next_key = planned[batch_end].0;
+                if (next_key.0, next_key.1) != descriptor_key {
+                    break;
+                }
+                let next_group_end = batch_end
+                    + planned[batch_end..]
+                        .iter()
+                        .take_while(|(candidate_key, _, _)| *candidate_key == next_key)
+                        .count();
+                let next = planned[batch_end].2;
+                let Ok(next_range) = descriptor.record_range(next) else {
+                    break;
+                };
+                let Some(next_end) = next_range
+                    .offset()
+                    .checked_add(u64::try_from(next_range.length()).unwrap_or(u64::MAX))
+                else {
+                    break;
+                };
+                let combined_length = next_end.saturating_sub(first_range.offset());
+                if next_range.offset() != physical_end
+                    || combined_length
+                        > u64::try_from(MAX_STORAGE_RANGE_BYTES)
+                            .expect("ASSERT: storage range limit fits u64")
+                {
+                    break;
+                }
+                physical_end = next_end;
+                batch_end = next_group_end;
             }
-            group_start = group_end;
+            let Ok(combined_length) = usize::try_from(physical_end - first_range.offset()) else {
+                group_start = batch_end;
+                continue;
+            };
+            let Ok(encoded_batch) = self.storage.read_exact_at(
+                &published_name(location.container_id()),
+                first_range.offset(),
+                combined_length,
+            ) else {
+                group_start = batch_end;
+                continue;
+            };
+
+            let mut record_start = group_start;
+            while record_start < batch_end {
+                let record_key = planned[record_start].0;
+                let record_end = record_start
+                    + planned[record_start..batch_end]
+                        .iter()
+                        .take_while(|(candidate_key, _, _)| *candidate_key == record_key)
+                        .count();
+                let record_candidates = &planned[record_start..record_end];
+                let candidate = record_candidates[0].2;
+                let Ok(record_range) = descriptor.record_range(candidate) else {
+                    record_start = record_end;
+                    continue;
+                };
+                let Some(relative_start) = record_range.offset().checked_sub(first_range.offset())
+                else {
+                    record_start = record_end;
+                    continue;
+                };
+                let Ok(relative_start) = usize::try_from(relative_start) else {
+                    record_start = record_end;
+                    continue;
+                };
+                let Some(relative_end) = relative_start.checked_add(record_range.length()) else {
+                    record_start = record_end;
+                    continue;
+                };
+                let Some(encoded_record) = encoded_batch.get(relative_start..relative_end) else {
+                    record_start = record_end;
+                    continue;
+                };
+                exact_candidates.clear();
+                exact_candidates
+                    .try_reserve(record_candidates.len())
+                    .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+                exact_candidates
+                    .extend(record_candidates.iter().map(|(_, _, candidate)| *candidate));
+                let Ok(records) = descriptor.decode_candidates(&exact_candidates, encoded_record)
+                else {
+                    record_start = record_end;
+                    continue;
+                };
+                assert_eq!(
+                    records.len(),
+                    record_candidates.len(),
+                    "ASSERT: a verified Record group returns one Chunk per candidate"
+                );
+                for (&(_, request_ordinal, _), record) in record_candidates.iter().zip(records) {
+                    resolved[request_ordinal] = Some(record.into_payload());
+                }
+                record_start = record_end;
+            }
+            group_start = batch_end;
         }
 
         for (request_ordinal, &(chunk_id, logical_length)) in requests.iter().enumerate() {
@@ -3133,6 +3230,7 @@ pub enum StoreError {
     InvalidContainerGenerationReservationSpan,
     ContainerGenerationExhausted,
     ContainerGenerationHighWaterFormat(fastdup_format::ContainerGenerationHighWaterFormatError),
+    ContainerGenerationHighWaterMissing,
     ContainerGenerationHighWaterChain,
     ContainerGenerationHighWaterBehind {
         reserved_through: u64,
@@ -3174,6 +3272,9 @@ impl fmt::Display for StoreError {
             Self::ContainerGenerationHighWaterFormat(error) => {
                 write!(formatter, "Container generation high-water is invalid: {error}")
             }
+            Self::ContainerGenerationHighWaterMissing => formatter.write_str(
+                "nonempty DATA repository has no durable Container generation high-water",
+            ),
             Self::ContainerGenerationHighWaterChain => formatter
                 .write_str("Container generation high-water slots do not form one monotonic chain"),
             Self::ContainerGenerationHighWaterBehind {
@@ -3200,6 +3301,7 @@ impl std::error::Error for StoreError {
             | Self::ExactLocationMismatch
             | Self::InvalidContainerGenerationReservationSpan
             | Self::ContainerGenerationExhausted
+            | Self::ContainerGenerationHighWaterMissing
             | Self::ContainerGenerationHighWaterChain
             | Self::ContainerGenerationHighWaterBehind { .. } => None,
         }

@@ -48,6 +48,7 @@ content, Location, or liveness authority.
   complete Chunk ID rather than comparing ordinals across Runs.
 - Singleton families use the same manifest protocol as multi-part families so
   recovery has one atomic selection rule for externally built snapshots.
-- The legacy singleton Run publication remains readable during migration.
+- Direct singleton Run publication is unsupported; singleton and multipart
+  snapshots both use the family-manifest publication point.
 - A future change to partition target, sampling policy, or key geometry requires
   a new policy/profile decision, not an in-place reinterpretation.

@@ -9,8 +9,8 @@ use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, ExactIndexStoreError,
     GcCandidateCatalogRepository, GcCandidateSelectionMode, GenerationRepository, MaintenanceError,
     MaintenanceExecutionMode, MaintenancePriority, MaintenanceRepository, MetadataGcExactReason,
-    MetadataGcMarkMode, OnlineGcCycleOutcome, OnlineGcRunMode, SimilarityIndexRepository,
-    StorageIo, StoreError,
+    MetadataGcMarkMode, OnlineGcCycleOutcome, OnlineGcRunMode, RecoveryCheckpointRepository,
+    SimilarityIndexRepository, StorageIo, StoreError,
 };
 use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
 use std::time::Duration;
@@ -38,6 +38,11 @@ fn seeded_repositories_using(
     let generations = GenerationRepository::new(metadata.clone(), policy);
     let containers = ContainerRepository::new(data);
     let indexes = ExactIndexRunRepository::new(metadata);
+    let container_generation = containers
+        .open_generation_allocator(1_024)
+        .expect("initialize current Container generation state")
+        .reserve_generation()
+        .expect("reserve the first Container generation");
 
     let reservation = NamespaceRoot::new(1_024, 2, 0, Vec::new(), Vec::new())
         .expect("initial reservation root is valid");
@@ -50,7 +55,7 @@ fn seeded_repositories_using(
     containers
         .publish_raw(
             ContainerId::new([0x83; 16]).expect("container ID is nonzero"),
-            1,
+            container_generation,
             &[first, second],
         )
         .expect("publish fixture Container");
@@ -127,8 +132,8 @@ fn metadata_gc_removes_an_uncommitted_manifest_without_touching_the_committed_gr
             .iter()
             .filter(|name| name.strip_suffix(".fdm").is_some())
             .count(),
-        3,
-        "reservation root, committed Namespace root, and committed Manifest remain"
+        5,
+        "both Namespace descriptors and shards plus the committed Manifest remain"
     );
 }
 
@@ -236,7 +241,7 @@ fn committed_successor_advances_metadata_catalog_with_an_additive_delta_run() {
     assert_eq!(delta.metrics().catalog_chain_runs(), 2);
     assert_eq!(delta.objects_removed(), 0);
     assert_eq!(delta.catalog_generation(), Some(2));
-    assert_eq!(delta.objects_retained(), exact.objects_retained() + 2);
+    assert_eq!(delta.objects_retained(), exact.objects_retained() + 3);
     maintenance
         .scrub()
         .expect("snapshot plus additive Metadata delta remains scrub-valid");
@@ -446,11 +451,11 @@ fn blocked_metadata_delta_io_does_not_block_a_frontend_commit() {
     assert_eq!(delta.mark_mode(), MetadataGcMarkMode::AdditionDelta);
     let exact = maintenance
         .garbage_collect_metadata()
-        .expect("concurrent legacy Commit forces an exact follow-up");
+        .expect("concurrent unclassified Commit forces an exact follow-up");
     assert_eq!(exact.mark_mode(), MetadataGcMarkMode::ExactSnapshot);
     assert_eq!(
         exact.exact_reason(),
-        Some(MetadataGcExactReason::LegacyCommit)
+        Some(MetadataGcExactReason::UnclassifiedPublication)
     );
     maintenance
         .scrub()
@@ -1014,6 +1019,57 @@ fn online_gc_retains_data_pinned_by_a_long_lived_reader() {
 }
 
 #[test]
+fn data_gc_retains_chunks_named_only_by_the_previous_recovery_checkpoint() {
+    let (generations, containers, indexes, profile) = seeded_repositories();
+    let checkpoints = RecoveryCheckpointRepository::new(containers.storage().clone());
+    let checkpoint = checkpoints
+        .publish(&generations, &containers)
+        .expect("publish DATA-tier Recovery Checkpoint")
+        .expect("fixture has one committed DATA generation");
+    assert_eq!(checkpoint.required_chunk_count(), 1);
+
+    let empty = NamespaceRoot::new(1_024, 3, 2, Vec::new(), Vec::new())
+        .expect("empty successor Namespace is valid");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("first empty generation commits");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("second empty generation drains the online predecessor");
+    let maintenance = MaintenanceRepository::new(generations, containers, indexes, profile);
+
+    let plan = maintenance
+        .scrub_for_gc(DataPoolUsage::new(50, 100).expect("fixture pool usage is valid"))
+        .expect("Scrub includes retained Recovery-Checkpoint dependencies");
+
+    assert_eq!(plan.reclaimable_containers(), 0);
+    assert_eq!(plan.partially_live_containers(), 1);
+}
+
+#[test]
+fn offline_scrub_rejects_a_corrupt_retained_recovery_checkpoint() {
+    let (generations, containers, indexes, profile) = seeded_repositories();
+    let data = containers.storage().clone();
+    let checkpoint = RecoveryCheckpointRepository::new(data.clone())
+        .publish(&generations, &containers)
+        .expect("publish DATA-tier Recovery Checkpoint")
+        .expect("fixture has one committed DATA generation");
+    let name = format!("recovery-checkpoint.{:016x}.fdrc", checkpoint.generation());
+    let mut authenticated = data
+        .read_exact_at(&name, 104, 1)
+        .expect("read one authenticated descriptor byte");
+    authenticated[0] ^= 0x80;
+    data.write_at(&name, 104, &authenticated)
+        .expect("inject checkpoint corruption");
+
+    let maintenance = MaintenanceRepository::new(generations, containers, indexes, profile);
+    assert!(matches!(
+        maintenance.scrub(),
+        Err(MaintenanceError::RecoveryCheckpoint(_))
+    ));
+}
+
+#[test]
 fn metadata_gc_waits_for_inflight_manifest_publication_and_retains_its_proof() {
     let metadata = MemoryStorageIo::new();
     let policy = PolicySetId::new([0x91; 32]).expect("policy ID is nonzero");
@@ -1511,6 +1567,9 @@ fn seeded_replaced_generation_repositories(
     let generations = GenerationRepository::new(metadata.clone(), policy);
     let containers = ContainerRepository::new(data);
     let indexes = ExactIndexRunRepository::new(metadata);
+    let allocator = containers
+        .open_generation_allocator(1_024)
+        .expect("initialize current Container generation state");
 
     let reservation = NamespaceRoot::new(1_024, 2, 0, Vec::new(), Vec::new())
         .expect("initial reservation root is valid");
@@ -1524,7 +1583,9 @@ fn seeded_replaced_generation_repositories(
         containers
             .publish_raw(
                 ContainerId::new([ordinal; 16]).expect("fixture Container ID is nonzero"),
-                u64::from(ordinal),
+                allocator
+                    .reserve_generation()
+                    .expect("reserve replacement Container generation"),
                 &[&payload],
             )
             .expect("publish replacement-generation Container");
@@ -3223,7 +3284,7 @@ fn scrub_rejects_cross_run_chunk_length_conflict_without_a_full_chunk_map() {
     let run_set = ExactIndexRunSet::new(profile, 1, refs).expect("Run Set is locally valid");
     indexes
         .activate(&run_set)
-        .expect("legacy activation accepts locally valid Runs");
+        .expect("activation accepts locally valid Runs");
     let maintenance = MaintenanceRepository::new(
         GenerationRepository::new(metadata, policy),
         ContainerRepository::new(data),

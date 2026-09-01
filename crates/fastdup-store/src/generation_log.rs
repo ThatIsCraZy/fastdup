@@ -6,7 +6,6 @@ use std::io;
 const SLOT_NAMES: [&str; 2] = ["commit.wal", "commit.1.wal"];
 const MAX_SEGMENT_RECORDS: usize = 64;
 const MAX_SEGMENT_BYTES: usize = MAX_SEGMENT_RECORDS * COMMIT_RECORD_BYTES;
-const MAX_LEGACY_WAL_BYTES: usize = 64 * 1_024 * 1_024;
 
 #[derive(Debug)]
 pub(crate) struct GenerationLog<'a, I> {
@@ -96,11 +95,46 @@ impl<'a, I: StorageIo> GenerationLog<'a, I> {
         Ok(())
     }
 
+    pub(crate) fn install_recovery_anchor(
+        &self,
+        record: CommitRecord,
+    ) -> Result<(), GenerationLogError> {
+        self.ensure_slots_exist()?;
+        if let Some(snapshot) = self.load()? {
+            return if snapshot.tail == LogTail::Clean
+                && snapshot.records() == [record]
+                && snapshot.bytes == record.encode()
+            {
+                self.storage.sync_file(SLOT_NAMES[snapshot.active_slot])?;
+                Ok(())
+            } else {
+                Err(GenerationLogError::AlreadyInitialized)
+            };
+        }
+
+        let encoded = record.encode();
+        self.storage.set_len(SLOT_NAMES[0], 0)?;
+        self.storage.write_at(SLOT_NAMES[0], 0, &encoded)?;
+        self.storage.set_len(
+            SLOT_NAMES[0],
+            u64::try_from(encoded.len()).map_err(|_| GenerationLogError::SegmentTooLarge)?,
+        )?;
+        let verified = decode_segment(0, self.storage.read(SLOT_NAMES[0])?)?;
+        if verified.tail != LogTail::Clean
+            || verified.records() != [record]
+            || verified.bytes != encoded
+        {
+            return Err(GenerationLogError::PublishVerificationMismatch);
+        }
+        self.storage.sync_file(SLOT_NAMES[0])?;
+        Ok(())
+    }
+
     fn ensure_slots_exist(&self) -> Result<(), GenerationLogError> {
-        for (slot, name) in SLOT_NAMES.into_iter().enumerate() {
+        for name in SLOT_NAMES {
             if self.storage.exists(name)? {
                 let length = self.storage.object_len(name)?;
-                if length > maximum_slot_bytes(slot) {
+                if length > maximum_slot_bytes() {
                     return Err(GenerationLogError::SegmentTooLarge);
                 }
             } else {
@@ -124,7 +158,7 @@ impl<'a, I: StorageIo> GenerationLog<'a, I> {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            if length > maximum_slot_bytes(slot) {
+            if length > maximum_slot_bytes() {
                 return Err(GenerationLogError::SegmentTooLarge);
             }
             let bytes = self.storage.read(name)?;
@@ -137,13 +171,8 @@ impl<'a, I: StorageIo> GenerationLog<'a, I> {
     }
 }
 
-fn maximum_slot_bytes(slot: usize) -> u64 {
-    let maximum = if slot == 0 {
-        MAX_LEGACY_WAL_BYTES
-    } else {
-        MAX_SEGMENT_BYTES
-    };
-    u64::try_from(maximum).expect("ASSERT: Generation Log size limit fits u64")
+fn maximum_slot_bytes() -> u64 {
+    u64::try_from(MAX_SEGMENT_BYTES).expect("ASSERT: Generation Log size limit fits u64")
 }
 
 #[derive(Clone, Debug)]
@@ -363,6 +392,7 @@ pub(crate) enum GenerationLogError {
     DivergentSlots,
     NeedsRepair(LogTail),
     EmptyAfterInitialization,
+    AlreadyInitialized,
     PublishVerificationMismatch,
     OutOfMemory,
 }

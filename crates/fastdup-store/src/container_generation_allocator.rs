@@ -59,19 +59,21 @@ impl<I: Clone + StorageIo> ContainerGenerationAllocator<I> {
         let _guard = barrier.lock().map_err(|_| {
             std::io::Error::other("Container generation allocator barrier is poisoned")
         })?;
+        let first_exists = repository
+            .storage()
+            .exists(CONTAINER_GENERATION_HIGH_WATER_SLOT_0)?;
+        let second_exists = repository
+            .storage()
+            .exists(CONTAINER_GENERATION_HIGH_WATER_SLOT_1)?;
+        if (!first_exists || !second_exists) && repository.published_container_count()? != 0 {
+            return Err(StoreError::ContainerGenerationHighWaterMissing);
+        }
         ensure_slots(repository.storage())?;
         let selected = load_selected(repository.storage())?;
-        let selected = if let Some(selected) = selected {
-            Some(selected.record)
-        } else {
-            let discovered = repository.discover_container_generation_high_water()?;
-            match discovered {
-                Some(high_water) => {
-                    Some(publish_successor(repository.storage(), None, high_water)?)
-                }
-                None => None,
-            }
-        };
+        if selected.is_none() && repository.published_container_count()? != 0 {
+            return Err(StoreError::ContainerGenerationHighWaterMissing);
+        }
+        let selected = selected.map(|selected| selected.record);
         let reserved_through =
             selected.map_or(0, ContainerGenerationHighWaterRecord::reserved_through);
         let next = reserved_through
@@ -153,18 +155,32 @@ pub(crate) fn audit_generation_high_water<I: StorageIo>(
     let first_exists = storage.exists(CONTAINER_GENERATION_HIGH_WATER_SLOT_0)?;
     let second_exists = storage.exists(CONTAINER_GENERATION_HIGH_WATER_SLOT_1)?;
     match (first_exists, second_exists) {
-        (false, false) => return Ok(None),
+        (false, false) => {
+            return if observed_generation.is_some() {
+                Err(StoreError::ContainerGenerationHighWaterMissing)
+            } else {
+                Ok(None)
+            };
+        }
         (true, true) => {}
         (true, false) => {
             return if read_slot(storage, CONTAINER_GENERATION_HIGH_WATER_SLOT_0)?.is_none() {
-                Ok(None)
+                if observed_generation.is_some() {
+                    Err(StoreError::ContainerGenerationHighWaterMissing)
+                } else {
+                    Ok(None)
+                }
             } else {
                 Err(StoreError::ContainerGenerationHighWaterChain)
             };
         }
         (false, true) => {
             return if read_slot(storage, CONTAINER_GENERATION_HIGH_WATER_SLOT_1)?.is_none() {
-                Ok(None)
+                if observed_generation.is_some() {
+                    Err(StoreError::ContainerGenerationHighWaterMissing)
+                } else {
+                    Ok(None)
+                }
             } else {
                 Err(StoreError::ContainerGenerationHighWaterChain)
             };

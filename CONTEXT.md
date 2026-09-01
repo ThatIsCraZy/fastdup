@@ -193,6 +193,12 @@ An immutable, content-identified metadata blob referenced by namespace or inode
 nodes when it is too large to represent inline.
 _Avoid_: User data chunk, online index
 
+**Namespace shard**:
+A bounded immutable piece of one Namespace Root's canonical byte stream. Only
+the ordered, hash-bound shard set selected by that Root is meaningful; a shard
+is not an independently mutable directory or inode partition.
+_Avoid_: Directory shard, namespace database page, independent root
+
 **Commit record**:
 The checksummed object that atomically selects a generation, its predecessor, and
 one namespace root. Durable objects not reachable from a commit record are not
@@ -205,6 +211,13 @@ which normal crash recovery selects the newest wholly valid namespace
 generation. Rotation rewrites only an inactive slot and preserves an exact
 bridge record.
 _Avoid_: Recovery checkpoint, online index
+
+**Recovery checkpoint**:
+A self-contained immutable copy of one committed Namespace graph stored on the
+Data Tier for complete Metadata-Tier loss. Paired selector heads retain the
+current and previous complete copies; each copy embeds its exact Commit Record
+and every transitively reachable Metadata object, but no online index.
+_Avoid_: Commit WAL, normal checkpoint, snapshot, backup
 
 **Visible version**:
 The single committed file version exposed through the POSIX namespace. A version
@@ -256,10 +269,33 @@ Capacity that only commit-critical metadata, WAL, indexes, and rebuild state may
 consume. Other tiers cannot borrow it even when they are full.
 _Avoid_: Free NVMe space, cache quota
 
+**Physical Pool isolation**:
+The production proof that Metadata and Data Pools occupy distinct XFS
+filesystems, so exhaustion of one cannot consume the other's reserved blocks.
+Persistent Pool identity alone does not establish this capacity boundary.
+_Avoid_: Different directory, Pool ID, reported capacity
+
+**Commit capacity claim**:
+A process-local pessimistic claim against cached physical Metadata and DATA
+headroom, acquired before a mutation becomes visible. It follows the mutation
+from the Active epoch into its Frozen Commit Cut and is retired only after the
+durable Commit is included in a newer physical capacity observation.
+_Avoid_: Logical quota, file preallocation, dirty-memory budget
+
+**Appliance ID**:
+The persistent random identity shared by every storage pool belonging to one
+appliance. It is independent of host names, mount paths, and process lifetimes.
+_Avoid_: Appliance lease, machine ID, repository path
+
 **Pool ID**:
-The persistent random identity and declared role of one storage pool belonging to
-an appliance. A mount path or device name is not a pool identity.
+The persistent random identity of one storage pool. A mount path, device name,
+or Pool Role is not a pool identity.
 _Avoid_: Mount point, device serial
+
+**Pool role**:
+The immutable purpose of one Pool within its Appliance: Metadata or Data. A
+Pool cannot change roles by being mounted at a different path.
+_Avoid_: Mount order, directory argument, storage class
 
 **Cache location**:
 A removable extra physical encoding that can accelerate reads but never provides
@@ -297,9 +333,9 @@ pressure without changing correctness or durability.
 _Avoid_: Generation proof set, persistent Exact Index, source of truth
 
 **Exact Index hot page**:
-An independently verified immutable Exact Index page retained as bounded RAM
-acceleration. It avoids repeated Metadata-Tier I/O but never authorizes Chunk
-reuse or replaces verification of the selected DATA Location.
+An independently verified, decoded page from an immutable Exact Index Run,
+retained as bounded RAM acceleration. It is distinct from the generation-pinned
+Run view and never authorizes Chunk reuse or replaces DATA Location verification.
 _Avoid_: In-memory Exact Index, hash table
 
 **Cache memory reserve**:
@@ -618,10 +654,41 @@ Background activities such as scrub are flags rather than mutually exclusive
 health states.
 _Avoid_: Metric, process status
 
+**Control plane**:
+The operator-facing configuration and orchestration view of one Appliance. It
+may start work and retain observations, but it is never content, liveness, Pool
+identity, or recovery authority.
+_Avoid_: Repository database, storage authority, metadata tier
+
+**Logical Share quota**:
+A hard upper bound on allocated logical bytes reachable below one managed Share
+root. DATA, FILL, Exact-Dedup and Clone ranges count at their full logical
+length; sparse holes do not. Admission returns `ENOSPC` before acknowledging a
+mutation that would exceed the bound. It is independent of physical Repository
+capacity admission and does not reserve physical bytes.
+_Avoid_: Transfer limit, physical reservation, reduction allowance
+
+**Share capacity presentation**:
+The `statfs` geometry derived from one Logical Share quota. Total bytes equal
+the quota; free and available bytes are the minimum of remaining logical quota
+and current Repository-wide physical availability.
+_Avoid_: Storage authority, physical capacity, independent quota
+
+**Provisioning target**:
+A currently discovered Block-Layer device eligible to become exactly one
+Metadata or Data Pool after a fresh topology and ownership check.
+_Avoid_: Device path, Pool, repository
+
+**Repository runtime**:
+The single live mount owner bound to one verified Metadata/Data Pool pair. Its
+process state is replaceable and does not define the Repository's durable state.
+_Avoid_: Repository, Appliance ID, Control plane
+
 **Repository format epoch**:
-A monotonic compatibility fence carried by the authoritative Commit chain. It
-states which repository-wide writer semantics may have been used and prevents
-an older writer from silently advancing a newer repository.
+A compatibility fence carried by the authoritative Commit chain. Every current
+repository begins at epoch one; epoch zero and unknown epochs are unsupported
+pre-production state rather than migration inputs. The fence prevents an older
+writer from silently advancing the repository.
 _Avoid_: Object version, software version, Policy Set
 
 **Appliance recovery latch**:

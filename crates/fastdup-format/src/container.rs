@@ -358,9 +358,112 @@ pub enum IncompressibilityGatePolicy {
 /// evidence and non-authoritative gate metrics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdaptiveContainerEncoding {
-    bytes: Vec<u8>,
+    bytes: AlignedContainerBytes,
     publication: VerifiedContainerPublication,
     metrics: IncompressibilityGateMetrics,
+}
+
+/// One page-aligned, page-sized immutable Container publication image.
+///
+/// The format's Header, Footer, and complete file length are all 4 KiB
+/// aligned. Retaining that geometry in memory lets a storage adapter use the
+/// same owned writer image for Linux Direct I/O without a second full-image
+/// copy.
+pub struct AlignedContainerBytes {
+    allocation: Vec<u8>,
+    start: usize,
+    length: usize,
+}
+
+impl AlignedContainerBytes {
+    /// Returns an allocation-free consumed-image sentinel.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            allocation: Vec::new(),
+            start: 0,
+            length: 0,
+        }
+    }
+
+    /// Allocates one zero-filled image whose address and length are both
+    /// aligned to the Container block size.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `length` is zero or is not a multiple of 4 KiB.
+    #[must_use]
+    pub fn zeroed(length: usize) -> Self {
+        assert!(length != 0 && length.is_multiple_of(HEADER_BYTES));
+        let allocation_length = length
+            .checked_add(HEADER_BYTES - 1)
+            .expect("ASSERT: bounded Container alignment allocation cannot overflow");
+        let allocation = vec![0; allocation_length];
+        let misalignment = allocation.as_ptr().addr() % HEADER_BYTES;
+        let start = (HEADER_BYTES - misalignment) % HEADER_BYTES;
+        assert!(start + length <= allocation.len());
+        Self {
+            allocation,
+            start,
+            length,
+        }
+    }
+
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.as_ref().to_vec()
+    }
+}
+
+impl AsRef<[u8]> for AlignedContainerBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.allocation[self.start..self.start + self.length]
+    }
+}
+
+impl AsMut<[u8]> for AlignedContainerBytes {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.allocation[self.start..self.start + self.length]
+    }
+}
+
+impl Clone for AlignedContainerBytes {
+    fn clone(&self) -> Self {
+        let mut cloned = Self::zeroed(self.length);
+        cloned.copy_from_slice(self);
+        cloned
+    }
+}
+
+impl fmt::Debug for AlignedContainerBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AlignedContainerBytes")
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for AlignedContainerBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for AlignedContainerBytes {}
+
+impl std::ops::Deref for AlignedContainerBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl std::ops::DerefMut for AlignedContainerBytes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut()
+    }
 }
 
 impl AdaptiveContainerEncoding {
@@ -378,12 +481,21 @@ impl AdaptiveContainerEncoding {
     /// evidence derived while that image was encoded.
     #[must_use]
     pub fn into_publication_parts(self) -> (Vec<u8>, VerifiedContainerPublication) {
+        (self.bytes.into_vec(), self.publication)
+    }
+
+    /// Consumes the writer result without discarding the image's page
+    /// alignment required by a Direct-I/O publication adapter.
+    #[must_use]
+    pub fn into_aligned_publication_parts(
+        self,
+    ) -> (AlignedContainerBytes, VerifiedContainerPublication) {
         (self.bytes, self.publication)
     }
 
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+        self.bytes.into_vec()
     }
 }
 
@@ -579,22 +691,6 @@ impl SealedContainerDescriptor {
             offset: location.record_offset(),
             length: record_length,
         })
-    }
-
-    /// Backward-compatible RAW-only range validator.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FormatError::ExactLocationMismatch`] for a non-RAW candidate
-    /// or any failure reported by [`Self::record_range`].
-    pub fn raw_record_range(
-        self,
-        candidate: ExactIndexEntry,
-    ) -> Result<ContainerRecordRange, FormatError> {
-        if candidate.location().codec_id() != RAW_CODEC {
-            return Err(FormatError::ExactLocationMismatch);
-        }
-        self.record_range(candidate)
     }
 
     /// Fully validates one independent RAW or Zstd record selected by an
@@ -4734,7 +4830,7 @@ fn encode_container_from_adaptive_plans(
     let mut raw_record_count = 0_usize;
     let mut zstd_record_count = 0_usize;
     let mut zstd_prefix_record_count = 0_usize;
-    let mut container = vec![0_u8; file_length];
+    let mut container = AlignedContainerBytes::zeroed(file_length);
     let mut cursor = HEADER_BYTES;
     for record in records {
         let record_length = record.record_length()?;
@@ -4923,7 +5019,7 @@ fn encode_container_from_records(
         usize::try_from(layout.file_length).map_err(|_| FormatError::ArithmeticOverflow)?;
     let footer_offset_usize =
         usize::try_from(layout.footer_offset).map_err(|_| FormatError::ArithmeticOverflow)?;
-    let mut container = vec![0_u8; file_length_usize];
+    let mut container = AlignedContainerBytes::zeroed(file_length_usize);
     let mut cursor = HEADER_BYTES;
     for record in encoded_records {
         let end = cursor

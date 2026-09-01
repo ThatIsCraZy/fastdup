@@ -61,9 +61,8 @@ checkpoint generations remain below the 64-active-Run bound and retain a first-
 generation Exact Hit across remount. Fail-before/fail-after injection across the
 complete compaction publication exposes only absence or a complete canonical
 Run; the activation matrix independently selects only the old or complete new
-Run Set. Activation now rotates through two overlapping 64-record slots and
-migrates the former 16,384-record single-file WAL without an activation-lifetime
-stop; writer, recovery, offline audit, and fault injection enforce the same
+Run Set. Activation uses two overlapping 64-record slots from repository
+creation; writer, recovery, offline audit, and fault injection enforce the same
 bridge identity. The former 262,144-entry transient cap is now an output
 partition target rather than a failure limit. Compaction performs two complete
 verified K-way merge passes, retains one 4-KiB page per source family plus one

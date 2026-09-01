@@ -44,13 +44,14 @@ pressure accounting.
 
 Different inode queues may FastCDC, encode, and publish concurrently; one inode
 always advances in mutation order. `Sync`, `Release`, and a Frozen Commit Cut
-wait through the sampled per-inode sequence before consuming reduction
-evidence. This fence is not a new durability promise: Namespace/WAL visibility
-still follows the bounded commit policy. Unlink, truncate, metadata clone, and
-rename-overwrite enqueue zero-payload sequence barriers, preventing a close or
-cut from waiting for a mutation the scheduler never observed. The POSIX Dirty
-Extent Map remains authoritative until independently verified immutable extents
-replace its resident ranges.
+wait through the newest actually enqueued DATA job at or below the sampled
+Inode Version before consuming reduction evidence. Metadata-only version gaps
+have no Ingest work and therefore cannot become an unfulfillable queue fence.
+This fence is not a new durability promise: Namespace/WAL visibility still
+follows the bounded commit policy. Unlink, truncate, metadata clone, and
+rename-overwrite enqueue zero-payload sequence barriers because they invalidate
+or reorder DATA lane state. The POSIX Dirty Extent Map remains authoritative
+until independently verified immutable extents replace its resident ranges.
 
 Format-v1 retains no more than eight registered Ingest Lanes. An idle
 least-recently-used lane may be discarded because its bytes remain authoritative

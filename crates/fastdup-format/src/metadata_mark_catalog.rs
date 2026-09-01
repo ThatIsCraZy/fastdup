@@ -8,7 +8,6 @@ const HEADER_BYTES_U64: u64 = 4_096;
 const ROW_BYTES_U64: u64 = 32;
 const HEADER_MAGIC: [u8; 8] = *b"FDMMARK1";
 const FOOTER_MAGIC: [u8; 8] = *b"FDMMARKF";
-const LEGACY_FORMAT_VERSION: u16 = 1;
 const FORMAT_VERSION: u16 = 2;
 const HASH_OFFSET: usize = 128;
 const HASH_BYTES: usize = 32;
@@ -22,7 +21,6 @@ pub enum MetadataMarkCatalogRunKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MetadataMarkCatalogDescriptor {
-    format_version: u16,
     run_kind: MetadataMarkCatalogRunKind,
     generation: u64,
     base_generation: u64,
@@ -107,7 +105,6 @@ impl MetadataMarkCatalogDescriptor {
             ordinal: 0,
             previous: None,
             hasher: rows_hasher(
-                self.format_version,
                 self.run_kind,
                 self.generation,
                 self.base_generation,
@@ -144,7 +141,7 @@ impl MetadataMarkCatalogDescriptor {
     fn encode_envelope(self, magic: [u8; 8]) -> [u8; METADATA_MARK_CATALOG_HEADER_BYTES] {
         let mut bytes = [0_u8; METADATA_MARK_CATALOG_HEADER_BYTES];
         bytes[0..8].copy_from_slice(&magic);
-        put_u16(&mut bytes, 8, self.format_version);
+        put_u16(&mut bytes, 8, FORMAT_VERSION);
         put_u16(&mut bytes, 10, 4_096);
         put_u16(&mut bytes, 12, 32);
         put_u16(&mut bytes, 14, self.run_kind as u16);
@@ -228,7 +225,6 @@ impl MetadataMarkCatalogStreamEncoder {
             .checked_add(HEADER_BYTES_U64)
             .ok_or(MetadataMarkCatalogError::ArithmeticOverflow)?;
         let descriptor = MetadataMarkCatalogDescriptor {
-            format_version: FORMAT_VERSION,
             run_kind,
             generation,
             base_generation,
@@ -244,7 +240,6 @@ impl MetadataMarkCatalogStreamEncoder {
             ordinal: 0,
             previous: None,
             hasher: rows_hasher(
-                FORMAT_VERSION,
                 run_kind,
                 generation,
                 base_generation,
@@ -383,7 +378,6 @@ pub fn metadata_mark_commit_binding(records: &[CommitRecord]) -> [u8; 32] {
 }
 
 fn rows_hasher(
-    format_version: u16,
     run_kind: MetadataMarkCatalogRunKind,
     generation: u64,
     base_generation: u64,
@@ -391,13 +385,9 @@ fn rows_hasher(
     row_count: u64,
 ) -> blake3::Hasher {
     let mut hasher = blake3::Hasher::new();
-    if format_version == LEGACY_FORMAT_VERSION {
-        hasher.update(b"fastdup-metadata-mark-rows-v1\0");
-    } else {
-        hasher.update(b"fastdup-metadata-mark-rows-v2\0");
-        hasher.update(&(run_kind as u16).to_le_bytes());
-        hasher.update(&base_generation.to_le_bytes());
-    }
+    hasher.update(b"fastdup-metadata-mark-rows-v2\0");
+    hasher.update(&(run_kind as u16).to_le_bytes());
+    hasher.update(&base_generation.to_le_bytes());
     hasher.update(&generation.to_le_bytes());
     hasher.update(&commit_binding);
     hasher.update(&row_count.to_le_bytes());
@@ -416,31 +406,19 @@ fn decode_envelope(
     {
         return Err(MetadataMarkCatalogError::InvalidEnvelope);
     }
-    let format_version = get_u16(bytes, 8)?;
-    let (run_kind, base_generation) = match format_version {
-        LEGACY_FORMAT_VERSION => {
-            if bytes[14..16].iter().any(|byte| *byte != 0)
-                || bytes[120..128].iter().any(|byte| *byte != 0)
-            {
-                return Err(MetadataMarkCatalogError::InvalidEnvelope);
-            }
-            (MetadataMarkCatalogRunKind::Snapshot, 0)
-        }
-        FORMAT_VERSION => {
-            let run_kind = match get_u16(bytes, 14)? {
-                1 => MetadataMarkCatalogRunKind::Snapshot,
-                2 => MetadataMarkCatalogRunKind::Addition,
-                _ => return Err(MetadataMarkCatalogError::InvalidEnvelope),
-            };
-            (run_kind, get_u64(bytes, 120)?)
-        }
+    if get_u16(bytes, 8)? != FORMAT_VERSION {
+        return Err(MetadataMarkCatalogError::InvalidEnvelope);
+    }
+    let run_kind = match get_u16(bytes, 14)? {
+        1 => MetadataMarkCatalogRunKind::Snapshot,
+        2 => MetadataMarkCatalogRunKind::Addition,
         _ => return Err(MetadataMarkCatalogError::InvalidEnvelope),
     };
+    let base_generation = get_u64(bytes, 120)?;
     if bytes[HASH_OFFSET..HASH_OFFSET + HASH_BYTES] != envelope_hash(bytes) {
         return Err(MetadataMarkCatalogError::EnvelopeHashMismatch);
     }
     let descriptor = MetadataMarkCatalogDescriptor {
-        format_version,
         run_kind,
         generation: get_u64(bytes, 16)?,
         base_generation,

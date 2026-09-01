@@ -1,0 +1,18 @@
+[Unit]
+Description=FastDup management resource envelope
+
+[Slice]
+# This is one aggregate budget for fastdup-control, fastdup-agent, and their
+# short-lived helpers.  It is deliberately not shared with the repository.
+CPUAccounting=yes
+CPUWeight=100
+CPUQuota=100%
+CPUQuotaPeriodSec=100ms
+MemoryAccounting=yes
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=0
+IOAccounting=yes
+IOWeight=100
+TasksAccounting=yes
+TasksMax=256

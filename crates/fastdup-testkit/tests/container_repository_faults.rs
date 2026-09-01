@@ -223,7 +223,7 @@ fn every_high_water_extension_fault_skips_all_precrash_generations() {
 }
 
 #[test]
-fn every_high_water_initialization_fault_recovers_to_legacy_or_a_valid_pair() {
+fn every_empty_high_water_initialization_fault_recovers_to_empty_or_a_valid_pair() {
     let probe_storage = MemoryStorageIo::new();
     let probe_repository = ContainerRepository::new(probe_storage.clone());
     let probe_allocator = probe_repository
@@ -255,7 +255,7 @@ fn every_high_water_initialization_fault_recovers_to_legacy_or_a_valid_pair() {
             let reopened_repository = ContainerRepository::new(storage.clone());
             reopened_repository
                 .audit_generation_high_water(None)
-                .expect("an interrupted initialization is legacy or a valid pair");
+                .expect("an interrupted empty initialization is absent or a valid pair");
             reopened_repository
                 .open_generation_allocator(2)
                 .expect("reopen the allocator after the crash")

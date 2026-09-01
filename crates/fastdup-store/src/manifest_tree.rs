@@ -138,8 +138,7 @@ pub(crate) fn encode_manifest_tree(
                     .checked_add(child.logical_length)
                     .ok_or(ManifestTreeError::ArithmeticOverflow)?;
             }
-            let encoded = ManifestInnerNode::new_with_allocated_bytes(offset, level, child_ranges)?
-                .encode()?;
+            let encoded = ManifestInnerNode::new(offset, level, child_ranges)?.encode()?;
             let object_id = MetadataObjectId::from_encoded(&encoded)?;
             remember_object(object_id, encoded, &mut objects, &mut seen)?;
             parents.push(NodeRef {
@@ -989,8 +988,7 @@ fn encode_parent_forest(
                 .checked_add(child.logical_length)
                 .ok_or(ManifestTreeError::ArithmeticOverflow)?;
         }
-        let encoded =
-            ManifestInnerNode::new_with_allocated_bytes(logical_offset, level, ranges)?.encode()?;
+        let encoded = ManifestInnerNode::new(logical_offset, level, ranges)?.encode()?;
         let object_id = MetadataObjectId::from_encoded(&encoded)?;
         remember_object(object_id, encoded, objects, seen)?;
         parents.push(NodeRef {
@@ -1133,11 +1131,8 @@ where
                     child_ref.object_id,
                 )?);
             }
-            let rewritten_node = ManifestInnerNode::new_with_allocated_bytes(
-                node.file_length(),
-                node.level(),
-                children,
-            )?;
+            let rewritten_node =
+                ManifestInnerNode::new(node.file_length(), node.level(), children)?;
             let allocated_bytes = rewritten_node
                 .allocated_bytes()?
                 .ok_or(ManifestTreeError::MissingSubtreeAllocation)?;
@@ -1420,6 +1415,7 @@ where
                 }
             }
             MetadataObjectKind::NamespaceRoot
+            | MetadataObjectKind::NamespaceShard
             | MetadataObjectKind::ExactIndexRunSet
             | MetadataObjectKind::Unknown(_) => return Err(ManifestTreeError::InvalidTree),
         }
@@ -1747,6 +1743,7 @@ where
             ManifestInnerNode::decode(&encoded)?,
         )),
         MetadataObjectKind::NamespaceRoot
+        | MetadataObjectKind::NamespaceShard
         | MetadataObjectKind::ExactIndexRunSet
         | MetadataObjectKind::Unknown(_) => Err(ManifestTreeError::InvalidTree),
     }

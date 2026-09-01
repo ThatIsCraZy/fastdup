@@ -1,4 +1,9 @@
-use fastdup_appliance::checkpoint_policy_set;
+use fastdup_appliance::{INODE_RESERVATION_SPAN_V1, checkpoint_policy_set};
+
+#[test]
+fn production_inode_reservation_outlives_small_file_bursts() {
+    assert_eq!(INODE_RESERVATION_SPAN_V1, 1_u64 << 32);
+}
 
 #[test]
 fn every_new_repository_uses_one_stable_writer_policy_identity() {

@@ -45,6 +45,11 @@ use crate::{
 };
 
 const FIRST_REGULAR_INODE: u64 = 2;
+/// Production Inode IDs durably reserved per writable appliance start.
+///
+/// A 2^32 range keeps allocation entirely in-memory for any practical process
+/// lifetime while a restart can still skip its unused suffix without reuse.
+pub const INODE_RESERVATION_SPAN_V1: u64 = 1_u64 << 32;
 const CONTAINER_PAYLOAD_TARGET_BYTES: usize = 32 * 1_024 * 1_024;
 const CONTAINER_PAYLOAD_FLUSH_BYTES: usize = CONTAINER_PAYLOAD_TARGET_BYTES - CDC_MAXIMUM_BYTES;
 const COMPRESSION_REGION_TARGET_BYTES: usize = 512 * 1_024;
@@ -186,6 +191,7 @@ pub struct WriteThroughStatus {
     ingest_fragments: u64,
     maximum_ingest_batch_bytes: u64,
     minimum_ingest_batch_target_bytes: u64,
+    maximum_ingest_batch_target_bytes: u64,
     maximum_ingest_ring_slots: u64,
     ingest_ring_wait_ns: u64,
     hash_cpu: CpuPhaseStatus,
@@ -248,6 +254,11 @@ impl WriteThroughStatus {
     #[must_use]
     pub const fn minimum_ingest_batch_target_bytes(self) -> u64 {
         self.minimum_ingest_batch_target_bytes
+    }
+
+    #[must_use]
+    pub const fn maximum_ingest_batch_target_bytes(self) -> u64 {
+        self.maximum_ingest_batch_target_bytes
     }
 
     #[must_use]
@@ -1962,6 +1973,7 @@ struct IngestQueueState {
     ingest_fragments: u64,
     maximum_ingest_batch_bytes: usize,
     minimum_ingest_batch_target_bytes: usize,
+    maximum_ingest_batch_target_bytes: usize,
     maximum_ingest_ring_slots: usize,
     ingest_ring_wait_ns: u64,
     shutdown: bool,
@@ -1974,6 +1986,7 @@ struct IngestQueueStatus {
     ingest_fragments: u64,
     maximum_ingest_batch_bytes: usize,
     minimum_ingest_batch_target_bytes: usize,
+    maximum_ingest_batch_target_bytes: usize,
     maximum_ingest_ring_slots: usize,
     ingest_ring_wait_ns: u64,
 }
@@ -2395,7 +2408,7 @@ impl IngestQueue {
                 u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
         }
-        record_minimum_ingest_batch_target(&mut state, WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1);
+        record_ingest_batch_target(&mut state, WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1);
         state.buffered_bytes = state
             .buffered_bytes
             .checked_add(fragment.bytes.len())
@@ -2439,7 +2452,7 @@ impl IngestQueue {
         loop {
             let active_inodes = active_ingest_inodes_with_candidate(&state, inode);
             let batch_target = ingest_batch_target_bytes(active_inodes);
-            record_minimum_ingest_batch_target(&mut state, batch_target);
+            record_ingest_batch_target(&mut state, batch_target);
             if seal_open_batches_at_or_above(&mut state, batch_target) {
                 self.work_available.notify_all();
             }
@@ -2584,11 +2597,22 @@ impl IngestQueue {
         if seal_open_ingest_batch(&mut state, inode) {
             self.work_available.notify_one();
         }
+        // Inode versions include Metadata-only mutations that intentionally
+        // have no ingest job. Flush waits through the newest DATA job at or
+        // before the requested version instead of waiting for every sequence
+        // number to appear in this queue.
+        let Some(target_sequence) = state
+            .inodes
+            .get(&inode)
+            .map(|queue| queue.last_enqueued_sequence.min(mutation_sequence))
+        else {
+            return;
+        };
         loop {
             let complete = state
                 .inodes
                 .get(&inode)
-                .is_none_or(|queue| queue.completed_sequence >= mutation_sequence);
+                .is_none_or(|queue| queue.completed_sequence >= target_sequence);
             if complete {
                 return;
             }
@@ -2610,6 +2634,7 @@ impl IngestQueue {
             ingest_fragments: state.ingest_fragments,
             maximum_ingest_batch_bytes: state.maximum_ingest_batch_bytes,
             minimum_ingest_batch_target_bytes: state.minimum_ingest_batch_target_bytes,
+            maximum_ingest_batch_target_bytes: state.maximum_ingest_batch_target_bytes,
             maximum_ingest_ring_slots: state.maximum_ingest_ring_slots,
             ingest_ring_wait_ns: state.ingest_ring_wait_ns,
         }
@@ -2663,13 +2688,14 @@ fn ingest_batch_target_bytes(active_inodes: usize) -> usize {
     }
 }
 
-fn record_minimum_ingest_batch_target(state: &mut IngestQueueState, target: usize) {
+fn record_ingest_batch_target(state: &mut IngestQueueState, target: usize) {
     if state.minimum_ingest_batch_target_bytes == 0 {
         state.minimum_ingest_batch_target_bytes = target;
     } else {
         state.minimum_ingest_batch_target_bytes =
             state.minimum_ingest_batch_target_bytes.min(target);
     }
+    state.maximum_ingest_batch_target_bytes = state.maximum_ingest_batch_target_bytes.max(target);
 }
 
 fn ingest_fragment_extends_batch(
@@ -3354,6 +3380,10 @@ where
                 .expect("ASSERT: bounded Ingest Batch bytes fit u64"),
             minimum_ingest_batch_target_bytes: u64::try_from(
                 ingest.minimum_ingest_batch_target_bytes,
+            )
+            .expect("ASSERT: bounded Ingest Batch target fits u64"),
+            maximum_ingest_batch_target_bytes: u64::try_from(
+                ingest.maximum_ingest_batch_target_bytes,
             )
             .expect("ASSERT: bounded Ingest Batch target fits u64"),
             maximum_ingest_ring_slots: u64::try_from(ingest.maximum_ingest_ring_slots)
@@ -7211,6 +7241,33 @@ mod tests {
         assert_eq!(second.mutation_sequence, 8);
         queue.finish(&second);
         queue.wait_through(inode, 8);
+    }
+
+    #[test]
+    fn ingest_queue_wait_ignores_metadata_only_sequence_gaps() {
+        let queue = Arc::new(IngestQueue::new());
+        let inode = InodeId::new(2).expect("fixture inode is nonzero");
+        queue.enqueue_write_fragment(
+            inode,
+            IngestWriteFragment {
+                offset: 0,
+                bytes: MutationPayload::try_copy_from_slice(&[1])
+                    .expect("allocate fixture payload"),
+                mutation_sequence: 1,
+            },
+        );
+        let write = queue.next_job().expect("queued write exists");
+        queue.finish(&write);
+
+        let waiter = Arc::clone(&queue);
+        let (completed, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            waiter.wait_through(inode, 2);
+            completed.send(()).expect("test receiver remains live");
+        });
+        receive
+            .recv_timeout(Duration::from_millis(100))
+            .expect("Metadata-only sequence gaps have no missing ingest work");
     }
 
     #[test]

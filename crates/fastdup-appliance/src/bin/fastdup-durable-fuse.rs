@@ -7,23 +7,28 @@ use std::time::{Duration, Instant};
 
 use fastdup_appliance::OnlineGcSchedulerStatus;
 use fastdup_appliance::{
-    ApplianceLease, ApplianceLeaseOwner, ApplianceRecoveryLatch, CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1,
-    CheckpointAction, CheckpointProgressAction, DurabilityObservation, DurabilitySupervisor,
-    DurableNamespace, ONLINE_GC_CONTROL_REQUEST, OnlineGcPolicy, OnlineGcScheduler,
-    ProfiledCheckpoint, STATFS_RESERVE_BASIS_POINTS, StatFsOverride, TieredStatFsSource,
-    bind_online_gc_control_socket, checkpoint_exact_index_profile_v1, checkpoint_policy_set,
-    online_gc_control_path,
+    ApplianceLease, ApplianceLeaseOwner, AppliancePoolBinding, ApplianceRecoveryLatch,
+    CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointAction, CheckpointProgressAction,
+    DurabilityObservation, DurabilitySupervisor, DurableNamespace, INODE_RESERVATION_SPAN_V1,
+    ONLINE_GC_CONTROL_REQUEST, OnlineGcPolicy, OnlineGcScheduler, PhysicalPoolIsolation,
+    PoolIsolationPolicy, ProfiledCheckpoint, STATFS_RESERVE_BASIS_POINTS, StatFsOverride,
+    TieredStatFsSource, bind_online_gc_control_socket, checkpoint_exact_index_profile_v1,
+    checkpoint_policy_set, online_gc_control_path,
 };
 use fastdup_copy_metrics::copy_telemetry;
 use fastdup_format::{HEADER_BYTES, VerifiedContainerPublication};
 use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo};
-use fastdup_posix::{FuseFilesystem, NamespaceConfig, volatile_mount_options};
+use fastdup_posix::{
+    FrontendTelemetry, FuseFilesystem, InodeId, LogicalQuotaRule, Namespace, NamespaceConfig,
+    volatile_mount_options,
+};
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo,
-    GcCandidateCatalogRepository, GenerationRepository, MaintenanceRepository,
-    OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport, OnlineGcRunMode,
-    OwnedContainerPublication, SimilarityIndexRepository, StorageIo, StoreError,
-    publication_sample_ranges, system_memory_budget_governor,
+    GcCandidateCatalogRepository, GenerationRepository, IndexedRequiredChunkVerifier,
+    MaintenanceRepository, OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport,
+    OnlineGcRunMode, OwnedContainerPublication, RecoveryCheckpointRepository,
+    SimilarityIndexRepository, StorageIo, StoreError, publication_sample_ranges,
+    system_memory_budget_governor,
 };
 
 mod common;
@@ -36,15 +41,30 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 
+use serde::{Deserialize, Serialize};
+
 const SCHEDULER_RESOLUTION: Duration = Duration::from_millis(50);
 const CHECKPOINT_WARNING: Duration = Duration::from_secs(5);
 const ONLINE_GC_SCHEDULER_RESOLUTION: Duration = Duration::from_secs(5);
-const INODE_RESERVATION_SPAN: u64 = 4_096;
+const RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(90);
+const MANAGEMENT_PROTOCOL_VERSION: u16 = 1;
+const MANAGEMENT_SOCKET_NAME: &str = ".fastdup-management.sock";
+static TELEMETRY_EXACT_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
+static TELEMETRY_NEW_CHUNK_BYTES: AtomicU64 = AtomicU64::new(0);
+static TELEMETRY_LOGICAL_CHUNK_BYTES: AtomicU64 = AtomicU64::new(0);
+static TELEMETRY_PHYSICAL_CONTAINER_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdvancedReductionPolicy {
     Off,
     PrefixV1,
+}
+
+struct StartupPolicies {
+    statfs_override: Option<StatFsOverride>,
+    online_gc: OnlineGcPolicy,
+    advanced_reduction: AdvancedReductionPolicy,
+    pool_isolation: PoolIsolationPolicy,
 }
 
 type FsAppliance = DurableNamespace<FsStorageIo, TelemetryStorageIo>;
@@ -56,6 +76,10 @@ struct RecoveredAppliance {
     online_gc_recovery: OnlineGcRecoveryReport,
     online_maintenance: FsOnlineMaintenance,
     gc_catalog: FsGcCatalog,
+    recovery_generations: GenerationRepository<FsStorageIo>,
+    recovery_containers: ContainerRepository<FsStorageIo>,
+    recovery_indexes: ExactIndexRunRepository<FsStorageIo>,
+    recovery_checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 }
 
 struct OnlineGcControlRequest {
@@ -68,6 +92,123 @@ struct OnlineGcSocketGuard {
 
 struct OnlineGcRuntimeHandle {
     requests: mpsc::Sender<OnlineGcControlRequest>,
+    configuration: watch::Sender<OnlineGcRuntimeConfiguration>,
+    shutdown: watch::Sender<bool>,
+    worker: JoinHandle<Result<(), String>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OnlineGcRuntimeConfiguration {
+    enabled: bool,
+    policy: OnlineGcPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagementRequest {
+    version: u16,
+    operation: ManagementOperation,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ManagementOperation {
+    Inspect,
+    UpdateOnlineGc {
+        enabled: bool,
+        pressure_low_basis_points: u16,
+        pressure_high_basis_points: u16,
+    },
+    UpdatePresentedCapacities {
+        revision: String,
+        rules: Vec<ManagementPresentedCapacityRule>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct ManagementPresentedCapacityRule {
+    inode: u64,
+    capacity_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShareCapacityManifest {
+    version: u16,
+    revision: String,
+    rules: Vec<ManagementPresentedCapacityRule>,
+}
+
+trait PresentedCapacityControl: Send + Sync {
+    fn replace(&self, revision: String, rules: Vec<(u64, u64)>) -> io::Result<()>;
+    fn revision(&self) -> io::Result<String>;
+}
+
+#[derive(Clone, Debug)]
+struct RuntimePresentedCapacityControl {
+    statfs: TieredStatFsSource,
+    namespace: Arc<Namespace>,
+}
+
+impl PresentedCapacityControl for RuntimePresentedCapacityControl {
+    fn replace(&self, revision: String, rules: Vec<(u64, u64)>) -> io::Result<()> {
+        let logical_rules = rules
+            .iter()
+            .map(|&(inode, capacity_bytes)| {
+                let inode = InodeId::new(inode).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "quota inode must be nonzero")
+                })?;
+                LogicalQuotaRule::new(inode, capacity_bytes).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("{error:?}"))
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        self.namespace
+            .replace_logical_quotas(revision.clone(), logical_rules)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("{error:?}")))?;
+        self.statfs.replace_presented_capacities(revision, rules)
+    }
+
+    fn revision(&self) -> io::Result<String> {
+        let logical = self.namespace.logical_quota_revision();
+        let presented = self.statfs.presented_capacity_revision()?;
+        if logical != presented {
+            return Err(io::Error::other(
+                "logical quota and statfs presentation revisions differ",
+            ));
+        }
+        Ok(logical)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ManagementResponse {
+    version: u16,
+    ok: bool,
+    error: Option<String>,
+    frontend: Option<ManagementFrontendTelemetry>,
+    presented_capacity_revision: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagementFrontendTelemetry {
+    read_bytes: u64,
+    write_bytes: u64,
+    read_operations: u64,
+    write_operations: u64,
+    read_errors: u64,
+    write_errors: u64,
+    read_latency_micros_p50: u64,
+    read_latency_micros_p95: u64,
+    read_latency_micros_p99: u64,
+    write_latency_micros_p50: u64,
+    write_latency_micros_p95: u64,
+    write_latency_micros_p99: u64,
+    exact_hit_bytes: u64,
+    new_chunk_bytes: u64,
+    logical_chunk_bytes: u64,
+    physical_container_bytes: u64,
+}
+
+struct RecoveryCheckpointRuntimeHandle {
     shutdown: watch::Sender<bool>,
     worker: JoinHandle<Result<(), String>>,
 }
@@ -83,6 +224,17 @@ impl OnlineGcRuntimeHandle {
     }
 }
 
+impl RecoveryCheckpointRuntimeHandle {
+    async fn stop(self) -> Result<(), String> {
+        self.shutdown
+            .send(true)
+            .map_err(|_| "Recovery-Checkpoint runtime stopped before shutdown".to_owned())?;
+        self.worker
+            .await
+            .map_err(|error| format!("Recovery-Checkpoint runtime join failed: {error}"))?
+    }
+}
+
 impl Drop for OnlineGcSocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -90,22 +242,61 @@ impl Drop for OnlineGcSocketGuard {
 }
 
 #[tokio::main(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mount_path, metadata_root, container_root) = parse_mount_arguments()?;
-    let (statfs_override, online_gc_policy, advanced_reduction) = validated_startup_policies()?;
+    let policies = validated_startup_policies()?;
+    let statfs_override = policies.statfs_override;
+    let online_gc_policy = policies.online_gc;
+    let advanced_reduction = policies.advanced_reduction;
+    let pool_isolation_policy = policies.pool_isolation;
     std::fs::create_dir_all(&metadata_root)?;
     let _appliance_lease =
         ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::WritableDaemon)?;
     let recovery_latch = arm_recovery_latch(&metadata_root)?;
+    let metadata_pool = FsStorageIo::open(&metadata_root)?;
+    let data_pool = FsStorageIo::open(&container_root)?;
+    if metadata_pool.root() == data_pool.root() {
+        return Err("metadata and DATA roots must resolve to distinct directories".into());
+    }
+    let isolation = PhysicalPoolIsolation::audit(
+        &PhysicalPoolIsolation::observe_paths(metadata_pool.root(), data_pool.root())?,
+        pool_isolation_policy,
+    )?;
+    if isolation == PhysicalPoolIsolation::LabBypass {
+        eprintln!(
+            "WARNING: physical pool isolation bypassed for LAB; this configuration is not production-safe"
+        );
+    }
+    AppliancePoolBinding::initialize_or_open_filesystem(&metadata_pool, &data_pool)?;
+    let capacity_source =
+        TieredStatFsSource::open(&container_root, &metadata_root, statfs_override)?;
     let (control_listener, _control_guard) = bind_online_gc_control(&metadata_root)?;
+    let (management_listener, _management_guard) = bind_management_control(&metadata_root)?;
 
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
     let data_storage = open_data_storage(&container_root, io_telemetry_enabled)?;
     let recovered = recover_appliance(&metadata_root, &data_storage, advanced_reduction)?;
     emit_online_gc_recovery(recovered.online_gc_recovery);
     let appliance = Arc::new(recovered.appliance);
-    let filesystem =
-        configured_filesystem(&appliance, &container_root, &metadata_root, statfs_override)?;
+    let namespace = appliance.namespace_arc();
+    capacity_source.attach_logical_quota_namespace(&namespace)?;
+    let presented_capacity_control = RuntimePresentedCapacityControl {
+        statfs: capacity_source.clone(),
+        namespace,
+    };
+    if let Some(manifest) = load_share_capacity_manifest()? {
+        presented_capacity_control.replace(
+            manifest.revision,
+            manifest
+                .rules
+                .into_iter()
+                .map(|rule| (rule.inode, rule.capacity_bytes))
+                .collect(),
+        )?;
+    }
+    let filesystem = configured_filesystem(&appliance, capacity_source.clone());
+    let frontend_telemetry = filesystem.frontend_telemetry();
     let session = Session::new(volatile_mount_options());
     let mount = session.mount(filesystem, &mount_path).await?;
     let gc_runtime = start_online_gc_runtime(
@@ -114,6 +305,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_storage.clone(),
         container_root.clone(),
         online_gc_policy,
+        online_gc_enabled(),
+    );
+    let recovery_checkpoint_runtime = start_recovery_checkpoint_runtime(
+        recovered.recovery_generations,
+        recovered.recovery_containers,
+        recovered.recovery_indexes,
+        recovered.recovery_checkpoints,
     );
     emit_mount_state(
         &appliance,
@@ -182,10 +380,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
+            accepted = management_listener.accept() => {
+                let (stream, _) = accepted?;
+                let telemetry = Arc::clone(&frontend_telemetry);
+                let configuration = gc_runtime.configuration.clone();
+                let capacity_control = presented_capacity_control.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_management_control(stream, telemetry, configuration, capacity_control).await {
+                        eprintln!("management_control_error={error}");
+                    }
+                });
+            }
         }
     }
 
-    let clean_catch_up = stop_background_and_catch_up(Arc::clone(&appliance), gc_runtime).await?;
+    let clean_catch_up = stop_background_and_catch_up(
+        Arc::clone(&appliance),
+        gc_runtime,
+        recovery_checkpoint_runtime,
+    )
+    .await?;
     mount.unmount().await?;
     if clean_catch_up {
         recovery_latch.mark_clean()?;
@@ -211,13 +425,18 @@ fn arm_recovery_latch(
 async fn stop_background_and_catch_up(
     appliance: Arc<FsAppliance>,
     gc_runtime: OnlineGcRuntimeHandle,
+    recovery_checkpoint_runtime: RecoveryCheckpointRuntimeHandle,
 ) -> Result<bool, String> {
     appliance.namespace().pause_mutation_admission();
     gc_runtime.stop().await?;
     match catch_up(appliance).await {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            recovery_checkpoint_runtime.stop().await?;
+            Ok(true)
+        }
         Err(error) => {
             eprintln!("CRITICAL: final checkpoint failed during shutdown: {error}");
+            recovery_checkpoint_runtime.stop().await?;
             Ok(false)
         }
     }
@@ -271,19 +490,18 @@ fn validate_memory_budget_policy() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn validated_startup_policies() -> Result<
-    (
-        Option<StatFsOverride>,
-        OnlineGcPolicy,
-        AdvancedReductionPolicy,
-    ),
-    Box<dyn std::error::Error>,
-> {
+fn validated_startup_policies() -> Result<StartupPolicies, Box<dyn std::error::Error>> {
     let statfs_override = statfs_override_from_environment()?;
     let online_gc_policy = OnlineGcPolicy::from_environment()?;
     let advanced_reduction = advanced_reduction_policy_from_environment()?;
+    let pool_isolation = PoolIsolationPolicy::from_environment()?;
     validate_memory_budget_policy()?;
-    Ok((statfs_override, online_gc_policy, advanced_reduction))
+    Ok(StartupPolicies {
+        statfs_override,
+        online_gc: online_gc_policy,
+        advanced_reduction,
+        pool_isolation,
+    })
 }
 
 fn advanced_reduction_policy_from_environment()
@@ -309,40 +527,156 @@ fn recover_appliance(
     let indexes = ExactIndexRunRepository::new(metadata_storage.clone());
     let maintenance_containers =
         containers.with_maintenance_storage(FsStorageIo::open(data_storage.inner.root())?);
+    let recovery_checkpoints =
+        RecoveryCheckpointRepository::new(FsStorageIo::open(data_storage.inner.root())?);
+    let restored_from_data_tier = if generations.has_committed_generation()? {
+        None
+    } else {
+        let recovered =
+            recovery_checkpoints.recover_latest(&generations, &maintenance_containers)?;
+        if recovered.is_none() && containers.audit_generation_high_water(None)?.is_some() {
+            return Err(
+                "Metadata tier is empty but initialized DATA has no complete Recovery Checkpoint"
+                    .into(),
+            );
+        }
+        recovered
+    };
+    if let Some(recovered) = &restored_from_data_tier {
+        eprintln!(
+            "data_tier_recovery_checkpoint_ok=true generation={} metadata_objects_restored=true",
+            recovered.record().generation()
+        );
+    }
     let online_maintenance = MaintenanceRepository::new(
         generations.clone(),
-        maintenance_containers,
+        maintenance_containers.clone(),
         indexes.clone(),
         checkpoint_exact_index_profile_v1(),
     );
     let online_gc_recovery = online_maintenance.finalize_recovered_online_gc()?;
     let gc_catalog = GcCandidateCatalogRepository::new(FsStorageIo::open(metadata_root)?);
+    let similarities = (advanced_reduction == AdvancedReductionPolicy::PrefixV1)
+        .then(|| SimilarityIndexRepository::new(metadata_storage));
+    if restored_from_data_tier.is_some() {
+        if let Some(similarities) = &similarities {
+            let rebuilt = online_maintenance.rebuild_pool_indexes(similarities)?;
+            eprintln!(
+                "data_tier_recovery_indexes_ok=true exact_generation={} similarity_generation={}",
+                rebuilt.exact().activation_generation(),
+                rebuilt.similarity_generation(),
+            );
+        } else {
+            let rebuilt = online_maintenance.rebuild_exact_index()?;
+            eprintln!(
+                "data_tier_recovery_indexes_ok=true exact_generation={}",
+                rebuilt.activation_generation(),
+            );
+        }
+    }
     let appliance = match advanced_reduction {
         AdvancedReductionPolicy::Off => DurableNamespace::open_with_index(
             NamespaceConfig::default(),
-            generations,
-            containers,
+            generations.clone(),
+            containers.clone(),
             &indexes,
-            INODE_RESERVATION_SPAN,
+            INODE_RESERVATION_SPAN_V1,
         )?,
-        AdvancedReductionPolicy::PrefixV1 => {
-            let similarities = SimilarityIndexRepository::new(metadata_storage);
-            DurableNamespace::open_with_reduction_indexes(
-                NamespaceConfig::default(),
-                generations,
-                containers,
-                &indexes,
-                &similarities,
-                INODE_RESERVATION_SPAN,
-            )?
-        }
+        AdvancedReductionPolicy::PrefixV1 => DurableNamespace::open_with_reduction_indexes(
+            NamespaceConfig::default(),
+            generations.clone(),
+            containers.clone(),
+            &indexes,
+            similarities
+                .as_ref()
+                .expect("ASSERT: Prefix policy constructs Similarity repository"),
+            INODE_RESERVATION_SPAN_V1,
+        )?,
     };
     Ok(RecoveredAppliance {
         appliance,
         online_gc_recovery,
         online_maintenance,
         gc_catalog,
+        recovery_generations: generations,
+        recovery_containers: maintenance_containers,
+        recovery_indexes: indexes,
+        recovery_checkpoints,
     })
+}
+
+fn start_recovery_checkpoint_runtime(
+    generations: GenerationRepository<FsStorageIo>,
+    containers: ContainerRepository<FsStorageIo>,
+    indexes: ExactIndexRunRepository<FsStorageIo>,
+    checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
+) -> RecoveryCheckpointRuntimeHandle {
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let worker = tokio::spawn(async move {
+        let mut ticks = interval(RECOVERY_CHECKPOINT_INTERVAL);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticks.tick().await;
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = ticks.tick() => {
+                    publish_recovery_checkpoint_background(
+                        generations.clone(),
+                        containers.clone(),
+                        indexes.clone(),
+                        checkpoints.clone(),
+                    ).await;
+                }
+            }
+        }
+        publish_recovery_checkpoint_once(generations, containers, indexes, checkpoints)
+            .await
+            .map(drop)
+    });
+    RecoveryCheckpointRuntimeHandle { shutdown, worker }
+}
+
+async fn publish_recovery_checkpoint_background(
+    generations: GenerationRepository<FsStorageIo>,
+    containers: ContainerRepository<FsStorageIo>,
+    indexes: ExactIndexRunRepository<FsStorageIo>,
+    checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
+) {
+    match publish_recovery_checkpoint_once(generations, containers, indexes, checkpoints).await {
+        Ok(Some(summary)) => eprintln!(
+            "data_tier_recovery_checkpoint_ok=true generation={} metadata_objects={} metadata_bytes={} required_chunks={} file_bytes={}",
+            summary.generation(),
+            summary.metadata_object_count(),
+            summary.metadata_payload_bytes(),
+            summary.required_chunk_count(),
+            summary.file_length(),
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!("data_tier_recovery_checkpoint_error={error}"),
+    }
+}
+
+async fn publish_recovery_checkpoint_once(
+    generations: GenerationRepository<FsStorageIo>,
+    containers: ContainerRepository<FsStorageIo>,
+    indexes: ExactIndexRunRepository<FsStorageIo>,
+    checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
+) -> Result<Option<fastdup_store::RecoveryCheckpointSummary>, String> {
+    tokio::task::spawn_blocking(move || {
+        if let Some(index) = indexes.pin_active_generation() {
+            let verifier = IndexedRequiredChunkVerifier::new(containers, index);
+            checkpoints.publish(&generations, &verifier)
+        } else {
+            checkpoints.publish(&generations, &containers)
+        }
+    })
+    .await
+    .map_err(|error| format!("Recovery-Checkpoint worker join failed: {error}"))?
+    .map_err(|error| error.to_string())
 }
 
 fn emit_online_gc_recovery(report: OnlineGcRecoveryReport) {
@@ -371,6 +705,197 @@ fn bind_online_gc_control(
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
     Ok((listener, guard))
+}
+
+fn bind_management_control(
+    metadata_root: &std::path::Path,
+) -> io::Result<(UnixListener, OnlineGcSocketGuard)> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let path = metadata_root.join(MANAGEMENT_SOCKET_NAME);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&path)?;
+    // Only the root agent may mutate live filesystem policy. The unprivileged
+    // HTTPS process reaches this seam exclusively through the typed agent.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    Ok((
+        UnixListener::from_std(listener)?,
+        OnlineGcSocketGuard { path },
+    ))
+}
+
+async fn handle_management_control(
+    mut stream: UnixStream,
+    telemetry: Arc<FrontendTelemetry>,
+    configuration: watch::Sender<OnlineGcRuntimeConfiguration>,
+    capacity_source: RuntimePresentedCapacityControl,
+) -> Result<(), String> {
+    let mut request = Vec::new();
+    timeout(
+        Duration::from_secs(5),
+        (&mut stream).take(1_048_577).read_to_end(&mut request),
+    )
+    .await
+    .map_err(|_| "management request timed out".to_owned())?
+    .map_err(|error| format!("management request read failed: {error}"))?;
+    let response = match serde_json::from_slice::<ManagementRequest>(&request) {
+        Ok(request) if request.version == MANAGEMENT_PROTOCOL_VERSION => {
+            apply_management_operation(
+                request.operation,
+                &telemetry,
+                &configuration,
+                &capacity_source,
+            )
+        }
+        Ok(_) => ManagementResponse {
+            version: MANAGEMENT_PROTOCOL_VERSION,
+            ok: false,
+            error: Some("unsupported_version".to_owned()),
+            frontend: None,
+            presented_capacity_revision: None,
+        },
+        Err(_) => ManagementResponse {
+            version: MANAGEMENT_PROTOCOL_VERSION,
+            ok: false,
+            error: Some("invalid_request".to_owned()),
+            frontend: None,
+            presented_capacity_revision: None,
+        },
+    };
+    let mut encoded = serde_json::to_vec(&response)
+        .map_err(|error| format!("management response encode failed: {error}"))?;
+    encoded.push(b'\n');
+    stream
+        .write_all(&encoded)
+        .await
+        .map_err(|error| format!("management response write failed: {error}"))
+}
+
+fn apply_management_operation(
+    operation: ManagementOperation,
+    telemetry: &FrontendTelemetry,
+    configuration: &watch::Sender<OnlineGcRuntimeConfiguration>,
+    capacity_source: &dyn PresentedCapacityControl,
+) -> ManagementResponse {
+    match operation {
+        ManagementOperation::Inspect => {
+            let snapshot = telemetry.snapshot();
+            ManagementResponse {
+                version: MANAGEMENT_PROTOCOL_VERSION,
+                ok: true,
+                error: None,
+                frontend: Some(ManagementFrontendTelemetry {
+                    read_bytes: snapshot.read_bytes,
+                    write_bytes: snapshot.write_bytes,
+                    read_operations: snapshot.read_operations,
+                    write_operations: snapshot.write_operations,
+                    read_errors: snapshot.read_errors,
+                    write_errors: snapshot.write_errors,
+                    read_latency_micros_p50: snapshot.read_latency_micros_p50,
+                    read_latency_micros_p95: snapshot.read_latency_micros_p95,
+                    read_latency_micros_p99: snapshot.read_latency_micros_p99,
+                    write_latency_micros_p50: snapshot.write_latency_micros_p50,
+                    write_latency_micros_p95: snapshot.write_latency_micros_p95,
+                    write_latency_micros_p99: snapshot.write_latency_micros_p99,
+                    exact_hit_bytes: TELEMETRY_EXACT_HIT_BYTES.load(Ordering::Relaxed),
+                    new_chunk_bytes: TELEMETRY_NEW_CHUNK_BYTES.load(Ordering::Relaxed),
+                    logical_chunk_bytes: TELEMETRY_LOGICAL_CHUNK_BYTES.load(Ordering::Relaxed),
+                    physical_container_bytes: TELEMETRY_PHYSICAL_CONTAINER_BYTES
+                        .load(Ordering::Relaxed),
+                }),
+                presented_capacity_revision: capacity_source.revision().ok(),
+            }
+        }
+        ManagementOperation::UpdateOnlineGc {
+            enabled,
+            pressure_low_basis_points,
+            pressure_high_basis_points,
+        } => {
+            let current = *configuration.borrow();
+            let policy = current
+                .policy
+                .with_pressure_watermarks(pressure_low_basis_points, pressure_high_basis_points);
+            match policy {
+                Ok(policy)
+                    if configuration
+                        .send(OnlineGcRuntimeConfiguration { enabled, policy })
+                        .is_ok() =>
+                {
+                    ManagementResponse {
+                        version: MANAGEMENT_PROTOCOL_VERSION,
+                        ok: true,
+                        error: None,
+                        frontend: None,
+                        presented_capacity_revision: None,
+                    }
+                }
+                Ok(_) => ManagementResponse {
+                    version: MANAGEMENT_PROTOCOL_VERSION,
+                    ok: false,
+                    error: Some("online_gc_runtime_unavailable".to_owned()),
+                    frontend: None,
+                    presented_capacity_revision: None,
+                },
+                Err(error) => ManagementResponse {
+                    version: MANAGEMENT_PROTOCOL_VERSION,
+                    ok: false,
+                    error: Some(error.to_string()),
+                    frontend: None,
+                    presented_capacity_revision: None,
+                },
+            }
+        }
+        ManagementOperation::UpdatePresentedCapacities { revision, rules } => {
+            update_presented_capacities(capacity_source, revision, rules)
+        }
+    }
+}
+
+fn update_presented_capacities(
+    capacity_source: &dyn PresentedCapacityControl,
+    revision: String,
+    rules: Vec<ManagementPresentedCapacityRule>,
+) -> ManagementResponse {
+    if rules.len() > 4_096 {
+        return ManagementResponse {
+            version: MANAGEMENT_PROTOCOL_VERSION,
+            ok: false,
+            error: Some("too_many_presented_capacity_rules".to_owned()),
+            frontend: None,
+            presented_capacity_revision: None,
+        };
+    }
+    match capacity_source.replace(
+        revision.clone(),
+        rules
+            .into_iter()
+            .map(|rule| (rule.inode, rule.capacity_bytes))
+            .collect(),
+    ) {
+        Ok(()) => ManagementResponse {
+            version: MANAGEMENT_PROTOCOL_VERSION,
+            ok: true,
+            error: None,
+            frontend: None,
+            presented_capacity_revision: Some(revision),
+        },
+        Err(error) => ManagementResponse {
+            version: MANAGEMENT_PROTOCOL_VERSION,
+            ok: false,
+            error: Some(error.to_string()),
+            frontend: None,
+            presented_capacity_revision: None,
+        },
+    }
+}
+
+fn online_gc_enabled() -> bool {
+    std::env::var("FASTDUP_ONLINE_GC_ENABLED").map_or(true, |value| value != "0")
 }
 
 async fn handle_online_gc_control(
@@ -425,8 +950,11 @@ fn start_online_gc_runtime(
     frontend_storage: TelemetryStorageIo,
     container_root: PathBuf,
     policy: OnlineGcPolicy,
+    enabled: bool,
 ) -> OnlineGcRuntimeHandle {
     let (requests, control) = mpsc::channel(1);
+    let (configuration, configuration_rx) =
+        watch::channel(OnlineGcRuntimeConfiguration { enabled, policy });
     let (shutdown, shutdown_rx) = watch::channel(false);
     let worker = tokio::spawn(run_online_gc_runtime(
         maintenance,
@@ -434,23 +962,29 @@ fn start_online_gc_runtime(
         frontend_storage,
         container_root,
         policy,
+        enabled,
         control,
+        configuration_rx,
         shutdown_rx,
     ));
     OnlineGcRuntimeHandle {
         requests,
+        configuration,
         shutdown,
         worker,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_online_gc_runtime(
     maintenance: FsOnlineMaintenance,
     catalog: FsGcCatalog,
     frontend_storage: TelemetryStorageIo,
     container_root: PathBuf,
     policy: OnlineGcPolicy,
+    mut enabled: bool,
     mut control: mpsc::Receiver<OnlineGcControlRequest>,
+    mut configuration: watch::Receiver<OnlineGcRuntimeConfiguration>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let now = Instant::now();
@@ -464,6 +998,16 @@ async fn run_online_gc_runtime(
     ticks.tick().await;
     loop {
         tokio::select! {
+            changed = configuration.changed() => {
+                changed.map_err(|_| "Online-GC configuration channel closed".to_owned())?;
+                let replacement = *configuration.borrow_and_update();
+                enabled = replacement.enabled;
+                scheduler = OnlineGcScheduler::with_policy(
+                    Instant::now(),
+                    frontend_storage.inner.status().submitted_operations(),
+                    replacement.policy,
+                );
+            }
             changed = shutdown.changed() => {
                 changed.map_err(|_| "Online-GC shutdown channel closed".to_owned())?;
                 if *shutdown.borrow() {
@@ -488,6 +1032,9 @@ async fn run_online_gc_runtime(
                 let _ = request.response.send(response);
             }
             _ = ticks.tick() => {
+                if !enabled {
+                    continue;
+                }
                 let usage = match data_pool_usage(&container_root) {
                     Ok(usage) => usage,
                     Err(error) => {
@@ -681,14 +1228,11 @@ fn emit_mount_state(
     emit_verified_read_cache(appliance);
 }
 
-fn configured_filesystem(
-    appliance: &FsAppliance,
-    container_root: &std::path::Path,
-    metadata_root: &std::path::Path,
-    capacity_override: Option<StatFsOverride>,
-) -> io::Result<FuseFilesystem> {
-    let source = TieredStatFsSource::open(container_root, metadata_root, capacity_override)?;
-    Ok(FuseFilesystem::new(appliance.namespace_arc()).with_statfs_source(Arc::new(source)))
+fn configured_filesystem(appliance: &FsAppliance, source: TieredStatFsSource) -> FuseFilesystem {
+    appliance
+        .namespace()
+        .install_commit_capacity_admission(source.commit_capacity_governor());
+    FuseFilesystem::new(appliance.namespace_arc()).with_statfs_source(Arc::new(source))
 }
 
 fn statfs_override_from_environment() -> Result<Option<StatFsOverride>, Box<dyn std::error::Error>>
@@ -698,6 +1242,27 @@ fn statfs_override_from_environment() -> Result<Option<StatFsOverride>, Box<dyn 
     let capacity = std::env::var_os(CAPACITY);
     let available = std::env::var_os(AVAILABLE);
     statfs_override_from_values(capacity.as_deref(), available.as_deref())
+}
+
+fn load_share_capacity_manifest()
+-> Result<Option<ShareCapacityManifest>, Box<dyn std::error::Error>> {
+    let Some(path) = std::env::var_os("FASTDUP_SHARE_CAPACITY_MANIFEST") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() > 1_048_576 {
+        return Err("Share capacity manifest exceeds one MiB".into());
+    }
+    let manifest: ShareCapacityManifest = serde_json::from_slice(&std::fs::read(&path)?)?;
+    if manifest.version != MANAGEMENT_PROTOCOL_VERSION || manifest.rules.len() > 4_096 {
+        return Err("Share capacity manifest version or rule count is invalid".into());
+    }
+    Ok(Some(manifest))
 }
 
 fn statfs_override_from_values(
@@ -802,12 +1367,14 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
     eprintln!(
         concat!(
             "write_through_ingest_ring batches={} fragments={} maximum_batch_bytes={} ",
-            "minimum_batch_target_bytes={} maximum_slots={} full_wait_ns={}"
+            "minimum_batch_target_bytes={} maximum_batch_target_bytes={} ",
+            "maximum_slots={} full_wait_ns={}"
         ),
         status.ingest_batches(),
         status.ingest_fragments(),
         status.maximum_ingest_batch_bytes(),
         status.minimum_ingest_batch_target_bytes(),
+        status.maximum_ingest_batch_target_bytes(),
         status.maximum_ingest_ring_slots(),
         status.ingest_ring_wait_ns(),
     );
@@ -963,10 +1530,14 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
     let membership = appliance.exact_run_membership_status();
     eprintln!(
         concat!(
-            "exact_run_membership filters={} allocated_bytes={} ",
+            "exact_run_membership mapped_runs={} positional_runs={} mapped_page_bounds_bytes={} ",
+            "filters={} allocated_bytes={} ",
             "huge_page_advised_filters={} huge_page_advised_bytes={} probes={} ",
             "definitely_absent={} requires_exact_lookup={}"
         ),
+        membership.mapped_run_count(),
+        membership.positional_run_count(),
+        membership.mapped_page_bounds_bytes(),
         membership.filter_count(),
         membership.allocated_bytes(),
         membership.huge_page_advised_filter_count(),
@@ -1167,6 +1738,10 @@ fn map_worker_result(
 
 fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
     let metrics = profiled.metrics();
+    TELEMETRY_EXACT_HIT_BYTES.fetch_add(metrics.exact_hit_bytes(), Ordering::Relaxed);
+    TELEMETRY_NEW_CHUNK_BYTES.fetch_add(metrics.new_chunk_bytes(), Ordering::Relaxed);
+    TELEMETRY_LOGICAL_CHUNK_BYTES.fetch_add(metrics.logical_chunk_bytes(), Ordering::Relaxed);
+    TELEMETRY_PHYSICAL_CONTAINER_BYTES.fetch_add(metrics.container_file_bytes(), Ordering::Relaxed);
     let gate = metrics.incompressibility_gate();
     eprintln!(
         concat!(
@@ -1457,6 +2032,91 @@ mod tests {
     use fastdup_format::ContainerId;
 
     use super::*;
+
+    #[test]
+    fn management_protocol_exposes_frontend_counters_and_hot_gc_policy() {
+        let telemetry = FrontendTelemetry::default();
+        let initial = OnlineGcRuntimeConfiguration {
+            enabled: true,
+            policy: OnlineGcPolicy::default(),
+        };
+        let (configuration, _configuration_rx) = watch::channel(initial);
+        let capacity_source = TestPresentedCapacityControl::default();
+
+        let inspected = apply_management_operation(
+            ManagementOperation::Inspect,
+            &telemetry,
+            &configuration,
+            &capacity_source,
+        );
+        assert!(inspected.ok);
+        assert!(inspected.frontend.is_some());
+
+        let updated = apply_management_operation(
+            ManagementOperation::UpdateOnlineGc {
+                enabled: false,
+                pressure_low_basis_points: 8_100,
+                pressure_high_basis_points: 8_800,
+            },
+            &telemetry,
+            &configuration,
+            &capacity_source,
+        );
+        assert!(updated.ok);
+        assert!(!configuration.borrow().enabled);
+
+        let quota = apply_management_operation(
+            ManagementOperation::UpdatePresentedCapacities {
+                revision: "shares-r1".to_owned(),
+                rules: vec![ManagementPresentedCapacityRule {
+                    inode: 42,
+                    capacity_bytes: 25_000_000_000_000,
+                }],
+            },
+            &telemetry,
+            &configuration,
+            &capacity_source,
+        );
+        assert!(quota.ok);
+        assert_eq!(
+            capacity_source.revision().expect("capacity revision"),
+            "shares-r1"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_socket_is_root_only() {
+        let root = std::env::temp_dir().join(format!(
+            "fastdup-management-permissions-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create management fixture root");
+        let (_listener, guard) = bind_management_control(&root).expect("bind management socket");
+        let mode = std::fs::metadata(root.join(MANAGEMENT_SOCKET_NAME))
+            .expect("management socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(guard);
+        std::fs::remove_dir(root).expect("remove management fixture root");
+    }
+
+    #[derive(Debug, Default)]
+    struct TestPresentedCapacityControl {
+        revision: Mutex<String>,
+    }
+
+    impl PresentedCapacityControl for TestPresentedCapacityControl {
+        fn replace(&self, revision: String, _rules: Vec<(u64, u64)>) -> io::Result<()> {
+            *self.revision.lock().expect("test capacity lock") = revision;
+            Ok(())
+        }
+
+        fn revision(&self) -> io::Result<String> {
+            Ok(self.revision.lock().expect("test capacity lock").clone())
+        }
+    }
 
     #[test]
     fn statfs_override_requires_a_complete_bounded_decimal_pair() {

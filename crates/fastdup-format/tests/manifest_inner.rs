@@ -14,8 +14,10 @@ fn manifest_inner_node_has_stable_content_addressed_bytes_and_round_trips() {
         12,
         1,
         vec![
-            ManifestChildRange::new(0, 4, object_id(0x22)).expect("first child range is valid"),
-            ManifestChildRange::new(4, 8, object_id(0x88)).expect("second child range is valid"),
+            ManifestChildRange::new_with_allocated_bytes(0, 4, 4, object_id(0x22))
+                .expect("first child range is valid"),
+            ManifestChildRange::new_with_allocated_bytes(4, 8, 8, object_id(0x88))
+                .expect("second child range is valid"),
         ],
     )
     .expect("worked child partition is valid");
@@ -65,6 +67,7 @@ fn manifest_inner_node_has_stable_content_addressed_bytes_and_round_trips() {
     assert_eq!(node.file_length(), 12);
     assert_eq!(node.level(), 1);
     assert_eq!(node.children().len(), 2);
+    assert_eq!(node.allocated_bytes(), Ok(Some(12)));
     assert_eq!(
         MetadataObjectId::from_encoded(&encoded).expect("generic envelope identity verifies"),
         MetadataObjectId::from_encoded(
@@ -80,7 +83,7 @@ fn manifest_inner_node_has_stable_content_addressed_bytes_and_round_trips() {
 
 #[test]
 fn v2_child_allocation_summaries_are_stable_bounded_and_round_trip() {
-    let node = ManifestInnerNode::new_with_allocated_bytes(
+    let node = ManifestInnerNode::new(
         12,
         1,
         vec![
@@ -118,7 +121,9 @@ fn v2_child_allocation_summaries_are_stable_bounded_and_round_trip() {
 
 #[test]
 fn writer_rejects_leaf_level_empty_gapped_overlapping_and_overflowing_ranges() {
-    let child = |offset, length, byte| ManifestChildRange::new(offset, length, object_id(byte));
+    let child = |offset, length, byte| {
+        ManifestChildRange::new_with_allocated_bytes(offset, length, length, object_id(byte))
+    };
     let complete = || vec![child(0, 4, 1).expect("worked child range is valid")];
 
     assert_eq!(
@@ -234,8 +239,10 @@ fn worked_node() -> ManifestInnerNode {
         12,
         2,
         vec![
-            ManifestChildRange::new(0, 4, object_id(0x33)).expect("first child range is valid"),
-            ManifestChildRange::new(4, 8, object_id(0x77)).expect("second child range is valid"),
+            ManifestChildRange::new_with_allocated_bytes(0, 4, 4, object_id(0x33))
+                .expect("first child range is valid"),
+            ManifestChildRange::new_with_allocated_bytes(4, 8, 8, object_id(0x77))
+                .expect("second child range is valid"),
         ],
     )
     .expect("worked child partition is valid")

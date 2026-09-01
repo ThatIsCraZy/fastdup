@@ -1,0 +1,30 @@
+[Unit]
+Description=FastDup Appliance HTTPS Control Plane
+After=network.target fastdup-agent.service
+Requires=fastdup-agent.service
+
+[Service]
+Type=simple
+Slice=fastdup-management.slice
+ExecStart=/usr/libexec/fastdup/fastdup-control
+User=fastdup-control
+Group=fastdup-control
+UMask=0077
+StateDirectory=fastdup/control
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/fastdup/control
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+OOMScoreAdjust=500
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

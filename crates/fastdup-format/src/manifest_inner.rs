@@ -9,8 +9,7 @@ pub const MANIFEST_INNER_HEADER_BYTES: usize = 64;
 pub const MANIFEST_CHILD_RANGE_BYTES: usize = 64;
 
 const MANIFEST_INNER_MAGIC: &[u8; 8] = b"FDMANI01";
-const FORMAT_VERSION_V1: u16 = 1;
-const FORMAT_VERSION_V2: u16 = 2;
+const FORMAT_VERSION: u16 = 2;
 
 /// One child Metadata Object and the byte range it covers inside its parent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,34 +21,20 @@ pub struct ManifestChildRange {
 }
 
 impl ManifestChildRange {
-    /// Constructs one nonempty, arithmetically representable child range.
-    ///
-    /// Parent-level ordering and complete coverage are checked by
-    /// [`ManifestInnerNode::new`].
-    ///
-    /// # Errors
-    ///
-    /// Rejects zero length or an offset-plus-length overflow.
-    pub fn new(
+    fn validate_range(
         logical_offset: u64,
         logical_length: u64,
-        child: MetadataObjectId,
-    ) -> Result<Self, ManifestInnerNodeError> {
+    ) -> Result<(), ManifestInnerNodeError> {
         if logical_length == 0 {
             return Err(ManifestInnerNodeError::InvalidChildRange);
         }
         logical_offset
             .checked_add(logical_length)
             .ok_or(ManifestInnerNodeError::ArithmeticOverflow)?;
-        Ok(Self {
-            logical_offset,
-            logical_length,
-            child,
-            allocated_bytes: None,
-        })
+        Ok(())
     }
 
-    /// Constructs one v2 child range with an authenticated subtree allocation
+    /// Constructs one child range with an authenticated subtree allocation
     /// total. DATA and FILL bytes are allocated; HOLE bytes are not.
     ///
     /// # Errors
@@ -64,9 +49,13 @@ impl ManifestChildRange {
         if allocated_bytes > logical_length {
             return Err(ManifestInnerNodeError::InvalidChildRange);
         }
-        let mut range = Self::new(logical_offset, logical_length, child)?;
-        range.allocated_bytes = Some(allocated_bytes);
-        Ok(range)
+        Self::validate_range(logical_offset, logical_length)?;
+        Ok(Self {
+            logical_offset,
+            logical_length,
+            child,
+            allocated_bytes: Some(allocated_bytes),
+        })
     }
 
     #[must_use]
@@ -84,8 +73,7 @@ impl ManifestChildRange {
         self.child
     }
 
-    /// Returns the authenticated v2 subtree allocation total. V1 child
-    /// records deliberately return `None`.
+    /// Returns the authenticated subtree allocation total.
     #[must_use]
     pub const fn allocated_bytes(self) -> Option<u64> {
         self.allocated_bytes
@@ -95,7 +83,6 @@ impl ManifestChildRange {
 /// One immutable Manifest inner node whose children partition its file range.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManifestInnerNode {
-    format_version: u16,
     file_length: u64,
     level: u16,
     children: Vec<ManifestChildRange>,
@@ -117,32 +104,9 @@ impl ManifestInnerNode {
         level: u16,
         children: Vec<ManifestChildRange>,
     ) -> Result<Self, ManifestInnerNodeError> {
-        validate_node(file_length, level, &children, FORMAT_VERSION_V1)?;
+        validate_node(file_length, level, &children)?;
         payload_length(children.len())?;
         Ok(Self {
-            format_version: FORMAT_VERSION_V1,
-            file_length,
-            level,
-            children,
-        })
-    }
-
-    /// Constructs a v2 inner node whose every child carries its authenticated
-    /// allocated-byte total.
-    ///
-    /// # Errors
-    ///
-    /// Rejects the same structural failures as [`Self::new`] and any child
-    /// without a v2 allocation summary.
-    pub fn new_with_allocated_bytes(
-        file_length: u64,
-        level: u16,
-        children: Vec<ManifestChildRange>,
-    ) -> Result<Self, ManifestInnerNodeError> {
-        validate_node(file_length, level, &children, FORMAT_VERSION_V2)?;
-        payload_length(children.len())?;
-        Ok(Self {
-            format_version: FORMAT_VERSION_V2,
             file_length,
             level,
             children,
@@ -164,17 +128,13 @@ impl ManifestInnerNode {
         &self.children
     }
 
-    /// Returns the checked authenticated allocation total for a v2 node.
-    /// V1 nodes have no such summary.
+    /// Returns the checked authenticated allocation total.
     ///
     /// # Errors
     ///
     /// Returns arithmetic overflow if corrupt in-memory totals cannot be
     /// summed, although constructors and decoders prevent this state.
     pub fn allocated_bytes(&self) -> Result<Option<u64>, ManifestInnerNodeError> {
-        if self.format_version == FORMAT_VERSION_V1 {
-            return Ok(None);
-        }
         self.children.iter().try_fold(Some(0_u64), |total, child| {
             let total = total.ok_or(ManifestInnerNodeError::InvalidChildRange)?;
             let child_allocated = child
@@ -187,19 +147,14 @@ impl ManifestInnerNode {
         })
     }
 
-    /// Encodes the selected v1/v2 Manifest inner node in the content-addressed
+    /// Encodes the current Manifest inner node in the content-addressed
     /// Metadata Object envelope as object kind 4.
     ///
     /// # Errors
     ///
     /// Returns partition, arithmetic, size, allocation, or envelope failures.
     pub fn encode(&self) -> Result<Vec<u8>, ManifestInnerNodeError> {
-        validate_node(
-            self.file_length,
-            self.level,
-            &self.children,
-            self.format_version,
-        )?;
+        validate_node(self.file_length, self.level, &self.children)?;
         let payload_length = payload_length(self.children.len())?;
         let mut payload = Vec::new();
         payload
@@ -207,7 +162,7 @@ impl ManifestInnerNode {
             .map_err(|_| ManifestInnerNodeError::OutOfMemory)?;
         payload.resize(payload_length, 0);
         payload[0..8].copy_from_slice(MANIFEST_INNER_MAGIC);
-        put_u16(&mut payload, 8, self.format_version);
+        put_u16(&mut payload, 8, FORMAT_VERSION);
         put_u16(
             &mut payload,
             10,
@@ -259,7 +214,7 @@ impl ManifestInnerNode {
         let payload = object.payload;
         if payload.len() < MANIFEST_INNER_HEADER_BYTES
             || &payload[0..8] != MANIFEST_INNER_MAGIC
-            || !matches!(get_u16(payload, 8), FORMAT_VERSION_V1 | FORMAT_VERSION_V2)
+            || get_u16(payload, 8) != FORMAT_VERSION
             || usize::from(get_u16(payload, 10)) != MANIFEST_INNER_HEADER_BYTES
             || usize::from(get_u16(payload, 12)) != MANIFEST_CHILD_RANGE_BYTES
             || get_u64(payload, 16) != 0
@@ -269,7 +224,6 @@ impl ManifestInnerNode {
         {
             return Err(ManifestInnerNodeError::InvalidPayload);
         }
-        let format_version = get_u16(payload, 8);
         let child_count = usize::try_from(get_u32(payload, 32))
             .map_err(|_| ManifestInnerNodeError::ArithmeticOverflow)?;
         if payload_length(child_count)? != payload.len()
@@ -285,35 +239,22 @@ impl ManifestInnerNode {
         for ordinal in 0..child_count {
             let start = entry_start(ordinal)?;
             let entry = &payload[start..start + MANIFEST_CHILD_RANGE_BYTES];
-            let reserved_start = if format_version == FORMAT_VERSION_V1 {
-                48
-            } else {
-                56
-            };
-            if entry[reserved_start..].iter().any(|byte| *byte != 0) {
+            if entry[56..].iter().any(|byte| *byte != 0) {
                 return Err(ManifestInnerNodeError::InvalidChildRange);
             }
             let mut child = [0_u8; 32];
             child.copy_from_slice(&entry[16..48]);
             let child =
                 MetadataObjectId::new(child).ok_or(ManifestInnerNodeError::InvalidChildRange)?;
-            let range = if format_version == FORMAT_VERSION_V1 {
-                ManifestChildRange::new(get_u64(entry, 0), get_u64(entry, 8), child)?
-            } else {
-                ManifestChildRange::new_with_allocated_bytes(
-                    get_u64(entry, 0),
-                    get_u64(entry, 8),
-                    get_u64(entry, 48),
-                    child,
-                )?
-            };
+            let range = ManifestChildRange::new_with_allocated_bytes(
+                get_u64(entry, 0),
+                get_u64(entry, 8),
+                get_u64(entry, 48),
+                child,
+            )?;
             children.push(range);
         }
-        if format_version == FORMAT_VERSION_V1 {
-            Self::new(get_u64(payload, 24), get_u16(payload, 14), children)
-        } else {
-            Self::new_with_allocated_bytes(get_u64(payload, 24), get_u16(payload, 14), children)
-        }
+        Self::new(get_u64(payload, 24), get_u16(payload, 14), children)
     }
 }
 
@@ -321,11 +262,7 @@ fn validate_node(
     file_length: u64,
     level: u16,
     children: &[ManifestChildRange],
-    format_version: u16,
 ) -> Result<(), ManifestInnerNodeError> {
-    if !matches!(format_version, FORMAT_VERSION_V1 | FORMAT_VERSION_V2) {
-        return Err(ManifestInnerNodeError::InvalidPayload);
-    }
     if level == 0 {
         return Err(ManifestInnerNodeError::InvalidLevel);
     }
@@ -340,10 +277,11 @@ fn validate_node(
         if child.logical_offset != expected_offset {
             return Err(ManifestInnerNodeError::InvalidPartition);
         }
-        match (format_version, child.allocated_bytes) {
-            (FORMAT_VERSION_V1, None) => {}
-            (FORMAT_VERSION_V2, Some(allocated)) if allocated <= child.logical_length => {}
-            _ => return Err(ManifestInnerNodeError::InvalidChildRange),
+        if child
+            .allocated_bytes
+            .is_none_or(|allocated| allocated > child.logical_length)
+        {
+            return Err(ManifestInnerNodeError::InvalidChildRange);
         }
         expected_offset = child
             .logical_offset

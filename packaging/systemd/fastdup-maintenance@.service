@@ -1,0 +1,22 @@
+[Unit]
+Description=FastDup offline repository maintenance (%i)
+After=local-fs.target
+ConditionPathIsMountPoint=/var/lib/fastdup/repository/metadata
+ConditionPathIsMountPoint=/var/lib/fastdup/repository/data
+
+[Service]
+Type=oneshot
+Slice=fastdup-storage.slice
+ExecStart=/usr/bin/fastdup-maintenance --offline %i /var/lib/fastdup/repository/metadata /var/lib/fastdup/repository/data
+User=root
+Group=fastdup-control
+UMask=0007
+MemorySwapMax=0
+OOMScoreAdjust=-900
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/fastdup/repository
+TimeoutStartSec=infinity
+

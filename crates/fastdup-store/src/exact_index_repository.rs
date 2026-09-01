@@ -18,6 +18,7 @@ use fastdup_format::{
 };
 
 use crate::exact_activation_log::{ExactActivationLog, ExactActivationLogError};
+use crate::exact_index_mmap::ImmutableExactIndexRun;
 use crate::read_cache::{
     MemoryPressureSnapshot, SYSTEM_REFRESH_INTERVAL, shared_cache_reserve_bytes,
 };
@@ -413,6 +414,9 @@ impl ExactIndexPageCacheStatus {
 /// Process-lifetime evidence for immutable active-Run membership probes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ExactRunMembershipStatus {
+    mapped_run_count: u64,
+    positional_run_count: u64,
+    mapped_page_bounds_bytes: u64,
     filter_count: u64,
     allocated_bytes: u64,
     huge_page_advised_filter_count: u64,
@@ -423,6 +427,21 @@ pub struct ExactRunMembershipStatus {
 }
 
 impl ExactRunMembershipStatus {
+    #[must_use]
+    pub const fn mapped_run_count(self) -> u64 {
+        self.mapped_run_count
+    }
+
+    #[must_use]
+    pub const fn positional_run_count(self) -> u64 {
+        self.positional_run_count
+    }
+
+    #[must_use]
+    pub const fn mapped_page_bounds_bytes(self) -> u64 {
+        self.mapped_page_bounds_bytes
+    }
+
     #[must_use]
     pub const fn filter_count(self) -> u64 {
         self.filter_count
@@ -625,6 +644,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             name,
             descriptor,
             page_cache: Arc::clone(&self.page_cache),
+            mapping: None,
             membership: None,
             membership_counters: Arc::clone(&self.membership_counters),
         })
@@ -1323,14 +1343,13 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         &self,
         name: &str,
         maximum_bytes: usize,
-    ) -> Result<(ExactIndexRunDescriptor, Option<Arc<BlockedBloomHint>>), ExactIndexStoreError>
-    {
+    ) -> Result<AuditedExactRun, ExactIndexStoreError> {
         let envelope = self.read_envelope(name)?;
         let descriptor = envelope.descriptor;
         let mut membership = (maximum_bytes != 0)
             .then(|| BlockedBloomHint::new(descriptor.entry_count(), maximum_bytes).ok())
             .flatten();
-        self.audit_opened_run(name, &envelope, |entry| {
+        let mut visit = |entry: &ExactIndexEntry| {
             if let Some(filter) = &mut membership {
                 let logical_length = usize::try_from(entry.logical_length())
                     .expect("ASSERT: Exact logical length fits usize");
@@ -1341,8 +1360,23 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                     "ASSERT: inserting an Exact Run key cannot produce a Bloom false negative"
                 );
             }
-        })?;
-        Ok((descriptor, membership.map(Arc::new)))
+        };
+        let expected_length = u64::try_from(descriptor.file_length())
+            .map_err(|_| ExactIndexStoreError::CounterOverflow)?;
+        let mapping =
+            if let Some(lease) = self.storage.lease_immutable_file(name, expected_length)? {
+                Some(Arc::new(ImmutableExactIndexRun::open(
+                    lease, descriptor, &mut visit,
+                )?))
+            } else {
+                self.audit_opened_run(name, &envelope, &mut visit)?;
+                None
+            };
+        Ok(AuditedExactRun {
+            descriptor,
+            membership: membership.map(Arc::new),
+            mapping,
+        })
     }
 
     fn audit_opened_run(
@@ -1724,10 +1758,20 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .try_reserve_exact(run_set.runs().len())
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
         let mut membership_bytes_remaining = self.membership_budget_bytes_now();
+        let mut mapped_mode = None;
         for run_ref in run_set.runs().iter().copied() {
             let name = published_name(run_ref.profile(), run_ref.generation());
-            let (descriptor, membership) =
-                self.audit_named_with_membership(&name, membership_bytes_remaining)?;
+            let audited = self.audit_named_with_membership(&name, membership_bytes_remaining)?;
+            let descriptor = audited.descriptor;
+            let membership = audited.membership;
+            let mapping = audited.mapping;
+            let is_mapped = mapping.is_some();
+            if mapped_mode
+                .replace(is_mapped)
+                .is_some_and(|mode| mode != is_mapped)
+            {
+                return Err(ExactIndexStoreError::DependencyMismatch);
+            }
             verify_requested_identity(run_ref.profile(), run_ref.generation(), descriptor)?;
             verify_run_reference(run_ref, descriptor)?;
             if let Some(filter) = &membership {
@@ -1740,6 +1784,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 name,
                 descriptor,
                 page_cache: Arc::clone(&self.page_cache),
+                mapping,
                 membership,
                 membership_counters: Arc::clone(&self.membership_counters),
             });
@@ -1922,6 +1967,22 @@ impl<I> ActivatedExactIndex<I> {
     /// memory-accounting invariants.
     #[must_use]
     pub fn membership_status(&self) -> ExactRunMembershipStatus {
+        let mapped_run_count = self
+            .readers
+            .iter()
+            .filter(|reader| reader.mapping.is_some())
+            .count();
+        let positional_run_count = self.readers.len().saturating_sub(mapped_run_count);
+        let mapped_page_bounds_bytes = self.readers.iter().fold(0_usize, |total, reader| {
+            total
+                .checked_add(
+                    reader
+                        .mapping
+                        .as_ref()
+                        .map_or(0, |mapping| mapping.page_bounds_bytes()),
+                )
+                .expect("ASSERT: active mapped Exact page-bound bytes fit usize")
+        });
         let filter_count = self
             .readers
             .iter()
@@ -1966,6 +2027,12 @@ impl<I> ActivatedExactIndex<I> {
             "ASSERT: one active Exact Index shares one membership counter set"
         );
         ExactRunMembershipStatus {
+            mapped_run_count: u64::try_from(mapped_run_count)
+                .expect("ASSERT: active mapped Exact Run count fits u64"),
+            positional_run_count: u64::try_from(positional_run_count)
+                .expect("ASSERT: active positional Exact Run count fits u64"),
+            mapped_page_bounds_bytes: u64::try_from(mapped_page_bounds_bytes)
+                .expect("ASSERT: active mapped Exact page-bound bytes fit u64"),
             filter_count: u64::try_from(filter_count)
                 .expect("ASSERT: active membership filter count fits u64"),
             allocated_bytes: u64::try_from(allocated_bytes)
@@ -2083,6 +2150,12 @@ struct OpenedRunEnvelope {
     header: Vec<u8>,
     footer: Vec<u8>,
     footer_offset: u64,
+}
+
+struct AuditedExactRun {
+    descriptor: ExactIndexRunDescriptor,
+    membership: Option<Arc<BlockedBloomHint>>,
+    mapping: Option<Arc<ImmutableExactIndexRun>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2885,13 +2958,14 @@ fn exact_page_cache_slot(run_hash: [u8; 32], page_ordinal: usize, slot_count: us
     usize::try_from(mixed & mask).expect("ASSERT: a masked Exact Index page-cache slot fits usize")
 }
 
-/// Open immutable run handle retaining only its verified envelope.
+/// Open immutable Run handle backed by bounded reads or an audited active mapping.
 #[derive(Clone, Debug)]
 pub struct ExactIndexRunReader<I> {
     storage: I,
     name: String,
     descriptor: ExactIndexRunDescriptor,
     page_cache: Arc<ExactIndexPageCache>,
+    mapping: Option<Arc<ImmutableExactIndexRun>>,
     membership: Option<Arc<BlockedBloomHint>>,
     membership_counters: Arc<ExactRunMembershipCounters>,
 }
@@ -2965,8 +3039,12 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         let mut upper = self.descriptor.page_count();
         while lower < upper {
             let middle = lower + (upper - lower) / 2;
-            let page = self.read_page(middle)?;
-            match page.position(chunk_id, logical_length) {
+            let position = if let Some(mapping) = &self.mapping {
+                mapping.page_position(middle, chunk_id, logical_length)?
+            } else {
+                self.read_page(middle)?.position(chunk_id, logical_length)
+            };
+            match position {
                 ExactIndexPagePosition::After => lower = middle + 1,
                 ExactIndexPagePosition::Before | ExactIndexPagePosition::Within => upper = middle,
             }
@@ -3008,10 +3086,17 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
             .descriptor
             .page_offset(page_ordinal)
             .ok_or(ExactIndexFormatError::InvalidPage)?;
-        let bytes = self
-            .storage
-            .read_exact_at(&self.name, offset, EXACT_INDEX_PAGE_BYTES)?;
-        let page = Arc::new(self.descriptor.decode_page(page_ordinal, &bytes)?);
+        let page = if let Some(mapping) = &self.mapping {
+            Arc::new(
+                self.descriptor
+                    .decode_page(page_ordinal, mapping.page(offset)?)?,
+            )
+        } else {
+            let bytes = self
+                .storage
+                .read_exact_at(&self.name, offset, EXACT_INDEX_PAGE_BYTES)?;
+            Arc::new(self.descriptor.decode_page(page_ordinal, &bytes)?)
+        };
         self.page_cache
             .insert(run_hash, page_ordinal, Arc::clone(&page));
         Ok(page)

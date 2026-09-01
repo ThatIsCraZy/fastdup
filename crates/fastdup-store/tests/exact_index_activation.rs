@@ -1,14 +1,12 @@
 use std::{
     fs::OpenOptions,
-    io::Write,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
 
 use fastdup_format::{
-    ChunkId, ContainerId, ExactIndexActivationHash, ExactIndexActivationRecord, ExactIndexEntry,
-    ExactIndexLocation, ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet,
-    ExactLocationTransition,
+    ChunkId, ContainerId, ExactIndexEntry, ExactIndexLocation, ExactIndexProfileId, ExactIndexRun,
+    ExactIndexRunRef, ExactIndexRunSet, ExactLocationTransition,
 };
 use fastdup_store::{ExactIndexRunRepository, ExactIndexStoreError, FsStorageIo};
 
@@ -96,72 +94,6 @@ fn activation_recovers_only_one_run_set_with_all_durable_dependencies() {
 }
 
 #[test]
-fn activation_rotates_and_recovers_past_the_legacy_wal_limit() {
-    const RECORD_COUNT_AT_LIMIT: u64 = (64 * 1_024 * 1_024) / 4_096;
-
-    let root = test_root("full-wal");
-    if root.exists() {
-        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
-    }
-    let profile = ExactIndexProfileId::new([0x8B; 32]).expect("profile identity is nonzero");
-    let repository = ExactIndexRunRepository::new(
-        FsStorageIo::open(&root).expect("open workspace-local index repository"),
-    );
-    let descriptor = repository
-        .publish(&run(profile, 1, 3))
-        .expect("publish one immutable dependency");
-    let run_set = ExactIndexRunSet::new(
-        profile,
-        RECORD_COUNT_AT_LIMIT + 1,
-        vec![ExactIndexRunRef::new(0, descriptor).expect("Run reference is valid")],
-    )
-    .expect("worked Run Set is valid");
-
-    let placeholder_id = ExactIndexRunSet::new(profile, 1, Vec::new())
-        .expect("empty historical Run Set is valid")
-        .id()
-        .expect("historical Run Set has a content identity");
-    let mut previous_hash = ExactIndexActivationHash::ZERO;
-    let mut wal = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(root.join("exact-index.activation.wal"))
-        .expect("create the bounded worked WAL fixture");
-    for generation in 1..=RECORD_COUNT_AT_LIMIT {
-        let record = ExactIndexActivationRecord::new(
-            generation,
-            previous_hash,
-            placeholder_id,
-            profile,
-            generation,
-        )
-        .expect("construct one contiguous worked record");
-        let encoded = record.encode();
-        wal.write_all(&encoded).expect("write one complete record");
-        previous_hash = ExactIndexActivationHash::of(&encoded);
-    }
-    wal.sync_all().expect("make the full fixture readable");
-    drop(wal);
-
-    let activated = repository
-        .activate(&run_set)
-        .expect("the first post-legacy activation rotates into a bounded slot");
-    assert_eq!(activated.record().generation(), RECORD_COUNT_AT_LIMIT + 1);
-    assert_eq!(activated.run_set(), &run_set);
-
-    drop(repository);
-    let reopened = ExactIndexRunRepository::new(
-        FsStorageIo::open(&root).expect("reopen the rotated index repository"),
-    );
-    let recovered = reopened
-        .recover_active()
-        .expect("paired-slot recovery remains valid")
-        .expect("the post-legacy Run Set remains active");
-    assert_eq!(recovered.record(), activated.record());
-    assert_eq!(recovered.run_set(), &run_set);
-}
-
-#[test]
 fn repeated_rotation_stays_bounded_and_offline_audit_selects_the_latest_record() {
     const ACTIVATIONS: u64 = 130;
     const SLOT_BYTES: u64 = 64 * 4_096;
@@ -194,7 +126,7 @@ fn repeated_rotation_stays_bounded_and_offline_audit_selects_the_latest_record()
             .len();
         assert!(
             length <= SLOT_BYTES,
-            "post-migration slot {name} exceeded the lifetime bound: {length}"
+            "rotated slot {name} exceeded the lifetime bound: {length}"
         );
     }
 

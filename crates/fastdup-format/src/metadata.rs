@@ -14,6 +14,7 @@ pub(crate) const MANIFEST_LEAF_KIND: u16 = 1;
 pub(crate) const NAMESPACE_ROOT_KIND: u16 = 2;
 pub(crate) const EXACT_INDEX_RUN_SET_KIND: u16 = 3;
 pub(crate) const MANIFEST_INNER_KIND: u16 = 4;
+pub(crate) const NAMESPACE_SHARD_KIND: u16 = 5;
 
 /// The durable payload kind selected by one verified Metadata Object envelope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +23,7 @@ pub enum MetadataObjectKind {
     NamespaceRoot,
     ExactIndexRunSet,
     ManifestInnerNode,
+    NamespaceShard,
     Unknown(u16),
 }
 
@@ -38,6 +40,7 @@ pub fn metadata_object_kind(bytes: &[u8]) -> Result<MetadataObjectKind, Metadata
         NAMESPACE_ROOT_KIND => MetadataObjectKind::NamespaceRoot,
         EXACT_INDEX_RUN_SET_KIND => MetadataObjectKind::ExactIndexRunSet,
         MANIFEST_INNER_KIND => MetadataObjectKind::ManifestInnerNode,
+        NAMESPACE_SHARD_KIND => MetadataObjectKind::NamespaceShard,
         unknown => MetadataObjectKind::Unknown(unknown),
     })
 }

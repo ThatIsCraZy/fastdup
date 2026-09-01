@@ -1,12 +1,15 @@
 use std::fs::OpenOptions;
+use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fastdup_format::{
     ChunkId, ContainerId, ExactIndexEntry, ExactIndexLocation, ExactIndexProfileId, ExactIndexRun,
-    ExactIndexRunRef,
+    ExactIndexRunRef, ExactIndexRunSet,
 };
-use fastdup_store::{ExactIndexRunRepository, ExactIndexStoreError, FsStorageIo};
+use fastdup_store::{ExactIndexRunRepository, ExactIndexStoreError, FsStorageIo, StorageIo};
 
 fn test_root(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -35,6 +38,264 @@ fn entry_with_crc(ordinal: u8, record_crc32c: u32) -> ExactIndexEntry {
     .expect("worked RAW location is valid");
     ExactIndexEntry::active(ChunkId::from_bytes([ordinal; 32]), logical_length, location)
         .expect("worked active entry is valid")
+}
+
+#[derive(Clone, Debug)]
+struct PositionalStorage {
+    inner: FsStorageIo,
+    range_reads: Arc<AtomicUsize>,
+}
+
+impl PositionalStorage {
+    fn open(root: &Path) -> Self {
+        Self {
+            inner: FsStorageIo::open(root).expect("open positional Exact storage"),
+            range_reads: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl StorageIo for PositionalStorage {
+    fn create_new(&self, name: &str) -> io::Result<()> {
+        self.inner.create_new(name)
+    }
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        self.inner.exists(name)
+    }
+
+    fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.inner.write_at(name, offset, bytes)
+    }
+
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        self.inner.read(name)
+    }
+
+    fn object_len(&self, name: &str) -> io::Result<u64> {
+        self.inner.object_len(name)
+    }
+
+    fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.range_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_exact_at(name, offset, length)
+    }
+
+    fn list_names(&self) -> io::Result<Vec<String>> {
+        self.inner.list_names()
+    }
+
+    fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
+        self.inner.set_len(name, length)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        self.inner.sync_file(name)
+    }
+
+    fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
+        self.inner.publish_noreplace(temporary_name, published_name)
+    }
+
+    fn remove_file(&self, name: &str) -> io::Result<()> {
+        self.inner.remove_file(name)
+    }
+
+    fn sync_root(&self) -> io::Result<()> {
+        self.inner.sync_root()
+    }
+}
+
+#[test]
+fn activated_filesystem_run_matches_positional_lookup_and_holds_immutable_lease() {
+    let root = test_root("mapped-active-run");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xD8; 32]).expect("profile identity is nonzero");
+    let storage = FsStorageIo::open(&root).expect("open workspace-local Exact repository");
+    let repository = ExactIndexRunRepository::new(storage.clone());
+    let expected = entry(8);
+    let transition = repository
+        .append_level_zero(profile, vec![expected])
+        .expect("publish and activate one Exact Run");
+    let activated = transition.current();
+    assert_eq!(activated.membership_status().mapped_run_count(), 1);
+    assert_eq!(activated.membership_status().positional_run_count(), 0);
+    assert!(activated.membership_status().mapped_page_bounds_bytes() > 0);
+    let positional = repository
+        .open(profile, 1)
+        .expect("open the same immutable Run through bounded reads");
+
+    assert_eq!(
+        activated
+            .lookup_transitions(expected.chunk_id(), expected.logical_length())
+            .expect("mapped lookup succeeds"),
+        positional
+            .lookup(expected.chunk_id(), expected.logical_length())
+            .expect("positional lookup succeeds")
+    );
+
+    let run_name = storage
+        .list_names()
+        .expect("list Exact repository names")
+        .into_iter()
+        .find(|name| name.strip_suffix(".fdx").is_some())
+        .expect("one published Exact Run exists");
+    let error = storage
+        .write_at(&run_name, 0, &[0])
+        .expect_err("an activated mapping leases its immutable Run");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn adapter_without_immutable_leases_keeps_bounded_positional_exact_reads() {
+    let root = test_root("positional-active-run");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xD9; 32]).expect("profile identity is nonzero");
+    let storage = PositionalStorage::open(&root);
+    let repository = ExactIndexRunRepository::new(storage.clone());
+    let expected = entry(9);
+    let transition = repository
+        .append_level_zero(profile, vec![expected])
+        .expect("activate through an adapter without mapping support");
+    let active = transition.current();
+    assert_eq!(active.membership_status().mapped_run_count(), 0);
+    assert_eq!(active.membership_status().positional_run_count(), 1);
+    assert_eq!(active.membership_status().mapped_page_bounds_bytes(), 0);
+
+    storage.range_reads.store(0, Ordering::Relaxed);
+    let lookup = active
+        .lookup_transitions(expected.chunk_id(), expected.logical_length())
+        .expect("fallback lookup succeeds");
+    assert_eq!(lookup.candidates(), &[expected]);
+    assert!(
+        storage.range_reads.load(Ordering::Relaxed) >= 1,
+        "fallback lookup must read a bounded Exact page through StorageIo"
+    );
+}
+
+#[test]
+fn immutable_exact_run_lease_is_released_only_after_the_final_active_reader() {
+    let root = test_root("mapped-reader-lease-lifetime");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xDA; 32]).expect("profile identity is nonzero");
+    let storage = FsStorageIo::open(&root).expect("open workspace-local Exact repository");
+    let repository = ExactIndexRunRepository::new(storage.clone());
+    let descriptor = repository
+        .publish(&ExactIndexRun::new(profile, 1, vec![entry(10)]).expect("one Exact Run is valid"))
+        .expect("publish one Exact Run");
+    let run_set = ExactIndexRunSet::new(
+        profile,
+        1,
+        vec![ExactIndexRunRef::new(0, descriptor).expect("Run reference is valid")],
+    )
+    .expect("one-Run activation set is valid");
+    let first = repository
+        .activate(&run_set)
+        .expect("activate the mapped Run");
+    let second = repository
+        .recover_active()
+        .expect("recover the same activation")
+        .expect("one activation exists");
+    let run_name = storage
+        .list_names()
+        .expect("list Exact repository names")
+        .into_iter()
+        .find(|name| name.strip_suffix(".fdx").is_some())
+        .expect("one published Exact Run exists");
+    let run_length = storage
+        .object_len(&run_name)
+        .expect("read the mapped Run length");
+    let independently_opened =
+        FsStorageIo::open(&root).expect("reopen the root through an independent adapter");
+    let replacement_name = ".exact-replacement.building";
+    independently_opened
+        .create_new(replacement_name)
+        .expect("create replacement fixture");
+
+    for error in [
+        independently_opened
+            .write_at(&run_name, 0, &[0])
+            .expect_err("mapped Run rejects writes"),
+        independently_opened
+            .set_len(&run_name, run_length)
+            .expect_err("mapped Run rejects truncation even to its current length"),
+        independently_opened
+            .remove_file(&run_name)
+            .expect_err("mapped Run rejects removal"),
+        independently_opened
+            .publish_noreplace(replacement_name, &run_name)
+            .expect_err("mapped Run rejects replacement"),
+    ] {
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+    independently_opened
+        .remove_file(replacement_name)
+        .expect("the unleased replacement fixture remains removable");
+    drop(first);
+    assert_eq!(
+        independently_opened
+            .remove_file(&run_name)
+            .expect_err("the recovered reader still holds the immutable lease")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    drop(second);
+    independently_opened
+        .remove_file(&run_name)
+        .expect("the final reader drop releases the immutable lease");
+}
+
+#[test]
+fn mapped_activation_and_positional_audit_both_reject_a_corrupt_exact_page() {
+    let root = test_root("mapped-and-positional-corruption");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xDB; 32]).expect("profile identity is nonzero");
+    let storage = FsStorageIo::open(&root).expect("open workspace-local Exact repository");
+    let repository = ExactIndexRunRepository::new(storage.clone());
+    let descriptor = repository
+        .publish(&ExactIndexRun::new(profile, 1, vec![entry(11)]).expect("one Exact Run is valid"))
+        .expect("publish one Exact Run");
+    let run_set = ExactIndexRunSet::new(
+        profile,
+        1,
+        vec![ExactIndexRunRef::new(0, descriptor).expect("Run reference is valid")],
+    )
+    .expect("one-Run activation set is valid");
+    let run_name = storage
+        .list_names()
+        .expect("list Exact repository names")
+        .into_iter()
+        .find(|name| name.strip_suffix(".fdx").is_some())
+        .expect("one published Exact Run exists");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join(run_name))
+        .expect("open the unpublished-to-readers Run for fault injection");
+    let offset = 4_096_u64 + 128;
+    let mut byte = [0_u8; 1];
+    file.read_exact_at(&mut byte, offset)
+        .expect("read one Exact page byte");
+    byte[0] ^= 1;
+    file.write_all_at(&byte, offset)
+        .expect("inject one Exact page fault");
+
+    assert!(matches!(
+        repository.activate(&run_set),
+        Err(ExactIndexStoreError::Format(_))
+    ));
+    assert!(matches!(
+        repository.audit(profile, 1),
+        Err(ExactIndexStoreError::Format(_))
+    ));
 }
 
 #[test]

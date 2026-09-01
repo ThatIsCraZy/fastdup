@@ -346,6 +346,34 @@ struct DirtyEpoch {
     first_sequence: Option<u64>,
     data: SparseData,
     holes: RangeSet,
+    append_metadata_covered_end: Option<u64>,
+}
+
+// A strict append from an empty base whose resulting size remains at most
+// 8 MiB can produce at most 513 SeqCDC Chunks at the 16-KiB minimum, including
+// one drained boundary Chunk. Its single root leaf is at most 40 KiB after the
+// 4-KiB Metadata envelope and alignment. If that file grows beyond 8 MiB, the
+// remaining bytes of the ordinary 16-MiB credit are claimed first.
+//
+// An arbitrary 16-MiB sequential append can produce at most 1,025 Chunks.
+// Four complete path claims cover the prior tail leaf, two 1,024-entry leaves,
+// and one early close at a 64-MiB logical window. Credits are inode-local and
+// belong only to the current Active Dirty Epoch.
+const SINGLE_LEAF_APPEND_COVERAGE_END_BYTES_V1: u64 = 8 * 1_024 * 1_024;
+const SINGLE_LEAF_METADATA_BYTES_V1: u64 = 40 * 1_024;
+const SEQUENTIAL_APPEND_COVERAGE_BYTES_V1: u64 = 16 * 1_024 * 1_024;
+const SEQUENTIAL_APPEND_PATH_CLAIMS_V1: u64 = 4;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WriteCapacityPlan {
+    metadata_bytes: u64,
+    append_metadata_covered_end: Option<u64>,
+}
+
+impl WriteCapacityPlan {
+    pub(super) const fn metadata_bytes(self) -> u64 {
+        self.metadata_bytes
+    }
 }
 
 impl DirtyEpoch {
@@ -361,6 +389,76 @@ impl DirtyEpoch {
                 ..SparseData::default()
             },
             holes: RangeSet::default(),
+            append_metadata_covered_end: None,
+        }
+    }
+
+    fn plan_write_capacity(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<WriteCapacityPlan, PosixError> {
+        // Discontinuous overwrites retain the full per-mutation path bound.
+        // Only exact EOF append consumes already reserved sequential coverage.
+        if offset != self.result_size {
+            return Ok(WriteCapacityPlan {
+                metadata_bytes: crate::MUTATION_METADATA_INCREMENT_BYTES_V1,
+                append_metadata_covered_end: None,
+            });
+        }
+        let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
+        if self.base_size == 0
+            && self.append_metadata_covered_end.is_none()
+            && end <= SINGLE_LEAF_APPEND_COVERAGE_END_BYTES_V1
+        {
+            return Ok(WriteCapacityPlan {
+                metadata_bytes: SINGLE_LEAF_METADATA_BYTES_V1,
+                append_metadata_covered_end: Some(SINGLE_LEAF_APPEND_COVERAGE_END_BYTES_V1),
+            });
+        }
+        let covered_end = self
+            .append_metadata_covered_end
+            .filter(|covered_end| *covered_end >= offset)
+            .unwrap_or(offset);
+        if end <= covered_end {
+            return Ok(WriteCapacityPlan {
+                metadata_bytes: 0,
+                append_metadata_covered_end: None,
+            });
+        }
+        let (covered_end, initial_metadata_bytes) =
+            if covered_end == SINGLE_LEAF_APPEND_COVERAGE_END_BYTES_V1 {
+                (
+                    SEQUENTIAL_APPEND_COVERAGE_BYTES_V1,
+                    SEQUENTIAL_APPEND_PATH_CLAIMS_V1 * crate::MUTATION_METADATA_INCREMENT_BYTES_V1
+                        - SINGLE_LEAF_METADATA_BYTES_V1,
+                )
+            } else {
+                (covered_end, 0)
+            };
+        let windows = end
+            .saturating_sub(covered_end)
+            .div_ceil(SEQUENTIAL_APPEND_COVERAGE_BYTES_V1);
+        let metadata_bytes = windows
+            .checked_mul(SEQUENTIAL_APPEND_PATH_CLAIMS_V1)
+            .and_then(|claims| claims.checked_mul(crate::MUTATION_METADATA_INCREMENT_BYTES_V1))
+            .and_then(|bytes| bytes.checked_add(initial_metadata_bytes))
+            .ok_or(PosixError::NoSpace)?;
+        let additional_coverage = windows
+            .checked_mul(SEQUENTIAL_APPEND_COVERAGE_BYTES_V1)
+            .ok_or(PosixError::NoSpace)?;
+        Ok(WriteCapacityPlan {
+            metadata_bytes,
+            append_metadata_covered_end: Some(covered_end.saturating_add(additional_coverage)),
+        })
+    }
+
+    fn accept_write_capacity(&mut self, plan: WriteCapacityPlan) {
+        if let Some(covered_end) = plan.append_metadata_covered_end {
+            self.append_metadata_covered_end = Some(
+                self.append_metadata_covered_end
+                    .map_or(covered_end, |existing| existing.max(covered_end)),
+            );
         }
     }
 
@@ -923,6 +1021,14 @@ impl VersionedFile {
         self.live_allocated_bytes
     }
 
+    pub(super) fn allocated_bytes_in_live_range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, PosixError> {
+        self.allocated_bytes_in_range(start, end)
+    }
+
     pub(super) fn active_resident_payload_bytes(&self) -> u64 {
         self.active.data.resident_bytes()
     }
@@ -1030,6 +1136,18 @@ impl VersionedFile {
             "ASSERT: allocated bytes must not exceed logical size"
         );
         Ok(())
+    }
+
+    pub(super) fn plan_write_capacity(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Result<WriteCapacityPlan, PosixError> {
+        self.active.plan_write_capacity(offset, length)
+    }
+
+    pub(super) fn accept_write_capacity(&mut self, plan: WriteCapacityPlan) {
+        self.active.accept_write_capacity(plan);
     }
 
     #[cfg(test)]
@@ -1313,6 +1431,7 @@ impl VersionedFile {
             first_sequence,
             data: flattened,
             holes,
+            append_metadata_covered_end: None,
         };
         self.live_allocated_bytes = allocated_bytes;
         self.active.assert_valid_after_mutation();

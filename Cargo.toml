@@ -3,6 +3,8 @@ resolver = "3"
 members = [
     "crates/fastdup-appliance",
     "crates/fastdup-copy-metrics",
+    "crates/fastdup-control",
+    "crates/fastdup-exact-bench",
     "crates/fastdup-format",
     "crates/fastdup-io-uring",
     "crates/fastdup-posix",
@@ -44,6 +46,18 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 all = "deny"
 pedantic = "deny"
+
+[profile.dev]
+# This workspace has many large integration binaries. Full DWARF plus Cargo's
+# per-crate incremental object graph can otherwise consume tens of gigabytes.
+debug = 1
+incremental = false
+
+[profile.test]
+# Line-level backtraces remain available while duplicated full DWARF and the
+# incremental cache stay out of the workspace-local target directory.
+debug = 1
+incremental = false
 
 [profile.release]
 debug = 1

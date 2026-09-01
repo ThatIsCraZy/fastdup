@@ -1,11 +1,103 @@
+use std::collections::BTreeMap;
+
 use fastdup_format::{
     DurableInode, DurableInodeKind, DurableRootMetadata, DurableTimes, DurableTimestamp,
-    DurableXattr, METADATA_HEADER_BYTES, MetadataFormatError, MetadataObjectId, NamespaceEntry,
-    NamespaceRoot,
+    DurableXattr, MetadataFormatError, MetadataObjectId, NamespaceEntry, NamespaceRoot,
 };
 
 fn object_id(byte: u8) -> MetadataObjectId {
     MetadataObjectId::new([byte; 32]).expect("fixture object ID is nonzero")
+}
+
+fn large_xattr_namespace(changed_inode: Option<u64>) -> NamespaceRoot {
+    let mut inodes = Vec::new();
+    let mut entries = Vec::new();
+    for ordinal in 0_u64..280 {
+        let inode = ordinal + 2;
+        let fill = if changed_inode == Some(inode) {
+            0x5A
+        } else {
+            0xA5
+        };
+        inodes.push(
+            DurableInode::new_with_metadata(
+                inode,
+                0o600,
+                1_000,
+                1_000,
+                1,
+                ordinal + 1,
+                0,
+                object_id(0x44),
+                0,
+                vec![
+                    DurableXattr::new(b"user.large".to_vec(), vec![fill; 60 * 1_024])
+                        .expect("bounded xattr"),
+                ],
+            )
+            .expect("durable inode"),
+        );
+        entries.push(
+            NamespaceEntry::new(1, inode, format!("file-{ordinal:04}").into_bytes())
+                .expect("namespace entry"),
+        );
+    }
+    NamespaceRoot::new(
+        1_024,
+        282,
+        if changed_inode.is_some() { 281 } else { 280 },
+        inodes,
+        entries,
+    )
+    .expect("large namespace")
+}
+
+#[test]
+fn sharded_graph_round_trips_beyond_object_bound_and_rejects_missing_or_corrupt_children() {
+    let root = large_xattr_namespace(None);
+    assert!(root.encode_canonical_state().unwrap().len() > 16 * 1_024 * 1_024);
+
+    let graph = root.encode_graph().expect("bounded graph encoding");
+    assert!(graph.shards().len() > 1);
+    let shards = graph
+        .shards()
+        .iter()
+        .map(|shard| (shard.object_id(), shard.bytes().to_vec()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(NamespaceRoot::decode_graph(graph.root(), &shards), Ok(root));
+
+    let mut missing = shards.clone();
+    missing.pop_first();
+    assert_eq!(
+        NamespaceRoot::decode_graph(graph.root(), &missing),
+        Err(MetadataFormatError::InvalidPayload)
+    );
+
+    let mut corrupt = shards;
+    corrupt.first_entry().expect("graph has a shard").get_mut()[0] ^= 1;
+    assert!(NamespaceRoot::decode_graph(graph.root(), &corrupt).is_err());
+}
+
+#[test]
+fn content_defined_namespace_shards_retain_most_ids_across_one_local_edit() {
+    let before = large_xattr_namespace(None).encode_graph().unwrap();
+    let after = large_xattr_namespace(Some(142)).encode_graph().unwrap();
+    let before_ids = before
+        .shards()
+        .iter()
+        .map(fastdup_format::EncodedNamespaceShard::object_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let after_ids = after
+        .shards()
+        .iter()
+        .map(fastdup_format::EncodedNamespaceShard::object_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let retained = before_ids.intersection(&after_ids).count();
+    assert!(
+        retained * 2 >= before_ids.len(),
+        "one local edit should retain most bounded namespace objects: {retained}/{}",
+        before_ids.len()
+    );
 }
 
 #[test]
@@ -40,12 +132,9 @@ fn version_four_round_trips_timestamps_and_byte_exact_symlinks() {
         ],
     )
     .unwrap();
-    let encoded = root.encode().unwrap();
-    assert_eq!(
-        &encoded[METADATA_HEADER_BYTES + 8..METADATA_HEADER_BYTES + 10],
-        &4_u16.to_le_bytes()
-    );
-    assert_eq!(NamespaceRoot::decode(&encoded), Ok(root));
+    let encoded = root.encode_canonical_state().unwrap();
+    assert_eq!(&encoded[8..10], &4_u16.to_le_bytes());
+    assert_eq!(NamespaceRoot::decode_canonical_state(&encoded), Ok(root));
 }
 
 #[test]
@@ -69,8 +158,11 @@ fn nested_directory_namespace_round_trips_and_rejects_cycles() {
         ],
     )
     .expect("nested namespace is valid");
-    let encoded = root.encode().expect("nested namespace encodes");
-    let decoded = NamespaceRoot::decode(&encoded).expect("nested namespace decodes");
+    let encoded = root
+        .encode_canonical_state()
+        .expect("nested namespace encodes");
+    let decoded =
+        NamespaceRoot::decode_canonical_state(&encoded).expect("nested namespace decodes");
     assert_eq!(decoded, root);
     assert_eq!(decoded.inodes()[0].kind(), DurableInodeKind::Directory);
     assert_eq!(decoded.inodes()[2].kind(), DurableInodeKind::Regular);
@@ -113,28 +205,16 @@ fn namespace_root_has_stable_bytes_and_round_trips_byte_exact_hardlinks() {
     )
     .expect("worked namespace root is valid");
 
-    let encoded = root.encode().expect("bounded namespace must encode");
+    let encoded = root
+        .encode_canonical_state()
+        .expect("canonical namespace must encode");
 
-    assert_eq!(&encoded[0..8], b"FDMDOBJ1");
-    assert_eq!(&encoded[12..14], &2_u16.to_le_bytes());
-    assert_eq!(
-        &encoded[METADATA_HEADER_BYTES..METADATA_HEADER_BYTES + 8],
-        b"FDNSRT01"
-    );
-    assert_eq!(
-        &encoded[METADATA_HEADER_BYTES + 40..METADATA_HEADER_BYTES + 48],
-        &1_024_u64.to_le_bytes()
-    );
-    assert_eq!(
-        &encoded[METADATA_HEADER_BYTES + 48..METADATA_HEADER_BYTES + 56],
-        &17_u64.to_le_bytes()
-    );
-    assert_eq!(
-        &encoded[METADATA_HEADER_BYTES + 88..METADATA_HEADER_BYTES + 96],
-        &10_u64.to_le_bytes()
-    );
+    assert_eq!(&encoded[0..8], b"FDNSRT01");
+    assert_eq!(&encoded[40..48], &1_024_u64.to_le_bytes());
+    assert_eq!(&encoded[48..56], &17_u64.to_le_bytes());
+    assert_eq!(&encoded[88..96], &10_u64.to_le_bytes());
     assert_eq!(root.inode_allocation_cursor(), 10);
-    let entries_offset = METADATA_HEADER_BYTES + 128 + 2 * 96;
+    let entries_offset = 128 + 2 * 96;
     assert_eq!(
         &encoded[entries_offset..entries_offset + 4],
         &40_u32.to_le_bytes()
@@ -148,37 +228,11 @@ fn namespace_root_has_stable_bytes_and_round_trips_byte_exact_hardlinks() {
             .iter()
             .all(|byte| *byte == 0)
     );
-    assert_eq!(NamespaceRoot::decode(&encoded), Ok(root));
+    assert_eq!(NamespaceRoot::decode_canonical_state(&encoded), Ok(root));
 }
 
 #[test]
-fn decoder_accepts_version_one_regular_file_namespace_roots() {
-    let root = NamespaceRoot::new(
-        8,
-        3,
-        11,
-        vec![
-            DurableInode::new(2, 0o640, 1_000, 1_001, 1, 7, 42, object_id(0x22))
-                .expect("regular inode is valid"),
-        ],
-        vec![NamespaceEntry::new(1, 2, b"legacy".to_vec()).expect("valid entry")],
-    )
-    .expect("namespace root is valid");
-    let mut encoded = root.encode().expect("namespace root encodes");
-    let payload = METADATA_HEADER_BYTES;
-    encoded[payload + 8..payload + 10].copy_from_slice(&1_u16.to_le_bytes());
-    encoded[payload + 16..payload + 32].fill(0);
-    encoded[payload + 96..payload + 128].fill(0);
-    let inode = payload + 128;
-    encoded[inode + 10..inode + 12].fill(0);
-    encoded[inode + 72..inode + 96].fill(0);
-    reauthenticate_metadata_object(&mut encoded);
-
-    assert_eq!(NamespaceRoot::decode(&encoded), Ok(root));
-}
-
-#[test]
-fn version_three_round_trips_root_file_flags_xattrs_and_posix_acls() {
+fn current_format_round_trips_root_file_flags_xattrs_and_posix_acls() {
     let access_acl = acl(&[
         (0x01, 0o7, u32::MAX),
         (0x02, 0o6, 2_000),
@@ -223,12 +277,11 @@ fn version_three_round_trips_root_file_flags_xattrs_and_posix_acls() {
         vec![NamespaceEntry::new(1, 2, b"backup.vbk".to_vec()).expect("entry")],
     )
     .expect("namespace root");
-    let encoded = root.encode().expect("version three encodes");
-    assert_eq!(
-        &encoded[METADATA_HEADER_BYTES + 8..METADATA_HEADER_BYTES + 10],
-        &3_u16.to_le_bytes()
-    );
-    assert_eq!(NamespaceRoot::decode(&encoded), Ok(root));
+    let encoded = root
+        .encode_canonical_state()
+        .expect("current namespace encodes");
+    assert_eq!(&encoded[8..10], &4_u16.to_le_bytes());
+    assert_eq!(NamespaceRoot::decode_canonical_state(&encoded), Ok(root));
 }
 
 const POSIX_ACL_ACCESS: &[u8] = b"system.posix_acl_access";
@@ -244,7 +297,7 @@ fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
 }
 
 #[test]
-fn decoder_rejects_reauthenticated_noncanonical_inode_order() {
+fn canonical_decoder_rejects_noncanonical_inode_order() {
     let root = NamespaceRoot::new(
         100,
         4,
@@ -259,16 +312,14 @@ fn decoder_rejects_reauthenticated_noncanonical_inode_order() {
         ],
     )
     .expect("valid root");
-    let mut encoded = root.encode().expect("root encodes");
-    let first = METADATA_HEADER_BYTES + 128;
+    let mut encoded = root.encode_canonical_state().expect("root encodes");
+    let first = 128;
     let second = first + 96;
     for offset in 0..96 {
         encoded.swap(first + offset, second + offset);
     }
-    reauthenticate_metadata_object(&mut encoded);
-
     assert_eq!(
-        NamespaceRoot::decode(&encoded),
+        NamespaceRoot::decode_canonical_state(&encoded),
         Err(MetadataFormatError::InvalidPayload)
     );
 }
@@ -276,12 +327,11 @@ fn decoder_rejects_reauthenticated_noncanonical_inode_order() {
 #[test]
 fn decoder_rejects_impossible_entry_count_before_allocation() {
     let root = NamespaceRoot::new(2, 2, 0, Vec::new(), Vec::new()).expect("empty root is valid");
-    let mut encoded = root.encode().expect("root encodes");
-    let count_offset = METADATA_HEADER_BYTES + 60;
+    let mut encoded = root.encode_canonical_state().expect("root encodes");
+    let count_offset = 60;
     encoded[count_offset..count_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-    reauthenticate_metadata_object(&mut encoded);
 
-    let result = std::panic::catch_unwind(|| NamespaceRoot::decode(&encoded));
+    let result = std::panic::catch_unwind(|| NamespaceRoot::decode_canonical_state(&encoded));
     assert!(
         matches!(result, Ok(Err(MetadataFormatError::InvalidPayload))),
         "corrupt counts must fail before reserving attacker-selected memory"
@@ -335,7 +385,7 @@ fn writer_rejects_duplicates_dangling_entries_orphans_and_inode_reuse() {
 }
 
 #[test]
-fn every_truncated_or_single_byte_corrupt_namespace_root_is_rejected_without_panicking() {
+fn every_truncated_or_single_byte_corrupt_namespace_graph_object_is_rejected_without_panicking() {
     let root = NamespaceRoot::new(
         10,
         3,
@@ -344,50 +394,39 @@ fn every_truncated_or_single_byte_corrupt_namespace_root_is_rejected_without_pan
         vec![NamespaceEntry::new(1, 2, vec![b'n', 0xff]).expect("valid entry")],
     )
     .expect("valid root");
-    let encoded = root.encode().expect("root encodes");
+    let graph = root.encode_graph().expect("root graph encodes");
+    let shards = graph
+        .shards()
+        .iter()
+        .map(|shard| (shard.object_id(), shard.bytes().to_vec()))
+        .collect::<BTreeMap<_, _>>();
 
-    for prefix_length in 0..encoded.len() {
-        let result = std::panic::catch_unwind(|| NamespaceRoot::decode(&encoded[..prefix_length]));
+    for prefix_length in 0..graph.root().len() {
+        let result = std::panic::catch_unwind(|| {
+            NamespaceRoot::decode_graph(&graph.root()[..prefix_length], &shards)
+        });
         assert!(result.is_ok(), "decoder panicked at prefix {prefix_length}");
         assert!(
             result.expect("checked above").is_err(),
             "decoder accepted truncated prefix {prefix_length}"
         );
     }
-    for offset in 0..encoded.len() {
-        let mut corrupted = encoded.clone();
+    for offset in 0..graph.root().len() {
+        let mut corrupted = graph.root().to_vec();
         corrupted[offset] ^= 1;
         assert!(
-            NamespaceRoot::decode(&corrupted).is_err(),
-            "decoder accepted corruption at byte {offset}"
+            NamespaceRoot::decode_graph(&corrupted, &shards).is_err(),
+            "decoder accepted root corruption at byte {offset}"
         );
     }
-}
-
-fn reauthenticate_metadata_object(encoded: &mut [u8]) {
-    let payload_length = usize::try_from(u64::from_le_bytes(
-        encoded[32..40].try_into().expect("fixed payload length"),
-    ))
-    .expect("fixture payload length fits");
-    let kind = u16::from_le_bytes(encoded[12..14].try_into().expect("fixed kind"));
-    let (payload_crc, object_id) = {
-        let payload = &encoded[METADATA_HEADER_BYTES..METADATA_HEADER_BYTES + payload_length];
-        let payload_crc = crc32c::crc32c(payload);
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"fastdup-metadata-object-v1\0");
-        hasher.update(&kind.to_le_bytes());
-        hasher.update(
-            &u64::try_from(payload_length)
-                .expect("fixture payload length fits")
-                .to_le_bytes(),
-        );
-        hasher.update(payload);
-        (payload_crc, *hasher.finalize().as_bytes())
-    };
-    encoded[80..84].copy_from_slice(&payload_crc.to_le_bytes());
-    encoded[48..80].copy_from_slice(&object_id);
-
-    encoded[84..88].fill(0);
-    let header_crc = crc32c::crc32c(&encoded[..METADATA_HEADER_BYTES]);
-    encoded[84..88].copy_from_slice(&header_crc.to_le_bytes());
+    for (shard_id, shard) in &shards {
+        for offset in 0..shard.len() {
+            let mut corrupted = shards.clone();
+            corrupted.get_mut(shard_id).expect("selected shard exists")[offset] ^= 1;
+            assert!(
+                NamespaceRoot::decode_graph(graph.root(), &corrupted).is_err(),
+                "decoder accepted shard corruption at byte {offset}"
+            );
+        }
+    }
 }

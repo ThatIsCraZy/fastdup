@@ -22,9 +22,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::pin::Pin;
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 const MAXIMUM_WRITE_BYTES: u32 = 1_024 * 1_024;
@@ -36,6 +37,140 @@ const INTERNAL_CONTEXT: RequestContext = RequestContext {
     gid: 0,
     pid: 0,
 };
+
+const FRONTEND_LATENCY_BUCKET_MICROS: [u64; 12] = [
+    50,
+    100,
+    250,
+    500,
+    1_000,
+    2_500,
+    5_000,
+    10_000,
+    25_000,
+    50_000,
+    100_000,
+    u64::MAX,
+];
+
+/// Lock-free counters at the successful POSIX read/write boundary.
+#[derive(Debug)]
+pub struct FrontendTelemetry {
+    read_bytes: AtomicU64,
+    write_bytes: AtomicU64,
+    read_operations: AtomicU64,
+    write_operations: AtomicU64,
+    read_errors: AtomicU64,
+    write_errors: AtomicU64,
+    read_latency_buckets: [AtomicU64; FRONTEND_LATENCY_BUCKET_MICROS.len()],
+    write_latency_buckets: [AtomicU64; FRONTEND_LATENCY_BUCKET_MICROS.len()],
+}
+
+impl Default for FrontendTelemetry {
+    fn default() -> Self {
+        Self {
+            read_bytes: AtomicU64::new(0),
+            write_bytes: AtomicU64::new(0),
+            read_operations: AtomicU64::new(0),
+            write_operations: AtomicU64::new(0),
+            read_errors: AtomicU64::new(0),
+            write_errors: AtomicU64::new(0),
+            read_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            write_latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrontendTelemetrySnapshot {
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_operations: u64,
+    pub write_operations: u64,
+    pub read_errors: u64,
+    pub write_errors: u64,
+    pub read_latency_micros_p50: u64,
+    pub read_latency_micros_p95: u64,
+    pub read_latency_micros_p99: u64,
+    pub write_latency_micros_p50: u64,
+    pub write_latency_micros_p95: u64,
+    pub write_latency_micros_p99: u64,
+}
+
+impl FrontendTelemetry {
+    #[must_use]
+    pub fn snapshot(&self) -> FrontendTelemetrySnapshot {
+        let read_buckets = self
+            .read_latency_buckets
+            .each_ref()
+            .map(|value| value.load(Ordering::Relaxed));
+        let write_buckets = self
+            .write_latency_buckets
+            .each_ref()
+            .map(|value| value.load(Ordering::Relaxed));
+        FrontendTelemetrySnapshot {
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            write_bytes: self.write_bytes.load(Ordering::Relaxed),
+            read_operations: self.read_operations.load(Ordering::Relaxed),
+            write_operations: self.write_operations.load(Ordering::Relaxed),
+            read_errors: self.read_errors.load(Ordering::Relaxed),
+            write_errors: self.write_errors.load(Ordering::Relaxed),
+            read_latency_micros_p50: percentile_bucket(&read_buckets, 50),
+            read_latency_micros_p95: percentile_bucket(&read_buckets, 95),
+            read_latency_micros_p99: percentile_bucket(&read_buckets, 99),
+            write_latency_micros_p50: percentile_bucket(&write_buckets, 50),
+            write_latency_micros_p95: percentile_bucket(&write_buckets, 95),
+            write_latency_micros_p99: percentile_bucket(&write_buckets, 99),
+        }
+    }
+
+    fn record_read(&self, bytes: Option<usize>, started: Instant) {
+        record_latency(&self.read_latency_buckets, started);
+        if let Some(bytes) = bytes {
+            self.read_operations.fetch_add(1, Ordering::Relaxed);
+            self.read_bytes
+                .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+        } else {
+            self.read_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_write(&self, bytes: Option<u32>, started: Instant) {
+        record_latency(&self.write_latency_buckets, started);
+        if let Some(bytes) = bytes {
+            self.write_operations.fetch_add(1, Ordering::Relaxed);
+            self.write_bytes
+                .fetch_add(u64::from(bytes), Ordering::Relaxed);
+        } else {
+            self.write_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn record_latency(buckets: &[AtomicU64; FRONTEND_LATENCY_BUCKET_MICROS.len()], started: Instant) {
+    let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let index = FRONTEND_LATENCY_BUCKET_MICROS.partition_point(|bound| *bound < elapsed);
+    buckets[index.min(buckets.len() - 1)].fetch_add(1, Ordering::Relaxed);
+}
+
+fn percentile_bucket(
+    buckets: &[u64; FRONTEND_LATENCY_BUCKET_MICROS.len()],
+    percentile: u64,
+) -> u64 {
+    let total = buckets.iter().sum::<u64>();
+    if total == 0 {
+        return 0;
+    }
+    let threshold = total.saturating_mul(percentile).div_ceil(100);
+    let mut cumulative = 0_u64;
+    for (index, count) in buckets.iter().enumerate() {
+        cumulative = cumulative.saturating_add(*count);
+        if cumulative >= threshold {
+            return FRONTEND_LATENCY_BUCKET_MICROS[index];
+        }
+    }
+    u64::MAX
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatFsSnapshot {
@@ -153,7 +288,7 @@ pub trait StatFsSource: fmt::Debug + Send + Sync {
     /// # Errors
     ///
     /// Returns an I/O error when the backing capacity cannot be observed.
-    fn snapshot(&self) -> std::io::Result<StatFsSnapshot>;
+    fn snapshot(&self, inode: u64) -> std::io::Result<StatFsSnapshot>;
 }
 
 #[derive(Debug)]
@@ -222,6 +357,7 @@ pub struct FuseFilesystem {
     blocking_permits: Arc<Semaphore>,
     statfs_source: Option<Arc<dyn StatFsSource>>,
     kernel_notify: Arc<OnceLock<KernelNotifier>>,
+    frontend_telemetry: Arc<FrontendTelemetry>,
 }
 
 #[derive(Clone, Debug)]
@@ -253,7 +389,13 @@ impl FuseFilesystem {
             blocking_permits: Arc::new(Semaphore::new(workers)),
             statfs_source: None,
             kernel_notify: Arc::new(OnceLock::new()),
+            frontend_telemetry: Arc::new(FrontendTelemetry::default()),
         }
+    }
+
+    #[must_use]
+    pub fn frontend_telemetry(&self) -> Arc<FrontendTelemetry> {
+        Arc::clone(&self.frontend_telemetry)
     }
 
     #[must_use]
@@ -297,13 +439,15 @@ impl FuseFilesystem {
         payload: crate::MutationPayload,
         write_flags: u32,
     ) -> fuse3::Result<ReplyWrite> {
+        let started = Instant::now();
         if write_flags & fuse3::raw::flags::FUSE_WRITE_CACHE != 0 {
+            self.frontend_telemetry.record_write(None, started);
             return Err(libc::EIO.into());
         }
         let inode = inode_from_raw(inode)?;
         let handle = handle_from_raw(handle)?;
         let request = context(request);
-        let (reply, kernel_data_cache_exposed) = loop {
+        let result = loop {
             self.namespace
                 .wait_for_mutation_admission()
                 .await
@@ -317,7 +461,14 @@ impl FuseFilesystem {
                 .await
             {
                 Err(PosixError::Again) => {}
-                result => break result.map_err(errno)?,
+                result => break result,
+            }
+        };
+        let (reply, kernel_data_cache_exposed) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.frontend_telemetry.record_write(None, started);
+                return Err(errno(error));
             }
         };
         let (bytes, _, actual_offset) = expect_written(&reply);
@@ -327,6 +478,7 @@ impl FuseFilesystem {
             kernel_data_cache_exposed,
         )
         .await;
+        self.frontend_telemetry.record_write(Some(bytes), started);
         Ok(ReplyWrite { written: bytes })
     }
 
@@ -755,6 +907,7 @@ impl Filesystem for FuseFilesystem {
         offset: u64,
         size: u32,
     ) -> fuse3::Result<ReplyData> {
+        let started = Instant::now();
         let namespace = Arc::clone(&self.namespace);
         let request = context(request);
         let inode = inode_from_raw(inode)?;
@@ -771,10 +924,19 @@ impl Filesystem for FuseFilesystem {
                     },
                 )
             })
-            .await
-            .map_err(errno)?;
+            .await;
+        let reply = match reply {
+            Ok(value) => value,
+            Err(error) => {
+                self.frontend_telemetry.record_read(None, started);
+                return Err(errno(error));
+            }
+        };
+        let data = expect_data(reply);
+        self.frontend_telemetry
+            .record_read(Some(data.len()), started);
         Ok(ReplyData {
-            data: Bytes::from(expect_data(reply)),
+            data: Bytes::from(data),
         })
     }
 
@@ -825,12 +987,12 @@ impl Filesystem for FuseFilesystem {
             .await
     }
 
-    async fn statfs(&self, _request: Request, _inode: u64) -> fuse3::Result<ReplyStatFs> {
+    async fn statfs(&self, _request: Request, inode: u64) -> fuse3::Result<ReplyStatFs> {
         let source = self
             .statfs_source
             .as_ref()
             .ok_or_else(|| Errno::from(libc::EOPNOTSUPP))?;
-        let snapshot = source.snapshot().map_err(Errno::from)?;
+        let snapshot = source.snapshot(inode).map_err(Errno::from)?;
         Ok(snapshot.reply())
     }
 
@@ -1723,6 +1885,7 @@ fn errno(error: PosixError) -> Errno {
         PosixError::NoData => libc::ENODATA.into(),
         PosixError::TooBig => libc::E2BIG.into(),
         PosixError::PermissionDenied => libc::EPERM.into(),
+        PosixError::CrossDevice => libc::EXDEV.into(),
         PosixError::Unsupported => libc::EOPNOTSUPP.into(),
         PosixError::Io => libc::EIO.into(),
         PosixError::ReadOnly => libc::EROFS.into(),
@@ -1903,8 +2066,8 @@ fn release_lookup_reference(namespace: &Namespace, inode: InodeId) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FuseFilesystem, INTERNAL_CONTEXT, KernelDataInvalidation, LookupTrackingStream,
-        StatFsSnapshot, dispatch_mutation_with_backpressure, fallocate_mode,
+        FrontendTelemetry, FuseFilesystem, INTERNAL_CONTEXT, KernelDataInvalidation,
+        LookupTrackingStream, StatFsSnapshot, dispatch_mutation_with_backpressure, fallocate_mode,
         regular_file_open_flags,
     };
     use crate::{
@@ -1915,6 +2078,26 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    #[test]
+    fn frontend_telemetry_counts_successes_errors_and_fixed_latency_buckets() {
+        let telemetry = FrontendTelemetry::default();
+        telemetry.record_read(Some(4_096), Instant::now());
+        telemetry.record_read(None, Instant::now());
+        telemetry.record_write(Some(8_192), Instant::now());
+        telemetry.record_write(None, Instant::now());
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.read_bytes, 4_096);
+        assert_eq!(snapshot.write_bytes, 8_192);
+        assert_eq!(snapshot.read_operations, 1);
+        assert_eq!(snapshot.write_operations, 1);
+        assert_eq!(snapshot.read_errors, 1);
+        assert_eq!(snapshot.write_errors, 1);
+        assert!(snapshot.read_latency_micros_p99 > 0);
+        assert!(snapshot.write_latency_micros_p99 > 0);
+    }
 
     #[test]
     fn v1_kernel_cache_policy_caches_only_read_only_regular_handles() {

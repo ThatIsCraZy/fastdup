@@ -22,8 +22,8 @@ use crate::{
     CONTAINER_GENERATION_RESERVATION_SPAN_V1, ContainerAuditSummary, ContainerRepository,
     ExactIndexGenerationDrain, ExactIndexRunRepository, ExactIndexStoreError,
     GcCandidateCatalogRepository, GcCandidateCatalogStoreError, GcCandidateSelectionMode,
-    GcCandidateShortlist, GenerationError, GenerationRepository, SimilarityIndexRepository,
-    SimilarityIndexStoreError, StorageIo, StoreError,
+    GcCandidateShortlist, GenerationError, GenerationRepository, RecoveryCheckpointRepository,
+    SimilarityIndexRepository, SimilarityIndexStoreError, StorageIo, StoreError,
 };
 
 const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
@@ -428,6 +428,8 @@ where
             .audit_generation_high_water(containers.generation_high_water())?;
         let generations = self.generations.scrub_all_with_data(&self.containers)?;
         self.generations.audit_metadata_mark_catalogs()?;
+        RecoveryCheckpointRepository::new(self.containers.storage().clone())
+            .scrub(&self.containers)?;
         let index_audit = self.indexes.audit_active_locations(&self.containers)?;
         if index_audit.is_some_and(|audit| audit.activation().profile() != self.exact_profile) {
             return Err(MaintenanceError::ExactProfileMismatch);
@@ -485,7 +487,11 @@ where
         &self,
         pool_usage: DataPoolUsage,
     ) -> Result<GarbageCollectionPlan, MaintenanceError> {
-        let generation_proof = self.generations.scrub_all_for_gc(&self.containers)?;
+        let mut generation_proof = self.generations.scrub_all_for_gc(&self.containers)?;
+        let (_, checkpoint_chunks) =
+            RecoveryCheckpointRepository::new(self.containers.storage().clone())
+                .scrub_with_protected_chunks(&self.containers)?;
+        generation_proof.extend_protected_chunks(checkpoint_chunks)?;
         let online_chunks = generation_proof.online_chunks();
         let inventory = self.plan_container_gc(online_chunks)?;
         self.containers
@@ -559,7 +565,11 @@ where
         if exact.record().profile() != self.exact_profile {
             return Err(MaintenanceError::ExactProfileMismatch);
         }
-        let generation_proof = self.generations.scan_online_liveness()?;
+        let mut generation_proof = self.generations.scan_online_liveness()?;
+        let checkpoint_chunks =
+            RecoveryCheckpointRepository::new(self.containers.storage().clone())
+                .protected_chunks()?;
+        generation_proof.extend_protected_chunks(checkpoint_chunks)?;
         let reverse_dependencies = self.reverse_dependency_generation(&exact, &generation_proof)?;
         let mut victims = BTreeMap::new();
         let mut replacement_chunks = BTreeMap::new();
@@ -2907,6 +2917,7 @@ impl BackgroundMaintenanceReport {
 pub enum MaintenanceError {
     Store(StoreError),
     Generation(GenerationError),
+    RecoveryCheckpoint(crate::RecoveryCheckpointError),
     ExactIndex(ExactIndexStoreError),
     SimilarityIndex(SimilarityIndexStoreError),
     GcCandidateCatalog(GcCandidateCatalogStoreError),
@@ -2962,6 +2973,12 @@ impl From<StoreError> for MaintenanceError {
 impl From<GenerationError> for MaintenanceError {
     fn from(error: GenerationError) -> Self {
         Self::Generation(error)
+    }
+}
+
+impl From<crate::RecoveryCheckpointError> for MaintenanceError {
+    fn from(error: crate::RecoveryCheckpointError) -> Self {
+        Self::RecoveryCheckpoint(error)
     }
 }
 

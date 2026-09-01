@@ -2,6 +2,10 @@ use fastdup_posix::{
     InodeAttributesUpdate, Namespace, NamespaceConfig, OpenOptions, Operation, PosixError,
     PosixTimestamp, ROOT_INODE, Reply, RequestContext,
 };
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 const OWNER: RequestContext = RequestContext {
     uid: 1_000,
@@ -13,6 +17,32 @@ const ROOT: RequestContext = RequestContext {
     gid: 0,
     pid: 1,
 };
+
+#[test]
+fn root_metadata_mutation_does_not_relock_the_root_inode() {
+    let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        done_tx
+            .send(namespace.dispatch(
+                ROOT,
+                Operation::SetMode {
+                    inode: ROOT_INODE,
+                    mode: 0o755,
+                },
+            ))
+            .ok();
+    });
+
+    let Reply::Attr(attributes) = done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("root chmod must not deadlock by reacquiring its Inode lock")
+        .expect("root chmod succeeds")
+    else {
+        panic!("chmod reply")
+    };
+    assert_eq!(attributes.mode & 0o777, 0o755);
+}
 
 #[test]
 fn hardlinks_share_one_inode_and_unlink_only_removes_one_name() {

@@ -17,6 +17,8 @@ mod manifest_inner;
 mod metadata;
 mod metadata_mark_catalog;
 mod namespace;
+mod pool_identity;
+mod recovery_checkpoint;
 mod similarity_index;
 mod similarity_index_family;
 
@@ -34,16 +36,17 @@ fn crc32c_with_zeroed_u32(bytes: &[u8], field_offset: usize) -> u32 {
 }
 
 pub use commit::{
-    COMMIT_RECORD_BYTES, CommitFormatError, CommitRecord, CommitRecordHash, PolicySetId,
+    COMMIT_RECORD_BYTES, CURRENT_REPOSITORY_FORMAT_EPOCH, CommitFormatError, CommitRecord,
+    CommitRecordHash, PolicySetId,
 };
 pub use container::{
-    AdaptiveContainerEncoding, BuildingContainerHeader, ChunkId, ContainerHeader, ContainerId,
-    ContainerIntrinsicSummary, ContainerLayout, ContainerRecordRange, ContainerRecoveryEnvelope,
-    FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
-    IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, MAX_LOGICAL_CHUNK_BYTES,
-    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, PreparedIndependentRecord,
-    PreparedZstdPrefixRecord, RECORD_HEADER_BYTES, RawRecord, RecoveryIndexCandidate,
-    SealedContainer, SealedContainerDescriptor, VerifiedChunkLocation,
+    AdaptiveContainerEncoding, AlignedContainerBytes, BuildingContainerHeader, ChunkId,
+    ContainerHeader, ContainerId, ContainerIntrinsicSummary, ContainerLayout, ContainerRecordRange,
+    ContainerRecoveryEnvelope, FOOTER_BYTES, FormatError, HEADER_BYTES,
+    IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
+    MAX_LOGICAL_CHUNK_BYTES, PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
+    PreparedIndependentRecord, PreparedZstdPrefixRecord, RECORD_HEADER_BYTES, RawRecord,
+    RecoveryIndexCandidate, SealedContainer, SealedContainerDescriptor, VerifiedChunkLocation,
     VerifiedContainerPublication, VerifiedRawLocation, VerifiedRecoveryIndex, ZstdPrefixDependency,
     ZstdPrefixRecord,
 };
@@ -86,7 +89,18 @@ pub use metadata_mark_catalog::{
 };
 pub use namespace::{
     DurableInode, DurableInodeKind, DurableRootMetadata, DurableTimes, DurableTimestamp,
-    DurableXattr, NAMESPACE_ROOT_HEADER_BYTES, NamespaceEntry, NamespaceRoot,
+    DurableXattr, EncodedNamespaceGraph, EncodedNamespaceShard, NAMESPACE_ROOT_HEADER_BYTES,
+    NamespaceEntry, NamespaceGraphRoot, NamespaceRoot, NamespaceShardRef,
+};
+pub use pool_identity::{
+    ApplianceId, POOL_IDENTITY_RECORD_BYTES, PoolId, PoolIdentityFormatError, PoolIdentityRecord,
+    PoolRole,
+};
+pub use recovery_checkpoint::{
+    RECOVERY_CHECKPOINT_ENTRY_ALIGNMENT, RECOVERY_CHECKPOINT_ENTRY_HEADER_BYTES,
+    RECOVERY_CHECKPOINT_FOOTER_BYTES, RECOVERY_CHECKPOINT_HEAD_BYTES,
+    RECOVERY_CHECKPOINT_HEADER_BYTES, RecoveryCheckpointDescriptor, RecoveryCheckpointEntryHeader,
+    RecoveryCheckpointFormatError, RecoveryCheckpointHeadRecord,
 };
 pub use similarity_index::{
     SIMILARITY_BUCKET_REFERENCE_BYTES, SIMILARITY_BUCKET_REFERENCES_PER_PAGE,

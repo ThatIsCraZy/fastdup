@@ -1,0 +1,13 @@
+[Unit]
+Description=FastDup repository resource domain
+
+[Slice]
+# Storage wins contention against the management slice and is never charged to
+# its 1 GiB / one-CPU envelope.
+CPUAccounting=yes
+CPUWeight=1000
+MemoryAccounting=yes
+IOAccounting=yes
+IOWeight=1000
+TasksAccounting=yes
+

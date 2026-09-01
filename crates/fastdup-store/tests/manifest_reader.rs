@@ -7,8 +7,8 @@ use fastdup_format::{
     ChunkId, ContainerId, ExactIndexEntry, ExactIndexProfileId, ManifestExtent, ManifestLeaf,
 };
 use fastdup_store::{
-    ContainerRepository, ExactIndexRunRepository, FsStorageIo, ManifestReadError, StorageIo,
-    StoreError, VerifiedManifestFile,
+    ContainerRepository, ExactIndexRunRepository, FsStorageIo, MAX_STORAGE_RANGE_BYTES,
+    ManifestReadError, StorageIo, StoreError, VerifiedManifestFile,
 };
 
 #[derive(Clone)]
@@ -382,16 +382,95 @@ fn adjacent_chunks_prefer_active_locations_in_the_same_container() {
     expected.extend_from_slice(&second);
     assert_eq!(restored, expected);
     let reads = storage.data_range_reads();
-    assert_eq!(reads.len(), 2);
+    assert_eq!(reads.len(), 1);
     let expected_name = format!("{}.fdc", "a1".repeat(16));
     assert!(
         reads.iter().all(|(name, _, _)| name == &expected_name),
         "the planned read must stay in the restore-local Container: {reads:?}"
     );
+    let first_location = local_entries[0].location();
+    let second_location = local_entries[1].location();
+    assert_eq!(
+        first_location
+            .record_offset()
+            .checked_add(u64::from(first_location.record_length())),
+        Some(second_location.record_offset()),
+        "the fixture must contain physically adjacent records"
+    );
+    assert_eq!(reads[0].1, first_location.record_offset());
+    assert_eq!(
+        reads[0].2,
+        usize::try_from(first_location.record_length() + second_location.record_length())
+            .expect("combined record range fits usize")
+    );
     assert_eq!(
         containers.descriptor_cache_status().hits() - descriptor_hits_before,
         1,
         "one Read Plan must reuse its verified descriptor across local Records"
+    );
+}
+
+#[test]
+fn adjacent_record_coalescing_never_exceeds_the_storage_range_bound() {
+    let root = unique_test_root("manifest-reader-bounded-record-coalescing");
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let container_id = ContainerId::new([0xa4; 16]).expect("container identity is nonzero");
+    let chunks = (1_u8..=4)
+        .map(|byte| vec![byte; 256 * 1_024])
+        .collect::<Vec<_>>();
+    let chunk_slices = chunks.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    containers
+        .publish_raw(container_id, 1, &chunk_slices)
+        .expect("publish four adjacent maximum-size RAW records");
+    let container = containers
+        .read(container_id)
+        .expect("recover verified Exact evidence");
+    let entries = container
+        .raw_locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified_raw)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("derive Exact entries");
+    let indexes = ExactIndexRunRepository::new(storage.clone());
+    let profile = ExactIndexProfileId::new([0xa5; 32]).expect("profile identity is nonzero");
+    indexes
+        .append_level_zero(profile, entries.clone())
+        .expect("activate the Exact generation");
+    let active = indexes
+        .pin_active_generation()
+        .expect("pin the Exact generation");
+    let manifest = ManifestLeaf::new(
+        u64::try_from(4 * 256 * 1_024).expect("fixture length fits u64"),
+        chunks
+            .iter()
+            .map(|chunk| ManifestExtent::Data {
+                logical_length: u64::try_from(chunk.len()).expect("chunk length fits u64"),
+                chunk_id: ChunkId::of(chunk),
+            })
+            .collect(),
+    )
+    .expect("four adjacent DATA extents form a valid Manifest");
+    let file = VerifiedManifestFile::new(manifest, containers.clone())
+        .expect("verify every Manifest dependency")
+        .with_active_index(&active);
+    containers
+        .read_verified_location(entries[0])
+        .expect("warm the verified descriptor");
+    storage.clear_range_reads();
+
+    let restored = file
+        .read_at(0, u32::try_from(4 * 256 * 1_024).unwrap())
+        .expect("restore the bounded range");
+    assert_eq!(restored, chunk_slices.concat());
+    let reads = storage.data_range_reads();
+    assert!(reads.len() >= 2, "the combined records exceed one range");
+    assert!(
+        reads
+            .iter()
+            .all(|(_, _, length)| *length <= MAX_STORAGE_RANGE_BYTES),
+        "every coalesced DATA read must remain bounded: {reads:?}"
     );
 }
 

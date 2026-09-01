@@ -1,5 +1,6 @@
 [build]
 target-dir = ".artifacts/target"
+incremental = false
 
 [env]
 TMPDIR = { value = ".artifacts/tmp", relative = true, force = true }

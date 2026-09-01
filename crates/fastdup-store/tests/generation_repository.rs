@@ -4,10 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fastdup_format::{
     DurableInode, ManifestExtent, ManifestLeaf, NamespaceEntry, NamespaceRoot, PolicySetId,
 };
-use fastdup_store::{
-    ContainerRepository, FsStorageIo, GenerationError, GenerationRepository,
-    RepositoryFormatSupport, StorageIo, WalTail,
-};
+use fastdup_store::{FsStorageIo, GenerationRepository, StorageIo, WalTail};
 
 fn unique_test_root(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -152,62 +149,4 @@ fn filesystem_repository_rotates_bounded_slots_and_reopens_the_latest_generation
     assert_eq!(recovered.record(), latest.expect("one Commit was made"));
     assert_eq!(recovered.namespace_root(), &reservation);
     assert_eq!(recovered.wal_tail(), &WalTail::Clean);
-}
-
-#[test]
-fn format_epoch_upgrade_is_readable_by_the_new_writer_and_fences_the_old_writer() {
-    let root = unique_test_root("format-epoch-upgrade");
-    let storage = FsStorageIo::open(root.join("metadata")).expect("create Metadata repository");
-    let policy = PolicySetId::new([0x63; 32]).expect("policy identity is nonzero");
-    let reservation = NamespaceRoot::new(4_096, 2, 0, Vec::new(), Vec::new())
-        .expect("empty reservation root is valid");
-
-    let legacy = GenerationRepository::new_with_format_support(
-        storage.clone(),
-        policy,
-        RepositoryFormatSupport::legacy_only(),
-    );
-    let legacy_record = legacy
-        .commit_namespace(&reservation)
-        .expect("legacy writer commits epoch zero");
-    assert_eq!(legacy_record.format_epoch(), 0);
-
-    let current = GenerationRepository::new(storage.clone(), policy);
-    assert_eq!(
-        current
-            .recover_latest()
-            .expect("current reader accepts the migration source")
-            .expect("legacy generation exists")
-            .record(),
-        legacy_record
-    );
-    let fenced_record = current
-        .commit_namespace(&reservation)
-        .expect("current writer publishes the downgrade fence");
-    assert_eq!(fenced_record.format_epoch(), 1);
-    current
-        .scrub_all_with_data(&ContainerRepository::new(
-            FsStorageIo::open(root.join("containers")).expect("create DATA repository"),
-        ))
-        .expect("offline Scrub accepts the monotonic epoch transition");
-
-    let downgraded = GenerationRepository::new_with_format_support(
-        storage,
-        policy,
-        RepositoryFormatSupport::legacy_only(),
-    );
-    assert!(matches!(
-        downgraded.recover_latest(),
-        Err(GenerationError::UnsupportedFormatEpoch {
-            generation: 2,
-            format_epoch: 1,
-        })
-    ));
-    assert!(matches!(
-        downgraded.commit_namespace(&reservation),
-        Err(GenerationError::UnsupportedFormatEpoch {
-            generation: 2,
-            format_epoch: 1,
-        })
-    ));
 }

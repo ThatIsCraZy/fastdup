@@ -196,9 +196,10 @@ alias internally, so long run-specific Metadata paths do not exceed Linux
 
 Every admitted adaptive Online-GC quantum also runs Metadata GC in the same
 idle-I/O maintenance class. The first or invalidated cycle exactly marks all
-Namespace Roots and Manifest nodes reachable from the selected bounded
-Commit-Log segment together with every process-local Metadata Root Pin held by
-an installed/open Manifest reader or an unpublished successor proof. A
+Namespace Root descriptors, their Namespace Shards, and Manifest nodes
+reachable from the selected bounded Commit-Log segment together with every
+process-local Metadata Root Pin held by an installed/open Manifest reader or an
+unpublished successor proof. A
 publication barrier prevents collection from observing a child-first Manifest
 batch before its root becomes pinned. An unchanged process-local liveness epoch
 reuses the clean mark-catalog result without another graph or directory scan.
@@ -226,9 +227,10 @@ worker bound. These counters are maintained by the
 maintenance runtime; the frontend I/O path does not update GC telemetry.
 
 Proof-bearing commits that do not rotate the Commit WAL journal their newly
-published Manifest nodes and Namespace Root in RAM. They perform no catalog
-I/O. A later maintenance quantum persists those identities as an immutable
-Addition run chained to the prior exact Snapshot or Addition and syncs the
+published Manifest nodes, Namespace Shards, and Namespace Root descriptor in
+RAM. They perform no catalog I/O. A later maintenance quantum persists those
+identities as an immutable Addition run chained to the prior exact Snapshot or
+Addition and syncs the
 Metadata directory without holding the Metadata publication barrier or Commit
 lock over that I/O. Addition runs never authorize deletion. Unclassified
 publication, an unpublished-pin drain, uncertain WAL durability, WAL rotation,

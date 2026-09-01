@@ -6,12 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fastdup_format::{
-    ChunkId, ExactIndexRunSetId, SIMILARITY_BUCKET_REFERENCES_PER_PAGE,
-    SIMILARITY_INDEX_ENTRIES_PER_PAGE, SIMILARITY_INDEX_HEADER_BYTES, SIMILARITY_INDEX_PAGE_BYTES,
+    ChunkId, ExactIndexRunSetId, SIMILARITY_INDEX_HEADER_BYTES, SIMILARITY_INDEX_PAGE_BYTES,
     SimilarityBucketKey, SimilarityBucketPage, SimilarityIndexEntry, SimilarityIndexFamilyError,
     SimilarityIndexFormatError, SimilarityIndexPage, SimilarityIndexPartitionRef,
     SimilarityIndexRun, SimilarityIndexRunDescriptor, SimilarityIndexRunFamily,
-    SimilarityIndexRunStreamEncoder,
 };
 
 use crate::StorageIo;
@@ -70,10 +68,8 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         self.page_cache.status()
     }
 
-    /// Durably publishes one complete immutable pool snapshot.
-    ///
-    /// An idempotent retry accepts an existing generation only when profiles,
-    /// length, and the complete run hash agree.
+    /// Durably publishes one complete immutable pool snapshot in the current
+    /// partition-family topology.
     ///
     /// # Errors
     ///
@@ -85,50 +81,9 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     pub fn publish(
         &self,
         run: &SimilarityIndexRun,
-    ) -> Result<SimilarityIndexRunDescriptor, SimilarityIndexStoreError> {
+    ) -> Result<SimilarityIndexRunFamily, SimilarityIndexStoreError> {
         require_v1_profiles(run.fingerprint_profile(), run.bucket_profile())?;
-        let _guard = self
-            .publish_lock
-            .lock()
-            .expect("ASSERT: Similarity Index publication lock poisoned");
-        let published_name = published_name(run.generation());
-        let temporary_name = format!(".{published_name}.building");
-
-        if self.storage.exists(&published_name)? {
-            let expected = stream_similarity_run(run, |_, _| Ok(()))?;
-            let observed = self.audit_named(&published_name, |_| Ok(()))?;
-            verify_expected_descriptor(expected, observed)?;
-            self.storage.sync_root()?;
-            return Ok(observed);
-        }
-
-        match self.storage.create_new(&temporary_name) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let expected = stream_similarity_run(run, |offset, page| {
-            self.storage.write_at(&temporary_name, offset, page)?;
-            Ok(())
-        })?;
-        self.storage
-            .set_len(&temporary_name, expected.file_length())?;
-        let observed = self.audit_named(&temporary_name, |_| Ok(()))?;
-        verify_expected_descriptor(expected, observed)?;
-        self.storage.sync_file(&temporary_name)?;
-        match self
-            .storage
-            .publish_noreplace(&temporary_name, &published_name)
-        {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let raced = self.audit_named(&published_name, |_| Ok(()))?;
-                verify_expected_descriptor(expected, raced)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        self.storage.sync_root()?;
-        Ok(observed)
+        self.publish_entries(run.generation(), run.entries().iter().copied())
     }
 
     /// Externally sorts and durably publishes an unsorted entry stream.
@@ -153,6 +108,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     where
         E: IntoIterator<Item = SimilarityIndexEntry>,
     {
+        self.reject_unsupported_direct_publications()?;
         let build = write_partitioned_runs(&self.storage, generation, entries)?;
         let staged = {
             let _guard = self
@@ -294,15 +250,28 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     ) -> Result<Option<u64>, SimilarityIndexStoreError> {
         let mut high_water = None;
         for name in self.storage.list_names()? {
-            let generation = parse_published_name(&name)?
-                .or(parse_family_name(&name)?)
-                .or(parse_partition_name(&name)?);
+            if is_unsupported_direct_publication_name(&name) {
+                return Err(SimilarityIndexStoreError::IdentityMismatch);
+            }
+            let generation = parse_family_name(&name)?.or(parse_partition_name(&name)?);
             if let Some(generation) = generation {
                 high_water =
                     Some(high_water.map_or(generation, |value: u64| value.max(generation)));
             }
         }
         Ok(high_water)
+    }
+
+    fn reject_unsupported_direct_publications(&self) -> Result<(), SimilarityIndexStoreError> {
+        if self
+            .storage
+            .list_names()?
+            .iter()
+            .any(|name| is_unsupported_direct_publication_name(name))
+        {
+            return Err(SimilarityIndexStoreError::IdentityMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn activate_staged_family(
@@ -450,80 +419,48 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         let Some(publication) = self.latest_published()? else {
             return Ok(None);
         };
-        let (generation, entries_streamed, buckets, source_exact_run_set_id, partitions) =
-            match publication {
-                LatestSimilarityPublication::Legacy { generation, name } => {
-                    let mut entries_streamed = 0_u64;
-                    let verified = self.recover_partition_named(&name)?;
-                    let descriptor = verified.descriptor;
-                    entries_streamed = entries_streamed
-                        .checked_add(
-                            u64::try_from(descriptor.entry_count())
-                                .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
-                        )
-                        .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-                    require_v1_profiles(
-                        descriptor.fingerprint_profile(),
-                        descriptor.bucket_profile(),
-                    )?;
-                    if descriptor.generation() != generation {
-                        return Err(SimilarityIndexStoreError::IdentityMismatch);
-                    }
-                    let buckets = u64::try_from(descriptor.bucket_count())
-                        .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?;
-                    let partition = RecoveredSimilarityPartition {
-                        name,
-                        descriptor,
-                        minimum_bucket_key: verified.minimum_bucket_key,
-                        maximum_bucket_key: verified.maximum_bucket_key,
-                        mapping: verified.mapping,
-                        page_cache: Arc::clone(&self.page_cache),
-                    };
-                    (generation, entries_streamed, buckets, None, vec![partition])
-                }
-                LatestSimilarityPublication::Family { generation, name } => {
-                    let family = self.read_family(&name)?;
-                    require_v1_profiles(family.fingerprint_profile(), family.bucket_profile())?;
-                    if family.generation() != generation {
-                        return Err(SimilarityIndexStoreError::IdentityMismatch);
-                    }
-                    let mut partitions = Vec::new();
-                    partitions
-                        .try_reserve_exact(family.partitions().len())
-                        .map_err(|_| SimilarityIndexStoreError::OutOfMemory)?;
-                    let mut buckets = 0_u64;
-                    for reference in family.partitions().iter().copied() {
-                        let partition_name =
-                            partition_name(generation, reference.partition_ordinal());
-                        let verified = self.recover_partition_named(&partition_name)?;
-                        let descriptor = verified.descriptor;
-                        verify_partition_reference(
-                            reference,
-                            descriptor,
-                            verified.minimum_bucket_key,
-                            verified.maximum_bucket_key,
-                        )?;
-                        buckets = buckets
-                            .checked_add(reference.bucket_count())
-                            .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-                        partitions.push(RecoveredSimilarityPartition {
-                            name: partition_name,
-                            descriptor,
-                            minimum_bucket_key: verified.minimum_bucket_key,
-                            maximum_bucket_key: verified.maximum_bucket_key,
-                            mapping: verified.mapping,
-                            page_cache: Arc::clone(&self.page_cache),
-                        });
-                    }
-                    (
-                        generation,
-                        family.logical_entry_count(),
-                        buckets,
-                        family.source_exact_run_set_id(),
-                        partitions,
-                    )
-                }
-            };
+        let (generation, entries_streamed, buckets, source_exact_run_set_id, partitions) = {
+            let LatestSimilarityPublication { generation, name } = publication;
+            let family = self.read_family(&name)?;
+            require_v1_profiles(family.fingerprint_profile(), family.bucket_profile())?;
+            if family.generation() != generation {
+                return Err(SimilarityIndexStoreError::IdentityMismatch);
+            }
+            let mut partitions = Vec::new();
+            partitions
+                .try_reserve_exact(family.partitions().len())
+                .map_err(|_| SimilarityIndexStoreError::OutOfMemory)?;
+            let mut buckets = 0_u64;
+            for reference in family.partitions().iter().copied() {
+                let partition_name = partition_name(generation, reference.partition_ordinal());
+                let verified = self.recover_partition_named(&partition_name)?;
+                let descriptor = verified.descriptor;
+                verify_partition_reference(
+                    reference,
+                    descriptor,
+                    verified.minimum_bucket_key,
+                    verified.maximum_bucket_key,
+                )?;
+                buckets = buckets
+                    .checked_add(reference.bucket_count())
+                    .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
+                partitions.push(RecoveredSimilarityPartition {
+                    name: partition_name,
+                    descriptor,
+                    minimum_bucket_key: verified.minimum_bucket_key,
+                    maximum_bucket_key: verified.maximum_bucket_key,
+                    mapping: verified.mapping,
+                    page_cache: Arc::clone(&self.page_cache),
+                });
+            }
+            (
+                generation,
+                family.logical_entry_count(),
+                buckets,
+                family.source_exact_run_set_id(),
+                partitions,
+            )
+        };
         let mapped_partitions = partitions
             .iter()
             .filter(|partition| partition.mapping.is_some())
@@ -551,9 +488,9 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
 
     /// Recovers only a family produced from the supplied active Exact Run Set.
     ///
-    /// Legacy, independently published, and snapshots bound to an older Exact
-    /// generation are not selected; this is the fail-closed reader seam for
-    /// paired advanced-reduction state.
+    /// Unbound snapshots and snapshots bound to an older Exact generation are
+    /// not selected; this is the fail-closed reader seam for paired advanced
+    /// reduction state.
     ///
     /// # Errors
     ///
@@ -597,74 +534,43 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         &self,
         publication: LatestSimilarityPublication,
     ) -> Result<Option<SimilarityIndexAuditStatus>, SimilarityIndexStoreError> {
-        match publication {
-            LatestSimilarityPublication::Legacy { generation, name } => {
-                let mut entries_verified = 0_u64;
-                let descriptor = self.audit_named(&name, |_| {
-                    entries_verified = entries_verified
-                        .checked_add(1)
-                        .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-                    Ok(())
-                })?;
-                require_v1_profiles(
-                    descriptor.fingerprint_profile(),
-                    descriptor.bucket_profile(),
+        {
+            let LatestSimilarityPublication { generation, name } = publication;
+            let family = self.read_family(&name)?;
+            require_v1_profiles(family.fingerprint_profile(), family.bucket_profile())?;
+            if family.generation() != generation {
+                return Err(SimilarityIndexStoreError::IdentityMismatch);
+            }
+            let mut pages_verified = 0_u64;
+            for reference in family.partitions().iter().copied() {
+                let name = partition_name(generation, reference.partition_ordinal());
+                let (descriptor, minimum_bucket_key, maximum_bucket_key) =
+                    self.audit_partition_named(&name)?;
+                verify_partition_reference(
+                    reference,
+                    descriptor,
+                    minimum_bucket_key,
+                    maximum_bucket_key,
                 )?;
-                if descriptor.generation() != generation
-                    || usize::try_from(entries_verified).ok() != Some(descriptor.entry_count())
-                {
-                    return Err(SimilarityIndexStoreError::IdentityMismatch);
-                }
-                Ok(Some(SimilarityIndexAuditStatus {
-                    generation,
-                    entries_verified,
-                    pages_verified: u64::try_from(
-                        descriptor
-                            .page_count()
-                            .checked_add(descriptor.bucket_page_count())
-                            .ok_or(SimilarityIndexStoreError::CounterOverflow)?,
-                    )
-                    .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
-                    run_hash: descriptor.run_hash(),
-                }))
-            }
-            LatestSimilarityPublication::Family { generation, name } => {
-                let family = self.read_family(&name)?;
-                require_v1_profiles(family.fingerprint_profile(), family.bucket_profile())?;
-                if family.generation() != generation {
-                    return Err(SimilarityIndexStoreError::IdentityMismatch);
-                }
-                let mut pages_verified = 0_u64;
-                for reference in family.partitions().iter().copied() {
-                    let name = partition_name(generation, reference.partition_ordinal());
-                    let (descriptor, minimum_bucket_key, maximum_bucket_key) =
-                        self.audit_partition_named(&name)?;
-                    verify_partition_reference(
-                        reference,
-                        descriptor,
-                        minimum_bucket_key,
-                        maximum_bucket_key,
-                    )?;
-                    pages_verified = pages_verified
-                        .checked_add(
-                            u64::try_from(
-                                descriptor
-                                    .page_count()
-                                    .checked_add(descriptor.bucket_page_count())
-                                    .ok_or(SimilarityIndexStoreError::CounterOverflow)?,
-                            )
-                            .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
+                pages_verified = pages_verified
+                    .checked_add(
+                        u64::try_from(
+                            descriptor
+                                .page_count()
+                                .checked_add(descriptor.bucket_page_count())
+                                .ok_or(SimilarityIndexStoreError::CounterOverflow)?,
                         )
-                        .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-                }
-                let encoded = family.encode()?;
-                Ok(Some(SimilarityIndexAuditStatus {
-                    generation,
-                    entries_verified: family.logical_entry_count(),
-                    pages_verified,
-                    run_hash: *blake3::hash(&encoded).as_bytes(),
-                }))
+                        .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
+                    )
+                    .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
             }
+            let encoded = family.encode()?;
+            Ok(Some(SimilarityIndexAuditStatus {
+                generation,
+                entries_verified: family.logical_entry_count(),
+                pages_verified,
+                run_hash: *blake3::hash(&encoded).as_bytes(),
+            }))
         }
     }
 
@@ -682,10 +588,11 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         let Some(publication) = self.latest_published()? else {
             return Ok(None);
         };
-        let LatestSimilarityPublication::Family { name, .. } = &publication else {
-            return Ok(None);
-        };
-        if self.read_family(name)?.source_exact_run_set_id() != Some(exact_run_set_id) {
+        if self
+            .read_family(&publication.name)?
+            .source_exact_run_set_id()
+            != Some(exact_run_set_id)
+        {
             return Ok(None);
         }
         self.audit_publication(publication)
@@ -696,12 +603,11 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     ) -> Result<Option<LatestSimilarityPublication>, SimilarityIndexStoreError> {
         let mut latest: Option<LatestSimilarityPublication> = None;
         for name in self.storage.list_names()? {
-            let candidate = if let Some(generation) = parse_published_name(&name)? {
-                Some(LatestSimilarityPublication::Legacy { generation, name })
-            } else {
-                parse_family_name(&name)?
-                    .map(|generation| LatestSimilarityPublication::Family { generation, name })
-            };
+            if is_unsupported_direct_publication_name(&name) {
+                return Err(SimilarityIndexStoreError::IdentityMismatch);
+            }
+            let candidate = parse_family_name(&name)?
+                .map(|generation| LatestSimilarityPublication { generation, name });
             let Some(candidate) = candidate else {
                 continue;
             };
@@ -912,16 +818,14 @@ impl StagedSimilarityIndex {
     }
 }
 
-enum LatestSimilarityPublication {
-    Legacy { generation: u64, name: String },
-    Family { generation: u64, name: String },
+struct LatestSimilarityPublication {
+    generation: u64,
+    name: String,
 }
 
 impl LatestSimilarityPublication {
     const fn generation(&self) -> u64 {
-        match self {
-            Self::Legacy { generation, .. } | Self::Family { generation, .. } => *generation,
-        }
+        self.generation
     }
 }
 
@@ -1882,46 +1786,6 @@ pub(crate) fn similarity_index_entry_v1_from_verified(
     )?)
 }
 
-fn stream_similarity_run(
-    run: &SimilarityIndexRun,
-    mut visit: impl FnMut(u64, &[u8]) -> Result<(), SimilarityIndexStoreError>,
-) -> Result<SimilarityIndexRunDescriptor, SimilarityIndexStoreError> {
-    let mut encoder = SimilarityIndexRunStreamEncoder::new(run.stream_layout())?;
-    let mut offset = 0_u64;
-    let page_bytes = u64::try_from(SIMILARITY_INDEX_PAGE_BYTES)
-        .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?;
-    visit(offset, encoder.header())?;
-    offset = offset
-        .checked_add(page_bytes)
-        .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-    for entries in run.entries().chunks(SIMILARITY_INDEX_ENTRIES_PER_PAGE) {
-        let page = encoder.encode_next_entry_page(entries)?;
-        visit(offset, &page)?;
-        offset = offset
-            .checked_add(page_bytes)
-            .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-    }
-    for references in run
-        .bucket_references()
-        .chunks(SIMILARITY_BUCKET_REFERENCES_PER_PAGE)
-    {
-        let page = encoder.encode_next_bucket_page(references)?;
-        visit(offset, &page)?;
-        offset = offset
-            .checked_add(page_bytes)
-            .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-    }
-    let (footer, descriptor) = encoder.finish()?;
-    visit(offset, &footer)?;
-    let observed_length = offset
-        .checked_add(page_bytes)
-        .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-    if observed_length != descriptor.file_length() {
-        return Err(SimilarityIndexStoreError::IdentityMismatch);
-    }
-    Ok(descriptor)
-}
-
 fn verify_expected_descriptor(
     expected: SimilarityIndexRunDescriptor,
     observed: SimilarityIndexRunDescriptor,
@@ -1987,43 +1851,23 @@ fn ensure_object<I: StorageIo>(storage: &I, name: &str) -> io::Result<()> {
     }
 }
 
-fn published_name(generation: u64) -> String {
-    format!(
-        "similarity.{SIMILARITY_PROFILE_V1:04x}.{SIMILARITY_BUCKET_PROFILE_V1:04x}.{generation:016x}.fds"
-    )
-}
-
 fn family_name(generation: u64) -> String {
     format!(
         "similarity-family.{SIMILARITY_PROFILE_V1:04x}.{SIMILARITY_BUCKET_PROFILE_V1:04x}.{generation:016x}.fdsf"
     )
 }
 
+fn is_unsupported_direct_publication_name(name: &str) -> bool {
+    name.starts_with("similarity.")
+        && std::path::Path::new(name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("fds"))
+}
+
 fn partition_name(generation: u64, partition_ordinal: u16) -> String {
     format!(
         "similarity-part.{SIMILARITY_PROFILE_V1:04x}.{SIMILARITY_BUCKET_PROFILE_V1:04x}.{generation:016x}.{partition_ordinal:04x}.fds"
     )
-}
-
-fn parse_published_name(name: &str) -> Result<Option<u64>, SimilarityIndexStoreError> {
-    if !name.starts_with("similarity.") || name.strip_suffix(".fds").is_none() {
-        return Ok(None);
-    }
-    let fields = name.split('.').collect::<Vec<_>>();
-    if fields.len() != 5
-        || fields[0] != "similarity"
-        || fields[1] != format!("{SIMILARITY_PROFILE_V1:04x}")
-        || fields[2] != format!("{SIMILARITY_BUCKET_PROFILE_V1:04x}")
-        || fields[4] != "fds"
-    {
-        return Err(SimilarityIndexStoreError::IdentityMismatch);
-    }
-    let generation = u64::from_str_radix(fields[3], 16)
-        .map_err(|_| SimilarityIndexStoreError::IdentityMismatch)?;
-    if generation == 0 || fields[3].len() != 16 {
-        return Err(SimilarityIndexStoreError::IdentityMismatch);
-    }
-    Ok(Some(generation))
 }
 
 fn parse_family_name(name: &str) -> Result<Option<u64>, SimilarityIndexStoreError> {
@@ -2126,54 +1970,5 @@ impl From<SimilarityIndexFamilyError> for SimilarityIndexStoreError {
             SimilarityIndexFamilyError::ArithmeticOverflow => Self::CounterOverflow,
             _ => Self::IndexCorruption,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn publication_stream_emits_only_complete_format_pages() {
-        let entries = (0_u64..400)
-            .map(|ordinal| {
-                SimilarityIndexEntry::new(
-                    ChunkId::of(&ordinal.to_le_bytes()),
-                    64 * 1_024,
-                    SIMILARITY_PROFILE_V1,
-                    [ordinal, ordinal + 1, ordinal + 2, ordinal + 3],
-                    [ordinal.rotate_left(7); 8],
-                )
-                .expect("fixture entry is valid")
-            })
-            .collect();
-        let run = SimilarityIndexRun::new(
-            SIMILARITY_PROFILE_V1,
-            SIMILARITY_BUCKET_PROFILE_V1,
-            91,
-            entries,
-        )
-        .expect("construct streaming fixture");
-        let mut ranges = Vec::new();
-        let descriptor = stream_similarity_run(&run, |offset, bytes| {
-            ranges.push((offset, bytes.len()));
-            Ok(())
-        })
-        .expect("stream fixture");
-
-        assert!(
-            ranges
-                .iter()
-                .all(|(_, length)| *length == SIMILARITY_INDEX_PAGE_BYTES)
-        );
-        assert!(
-            ranges
-                .windows(2)
-                .all(|pair| pair[1].0 == pair[0].0 + SIMILARITY_INDEX_PAGE_BYTES as u64)
-        );
-        assert_eq!(
-            ranges.len() * SIMILARITY_INDEX_PAGE_BYTES,
-            usize::try_from(descriptor.file_length()).expect("fixture length fits usize")
-        );
     }
 }

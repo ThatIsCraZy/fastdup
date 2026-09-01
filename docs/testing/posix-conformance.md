@@ -19,7 +19,7 @@ write and recovery rules in ADRs
 ## Current boundary
 
 The repository implements the Stage-1 immutable Container Store, versioned
-Manifest leaves, flat Namespace Roots, Commit Records and WAL, the shared
+Manifest trees, sharded Namespace graphs, Commit Records and WAL, the shared
 namespace/FUSE seam, and the bounded adaptive RAW/Zstd orchestration recorded in
 [Durable POSIX/FUSE checkpoint](durable-posix-checkpoint.md). A five-second
 runtime loop, event-driven 512-MiB active-Dirty-DATA pressure trigger, and
@@ -31,7 +31,7 @@ are connected. Offline maintenance now scrubs every retained generation,
 published Container, active Exact object, and ACTIVE Location, and can rebuild
 the Exact Index through hidden RoW Runs plus final atomic activation. Nested
 `mkdir`, `rmdir`, lookup, `readdir`, cross-parent rename, durable recovery, and
-offline scrub are connected through Namespace Root v2. Volatile advisory POSIX
+offline scrub are connected through the current Namespace graph. Volatile advisory POSIX
 byte-range locks implement `F_GETLK`, `F_SETLK`, and `F_SETLKW`, including
 owner cleanup on close. Metadata-only allocation, hole punch, zero range,
 DATA/HOLE seek, and the shared-seam collapse/insert operations are connected.

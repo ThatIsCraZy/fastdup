@@ -12,12 +12,15 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use fastdup_format::{HEADER_BYTES, MAX_CONTAINER_BYTES, VerifiedContainerPublication};
+use fastdup_format::{
+    AlignedContainerBytes, HEADER_BYTES, MAX_CONTAINER_BYTES, VerifiedContainerPublication,
+};
 use fastdup_store::{
     FsStorageIo, MAX_STORAGE_RANGE_BYTES, OwnedContainerPublication, PublicationSampleRange,
     StorageIo, StoreError, publication_sample_ranges, verify_publication_sample,
@@ -27,12 +30,28 @@ use io_uring::{IoUring, Probe, opcode, squeue, types};
 const DEFAULT_RING_ENTRIES: u32 = 256;
 const DEFAULT_INFLIGHT_BYTES: u64 = 256 * 1_024 * 1_024;
 const WAKE_USER_DATA: u64 = u64::MAX;
+/// Smallest sealed Container for which the XFS A/B benchmark showed no
+/// publication-throughput or tail-latency regression from Direct I/O.
+pub const DIRECT_PUBLICATION_MIN_BYTES: usize = 4 * 1_024 * 1_024;
+
+/// Cache policy for the short-lived DATA Container publication descriptor.
+///
+/// This does not affect ordinary reads after rename; they remain buffered and
+/// retain kernel readahead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationIoMode {
+    Buffered,
+    Direct,
+    /// Selects Direct I/O only for Containers at least 4 MiB long.
+    Adaptive,
+}
 
 /// Bounded shared-ring configuration for the data-tier adapter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IoUringStorageConfig {
     ring_entries: NonZeroU32,
     max_inflight_bytes: NonZeroU64,
+    publication_io_mode: PublicationIoMode,
 }
 
 impl IoUringStorageConfig {
@@ -41,6 +60,7 @@ impl IoUringStorageConfig {
         Self {
             ring_entries,
             max_inflight_bytes,
+            publication_io_mode: PublicationIoMode::Adaptive,
         }
     }
 
@@ -52,6 +72,17 @@ impl IoUringStorageConfig {
     #[must_use]
     pub const fn max_inflight_bytes(self) -> NonZeroU64 {
         self.max_inflight_bytes
+    }
+
+    #[must_use]
+    pub const fn with_publication_io_mode(mut self, mode: PublicationIoMode) -> Self {
+        self.publication_io_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn publication_io_mode(self) -> PublicationIoMode {
+        self.publication_io_mode
     }
 }
 
@@ -79,6 +110,9 @@ pub struct IoUringStorageStatus {
     owned_publications_started: u64,
     owned_publications_completed: u64,
     borrowed_write_copy_bytes: u64,
+    publication_io_mode: PublicationIoMode,
+    direct_publication_write_bytes: u64,
+    direct_publication_sample_bytes: u64,
 }
 
 impl IoUringStorageStatus {
@@ -135,6 +169,21 @@ impl IoUringStorageStatus {
     #[must_use]
     pub const fn borrowed_write_copy_bytes(&self) -> u64 {
         self.borrowed_write_copy_bytes
+    }
+
+    #[must_use]
+    pub const fn publication_io_mode(&self) -> PublicationIoMode {
+        self.publication_io_mode
+    }
+
+    #[must_use]
+    pub const fn direct_publication_write_bytes(&self) -> u64 {
+        self.direct_publication_write_bytes
+    }
+
+    #[must_use]
+    pub const fn direct_publication_sample_bytes(&self) -> u64 {
+        self.direct_publication_sample_bytes
     }
 }
 
@@ -298,17 +347,32 @@ impl StorageIo for IoUringStorageIo {
         let lease = self.backend.acquire_publication(&publication)?;
         let temporary_name = publication.temporary_name().to_owned();
         let published_name = publication.published_name().to_owned();
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(self.path(&temporary_name)?)?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        let resolved_io_mode = match self.config.publication_io_mode {
+            PublicationIoMode::Buffered => PublicationIoMode::Buffered,
+            PublicationIoMode::Direct => PublicationIoMode::Direct,
+            PublicationIoMode::Adaptive => {
+                if publication.sealed_len() >= DIRECT_PUBLICATION_MIN_BYTES {
+                    PublicationIoMode::Direct
+                } else {
+                    PublicationIoMode::Buffered
+                }
+            }
+        };
+        if resolved_io_mode == PublicationIoMode::Direct {
+            options.custom_flags(libc::O_DIRECT);
+        }
+        let file = options.open(self.path(&temporary_name)?)?;
         let directory = File::open(self.filesystem.root())?;
         self.backend.publish_owned(
-            file,
-            directory,
-            c_name(&temporary_name)?,
-            c_name(&published_name)?,
+            PublicationTarget {
+                file,
+                directory,
+                old_name: c_name(&temporary_name)?,
+                new_name: c_name(&published_name)?,
+                io_mode: resolved_io_mode,
+            },
             publication,
             lease,
         )
@@ -502,6 +566,17 @@ impl ActiveBackend {
                 .callers
                 .borrowed_write_copy_bytes
                 .load(Ordering::Relaxed),
+            publication_io_mode: config.publication_io_mode,
+            direct_publication_write_bytes: self
+                .counters
+                .worker
+                .direct_publication_write_bytes
+                .load(Ordering::Relaxed),
+            direct_publication_sample_bytes: self
+                .counters
+                .worker
+                .direct_publication_sample_bytes
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -571,10 +646,7 @@ impl ActiveBackend {
 
     fn publish_owned(
         &self,
-        file: File,
-        directory: File,
-        old_name: CString,
-        new_name: CString,
+        target: PublicationTarget,
         publication: OwnedContainerPublication,
         lease: BudgetLease,
     ) -> Result<VerifiedContainerPublication, StoreError> {
@@ -590,10 +662,7 @@ impl ActiveBackend {
             .fetch_add(1, Ordering::Relaxed);
         let (reply, receive) = mpsc::sync_channel(1);
         self.send(Command::PublishOwned {
-            file,
-            directory,
-            old_name,
-            new_name,
+            target,
             publication: Box::new(publication),
             lease,
             reply,
@@ -672,6 +741,8 @@ struct WorkerCounters {
     completed: AtomicU64,
     root_sync_submissions: AtomicU64,
     owned_publications_completed: AtomicU64,
+    direct_publication_write_bytes: AtomicU64,
+    direct_publication_sample_bytes: AtomicU64,
 }
 
 #[derive(Default)]
@@ -759,10 +830,7 @@ impl Drop for BudgetLease {
 
 enum Command {
     PublishOwned {
-        file: File,
-        directory: File,
-        old_name: CString,
-        new_name: CString,
+        target: PublicationTarget,
         publication: Box<OwnedContainerPublication>,
         lease: BudgetLease,
         reply: mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>,
@@ -798,6 +866,14 @@ enum Command {
     Shutdown,
 }
 
+struct PublicationTarget {
+    file: File,
+    directory: File,
+    old_name: CString,
+    new_name: CString,
+    io_mode: PublicationIoMode,
+}
+
 enum PublishPhase {
     Building {
         progress: usize,
@@ -812,7 +888,7 @@ enum PublishPhase {
     SampleRead {
         ordinal: usize,
         range: PublicationSampleRange,
-        bytes: Vec<u8>,
+        bytes: AlignedContainerBytes,
         progress: usize,
     },
     FileSync,
@@ -825,8 +901,9 @@ struct PublishOperation {
     old_name: CString,
     new_name: CString,
     sealed_length: usize,
-    building_header: Box<[u8; HEADER_BYTES]>,
-    sealed: Vec<u8>,
+    building_header: AlignedContainerBytes,
+    sealed: AlignedContainerBytes,
+    publication_io_mode: PublicationIoMode,
     phase: PublishPhase,
     verified: Option<VerifiedContainerPublication>,
     lease: Option<BudgetLease>,
@@ -835,14 +912,18 @@ struct PublishOperation {
 
 impl PublishOperation {
     fn new(
-        file: File,
-        directory: File,
-        old_name: CString,
-        new_name: CString,
+        target: PublicationTarget,
         publication: OwnedContainerPublication,
         lease: BudgetLease,
         reply: mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>,
     ) -> Self {
+        let PublicationTarget {
+            file,
+            directory,
+            old_name,
+            new_name,
+            io_mode: publication_io_mode,
+        } = target;
         let (
             container_id,
             container_generation,
@@ -885,6 +966,7 @@ impl PublishOperation {
             sealed_length,
             building_header,
             sealed,
+            publication_io_mode,
             phase: PublishPhase::Building { progress: 0 },
             verified: Some(verified),
             lease: Some(lease),
@@ -942,13 +1024,34 @@ impl PublishOperation {
         }
     }
 
-    fn complete(mut self, result: i32) -> OperationCompletion {
+    fn complete(mut self, result: i32, counters: &Counters) -> OperationCompletion {
         if result < 0 {
             self.fail(StoreError::Io(io::Error::from_raw_os_error(-result)));
             return OperationCompletion::Done;
         }
         let transferred = usize::try_from(result)
             .expect("ASSERT: nonnegative owned-publisher CQE result fits usize");
+        if self.publication_io_mode == PublicationIoMode::Direct {
+            match &self.phase {
+                PublishPhase::Building { .. }
+                | PublishPhase::Body { .. }
+                | PublishPhase::SealedHeader { .. } => {
+                    counters.worker.direct_publication_write_bytes.fetch_add(
+                        u64::try_from(transferred)
+                            .expect("ASSERT: Direct-I/O write count fits u64"),
+                        Ordering::Relaxed,
+                    );
+                }
+                PublishPhase::SampleRead { .. } => {
+                    counters.worker.direct_publication_sample_bytes.fetch_add(
+                        u64::try_from(transferred)
+                            .expect("ASSERT: Direct-I/O sample count fits u64"),
+                        Ordering::Relaxed,
+                    );
+                }
+                PublishPhase::SetLength | PublishPhase::FileSync | PublishPhase::Rename => {}
+            }
+        }
         match std::mem::replace(&mut self.phase, PublishPhase::FileSync) {
             PublishPhase::Building { progress } => self.complete_building(progress, transferred),
             PublishPhase::Body { progress } => self.complete_body(progress, transferred),
@@ -1073,7 +1176,7 @@ impl PublishOperation {
         mut self,
         ordinal: usize,
         range: PublicationSampleRange,
-        bytes: Vec<u8>,
+        bytes: AlignedContainerBytes,
         mut progress: usize,
         transferred: usize,
     ) -> OperationCompletion {
@@ -1126,7 +1229,7 @@ impl PublishOperation {
             };
             return self.pending();
         }
-        self.sealed = Vec::new();
+        self.sealed = AlignedContainerBytes::empty();
         self.lease = None;
         self.phase = PublishPhase::FileSync;
         self.pending()
@@ -1143,13 +1246,13 @@ impl PublishOperation {
     }
 }
 
-fn allocate_sample_buffer(length: usize) -> Result<Vec<u8>, StoreError> {
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|_| StoreError::Io(io::Error::from(io::ErrorKind::OutOfMemory)))?;
-    bytes.resize(length, 0);
-    Ok(bytes)
+fn allocate_sample_buffer(length: usize) -> Result<AlignedContainerBytes, StoreError> {
+    if length == 0 || !length.is_multiple_of(HEADER_BYTES) {
+        return Err(StoreError::Io(invalid_input(
+            "publication sample is not Direct-I/O aligned",
+        )));
+    }
+    Ok(AlignedContainerBytes::zeroed(length))
 }
 
 struct PublishReady {
@@ -1265,7 +1368,7 @@ impl Operation {
 
     fn complete(self, result: i32, counters: &Counters) -> OperationCompletion {
         match self {
-            Self::PublishOwned(operation) => (*operation).complete(result),
+            Self::PublishOwned(operation) => (*operation).complete(result, counters),
             operation => complete_storage_operation(operation, result, counters),
         }
     }
@@ -1621,18 +1724,12 @@ impl RootCohort {
 fn admit_command(command: Command, ready: &mut VecDeque<Operation>, roots: &mut RootCohort) {
     match command {
         Command::PublishOwned {
-            file,
-            directory,
-            old_name,
-            new_name,
+            target,
             publication,
             lease,
             reply,
         } => ready.push_back(Operation::PublishOwned(Box::new(PublishOperation::new(
-            file,
-            directory,
-            old_name,
-            new_name,
+            target,
             *publication,
             lease,
             reply,

@@ -3,8 +3,8 @@ use fastdup_format::{
     ExactIndexRunSet,
 };
 use fastdup_store::{
-    CONTAINER_GENERATION_HIGH_WATER_SLOT_0, ContainerRepository, ExactIndexRunRepository,
-    MemoryPressureSnapshot, StorageIo, StoreError,
+    CONTAINER_GENERATION_HIGH_WATER_SLOT_0, CONTAINER_GENERATION_HIGH_WATER_SLOT_1,
+    ContainerRepository, ExactIndexRunRepository, MemoryPressureSnapshot, StorageIo, StoreError,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
@@ -96,6 +96,38 @@ fn durable_container_generation_high_water_reopens_without_a_directory_scan() {
     assert!(
         !storage.operations()[baseline..].contains(&StorageOperation::ListNames),
         "a healthy durable high-water must eliminate Container directory discovery"
+    );
+}
+
+#[test]
+fn absent_high_water_is_rejected_before_mutating_a_nonempty_repository() {
+    let storage = MemoryStorageIo::new();
+    let repository = ContainerRepository::new(storage.clone());
+    repository
+        .publish_raw(
+            ContainerId::new([0xA8; 16]).expect("container identity is nonzero"),
+            7,
+            &[b"preproduction container without allocator state"],
+        )
+        .expect("publish preproduction fixture");
+
+    assert!(matches!(
+        repository.audit_generation_high_water(Some(7)),
+        Err(StoreError::ContainerGenerationHighWaterMissing)
+    ));
+    assert!(matches!(
+        repository.open_generation_allocator(4),
+        Err(StoreError::ContainerGenerationHighWaterMissing)
+    ));
+    assert!(
+        !storage
+            .exists(CONTAINER_GENERATION_HIGH_WATER_SLOT_0)
+            .unwrap()
+    );
+    assert!(
+        !storage
+            .exists(CONTAINER_GENERATION_HIGH_WATER_SLOT_1)
+            .unwrap()
     );
 }
 

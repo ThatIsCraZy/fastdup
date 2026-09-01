@@ -53,7 +53,7 @@ fn bounded_descriptor_pairs_the_envelope_and_fully_verifies_one_candidate_record
     )
     .expect("bounded reader pairs Header, Footer, and physical length");
     let range = descriptor
-        .raw_record_range(candidate)
+        .record_range(candidate)
         .expect("candidate lies in the sealed record region");
     let start = usize::try_from(range.offset()).expect("worked record offset fits usize");
     let end = start + range.length();

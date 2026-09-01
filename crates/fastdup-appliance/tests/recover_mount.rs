@@ -45,10 +45,15 @@ fn recovered_mixed_manifest_mounts_byte_exactly_and_keeps_create_closed() {
     let containers = ContainerRepository::new(
         FsStorageIo::open(&container_root).expect("create workspace-local container repository"),
     );
+    let container_generation = containers
+        .open_generation_allocator(1_024)
+        .expect("initialize current Container generation state")
+        .reserve_generation()
+        .expect("reserve the first Container generation");
     containers
         .publish_raw(
             ContainerId::new([0x91; 16]).expect("container identity is nonzero"),
-            1,
+            container_generation,
             &[payload.as_slice()],
         )
         .expect("publish durable DATA dependency");
@@ -193,8 +198,13 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
 
     let containers = ContainerRepository::new(container_storage.clone());
     let container_id = ContainerId::new([0xA2; 16]).expect("container identity is nonzero");
+    let container_generation = containers
+        .open_generation_allocator(1_024)
+        .expect("initialize current Container generation state")
+        .reserve_generation()
+        .expect("reserve the first Container generation");
     containers
-        .publish_raw(container_id, 1, &[payload.as_slice()])
+        .publish_raw(container_id, container_generation, &[payload.as_slice()])
         .expect("publish the durable DATA dependency");
     let container = containers
         .read(container_id)
@@ -333,8 +343,8 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
             .iter()
             .filter(|operation| **operation == StorageOperation::ListNames)
             .count(),
-        1,
-        "only mount-time Container-generation discovery may scan the directory: {writable_recovery_operations:?}"
+        0,
+        "healthy fixed high-water recovery must not scan the DATA directory: {writable_recovery_operations:?}"
     );
     assert_eq!(
         writable_recovery_operations
@@ -342,7 +352,7 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
             .filter(|operation| **operation == StorageOperation::Read)
             .count(),
         0,
-        "Container-generation discovery must not read whole Container payloads: {writable_recovery_operations:?}"
+        "fixed high-water recovery must not read whole Container payloads: {writable_recovery_operations:?}"
     );
     let object_lengths = writable_recovery_operations
         .iter()
@@ -352,20 +362,11 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
         .iter()
         .filter(|operation| **operation == StorageOperation::ReadExactAt)
         .count();
-    if object_lengths == 3 {
-        assert_eq!(
-            bounded_reads, 5,
-            "graph proof, one-time Container migration, and fixed high-water verification stay bounded: {writable_recovery_operations:?}"
-        );
-    } else {
-        let cache = writable.container_descriptor_cache_status();
-        assert!(
-            cache.pressure_rejections() > 0 && cache.swap_used_bytes() > 0,
-            "descriptor rereads are permitted only after the rebuildable cache rejects admission under swap pressure: {writable_recovery_operations:?}"
-        );
-        assert_eq!(object_lengths, 5);
-        assert_eq!(bounded_reads, 9);
-    }
+    assert_eq!(object_lengths, 0);
+    assert_eq!(
+        bounded_reads, 2,
+        "writable recovery reads only the paired fixed high-water slots: {writable_recovery_operations:?}"
+    );
     let writable_baseline = container_storage.operation_count();
     let Reply::Entry(writable_entry) = writable
         .namespace()

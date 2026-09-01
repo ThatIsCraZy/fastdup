@@ -7,24 +7,19 @@ hardware evidence gate is closed. Historical ADR text is not silently rewritten.
 
 ## Result
 
-- 77 uniquely numbered ADRs exist after renumbering the accidentally duplicated
-  Similarity ADR from 0046 to 0076.
-- 58 are current for their implemented scope.
-- 8 are current designs with an explicit implementation or evidence gate still
-  open.
-- 7 contain historical wording already superseded by later ADRs and need only a
-  current-state pointer, not a code change.
-- 4 expose material documentation/code drift: DATA-tier Recovery Checkpoints
-  and Small-File placement are not implemented; per-handle userspace prefetch is
-  not implemented; and the repository still accepts legacy Format-Epoch and
-  generation-allocation migration paths despite the pre-production
-  no-migration decision.
-
-The last item is the only correctness-policy conflict. It is not a live-data
-compatibility requirement: `RepositoryFormatSupport::legacy_only`, Commit epoch
-zero, the absent-high-water migration scan, legacy Metadata-GC classification,
-and their tests are removable before production. This audit does not remove
-that broad compatibility surface as a side effect of documentation review.
+- 84 uniquely numbered ADRs exist. ADR 0024's five independent capacity and
+  placement decisions are split into ADRs 0080 through 0084.
+- DATA-tier Recovery Checkpoints are now current across writer, recovery,
+  scrub, GC, fault injection, and daemon scheduling.
+- Pool/Appliance identity and fixed roles are current across startup, offline
+  Scrub, durable format, corruption checks, and fault injection. The material
+  implementation gaps remain hard quota isolation, commit-capacity admission,
+  Small-File placement, and per-handle userspace prefetch. Physical-HDD evidence
+  for restore coalescing and broader Advanced-Reduction gates remain open.
+- The pre-production compatibility conflict found by this audit is closed:
+  Commit epoch zero, absent-high-water migration, superseded object decoders,
+  direct Similarity Runs, and oversized single-slot WAL inputs are rejected or
+  removed. Current repositories are born directly in the current formats.
 
 ## Complete inventory
 
@@ -33,7 +28,7 @@ that broad compatibility surface as a side effect of documentation review.
 | 0001 | Current architecture | Redundancy is outside the repository format; no in-process RAID layer exists. Hardware qualification remains external. |
 | 0002 | Current | Durable formats use explicit versions and field-wise encoders in `fastdup-format`; compatibility is still explicitly pre-release. |
 | 0003 | Current | Publication and Commit paths preserve file and directory durability barriers rather than treating `fsync` as stronger hardware truth. |
-| 0004 | Design open | Normal Commit recovery exists; the separate 90-second DATA-tier Recovery Checkpoint does not. Same gap as ADR 0020. |
+| 0004 | Current | Normal Commit recovery and a separately scheduled 90-second DATA-tier disaster-recovery point are implemented; blocked HDD publication does not hold the Commit lock. |
 | 0005 | Current | Commit generations preserve wholly committed ingest prefixes. |
 | 0006 | Current | Namespace visibility is one immutable Root plus one Commit Record. |
 | 0007 | Current | The live namespace retains acknowledged mutations ahead of the durability cut. |
@@ -49,11 +44,11 @@ that broad compatibility surface as a side effect of documentation review.
 | 0017 | Design open | Dictionary IDs and dependency rules exist only in the bounded experimental pipeline; no durable production Dictionary activation exists. |
 | 0018 | Current | Similarity lookup is bounded/versioned and is candidate acceleration only. |
 | 0019 | Current | Commit follows durable DATA and Metadata publication. |
-| 0020 | Not implemented | No Recovery-Checkpoint writer, reader, recovery selector, or `lost+found` path exists in the crates. |
+| 0020 | Current implemented scope | Paired heads select current/previous self-contained checkpoints; writer, bounded reader, exact recovery, scrub, GC retention, daemon scheduling, and exhaustive publication/installation fault tests exist. Automatic `lost+found` discovery remains a separate optional design. |
 | 0021 | Current | Exact Location transitions implement ACTIVE, RETIRING, and REMOVED RoW state. |
 | 0022 | Current | ASSERT/VERIFY/AUDIT language and independent scrub boundaries are used consistently. |
-| 0023 | Partly implemented | Exact and Similarity rebuild as immutable generations; the disaster-recovery source checkpoint named by this ADR is absent. |
-| 0024 | Partly implemented | `statfs` reserve sampling/override is implemented. Physical quota enforcement, Pool IDs, Small-File DATA placement, and spill hysteresis are not. |
+| 0023 | Current | Exact and Similarity rebuild as immutable generations; after complete Metadata loss the selected DATA-tier checkpoint is installed and the applicable index generation is rebuilt before mount. |
+| 0024 | Superseded by 0080–0084 | The former combined decision is retained only as a pointer to independently verifiable invariants. |
 | 0025 | Current process | Fault matrices and benchmark corpora exist under testkit/docs; hardware gates remain explicit rather than claimed. |
 | 0026 | Historical platform wording | Deep crate boundaries and field-wise formats remain. The “future SIMD/FUSE/io_uring” text is fulfilled by isolated SeqCDC, FUSE, mmap, ioprio, and io_uring modules; ADR 0058 supersedes the synchronous Stage-1 publisher. |
 | 0027 | Current | POSIX edge semantics are centralized in `fastdup-posix`. |
@@ -61,19 +56,19 @@ that broad compatibility surface as a side effect of documentation review.
 | 0029 | Partly superseded by 0074 | Object decode-version separation remains. Predecessor Policy Sets, read-only downgrade, and policy migration are excluded for the pre-production repository. |
 | 0030 | Partly implemented | bounded record/Base amplification, verified caches, candidate fallback, and maintenance priority exist. Per-handle userspace prefetch and its metrics do not; kernel readahead under ADR 0073 is not the same mechanism. |
 | 0031 | Current | RoW history is not exposed as snapshots. |
-| 0032 | Historical milestone | POSIX/Exact MVP and advanced reduction/GC now exist. FastCDC is superseded by ADR 0054; DATA-tier DR and Small-File production scope remain open. |
+| 0032 | Historical milestone | POSIX/Exact MVP, advanced reduction/GC, and DATA-tier DR now exist. FastCDC is superseded by ADR 0054; Small-File production scope remains open. |
 | 0033 | Current | model and FUSE share the Namespace dispatch seam. |
 | 0034 | Current | Inode IDs are durably reserved before visibility. |
 | 0035 | Implemented, evidence gates open | immutable sorted Runs, activation, partitioned compaction, filters, rebuild, bounded lookup, fallback, and fault tests exist. The ADR correctly remains `proposed` because corpus throughput and write-amplification gates are still open. |
 | 0036 | Current core; stale details | Successor DATA proofs and path-local Manifest publication exist. FastCDC/LRU text is superseded by ADRs 0054/0051, and the “deferred” cross-process lease is implemented by ADR 0069. |
 | 0037 | Current | structural recovery and current DATA graph proof remain separate. |
-| 0038 | Legacy-only drift | Paired-envelope proof exists solely to migrate a repository without high-water slots. ADR 0074 plus the pre-production no-migration decision make this path obsolete. |
-| 0039 | Current rotation; legacy drift | paired Commit slots and recovery are current. Single-file WAL migration language/code is obsolete; offline scrub is already implemented, not future. |
+| 0038 | Superseded by 0072 | Paired-envelope proof remains diagnostic; it no longer initializes writable allocator state. |
+| 0039 | Current | paired Commit slots are bounded from creation; recovery and scrub reject old single-slot inputs. |
 | 0040 | Current core; historical names | streaming Container prepublication and Commit coalescing exist. FastCDC wording is SeqCDC now; production DATA publication is io_uring under ADR 0058. |
 | 0041 | Current core; historical names | Active/Frozen overlap and bounded Ingest Lanes exist. FastCDC names should be read as SeqCDC under ADR 0054. |
-| 0042 | Current v2; compatibility question | authenticated allocation summaries drive truncate/splice. Readers still accept Manifest Inner v1, which should be removed if the no-prototype-data rule is applied to every object-local version. |
+| 0042 | Current v2 | authenticated allocation summaries drive truncate/splice; writer and reader accept only the current inner-node format. |
 | 0043 | Current implemented scope | metadata-only range clone is implemented; sparse-source clone remains deliberately deferred. |
-| 0044 | Current rotation; legacy drift | paired Exact activation slots are current. Former single-WAL migration code/text has no production data to serve. |
+| 0044 | Current | paired Exact activation slots are bounded from creation; former single-WAL input is unsupported. |
 | 0045 | Current | Exact compaction uses key-disjoint Run families and bounded partition targets. |
 | 0046 | Current | verified DATA cache, Exact-page cache, descriptor cache, process-only Swap admission, huge-page-backed dense filters, and telemetry are implemented. Its long io_uring history is explicitly superseded by ADR 0058. |
 | 0047 | Design open | bounded Dictionary training/family experiments exist, but durable activation and production write-through are still gated. |
@@ -97,31 +92,28 @@ that broad compatibility surface as a side effect of documentation review.
 | 0065 | Current | adaptive Online GC uses isolated idle I/O workers; offline full-speed requires lease/exclusivity. |
 | 0066 | Current | Metadata GC marks Commit graphs plus live root pins under the publication barrier. |
 | 0067 | Current | persistent Metadata marks are acceleration and are re-proved after start. |
-| 0068 | Current core; legacy clause obsolete | additive Metadata deltas and exact-mark fallbacks exist. `LegacyCommit` remains only because epoch-zero commits are still accepted. |
+| 0068 | Current | additive Metadata deltas and exact-mark fallbacks exist; unclassified publication is named directly and Metadata Mark readers accept only v2. |
 | 0069 | Current | one kernel-backed Appliance Lease precedes repository mutation. |
 | 0070 | Current | Recovery Latch and startup/shutdown ordering are implemented and tested. |
-| 0071 | Code/policy conflict | epoch-one writer/downgrade fence exists, but epoch-zero reader and upgrade path remain despite the later no-migration instruction. Keep the epoch field and unsupported-epoch rejection; remove epoch-zero compatibility. |
-| 0072 | Code/policy conflict | paired high-water slots and 1,024-generation reservation are current. Absent-slot legacy scan/migration remains and should be replaced by first-repository initialization only. |
+| 0071 | Current | every Commit is v2/epoch one; epoch zero and unknown epochs fail before mutation. |
+| 0072 | Current | paired high-water slots initialize only in an empty DATA repository; missing state beside Containers fails closed. |
 | 0073 | Current | read-only kernel caching, direct writable handles, explicit DATA invalidation, and adapter tests exist. |
-| 0074 | Current policy, incompletely enforced | only the current Policy Set is accepted. The same no-prototype-data rule is not yet applied consistently to legacy Commit/high-water/activation/Manifest readers. |
+| 0074 | Current | only the current Policy Set and current pre-production durable formats are accepted. |
 | 0075 | Current | Prefix Base recovery uses bounded envelope, Recovery Index, selected-record reads, and pass-local Base caching without Container v3. |
-| 0076 | Current | Similarity snapshots are partitioned by complete BucketKey ranges and use immutable family manifests. The old singleton migration clause is obsolete in a no-prototype-data repository. |
-| 0077 | Current | Verified Read Plan groups one Record read/decode, prefers same-Container forward Locations, preserves logical order, and leaves the single-extent hot path scalar. |
+| 0076 | Current | Similarity snapshots are partitioned by complete BucketKey ranges; singleton and multipart snapshots both use immutable family manifests. |
+| 0077 | Current | Verified Read Plan groups shared Records, coalesces directly adjacent Records up to 1 MiB, prefers same-Container forward Locations, preserves logical order, verifies every Record independently, and leaves the single-extent hot path scalar. |
+| 0078 | Current | Workspace and production builds target x86-64 only; scalar implementations remain differential or unsupported-host guards where required. |
+| 0079 | Current | Active filesystem Exact Runs use fully audited leased mappings plus compact page-key bounds; candidate pages retain the memory-governed decoded cache, while adapters and offline scrub remain positional. |
+| 0080 | Current | Checksummed current-only Pool records bind distinct Metadata/Data Pool IDs to one Appliance ID and fixed roles. Daemon startup and offline Scrub reject missing populated, corrupt, foreign, duplicate, swapped, and non-regular identities; exhaustive first-publication fault tests recover a valid pair. |
+| 0081 | Design open | Hard filesystem/project-quota isolation for Metadata reserve, Small-File data, and cache is not yet enforced or qualification-tested. |
+| 0082 | Design open | Pessimistic per-mutation Metadata/DATA capacity reservation before acknowledgement is not yet implemented. |
+| 0083 | Current | Cached five-second physical tier sampling, ten-percent reserve reporting, Metadata gating, and validated reporting-only overrides are implemented outside the hot loop. |
+| 0084 | Design open | Durable Small-File placement, the 8 MiB spill hysteresis, and separate quota behavior are not implemented. |
 
 ## Required follow-up
 
-1. Remove the epoch-zero and absent-high-water migration surface together, not
-   piecemeal. Update writer, recovery, scrub, Metadata-GC classification, fault
-   tests, and specs in one change. Also decide whether “no legacy data” covers
-   Manifest Inner v1, Metadata Mark v1, Namespace Root v1, and singleton
-   Similarity readers; the current code treats those object-local versions
-   inconsistently.
-2. Either implement DATA-tier Recovery Checkpoints as a complete writer,
-   reader/recovery, scrub, and fault-injection slice, or mark ADRs 0004/0020 and
-   the dependent part of 0023 as deferred. They must not read as delivered.
-3. Split ADR 0024's delivered `statfs` decision from the still-open Pool-ID,
-   physical-quota, and Small-File placement design before production planning.
-4. Treat speculative userspace read-ahead as an evidence-gated follow-up to
+1. Implement and qualify ADR 0081's physical quota isolation and ADR 0082's
+   bounded commit-capacity admission before Small-File placement under ADR 0084.
+2. Treat speculative userspace read-ahead as an evidence-gated follow-up to
    ADR 0077. Do not claim ADR 0030 complete merely because the kernel page cache
    performs its own readahead.
-

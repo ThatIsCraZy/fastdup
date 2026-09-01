@@ -1,11 +1,11 @@
 use fastdup_format::{
     COMMIT_RECORD_BYTES, ChunkId, ContainerId, DurableInode, ManifestExtent, ManifestInnerNode,
-    ManifestLeaf, MetadataObjectId, MetadataObjectKind, NamespaceEntry, NamespaceRoot, PolicySetId,
-    metadata_object_kind,
+    ManifestLeaf, MetadataObjectId, MetadataObjectKind, NamespaceEntry, NamespaceGraphRoot,
+    NamespaceRoot, PolicySetId, metadata_object_kind,
 };
 use fastdup_store::{
-    ContainerRepository, GenerationError, GenerationRepository, RepositoryFormatSupport,
-    RequiredChunkVerifier, StorageIo, StoreError, SuccessorPredecessor, WalTail,
+    ContainerRepository, GenerationError, GenerationRepository, RequiredChunkVerifier, StorageIo,
+    StoreError, SuccessorPredecessor, WalTail,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 use std::collections::BTreeMap;
@@ -358,76 +358,6 @@ fn every_generation_two_failpoint_recovers_only_the_previous_or_complete_next_ro
 }
 
 #[test]
-fn every_format_epoch_upgrade_fault_recovers_legacy_or_complete_fence() {
-    let policy = PolicySetId::new([0x53; 32]).expect("policy identity is nonzero");
-    let root = reservation_root(1_024);
-    let probe_storage = MemoryStorageIo::new();
-    let probe_legacy = GenerationRepository::new_with_format_support(
-        probe_storage.clone(),
-        policy,
-        RepositoryFormatSupport::legacy_only(),
-    );
-    probe_legacy
-        .commit_namespace(&root)
-        .expect("commit legacy fixture");
-    let baseline = probe_storage.operation_count();
-    GenerationRepository::new(probe_storage.clone(), policy)
-        .commit_namespace(&root)
-        .expect("commit epoch-one probe");
-    let upgrade_operations = probe_storage.operation_count() - baseline;
-    assert!(upgrade_operations > 0);
-
-    for fail_after_effect in [false, true] {
-        for relative in 0..upgrade_operations {
-            let position = baseline + relative;
-            let storage = if fail_after_effect {
-                MemoryStorageIo::with_fail_after(position)
-            } else {
-                MemoryStorageIo::with_fail_before(position)
-            };
-            GenerationRepository::new_with_format_support(
-                storage.clone(),
-                policy,
-                RepositoryFormatSupport::legacy_only(),
-            )
-            .commit_namespace(&root)
-            .expect("legacy fixture commits before the upgrade fault");
-            assert!(
-                GenerationRepository::new(storage.clone(), policy)
-                    .commit_namespace(&root)
-                    .is_err(),
-                "fault position {relative} must interrupt the epoch upgrade"
-            );
-            storage.crash();
-
-            let recovered = GenerationRepository::new(storage.clone(), policy)
-                .recover_latest()
-                .expect("modern recovery accepts the complete old or new epoch")
-                .expect("one complete generation survives");
-            assert!(matches!(recovered.record().format_epoch(), 0 | 1));
-            let legacy_recovery = GenerationRepository::new_with_format_support(
-                storage,
-                policy,
-                RepositoryFormatSupport::legacy_only(),
-            )
-            .recover_latest();
-            if recovered.record().format_epoch() == 1 {
-                assert!(matches!(
-                    legacy_recovery,
-                    Err(GenerationError::UnsupportedFormatEpoch { .. })
-                ));
-            } else {
-                assert!(
-                    legacy_recovery
-                        .expect("legacy epoch remains readable")
-                        .is_some()
-                );
-            }
-        }
-    }
-}
-
-#[test]
 fn every_nested_directory_failpoint_recovers_only_the_reservation_or_complete_tree() {
     let policy = PolicySetId::new([0x7B; 32]).expect("policy identity is nonzero");
     let old_root = reservation_root(1_024);
@@ -552,6 +482,35 @@ fn corrupt_newest_namespace_object_falls_back_as_one_whole_generation() {
     assert_eq!(recovered.namespace_root(), &old_root);
     assert_eq!(recovered.rejected_newer_generations(), 1);
     assert_eq!(recovered.wal_tail(), &WalTail::Clean);
+}
+
+#[test]
+fn missing_newest_namespace_shard_falls_back_as_one_whole_generation() {
+    let policy = PolicySetId::new([0x56; 32]).expect("policy identity is nonzero");
+    let storage = MemoryStorageIo::new();
+    let (repository, old_root) = seed_first_generation(&storage, policy);
+    let (_, new_record) =
+        commit_hole_generation(&repository, 5, 3).expect("generation two must commit");
+    let descriptor = NamespaceGraphRoot::decode(
+        &storage
+            .read(&metadata_name(new_record.namespace_root()))
+            .expect("newest descriptor exists"),
+    )
+    .expect("newest descriptor verifies");
+    let shard_name = metadata_name(descriptor.shards()[0].object_id());
+    storage
+        .remove_file(&shard_name)
+        .expect("remove one durable child shard");
+    storage.sync_root().expect("make missing shard durable");
+    storage.crash();
+
+    let recovered = GenerationRepository::new(storage, policy)
+        .recover_latest()
+        .expect("the earlier complete graph must recover")
+        .expect("generation one remains reachable");
+    assert_eq!(recovered.record().generation(), 2);
+    assert_eq!(recovered.namespace_root(), &old_root);
+    assert_eq!(recovered.rejected_newer_generations(), 1);
 }
 
 #[test]
@@ -1150,8 +1109,8 @@ fn every_rotation_failpoint_recovers_only_the_previous_or_complete_next_generati
 }
 
 #[test]
-#[ignore = "manual lifetime gate crosses the complete legacy 64-MiB Commit-WAL capacity"]
-fn commit_log_crosses_the_legacy_sixteen_thousand_commit_limit() {
+#[ignore = "manual lifetime gate crosses sixteen thousand Commit generations"]
+fn commit_log_crosses_sixteen_thousand_generations() {
     const COMMIT_COUNT: u64 = 16_400;
 
     let policy = PolicySetId::new([0x63; 32]).expect("policy identity is nonzero");
@@ -1162,7 +1121,7 @@ fn commit_log_crosses_the_legacy_sixteen_thousand_commit_limit() {
     for expected_generation in 1..=COMMIT_COUNT {
         let record = repository
             .commit_namespace(&root)
-            .expect("slot rotation must outlive the legacy WAL capacity");
+            .expect("slot rotation must remain lifetime-bounded");
         assert_eq!(record.generation(), expected_generation);
         latest = Some(record);
     }

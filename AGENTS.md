@@ -21,3 +21,10 @@
   format.
 - Pair each new durable invariant at writer, reader/recovery, and offline-scrub
   boundaries, including a fault-injection case where applicable.
+
+## Unsafe code
+
+- `unsafe` is permitted when an A/B benchmark demonstrates a measurable
+  advantage over the safe implementation. Keep it behind the smallest
+  auditable interface, document every safety invariant, and retain the
+  benchmark evidence in the repository.

@@ -4,8 +4,8 @@ use core::fmt;
 pub const COMMIT_RECORD_BYTES: usize = 4_096;
 const COMMIT_RECORD_BYTES_U32: u32 = 4_096;
 const COMMIT_MAGIC: &[u8; 8] = b"FDCMIT01";
-const LEGACY_FORMAT_VERSION: u16 = 1;
 const EPOCH_FORMAT_VERSION: u16 = 2;
+pub const CURRENT_REPOSITORY_FORMAT_EPOCH: u16 = 1;
 const RECORD_TYPE_NAMESPACE: u16 = 1;
 const HEADER_BYTES: u16 = 176;
 const BLAKE3_256_ALGORITHM: u16 = 1;
@@ -81,7 +81,7 @@ impl CommitRecord {
         inode_reservation_end: u64,
         inode_allocation_cursor: u64,
     ) -> Result<Self, CommitFormatError> {
-        Self::new_with_format_epoch(
+        Self::new_decoded(
             generation,
             previous_record_hash,
             namespace_root,
@@ -89,20 +89,12 @@ impl CommitRecord {
             namespace_mutation_cutoff,
             inode_reservation_end,
             inode_allocation_cursor,
-            0,
+            CURRENT_REPOSITORY_FORMAT_EPOCH,
         )
     }
 
-    /// Constructs one record carrying an explicit repository format epoch.
-    ///
-    /// Epoch zero encodes the legacy v1 record. A nonzero epoch encodes v2 so
-    /// pre-epoch readers reject the record rather than ignoring the fence.
-    ///
-    /// # Errors
-    ///
-    /// Applies the same chain and Inode allocator validation as [`Self::new`].
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_format_epoch(
+    fn new_decoded(
         generation: u64,
         previous_record_hash: CommitRecordHash,
         namespace_root: MetadataObjectId,
@@ -178,15 +170,7 @@ impl CommitRecord {
     pub fn encode(self) -> [u8; COMMIT_RECORD_BYTES] {
         let mut bytes = [0_u8; COMMIT_RECORD_BYTES];
         bytes[0..8].copy_from_slice(COMMIT_MAGIC);
-        put_u16(
-            &mut bytes,
-            8,
-            if self.format_epoch == 0 {
-                LEGACY_FORMAT_VERSION
-            } else {
-                EPOCH_FORMAT_VERSION
-            },
-        );
+        put_u16(&mut bytes, 8, EPOCH_FORMAT_VERSION);
         put_u16(&mut bytes, 10, RECORD_TYPE_NAMESPACE);
         put_u16(&mut bytes, 12, HEADER_BYTES);
         put_u16(&mut bytes, 14, BLAKE3_256_ALGORITHM);
@@ -205,7 +189,7 @@ impl CommitRecord {
         bytes
     }
 
-    /// Validates one complete Commit Record v1.
+    /// Validates one complete current Commit Record.
     ///
     /// # Errors
     ///
@@ -223,10 +207,9 @@ impl CommitRecord {
         }
         let format_version = get_u16(bytes, 8);
         let format_epoch = get_u16(bytes, 22);
-        if !matches!(
-            (format_version, format_epoch),
-            (LEGACY_FORMAT_VERSION, 0) | (EPOCH_FORMAT_VERSION, 1..=u16::MAX)
-        ) || get_u16(bytes, 10) != RECORD_TYPE_NAMESPACE
+        if format_version != EPOCH_FORMAT_VERSION
+            || format_epoch != CURRENT_REPOSITORY_FORMAT_EPOCH
+            || get_u16(bytes, 10) != RECORD_TYPE_NAMESPACE
             || get_u16(bytes, 12) != HEADER_BYTES
             || get_u16(bytes, 14) != BLAKE3_256_ALGORITHM
             || usize::try_from(get_u32(bytes, 16)) != Ok(COMMIT_RECORD_BYTES)
@@ -246,7 +229,7 @@ impl CommitRecord {
         let mut policy_set = [0_u8; 32];
         policy_set.copy_from_slice(&bytes[112..144]);
         let policy_set = PolicySetId::new(policy_set).ok_or(CommitFormatError::InvalidPolicySet)?;
-        Self::new_with_format_epoch(
+        Self::new_decoded(
             get_u64(bytes, 40),
             CommitRecordHash::from_bytes(previous_hash),
             namespace_root,

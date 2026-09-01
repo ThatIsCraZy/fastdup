@@ -498,8 +498,9 @@ bytes, maximum eviction steps, available RAM, and Swap use after checkpoints.
   Container-generation discovery performs its O(number of Containers)
   envelope scan only once when migrating a repository without durable
   high-water slots.
-- The bounded v2 Namespace Root stores regular and directory inode versions
-  plus nested byte-exact entries. `mkdir`, empty-only `rmdir`, `..`, link counts,
+- The current Namespace Root descriptor binds bounded content-defined Shards
+  whose canonical state stores regular and directory inode versions plus
+  nested byte-exact entries. `mkdir`, empty-only `rmdir`, `..`, link counts,
   cycle rejection, cross-parent rename, recovery, and scrub share the same
   namespace rules. The compatibility Manifest planner retains its documented
   metadata size limits.

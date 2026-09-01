@@ -4,7 +4,7 @@ Status: experimental and implemented; pre-`format-v1-stable`.
 
 This specification records the exact durable bytes and publication behavior of
 the first metadata-generation checkpoint. It makes the current implementation
-of immutable Manifest trees, the bounded Namespace Root, and the paired Commit Log
+of immutable Manifest trees, the sharded Namespace graph, and the paired Commit Log
 auditable without claiming the complete POSIX Exact-Dedup MVP.
 
 The governing decisions are [ADR 0011](../adr/0011-use-hierarchical-immutable-manifests.md),
@@ -46,6 +46,10 @@ The implemented constants are:
 | Manifest inner-node payload header | 64 bytes |
 | Manifest child-range entry | 64 bytes |
 | Namespace Root payload header | 128 bytes |
+| Namespace graph descriptor header | 128 bytes |
+| Namespace graph shard reference | 48 bytes |
+| Namespace Shard payload header | 96 bytes |
+| Namespace Shard FastCDC profile | 256-KiB minimum, 512-KiB average, 1-MiB maximum |
 | Durable Inode record | 96 bytes |
 | Namespace Entry fixed header | 24 bytes |
 | Namespace Entry alignment | 8 bytes |
@@ -74,7 +78,7 @@ offset 4,096. Every byte after the payload through EOF is zero.
 | 0 | 8 | `magic` | ASCII `FDMDOBJ1` |
 | 8 | 2 | `format_version` | `1` |
 | 10 | 2 | `header_length` | `4,096` |
-| 12 | 2 | `object_kind` | `1` = Manifest Leaf, `2` = Namespace Root, `3` = Exact Index Run Set, `4` = Manifest Inner Node |
+| 12 | 2 | `object_kind` | `1` = Manifest Leaf, `2` = Namespace Root descriptor, `3` = Exact Index Run Set, `4` = Manifest Inner Node, `5` = Namespace Shard |
 | 14 | 2 | `object_id_algorithm` | `1` = unkeyed BLAKE3-256 |
 | 16 | 8 | required-flags slot | zero |
 | 24 | 8 | compatible-flags slot | zero |
@@ -231,17 +235,39 @@ derives allocation from v2 summaries plus the replacement, and retains complete
 prefix and shifted-suffix child IDs. HOLE/FILL may split at either boundary;
 DATA may not.
 
-## Namespace Root v1, v2, v3, and v4 payload
+## Namespace graph descriptor v1
 
-A Namespace Root is Metadata Object kind `2`. Both versions embed inode
-versions and directory entries in one bounded object. Version 1 is the legacy
-flat form with only the implicit root Inode ID `1`; every v1 inode record is a
-regular file. Version 2 adds directory inode records and nested parent IDs.
-Version 3 adds root-inode metadata, per-inode immutable flags, and bounded
-inline extended attributes including POSIX ACL wire values. Version 4 adds
-nanosecond timestamps and byte-exact symbolic-link targets. Writers emit v3
-when v4 state is absent and v4 otherwise; readers retain v1 and v2 support. This remains a pre-stable, bounded format
-rather than the final scalable namespace tree.
+A Namespace Root is Metadata Object kind `2`. It is a compact descriptor, not
+the complete namespace state. Its 128-byte header contains magic `FDNSGR01`,
+format version `1`, header length `128`, shard-reference length `48`, FastCDC
+profile `1`, the inode reservation end, allocation cursor, namespace mutation
+sequence, canonical-state byte length, nonzero shard count, BLAKE3 hash of the
+complete canonical state, inode count, and entry count; all remaining bytes are
+zero. Each ordered 48-byte reference contains the exact logical byte offset,
+nonzero length no greater than 1 MiB, a zero reserved word, and the Namespace
+Shard Metadata Object ID. References form one exact contiguous partition of the
+canonical byte stream.
+
+A Namespace Shard is Metadata Object kind `5`. Its payload begins with a
+96-byte header containing magic `FDNSSH01`, format version `1`, header length
+`96`, FastCDC profile `1`, and the exact following slice length; every reserved
+byte is zero. The final shard may be shorter than 256 KiB. The descriptor binds
+order, offsets, total length, and the full-stream hash, so no individual shard
+has generation-local position fields and unchanged content-defined pieces can
+retain their Object IDs across namespace edits.
+
+Writers emit only this graph form. They canonicalize and validate the complete
+logical state, apply FastCDC v2020 with the fixed profile, publish unique shards
+child-first, sync the Metadata directory once after publishing the descriptor,
+and append the Commit Record last. Readers accept no former flat-root form.
+
+## Canonical Namespace State v4
+
+The reconstructed shard stream is the version-4 canonical Namespace state. It
+contains inode versions, directory entries, root and per-inode metadata,
+nanosecond timestamps, byte-exact symbolic-link targets, and bounded inline
+extended attributes including POSIX ACL wire values. It is globally decoded
+and validated only after every shard and the full-stream hash verify.
 
 The payload layout is:
 
@@ -249,28 +275,26 @@ The payload layout is:
 [128-byte header]
 [inode_count * 96-byte Durable Inode records]
 [entry_count variable Namespace Entry records]
-[xattr_count variable Xattr records, v3/v4 only]
-[inode_count + 1 variable POSIX metadata records, v4 only]
+[xattr_count variable Xattr records]
+[inode_count + 1 variable POSIX metadata records]
 ```
 
-There are no bytes after the final Xattr record. A v1 or v2 payload ends after
-its final Namespace Entry. An empty v3 namespace without root attributes
-consists of the 128-byte payload header alone.
+There are no bytes after the final POSIX metadata record.
 
 ### Namespace Root header
 
 | Offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
 | 0 | 8 | `magic` | ASCII `FDNSRT01` |
-| 8 | 2 | `format_version` | `1`, `2`, `3`, or `4`; writers emit `3` or `4` |
+| 8 | 2 | `format_version` | `4` |
 | 10 | 2 | `header_length` | `128` |
 | 12 | 2 | `inode_record_length` | `96` |
 | 14 | 2 | `entry_header_length` | `24` |
-| 16 | 2 | `root_mode` | v3/v4: root permission and special bits; v1/v2: zero |
+| 16 | 2 | `root_mode` | root permission and special bits |
 | 18 | 2 | reserved | zero |
-| 20 | 4 | `root_uid` | v3/v4: root owner UID; v1/v2: zero |
-| 24 | 4 | `root_gid` | v3/v4: root owner GID; v1/v2: zero |
-| 28 | 4 | `root_file_flags` | v3/v4: zero or `FS_IMMUTABLE_FL` (`0x10`); v1/v2: zero |
+| 20 | 4 | `root_uid` | root owner UID |
+| 24 | 4 | `root_gid` | root owner GID |
+| 28 | 4 | `root_file_flags` | zero or `FS_IMMUTABLE_FL` (`0x10`) |
 | 32 | 8 | `root_inode` | `1` |
 | 40 | 8 | `inode_reservation_end` | at least `2`, and greater than every inode record ID |
 | 48 | 8 | `namespace_mutation_sequence` | committed namespace mutation cutoff |
@@ -280,14 +304,14 @@ consists of the 128-byte payload header alone.
 | 72 | 8 | `entries_offset` | `128 + inode_count * 96` |
 | 80 | 8 | `payload_length` | exact payload length through the final entry |
 | 88 | 8 | `inode_allocation_cursor` | at least `2`, no greater than `inode_reservation_end`, and greater than every inode record ID |
-| 96 | 4 | `xattr_count` | v3/v4: total root-plus-inode Xattr records; v1/v2: zero |
-| 100 | 2 | `xattr_record_header_length` | v3/v4: `24`; v1/v2: zero |
+| 96 | 4 | `xattr_count` | total root-plus-inode Xattr records |
+| 100 | 2 | `xattr_record_header_length` | `24` |
 | 102 | 2 | reserved | zero |
-| 104 | 8 | `xattrs_offset` | v3/v4: exact end of Namespace Entry records; v1/v2: zero |
-| 112 | 4 | `posix_metadata_count` | v4: `inode_count + 1`; older versions: zero |
-| 116 | 2 | `posix_metadata_header_length` | v4: `64`; older versions: zero |
+| 104 | 8 | `xattrs_offset` | exact end of Namespace Entry records |
+| 112 | 4 | `posix_metadata_count` | `inode_count + 1` |
+| 116 | 2 | `posix_metadata_header_length` | `64` |
 | 118 | 2 | reserved | zero |
-| 120 | 8 | `posix_metadata_offset` | v4: exact end of Xattr records; older versions: zero |
+| 120 | 8 | `posix_metadata_offset` | exact end of Xattr records |
 
 The field widths sum to 128 bytes. Before allocating record vectors, a reader
 proves the inode byte equation, `entries_offset <= payload_length`, and that
@@ -310,14 +334,14 @@ prevents reuse after falling back to an older metadata graph.
 | ---: | ---: | --- | --- |
 | 0 | 8 | `inode_id` | greater than `1` |
 | 8 | 2 | `mode` | stored POSIX mode bits |
-| 10 | 2 | `inode_kind` | v1: zero and implicitly regular; v2/v3: `1` = regular, `2` = directory; v4 also permits `3` = symlink |
+| 10 | 2 | `inode_kind` | `1` = regular, `2` = directory, `3` = symlink |
 | 12 | 4 | `uid` | stored owner UID |
 | 16 | 4 | `gid` | stored owner GID |
 | 20 | 4 | `link_count` | regular/symlink: incoming names; directory: `2 + immediate child directories` |
 | 24 | 8 | `mutation_sequence` | committed per-inode mutation sequence |
 | 32 | 8 | `logical_size` | regular: exact Manifest length; symlink: target length; directory: zero |
 | 40 | 32 | `manifest_root` | regular: nonzero Metadata Object ID; directory/symlink: zero |
-| 72 | 4 | `file_flags` | v3/v4: zero or `FS_IMMUTABLE_FL` (`0x10`); v1/v2: zero |
+| 72 | 4 | `file_flags` | zero or `FS_IMMUTABLE_FL` (`0x10`) |
 | 76 | 20 | reserved | zero |
 
 The field widths sum to 96 bytes. Records are strictly increasing by numeric
@@ -349,7 +373,7 @@ reach every inode exactly once except that several names may reach one regular
 inode. Recovery and scrub reject dangling parents, non-directory parents,
 cycles, disconnected subtrees, and incorrect link counts.
 
-### Xattr record (v3)
+### Xattr record (v4)
 
 | Relative offset | Width | Field | Requirement |
 | ---: | ---: | --- | --- |
@@ -450,8 +474,8 @@ in byte order.
 - paired Commit Log slots: `commit.wal` and `commit.1.wal`
 
 Metadata publication looks up these exact ASCII names. Recovery follows IDs
-referenced from Commit Records and Namespace Roots; it does not currently scan
-or reject unrelated or malformed unreferenced `.fdm` names. Temporary and
+referenced from Commit Records, Namespace Root descriptors, and their Shards;
+it does not currently scan or reject unrelated or malformed unreferenced `.fdm` names. Temporary and
 unreferenced valid objects are not selected by a Commit Record and remain
 invisible metadata orphans.
 
@@ -464,7 +488,8 @@ lifetime, as required by ADR 0069.
 
 ### Immutable Metadata Object publication
 
-For each Manifest Leaf, and later for the Namespace Root, the writer:
+For each Manifest node and each unique Namespace Shard, then for the Namespace
+Root descriptor, the writer:
 
 1. Encodes and validates the complete generic envelope and derives its Object
    ID.
@@ -481,7 +506,8 @@ For each Manifest Leaf, and later for the Namespace Root, the writer:
    production-verified Object ID.
 7. Synchronizes the temporary file.
 8. Renames it to the published name without replacement.
-9. Synchronizes the containing directory.
+9. Synchronizes the containing directory. One Namespace graph stages all
+   unique children and its descriptor before performing this sync once.
 
 Unlike Container v1, a Metadata Object has no BUILDING/SEALED state in its
 header. Its temporary filename controls publication. A failure may leave a
@@ -510,8 +536,9 @@ The implemented `commit_namespace` and `commit_namespace_with_data` sequence is:
    is passed to the ordinary verifier. The adapter asserts that this delta is a
    subset of the independently reread proposed graph. It is not used by
    recovery or offline verification.
-2. Encode and publish the complete Namespace Root using the immutable-object
-   protocol above.
+2. Encode the complete canonical Namespace state, split it with the fixed
+   FastCDC profile, publish every unique Shard child-first, publish the compact
+   Namespace Root descriptor, and synchronize the Metadata directory once.
 3. Ensure both fixed Commit Log names exist. Initial creation sets each length
    to zero and synchronizes each file, then synchronizes the containing
    directory. Retry synchronizes the directory again before relying on either
@@ -700,8 +727,10 @@ Normal recovery performs these steps:
    newer writer contract by rolling back.
 5. Build the Recovery Transition Prefix **forward**, oldest to newest. For each
    record, read `<namespace_root>.fdm`; enforce the 16-MiB bound, generic
-   envelope identity, kind `2`, complete Namespace Root payload invariants,
-   link counts, reservation bound, and allocation cursor bound.
+   envelope identity, kind `2`, descriptor fields and exact shard partition,
+   then read and authenticate every named kind-`5` shard. Require the assembled
+   length and BLAKE3 hash before validating the complete canonical Namespace
+   state, link counts, reservation bound, and allocation cursor bound.
 6. Require the root's namespace mutation sequence, reservation end, and
    allocation cursor to equal all three values copied into the Commit Record.
    Verify the same monotone namespace, reservation, allocation, inode-mutation,
@@ -748,7 +777,7 @@ is required before that repository can advance again.
 | --- | --- | --- | --- |
 | Object ID identifies exact kind and payload | derive after canonical payload encoding; re-read exact bytes before sync | recompute domain-separated ID and pair it with every referenced filename | substituted or mutated valid-looking bytes fail identity/equality checks |
 | Manifest is one complete byte-exact recipe | validate leaf extents, inner levels, and full child partitions before child-first publication | repeat envelope, level, child range, extent, length, and partition validation | every inner-node prefix and single-byte mutation is rejected without panic; one changed leaf creates only that leaf and its new root path |
-| Namespace has no dangling or reused inode state | canonicalize, validate target existence, cross-check every link count, and bound every ID below the allocation cursor | reject reordered/duplicate IDs and names, dangling targets, orphans, bad names, decreasing cursors, or IDs reused below a prior cursor | reauthenticated order/count corruption, invalid transitions, and exhaustive truncation/byte corruption are rejected |
+| Namespace graph is complete and namespace state has no dangling or reused inode state | canonicalize and validate globally; content-define bounded shards; bind their exact order, offsets, total length, full hash, counters, and IDs in one descriptor; publish children before root | authenticate every descriptor/shard object, require an exact contiguous partition and full-stream hash, then reject reordered/duplicate IDs and names, dangling targets, orphans, bad names, decreasing cursors, or IDs reused below a prior cursor | a public checkpoint above 16 MiB recovers and scrubs; missing/corrupt shard injection, reauthenticated order/count corruption, invalid transitions, and exhaustive truncation/byte corruption are rejected |
 | Inode reservation precedes visibility | generation 1 is reservation-only; later allocation cannot cross the preceding record's durable reservation end | validate forward transitions and retain the structurally valid WAL reservation high-water across graph fallback | premature use of a newly extended range and reuse of a removed inode both fail |
 | Commit Record is atomic visibility | publish and sync dependencies before append or rotation; re-read exact target; sync its slot last | accept only internally valid slots with exact cross-slot bridge continuity, validate transitions forward, then prove live graph candidates backward | exhaustive fail-before/fail-after rotation recovers only the previous or complete next generation; a 16,400-Commit lifetime gate crosses the old cap |
 | DATA is durable before visibility and verified before reads | initial/recovered graphs verify every referenced ID and length; a serialized successor composes unchanged predecessor proof with complete changed-dependency verification before WAL append | recovery completely verifies the selected current/previous candidate; demand reads re-verify the containing container; any unusable index candidate invokes the complete scan | healthy recovery proves only the newest graph, missing newest DATA falls back atomically once, unpinned history is never exposed, index-page corruption takes the scan path, suffix-proof work is independent of preserved-prefix size, and corruption after file construction fails demand reads |
@@ -766,12 +795,13 @@ This implemented checkpoint intentionally does **not** provide:
   Snapshot and Addition runs suppress unchanged and safely additive online
   cycles, but the first cycle after process start deliberately rebuilds the
   exact mark because those unpublished pins ended with the process;
-- a scalable Namespace tree: NamespaceRoot v4 rewrites one bounded object and
-  keeps xattrs, ACLs, timestamps, and symlink targets inline; external
-  large-metadata objects remain future work;
+- incremental Namespace-tree updates: graph sharding removes the per-object
+  capacity limit and content-defined boundaries retain unaffected pieces, but
+  checkpoint construction still canonicalizes the complete in-memory state;
 - automatic dirty-tail repair;
 - serialization or transitive verification of the Policy Set itself;
-- data-tier Recovery Checkpoints or metadata-tier-loss rebuild.
+- automatic `lost+found` discovery of objects created after the selected
+  data-tier Recovery Checkpoint.
 
 These omissions are stage boundaries, not implicit format promises. Unknown
 future kinds, versions, flags, tree nodes, and record types require explicit

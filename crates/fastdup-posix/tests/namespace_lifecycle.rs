@@ -445,7 +445,10 @@ fn seek_write_truncate_and_access_modes_are_checked() {
         panic!("ASSERT: truncate returned the wrong reply variant");
     };
     assert_eq!(shrunk.size, 4);
-    assert_eq!(shrunk.mutation_sequence, 2);
+    assert_eq!(
+        shrunk.mutation_sequence, 3,
+        "the preceding read persisted one relatime Inode Version"
+    );
 
     assert_eq!(
         namespace.dispatch(
@@ -459,7 +462,7 @@ fn seek_write_truncate_and_access_modes_are_checked() {
         ),
         Ok(Reply::Written {
             bytes: 0,
-            mutation_sequence: 2,
+            mutation_sequence: 3,
             offset: 10_000,
         })
     );

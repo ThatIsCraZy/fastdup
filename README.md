@@ -92,8 +92,13 @@ Der FUSE-Pfad unterstützt unter anderem:
   erneut zu lesen oder zu chunken
 - absturzsichere Checkpoints und Recovery auf den jüngsten vollständigen
   Commit
+- selbstständige DATA-Tier-Recovery-Checkpoints für vollständigen Verlust der
+  NVMe-Metadaten; aktueller und vorheriger Stand bleiben unabhängig prüfbar
 - Unterverzeichnisse, Hardlinks, Symlinks, xattrs/ACLs, Besitz, Rechte,
   Zeitstempel und flüchtige POSIX-Record-Locks
+- Namespace-Zustände oberhalb der 16-MiB-Objektgrenze: eine Commit-Root bindet
+  geordnete, content-definierte 256-KiB/512-KiB/1-MiB-Shards; Recovery, GC,
+  Scrub und DATA-Tier-Recovery prüfen denselben vollständigen Graphen
 - `statfs`, dünne Allokation, Hole Punch, Zero Range und DATA/HOLE-Seeks
 - Kernel-Read-Cache und Readahead für Read-only-Handles mit expliziter
   Bereichsinvalidierung; Read-only-`mmap` ist kohärent, Shared-writable-`mmap`
@@ -136,14 +141,15 @@ Upgrade-/Allocator-Grenzen geschlossen:
   ihn stehen; nur vollständige Recovery plus sauberer Shutdown oder ein
   erfolgreicher Offline-Scrub entfernen ihn. Fehler beim Setzen/Löschen sowie
   fehlerhafte Dateien und Symlinks werden fail-closed geprüft.
-- Commit Record v2 trägt eine monotone Repository Format Epoch. Der aktuelle
-  Writer liest Epoch 0/1, schreibt Epoch 1 und lehnt unbekannte oder fallende
-  Epochen bei Append, Recovery und Scrub ab. Ein alter Writer kann den v2-Zaun
-  nicht als gültigen v1-Commit überschreiben.
+- Commit Record v2 trägt Repository Format Epoch 1. Writer, Recovery und Scrub
+  akzeptieren ausschließlich Epoch 1; Commit-v1/Epoch-0 ist nicht migrierbarer
+  Vorproduktionszustand und wird vor jeder Repository-Mutation abgewiesen.
 - Zwei verkettete 4-KiB-DATA-Slots reservieren Container-Generationen in
-  1.024er-Bereichen dauerhaft. Nach einer einmaligen Legacy-Envelope-Migration
-  benötigt ein gesunder Start keinen Container-Verzeichnis-Scan mehr; Crashs
-  dürfen Nummern überspringen, aber niemals wiederverwenden.
+  1.024er-Bereichen dauerhaft. Sie dürfen nur in einem leeren DATA-Repository
+  initialisiert werden; ein nichtleeres Repository ohne High-Water wird ohne
+  Envelope-Migration abgewiesen. Ein gesunder Start benötigt keinen
+  Container-Verzeichnis-Scan; Crashs dürfen Nummern überspringen, aber niemals
+  wiederverwenden.
 - Read-only-FUSE-Handles nutzen jetzt den Kernel-Page-Cache mit `KEEP_CACHE`;
   schreibfähige Handles bleiben `DIRECT_IO`, Writeback bleibt aus. Erfolgreiche
   Writes, Truncates, Clone-/Fallocate-Mutationen invalidieren vor ihrer Antwort
@@ -171,10 +177,12 @@ Upgrade-/Allocator-Grenzen geschlossen:
 - Der Supervisor, die Latch-I/O und deren Synchronisation liegen ausschließlich
   im Daemon-/Maintenance-Kontrollpfad. Auch Epoch-Prüfung und High-Water-I/O
   liegen an Repository-Open, Commit, Container-Publikation und Scrub. Die
-  POSIX-Namespace-, Ingest-Admission- und Reduktions-Hot-Loops erhielten weder
-  zusätzliche Dateisystem-I/O noch neue Locks. Der Write-Pfad trägt nur einen
-  Inode-lokalen Atomic-Load; Kernel-Cache-Notify bleibt am FUSE-Rand und läuft
-  nur nach einer erfolgreichen Inhaltsmutation eines cache-exponierten Inodes.
+  POSIX-Namespace-, Ingest-Admission- und Reduktions-Hot-Loops erhielten keine
+  zusätzliche Dateisystem-I/O und keinen neuen globalen Lock. Der Write-Pfad
+  trägt neben dem Inode-lokalen Cache-Atomic nur begrenzte atomare
+  Kapazitäts-Claims; `statvfs`, Commit-Epoch-Rotation und deren Mutex bleiben
+  im Kontrollpfad. Kernel-Cache-Notify bleibt am FUSE-Rand und läuft nur nach
+  einer erfolgreichen Inhaltsmutation eines cache-exponierten Inodes.
 - Der vollständige serielle Workspace-Test, Clippy, der Release-Build und die
   reale siebenstufige SIGKILL/FUSE-Remount-Matrix sind für diesen Stand grün.
   Dauerhaft blockierte oder fehlerhaft bestätigende Hardware bleibt außerhalb
@@ -186,34 +194,74 @@ Upgrade-/Allocator-Grenzen geschlossen:
   cachen wiederholt verwendete Bases nur für den laufenden Container-Read.
   Physische Base-Adressen bleiben ausschließlich rebuildbare
   Location-Beschleunigung.
+- Commit, geschardeter Namespace-Graph, Manifest Leaf/Inner, Exact Run Set,
+  Metadata-Mark und Similarity-Publikation besitzen jeweils nur noch ihren
+  aktuellen Writer- und Readerpfad. Similarity nutzt auch für Singleton-Snapshots immer
+  Partition plus Family-Manifest; Vorproduktionsformate werden nicht migriert.
+- Restore-Read-Pläne sortieren ausgewählte Exact-Locations nach
+  Container/Record-Offset und lesen direkt benachbarte Records desselben
+  Containers in einem höchstens 1-MiB großen DATA-Read. Jeder Record wird aus
+  seinem eigenen Slice weiterhin vollständig und unabhängig verifiziert; die
+  logische Ausgabeordnung und der skalare Einzel-Extent-Pfad bleiben erhalten.
+- Ein separater Worker schreibt alle 90 Sekunden und beim sauberen Shutdown
+  einen selbstständigen Recovery Checkpoint auf das DATA Tier. Zwei verkettete
+  Selector-Slots halten den aktuellen und vorherigen vollständigen Graphen.
+  Nach vollständigem Metadata-Tier-Verlust werden Checkpoint und DATA vor der
+  ersten Metadata-Mutation geprüft, der originale Commit zuletzt installiert
+  und Exact beziehungsweise Exact/Similarity vor dem Mount neu aufgebaut.
+  Root-Pins binden parallel laufendes GC; Graphscan, Verifikation und HDD-I/O
+  halten weder den Commit-Lock noch die Metadata-GC-Publikationsbarriere.
+- Metadata- und DATA-Pool tragen checksummierte persistente Identitäten. Beide
+  teilen eine Appliance-ID, besitzen verschiedene Pool-IDs und feste Rollen;
+  vertauschte Pfade, fremde Pools, doppelte IDs, Symlinks und befüllte
+  Vorproduktions-Pools ohne Identität scheitern vor Recovery beziehungsweise
+  Offline-Scrub. Die Initialisierung ist gegen jeden Publikationsabbruch
+  fault-injection-getestet und berührt keine Ingest-Hot-Loop.
+- Produktiver Writable-Start verlangt zwei physisch getrennte XFS-
+  Dateisysteme; verschiedene Verzeichnisse oder Pool-IDs allein genügen nicht.
+  Nur `FASTDUP_POOL_ISOLATION=lab-allow-shared` erlaubt bewusst einen
+  nicht-produktiven Ein-Disk-Aufbau. Ein lock-freier
+  `CommitCapacityGovernor` schützt dauerhaft 64 MiB Metadata-Commit-Reserve
+  und reserviert vor jeder sichtbaren Mutation den pessimistischen Metadata-/
+  DATA-Footprint. `ENOSPC` kommt vor der Mutation; Reads und Cleanup bleiben
+  möglich. Claims bleiben bei fehlgeschlagenem Commit gebunden und werden erst
+  nach durablem Commit plus nachfolgender physischer Kapazitätsmessung
+  freigegeben.
 
 ## Empfohlener nächster Entwicklungsabschnitt
 
-Als Nächstes sollte der opt-in Advanced-Reduction-Pfad gegen ein breiteres,
-realistisch entwickeltes Backup-Corpus und mehrere ABBA-Wiederholungen
-qualifiziert werden. Der erste reale Lauf belegt den funktionierenden
-Similarity-/Prefix-Pfad und null Prozess-Swap, zeigt aber nur 0,0527 % weniger
-Repository-Allokation. Der aktuelle Format-2-Recovery-Index-Resolver senkt das
-damalige Prefix-/Off-GC-Verhältnis von 3,424 auf 1,306. Eine erneute Prüfung des
-verworfenen Format-3-Digests und 3-KiB-Base-Filters fand keinen isolierten
-Writer-Nachteil, aber auch nur höchstens 1,47 % vermeidbare Bytes pro
-vollständigem Provider-Probe. Format 2 bleibt deshalb das einzige Format; bei
-erneut messbarer Base-Resolution-Verstärkung ist zuerst ein poolweiter
-pass-lokaler Resolver ohne neue dauerhafte Felder zu testen.
+Die Kapazitätsentscheidungen aus ADR 0081 bis 0083 sind umgesetzt. Als Nächstes
+sollte die policy-gesteuerte Small-File-Platzierung aus ADR 0084 ihre eigene
+XFS-Projektquota erhalten, ohne die geschützte Metadata-Reserve ausleihen zu
+können. Parallel bleibt der HDD-Lesepfad auf echter rotierender Hardware zu
+qualifizieren. Der korrigierte A/B nutzt den produktiven
+`IoUringStorageIo`-Adapter: Bei 64-KiB-Chunks sinken Ring-Submissions von 128
+auf 16 und der Planned-Pfad ist im Median 25,7 Prozent schneller. Beide Pfade
+erzeugen wegen Kernel-Readahead trotzdem dieselben zehn sequenziellen Block-
+Reads. Bei 256-KiB-Chunks sinken Submissions nur von 128 auf 64, Block-Reads von
+34 auf 33, und Planned ist 12,0 Prozent langsamer. Obwohl der Gast `ROTA=1`
+meldet, wurde keine HDD-Latenz emuliert. Coalescing bleibt für das HDD-Ziel
+aktiv; ein Schwellwert, spekulatives Readahead oder Parallel-I/O benötigt zuerst
+fragmentierte Messungen auf echter HDD. Gleichzeitig bleibt der opt-in
+Advanced-Reduction-Pfad gegen breitere Backup-Corpora zu qualifizieren.
 
 Der Abschnitt ist abgeschlossen, wenn:
 
-1. mehrere versionierte Backup-Familien statt nur acht Ein-Byte-Änderungen pro
-   ISO Exact-, Similarity- und Fallback-Entscheidungen reproduzierbar auslösen;
-2. ABBA-Läufe Kapazität, SMB-Durchsatz, completed-write-p99, Restore und
-   Prozess-/cgroup-Swap gemeinsam ausweisen;
-3. breitere Prefix-ABBA-Läufe bestätigen das aktuelle GC-Verhältnis und messen
-   Base-Resolver-I/O getrennt von vollständiger Containerverifikation und
-   Relocation;
-4. alle Restores bytegenau sowie Recovery, Scrub und GC fail-closed bleiben;
+1. ein alternierender Cold-Restore-A/B auf physischer HDD oder dem geplanten
+   redundanten HDD-Array sequenzielle, fragmentierte und Container-übergreifende
+   Dateien abdeckt;
+2. Small-File-Workloads Suchwege, IOPS, Platzverbrauch und Write Amplification
+   messen, bevor ein dauerhaftes Platzierungsformat festgelegt wird;
+3. gefüllte Cache- und Small-File-Quoten die Metadata-Reserve nicht verbrauchen
+   und jede zugelassene Mutation ihren bounded Commit abschließen kann;
+4. mehrere versionierte Backup-Familien Exact-, Similarity- und Fallback-
+   Entscheidungen reproduzierbar auslösen und ABBA-Läufe Kapazität,
+   SMB-Durchsatz, completed-write-p99, Restore und Swap gemeinsam ausweisen;
+5. alle Restores bytegenau sowie Recovery, Scrub und GC fail-closed bleiben;
    und
-5. Metrik, Cache-Governance und Policy-Auswahl weiterhin keine Locks, Syscalls
-   oder Speicher-Samples in die Ingest- und Candidate-Hot-Loops einführen.
+6. weder Restore-Optimierung noch Metrik, Cache-Governance oder Policy-Auswahl
+   neue Locks, Syscalls oder Speicher-Samples in die Ingest- und Candidate-
+   Hot-Loops einführen.
 
 Danach folgen die randomisierte Process-Kill-Kampagne, Blockgeräte-Power-Cut-/
 Torn-Write-Tests und die offenen POSIX-/Samba-Matrizen.
@@ -304,6 +352,13 @@ einem Absturz lädt fastdup die jüngste vollständige Generation. Eine
 unterbrochene Datei kann deshalb mit ihrem bereits committeten Präfix
 zurückkehren.
 
+Unabhängig davon versucht der Daemon alle 90 Sekunden und beim geordneten
+Shutdown, den vollständigen Graphen eines Commit als unveränderlichen Recovery
+Checkpoint auf das DATA Tier zu schreiben. Er dient ausschließlich dem Verlust
+des kompletten Metadata Tiers. Discovery läuft über zwei feste, verkettete
+Head-Slots; Recovery akzeptiert nur einen vollständig geprüften Checkpoint samt
+aller erreichbaren DATA-Abhängigkeiten.
+
 Der Standard-Daemon plant etwa alle fünf Sekunden einen Checkpoint. Bei 512
 MiB einzigartiger, noch nicht committeter DATA stoppt er kurz die Aufnahme
 neuer Mutationen, um die Dirty-DATA-Menge zu begrenzen. `fsync` erzeugt keine
@@ -317,6 +372,10 @@ Die dauerhaften Grenzen werden mehrfach geprüft:
 - Ein verkettetes, gechecksummtes Commit-WAL wählt die Namespace-Generation.
 - Der Exact Index darf fehlen oder neu aufgebaut werden, ohne zur
   Inhaltsautorität zu werden.
+- Aktivierte Exact-Runs werden nach vollständigem Audit read-only unter einer
+  Immutable-File-Lease gemappt. Kompakte Seitengrenzen halten die binäre Suche
+  aus I/O und decoded Page Cache heraus; Adapter-Fallback, Publication und
+  Offline-Scrub bleiben unabhängige bounded `read_exact_at`-Pfade.
 - Scrub prüft erreichbare Generationen, Container und aktive Locations.
 
 Container werden zunächst aufgebaut, vollständig erneut gelesen und geprüft,
@@ -329,7 +388,9 @@ Details stehen im
 [Checkpoint-Testplan](docs/testing/durable-posix-checkpoint.md), in der
 [Container-Spezifikation](docs/specs/container-v1.md), der
 [Metadatenspezifikation](docs/specs/metadata-generation-v1.md) und der
-[Exact-Index-Spezifikation](docs/specs/exact-index-run-v1.md).
+[Exact-Index-Spezifikation](docs/specs/exact-index-run-v1.md). Das DATA-Tier-
+Notfallformat beschreibt die
+[Recovery-Checkpoint-Spezifikation](docs/specs/recovery-checkpoint-v1.md).
 
 ## Bauen und testen
 
@@ -346,7 +407,10 @@ export CARGO_TARGET_DIR=/source/fastdup/.artifacts/target
 export TMPDIR=/source/fastdup/.artifacts/tmp
 export PATH=/source/fastdup/.artifacts/cargo/bin:$PATH
 
-mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR" "$TMPDIR"
+# Cargo creates CARGO_TARGET_DIR itself, including its CACHEDIR.TAG safety
+# marker. Do not pre-create that directory; otherwise `cargo clean` may refuse
+# to remove the regenerable cache.
+mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$TMPDIR"
 
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
@@ -467,6 +531,7 @@ sh samba/vfs_fastdup/tests/run.sh
 | `fastdup-posix` | POSIX-Modell, Live-Dirty-Overlay und Low-Level-FUSE-Adapter |
 | `fastdup-appliance` | Ingest, Checkpoints, Recovery und ausführbare Programme |
 | `fastdup-copy-metrics` | Günstige Hot-Path- und Kopiertelemetrie |
+| `fastdup-exact-bench` | Reproduzierbares A/B für aktivierte Exact-Lookups über mmap und bounded Reads |
 | `fastdup-testkit` | Deterministische Fehler, Crash-Modell und Corpus-Werkzeuge |
 | `samba/vfs_fastdup` | Experimentelles Samba-VFS-Modul für Fast Clone |
 
@@ -495,3 +560,5 @@ dokumentiert. Der opt-in Prefix-ABBA-Lauf steht unter
 Die Neubewertung des verworfenen Container-Formats 3 nach dem Governor-Fix ist
 unter [docs/benchmarks/container-format-v3-gc-reevaluation-2026-08-27.md](docs/benchmarks/container-format-v3-gc-reevaluation-2026-08-27.md)
 dokumentiert.
+Der kalte A/B-Test für Restore-Coalescing steht unter
+[docs/benchmarks/verified-restore-coalescing-2026-08-27.md](docs/benchmarks/verified-restore-coalescing-2026-08-27.md).

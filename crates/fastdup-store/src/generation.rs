@@ -15,8 +15,8 @@ use crate::metadata_mark_catalog::{
 use crate::{ContainerRepository, StorageIo, StoreError, VerifiedManifestFile};
 use fastdup_format::{
     CommitFormatError, CommitRecord, CommitRecordHash, MAX_METADATA_OBJECT_BYTES, ManifestExtent,
-    ManifestLeaf, MetadataFormatError, MetadataMarkCatalogRunKind, MetadataObjectId, NamespaceRoot,
-    PolicySetId,
+    ManifestLeaf, MetadataFormatError, MetadataMarkCatalogRunKind, MetadataObjectId,
+    NamespaceGraphRoot, NamespaceRoot, PolicySetId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -87,45 +87,15 @@ struct SelectedGraph {
 pub struct GenerationRepository<I> {
     storage: I,
     supported_policy: PolicySetId,
-    format_support: RepositoryFormatSupport,
     commit_lock: Arc<Mutex<()>>,
     metadata_root_pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
     metadata_root_pin_handles: Arc<Mutex<Vec<Weak<MetadataRootPinInner>>>>,
+    recovery_checkpoint_root_pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
     metadata_gc_barrier: Arc<RwLock<()>>,
     metadata_gc_epoch: Arc<AtomicU64>,
     metadata_gc_clean: Arc<Mutex<Option<MetadataGcCleanState>>>,
     metadata_gc_delta: Arc<Mutex<MetadataGcDeltaJournal>>,
     metadata_gc_run_lock: Arc<Mutex<()>>,
-}
-
-/// Repository format epochs accepted and emitted by one writer binary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RepositoryFormatSupport {
-    minimum_readable: u16,
-    writable: u16,
-}
-
-impl RepositoryFormatSupport {
-    #[must_use]
-    pub const fn current() -> Self {
-        Self {
-            minimum_readable: 0,
-            writable: 1,
-        }
-    }
-
-    /// Models the pre-fence writer for migration and downgrade tests.
-    #[must_use]
-    pub const fn legacy_only() -> Self {
-        Self {
-            minimum_readable: 0,
-            writable: 0,
-        }
-    }
-
-    const fn reads(self, epoch: u16) -> bool {
-        epoch >= self.minimum_readable && epoch <= self.writable
-    }
 }
 
 #[derive(Clone)]
@@ -139,6 +109,18 @@ struct MetadataRootPinInner {
     metadata_gc_epoch: Arc<AtomicU64>,
     release_requires_exact: AtomicBool,
     metadata_gc_delta: Arc<Mutex<MetadataGcDeltaJournal>>,
+}
+
+struct RecoveryCheckpointRootPin {
+    root: MetadataObjectId,
+    pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
+    metadata_gc_epoch: Arc<AtomicU64>,
+    metadata_gc_delta: Arc<Mutex<MetadataGcDeltaJournal>>,
+}
+
+struct RecoveryCheckpointCandidate {
+    record: CommitRecord,
+    _pin: RecoveryCheckpointRootPin,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,10 +146,10 @@ struct StagedMetadata {
     published_new: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CommittedMetadata {
     record: CommitRecord,
-    namespace_root_published_new: bool,
+    introduced_namespace_metadata: BTreeSet<MetadataObjectId>,
     wal_rotated: bool,
 }
 
@@ -225,6 +207,32 @@ impl Drop for MetadataRootPinInner {
                 MetadataGcExactReason::MetadataRootPinDrain,
             );
         }
+    }
+}
+
+impl Drop for RecoveryCheckpointRootPin {
+    fn drop(&mut self) {
+        let mut pins = self
+            .pins
+            .lock()
+            .expect("ASSERT: Recovery Checkpoint root pin registry poisoned during release");
+        let remove = match pins.get_mut(&self.root) {
+            Some(1) => true,
+            Some(count) => {
+                *count -= 1;
+                false
+            }
+            None => panic!("ASSERT: Recovery Checkpoint root pin release has an acquisition"),
+        };
+        if remove {
+            pins.remove(&self.root);
+        }
+        drop(pins);
+        mark_metadata_gc_exact_required(
+            &self.metadata_gc_epoch,
+            &self.metadata_gc_delta,
+            MetadataGcExactReason::RecoveryCheckpointPinChange,
+        );
     }
 }
 
@@ -295,32 +303,265 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
 impl<I: StorageIo> GenerationRepository<I> {
     #[must_use]
     pub fn new(storage: I, supported_policy: PolicySetId) -> Self {
-        Self::new_with_format_support(
-            storage,
-            supported_policy,
-            RepositoryFormatSupport::current(),
-        )
-    }
-
-    #[must_use]
-    pub fn new_with_format_support(
-        storage: I,
-        supported_policy: PolicySetId,
-        format_support: RepositoryFormatSupport,
-    ) -> Self {
         Self {
             storage,
             supported_policy,
-            format_support,
             commit_lock: Arc::new(Mutex::new(())),
             metadata_root_pins: Arc::new(Mutex::new(BTreeMap::new())),
             metadata_root_pin_handles: Arc::new(Mutex::new(Vec::new())),
+            recovery_checkpoint_root_pins: Arc::new(Mutex::new(BTreeMap::new())),
             metadata_gc_barrier: Arc::new(RwLock::new(())),
             metadata_gc_epoch: Arc::new(AtomicU64::new(0)),
             metadata_gc_clean: Arc::new(Mutex::new(None)),
             metadata_gc_delta: Arc::new(Mutex::new(MetadataGcDeltaJournal::default())),
             metadata_gc_run_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Reports whether the paired Commit WAL selects at least one Commit
+    /// record without traversing its Metadata or DATA graph.
+    ///
+    /// This is the empty-target gate for disaster recovery. A malformed or
+    /// torn existing WAL returns an error and is never treated as an empty
+    /// Metadata tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Generation-Log, format, or storage error if the paired WAL
+    /// cannot be inspected as valid durable state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another repository operation poisoned the Commit lock.
+    pub fn has_committed_generation(&self) -> Result<bool, GenerationError> {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: generation inspection lock poisoned");
+        GenerationLog::new(&self.storage)
+            .load_for_recovery()
+            .map(|snapshot| snapshot.is_some_and(|snapshot| !snapshot.records().is_empty()))
+            .map_err(map_log_error)
+    }
+
+    pub(crate) fn publish_latest_recovery_checkpoint_to<D: StorageIo>(
+        &self,
+        checkpoints: &crate::recovery_checkpoint::RecoveryCheckpointRepository<D>,
+        verifier: &dyn RequiredChunkVerifier,
+    ) -> Result<
+        Option<crate::recovery_checkpoint::RecoveryCheckpointSummary>,
+        crate::recovery_checkpoint::RecoveryCheckpointError,
+    > {
+        let candidates = self.recovery_checkpoint_candidates()?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        for candidate in candidates {
+            let graph = self.scan_recovery_checkpoint_candidate(candidate.record);
+            let (object_ids, required) = match graph {
+                Ok(graph) => graph,
+                Err(error) if error.allows_generation_fallback() => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if let Err(error) = verifier.verify_required_chunks(&required) {
+                let error = GenerationError::Store(error);
+                if error.allows_generation_fallback() {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            return checkpoints
+                .publish_source(candidate.record, &object_ids, verifier, |object_id| {
+                    self.read_metadata(object_id).map_err(Into::into)
+                })
+                .map(Some);
+        }
+        Err(GenerationError::NoRecoverableGeneration.into())
+    }
+
+    fn recovery_checkpoint_candidates(
+        &self,
+    ) -> Result<Vec<RecoveryCheckpointCandidate>, GenerationError> {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Recovery Checkpoint pin barrier poisoned");
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: Recovery Checkpoint candidate lock poisoned");
+        let Some(snapshot) = GenerationLog::new(&self.storage)
+            .load_for_recovery()
+            .map_err(map_log_error)?
+        else {
+            return Ok(Vec::new());
+        };
+        let valid = self.validate_recovery_transition_prefix(snapshot.records())?;
+        let start = valid.len().saturating_sub(2);
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(valid.len() - start)
+            .map_err(|_| GenerationError::OutOfMemory)?;
+        for record in valid[start..].iter().rev().copied() {
+            candidates.push(RecoveryCheckpointCandidate {
+                record,
+                _pin: self.pin_recovery_checkpoint_root(record.namespace_root()),
+            });
+        }
+        Ok(candidates)
+    }
+
+    fn pin_recovery_checkpoint_root(&self, root: MetadataObjectId) -> RecoveryCheckpointRootPin {
+        let mut pins = self
+            .recovery_checkpoint_root_pins
+            .lock()
+            .expect("ASSERT: Recovery Checkpoint root pin registry poisoned");
+        let count = pins.entry(root).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .expect("ASSERT: Recovery Checkpoint root pin count cannot overflow");
+        drop(pins);
+        mark_metadata_gc_exact_required(
+            &self.metadata_gc_epoch,
+            &self.metadata_gc_delta,
+            MetadataGcExactReason::RecoveryCheckpointPinChange,
+        );
+        RecoveryCheckpointRootPin {
+            root,
+            pins: Arc::clone(&self.recovery_checkpoint_root_pins),
+            metadata_gc_epoch: Arc::clone(&self.metadata_gc_epoch),
+            metadata_gc_delta: Arc::clone(&self.metadata_gc_delta),
+        }
+    }
+
+    fn scan_recovery_checkpoint_candidate(
+        &self,
+        record: CommitRecord,
+    ) -> Result<
+        (
+            BTreeSet<MetadataObjectId>,
+            BTreeMap<fastdup_format::ChunkId, u64>,
+        ),
+        GenerationError,
+    > {
+        let (root, namespace_objects, _) =
+            self.read_namespace_root_graph(record.namespace_root())?;
+        if !record_matches_namespace_root(record, &root) {
+            return Err(GenerationError::PreviousGenerationRecordMismatch);
+        }
+        let mut objects = BTreeSet::new();
+        objects.insert(record.namespace_root());
+        objects.extend(namespace_objects);
+        let mut required = BTreeMap::new();
+        for inode in root.file_inodes() {
+            let mut conflict = None;
+            let summary = scan_manifest_tree(
+                inode.manifest_root(),
+                |object_id| {
+                    objects.insert(object_id);
+                    self.read_manifest_node(object_id)
+                },
+                |_logical_offset, extent| {
+                    let (chunk_id, logical_length) = match *extent {
+                        ManifestExtent::Data {
+                            logical_length,
+                            chunk_id,
+                        } => (chunk_id, logical_length),
+                        ManifestExtent::DataSlice {
+                            chunk_id,
+                            chunk_length,
+                            ..
+                        } => (chunk_id, u64::from(chunk_length)),
+                        ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => return Ok(()),
+                    };
+                    if let Some(previous) = required.insert(chunk_id, logical_length)
+                        && previous != logical_length
+                    {
+                        conflict = Some((chunk_id, previous, logical_length));
+                    }
+                    Ok(())
+                },
+            )?;
+            if summary.logical_size() != inode.logical_size() {
+                return Err(GenerationError::ManifestLengthMismatch {
+                    inode: inode.inode(),
+                    inode_length: inode.logical_size(),
+                    manifest_length: summary.logical_size(),
+                });
+            }
+            if let Some((chunk_id, first_length, second_length)) = conflict {
+                return Err(GenerationError::ManifestChunkLengthConflict {
+                    chunk_id,
+                    first_length,
+                    second_length,
+                });
+            }
+        }
+        Ok((objects, required))
+    }
+
+    pub(crate) fn install_recovery_checkpoint<F>(
+        &self,
+        record: CommitRecord,
+        object_ids: &BTreeSet<MetadataObjectId>,
+        mut read_object: F,
+        verifier: &dyn RequiredChunkVerifier,
+    ) -> Result<RecoveredGeneration, GenerationError>
+    where
+        F: FnMut(
+            MetadataObjectId,
+        ) -> Result<Vec<u8>, crate::recovery_checkpoint::RecoveryCheckpointError>,
+    {
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Recovery Checkpoint installation barrier poisoned");
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: Recovery Checkpoint installation lock poisoned");
+        if let Some(snapshot) = GenerationLog::new(&self.storage)
+            .load_for_recovery()
+            .map_err(map_log_error)?
+        {
+            if snapshot.tail() != &WalTail::Clean || snapshot.records() != [record] {
+                return Err(GenerationError::RecoveryTargetNotEmpty);
+            }
+            return self
+                .recover_latest_using(Some(verifier))?
+                .map(|graph| graph.generation)
+                .ok_or(GenerationError::NoRecoverableGeneration);
+        }
+        if record.policy_set() != self.supported_policy {
+            return Err(GenerationError::UnsupportedPolicySet {
+                generation: record.generation(),
+                policy_set: record.policy_set(),
+            });
+        }
+        for object_id in object_ids.iter().copied() {
+            let encoded = read_object(object_id).map_err(|error| match error {
+                crate::recovery_checkpoint::RecoveryCheckpointError::Io(error) => {
+                    GenerationError::Io(error)
+                }
+                _ => GenerationError::PublishVerificationMismatch,
+            })?;
+            if self.stage_metadata(&encoded)? != object_id {
+                return Err(GenerationError::MetadataIdentityCollision(object_id));
+            }
+        }
+        self.storage.sync_root()?;
+        let root = self.read_namespace_root(record.namespace_root())?;
+        if !record_matches_namespace_root(record, &root) {
+            return Err(GenerationError::PreviousGenerationRecordMismatch);
+        }
+        self.verify_manifest_graph(&root, Some(verifier))?;
+        mark_metadata_gc_dirty(&self.metadata_gc_epoch);
+        GenerationLog::new(&self.storage)
+            .install_recovery_anchor(record)
+            .map_err(map_log_error)?;
+        self.recover_latest_using(Some(verifier))?
+            .map(|graph| graph.generation)
+            .ok_or(GenerationError::NoRecoverableGeneration)
     }
 
     fn pin_metadata_root(&self, root: MetadataObjectId) -> MetadataRootPin {
@@ -1122,6 +1363,23 @@ impl<I: StorageIo> GenerationRepository<I> {
         for root in proof.pinned_roots.iter().copied() {
             self.scan_manifest_root_required_chunks(root, &mut proof.online_chunks)?;
         }
+        proof.recovery_checkpoint_roots = self
+            .recovery_checkpoint_root_pins
+            .lock()
+            .expect("ASSERT: Recovery Checkpoint root pins poisoned during DATA proof")
+            .keys()
+            .copied()
+            .collect();
+        let recovery_checkpoint_roots = proof
+            .recovery_checkpoint_roots
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for root_id in recovery_checkpoint_roots {
+            let root = self.read_namespace_root(root_id)?;
+            let (_, required) = self.scan_manifest_graph_with_required(&root)?;
+            proof.extend_protected_chunks(required)?;
+        }
         Ok(proof)
     }
 
@@ -1425,14 +1683,12 @@ impl<I: StorageIo> GenerationRepository<I> {
         let mut bytes_read = 0_u64;
         for record in records {
             reachable.insert(record.namespace_root());
-            let encoded_root = self.read_metadata(record.namespace_root())?;
+            let (root, namespace_objects, namespace_bytes) =
+                self.read_namespace_root_graph(record.namespace_root())?;
+            reachable.extend(namespace_objects);
             bytes_read = bytes_read
-                .checked_add(
-                    u64::try_from(encoded_root.len())
-                        .map_err(|_| GenerationError::MetadataTooLarge)?,
-                )
+                .checked_add(namespace_bytes)
                 .ok_or(GenerationError::MetadataTooLarge)?;
-            let root = NamespaceRoot::decode(&encoded_root)?;
             if !record_matches_namespace_root(*record, &root) {
                 return Err(GenerationError::PreviousGenerationRecordMismatch);
             }
@@ -1465,6 +1721,41 @@ impl<I: StorageIo> GenerationRepository<I> {
             if reachable.insert(root) {
                 scan_manifest_tree(
                     root,
+                    |node_id| {
+                        reachable.insert(node_id);
+                        let bytes = self.read_manifest_node(node_id)?;
+                        bytes_read = bytes_read
+                            .checked_add(
+                                u64::try_from(bytes.len())
+                                    .map_err(|_| ManifestTreeError::ArithmeticOverflow)?,
+                            )
+                            .ok_or(ManifestTreeError::ArithmeticOverflow)?;
+                        Ok(bytes)
+                    },
+                    |_logical_offset, _extent| Ok(()),
+                )?;
+            }
+        }
+        let recovery_roots = self
+            .recovery_checkpoint_root_pins
+            .lock()
+            .expect("ASSERT: Recovery Checkpoint root pins poisoned during Metadata mark")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for root_id in recovery_roots {
+            if !reachable.insert(root_id) {
+                continue;
+            }
+            let (root, namespace_objects, namespace_bytes) =
+                self.read_namespace_root_graph(root_id)?;
+            reachable.extend(namespace_objects);
+            bytes_read = bytes_read
+                .checked_add(namespace_bytes)
+                .ok_or(GenerationError::MetadataTooLarge)?;
+            for inode in root.file_inodes() {
+                scan_manifest_tree(
+                    inode.manifest_root(),
                     |node_id| {
                         reachable.insert(node_id);
                         let bytes = self.read_manifest_node(node_id)?;
@@ -1593,6 +1884,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             online_records,
             online_chunks,
             pinned_roots: BTreeSet::new(),
+            recovery_checkpoint_roots: BTreeSet::new(),
         })
     }
 
@@ -1754,6 +2046,16 @@ impl<I: StorageIo> GenerationRepository<I> {
             .copied()
             .collect::<BTreeSet<_>>();
         if pinned_roots != proof.pinned_roots {
+            return Ok(false);
+        }
+        let recovery_checkpoint_roots = self
+            .recovery_checkpoint_root_pins
+            .lock()
+            .expect("ASSERT: Recovery Checkpoint root pins poisoned during GC revalidation")
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if recovery_checkpoint_roots != proof.recovery_checkpoint_roots {
             return Ok(false);
         }
         let Some(snapshot) = GenerationLog::new(&self.storage)
@@ -1991,9 +2293,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         for proof in proofs {
             introduced_metadata.extend(proof.introduced_metadata.iter().copied());
         }
-        if committed.namespace_root_published_new {
-            introduced_metadata.insert(committed.record.namespace_root());
-        }
+        introduced_metadata.extend(committed.introduced_namespace_metadata.iter().copied());
         if committed.wal_rotated {
             mark_metadata_gc_exact_required(
                 &self.metadata_gc_epoch,
@@ -2037,7 +2337,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         if snapshot.tail() != &WalTail::Clean {
             return Err(GenerationError::WalNeedsRepair(snapshot.tail().clone()));
         }
-        self.validate_format_epoch_compatibility(snapshot.records())?;
+        Self::validate_format_epoch_compatibility(snapshot.records())?;
         if let Some(expected) = expected_predecessor
             && snapshot.last_record() != Some(expected.record)
         {
@@ -2058,7 +2358,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         mark_metadata_gc_exact_required(
             &self.metadata_gc_epoch,
             &self.metadata_gc_delta,
-            MetadataGcExactReason::LegacyCommit,
+            MetadataGcExactReason::UnclassifiedPublication,
         );
         Ok(committed.record)
     }
@@ -2068,9 +2368,23 @@ impl<I: StorageIo> GenerationRepository<I> {
         root: &NamespaceRoot,
         snapshot: &LogSnapshot,
     ) -> Result<CommittedMetadata, GenerationError> {
-        let encoded_root = root.encode()?;
-        let staged_root = self.publish_metadata_with_status(&encoded_root)?;
+        let encoded_graph = root.encode_graph()?;
+        let mut introduced_namespace_metadata = BTreeSet::new();
+        for shard in encoded_graph.shards() {
+            let staged = self.stage_metadata_with_status(shard.bytes())?;
+            if staged.object_id != shard.object_id() {
+                return Err(GenerationError::PublishVerificationMismatch);
+            }
+            if staged.published_new {
+                introduced_namespace_metadata.insert(staged.object_id);
+            }
+        }
+        let staged_root = self.stage_metadata_with_status(encoded_graph.root())?;
+        self.storage.sync_root()?;
         let root_id = staged_root.object_id;
+        if staged_root.published_new {
+            introduced_namespace_metadata.insert(root_id);
+        }
         if let Some(previous) = snapshot.last_record() {
             self.verify_generation_transition(previous, root)?;
         } else if root.inode_allocation_cursor() != 2 || !root.inodes().is_empty() {
@@ -2088,7 +2402,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             ),
             None => (1, CommitRecordHash::ZERO),
         };
-        let record = CommitRecord::new_with_format_epoch(
+        let record = CommitRecord::new(
             generation,
             previous_hash,
             root_id,
@@ -2096,7 +2410,6 @@ impl<I: StorageIo> GenerationRepository<I> {
             root.namespace_mutation_sequence(),
             root.inode_reservation_end(),
             root.inode_allocation_cursor(),
-            self.format_support.writable,
         )?;
         let wal_rotated = snapshot.will_rotate();
         if wal_rotated {
@@ -2115,7 +2428,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         }
         Ok(CommittedMetadata {
             record,
-            namespace_root_published_new: staged_root.published_new,
+            introduced_namespace_metadata,
             wal_rotated,
         })
     }
@@ -2334,31 +2647,19 @@ impl<I: StorageIo> GenerationRepository<I> {
                 });
             }
         }
-        self.validate_format_epoch_compatibility(records)
+        Self::validate_format_epoch_compatibility(records)
     }
 
     fn validate_format_epoch_compatibility(
-        &self,
         records: &[CommitRecord],
     ) -> Result<(), GenerationError> {
-        let mut previous_epoch = None;
         for record in records {
-            if !self.format_support.reads(record.format_epoch()) {
+            if record.format_epoch() != fastdup_format::CURRENT_REPOSITORY_FORMAT_EPOCH {
                 return Err(GenerationError::UnsupportedFormatEpoch {
                     generation: record.generation(),
                     format_epoch: record.format_epoch(),
                 });
             }
-            if let Some(previous) = previous_epoch
-                && previous > record.format_epoch()
-            {
-                return Err(GenerationError::NonMonotonicFormatEpoch {
-                    generation: record.generation(),
-                    previous,
-                    proposed: record.format_epoch(),
-                });
-            }
-            previous_epoch = Some(record.format_epoch());
         }
         Ok(())
     }
@@ -2394,15 +2695,6 @@ impl<I: StorageIo> GenerationRepository<I> {
             }));
         }
         Ok(None)
-    }
-
-    fn publish_metadata_with_status(
-        &self,
-        encoded: &[u8],
-    ) -> Result<StagedMetadata, GenerationError> {
-        let staged = self.stage_metadata_with_status(encoded)?;
-        self.storage.sync_root()?;
-        Ok(staged)
     }
 
     fn stage_metadata(&self, encoded: &[u8]) -> Result<MetadataObjectId, GenerationError> {
@@ -2465,7 +2757,42 @@ impl<I: StorageIo> GenerationRepository<I> {
         object_id: MetadataObjectId,
     ) -> Result<NamespaceRoot, GenerationError> {
         let bytes = self.read_metadata(object_id)?;
-        NamespaceRoot::decode(&bytes).map_err(Into::into)
+        let descriptor = NamespaceGraphRoot::decode(&bytes)?;
+        let mut shards = BTreeMap::new();
+        for reference in descriptor.shards() {
+            let shard_id = reference.object_id();
+            if let std::collections::btree_map::Entry::Vacant(entry) = shards.entry(shard_id) {
+                entry.insert(self.read_metadata(shard_id)?);
+            }
+        }
+        NamespaceRoot::decode_graph(&bytes, &shards).map_err(Into::into)
+    }
+
+    fn read_namespace_root_graph(
+        &self,
+        object_id: MetadataObjectId,
+    ) -> Result<(NamespaceRoot, BTreeSet<MetadataObjectId>, u64), GenerationError> {
+        let bytes = self.read_metadata(object_id)?;
+        let descriptor = NamespaceGraphRoot::decode(&bytes)?;
+        let mut object_ids = BTreeSet::new();
+        let mut byte_count =
+            u64::try_from(bytes.len()).map_err(|_| GenerationError::MetadataTooLarge)?;
+        let mut shards = BTreeMap::new();
+        for reference in descriptor.shards() {
+            let shard_id = reference.object_id();
+            if object_ids.insert(shard_id) {
+                let shard = self.read_metadata(shard_id)?;
+                byte_count = byte_count
+                    .checked_add(
+                        u64::try_from(shard.len())
+                            .map_err(|_| GenerationError::MetadataTooLarge)?,
+                    )
+                    .ok_or(GenerationError::MetadataTooLarge)?;
+                shards.insert(shard_id, shard);
+            }
+        }
+        let root = NamespaceRoot::decode_graph(&bytes, &shards)?;
+        Ok((root, object_ids, byte_count))
     }
 
     fn read_metadata(&self, object_id: MetadataObjectId) -> Result<Vec<u8>, GenerationError> {
@@ -2738,9 +3065,9 @@ pub enum MetadataGcExactReason {
     UnclassifiedPublication,
     MetadataRootPinDrain,
     WalRotation,
-    LegacyCommit,
     UncertainWalDurability,
     DeltaChainLimit,
+    RecoveryCheckpointPinChange,
 }
 
 impl MetadataGcExactReason {
@@ -2751,9 +3078,9 @@ impl MetadataGcExactReason {
             Self::UnclassifiedPublication => "unclassified_publication",
             Self::MetadataRootPinDrain => "metadata_root_pin_drain",
             Self::WalRotation => "wal_rotation",
-            Self::LegacyCommit => "legacy_commit",
             Self::UncertainWalDurability => "uncertain_wal_durability",
             Self::DeltaChainLimit => "delta_chain_limit",
+            Self::RecoveryCheckpointPinChange => "recovery_checkpoint_pin_change",
         }
     }
 }
@@ -2882,6 +3209,7 @@ pub(crate) struct GenerationLivenessProof {
     online_records: Vec<CommitRecord>,
     online_chunks: BTreeMap<fastdup_format::ChunkId, u64>,
     pinned_roots: BTreeSet<MetadataObjectId>,
+    recovery_checkpoint_roots: BTreeSet<MetadataObjectId>,
 }
 
 /// Metadata-only reachability changes for the current and previous protected
@@ -2929,6 +3257,24 @@ impl GenerationLivenessProof {
 
     pub(crate) fn online_chunks(&self) -> &BTreeMap<fastdup_format::ChunkId, u64> {
         &self.online_chunks
+    }
+
+    pub(crate) fn extend_protected_chunks(
+        &mut self,
+        additional: BTreeMap<fastdup_format::ChunkId, u64>,
+    ) -> Result<(), GenerationError> {
+        for (chunk_id, logical_length) in additional {
+            if let Some(previous) = self.online_chunks.insert(chunk_id, logical_length)
+                && previous != logical_length
+            {
+                return Err(GenerationError::ManifestChunkLengthConflict {
+                    chunk_id,
+                    first_length: previous,
+                    second_length: logical_length,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3182,11 +3528,6 @@ pub enum GenerationError {
         generation: u64,
         format_epoch: u16,
     },
-    NonMonotonicFormatEpoch {
-        generation: u64,
-        previous: u16,
-        proposed: u16,
-    },
     NonMonotonicNamespaceMutation {
         previous: u64,
         proposed: u64,
@@ -3255,6 +3596,7 @@ pub enum GenerationError {
     },
     InvalidMetadataObjectName(String),
     MetadataMarkCatalogCorruption,
+    RecoveryTargetNotEmpty,
 }
 
 impl GenerationError {
@@ -3298,6 +3640,7 @@ impl GenerationError {
                 | StoreError::InvalidContainerGenerationReservationSpan
                 | StoreError::ContainerGenerationExhausted
                 | StoreError::ContainerGenerationHighWaterFormat(_)
+                | StoreError::ContainerGenerationHighWaterMissing
                 | StoreError::ContainerGenerationHighWaterChain
                 | StoreError::ContainerGenerationHighWaterBehind { .. },
             )
@@ -3306,7 +3649,6 @@ impl GenerationError {
             | Self::GenerationExhausted
             | Self::UnsupportedPolicySet { .. }
             | Self::UnsupportedFormatEpoch { .. }
-            | Self::NonMonotonicFormatEpoch { .. }
             | Self::NonMonotonicNamespaceMutation { .. }
             | Self::NonMonotonicInodeReservation { .. }
             | Self::NonMonotonicInodeAllocation { .. }
@@ -3333,7 +3675,8 @@ impl GenerationError {
             )
             | Self::OutOfMemory
             | Self::InvalidMetadataObjectName(_)
-            | Self::MetadataMarkCatalogCorruption => false,
+            | Self::MetadataMarkCatalogCorruption
+            | Self::RecoveryTargetNotEmpty => false,
         }
     }
 }
@@ -3411,6 +3754,7 @@ fn map_log_error(error: GenerationLogError) -> GenerationError {
             GenerationError::PublishVerificationMismatch
         }
         GenerationLogError::OutOfMemory => GenerationError::OutOfMemory,
+        GenerationLogError::AlreadyInitialized => GenerationError::RecoveryTargetNotEmpty,
         GenerationLogError::BrokenGenerationChain
         | GenerationLogError::DivergentSlots
         | GenerationLogError::EmptyAfterInitialization => GenerationError::NoRecoverableGeneration,

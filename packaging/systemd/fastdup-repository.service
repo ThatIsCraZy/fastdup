@@ -1,0 +1,34 @@
+[Unit]
+Description=FastDup Repository Runtime
+After=local-fs.target
+ConditionPathIsMountPoint=/var/lib/fastdup/repository/metadata
+ConditionPathIsMountPoint=/var/lib/fastdup/repository/data
+
+[Service]
+Type=simple
+Slice=fastdup-storage.slice
+EnvironmentFile=-/etc/fastdup/repository.env
+Environment=FASTDUP_REQUIRE_CGROUP_NO_SWAP=1
+Environment=FASTDUP_SHARE_CAPACITY_MANIFEST=/etc/fastdup/share-capacities.json
+ExecStart=/usr/libexec/fastdup/fastdup-durable-fuse /srv/fastdup/repository /var/lib/fastdup/repository/metadata /var/lib/fastdup/repository/data
+User=root
+Group=fastdup-control
+UMask=0007
+KillSignal=SIGINT
+SendSIGKILL=no
+TimeoutStopSec=5min
+MemorySwapMax=0
+CPUWeight=1000
+IOWeight=1000
+OOMScoreAdjust=-900
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/fastdup/repository /var/lib/fastdup/repository
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target

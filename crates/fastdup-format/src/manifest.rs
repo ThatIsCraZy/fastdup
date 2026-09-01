@@ -7,8 +7,7 @@ use crate::{
 pub const MANIFEST_HEADER_BYTES: usize = 64;
 const MANIFEST_ENTRY_BYTES: usize = 64;
 const MANIFEST_MAGIC: &[u8; 8] = b"FDMANL01";
-const FORMAT_VERSION_V1: u16 = 1;
-const FORMAT_VERSION_V2: u16 = 2;
+const FORMAT_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestExtent {
@@ -91,16 +90,7 @@ impl ManifestLeaf {
         let payload_length = payload_length(self.extents.len())?;
         let mut payload = vec![0_u8; payload_length];
         payload[0..8].copy_from_slice(MANIFEST_MAGIC);
-        let format_version = if self
-            .extents
-            .iter()
-            .any(|extent| matches!(extent, ManifestExtent::DataSlice { .. }))
-        {
-            FORMAT_VERSION_V2
-        } else {
-            FORMAT_VERSION_V1
-        };
-        put_u16(&mut payload, 8, format_version);
+        put_u16(&mut payload, 8, FORMAT_VERSION);
         put_u16(&mut payload, 10, 64);
         put_u16(&mut payload, 12, 64);
         put_u64(&mut payload, 16, 0);
@@ -172,8 +162,7 @@ impl ManifestLeaf {
         if payload.len() < MANIFEST_HEADER_BYTES || &payload[0..8] != MANIFEST_MAGIC {
             return Err(MetadataFormatError::InvalidPayload);
         }
-        let format_version = get_u16(payload, 8);
-        if !matches!(format_version, FORMAT_VERSION_V1 | FORMAT_VERSION_V2)
+        if get_u16(payload, 8) != FORMAT_VERSION
             || usize::from(get_u16(payload, 10)) != MANIFEST_HEADER_BYTES
             || usize::from(get_u16(payload, 12)) != MANIFEST_ENTRY_BYTES
             || get_u16(payload, 14) != 0
@@ -228,16 +217,12 @@ impl ManifestLeaf {
                         value: entry[56],
                     }
                 }
-                4 if format_version == FORMAT_VERSION_V2
-                    && entry[60..64].iter().all(|byte| *byte == 0) =>
-                {
-                    ManifestExtent::DataSlice {
-                        logical_length,
-                        chunk_id: ChunkId::from_bytes(chunk_id),
-                        chunk_length,
-                        chunk_offset: get_u32(entry, 56),
-                    }
-                }
+                4 if entry[60..64].iter().all(|byte| *byte == 0) => ManifestExtent::DataSlice {
+                    logical_length,
+                    chunk_id: ChunkId::from_bytes(chunk_id),
+                    chunk_length,
+                    chunk_offset: get_u32(entry, 56),
+                },
                 _ => return Err(MetadataFormatError::InvalidExtent),
             };
             expected_offset = expected_offset

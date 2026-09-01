@@ -18,7 +18,8 @@ fn commit_records_have_stable_bytes_and_form_a_hash_chain() {
 
     assert_eq!(first_bytes.len(), COMMIT_RECORD_BYTES);
     assert_eq!(&first_bytes[0..8], b"FDCMIT01");
-    assert_eq!(&first_bytes[8..10], &1_u16.to_le_bytes());
+    assert_eq!(&first_bytes[8..10], &2_u16.to_le_bytes());
+    assert_eq!(&first_bytes[22..24], &1_u16.to_le_bytes());
     assert_eq!(&first_bytes[40..48], &1_u64.to_le_bytes());
     assert_eq!(&first_bytes[152..160], &1_024_u64.to_le_bytes());
     assert_eq!(&first_bytes[160..168], &10_u64.to_le_bytes());
@@ -46,7 +47,7 @@ fn commit_records_have_stable_bytes_and_form_a_hash_chain() {
 
 #[test]
 fn format_epoch_one_has_a_stable_v2_fence_and_round_trips() {
-    let record = CommitRecord::new_with_format_epoch(
+    let record = CommitRecord::new(
         1,
         CommitRecordHash::ZERO,
         MetadataObjectId::new([0x31; 32]).expect("nonzero namespace root"),
@@ -54,7 +55,6 @@ fn format_epoch_one_has_a_stable_v2_fence_and_round_trips() {
         0,
         4_096,
         2,
-        1,
     )
     .expect("epoch-one record is valid");
     let bytes = record.encode();
@@ -63,4 +63,26 @@ fn format_epoch_one_has_a_stable_v2_fence_and_round_trips() {
     assert_eq!(&bytes[22..24], &1_u16.to_le_bytes());
     assert_eq!(record.format_epoch(), 1);
     assert_eq!(CommitRecord::decode(&bytes), Ok(record));
+}
+
+#[test]
+fn preproduction_epoch_zero_commit_is_rejected() {
+    let record = CommitRecord::new(
+        1,
+        CommitRecordHash::ZERO,
+        MetadataObjectId::new([0x41; 32]).expect("nonzero namespace root"),
+        PolicySetId::new([0xc1; 32]).expect("nonzero policy set"),
+        0,
+        4_096,
+        2,
+    )
+    .expect("current record is valid");
+    let mut legacy = record.encode();
+    legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    legacy[22..24].copy_from_slice(&0_u16.to_le_bytes());
+    legacy[168..172].fill(0);
+    let checksum = crc32c::crc32c(&legacy);
+    legacy[168..172].copy_from_slice(&checksum.to_le_bytes());
+
+    assert!(CommitRecord::decode(&legacy).is_err());
 }

@@ -10,6 +10,13 @@ use fastdup_store::{
     SimilarityIndexStoreError, StorageIo, similarity_index_entry_v1,
 };
 
+fn is_similarity_partition_name(name: &str) -> bool {
+    name.starts_with("similarity-part.")
+        && Path::new(name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("fds"))
+}
+
 #[test]
 fn newest_complete_pool_snapshot_survives_restart_and_proposes_old_bases() {
     let root = test_root("restart");
@@ -127,7 +134,7 @@ fn offline_audit_rejects_corrupt_snapshot_page() {
         .list_names()
         .expect("list test repository")
         .into_iter()
-        .find(|name| name.starts_with("similarity.") && name.strip_suffix(".fds").is_some())
+        .find(|name| is_similarity_partition_name(name))
         .expect("published Similarity name exists");
     let file = OpenOptions::new()
         .read(true)
@@ -166,7 +173,7 @@ fn offline_audit_rejects_corrupt_bucket_page() {
         .list_names()
         .expect("list test repository")
         .into_iter()
-        .find(|name| name.starts_with("similarity.") && name.strip_suffix(".fds").is_some())
+        .find(|name| is_similarity_partition_name(name))
         .expect("published Similarity name exists");
     let file = OpenOptions::new()
         .read(true)
@@ -280,6 +287,28 @@ fn one_generation_cannot_be_reused_for_different_snapshot_bytes() {
         repository.publish(&snapshot(1, &[second_bytes.as_slice()])),
         Err(SimilarityIndexStoreError::PublishVerificationMismatch)
     ));
+}
+
+#[test]
+fn direct_preproduction_run_blocks_current_publication_before_mutation() {
+    let storage =
+        FsStorageIo::open(test_root("reject-direct-run")).expect("open Similarity repository root");
+    let unsupported = "similarity.0001.0001.0000000000000001.fds";
+    storage
+        .create_new(unsupported)
+        .expect("create unsupported direct publication marker");
+    storage
+        .sync_file(unsupported)
+        .expect("sync unsupported marker");
+    storage.sync_root().expect("sync unsupported marker name");
+    let repository = SimilarityIndexRepository::new(storage.clone());
+    let bytes = fixture_bytes(64 * 1_024, 3);
+
+    assert!(matches!(
+        repository.publish(&snapshot(2, &[bytes.as_slice()])),
+        Err(SimilarityIndexStoreError::IdentityMismatch)
+    ));
+    assert_eq!(storage.list_names().unwrap(), vec![unsupported.to_owned()]);
 }
 
 #[test]
@@ -574,7 +603,7 @@ fn mmap_generation_lease_blocks_mutation_until_the_reader_drops() {
         .list_names()
         .expect("list mmap lease fixture")
         .into_iter()
-        .find(|name| name.starts_with("similarity.") && name.strip_suffix(".fds").is_some())
+        .find(|name| is_similarity_partition_name(name))
         .expect("published Similarity run exists");
     let run_length = storage
         .object_len(&run_name)

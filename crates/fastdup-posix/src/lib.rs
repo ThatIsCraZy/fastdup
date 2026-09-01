@@ -8,23 +8,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::ops::Bound::Excluded;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 mod fuse_adapter;
 mod inode_metadata;
+mod logical_quota;
 mod versioned_file;
 
 use versioned_file::VersionedFile;
 
 pub use fuse_adapter::{
-    FuseFilesystem, StatFsSnapshot, StatFsSnapshotError, StatFsSource, volatile_mount_options,
+    FrontendTelemetry, FrontendTelemetrySnapshot, FuseFilesystem, StatFsSnapshot,
+    StatFsSnapshotError, StatFsSource, volatile_mount_options,
 };
 pub use inode_metadata::{
     ExtendedAttribute, FS_IMMUTABLE_FL, InodeMetadata, POSIX_ACL_ACCESS_XATTR,
     POSIX_ACL_DEFAULT_XATTR, XattrSetMode,
 };
+use logical_quota::LogicalQuotaTable;
+pub use logical_quota::{LogicalQuotaRule, LogicalQuotaStatus};
 pub use versioned_file::CommittedFile;
 
 /// Format-independent reduction recipe retained by verified write-through DATA.
@@ -659,6 +663,84 @@ pub enum Operation<'a> {
     },
 }
 
+const MUTATION_METADATA_INCREMENT_BYTES_V1: u64 = 2 * 1_024 * 1_024;
+const DATA_RECORD_SAFETY_BYTES_V1: u64 = 4 * 1_024;
+const DATA_RECHUNK_MINIMUM_BYTES_V1: u64 = 256 * 1_024;
+
+impl Operation<'_> {
+    fn is_durable_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::SetXattr { .. }
+                | Self::RemoveXattr { .. }
+                | Self::SetFileFlags { .. }
+                | Self::SetMode { .. }
+                | Self::SetAttributes { .. }
+                | Self::Link { .. }
+                | Self::Symlink { .. }
+                | Self::Create { .. }
+                | Self::CreateWithUmask { .. }
+                | Self::Mkdir { .. }
+                | Self::MkdirWithUmask { .. }
+                | Self::Open { truncate: true, .. }
+                | Self::Write { .. }
+                | Self::SetLength { .. }
+                | Self::CloneRange { .. }
+                | Self::Fallocate { .. }
+                | Self::Unlink { .. }
+                | Self::Rmdir { .. }
+                | Self::Rename { .. }
+        )
+    }
+
+    fn commit_capacity_claim(&self) -> CommitCapacityClaim {
+        let metadata = CommitCapacityClaim::new(MUTATION_METADATA_INCREMENT_BYTES_V1, 0);
+        match self {
+            Self::SetXattr { .. }
+            | Self::SetMode { .. }
+            | Self::Link { .. }
+            | Self::Fallocate {
+                mode:
+                    FallocateMode::Allocate { .. }
+                    | FallocateMode::ZeroRange { .. }
+                    | FallocateMode::CollapseRange
+                    | FallocateMode::InsertRange,
+                ..
+            } => metadata,
+            Self::CloneRange { length, .. } if *length != 0 => metadata,
+            _ => CommitCapacityClaim::default(),
+        }
+    }
+
+    fn requires_mutation_admission(&self) -> bool {
+        self.is_durable_mutation()
+            || matches!(
+                self,
+                Self::Open {
+                    options,
+                    truncate,
+                    ..
+                } if options.access != AccessMode::ReadOnly || *truncate
+            )
+    }
+}
+
+fn write_capacity_claim(
+    payload_bytes: usize,
+    metadata_bytes: u64,
+) -> Result<CommitCapacityClaim, PosixError> {
+    if payload_bytes == 0 {
+        return Ok(CommitCapacityClaim::default());
+    }
+    let payload_bytes = u64::try_from(payload_bytes).map_err(|_| PosixError::NoSpace)?;
+    let data_bytes = payload_bytes
+        .max(DATA_RECHUNK_MINIMUM_BYTES_V1)
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(DATA_RECORD_SAFETY_BYTES_V1))
+        .ok_or(PosixError::NoSpace)?;
+    Ok(CommitCapacityClaim::new(metadata_bytes, data_bytes))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Reply {
     Entry(Entry),
@@ -706,6 +788,7 @@ pub enum PosixError {
     NoData,
     TooBig,
     PermissionDenied,
+    CrossDevice,
     Unsupported,
     Io,
     ReadOnly,
@@ -772,6 +855,92 @@ pub trait MutationObserver: std::fmt::Debug + Send + Sync {
     /// Waits until every accepted mutation through `mutation_sequence` has
     /// left the observer's asynchronous processing queue.
     fn wait_through(&self, _inode: InodeId, _mutation_sequence: u64) {}
+}
+
+/// Pessimistic physical capacity required by one acknowledged mutation.
+///
+/// The claim describes additional durable footprint, not logical file size.
+/// Cleanup operations therefore use a zero claim and consume the separately
+/// protected Metadata floor when they eventually checkpoint.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CommitCapacityClaim {
+    metadata_bytes: u64,
+    data_bytes: u64,
+}
+
+impl CommitCapacityClaim {
+    #[must_use]
+    pub const fn new(metadata_bytes: u64, data_bytes: u64) -> Self {
+        Self {
+            metadata_bytes,
+            data_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn metadata_bytes(self) -> u64 {
+        self.metadata_bytes
+    }
+
+    #[must_use]
+    pub const fn data_bytes(self) -> u64 {
+        self.data_bytes
+    }
+
+    const fn is_empty(self) -> bool {
+        self.metadata_bytes == 0 && self.data_bytes == 0
+    }
+}
+
+/// Appliance-owned physical commit-capacity admission.
+///
+/// Implementations keep the request path syscall-free. Namespace invokes the
+/// lifecycle callbacks while holding its mutation fence, so accepted claims
+/// move into exactly the Commit Cut that contains their mutation.
+pub trait CommitCapacityAdmission: std::fmt::Debug + Send + Sync {
+    /// Claims physical capacity without changing live namespace state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PosixError::NoSpace`] when either tier lacks cached headroom.
+    fn try_reserve(&self, claim: CommitCapacityClaim) -> Result<(), PosixError>;
+    fn cancel(&self, claim: CommitCapacityClaim);
+    fn accept(&self, claim: CommitCapacityClaim);
+    /// Releases accepted Metadata whose mutation was completely reversed
+    /// before it entered a Frozen Commit Cut. DATA publication is irreversible
+    /// at this boundary and deliberately has no matching callback.
+    fn release_active_metadata(&self, bytes: u64);
+    fn freeze(&self, token: CommitToken);
+    fn complete(&self, token: CommitToken);
+    /// Finishes Active claims when no recoverable Namespace mutation exists.
+    /// Metadata may be released immediately; irreversible write-through DATA
+    /// remains charged until a later physical observation includes it.
+    fn finish_uncheckpointed_active(&self);
+}
+
+struct CommitCapacityReservation<'a> {
+    admission: Option<&'a dyn CommitCapacityAdmission>,
+    claim: CommitCapacityClaim,
+    accepted: bool,
+}
+
+impl CommitCapacityReservation<'_> {
+    fn accept(mut self) {
+        if let Some(admission) = self.admission {
+            admission.accept(self.claim);
+        }
+        self.accepted = true;
+    }
+}
+
+impl Drop for CommitCapacityReservation<'_> {
+    fn drop(&mut self) {
+        if !self.accepted
+            && let Some(admission) = self.admission
+        {
+            admission.cancel(self.claim);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2275,6 +2444,7 @@ struct Catalog {
     entries: BTreeMap<(InodeId, Vec<u8>), InodeId>,
     handles: BTreeMap<HandleId, OpenHandle>,
     lookup_counts: BTreeMap<InodeId, u64>,
+    active_create_metadata_bytes: BTreeMap<InodeId, u64>,
 }
 
 #[derive(Debug)]
@@ -2361,6 +2531,8 @@ pub struct Namespace {
     admission_changed: Notify,
     dirty_payload: DirtyPayloadTracker,
     mutation_observer: RwLock<Option<Arc<dyn MutationObserver>>>,
+    commit_capacity_admission: OnceLock<Arc<dyn CommitCapacityAdmission>>,
+    logical_quotas: LogicalQuotaTable,
     catalog: RwLock<Catalog>,
     locks: Mutex<LockTable>,
     lock_change_sequence: AtomicU64,
@@ -2406,6 +2578,8 @@ impl Namespace {
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
             mutation_observer: RwLock::new(None),
+            commit_capacity_admission: OnceLock::new(),
+            logical_quotas: LogicalQuotaTable::default(),
             catalog: RwLock::new(Catalog {
                 next_inode: ROOT_INODE.get() + 1,
                 inode_reservation_end: u64::MAX,
@@ -2417,6 +2591,7 @@ impl Namespace {
                 entries: BTreeMap::new(),
                 handles: BTreeMap::new(),
                 lookup_counts: BTreeMap::new(),
+                active_create_metadata_bytes: BTreeMap::new(),
             }),
             locks: Mutex::new(LockTable::default()),
             lock_change_sequence: AtomicU64::new(0),
@@ -2666,6 +2841,8 @@ impl Namespace {
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
             mutation_observer: RwLock::new(None),
+            commit_capacity_admission: OnceLock::new(),
+            logical_quotas: LogicalQuotaTable::default(),
             catalog: RwLock::new(Catalog {
                 next_inode: snapshot.next_inode,
                 inode_reservation_end: snapshot.inode_reservation_end,
@@ -2677,6 +2854,7 @@ impl Namespace {
                 entries,
                 handles: BTreeMap::new(),
                 lookup_counts: BTreeMap::new(),
+                active_create_metadata_bytes: BTreeMap::new(),
             }),
             locks: Mutex::new(LockTable::default()),
             lock_change_sequence: AtomicU64::new(0),
@@ -2781,6 +2959,159 @@ impl Namespace {
             "ASSERT: a Namespace may install only one mutation observer"
         );
         *installed = Some(observer);
+    }
+
+    /// Installs the appliance's one physical commit-capacity governor.
+    ///
+    /// Installation is intentionally one-shot and must happen before serving
+    /// requests. The request path then reads the immutable trait pointer and
+    /// performs only atomic accounting in the governor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a governor was already installed.
+    pub fn install_commit_capacity_admission(&self, admission: Arc<dyn CommitCapacityAdmission>) {
+        assert!(
+            self.commit_capacity_admission.set(admission).is_ok(),
+            "ASSERT: a Namespace may install only one commit-capacity governor"
+        );
+    }
+
+    /// Atomically replaces the hard logical quotas attached to managed
+    /// directory subtrees.
+    ///
+    /// Usage is reconstructed from the live namespace while mutation admission
+    /// is fenced. Allocated DATA/FILL/clone extents count in full, sparse holes
+    /// do not, and a hard-linked inode is counted once. Cross-quota hard links
+    /// and nested quota roots are rejected because they have no single owner.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid revisions, missing or non-directory roots, overlapping
+    /// quota trees, usage already above the requested limit, or inconsistent
+    /// namespace allocation metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an internal admission, catalog, inode, or quota lock was
+    /// poisoned by an earlier invariant violation.
+    pub fn replace_logical_quotas(
+        &self,
+        revision: String,
+        rules: impl IntoIterator<Item = LogicalQuotaRule>,
+    ) -> Result<(), PosixError> {
+        let _mutation_fence = self
+            .mutations_admitted
+            .write()
+            .expect("ASSERT: mutation admission lock poisoned");
+        let catalog = self.catalog.read().expect("ASSERT: catalog lock poisoned");
+        let mut limits = BTreeMap::new();
+        for rule in rules {
+            if limits
+                .insert(rule.root_inode(), rule.limit_bytes())
+                .is_some()
+            {
+                return Err(PosixError::InvalidArgument);
+            }
+            let root = catalog
+                .inodes
+                .get(&rule.root_inode())
+                .ok_or(PosixError::NoEntry)?;
+            if root
+                .state
+                .read()
+                .expect("ASSERT: quota root inode lock poisoned")
+                .kind
+                != FileKind::Directory
+            {
+                return Err(PosixError::NotDirectory);
+            }
+        }
+
+        let mut membership = BTreeMap::<InodeId, InodeId>::new();
+        let mut usage = BTreeMap::<InodeId, u64>::new();
+        for &root_inode in limits.keys() {
+            let mut pending = vec![root_inode];
+            while let Some(inode) = pending.pop() {
+                if inode != root_inode && limits.contains_key(&inode) {
+                    return Err(PosixError::InvalidArgument);
+                }
+                match membership.insert(inode, root_inode) {
+                    Some(existing) if existing != root_inode => {
+                        return Err(PosixError::InvalidArgument);
+                    }
+                    Some(_) => continue,
+                    None => {}
+                }
+                let object = catalog
+                    .inodes
+                    .get(&inode)
+                    .ok_or(PosixError::InvalidArgument)?;
+                let state = object.state.read().expect("ASSERT: inode lock poisoned");
+                if state.kind == FileKind::Regular {
+                    let root_usage = usage.entry(root_inode).or_default();
+                    *root_usage = root_usage
+                        .checked_add(state.data.allocated_bytes())
+                        .ok_or(PosixError::NoSpace)?;
+                }
+                let is_directory = state.kind == FileKind::Directory;
+                drop(state);
+                if is_directory {
+                    for ((parent, _), &child) in catalog.entries.range((inode, Vec::new())..) {
+                        if *parent != inode {
+                            break;
+                        }
+                        pending.push(child);
+                    }
+                }
+            }
+        }
+        for ((parent, _), target) in &catalog.entries {
+            if let Some(&target_root) = membership.get(target)
+                && *target != target_root
+                && membership.get(parent).copied() != Some(target_root)
+            {
+                return Err(PosixError::InvalidArgument);
+            }
+        }
+        for (&inode, object) in &catalog.inodes {
+            if membership.contains_key(&inode) {
+                continue;
+            }
+            let state = object.state.read().expect("ASSERT: inode lock poisoned");
+            if state.link_count != 0 || state.kind != FileKind::Regular {
+                continue;
+            }
+            let Some(root_inode) = self.logical_quotas.root_for(inode) else {
+                continue;
+            };
+            if !limits.contains_key(&root_inode) {
+                continue;
+            }
+            membership.insert(inode, root_inode);
+            let root_usage = usage.entry(root_inode).or_default();
+            *root_usage = root_usage
+                .checked_add(state.data.allocated_bytes())
+                .ok_or(PosixError::NoSpace)?;
+        }
+        drop(catalog);
+        self.logical_quotas
+            .replace(revision, &limits, membership, &usage)
+    }
+
+    #[must_use]
+    pub fn logical_quota_revision(&self) -> String {
+        self.logical_quotas.revision()
+    }
+
+    #[must_use]
+    pub fn logical_quota_status(&self, root_inode: InodeId) -> Option<LogicalQuotaStatus> {
+        self.logical_quotas.status(root_inode)
+    }
+
+    #[must_use]
+    pub fn logical_quota_status_for_inode(&self, inode: InodeId) -> Option<LogicalQuotaStatus> {
+        self.logical_quotas.status_for_inode(inode)
     }
 
     fn notify_write_handle_opened(&self, inode: InodeId) {
@@ -2890,6 +3221,9 @@ impl Namespace {
             }
         }
         if !namespace_dirty && !content_dirty {
+            if let Some(admission) = self.commit_capacity_admission.get() {
+                admission.finish_uncheckpointed_active();
+            }
             return Ok(None);
         }
 
@@ -3020,6 +3354,10 @@ impl Namespace {
             catalog.inflight_commit.replace(commit.clone()).is_none(),
             "ASSERT: begin commit replaced an in-flight generation"
         );
+        catalog.active_create_metadata_bytes.clear();
+        if let Some(admission) = self.commit_capacity_admission.get() {
+            admission.freeze(token);
+        }
         Ok(Some(commit))
     }
 
@@ -3102,6 +3440,9 @@ impl Namespace {
         catalog.committed_namespace_mutation_sequence = commit.namespace_mutation_sequence;
         let removed = catalog.inflight_commit.take();
         assert!(removed.is_some(), "ASSERT: completed commit disappeared");
+        if let Some(admission) = self.commit_capacity_admission.get() {
+            admission.complete(commit.token);
+        }
         Ok(())
     }
 
@@ -3111,13 +3452,25 @@ impl Namespace {
     ///
     /// Returns a stable semantic error for invalid user input, missing objects,
     /// invalid handles, or exhausted configured resources.
+    ///
+    /// # Panics
+    ///
+    /// Panics when internal namespace, lock, or capacity-attribution invariants
+    /// are violated.
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub fn dispatch(
         &self,
         context: RequestContext,
         operation: Operation<'_>,
     ) -> Result<Reply, PosixError> {
-        match operation {
+        let durable_mutation = operation.is_durable_mutation();
+        let requires_mutation_admission = operation.requires_mutation_admission();
+        let claim = operation.commit_capacity_claim();
+        let _mutation_fence = requires_mutation_admission
+            .then(|| self.require_mutation_admission())
+            .transpose()?;
+        let reservation = self.reserve_commit_capacity(claim)?;
+        let result = match operation {
             Operation::Lookup { parent, name } => self.lookup(parent, name),
             Operation::GetAttr { inode } => self.getattr(inode),
             Operation::GetXattr { inode, name } => self.get_xattr(inode, name),
@@ -3281,7 +3634,11 @@ impl Namespace {
                 inode,
                 lookup_count,
             } => Ok(self.forget(inode, lookup_count)),
+        };
+        if durable_mutation && result.is_ok() {
+            reservation.accept();
         }
+        result
     }
 
     fn create_and_track_writer(&self, request: CreateRequest<'_>) -> Result<Reply, PosixError> {
@@ -3339,8 +3696,8 @@ impl Namespace {
         offset: u64,
         payload: MutationPayload,
     ) -> Result<Reply, PosixError> {
-        self.write_payload(inode, handle, offset, payload)
-            .map(|result| result.reply)
+        let result = self.dispatch_owned_write_inner(inode, handle, offset, payload)?;
+        Ok(result.reply)
     }
 
     pub(crate) fn dispatch_owned_write_for_fuse(
@@ -3351,8 +3708,19 @@ impl Namespace {
         offset: u64,
         payload: MutationPayload,
     ) -> Result<(Reply, bool), PosixError> {
+        let result = self.dispatch_owned_write_inner(inode, handle, offset, payload)?;
+        Ok((result.reply, result.kernel_data_cache_exposed))
+    }
+
+    fn dispatch_owned_write_inner(
+        &self,
+        inode: InodeId,
+        handle: HandleId,
+        offset: u64,
+        payload: MutationPayload,
+    ) -> Result<WriteResult, PosixError> {
+        let _mutation_fence = self.require_mutation_admission()?;
         self.write_payload(inode, handle, offset, payload)
-            .map(|result| (result.reply, result.kernel_data_cache_exposed))
     }
 
     pub(crate) fn expose_kernel_data_cache(&self, inode: InodeId) -> Result<(), PosixError> {
@@ -3451,7 +3819,6 @@ impl Namespace {
         if context.uid != 0 {
             return Err(PosixError::PermissionDenied);
         }
-        let _admission = self.require_mutation_admission()?;
         let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         let object = catalog
             .inodes
@@ -3462,17 +3829,15 @@ impl Namespace {
         if state.metadata.file_flags() == flags {
             return Ok(Reply::Empty);
         }
+        let reservation = self.reserve_commit_capacity(CommitCapacityClaim::new(
+            MUTATION_METADATA_INCREMENT_BYTES_V1,
+            0,
+        ))?;
         Arc::make_mut(&mut state.metadata).set_file_flags(flags)?;
         state.times.ctime = PosixTimestamp::now();
-        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
-        state.mutation_sequence = if inode == ROOT_INODE {
-            next_namespace_sequence
-        } else {
-            state
-                .mutation_sequence
-                .checked_add(1)
-                .ok_or(PosixError::NoSpace)?
-        };
+        let (next_namespace_sequence, next_inode_sequence) =
+            next_namespace_and_inode_mutation_sequences(&catalog, inode, state.mutation_sequence)?;
+        state.mutation_sequence = next_inode_sequence;
         if state.kind == FileKind::Regular {
             let mutation_sequence = state.mutation_sequence;
             state.data.advance_mutation_sequence(mutation_sequence);
@@ -3481,6 +3846,7 @@ impl Namespace {
         if inode != ROOT_INODE {
             install_root_mutation_sequence(&catalog, next_namespace_sequence);
         }
+        reservation.accept();
         Ok(Reply::Empty)
     }
 
@@ -3490,7 +3856,6 @@ impl Namespace {
         inode: InodeId,
         mode: u16,
     ) -> Result<Reply, PosixError> {
-        let _admission = self.require_mutation_admission()?;
         let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         let object = catalog
             .inodes
@@ -3504,15 +3869,8 @@ impl Namespace {
         if state.metadata.is_immutable() {
             return Err(PosixError::PermissionDenied);
         }
-        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
-        let next_inode_sequence = if inode == ROOT_INODE {
-            next_namespace_sequence
-        } else {
-            state
-                .mutation_sequence
-                .checked_add(1)
-                .ok_or(PosixError::NoSpace)?
-        };
+        let (next_namespace_sequence, next_inode_sequence) =
+            next_namespace_and_inode_mutation_sequences(&catalog, inode, state.mutation_sequence)?;
         state.mode = Arc::make_mut(&mut state.metadata).chmod(mode)?;
         state.times.ctime = PosixTimestamp::now();
         if state.kind == FileKind::Regular {
@@ -3550,7 +3908,6 @@ impl Namespace {
         {
             return Err(PosixError::InvalidArgument);
         }
-        let _admission = self.require_mutation_admission()?;
         let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         let object = catalog
             .inodes
@@ -3569,15 +3926,12 @@ impl Namespace {
                 return Err(PosixError::PermissionDenied);
             }
         }
-        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
-        let next_inode_sequence = if inode == ROOT_INODE {
-            next_namespace_sequence
-        } else {
-            state
-                .mutation_sequence
-                .checked_add(1)
-                .ok_or(PosixError::NoSpace)?
-        };
+        let reservation = self.reserve_commit_capacity(CommitCapacityClaim::new(
+            MUTATION_METADATA_INCREMENT_BYTES_V1,
+            0,
+        ))?;
+        let (next_namespace_sequence, next_inode_sequence) =
+            next_namespace_and_inode_mutation_sequences(&catalog, inode, state.mutation_sequence)?;
         if let Some(mode) = update.mode {
             state.mode = Arc::make_mut(&mut state.metadata).chmod(mode)?;
         }
@@ -3606,6 +3960,7 @@ impl Namespace {
         if inode != ROOT_INODE {
             install_root_mutation_sequence(&catalog, next_namespace_sequence);
         }
+        reservation.accept();
         Ok(Reply::Attr(attr))
     }
 
@@ -3617,7 +3972,6 @@ impl Namespace {
         new_name: &[u8],
     ) -> Result<Reply, PosixError> {
         self.validate_name(new_name)?;
-        let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, new_parent)?;
         validate_mutable_directory(&catalog, new_parent)?;
@@ -3633,6 +3987,9 @@ impl Namespace {
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
         if state.kind == FileKind::Directory {
             return Err(PosixError::PermissionDenied);
+        }
+        if !self.logical_quotas.same_domain(inode, new_parent) {
+            return Err(PosixError::CrossDevice);
         }
         if context.uid != 0 && context.uid != state.uid {
             return Err(PosixError::PermissionDenied);
@@ -3670,7 +4027,6 @@ impl Namespace {
         if target.is_empty() || target.len() > 4_096 {
             return Err(PosixError::InvalidArgument);
         }
-        let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, parent)?;
         validate_mutable_directory(&catalog, parent)?;
@@ -3684,6 +4040,10 @@ impl Namespace {
             .map_err(|_| PosixError::OutOfMemory)?;
         copied.extend_from_slice(target);
         let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
+        let reservation = self.reserve_commit_capacity(CommitCapacityClaim::new(
+            MUTATION_METADATA_INCREMENT_BYTES_V1,
+            0,
+        ))?;
         let inode = allocate_inode(&mut catalog)?;
         let object = Arc::new(Inode {
             observer_order: Mutex::new(()),
@@ -3709,7 +4069,18 @@ impl Namespace {
         assert!(catalog.inodes.insert(inode, object).is_none());
         assert!(catalog.lookup_counts.insert(inode, 1).is_none());
         assert!(catalog.entries.insert(key, inode).is_none());
+        self.logical_quotas.associate_child(parent, inode);
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        if self.commit_capacity_admission.get().is_some() {
+            assert!(
+                catalog
+                    .active_create_metadata_bytes
+                    .insert(inode, MUTATION_METADATA_INCREMENT_BYTES_V1)
+                    .is_none(),
+                "ASSERT: a new inode receives one Active create claim"
+            );
+            reservation.accept();
+        }
         Ok(Reply::Entry(Entry { attr }))
     }
 
@@ -3752,17 +4123,27 @@ impl Namespace {
         if !relatime_due(state.times, now) {
             return;
         }
-        let Ok(next_namespace_sequence) = next_root_mutation_sequence(&catalog) else {
+        let Ok((next_namespace_sequence, next_inode_sequence)) =
+            next_namespace_and_inode_mutation_sequences(&catalog, inode, state.mutation_sequence)
+        else {
+            return;
+        };
+        let Ok(reservation) = self.reserve_commit_capacity(CommitCapacityClaim::new(
+            MUTATION_METADATA_INCREMENT_BYTES_V1,
+            0,
+        )) else {
             return;
         };
         state.times.atime = now;
-        if inode == ROOT_INODE {
-            state.mutation_sequence = next_namespace_sequence;
+        if state.kind == FileKind::Regular {
+            state.data.advance_mutation_sequence(next_inode_sequence);
         }
+        state.mutation_sequence = next_inode_sequence;
         drop(state);
         if inode != ROOT_INODE {
             install_root_mutation_sequence(&catalog, next_namespace_sequence);
         }
+        reservation.accept();
     }
 
     fn mutate_metadata(
@@ -3772,7 +4153,6 @@ impl Namespace {
         name: &[u8],
         mutation: impl FnOnce(&mut InodeState) -> Result<(), PosixError>,
     ) -> Result<Reply, PosixError> {
-        let _admission = self.require_mutation_admission()?;
         let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         let object = catalog
             .inodes
@@ -3784,15 +4164,8 @@ impl Namespace {
         if state.metadata.is_immutable() {
             return Err(PosixError::PermissionDenied);
         }
-        let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
-        let next_inode_sequence = if inode == ROOT_INODE {
-            next_namespace_sequence
-        } else {
-            state
-                .mutation_sequence
-                .checked_add(1)
-                .ok_or(PosixError::NoSpace)?
-        };
+        let (next_namespace_sequence, next_inode_sequence) =
+            next_namespace_and_inode_mutation_sequences(&catalog, inode, state.mutation_sequence)?;
         mutation(&mut state)?;
         state.times.ctime = PosixTimestamp::now();
         if state.kind == FileKind::Regular {
@@ -3808,7 +4181,6 @@ impl Namespace {
 
     fn create(&self, request: CreateRequest<'_>) -> Result<Reply, PosixError> {
         self.validate_name(request.name)?;
-        let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, request.parent)?;
         let key = (request.parent, request.name.to_vec());
@@ -3826,11 +4198,33 @@ impl Namespace {
                 inode,
                 request,
                 &self.dirty_payload,
+                &self.logical_quotas,
                 observer.as_deref(),
             );
         }
         validate_mutable_directory(&catalog, request.parent)?;
-        create_new_file(&mut catalog, key, request)
+        let reservation = self.reserve_commit_capacity(CommitCapacityClaim::new(
+            MUTATION_METADATA_INCREMENT_BYTES_V1,
+            0,
+        ))?;
+        let result = create_new_file(&mut catalog, key, request);
+        if let Ok(Reply::Created { entry, .. }) = &result {
+            self.logical_quotas
+                .associate_child(request.parent, entry.attr.inode);
+        }
+        if let Ok(Reply::Created { entry, .. }) = &result
+            && self.commit_capacity_admission.get().is_some()
+        {
+            assert!(
+                catalog
+                    .active_create_metadata_bytes
+                    .insert(entry.attr.inode, MUTATION_METADATA_INCREMENT_BYTES_V1,)
+                    .is_none(),
+                "ASSERT: a new inode receives one Active create claim"
+            );
+            reservation.accept();
+        }
+        result
     }
 
     fn mkdir(
@@ -3842,7 +4236,6 @@ impl Namespace {
         umask: u16,
     ) -> Result<Reply, PosixError> {
         self.validate_name(name)?;
-        let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, parent)?;
         let key = (parent, name.to_vec());
@@ -3875,6 +4268,10 @@ impl Namespace {
         let (mode, metadata) = parent_state
             .metadata
             .for_child(FileKind::Directory, mode, umask)?;
+        let reservation = self.reserve_commit_capacity(CommitCapacityClaim::new(
+            MUTATION_METADATA_INCREMENT_BYTES_V1,
+            0,
+        ))?;
         let inode = allocate_inode(&mut catalog)?;
         let object = Arc::new(Inode {
             observer_order: Mutex::new(()),
@@ -3909,11 +4306,22 @@ impl Namespace {
             catalog.entries.insert(key, inode).is_none(),
             "ASSERT: mkdir replaced an existing directory entry"
         );
+        self.logical_quotas.associate_child(parent, inode);
         parent_state.link_count = next_parent_links;
         parent_state.mutation_sequence = next_parent_sequence;
         drop(parent_state);
         if parent != ROOT_INODE {
             install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        }
+        if self.commit_capacity_admission.get().is_some() {
+            assert!(
+                catalog
+                    .active_create_metadata_bytes
+                    .insert(inode, MUTATION_METADATA_INCREMENT_BYTES_V1)
+                    .is_none(),
+                "ASSERT: a new inode receives one Active create claim"
+            );
+            reservation.accept();
         }
         Ok(Reply::Entry(Entry { attr }))
     }
@@ -3924,9 +4332,6 @@ impl Namespace {
         options: OpenOptions,
         truncate: bool,
     ) -> Result<Reply, PosixError> {
-        let _admission = (options.access != AccessMode::ReadOnly || truncate)
-            .then(|| self.require_mutation_admission())
-            .transpose()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         let object = catalog
             .inodes
@@ -3956,6 +4361,12 @@ impl Namespace {
         } else {
             None
         };
+        let logical_quota = next_sequence
+            .map(|_| {
+                self.logical_quotas
+                    .reserve_change(inode, state.data.allocated_bytes(), 0)
+            })
+            .transpose()?;
 
         let handle = allocate_handle(&mut catalog)?;
         if let Some(sequence) = next_sequence {
@@ -3971,6 +4382,9 @@ impl Namespace {
             state.times.ctime = now;
         }
         drop(state);
+        if let Some(logical_quota) = logical_quota {
+            logical_quota.accept();
+        }
         assert!(
             catalog
                 .handles
@@ -4028,6 +4442,7 @@ impl Namespace {
             .map(|result| result.reply)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn write_payload(
         &self,
         inode: InodeId,
@@ -4035,7 +4450,6 @@ impl Namespace {
         requested_offset: u64,
         payload: MutationPayload,
     ) -> Result<WriteResult, PosixError> {
-        let _admission = self.require_mutation_admission()?;
         let written = u32::try_from(payload.len()).map_err(|_| PosixError::FileTooLarge)?;
         let (object, open) = self.resolve_open_file(inode, handle)?;
         if open.options.access == AccessMode::ReadOnly {
@@ -4076,6 +4490,27 @@ impl Namespace {
         if end > self.config.maximum_file_bytes {
             return Err(PosixError::FileTooLarge);
         }
+        let capacity = state.data.plan_write_capacity(offset, data_length)?;
+        let reservation = self.reserve_commit_capacity(write_capacity_claim(
+            payload.len(),
+            capacity.metadata_bytes(),
+        )?)?;
+        let logical_before = state.data.allocated_bytes();
+        let overwritten_end = end.min(state.data.logical_size());
+        let overwritten = if offset < overwritten_end {
+            state
+                .data
+                .allocated_bytes_in_live_range(offset, overwritten_end)?
+        } else {
+            0
+        };
+        let logical_after = logical_before
+            .checked_sub(overwritten)
+            .and_then(|remaining| remaining.checked_add(data_length))
+            .ok_or(PosixError::NoSpace)?;
+        let logical_quota =
+            self.logical_quotas
+                .reserve_change(inode, logical_before, logical_after)?;
         let next_sequence = state
             .mutation_sequence
             .checked_add(u64::from(!payload.is_empty()))
@@ -4085,6 +4520,12 @@ impl Namespace {
         state
             .data
             .write_payload(offset, payload.clone(), next_sequence)?;
+        assert_eq!(
+            state.data.allocated_bytes(),
+            logical_after,
+            "ASSERT: admitted write allocation must match its logical quota claim"
+        );
+        state.data.accept_write_capacity(capacity);
         let dirty_after = state.data.active_resident_payload_bytes();
         if state.link_count > 0 {
             self.dirty_payload.replace(dirty_before, dirty_after);
@@ -4094,6 +4535,7 @@ impl Namespace {
         state.times.mtime = now;
         state.times.ctime = now;
         drop(state);
+        logical_quota.accept();
         let externalized = self
             .mutation_observer
             .read()
@@ -4105,6 +4547,7 @@ impl Namespace {
             });
         drop(observer_order);
         self.externalize_verified_extents(externalized);
+        reservation.accept();
 
         Ok(WriteResult {
             reply: Reply::Written {
@@ -4173,7 +4616,6 @@ impl Namespace {
         if length > self.config.maximum_file_bytes {
             return Err(PosixError::FileTooLarge);
         }
-        let _admission = self.require_mutation_admission()?;
         let object = match handle {
             Some(handle) => {
                 let (object, open) = self.resolve_open_file(inode, handle)?;
@@ -4198,15 +4640,42 @@ impl Namespace {
         if state.metadata.is_immutable() {
             return Err(PosixError::PermissionDenied);
         }
-        if length == state.data.logical_size() {
+        let current_size = state.data.logical_size();
+        if length == current_size {
             return Ok(Reply::Attr(state.attributes(inode)));
         }
+        let capacity = if length > current_size {
+            CommitCapacityClaim::new(MUTATION_METADATA_INCREMENT_BYTES_V1, 0)
+        } else {
+            CommitCapacityClaim::default()
+        };
+        let reservation = self.reserve_commit_capacity(capacity)?;
+        let logical_before = state.data.allocated_bytes();
+        let logical_after = if length < current_size {
+            logical_before
+                .checked_sub(
+                    state
+                        .data
+                        .allocated_bytes_in_live_range(length, current_size)?,
+                )
+                .ok_or(PosixError::Io)?
+        } else {
+            logical_before
+        };
+        let logical_quota =
+            self.logical_quotas
+                .reserve_change(inode, logical_before, logical_after)?;
         let next_sequence = state
             .mutation_sequence
             .checked_add(1)
             .ok_or(PosixError::NoSpace)?;
         let dirty_before = state.data.active_resident_payload_bytes();
         state.data.truncate(length, next_sequence)?;
+        assert_eq!(
+            state.data.allocated_bytes(),
+            logical_after,
+            "ASSERT: admitted truncate allocation must match its logical quota claim"
+        );
         let dirty_after = state.data.active_resident_payload_bytes();
         if state.link_count > 0 {
             self.dirty_payload.replace(dirty_before, dirty_after);
@@ -4217,11 +4686,14 @@ impl Namespace {
         state.times.ctime = now;
         let attr = state.attributes(inode);
         drop(state);
+        logical_quota.accept();
         self.observe_truncate(inode, next_sequence, length);
         drop(observer_order);
+        reservation.accept();
         Ok(Reply::Attr(attr))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn fallocate(
         &self,
         inode: InodeId,
@@ -4234,7 +4706,6 @@ impl Namespace {
             return Err(PosixError::InvalidArgument);
         }
         let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
-        let _admission = self.require_mutation_admission()?;
         let (object, open) = self.resolve_open_file(inode, handle)?;
         if open.options.access == AccessMode::ReadOnly {
             return Err(PosixError::BadHandle);
@@ -4275,6 +4746,36 @@ impl Namespace {
         if result_size > self.config.maximum_file_bytes {
             return Err(PosixError::FileTooLarge);
         }
+        let logical_before = state.data.allocated_bytes();
+        let effective_end = end.min(result_size);
+        let logical_after = match mode {
+            FallocateMode::Allocate { .. } | FallocateMode::ZeroRange { .. } => {
+                let allocated = if offset < effective_end {
+                    state
+                        .data
+                        .allocated_bytes_in_live_range(offset, effective_end)?
+                } else {
+                    0
+                };
+                logical_before
+                    .checked_add(
+                        effective_end
+                            .saturating_sub(offset)
+                            .saturating_sub(allocated),
+                    )
+                    .ok_or(PosixError::NoSpace)?
+            }
+            FallocateMode::PunchHole | FallocateMode::CollapseRange => logical_before
+                .checked_sub(state.data.allocated_bytes_in_live_range(
+                    offset.min(current_size),
+                    end.min(current_size),
+                )?)
+                .ok_or(PosixError::Io)?,
+            FallocateMode::InsertRange => logical_before,
+        };
+        let logical_quota =
+            self.logical_quotas
+                .reserve_change(inode, logical_before, logical_after)?;
         let next_sequence = state
             .mutation_sequence
             .checked_add(1)
@@ -4315,6 +4816,11 @@ impl Namespace {
                 state.data.insert_range(offset, length, next_sequence)?;
             }
         }
+        assert_eq!(
+            state.data.allocated_bytes(),
+            logical_after,
+            "ASSERT: admitted fallocate allocation must match its logical quota claim"
+        );
         let dirty_after = state.data.active_resident_payload_bytes();
         if state.link_count > 0 {
             self.dirty_payload.replace(dirty_before, dirty_after);
@@ -4325,6 +4831,7 @@ impl Namespace {
         state.times.ctime = now;
         let attr = state.attributes(inode);
         drop(state);
+        logical_quota.accept();
         self.observe_truncate(inode, next_sequence, result_size);
         drop(observer_order);
         Ok(Reply::Attr(attr))
@@ -4350,7 +4857,7 @@ impl Namespace {
         Ok(Reply::Offset(found))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn clone_range(
         &self,
         source_inode: InodeId,
@@ -4361,7 +4868,6 @@ impl Namespace {
         target_offset: u64,
         length: u64,
     ) -> Result<Reply, PosixError> {
-        let _admission = self.require_mutation_admission()?;
         let (source_object, source_open) = self.resolve_open_file(source_inode, source_handle)?;
         let (target_object, target_open) = self.resolve_open_file(target_inode, target_handle)?;
         if source_open.options.access == AccessMode::WriteOnly
@@ -4428,6 +4934,22 @@ impl Namespace {
         if target.metadata.is_immutable() {
             return Err(PosixError::PermissionDenied);
         }
+        let logical_before = target.data.allocated_bytes();
+        let overwritten_end = target_end.min(target.data.logical_size());
+        let overwritten = if target_offset < overwritten_end {
+            target
+                .data
+                .allocated_bytes_in_live_range(target_offset, overwritten_end)?
+        } else {
+            0
+        };
+        let logical_after = logical_before
+            .checked_sub(overwritten)
+            .and_then(|remaining| remaining.checked_add(length))
+            .ok_or(PosixError::NoSpace)?;
+        let logical_quota =
+            self.logical_quotas
+                .reserve_change(target_inode, logical_before, logical_after)?;
         let next_sequence = target
             .mutation_sequence
             .checked_add(1)
@@ -4436,6 +4958,11 @@ impl Namespace {
         target
             .data
             .clone_range(target_offset, source, source_offset, length, next_sequence)?;
+        assert_eq!(
+            target.data.allocated_bytes(),
+            logical_after,
+            "ASSERT: admitted clone allocation must match its logical quota claim"
+        );
         let dirty_after = target.data.active_resident_payload_bytes();
         assert_eq!(
             dirty_before, dirty_after,
@@ -4447,6 +4974,7 @@ impl Namespace {
         target.times.ctime = now;
         let target_size = target.data.logical_size();
         drop(target);
+        logical_quota.accept();
         self.observe_truncate(target_inode, next_sequence, target_size);
         drop(observer_order);
         Ok(Reply::Cloned {
@@ -4678,13 +5206,13 @@ impl Namespace {
         {
             let removed = catalog.inodes.remove(&inode);
             assert!(removed.is_some(), "ASSERT: orphan inode disappeared early");
+            self.release_removed_inode_quota(inode, &object);
         }
         Ok(Reply::Empty)
     }
 
     fn unlink(&self, parent: InodeId, name: &[u8]) -> Result<Reply, PosixError> {
         self.validate_name(name)?;
-        let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, parent)?;
         validate_mutable_directory(&catalog, parent)?;
@@ -4726,6 +5254,9 @@ impl Namespace {
         let removed = catalog.entries.remove(&key);
         assert_eq!(removed, Some(inode), "ASSERT: validated name disappeared");
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        let reversed_create_claim = final_link
+            .then(|| catalog.active_create_metadata_bytes.remove(&inode))
+            .flatten();
 
         let has_lookup = catalog.lookup_counts.get(&inode).copied().unwrap_or(0) != 0;
         if final_link
@@ -4740,8 +5271,14 @@ impl Namespace {
                 removed.is_some(),
                 "ASSERT: unlinked inode disappeared early"
             );
+            self.release_removed_inode_quota(inode, &object);
         }
         drop(catalog);
+        if let Some(bytes) = reversed_create_claim
+            && let Some(admission) = self.commit_capacity_admission.get()
+        {
+            admission.release_active_metadata(bytes);
+        }
         if final_link
             && object
                 .state
@@ -4758,7 +5295,6 @@ impl Namespace {
 
     fn rmdir(&self, parent: InodeId, name: &[u8]) -> Result<Reply, PosixError> {
         self.validate_name(name)?;
-        let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, parent)?;
         validate_mutable_directory(&catalog, parent)?;
@@ -4836,6 +5372,14 @@ impl Namespace {
                 removed.is_some(),
                 "ASSERT: unpinned removed directory disappeared"
             );
+            self.release_removed_inode_quota(inode, &object);
+        }
+        let reversed_create_claim = catalog.active_create_metadata_bytes.remove(&inode);
+        drop(catalog);
+        if let Some(bytes) = reversed_create_claim
+            && let Some(admission) = self.commit_capacity_admission.get()
+        {
+            admission.release_active_metadata(bytes);
         }
         Ok(Reply::Empty)
     }
@@ -4851,7 +5395,6 @@ impl Namespace {
     ) -> Result<Reply, PosixError> {
         self.validate_name(name)?;
         self.validate_name(new_name)?;
-        let _admission = self.require_mutation_admission()?;
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         validate_directory(&catalog, parent)?;
         validate_directory(&catalog, new_parent)?;
@@ -4871,6 +5414,9 @@ impl Namespace {
         }
         if replaced_inode == Some(source_inode) {
             return Ok(Reply::Empty);
+        }
+        if !self.logical_quotas.same_domain(source_inode, new_parent) {
+            return Err(PosixError::CrossDevice);
         }
         let source_kind = catalog
             .inodes
@@ -4905,8 +5451,12 @@ impl Namespace {
         {
             return Err(PosixError::PermissionDenied);
         }
+        let reservation = self.reserve_commit_capacity(CommitCapacityClaim::new(
+            MUTATION_METADATA_INCREMENT_BYTES_V1,
+            0,
+        ))?;
         if source_kind == FileKind::Directory {
-            return rename_directory(
+            let result = rename_directory(
                 &mut catalog,
                 parent,
                 &old_key,
@@ -4915,6 +5465,24 @@ impl Namespace {
                 source_inode,
                 replaced_inode,
             );
+            let reversed_create_claim = result
+                .is_ok()
+                .then(|| {
+                    replaced_inode.and_then(|target_inode| {
+                        catalog.active_create_metadata_bytes.remove(&target_inode)
+                    })
+                })
+                .flatten();
+            drop(catalog);
+            if let Some(bytes) = reversed_create_claim
+                && let Some(admission) = self.commit_capacity_admission.get()
+            {
+                admission.release_active_metadata(bytes);
+            }
+            if result.is_ok() {
+                reservation.accept();
+            }
+            return result;
         }
         let next_namespace_sequence = next_root_mutation_sequence(&catalog)?;
         let target_object = replaced_inode.map(|target_inode| {
@@ -4979,6 +5547,7 @@ impl Namespace {
             "ASSERT: rename target changed under the catalog write lock"
         );
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
+        let mut reversed_create_claim = None;
         if let Some(target_inode) = replaced_inode {
             let has_lookup = catalog
                 .lookup_counts
@@ -4998,15 +5567,30 @@ impl Namespace {
                 .expect("ASSERT: target inode lock poisoned")
                 .link_count
                 == 0;
+            if is_orphan {
+                reversed_create_claim = catalog.active_create_metadata_bytes.remove(&target_inode);
+            }
             if is_orphan && !has_lookup && !has_handle {
                 let removed = catalog.inodes.remove(&target_inode);
                 assert!(
                     removed.is_some(),
                     "ASSERT: replaced unpinned inode must remain live until rename"
                 );
+                self.release_removed_inode_quota(
+                    target_inode,
+                    target_object
+                        .as_ref()
+                        .expect("ASSERT: replaced target object exists"),
+                );
             }
         }
         drop(catalog);
+        if let Some(bytes) = reversed_create_claim
+            && let Some(admission) = self.commit_capacity_admission.get()
+        {
+            admission.release_active_metadata(bytes);
+        }
+        reservation.accept();
         if let Some((target_inode, next_sequence)) = target_sequence {
             self.observe_truncate(target_inode, next_sequence, 0);
         }
@@ -5149,8 +5733,20 @@ impl Namespace {
                 removed.is_some(),
                 "ASSERT: forgotten orphan must remain live"
             );
+            self.release_removed_inode_quota(inode, &object);
         }
         Reply::Empty
+    }
+
+    fn release_removed_inode_quota(&self, inode: InodeId, object: &Arc<Inode>) {
+        let state = object.state.read().expect("ASSERT: inode lock poisoned");
+        let allocated_bytes = if state.kind == FileKind::Regular {
+            state.data.allocated_bytes()
+        } else {
+            0
+        };
+        drop(state);
+        self.logical_quotas.remove_inode(inode, allocated_bytes);
     }
 
     fn resolve_inode(&self, inode: InodeId) -> Result<Arc<Inode>, PosixError> {
@@ -5197,6 +5793,23 @@ impl Namespace {
             return Err(PosixError::Again);
         }
         Ok(admitted)
+    }
+
+    fn reserve_commit_capacity(
+        &self,
+        claim: CommitCapacityClaim,
+    ) -> Result<CommitCapacityReservation<'_>, PosixError> {
+        let admission = (!claim.is_empty())
+            .then(|| self.commit_capacity_admission.get().map(AsRef::as_ref))
+            .flatten();
+        if let Some(admission) = admission {
+            admission.try_reserve(claim)?;
+        }
+        Ok(CommitCapacityReservation {
+            admission,
+            claim,
+            accepted: false,
+        })
     }
 }
 
@@ -5330,6 +5943,18 @@ fn next_root_mutation_sequence(catalog: &Catalog) -> Result<u64, PosixError> {
     root_mutation_sequence(catalog)
         .checked_add(1)
         .ok_or(PosixError::NoSpace)
+}
+
+fn next_namespace_and_inode_mutation_sequences(
+    catalog: &Catalog,
+    inode: InodeId,
+    inode_sequence: u64,
+) -> Result<(u64, u64), PosixError> {
+    let next_inode_sequence = inode_sequence.checked_add(1).ok_or(PosixError::NoSpace)?;
+    if inode == ROOT_INODE {
+        return Ok((next_inode_sequence, next_inode_sequence));
+    }
+    Ok((next_root_mutation_sequence(catalog)?, next_inode_sequence))
 }
 
 fn install_root_mutation_sequence(catalog: &Catalog, sequence: u64) {
@@ -5647,6 +6272,7 @@ fn open_existing_for_create(
     inode: InodeId,
     request: CreateRequest<'_>,
     dirty_payload: &DirtyPayloadTracker,
+    logical_quotas: &LogicalQuotaTable,
     observer: Option<&dyn MutationObserver>,
 ) -> Result<Reply, PosixError> {
     let object = catalog
@@ -5683,6 +6309,9 @@ fn open_existing_for_create(
     } else {
         None
     };
+    let logical_quota = next_sequence
+        .map(|_| logical_quotas.reserve_change(inode, state.data.allocated_bytes(), 0))
+        .transpose()?;
     let next_lookup = catalog
         .lookup_counts
         .get(&inode)
@@ -5707,6 +6336,9 @@ fn open_existing_for_create(
     }
     let attr = state.attributes(inode);
     drop(state);
+    if let Some(logical_quota) = logical_quota {
+        logical_quota.accept();
+    }
     if let Some(sequence) = next_sequence
         && let Some(observer) = observer
     {

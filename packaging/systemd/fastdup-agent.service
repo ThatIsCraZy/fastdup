@@ -1,0 +1,26 @@
+[Unit]
+Description=FastDup privileged appliance agent
+After=local-fs.target
+Before=fastdup-control.service
+
+[Service]
+Type=simple
+Slice=fastdup-management.slice
+ExecStart=/usr/libexec/fastdup/fastdup-agent
+User=root
+Group=fastdup-control
+UMask=0007
+RuntimeDirectory=fastdup
+RuntimeDirectoryMode=0770
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/fastdup /var/lib/fastdup /etc/fastdup /etc/samba/fastdup-shares.conf /srv/fastdup
+RestrictAddressFamilies=AF_UNIX
+OOMScoreAdjust=500
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+[package]
+name = "fastdup-exact-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+fastdup-format.workspace = true
+fastdup-io-uring = { path = "../fastdup-io-uring" }
+fastdup-store.workspace = true
+rustix.workspace = true
+
+[[bin]]
+name = "fastdup-exact-lookup-bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "fastdup-verified-restore-bench"
+path = "src/restore.rs"
+
+[lints]
+workspace = true

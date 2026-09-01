@@ -10,7 +10,6 @@ use crate::StorageIo;
 const SLOT_NAMES: [&str; 2] = ["exact-index.activation.wal", "exact-index.activation.1.wal"];
 const MAX_SLOT_RECORDS: usize = 64;
 const MAX_SLOT_BYTES: usize = MAX_SLOT_RECORDS * EXACT_INDEX_ACTIVATION_RECORD_BYTES;
-const MAX_LEGACY_WAL_BYTES: usize = 64 * 1_024 * 1_024;
 
 /// Paired-slot selection and publication for Exact-Index activations.
 ///
@@ -122,10 +121,10 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
     }
 
     fn ensure_slots_exist(&self) -> Result<(), ExactActivationLogError> {
-        for (slot, name) in SLOT_NAMES.into_iter().enumerate() {
+        for name in SLOT_NAMES {
             if self.storage.exists(name)? {
                 let length = self.storage.object_len(name)?;
-                if length > maximum_slot_bytes(slot) {
+                if length > maximum_slot_bytes() {
                     return Err(ExactActivationLogError::SlotTooLarge);
                 }
             } else {
@@ -149,7 +148,7 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            if length > maximum_slot_bytes(slot) {
+            if length > maximum_slot_bytes() {
                 return Err(ExactActivationLogError::SlotTooLarge);
             }
             let bytes = self.storage.read(name)?;
@@ -162,13 +161,8 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
     }
 }
 
-fn maximum_slot_bytes(slot: usize) -> u64 {
-    let maximum = if slot == 0 {
-        MAX_LEGACY_WAL_BYTES
-    } else {
-        MAX_SLOT_BYTES
-    };
-    u64::try_from(maximum).expect("ASSERT: Exact Activation Log size limit fits u64")
+fn maximum_slot_bytes() -> u64 {
+    u64::try_from(MAX_SLOT_BYTES).expect("ASSERT: Exact Activation Log size limit fits u64")
 }
 
 #[derive(Clone, Debug)]

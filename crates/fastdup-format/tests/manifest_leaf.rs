@@ -30,7 +30,7 @@ fn manifest_leaf_has_stable_bytes_and_round_trips_a_complete_file_partition() {
     );
     assert_eq!(
         &encoded[METADATA_HEADER_BYTES + 8..METADATA_HEADER_BYTES + 10],
-        &1_u16.to_le_bytes()
+        &2_u16.to_le_bytes()
     );
     assert_eq!(
         &encoded[METADATA_HEADER_BYTES + 10..METADATA_HEADER_BYTES + 12],

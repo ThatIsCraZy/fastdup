@@ -1,10 +1,13 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
 
-use fastdup_posix::{StatFsSnapshot, StatFsSource};
+use fastdup_posix::{InodeId, Namespace, StatFsSnapshot, StatFsSource};
+
+use crate::{CommitCapacityGovernor, CommitCapacitySnapshot};
 
 pub const STATFS_RESERVE_BASIS_POINTS: u64 = 1_000;
 const BASIS_POINTS: u64 = 10_000;
@@ -65,14 +68,24 @@ impl std::error::Error for StatFsOverrideError {}
 #[derive(Clone, Debug)]
 pub struct TieredStatFsSource {
     snapshot: Arc<RwLock<StatFsSnapshot>>,
+    governor: Arc<CommitCapacityGovernor>,
+    presented_capacities: Arc<RwLock<PresentedCapacities>>,
+    logical_quota_namespace: Arc<RwLock<Option<Weak<Namespace>>>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PresentedCapacities {
+    revision: String,
+    by_inode: BTreeMap<u64, u64>,
 }
 
 impl TieredStatFsSource {
     /// Opens a cached tier-capacity source.
     ///
     /// Physical capacity is sampled before this function returns and refreshed
-    /// every five seconds by one dedicated thread. An explicit override keeps
-    /// one fixed snapshot and starts no refresher.
+    /// every five seconds by one dedicated thread. An explicit reporting
+    /// override keeps the client snapshot fixed while physical observations
+    /// continue feeding mutation admission.
     ///
     /// # Errors
     ///
@@ -85,12 +98,97 @@ impl TieredStatFsSource {
     ) -> io::Result<Self> {
         let data_root = data_root.into();
         let metadata_root = metadata_root.into();
-        let initial = sample_paths(&data_root, &metadata_root, capacity_override)?;
+        let (initial, capacity) = sample_paths(&data_root, &metadata_root, capacity_override)?;
+        let governor = Arc::new(
+            CommitCapacityGovernor::new(capacity)
+                .map_err(|error| io::Error::new(io::ErrorKind::StorageFull, error))?,
+        );
         let snapshot = Arc::new(RwLock::new(initial));
-        if capacity_override.is_none() {
-            spawn_refresher(&snapshot, data_root, metadata_root)?;
+        spawn_refresher(
+            &snapshot,
+            &governor,
+            data_root,
+            metadata_root,
+            capacity_override,
+        )?;
+        Ok(Self {
+            snapshot,
+            governor,
+            presented_capacities: Arc::new(RwLock::new(PresentedCapacities::default())),
+            logical_quota_namespace: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    /// Connects Share `statfs` reporting to the synchronous logical quota
+    /// ledger owned by the POSIX namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an earlier invariant violation poisoned the
+    /// attachment lock.
+    pub fn attach_logical_quota_namespace(&self, namespace: &Arc<Namespace>) -> io::Result<()> {
+        *self
+            .logical_quota_namespace
+            .write()
+            .map_err(|_| io::Error::other("logical-quota namespace lock is poisoned"))? =
+            Some(Arc::downgrade(namespace));
+        Ok(())
+    }
+
+    /// Returns the admission governor fed by the same physical observations as
+    /// client-visible `statfs` reporting.
+    #[must_use]
+    pub fn commit_capacity_governor(&self) -> Arc<CommitCapacityGovernor> {
+        Arc::clone(&self.governor)
+    }
+
+    /// Atomically replaces reporting-only capacities for managed Share roots.
+    ///
+    /// Physical observations and mutation admission remain unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid revision, a zero inode or capacity, duplicate inode
+    /// rules, or a poisoned policy lock.
+    pub fn replace_presented_capacities(
+        &self,
+        revision: String,
+        rules: impl IntoIterator<Item = (u64, u64)>,
+    ) -> io::Result<()> {
+        if revision.is_empty() || revision.len() > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "presented-capacity revision is invalid",
+            ));
         }
-        Ok(Self { snapshot })
+        let mut by_inode = BTreeMap::new();
+        for (inode, capacity_bytes) in rules {
+            if inode == 0 || capacity_bytes == 0 || by_inode.insert(inode, capacity_bytes).is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "presented-capacity rules require unique nonzero inodes and capacities",
+                ));
+            }
+        }
+        let mut current = self
+            .presented_capacities
+            .write()
+            .map_err(|_| io::Error::other("presented-capacity lock is poisoned"))?;
+        *current = PresentedCapacities { revision, by_inode };
+        Ok(())
+    }
+
+    /// Returns the revision of the currently active Share presentation rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the policy lock is poisoned.
+    pub fn presented_capacity_revision(&self) -> io::Result<String> {
+        self.presented_capacities
+            .read()
+            .map(|capacities| capacities.revision.clone())
+            .map_err(|_| io::Error::other("presented-capacity lock is poisoned"))
     }
 }
 
@@ -98,45 +196,64 @@ fn sample_paths(
     data_root: &Path,
     metadata_root: &Path,
     capacity_override: Option<StatFsOverride>,
-) -> io::Result<StatFsSnapshot> {
+) -> io::Result<(StatFsSnapshot, CommitCapacitySnapshot)> {
     let metadata = TierCapacity::read(metadata_root)?;
-    let data = if capacity_override.is_some() {
-        None
-    } else {
-        Some(TierCapacity::read(data_root)?)
-    };
-    snapshot_from_tiers(data, metadata, capacity_override)
+    let data = TierCapacity::read(data_root)?;
+    Ok((
+        snapshot_from_tiers(Some(data), metadata, capacity_override)?,
+        commit_capacity_from_tiers(data, metadata)?,
+    ))
 }
 
 fn spawn_refresher(
     snapshot: &Arc<RwLock<StatFsSnapshot>>,
+    governor: &Arc<CommitCapacityGovernor>,
     data_root: PathBuf,
     metadata_root: PathBuf,
+    capacity_override: Option<StatFsOverride>,
 ) -> io::Result<()> {
     let weak_snapshot = Arc::downgrade(snapshot);
+    let weak_governor = Arc::downgrade(governor);
     thread::Builder::new()
         .name("fastdup-statfs".to_owned())
-        .spawn(move || refresh_loop(&weak_snapshot, &data_root, &metadata_root))?;
+        .spawn(move || {
+            refresh_loop(
+                &weak_snapshot,
+                &weak_governor,
+                &data_root,
+                &metadata_root,
+                capacity_override,
+            );
+        })?;
     Ok(())
 }
 
 fn refresh_loop(
     weak_snapshot: &Weak<RwLock<StatFsSnapshot>>,
+    weak_governor: &Weak<CommitCapacityGovernor>,
     data_root: &Path,
     metadata_root: &Path,
+    capacity_override: Option<StatFsOverride>,
 ) {
     loop {
         thread::sleep(STATFS_REFRESH_INTERVAL);
         let Some(snapshot) = weak_snapshot.upgrade() else {
             return;
         };
-        let sampled = sample_paths(data_root, metadata_root, None);
+        let Some(governor) = weak_governor.upgrade() else {
+            return;
+        };
+        let observation_epoch = governor.begin_observation();
+        let sampled = sample_paths(data_root, metadata_root, capacity_override);
         let Ok(mut cached) = snapshot.write() else {
             return;
         };
-        *cached = match sampled {
-            Ok(sampled) => sampled,
-            Err(_) => unavailable_snapshot(*cached),
+        *cached = if let Ok((sampled, capacity)) = sampled {
+            governor.finish_observation(observation_epoch, capacity);
+            sampled
+        } else {
+            governor.observation_failed(observation_epoch);
+            unavailable_snapshot(*cached)
         };
     }
 }
@@ -196,13 +313,73 @@ fn snapshot_from_tiers(
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+fn commit_capacity_from_tiers(
+    data: TierCapacity,
+    metadata: TierCapacity,
+) -> io::Result<CommitCapacitySnapshot> {
+    let data_reserve = reserve_bytes(data.capacity_bytes)?;
+    let metadata_reserve = reserve_bytes(metadata.capacity_bytes)?;
+    Ok(CommitCapacitySnapshot::new(
+        metadata.available_bytes.saturating_sub(metadata_reserve),
+        data.available_bytes.saturating_sub(data_reserve),
+    ))
+}
+
 impl StatFsSource for TieredStatFsSource {
-    fn snapshot(&self) -> io::Result<StatFsSnapshot> {
-        self.snapshot
+    fn snapshot(&self, inode: u64) -> io::Result<StatFsSnapshot> {
+        let snapshot = self
+            .snapshot
             .read()
             .map(|snapshot| *snapshot)
-            .map_err(|_| io::Error::other("cached statfs capacity lock is poisoned"))
+            .map_err(|_| io::Error::other("cached statfs capacity lock is poisoned"))?;
+        let configured_capacity = self
+            .presented_capacities
+            .read()
+            .map_err(|_| io::Error::other("presented-capacity lock is poisoned"))?
+            .by_inode
+            .get(&inode)
+            .copied();
+        let quota_status = InodeId::new(inode).and_then(|inode| {
+            self.logical_quota_namespace
+                .read()
+                .ok()
+                .and_then(|namespace| namespace.as_ref().and_then(Weak::upgrade))
+                .and_then(|namespace| namespace.logical_quota_status_for_inode(inode))
+        });
+        let capacity = quota_status
+            .as_ref()
+            .map(|status| status.limit_bytes)
+            .or(configured_capacity);
+        capacity.map_or(Ok(snapshot), |capacity| {
+            let quota_available =
+                quota_status.map(|status| status.limit_bytes.saturating_sub(status.used_bytes));
+            presented_snapshot(snapshot, capacity, quota_available)
+        })
     }
+}
+
+fn presented_snapshot(
+    snapshot: StatFsSnapshot,
+    capacity_bytes: u64,
+    quota_available_bytes: Option<u64>,
+) -> io::Result<StatFsSnapshot> {
+    let quota_available_bytes = quota_available_bytes.unwrap_or(capacity_bytes);
+    StatFsSnapshot::new(
+        capacity_bytes,
+        snapshot
+            .free_bytes()
+            .min(capacity_bytes)
+            .min(quota_available_bytes),
+        snapshot
+            .available_bytes()
+            .min(capacity_bytes)
+            .min(quota_available_bytes),
+        snapshot.files(),
+        snapshot.free_files(),
+        snapshot.block_size(),
+        snapshot.maximum_name_bytes(),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_override_controls_capacity_without_sampling_the_data_tier() {
+    fn explicit_override_controls_only_the_reported_capacity() {
         let metadata = TierCapacity {
             capacity_bytes: 10_000,
             free_bytes: 0,
@@ -331,5 +508,59 @@ mod tests {
         assert_eq!(unavailable.free_bytes(), 8_000);
         assert_eq!(unavailable.available_bytes(), 0);
         assert_eq!((unavailable.files(), unavailable.free_files()), (100, 90));
+    }
+
+    #[test]
+    fn presented_capacity_changes_geometry_without_inventing_availability() {
+        let physical = StatFsSnapshot::new(100_000, 80_000, 70_000, 100, 90, 4_096, 255)
+            .expect("valid physical snapshot");
+        let smaller = presented_snapshot(physical, 25_000, None).expect("smaller presentation");
+        assert_eq!(smaller.capacity_bytes(), 25_000);
+        assert_eq!(smaller.free_bytes(), 25_000);
+        assert_eq!(smaller.available_bytes(), 25_000);
+
+        let larger = presented_snapshot(physical, 1_000_000, None).expect("larger presentation");
+        assert_eq!(larger.capacity_bytes(), 1_000_000);
+        assert_eq!(larger.free_bytes(), 80_000);
+        assert_eq!(larger.available_bytes(), 70_000);
+    }
+
+    #[test]
+    fn share_root_inode_selects_one_hot_replaceable_presentation() {
+        let snapshot = StatFsSnapshot::new(100_000, 80_000, 70_000, 100, 90, 4_096, 255)
+            .expect("valid physical snapshot");
+        let source = TieredStatFsSource {
+            snapshot: Arc::new(RwLock::new(snapshot)),
+            governor: Arc::new(
+                CommitCapacityGovernor::new(CommitCapacitySnapshot::new(
+                    128 * 1_024 * 1_024,
+                    1_000_000,
+                ))
+                .expect("valid test governor"),
+            ),
+            presented_capacities: Arc::new(RwLock::new(PresentedCapacities::default())),
+            logical_quota_namespace: Arc::new(RwLock::new(None)),
+        };
+        source
+            .replace_presented_capacities("shares-r1".to_owned(), [(42, 25_000)])
+            .expect("install presented capacity");
+        assert_eq!(
+            StatFsSource::snapshot(&source, 42)
+                .expect("share-root snapshot")
+                .capacity_bytes(),
+            25_000
+        );
+        assert_eq!(
+            StatFsSource::snapshot(&source, 7)
+                .expect("repository snapshot")
+                .capacity_bytes(),
+            100_000
+        );
+        assert_eq!(
+            source
+                .presented_capacity_revision()
+                .expect("presented-capacity revision"),
+            "shares-r1"
+        );
     }
 }

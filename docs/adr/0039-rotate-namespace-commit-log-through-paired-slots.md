@@ -102,7 +102,7 @@ whether the synchronization became durable; no mixed Namespace graph is valid.
 The old slot becomes inactive only after the successor is durable and is not
 changed again until a later rotation.
 
-## Recovery and migration
+## Recovery and scrub
 
 Normal recovery reads at most both 256-KiB slots, validates them independently,
 then applies the overlap rule. It validates Namespace Root transitions forward
@@ -110,14 +110,10 @@ from the first stored record and proves DATA only for current and, on a
 classified current-graph failure, immediately previous. A segment-relative
 torn or invalid tail is reported without treating its bytes as Commit Records.
 
-For migration only, `commit.wal` may contain the older valid v1 chain up to its
-64-MiB hard limit. The first rotation copies its final record into
-`commit.1.wal`; every subsequent selected slot is bounded. Once `commit.wal` is
-reused, its first generation is greater than one, so the old v1 reader rejects
-it as a broken chain rather than appending a fork. The Repository Format Epoch
-accepted by [ADR 0071](0071-fence-writer-downgrade-in-the-commit-chain.md) now
-closes this downgrade boundary: current writers emit v2 epoch-one records and
-older v1 writers cannot append through that structural fence.
+Both slots are bounded to 64 records from creation. Commit format v1, epoch
+zero, and a former 64-MiB single-slot chain are unsupported pre-production
+state and are not migration inputs. ADR 0071 requires v2 epoch-one records from
+the first Commit.
 
 No slot is a user-visible historical snapshot. Discarded records cease to pin
 Metadata Objects or DATA. Offline scrub must apply the same per-slot and
@@ -129,13 +125,13 @@ The writer re-reads the exact target slot before its final sync. Recovery
 independently validates record bytes, the internal chain, monotone fields, and
 cross-slot bridge identity. Fault injection covers failure before and after
 every operation at a rotation boundary. A manual lifetime gate commits and
-recovers more than the legacy 16,384-record capacity. Future scrub must repeat
-both local and cross-slot checks before this format is declared stable.
+recovers more than 16,384 generations. Scrub repeats both local and cross-slot
+checks.
 
 ## Consequences
 
-Commit-log I/O and memory are bounded independently of appliance lifetime after
-the one-time legacy migration. Rotation happens every 63 new generations per
+Commit-log I/O and memory are bounded independently of appliance lifetime.
+Rotation happens every 63 new generations per
 slot because one of the 64 records is the bridge. The scheme intentionally
 retains only enough Commit history for transition proof and the two online
 recovery candidates. Audit history belongs in separate, non-authoritative

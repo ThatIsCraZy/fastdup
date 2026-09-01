@@ -434,10 +434,11 @@ rather than assigning accidental durable meanings:
 - Similarity fingerprints in recovery metadata. They are derived acceleration
   and are not part of the authoritative Stage-1 Recovery Index.
 - Allocation and persistence of the appliance-wide Container Generation
-  counter, published-directory naming, Pool/Appliance identity binding, and
-  duplicate-generation handling. The store/WAL specification must define these;
-  this format only records the nonzero ID and generation and permits rebuild to
-  find their maximum.
+  counter, published-directory naming, and duplicate-generation handling. The
+  store/WAL specification must define these; this format only records the
+  nonzero ID and generation and permits rebuild to find their maximum. Pool and
+  Appliance binding is defined independently by
+  [Pool identity v1](pool-identity-v1.md).
 - Stable-storage certification and exact filesystem syscall wrappers. This
   format requires the ordered file and directory synchronization above; the I/O
   layer is responsible for meeting that contract on supported XFS storage.

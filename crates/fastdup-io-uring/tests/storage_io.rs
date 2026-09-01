@@ -3,7 +3,9 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use fastdup_format::ContainerId;
-use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo};
+use fastdup_io_uring::{
+    DIRECT_PUBLICATION_MIN_BYTES, IoUringStorageConfig, IoUringStorageIo, PublicationIoMode,
+};
 use fastdup_store::{ContainerRepository, StorageIo};
 
 #[test]
@@ -223,6 +225,96 @@ fn prepared_container_transfers_owned_image_once_into_the_ring_publisher() {
     assert_eq!(status.borrowed_write_copy_bytes(), 0);
     assert_eq!(status.peak_inflight_bytes(), metrics.file_bytes());
     assert_eq!(status.inflight_bytes(), 0);
+
+    drop(repository);
+    drop(storage);
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn direct_publication_writes_and_samples_reopen_through_buffered_reads() {
+    let root = test_root("direct-publication");
+    let config =
+        IoUringStorageConfig::default().with_publication_io_mode(PublicationIoMode::Direct);
+    let storage = IoUringStorageIo::open(&root, config).expect("active direct publisher");
+    let repository = ContainerRepository::new(storage.clone());
+    let id = ContainerId::new([0xD1; 16]).expect("nonzero Container ID");
+    let chunk = pseudorandom_bytes(2 * 1_024 * 1_024, 0x4d71_0ec7_93a2_615b);
+    let chunks = chunk.chunks(256 * 1_024).collect::<Vec<_>>();
+    let regions = chunks.chunks(2).collect::<Vec<_>>();
+    let prepared = ContainerRepository::<IoUringStorageIo>::prepare_adaptive_regions_parallel(
+        id,
+        31,
+        &regions,
+        NonZeroUsize::new(2).expect("literal is nonzero"),
+    )
+    .expect("prepare aligned Container image");
+
+    let (_, metrics) = repository
+        .publish_prepared_adaptive_profiled(prepared)
+        .expect("direct publication and samples succeed");
+    let status = storage.status();
+    assert_eq!(status.publication_io_mode(), PublicationIoMode::Direct);
+    assert_eq!(
+        status.direct_publication_write_bytes(),
+        metrics.file_bytes() + 4_096
+    );
+    assert_eq!(status.direct_publication_sample_bytes(), 3 * 4_096);
+    assert_eq!(status.borrowed_write_copy_bytes(), 0);
+
+    drop(repository);
+    drop(storage);
+    let reopened = ContainerRepository::new(
+        IoUringStorageIo::open(
+            &root,
+            IoUringStorageConfig::default().with_publication_io_mode(PublicationIoMode::Buffered),
+        )
+        .expect("reopen buffered reader"),
+    );
+    let recovered = reopened.read(id).expect("published Container recovers");
+    for original in chunks {
+        assert_eq!(
+            recovered.chunk(fastdup_format::ChunkId::of(original)),
+            Some(original)
+        );
+    }
+
+    drop(reopened);
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn adaptive_publication_bypasses_cache_only_at_the_measured_size_gate() {
+    let root = test_root("adaptive-direct-publication");
+    let storage = IoUringStorageIo::open(&root, IoUringStorageConfig::default())
+        .expect("active adaptive publisher");
+    let repository = ContainerRepository::new(storage.clone());
+    assert_eq!(
+        storage.status().publication_io_mode(),
+        PublicationIoMode::Adaptive
+    );
+
+    repository
+        .publish_raw(
+            ContainerId::new([0xA1; 16]).expect("small ID is nonzero"),
+            41,
+            &[&vec![0x71; 128 * 1_024]],
+        )
+        .expect("small buffered publication succeeds");
+    assert_eq!(storage.status().direct_publication_write_bytes(), 0);
+
+    let large = pseudorandom_bytes(DIRECT_PUBLICATION_MIN_BYTES, 0x10f7_33cb_b495_6801);
+    let large_chunks = large.chunks(256 * 1_024).collect::<Vec<_>>();
+    repository
+        .publish_raw(
+            ContainerId::new([0xA2; 16]).expect("large ID is nonzero"),
+            42,
+            &large_chunks,
+        )
+        .expect("large Direct publication succeeds");
+    let status = storage.status();
+    assert!(status.direct_publication_write_bytes() > DIRECT_PUBLICATION_MIN_BYTES as u64);
+    assert_eq!(status.direct_publication_sample_bytes(), 3 * 4_096);
 
     drop(repository);
     drop(storage);

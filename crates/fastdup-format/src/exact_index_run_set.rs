@@ -7,11 +7,9 @@ use crate::metadata::{
 use crate::{ChunkId, ExactIndexProfileId, ExactIndexRunDescriptor};
 
 const PAYLOAD_MAGIC: [u8; 8] = *b"FDXRST01";
-const FORMAT_VERSION_V1: u16 = 1;
-const FORMAT_VERSION_V2: u16 = 2;
+const FORMAT_VERSION: u16 = 2;
 const PAYLOAD_HEADER_BYTES: usize = 128;
-const RUN_ENTRY_BYTES_V1: usize = 128;
-const RUN_ENTRY_BYTES_V2: usize = 160;
+const RUN_ENTRY_BYTES: usize = 160;
 const PAYLOAD_HEADER_BYTES_U16: u16 = 128;
 const MAX_RUN_FILE_BYTES: u64 = 1 << 30;
 const MIN_RUN_FILE_BYTES: u64 = 8_192;
@@ -178,16 +176,7 @@ impl ExactIndexRunRef {
         self.maximum_chunk_id
     }
 
-    const fn canonical_key_v1(self) -> (u16, ChunkId, ChunkId, u64) {
-        (
-            self.level,
-            self.minimum_chunk_id,
-            self.maximum_chunk_id,
-            self.generation,
-        )
-    }
-
-    const fn canonical_key_v2(self) -> (u16, u64, u16, u64) {
+    const fn canonical_key(self) -> (u16, u64, u16, u64) {
         (
             self.level,
             self.family_generation,
@@ -196,17 +185,7 @@ impl ExactIndexRunRef {
         )
     }
 
-    fn encode_v1(self, bytes: &mut [u8]) {
-        put_u16(bytes, 0, self.level);
-        put_u64(bytes, 8, self.generation);
-        bytes[16..48].copy_from_slice(&self.run_hash);
-        put_u64(bytes, 48, self.file_length);
-        put_u64(bytes, 56, self.entry_count);
-        bytes[64..96].copy_from_slice(&self.minimum_chunk_id.bytes());
-        bytes[96..128].copy_from_slice(&self.maximum_chunk_id.bytes());
-    }
-
-    fn encode_v2(self, bytes: &mut [u8]) {
+    fn encode(self, bytes: &mut [u8]) {
         put_u16(bytes, 0, self.level);
         put_u16(bytes, 2, self.partition_ordinal);
         put_u16(bytes, 4, self.partition_count);
@@ -219,51 +198,8 @@ impl ExactIndexRunRef {
         put_u64(bytes, 128, self.family_generation);
     }
 
-    fn decode_v1(
-        profile: ExactIndexProfileId,
-        bytes: &[u8],
-    ) -> Result<Self, ExactIndexRunSetError> {
-        if bytes.len() != RUN_ENTRY_BYTES_V1
-            || bytes[2..8].iter().any(|byte| *byte != 0)
-            || get_u64(bytes, 8) == 0
-            || get_u64(bytes, 48) < MIN_RUN_FILE_BYTES
-            || get_u64(bytes, 48) > MAX_RUN_FILE_BYTES
-            || !get_u64(bytes, 48).is_multiple_of(4_096)
-            || get_u64(bytes, 56) == 0
-        {
-            return Err(ExactIndexRunSetError::InvalidRunReference);
-        }
-        let mut run_hash = [0_u8; 32];
-        run_hash.copy_from_slice(&bytes[16..48]);
-        let mut minimum = [0_u8; 32];
-        minimum.copy_from_slice(&bytes[64..96]);
-        let mut maximum = [0_u8; 32];
-        maximum.copy_from_slice(&bytes[96..128]);
-        let minimum_chunk_id = ChunkId::from_bytes(minimum);
-        let maximum_chunk_id = ChunkId::from_bytes(maximum);
-        if minimum_chunk_id > maximum_chunk_id {
-            return Err(ExactIndexRunSetError::InvalidRunReference);
-        }
-        Ok(Self {
-            level: get_u16(bytes, 0),
-            partition_ordinal: 0,
-            partition_count: 1,
-            profile,
-            family_generation: get_u64(bytes, 8),
-            generation: get_u64(bytes, 8),
-            run_hash,
-            file_length: get_u64(bytes, 48),
-            entry_count: get_u64(bytes, 56),
-            minimum_chunk_id,
-            maximum_chunk_id,
-        })
-    }
-
-    fn decode_v2(
-        profile: ExactIndexProfileId,
-        bytes: &[u8],
-    ) -> Result<Self, ExactIndexRunSetError> {
-        if bytes.len() != RUN_ENTRY_BYTES_V2
+    fn decode(profile: ExactIndexProfileId, bytes: &[u8]) -> Result<Self, ExactIndexRunSetError> {
+        if bytes.len() != RUN_ENTRY_BYTES
             || bytes[6..8].iter().any(|byte| *byte != 0)
             || bytes[136..].iter().any(|byte| *byte != 0)
             || get_u64(bytes, 8) == 0
@@ -328,15 +264,9 @@ impl ExactIndexRunSet {
         if generation == 0 {
             return Err(ExactIndexRunSetError::InvalidGeneration);
         }
-        let format_version = selected_format_version(&runs);
-        let entry_bytes = run_entry_bytes(format_version);
-        payload_length(runs.len(), entry_bytes)?;
-        if format_version == FORMAT_VERSION_V1 {
-            runs.sort_unstable_by_key(|run| run.canonical_key_v1());
-        } else {
-            runs.sort_unstable_by_key(|run| run.canonical_key_v2());
-        }
-        validate_runs(profile, &runs, format_version)?;
+        payload_length(runs.len(), RUN_ENTRY_BYTES)?;
+        runs.sort_unstable_by_key(|run| run.canonical_key());
+        validate_runs(profile, &runs)?;
         Ok(Self {
             profile,
             generation,
@@ -379,22 +309,21 @@ impl ExactIndexRunSet {
     ///
     /// Returns canonical, arithmetic, size, allocation, or envelope errors.
     pub fn encode(&self) -> Result<Vec<u8>, ExactIndexRunSetError> {
-        let format_version = selected_format_version(&self.runs);
-        validate_runs(self.profile, &self.runs, format_version)?;
-        let entry_bytes = run_entry_bytes(format_version);
-        let payload_length = payload_length(self.runs.len(), entry_bytes)?;
+        validate_runs(self.profile, &self.runs)?;
+        let payload_length = payload_length(self.runs.len(), RUN_ENTRY_BYTES)?;
         let mut payload = Vec::new();
         payload
             .try_reserve_exact(payload_length)
             .map_err(|_| ExactIndexRunSetError::OutOfMemory)?;
         payload.resize(payload_length, 0);
         payload[0..8].copy_from_slice(&PAYLOAD_MAGIC);
-        put_u16(&mut payload, 8, format_version);
+        put_u16(&mut payload, 8, FORMAT_VERSION);
         put_u16(&mut payload, 10, PAYLOAD_HEADER_BYTES_U16);
         put_u16(
             &mut payload,
             12,
-            u16::try_from(entry_bytes).map_err(|_| ExactIndexRunSetError::ArithmeticOverflow)?,
+            u16::try_from(RUN_ENTRY_BYTES)
+                .map_err(|_| ExactIndexRunSetError::ArithmeticOverflow)?,
         );
         put_u64(&mut payload, 24, self.generation);
         payload[32..64].copy_from_slice(&self.profile.bytes());
@@ -410,12 +339,8 @@ impl ExactIndexRunSet {
             u32::try_from(payload_length).map_err(|_| ExactIndexRunSetError::ArithmeticOverflow)?,
         );
         for (ordinal, run) in self.runs.iter().copied().enumerate() {
-            let start = PAYLOAD_HEADER_BYTES + ordinal * entry_bytes;
-            if format_version == FORMAT_VERSION_V1 {
-                run.encode_v1(&mut payload[start..start + entry_bytes]);
-            } else {
-                run.encode_v2(&mut payload[start..start + entry_bytes]);
-            }
+            let start = PAYLOAD_HEADER_BYTES + ordinal * RUN_ENTRY_BYTES;
+            run.encode(&mut payload[start..start + RUN_ENTRY_BYTES]);
         }
         Ok(encode_metadata_object(EXACT_INDEX_RUN_SET_KIND, &payload)?)
     }
@@ -448,15 +373,10 @@ fn decode_with_id(
     if payload.len() < PAYLOAD_HEADER_BYTES {
         return Err(ExactIndexRunSetError::InvalidPayload);
     }
-    let format_version = get_u16(payload, 8);
-    let entry_bytes = match format_version {
-        FORMAT_VERSION_V1 => RUN_ENTRY_BYTES_V1,
-        FORMAT_VERSION_V2 => RUN_ENTRY_BYTES_V2,
-        _ => return Err(ExactIndexRunSetError::InvalidPayload),
-    };
     if payload[0..8] != PAYLOAD_MAGIC
+        || get_u16(payload, 8) != FORMAT_VERSION
         || usize::from(get_u16(payload, 10)) != PAYLOAD_HEADER_BYTES
-        || usize::from(get_u16(payload, 12)) != entry_bytes
+        || usize::from(get_u16(payload, 12)) != RUN_ENTRY_BYTES
         || get_u16(payload, 14) != 0
         || get_u64(payload, 16) != 0
         || payload[72..PAYLOAD_HEADER_BYTES]
@@ -471,7 +391,7 @@ fn decode_with_id(
     }
     let run_count = usize::try_from(get_u32(payload, 64))
         .map_err(|_| ExactIndexRunSetError::ArithmeticOverflow)?;
-    if payload_length(run_count, entry_bytes)? != payload.len()
+    if payload_length(run_count, RUN_ENTRY_BYTES)? != payload.len()
         || usize::try_from(get_u32(payload, 68)) != Ok(payload.len())
     {
         return Err(ExactIndexRunSetError::InvalidPayload);
@@ -483,15 +403,11 @@ fn decode_with_id(
     runs.try_reserve_exact(run_count)
         .map_err(|_| ExactIndexRunSetError::OutOfMemory)?;
     for ordinal in 0..run_count {
-        let start = PAYLOAD_HEADER_BYTES + ordinal * entry_bytes;
-        let entry = &payload[start..start + entry_bytes];
-        runs.push(if format_version == FORMAT_VERSION_V1 {
-            ExactIndexRunRef::decode_v1(profile, entry)?
-        } else {
-            ExactIndexRunRef::decode_v2(profile, entry)?
-        });
+        let start = PAYLOAD_HEADER_BYTES + ordinal * RUN_ENTRY_BYTES;
+        let entry = &payload[start..start + RUN_ENTRY_BYTES];
+        runs.push(ExactIndexRunRef::decode(profile, entry)?);
     }
-    validate_runs(profile, &runs, format_version)?;
+    validate_runs(profile, &runs)?;
     Ok((
         ExactIndexRunSet {
             profile,
@@ -505,35 +421,17 @@ fn decode_with_id(
 fn validate_runs(
     profile: ExactIndexProfileId,
     runs: &[ExactIndexRunRef],
-    format_version: u16,
 ) -> Result<(), ExactIndexRunSetError> {
     if runs.iter().any(|run| run.profile != profile) {
         return Err(ExactIndexRunSetError::InvalidProfile);
     }
-    let noncanonical = if format_version == FORMAT_VERSION_V1 {
-        runs.windows(2)
-            .any(|pair| pair[0].canonical_key_v1() >= pair[1].canonical_key_v1())
-    } else {
-        runs.windows(2)
-            .any(|pair| pair[0].canonical_key_v2() >= pair[1].canonical_key_v2())
-    };
+    let noncanonical = runs
+        .windows(2)
+        .any(|pair| pair[0].canonical_key() >= pair[1].canonical_key());
     if noncanonical {
         return Err(ExactIndexRunSetError::NonCanonicalOrder);
     }
-    if format_version == FORMAT_VERSION_V1 {
-        if runs.iter().any(|run| {
-            run.partition_ordinal != 0
-                || run.partition_count != 1
-                || run.family_generation != run.generation
-        }) {
-            return Err(ExactIndexRunSetError::InvalidRunFamily);
-        }
-    } else {
-        validate_families(runs)?;
-        if runs.iter().all(|run| run.partition_count == 1) {
-            return Err(ExactIndexRunSetError::InvalidPayload);
-        }
-    }
+    validate_families(runs)?;
     let mut generations = Vec::new();
     generations
         .try_reserve_exact(runs.len())
@@ -580,22 +478,6 @@ fn validate_families(runs: &[ExactIndexRunRef]) -> Result<(), ExactIndexRunSetEr
         cursor = end;
     }
     Ok(())
-}
-
-fn selected_format_version(runs: &[ExactIndexRunRef]) -> u16 {
-    if runs.iter().any(|run| run.partition_count > 1) {
-        FORMAT_VERSION_V2
-    } else {
-        FORMAT_VERSION_V1
-    }
-}
-
-const fn run_entry_bytes(format_version: u16) -> usize {
-    if format_version == FORMAT_VERSION_V1 {
-        RUN_ENTRY_BYTES_V1
-    } else {
-        RUN_ENTRY_BYTES_V2
-    }
 }
 
 fn payload_length(run_count: usize, entry_bytes: usize) -> Result<usize, ExactIndexRunSetError> {

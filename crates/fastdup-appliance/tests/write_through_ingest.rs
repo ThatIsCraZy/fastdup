@@ -379,7 +379,7 @@ fn one_stream_hashes_stable_chunk_batches_on_multiple_workers() {
 }
 
 #[test]
-fn sequential_writes_coalesce_up_to_four_mebibytes_before_sync() {
+fn sequential_writes_select_a_bounded_four_mebibyte_batch_target() {
     let appliance = open_appliance();
     let (inode, handle) = create_file(&appliance, b"coalesced-ingest-batches");
     let mut block = fixture_block();
@@ -390,12 +390,19 @@ fn sequential_writes_coalesce_up_to_four_mebibytes_before_sync() {
     fence_ingest(&appliance, inode, handle);
 
     let status = appliance.write_through_status();
-    assert!(
-        status.ingest_batches() <= 4,
-        "eight sequential one-MiB writes must be coalesced despite the age bound: {status:?}"
-    );
     assert_eq!(status.ingest_fragments(), 8);
-    assert_eq!(status.maximum_ingest_batch_bytes(), 4 * 1_024 * 1_024);
+    assert_eq!(
+        status.minimum_ingest_batch_target_bytes(),
+        4 * 1_024 * 1_024
+    );
+    assert_eq!(
+        status.maximum_ingest_batch_target_bytes(),
+        4 * 1_024 * 1_024
+    );
+    assert!(
+        status.maximum_ingest_batch_bytes() <= 4 * 1_024 * 1_024,
+        "the age bound may flush early but never enlarges the hard target: {status:?}"
+    );
     block[0] = 4;
     assert_eq!(read_fixture(&appliance, inode, handle), block[..4_096]);
 }
@@ -480,7 +487,7 @@ fn releasing_the_competing_writer_restores_single_stream_coalescing() {
     assert_eq!(
         appliance
             .write_through_status()
-            .maximum_ingest_batch_bytes(),
+            .maximum_ingest_batch_target_bytes(),
         4 * 1_024 * 1_024
     );
 }
