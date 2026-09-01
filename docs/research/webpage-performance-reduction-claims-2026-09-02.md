@@ -3,6 +3,18 @@
 Datum: 2026-09-02  
 Status: Recherchegrundlage, kein unabhängiger Produktvergleich und keine SLA
 
+## Aktuelle 50-Versionen-Neumessung
+
+Der aktuelle FUSE-Pfad wurde am 2. September mit exakt 50 gleichzeitig live
+gehaltenen, minimal veränderten ISO-Versionen neu gemessen. 103.622.246.400
+logische Bytes belegten 2.111.537.152 allokierte DATA-Bytes und 99.266.560
+allokierte Metadata-Bytes. Das entspricht **49,0743x logisch/DATA** und
+**46,8708x logisch/(DATA + Metadata)** beziehungsweise 97,9623 % und 97,8665 %
+Einsparung. Alle 50 Dateien des ersten Zyklus wurden vollständig per BLAKE3
+verifiziert. Diese Neumessung ersetzt den früher auf der Website verwendeten
+42,95x-Wert; Details und Einschränkungen stehen im
+[aktuellen 50-Versionen-Rerun](../benchmarks/iso50-live-reduction-2026-09-02.md).
+
 ## Kurzurteil
 
 Die Website kann fastdup belastbar als Software darstellen, die handelsübliche
@@ -81,11 +93,12 @@ Daemon nutzte dabei im Mittel 1,616 CPUs; die zehn vCPUs wurden also nicht
 durchgehend ausgelastet.
 [600-Sekunden-Rerun](../benchmarks/io-intensive-fuse-600s.md#incremental-streaming-and-bounded-recovery-600-second-rerun)
 
-Dieser Wert ist ein starker Workload-Beleg, aber **keine allgemeine
-Kapazitätszusage**: Die Varianten unterscheiden sich nur durch wenige Bytes,
-der finale Namespace ist nach dem Test leer, und der damalige Lauf behielt
-unreachable Historie ohne GC-Credit. Für eine prominente Kachel daher
-„42,95x im versionierten ISO-Stresstest“ statt bloß „bis zu 42,95x“ schreiben.
+Dieser historische Wert bleibt ein starker Workload-Beleg, aber **keine
+allgemeine Kapazitätszusage**: Die Varianten unterscheiden sich nur durch wenige
+Bytes, der finale Namespace ist nach dem Test leer, und der damalige Lauf
+behielt unreachable Historie ohne GC-Credit. Er wird nicht mehr für die
+prominente Website-Kachel verwendet; dort steht die oben dokumentierte aktuelle
+Messung mit exakt 50 gleichzeitig live gehaltenen Versionen.
 
 ### Nur als Engineering-Evidence
 

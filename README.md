@@ -41,7 +41,7 @@ CPUs, AVX2/BMI2, and no AVX-512:
 | First physical / fastest exact upload | **601.0 / 1,576.2 MiB/s** | byte-verified SMB run |
 | Three-copy reduction | **67.78% saved / 3.104×** | including metadata; exact dedup alone is capped at 66.67% |
 | SeqCDC AVX2/BMI2 scanner | **9,568 MiB/s** | isolated 1 MiB-slice Rocky-ISO scan |
-| Versioned ISO stress-test reduction | **42.95× / 98.311% exact hits** | ingest history, not live capacity |
+| 50 live, minimally changed ISO versions | **49.07× DATA / 46.87× with metadata** | 50/50 first-cycle files BLAKE3-verified |
 
 These are host- and workload-specific measurements, not an SLA. See the
 [current SMB evidence](docs/benchmarks/hot-buffer-reuse-2026-09-01.md),
@@ -52,8 +52,10 @@ The three-copy result is deliberately not a maximum-capacity benchmark: three
 identical copies can demonstrate at most 3:1 from exact dedup alone. fastdup
 already exceeds the corresponding 66.67% saving including repository metadata,
 because its other reduction stages contribute too. Ratios such as 50:1 require
-enough redundant versions and a suitable data mix; the separate 50-version
-workload reached 42.95×, but no three-copy test can establish a universal 50:1.
+enough redundant versions and a suitable data mix. The current 50-live-version
+workload reaches 49.07× on DATA and 46.87× including all allocated metadata;
+the exact result is documented in the
+[current reduction rerun](docs/benchmarks/iso50-live-reduction-2026-09-02.md).
 
 fastdup goes beyond a classic exact-dedup-plus-compression pipeline. The durable
 default combines SeqCDC content-defined chunking, BLAKE3-verified exact dedup,
