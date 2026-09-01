@@ -48,6 +48,9 @@ TMPDIR="$workspace/.artifacts/tmp" ./configure \
 	--without-json \
 	--without-libarchive \
 	--without-ldb-lmdb \
+	--bundled-libraries='!talloc,!tdb,!tevent,!ldb' \
+	--private-libraries='dcerpc-samr,samba-policy,dcerpc,samba-hostconfig,samba-credentials,dcerpc_server,samdb' \
+	--disable-rpath-install \
 	--disable-cups \
 	--disable-iprint \
 	--disable-python \

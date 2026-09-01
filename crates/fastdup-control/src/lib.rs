@@ -98,6 +98,14 @@ pub struct RepositorySettings {
     pub maintenance_window_utc: Option<String>,
     pub pressure_low_basis_points: u16,
     pub pressure_high_basis_points: u16,
+    #[serde(default = "default_small_file_extensions")]
+    pub small_file_extensions: Vec<String>,
+}
+
+fn default_small_file_extensions() -> Vec<String> {
+    fastdup_posix::DEFAULT_SMALL_FILE_EXTENSIONS
+        .map(str::to_owned)
+        .to_vec()
 }
 
 impl Default for RepositorySettings {
@@ -110,7 +118,30 @@ impl Default for RepositorySettings {
             maintenance_window_utc: None,
             pressure_low_basis_points: 8_500,
             pressure_high_basis_points: 9_000,
+            small_file_extensions: default_small_file_extensions(),
         }
+    }
+}
+
+#[cfg(test)]
+mod repository_settings_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_settings_receive_the_v1_small_file_defaults() {
+        let settings: RepositorySettings = serde_json::from_str(
+            r#"{
+                "revision": 7,
+                "autoMount": true,
+                "advancedReduction": "off",
+                "onlineGcEnabled": true,
+                "maintenanceWindowUtc": null,
+                "pressureLowBasisPoints": 8500,
+                "pressureHighBasisPoints": 9000
+            }"#,
+        )
+        .expect("deserialize legacy settings");
+        assert_eq!(settings.small_file_extensions, [".json", ".xml"]);
     }
 }
 

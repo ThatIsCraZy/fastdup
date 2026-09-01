@@ -76,3 +76,37 @@ fn v1_policy_matches_byte_names_hints_and_spills_above_eight_mib() {
         .expect("set explicit DATA placement hint");
     assert!(!namespace.prefers_small_file_tier(forced_data));
 }
+
+#[test]
+fn runtime_suffix_update_is_atomic_and_commit_cuts_keep_their_policy() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let (xml, _) = create(&namespace, b"frozen.xml");
+    let commit = namespace
+        .begin_commit()
+        .expect("freeze namespace")
+        .expect("created inode makes namespace dirty");
+
+    let active = namespace
+        .replace_small_file_extensions(
+            "settings-2".to_owned(),
+            vec![".BIN".to_owned(), ".bin".to_owned()],
+        )
+        .expect("install runtime policy");
+    assert_eq!(active.revision, "settings-2");
+    assert_eq!(active.extensions, [".bin"]);
+    assert!(!namespace.prefers_small_file_tier(xml));
+
+    let frozen = commit
+        .inodes()
+        .iter()
+        .find(|inode| inode.inode() == xml)
+        .expect("frozen XML inode");
+    assert!(commit.prefers_small_file_tier(frozen));
+
+    assert!(
+        namespace
+            .replace_small_file_extensions("settings-3".to_owned(), vec!["bin".to_owned()])
+            .is_err()
+    );
+    assert_eq!(namespace.small_file_policy(), active);
+}

@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 mod fuse_adapter;
 mod inode_metadata;
 mod logical_quota;
+mod small_file_policy;
 mod versioned_file;
 
 use versioned_file::VersionedFile;
@@ -29,6 +30,11 @@ pub use inode_metadata::{
 };
 use logical_quota::LogicalQuotaTable;
 pub use logical_quota::{LogicalQuotaRule, LogicalQuotaStatus};
+pub use small_file_policy::{
+    DEFAULT_SMALL_FILE_EXTENSIONS, MAX_SMALL_FILE_EXTENSION_BYTES, MAX_SMALL_FILE_EXTENSIONS,
+    MAX_SMALL_FILE_POLICY_REVISION_BYTES, SmallFilePolicyError, SmallFilePolicySnapshot,
+    validate_small_file_extensions,
+};
 pub use versioned_file::CommittedFile;
 
 pub const SMALL_FILE_SPILL_BYTES_V1: u64 = 8 * 1_024 * 1_024;
@@ -1384,19 +1390,6 @@ impl CommitInode {
         self.file.allocated_bytes()
     }
 
-    /// Evaluates Small-File placement against the exact frozen namespace cut.
-    #[must_use]
-    pub fn prefers_small_file_tier(&self, entries: &[CommitEntry]) -> bool {
-        small_file_policy(
-            self.logical_size(),
-            &self.metadata,
-            entries
-                .iter()
-                .filter(|entry| entry.target == self.inode)
-                .map(|entry| entry.name.as_slice()),
-        )
-    }
-
     /// Returns the coalesced DATA/HOLE ranges changed since the immediately
     /// preceding installed version.
     ///
@@ -1493,6 +1486,7 @@ pub struct NamespaceCommit {
     directories: Vec<CommitDirectory>,
     symlinks: Vec<CommitSymlink>,
     entries: Vec<CommitEntry>,
+    small_file_policy: Arc<small_file_policy::SmallFileExtensionPolicy>,
 }
 
 impl NamespaceCommit {
@@ -1539,6 +1533,20 @@ impl NamespaceCommit {
     #[must_use]
     pub fn entries(&self) -> &[CommitEntry] {
         &self.entries
+    }
+
+    /// Evaluates placement using the policy snapshot frozen with this commit.
+    #[must_use]
+    pub fn prefers_small_file_tier(&self, inode: &CommitInode) -> bool {
+        small_file_policy(
+            inode.logical_size(),
+            &inode.metadata,
+            self.entries
+                .iter()
+                .filter(|entry| entry.target == inode.inode)
+                .map(|entry| entry.name.as_slice()),
+            &self.small_file_policy,
+        )
     }
 }
 
@@ -2489,6 +2497,7 @@ struct Catalog {
     handles: BTreeMap<HandleId, OpenHandle>,
     lookup_counts: BTreeMap<InodeId, u64>,
     active_create_metadata_bytes: BTreeMap<InodeId, u64>,
+    small_file_policy: Arc<small_file_policy::SmallFileExtensionPolicy>,
 }
 
 #[derive(Debug)]
@@ -2636,6 +2645,7 @@ impl Namespace {
                 handles: BTreeMap::new(),
                 lookup_counts: BTreeMap::new(),
                 active_create_metadata_bytes: BTreeMap::new(),
+                small_file_policy: Arc::new(small_file_policy::SmallFileExtensionPolicy::default()),
             }),
             locks: Mutex::new(LockTable::default()),
             lock_change_sequence: AtomicU64::new(0),
@@ -2899,6 +2909,7 @@ impl Namespace {
                 handles: BTreeMap::new(),
                 lookup_counts: BTreeMap::new(),
                 active_create_metadata_bytes: BTreeMap::new(),
+                small_file_policy: Arc::new(small_file_policy::SmallFileExtensionPolicy::default()),
             }),
             locks: Mutex::new(LockTable::default()),
             lock_change_sequence: AtomicU64::new(0),
@@ -3161,9 +3172,9 @@ impl Namespace {
     /// Applies the v1 Small-File placement policy to one live regular inode.
     ///
     /// A `user.fastdup.placement` value of `metadata` or `data` is an explicit
-    /// hint. Without a hint, any current hardlink name ending in `.xml` or
-    /// `.json` (ASCII case-insensitive) selects the Small-File tier. New
-    /// records spill to DATA once the live logical size exceeds 8 MiB.
+    /// hint. Without a hint, any current hardlink name ending in a configured
+    /// suffix (ASCII case-insensitive) selects the Small-File tier. New records
+    /// spill to DATA once the live logical size exceeds 8 MiB.
     ///
     /// # Panics
     ///
@@ -3192,7 +3203,52 @@ impl Namespace {
                 .iter()
                 .filter(|(_, target)| **target == inode)
                 .map(|((_, name), _)| name.as_slice()),
+            &catalog.small_file_policy,
         )
+    }
+
+    /// Atomically replaces the compiled Small-File suffix policy.
+    ///
+    /// Compilation and validation happen before the catalog write lock is
+    /// acquired. Write admission observes either the complete old policy or
+    /// the complete new policy and performs no allocation or additional lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmallFilePolicyError`] when the revision or suffix list is
+    /// invalid or exceeds its bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an earlier invariant violation poisoned the catalog lock.
+    pub fn replace_small_file_extensions(
+        &self,
+        revision: String,
+        extensions: Vec<String>,
+    ) -> Result<SmallFilePolicySnapshot, SmallFilePolicyError> {
+        let policy = Arc::new(small_file_policy::SmallFileExtensionPolicy::compile(
+            revision, extensions,
+        )?);
+        let snapshot = policy.snapshot();
+        self.catalog
+            .write()
+            .expect("ASSERT: namespace catalog lock poisoned")
+            .small_file_policy = policy;
+        Ok(snapshot)
+    }
+
+    /// Returns the active canonical Small-File suffix policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an earlier invariant violation poisoned the catalog lock.
+    #[must_use]
+    pub fn small_file_policy(&self) -> SmallFilePolicySnapshot {
+        self.catalog
+            .read()
+            .expect("ASSERT: namespace catalog lock poisoned")
+            .small_file_policy
+            .snapshot()
     }
 
     fn notify_write_handle_opened(&self, inode: InodeId) {
@@ -3429,6 +3485,7 @@ impl Namespace {
             directories,
             symlinks,
             entries,
+            small_file_policy: Arc::clone(&catalog.small_file_policy),
         };
         catalog.next_commit_token = next_commit_token;
         assert!(
@@ -4533,16 +4590,15 @@ impl Namespace {
     ) -> Result<WriteResult, PosixError> {
         let written = u32::try_from(payload.len()).map_err(|_| PosixError::FileTooLarge)?;
         let (object, open) = self.resolve_open_file(inode, handle)?;
-        let policy_name_matches = self
-            .catalog
-            .read()
-            .expect("ASSERT: namespace catalog lock poisoned")
-            .entries
-            .iter()
-            .any(|((_, name), target)| {
-                *target == inode
-                    && (ascii_suffix_eq(name, b".xml") || ascii_suffix_eq(name, b".json"))
-            });
+        let policy_name_matches = {
+            let catalog = self
+                .catalog
+                .read()
+                .expect("ASSERT: namespace catalog lock poisoned");
+            catalog.entries.iter().any(|((_, name), target)| {
+                *target == inode && catalog.small_file_policy.matches_name(name)
+            })
+        };
         if open.options.access == AccessMode::ReadOnly {
             return Err(PosixError::BadHandle);
         }
@@ -6011,21 +6067,16 @@ fn validate_component(config: &NamespaceConfig, name: &[u8]) -> Result<(), Posix
     Ok(())
 }
 
-fn ascii_suffix_eq(value: &[u8], suffix: &[u8]) -> bool {
-    value
-        .get(value.len().saturating_sub(suffix.len())..)
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(suffix))
-}
-
 fn small_file_policy<'a>(
     logical_size: u64,
     metadata: &InodeMetadata,
     mut names: impl Iterator<Item = &'a [u8]>,
+    extension_policy: &small_file_policy::SmallFileExtensionPolicy,
 ) -> bool {
     small_file_policy_with_name_match(
         logical_size,
         metadata,
-        names.any(|name| ascii_suffix_eq(name, b".xml") || ascii_suffix_eq(name, b".json")),
+        names.any(|name| extension_policy.matches_name(name)),
     )
 }
 

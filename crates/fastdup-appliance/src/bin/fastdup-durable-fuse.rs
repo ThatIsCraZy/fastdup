@@ -66,6 +66,8 @@ struct StartupPolicies {
     online_gc: OnlineGcPolicy,
     advanced_reduction: AdvancedReductionPolicy,
     pool_isolation: PoolIsolationPolicy,
+    small_file_policy_revision: String,
+    small_file_extensions: Vec<String>,
 }
 
 type FrontendContainerStorage = TieredStorageIo<TelemetryStorageIo, FsStorageIo>;
@@ -125,6 +127,10 @@ enum ManagementOperation {
     UpdatePresentedCapacities {
         revision: String,
         rules: Vec<ManagementPresentedCapacityRule>,
+    },
+    UpdateSmallFileExtensions {
+        revision: String,
+        extensions: Vec<String>,
     },
 }
 
@@ -190,6 +196,22 @@ struct ManagementResponse {
     error: Option<String>,
     frontend: Option<ManagementFrontendTelemetry>,
     presented_capacity_revision: Option<String>,
+    small_file_policy: Option<ManagementSmallFilePolicy>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagementSmallFilePolicy {
+    revision: String,
+    extensions: Vec<String>,
+}
+
+impl From<fastdup_posix::SmallFilePolicySnapshot> for ManagementSmallFilePolicy {
+    fn from(snapshot: fastdup_posix::SmallFilePolicySnapshot) -> Self {
+        Self {
+            revision: snapshot.revision,
+            extensions: snapshot.extensions,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -254,6 +276,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let online_gc_policy = policies.online_gc;
     let advanced_reduction = policies.advanced_reduction;
     let pool_isolation_policy = policies.pool_isolation;
+    let small_file_policy_revision = policies.small_file_policy_revision;
+    let small_file_extensions = policies.small_file_extensions;
     std::fs::create_dir_all(&metadata_root)?;
     let _appliance_lease =
         ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::WritableDaemon)?;
@@ -299,10 +323,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_online_gc_recovery(recovered.online_gc_recovery);
     let appliance = Arc::new(recovered.appliance);
     let namespace = appliance.namespace_arc();
+    namespace.replace_small_file_extensions(small_file_policy_revision, small_file_extensions)?;
     capacity_source.attach_logical_quota_namespace(&namespace)?;
     let presented_capacity_control = RuntimePresentedCapacityControl {
         statfs: capacity_source.clone(),
-        namespace,
+        namespace: Arc::clone(&namespace),
     };
     if let Some(manifest) = load_share_capacity_manifest()? {
         presented_capacity_control.replace(
@@ -404,8 +429,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let telemetry = Arc::clone(&frontend_telemetry);
                 let configuration = gc_runtime.configuration.clone();
                 let capacity_control = presented_capacity_control.clone();
+                let namespace = Arc::clone(&namespace);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_management_control(stream, telemetry, configuration, capacity_control).await {
+                    if let Err(error) = handle_management_control(stream, telemetry, configuration, capacity_control, namespace).await {
                         eprintln!("management_control_error={error}");
                     }
                 });
@@ -514,13 +540,40 @@ fn validated_startup_policies() -> Result<StartupPolicies, Box<dyn std::error::E
     let online_gc_policy = OnlineGcPolicy::from_environment()?;
     let advanced_reduction = advanced_reduction_policy_from_environment()?;
     let pool_isolation = PoolIsolationPolicy::from_environment()?;
+    let (small_file_policy_revision, small_file_extensions) = small_file_policy_from_environment()?;
     validate_memory_budget_policy()?;
     Ok(StartupPolicies {
         statfs_override,
         online_gc: online_gc_policy,
         advanced_reduction,
         pool_isolation,
+        small_file_policy_revision,
+        small_file_extensions,
     })
+}
+
+fn small_file_policy_from_environment() -> Result<(String, Vec<String>), Box<dyn std::error::Error>>
+{
+    const REVISION: &str = "FASTDUP_SMALL_FILE_POLICY_REVISION";
+    const EXTENSIONS: &str = "FASTDUP_SMALL_FILE_EXTENSIONS";
+    let revision = match std::env::var(REVISION) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "default-v1".to_owned(),
+        Err(error) => return Err(error.into()),
+    };
+    let extensions = match std::env::var(EXTENSIONS) {
+        Ok(value) if value.is_empty() => Vec::new(),
+        Ok(value) => value.split(',').map(str::to_owned).collect(),
+        Err(std::env::VarError::NotPresent) => fastdup_posix::DEFAULT_SMALL_FILE_EXTENSIONS
+            .map(str::to_owned)
+            .to_vec(),
+        Err(error) => return Err(error.into()),
+    };
+    let canonical = fastdup_posix::validate_small_file_extensions(&extensions)?;
+    if revision.is_empty() || revision.len() > fastdup_posix::MAX_SMALL_FILE_POLICY_REVISION_BYTES {
+        return Err(format!("{REVISION} is invalid").into());
+    }
+    Ok((revision, canonical))
 }
 
 fn advanced_reduction_policy_from_environment()
@@ -759,6 +812,7 @@ async fn handle_management_control(
     telemetry: Arc<FrontendTelemetry>,
     configuration: watch::Sender<OnlineGcRuntimeConfiguration>,
     capacity_source: RuntimePresentedCapacityControl,
+    namespace: Arc<Namespace>,
 ) -> Result<(), String> {
     let mut request = Vec::new();
     timeout(
@@ -775,6 +829,7 @@ async fn handle_management_control(
                 &telemetry,
                 &configuration,
                 &capacity_source,
+                &namespace,
             )
         }
         Ok(_) => ManagementResponse {
@@ -783,6 +838,7 @@ async fn handle_management_control(
             error: Some("unsupported_version".to_owned()),
             frontend: None,
             presented_capacity_revision: None,
+            small_file_policy: None,
         },
         Err(_) => ManagementResponse {
             version: MANAGEMENT_PROTOCOL_VERSION,
@@ -790,6 +846,7 @@ async fn handle_management_control(
             error: Some("invalid_request".to_owned()),
             frontend: None,
             presented_capacity_revision: None,
+            small_file_policy: None,
         },
     };
     let mut encoded = serde_json::to_vec(&response)
@@ -806,6 +863,7 @@ fn apply_management_operation(
     telemetry: &FrontendTelemetry,
     configuration: &watch::Sender<OnlineGcRuntimeConfiguration>,
     capacity_source: &dyn PresentedCapacityControl,
+    namespace: &Namespace,
 ) -> ManagementResponse {
     match operation {
         ManagementOperation::Inspect => {
@@ -834,6 +892,7 @@ fn apply_management_operation(
                         .load(Ordering::Relaxed),
                 }),
                 presented_capacity_revision: capacity_source.revision().ok(),
+                small_file_policy: Some(namespace.small_file_policy().into()),
             }
         }
         ManagementOperation::UpdateOnlineGc {
@@ -857,6 +916,7 @@ fn apply_management_operation(
                         error: None,
                         frontend: None,
                         presented_capacity_revision: None,
+                        small_file_policy: None,
                     }
                 }
                 Ok(_) => ManagementResponse {
@@ -865,6 +925,7 @@ fn apply_management_operation(
                     error: Some("online_gc_runtime_unavailable".to_owned()),
                     frontend: None,
                     presented_capacity_revision: None,
+                    small_file_policy: None,
                 },
                 Err(error) => ManagementResponse {
                     version: MANAGEMENT_PROTOCOL_VERSION,
@@ -872,12 +933,34 @@ fn apply_management_operation(
                     error: Some(error.to_string()),
                     frontend: None,
                     presented_capacity_revision: None,
+                    small_file_policy: None,
                 },
             }
         }
         ManagementOperation::UpdatePresentedCapacities { revision, rules } => {
             update_presented_capacities(capacity_source, revision, rules)
         }
+        ManagementOperation::UpdateSmallFileExtensions {
+            revision,
+            extensions,
+        } => match namespace.replace_small_file_extensions(revision, extensions) {
+            Ok(snapshot) => ManagementResponse {
+                version: MANAGEMENT_PROTOCOL_VERSION,
+                ok: true,
+                error: None,
+                frontend: None,
+                presented_capacity_revision: None,
+                small_file_policy: Some(snapshot.into()),
+            },
+            Err(error) => ManagementResponse {
+                version: MANAGEMENT_PROTOCOL_VERSION,
+                ok: false,
+                error: Some(error.to_string()),
+                frontend: None,
+                presented_capacity_revision: None,
+                small_file_policy: None,
+            },
+        },
     }
 }
 
@@ -893,6 +976,7 @@ fn update_presented_capacities(
             error: Some("too_many_presented_capacity_rules".to_owned()),
             frontend: None,
             presented_capacity_revision: None,
+            small_file_policy: None,
         };
     }
     match capacity_source.replace(
@@ -908,6 +992,7 @@ fn update_presented_capacities(
             error: None,
             frontend: None,
             presented_capacity_revision: Some(revision),
+            small_file_policy: None,
         },
         Err(error) => ManagementResponse {
             version: MANAGEMENT_PROTOCOL_VERSION,
@@ -915,6 +1000,7 @@ fn update_presented_capacities(
             error: Some(error.to_string()),
             frontend: None,
             presented_capacity_revision: None,
+            small_file_policy: None,
         },
     }
 }
@@ -2079,12 +2165,14 @@ mod tests {
         };
         let (configuration, _configuration_rx) = watch::channel(initial);
         let capacity_source = TestPresentedCapacityControl::default();
+        let namespace = Namespace::new_volatile(NamespaceConfig::default());
 
         let inspected = apply_management_operation(
             ManagementOperation::Inspect,
             &telemetry,
             &configuration,
             &capacity_source,
+            &namespace,
         );
         assert!(inspected.ok);
         assert!(inspected.frontend.is_some());
@@ -2098,6 +2186,7 @@ mod tests {
             &telemetry,
             &configuration,
             &capacity_source,
+            &namespace,
         );
         assert!(updated.ok);
         assert!(!configuration.borrow().enabled);
@@ -2113,12 +2202,39 @@ mod tests {
             &telemetry,
             &configuration,
             &capacity_source,
+            &namespace,
         );
         assert!(quota.ok);
         assert_eq!(
             capacity_source.revision().expect("capacity revision"),
             "shares-r1"
         );
+
+        let suffixes = apply_management_operation(
+            ManagementOperation::UpdateSmallFileExtensions {
+                revision: "settings-2".to_owned(),
+                extensions: vec![".VMDK".to_owned()],
+            },
+            &telemetry,
+            &configuration,
+            &capacity_source,
+            &namespace,
+        );
+        assert!(suffixes.ok);
+        assert_eq!(namespace.small_file_policy().extensions, [".vmdk"]);
+
+        let rejected = apply_management_operation(
+            ManagementOperation::UpdateSmallFileExtensions {
+                revision: "settings-3".to_owned(),
+                extensions: vec!["vmdk".to_owned()],
+            },
+            &telemetry,
+            &configuration,
+            &capacity_source,
+            &namespace,
+        );
+        assert!(!rejected.ok);
+        assert_eq!(namespace.small_file_policy().extensions, [".vmdk"]);
     }
 
     #[tokio::test]

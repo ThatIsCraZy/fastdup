@@ -69,6 +69,60 @@ describe("FastDup Control Plane UI", () => {
     }
   });
 
+  it("sendet geänderte Small-File-Endungen über die Runtime-Einstellungen", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      const body = url.endsWith("/api/v1/session")
+        ? {
+            username: "admin",
+            csrfToken: "csrf",
+            mustChangePassword: false,
+            certificateFingerprint: "AA:BB",
+          }
+        : url.endsWith("/api/v1/samba/principals")
+          ? { users: [], groups: [] }
+          : url.endsWith("/api/v1/repository/commands")
+            ? {
+                id: "settings-job",
+                kind: "update_settings",
+                state: "queued",
+                progressBasisPoints: 0,
+                message: "Wartet",
+                createdAt: 1,
+                updatedAt: 1,
+              }
+            : previewSnapshot;
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await screen.findByRole("button", { name: /admin administrator/i });
+    fireEvent.click(screen.getByRole("button", { name: "Einstellungen" }));
+    fireEvent.change(
+      screen.getByRole("textbox", { name: /small-file-tier.*dateiendungen/i }),
+      { target: { value: ".vmdk\n.XML" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /übernehmen/i }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/repository/commands",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    const commandCall = fetchMock.mock.calls.find(
+      ([input]) => String(input) === "/api/v1/repository/commands",
+    );
+    const submitted = JSON.parse(String(commandCall?.[1]?.body));
+    expect(submitted.settings.smallFileExtensions).toEqual([".vmdk", ".XML"]);
+  });
+
   it("lädt ausgewählte Telemetrie-Zeiträume aus der Historien-API", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);

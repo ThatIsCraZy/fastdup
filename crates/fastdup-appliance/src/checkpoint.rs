@@ -4963,7 +4963,7 @@ where
         for inode in commit.inodes() {
             writer.begin_inode(
                 inode.inode(),
-                if inode.prefers_small_file_tier(commit.entries()) {
+                if commit.prefers_small_file_tier(inode) {
                     ContainerPlacement::SmallFile
                 } else {
                     ContainerPlacement::Data

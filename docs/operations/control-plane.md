@@ -58,7 +58,13 @@ protocol at
 `/var/lib/fastdup/repository/metadata/.fastdup-management.sock`. It returns
 lock-free POSIX frontend counters and fixed latency percentiles and applies
 Online-GC enablement, pressure watermarks, and per-Share Logical Share quotas
-rules live. Each Share uses `/srv/fastdup/repository/.fastdup-shares/<share-id>`
+rules live. The Small-File-Tier suffix list is also a live, revision-guarded
+Repository setting. The WebUI accepts up to 64 ASCII suffixes (including the
+leading dot), canonicalizes them case-insensitively, and activates them without
+a remount. An empty list disables name-based placement while the explicit
+`user.fastdup.placement` hint remains available. Policy changes affect new
+records; already immutable records are not migrated synchronously. Each Share
+uses `/srv/fastdup/repository/.fastdup-shares/<share-id>`
 as its stable root; changing the visible Share name therefore never changes its
 data path. The UI accepts an optional integer from 1 through 999 and a decimal
 GB/TB/PB unit. The same rule drives both `statfs` reporting and the hard logical

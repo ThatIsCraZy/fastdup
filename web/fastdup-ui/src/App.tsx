@@ -1674,8 +1674,14 @@ function SettingsPage({
   regenerateTls: () => void;
 }) {
   const [draft, setDraft] = useState(settings);
+  const [extensionDraft, setExtensionDraft] = useState(
+    settings.smallFileExtensions.join("\n"),
+  );
   const [confirm, setConfirm] = useState(false);
-  useEffect(() => setDraft(settings), [settings]);
+  useEffect(() => {
+    setDraft(settings);
+    setExtensionDraft(settings.smallFileExtensions.join("\n"));
+  }, [settings]);
   const set = <K extends keyof RepositorySettings>(
     key: K,
     value: RepositorySettings[K],
@@ -1749,6 +1755,30 @@ function SettingsPage({
                 }
                 placeholder="Sonntag 02:00–05:00"
               />
+            </label>
+            <label className="field">
+              <span>Small-File-Tier · Dateiendungen</span>
+              <textarea
+                rows={5}
+                value={extensionDraft}
+                onChange={(event) => {
+                  setExtensionDraft(event.target.value);
+                  set(
+                    "smallFileExtensions",
+                    event.target.value
+                      .split(/[\s,;]+/)
+                      .map((extension) => extension.trim())
+                      .filter(Boolean),
+                  );
+                }}
+                placeholder={".json\n.xml\n.vmdk"}
+                spellCheck={false}
+              />
+              <small>
+                Eine Endung pro Zeile, inklusive Punkt. Groß-/Kleinschreibung
+                wird ignoriert; maximal 64 Endungen. Die Änderung wird ohne
+                Remount aktiv.
+              </small>
             </label>
             <div className="thresholds">
               <label className="field">

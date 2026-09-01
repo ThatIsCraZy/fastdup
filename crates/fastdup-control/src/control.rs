@@ -489,9 +489,9 @@ impl AgentRuntime {
             Command::OfflineScrub => self.offline_scrub(),
             Command::UpdateSettings {
                 expected_revision,
-                settings,
+                mut settings,
             } => {
-                validate_settings(&settings)?;
+                validate_settings(&mut settings)?;
                 let current = self.store.settings().map_err(problem("settings_failed"))?;
                 if current.revision != expected_revision {
                     return Err(ControlProblem::new(
@@ -499,6 +499,7 @@ impl AgentRuntime {
                         "Die Einstellungen wurden zwischenzeitlich geändert",
                     ));
                 }
+                settings.revision = expected_revision.saturating_add(1);
                 let requires_remount = current.advanced_reduction != settings.advanced_reduction;
                 let was_online = self
                     .store
@@ -527,9 +528,10 @@ impl AgentRuntime {
                         }
                         return Err(error);
                     }
-                } else if was_online && let Err(error) = send_online_gc_configuration(&settings) {
+                } else if was_online && let Err(error) = send_hot_settings_configuration(&settings)
+                {
                     let _ = write_runtime_environment(&current);
-                    let _ = send_online_gc_configuration(&current);
+                    let _ = send_hot_settings_configuration(&current);
                     return Err(error);
                 }
                 if let Err(error) = self.store.update_settings(expected_revision, settings) {
@@ -539,7 +541,7 @@ impl AgentRuntime {
                             let _ = systemctl("stop", REPOSITORY_UNIT);
                             let _ = self.start_repository();
                         } else {
-                            let _ = send_online_gc_configuration(&current);
+                            let _ = send_hot_settings_configuration(&current);
                         }
                     }
                     return Err(ControlProblem::new("settings_conflict", error.to_string()));
@@ -930,7 +932,7 @@ fn command_name(command: &Command) -> &'static str {
     }
 }
 
-fn validate_settings(settings: &crate::RepositorySettings) -> Result<(), ControlProblem> {
+fn validate_settings(settings: &mut crate::RepositorySettings) -> Result<(), ControlProblem> {
     if settings.pressure_low_basis_points >= settings.pressure_high_basis_points
         || settings.pressure_high_basis_points > 10_000
     {
@@ -949,6 +951,15 @@ fn validate_settings(settings: &crate::RepositorySettings) -> Result<(), Control
             "Wartungsfenster muss HH:MM-HH:MM verwenden",
         ));
     }
+    settings.small_file_extensions = fastdup_posix::validate_small_file_extensions(
+        &settings.small_file_extensions,
+    )
+    .map_err(|error| {
+        ControlProblem::new(
+            "invalid_small_file_extension",
+            format!("Ungültige Small-File-Endung: {error}"),
+        )
+    })?;
     Ok(())
 }
 
@@ -1054,7 +1065,7 @@ fn mount_filesystem(uuid: &str, target: &Path) -> Result<(), ControlProblem> {
             "-t",
             "xfs",
             "-o",
-            "noatime,nodev,nosuid",
+            "noatime,nodev,nosuid,prjquota",
             &format!("UUID={uuid}"),
             &target,
         ],
@@ -1131,6 +1142,18 @@ fn write_runtime_environment(settings: &crate::RepositorySettings) -> Result<(),
         file,
         "FASTDUP_ONLINE_GC_PRESSURE_HIGH_BASIS_POINTS={}",
         settings.pressure_high_basis_points
+    )
+    .map_err(problem("runtime_write"))?;
+    writeln!(
+        file,
+        "FASTDUP_SMALL_FILE_POLICY_REVISION=settings-{}",
+        settings.revision
+    )
+    .map_err(problem("runtime_write"))?;
+    writeln!(
+        file,
+        "FASTDUP_SMALL_FILE_EXTENSIONS={}",
+        settings.small_file_extensions.join(",")
     )
     .map_err(problem("runtime_write"))?;
     if let Some(window) = &settings.maintenance_window_utc {
@@ -1330,6 +1353,21 @@ fn send_online_gc_configuration(
     .map(|_| ())
 }
 
+fn send_hot_settings_configuration(
+    settings: &crate::RepositorySettings,
+) -> Result<(), ControlProblem> {
+    send_online_gc_configuration(settings)?;
+    if dry_run() {
+        return Ok(());
+    }
+    send_management_operation(&serde_json::json!({
+        "kind": "update_small_file_extensions",
+        "revision": format!("settings-{}", settings.revision),
+        "extensions": settings.small_file_extensions,
+    }))
+    .map(|_| ())
+}
+
 fn run_process(program: &str, arguments: &[&str]) -> Result<String, ControlProblem> {
     let output = ProcessCommand::new(program)
         .args(arguments)
@@ -1384,12 +1422,25 @@ mod tests {
 
     #[test]
     fn gc_pressure_is_fail_closed() {
-        let settings = crate::RepositorySettings {
+        let mut settings = crate::RepositorySettings {
             pressure_low_basis_points: 9_500,
             pressure_high_basis_points: 9_000,
             ..crate::RepositorySettings::default()
         };
-        assert!(validate_settings(&settings).is_err());
+        assert!(validate_settings(&mut settings).is_err());
+    }
+
+    #[test]
+    fn small_file_extensions_are_canonicalized_and_bounded() {
+        let mut settings = crate::RepositorySettings {
+            small_file_extensions: vec![".XML".to_owned(), ".tar.gz".to_owned(), ".xml".to_owned()],
+            ..crate::RepositorySettings::default()
+        };
+        validate_settings(&mut settings).expect("valid suffix settings");
+        assert_eq!(settings.small_file_extensions, [".tar.gz", ".xml"]);
+
+        settings.small_file_extensions = vec!["xml".to_owned()];
+        assert!(validate_settings(&mut settings).is_err());
     }
 
     #[test]

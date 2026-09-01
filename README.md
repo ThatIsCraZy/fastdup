@@ -230,9 +230,10 @@ Upgrade-/Allocator-Grenzen geschlossen:
 
 ## Empfohlener nächster Entwicklungsabschnitt
 
-Die Kapazitätsentscheidungen aus ADR 0081 bis 0084 sind umgesetzt. Policy-
-bekannte `.xml`/`.json`-Dateien und der explizite Placement-Hint wählen bis
-8 MiB den Small-File-Tier; neue Records darüber gehen auf DATA. Der Tier besitzt
+Die Kapazitätsentscheidungen aus ADR 0081 bis 0084 sind umgesetzt. Die live in
+der WebUI konfigurierbaren Dateiendungen (Default `.xml`/`.json`) und der
+explizite Placement-Hint wählen bis 8 MiB den Small-File-Tier; neue Records
+darüber gehen auf DATA. Der Tier besitzt
 eine eigene XFS-Projekt-Hard-Quota und einen eigenen synchronen Admission-
 Bucket, während sein physischer Footprint zugleich gegen Metadata gerechnet
 wird. Der privilegierte XFS/FUSE-Test füllt DATA und Small-File-Quota, prüft
@@ -397,6 +398,80 @@ Details stehen im
 [Exact-Index-Spezifikation](docs/specs/exact-index-run-v1.md). Das DATA-Tier-
 Notfallformat beschreibt die
 [Recovery-Checkpoint-Spezifikation](docs/specs/recovery-checkpoint-v1.md).
+
+## Version 0.5 als RPM installieren
+
+Version 0.5 wird als natives RPM für Rocky Linux 10 auf x86-64 ausgeliefert.
+Das Paket enthält den FUSE-Repository-Daemon, die Offline-Wartung, den
+privilegierten Appliance-Agent und die HTTPS-Control-Plane einschließlich der
+eingebetteten WebUI. Node.js oder eine Rust-Toolchain werden auf dem Zielsystem
+nicht benötigt.
+
+```bash
+curl -LO \
+  https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.5.0-1.el10.x86_64.rpm
+sudo systemctl enable --now fastdup-agent.service fastdup-control.service
+```
+
+Das RPM installiert und prüft die benötigte Laufzeitumgebung:
+
+- `kernel.io_uring_disabled=0` unter `/usr/lib/sysctl.d`; der DATA-Publisher
+  hat gemäß ADR 0058 bewusst keinen synchronen Fallback
+- getrennte systemd-Slices für Storage und Management, `MemorySwapMax=0` für
+  den Repository-Prozess sowie einen checkpointenden Stop über `SIGINT`
+- den Benutzer `fastdup-control`, Laufzeit-/State-Verzeichnisse und die
+  Standardkonfiguration unter `/etc/fastdup`
+- XFS-, FUSE-, Samba- und Provisionierungswerkzeuge als RPM-Abhängigkeiten;
+  automatisch provisionierte XFS-Pools werden mit `prjquota` eingehängt
+
+Nach der Installation ist die WebUI über
+`https://<appliance-host>:8080/` erreichbar. Das beim ersten Start erzeugte
+Zertifikat ist selbstsigniert. Die initiale Anmeldung lautet `admin` /
+`fastdup01.` und erzwingt sofort ein neues Passwort mit mindestens zwölf
+Zeichen. Falls `firewalld` aktiv ist, muss TCP-Port 8080 gezielt für das
+Management-Netz freigegeben werden.
+
+Der Repository-Dienst wird nicht automatisch gestartet: Zuerst müssen in der
+WebUI zwei leere, physisch getrennte Geräte für Metadata und DATA ausgewählt
+und provisioniert werden. **Die Provisionierung löscht Partitionstabelle und
+Inhalt der ausgewählten Geräte.** Danach steuert die WebUI Mount, Unmount,
+Scrub, GC, Shares und die Repository-Einstellungen. Das RPM bindet
+`/etc/samba/fastdup-shares.conf` idempotent in den globalen Samba-Abschnitt ein
+und installiert den verpflichtenden, gegen Samba 4.23.5 gebauten
+`vfs_fastdup`-Adapter unter `/usr/lib64/samba/vfs/fastdup.so`. Er stellt SMB
+Fast Clone über genau einen `copy_file_range`-Aufruf bereit. Die noch geltenden
+Veeam- und Produktionsgrenzen stehen im
+[Samba-Modul-README](samba/vfs_fastdup/README.md).
+
+Die Installation lässt sich ohne Storage-Provisionierung prüfen:
+
+```bash
+uname -m
+sysctl kernel.io_uring_disabled
+systemctl status fastdup-agent.service fastdup-control.service
+curl --insecure https://127.0.0.1:8080/api/v1/session
+```
+
+Zum Entfernen der Programme (Repository-Daten unter `/var/lib/fastdup` und
+`/srv/fastdup` bleiben absichtlich erhalten):
+
+```bash
+sudo dnf remove fastdup
+```
+
+### RPM reproduzierbar bauen
+
+Auf Rocky Linux 10 werden Rust 1.97.1, Node.js/npm, `rpm-build`, `patchelf` und
+die Development-Pakete von Samba, LDB, Talloc, TDB und Tevent benötigt.
+Der Build schreibt ausschließlich nach `.artifacts` und gibt am Ende den Pfad
+zum fertigen RPM aus:
+
+```bash
+sudo dnf install nodejs npm rpm-build patchelf \
+  samba-devel libldb-devel libtalloc-devel libtdb-devel libtevent-devel
+./packaging/build-rpm.sh
+```
 
 ## Bauen und testen
 

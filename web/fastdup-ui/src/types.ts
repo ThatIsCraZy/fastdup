@@ -79,6 +79,7 @@ export interface RepositorySettings {
   maintenanceWindowUtc?: string;
   pressureLowBasisPoints: number;
   pressureHighBasisPoints: number;
+  smallFileExtensions: string[];
 }
 export interface ShareSettings {
   id: string;
@@ -165,6 +166,7 @@ export function emptyApplianceSnapshot(): ApplianceSnapshot {
       onlineGcEnabled: true,
       pressureLowBasisPoints: 8500,
       pressureHighBasisPoints: 9000,
+      smallFileExtensions: [".json", ".xml"],
     },
     shares: [],
     jobs: [],
@@ -296,6 +298,7 @@ export const previewSnapshot: ApplianceSnapshot = {
     maintenanceWindowUtc: "Sonntag 02:00–05:00",
     pressureLowBasisPoints: 8500,
     pressureHighBasisPoints: 9000,
+    smallFileExtensions: [".json", ".xml"],
   },
   shares: [
     {
