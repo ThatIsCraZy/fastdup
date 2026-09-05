@@ -1,7 +1,7 @@
 # fastdup
 
 <p align="center">
-  <strong>Aus geeigneter x86-64-Hardware wird eine High-Performance Dedup-Appliance—bequem im Browser verwaltet.</strong>
+  <strong>Weniger Speicher für dieselben Dateien. Eine Storage-Appliance in Rust für x86-64, im Browser verwaltet.</strong>
 </p>
 
 <p align="center">
@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Produktseite</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.5">Release-Informationen</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6">Release-Informationen</a>
 </p>
 
 fastdup ist eine experimentelle, softwaredefinierte Single-Node-
@@ -32,46 +32,91 @@ HTTPS-WebUI hält die Administration einfach.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
 
-## Gemessen mit 10 vCPUs auf einem Notebook-Prozessor
+## Neu in v0.6 · 5. September 2026
 
-Die Benchmark-VM lief auf einem Intel Core i7-1370P und sah nur zehn logische
-CPUs, AVX2/BMI2 und kein AVX-512:
+Der Quellstand unterstützt jetzt **permanente Online-Similarity**: Neue,
+unabhängig dekodierbare Chunks werden im laufenden Mount zu möglichen
+Kompressionsbasen, ohne Offline-Rebuild. Advanced Reduction lässt sich je
+SMB-Freigabe ausschalten, einschalten oder vom Repository erben. Neue
+WebUI-Freigaben starten mit ausgeschaltetem Advanced-Pfad. Bereits gespeicherte
+abhängige Daten bleiben auch nach dem Abschalten lesbar.
 
-| Messung | Ergebnis | Umfang |
-| --- | ---: | --- |
-| Drei serielle SingleStream-SMB-Uploads | **1.022,1 MiB/s** | aktueller Produktionspfad |
-| Erster physischer / schnellster Exact-Upload | **601,0 / 1.576,2 MiB/s** | bytegenau geprüfter SMB-Lauf |
-| Reduction bei drei Kopien | **67,78 % gespart / 3,104×** | inklusive Metadaten; reine Exact-Dedup ist auf 66,67 % begrenzt |
-| SeqCDC-AVX2-/BMI2-Scanner | **9.568 MiB/s** | isolierter Rocky-ISO-Scan in 1-MiB-Slices |
-| 50 live, minimal veränderte ISO-Versionen | **49,07× DATA / 46,87× mit Metadaten** | 50/50 Dateien des ersten Zyklus BLAKE3-verifiziert |
+Im Datenpfad kommen begrenzte parallele Chunk-Vorbereitung, weniger
+Lesepuffer-Kopien und feinere Dateisperren hinzu. Die Telemetrie aggregiert
+Historien jetzt mit begrenztem Speicherbedarf, damit die Verwaltung erreichbar
+bleibt. Nachweise: [Online-Similarity](docs/benchmarks/online-similarity-share-policy-2026-09-05.md),
+[Datenpfad-Messungen](docs/benchmarks/hotpath-implementation3-2026-09-05.md)
+und [Control Plane](docs/benchmarks/control-plane-memory-2026-09-05.md).
 
-Die Werte sind host- und workloadspezifisch und keine SLA-Zusage. Siehe
-[aktueller SMB-Nachweis](docs/benchmarks/hot-buffer-reuse-2026-09-01.md),
-[601-Sekunden-FUSE-Lauf](docs/benchmarks/io-intensive-fuse-600s.md) und
-[interaktive Produktseite](https://thatiscrazy.github.io/fastdup/#performance).
+Das Release v0.6 enthält Paketversion **0.6.0** für Rocky Linux 10 x86-64.
+Die folgenden Benchmarks dokumentieren die Entwicklungsbuilds auf dem Weg
+zu diesem Release; Binary-Hashes und Messgrenzen stehen im jeweiligen Bericht.
 
-Das Drei-Kopien-Ergebnis ist bewusst kein Maximaltest: Drei identische Kopien
-können durch reine Exact-Dedup höchstens 3:1 zeigen. fastdup übertrifft die
-dazugehörige Einsparung von 66,67 % bereits inklusive Repository-Metadaten,
-weil weitere Reduction-Stufen beitragen. Werte wie 50:1 benötigen genügend
-redundante Versionen und einen passenden Datenmix. Der aktuelle Workload mit
-50 gleichzeitig live gehaltenen Versionen erreicht 49,07× auf DATA und 46,87×
-inklusive sämtlicher allokierter Metadaten; die exakten Ergebnisse stehen im
-[aktuellen Reduction-Rerun](docs/benchmarks/iso50-live-reduction-2026-09-02.md).
+## Gemessener Durchsatz und Speicherbedarf
 
-fastdup geht über eine klassische Exact-Dedup-plus-Kompression-Pipeline hinaus.
-Der dauerhafte Default kombiniert SeqCDC Content-Defined Chunking,
-BLAKE3-geprüfte Exact Dedup, Sparse-HOLE- und Constant-Byte-FILL-Extents,
-gruppiertes adaptives RAW/Zstd mit versionierter Sparschwelle. Workloads mit
-`copy_file_range` erhalten zusätzlich Metadata Fast Clone. Ein neu aufbaubarer
-Similarity Index mit Depth-1-`ZSTD_PREFIX` und Sparse-XOR ist opt-in. Beide
-dauerhaften abhängigen Codecs nutzen genau eine unabhängig dekodierbare Base
-und dieselbe begrenzte Trial- und Sparpolitik. Inhaltsidentifizierte
-Zstd-Dictionaries bleiben ein Forschungspfad; Similarity-Reorder wurde zugunsten der
-Restore-Lokalität verworfen. Weil proprietäre Appliance-Interna nicht
-vollständig offengelegt sind, behauptet das Projekt keinen unseriös zählbaren
-Technikvorsprung. Die Quellen stehen in der
-[Recherchegrundlage für Website-Aussagen](docs/research/webpage-performance-reduction-claims-2026-09-02.md).
+| Workload | Normale Reduktion | Advanced Reduction |
+| --- | ---: | ---: |
+| Drei identische ISO-Uploads über SMB, medianer Durchsatz | **1.061,0 MiB/s** | **941,5 MiB/s** |
+| Dieselbe SMB-Serie, Ersparnis inklusive Metadaten | **67,823 %** | **67,904 %** |
+| 50 Linux-6.12-TAR-Versionen, gesamtes Repository | **10,93 GiB** | **3,02 GiB** |
+| Derselbe Linux-Korpus, gesamter Reduktionsfaktor | **6,59:1** | **23,84:1** |
+| Derselbe Linux-Korpus, Copy+fsync-Durchsatz | **202,48 MiB/s** | **116,92 MiB/s** |
+
+**SMB:** Mediane aus drei Läufen je Modus mit zehn vCPUs, getrennten
+XFS-Tiers für Metadata und DATA sowie SMB über Loopback ohne Signing und
+Verschlüsselung. Jeder Lauf lädt dieselbe Rocky-ISO dreimal nacheinander hoch.
+Die getrennt ausgewiesenen Abschlussläufe mit dem endgültigen Build erreichten
+1.040,9 / 930,5 MiB/s. Der Runner prüft Abschlüsse, Dateilängen und null
+Prozess-Swap, führt aber keinen vollständigen Hash-Readback aus.
+[Aufbau und alle 14 Läufe](docs/benchmarks/hotpath-implementation3-2026-09-05.md#smb-normal-und-advanced).
+
+**Online-Similarity:** 72,05 GiB unkomprimierte TAR-Streams von Linux
+6.12.1–6.12.50, zwei frische Repositories und ein durchgehender Mount je Modus.
+Advanced Reduction benötigte **72,35 % weniger Gesamtplatz**, bei **42,25 %
+geringerem Schreibdurchsatz**. Gemessen wurden Allokation und Schreibabschluss
+ohne Ziel-Readbacks. Dieser Lauf verwendet einen früheren Entwicklungsbuild
+als die obige SMB-Serie.
+[Vollständiger A/B-Nachweis](docs/benchmarks/linux-6.12-online-similarity-2026-09-05.md).
+
+Die passende Policy hängt vom Datenbestand ab: Identische Kopien profitieren
+vor allem von Exact Dedup; ähnliche, veränderte Versionen können mit Advanced
+Reduction deutlich kleiner werden. Die Werte sind host- und workloadspezifisch,
+keine SLA und keine Zusage für Netzwerkdurchsatz. Der ältere synthetische
+50-ISO-Test bleibt separat dokumentiert:
+[46,87:1 inklusive Metadaten mit vollständigem BLAKE3-Readback](docs/benchmarks/iso50-live-reduction-2026-09-02.md).
+
+## Reduktion beim Schreiben
+
+Standardmäßig kombiniert fastdup SeqCDC Content-Defined Chunking,
+BLAKE3-geprüfte Exact Dedup, Sparse-HOLE- und Constant-Byte-FILL-Extents sowie
+adaptive, gruppierte RAW/Zstd-Kompression. `copy_file_range` unterstützt
+Metadata Fast Clone. Optional prüft Advanced Reduction `ZSTD_PREFIX` und
+Sparse-XOR gegen verifizierte, unabhängig dekodierbare Basen. Die maximale
+Abhängigkeitstiefe ist eins. Der permanente Online-Index ist neu aufbaubare
+Beschleunigung; fehlende Kandidaten kosten eine Optimierungsmöglichkeit,
+ändern aber keine Dateiinhalte.
+
+Inhaltsidentifizierte Zstd-Dictionaries bleiben Forschung. Similarity-Reorder
+wurde zugunsten der Restore-Lokalität verworfen.
+
+## Warum Rust
+
+Storage-Kern und Management-Dienste von fastdup sind in Rust geschrieben.
+Safe Rust verhindert ganze Klassen von Speicherfehlern wie Zugriffe auf
+freigegebenen Speicher oder außerhalb von Puffergrenzen. Das reduziert eine
+wesentliche Ursache von Sicherheitslücken in C/C++-Systemen. Google berichtete
+im November 2025 für Android eine **über 1.000-fach geringere Dichte an
+Speichersicherheitslücken** im Rust-Code gegenüber seinem historischen
+C/C++-Code. [Daten und Methodik von Google](https://blog.google/security/rust-in-android-move-fast-fix-things/).
+
+Das stützt die Sprachwahl, ist aber kein gemessener Sicherheitsfaktor für
+fastdup und kein Vergleich mit einer bestimmten Legacy-Appliance. fastdup
+nutzt eng begrenzte `unsafe`-Schnittstellen und native Abhängigkeiten,
+darunter Samba und Codec-Bibliotheken. Speichersicherheit allein belegt weder
+Gesamtsicherheit noch Produktionsreife. Die
+[Rust-Architekturentscheidung](docs/adr/0026-start-with-safe-deep-rust-modules.md)
+und die [gemessenen Unsafe-Grenzen](docs/benchmarks/hotpath-implementation3-2026-09-05.md#reproduktion-und-unsafe-nachweis)
+dokumentieren den Ansatz.
 
 ## Auf Rocky Linux 10 installieren
 
@@ -85,11 +130,11 @@ Benötigt werden:
 Aktuelles Binärpaket herunterladen und installieren:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.5.0-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.6.0-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

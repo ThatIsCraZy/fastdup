@@ -5,7 +5,8 @@ workspace=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 artifact_root="$workspace/.artifacts"
 package_root="$artifact_root/package"
 rpmbuild_root="$artifact_root/rpmbuild"
-stage_root="$package_root/fastdup-0.5.0"
+stage_root="$package_root/fastdup-0.6.0"
+ui_build_root="$artifact_root/webui-build"
 samba_version=4.23.5
 samba_archive="$artifact_root/downloads/samba-$samba_version.tar.gz"
 samba_tree="$artifact_root/samba-vfs-fastdup/samba-$samba_version"
@@ -20,11 +21,20 @@ mkdir -p "$TMPDIR" "$package_root" \
     "$rpmbuild_root/SPECS" "$rpmbuild_root/SRPMS"
 
 if command -v npm >/dev/null 2>&1; then
+    rm -rf "$ui_build_root"
+    mkdir -p "$ui_build_root"
+    tar -C "$workspace/web/fastdup-ui" \
+        --exclude=node_modules --exclude=dist --exclude='*.tsbuildinfo' \
+        -cf - . | tar -C "$ui_build_root" -xf -
     (
-        cd "$workspace/web/fastdup-ui"
+        cd "$ui_build_root"
         npm ci --cache "$artifact_root/npm-cache"
         npm run build
     )
+    # Retain the built assets in the embedded, version-controlled UI surface.
+    rm -rf "$workspace/web/fastdup-ui/dist"
+    mkdir -p "$workspace/web/fastdup-ui/dist"
+    cp -a "$ui_build_root/dist/." "$workspace/web/fastdup-ui/dist/"
 elif [ ! -f "$workspace/web/fastdup-ui/dist/index.html" ]; then
     echo "npm is required because web/fastdup-ui/dist is missing" >&2
     exit 1
@@ -74,13 +84,14 @@ cp -a "$workspace/packaging/samba" "$stage_root/"
 install -m 0644 "$workspace/README.md" "$stage_root/README.md"
 
 tar -C "$package_root" -czf \
-    "$rpmbuild_root/SOURCES/fastdup-0.5.0-x86_64.tar.gz" \
-    fastdup-0.5.0
+    "$rpmbuild_root/SOURCES/fastdup-0.6.0-x86_64.tar.gz" \
+    fastdup-0.6.0
 install -m 0644 "$workspace/packaging/rpm/fastdup.spec" \
     "$rpmbuild_root/SPECS/fastdup.spec"
 
 rpmbuild -ba \
     --define "_topdir $rpmbuild_root" \
+    --define "_tmppath $TMPDIR" \
     "$rpmbuild_root/SPECS/fastdup.spec"
 
-find "$rpmbuild_root/RPMS" -type f -name 'fastdup-0.5.0-*.x86_64.rpm' -print
+find "$rpmbuild_root/RPMS" -type f -name 'fastdup-0.6.0-*.x86_64.rpm' -print

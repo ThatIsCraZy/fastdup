@@ -750,7 +750,7 @@ checksum = "77af40d8a8dadb92dc178569a5f5edb5f3056e98255c2de48ab5d59a52892e0c"
 
 [[package]]
 name = "fastdup-appliance"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "fastdup-control"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -810,11 +810,11 @@ dependencies = [
 
 [[package]]
 name = "fastdup-copy-metrics"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "fastdup-exact-bench"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "fastdup-format",
@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "fastdup-format"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "fastdup-io-uring"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fastdup-format",
  "fastdup-store",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "fastdup-posix"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "fastdup-copy-metrics",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "fastdup-similarity-bench"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fastdup-format",
  "memmap2",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "fastdup-store"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "fastdup-testkit"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "crc32c",

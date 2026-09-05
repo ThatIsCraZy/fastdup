@@ -2,31 +2,52 @@ const root = document.documentElement;
 const buttons = document.querySelectorAll("[data-language]");
 
 function setLanguage(language) {
-  root.dataset.language = language;
-  root.lang = language;
-  document.title = language === "de"
-    ? "fastdup · Aus x86-64-Hardware wird eine High-Performance Dedup-Appliance"
-    : "fastdup · Turn x86-64 hardware into a high-performance dedup appliance";
+  const selected = language === "en" ? "en" : "de";
+  root.dataset.language = selected;
+  root.lang = selected;
+  document.title =
+    selected === "de"
+      ? "fastdup · Weniger Speicher. Dieselben Dateien. In Rust."
+      : "fastdup · Less storage. The same files. Built with Rust.";
   buttons.forEach((button) => {
-    button.setAttribute("aria-pressed", String(button.dataset.language === language));
+    button.setAttribute(
+      "aria-pressed",
+      String(button.dataset.language === selected),
+    );
   });
-  localStorage.setItem("fastdup-language", language);
+  try {
+    localStorage.setItem("fastdup-language", selected);
+  } catch {
+    // Language switching also works when browser storage is unavailable.
+  }
 }
 
-const preferred = localStorage.getItem("fastdup-language")
-  || (navigator.language.toLowerCase().startsWith("de") ? "de" : "en");
+let preferred = navigator.language.toLowerCase().startsWith("de") ? "de" : "en";
+try {
+  const saved = localStorage.getItem("fastdup-language");
+  if (saved === "de" || saved === "en") preferred = saved;
+} catch {
+  // Use the browser language when preferences cannot be read.
+}
 setLanguage(preferred);
-buttons.forEach((button) => button.addEventListener("click", () => setLanguage(button.dataset.language)));
+buttons.forEach((button) =>
+  button.addEventListener("click", () => setLanguage(button.dataset.language)),
+);
 
-document.querySelector("[data-copy='install']")?.addEventListener("click", async (event) => {
-  const commands = [
-    "curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm",
-    "sudo dnf install ./fastdup-0.5.0-1.el10.x86_64.rpm",
-    "sudo systemctl enable --now fastdup-agent.service fastdup-control.service",
-  ].join("\n");
-  await navigator.clipboard.writeText(commands);
-  const button = event.currentTarget;
-  const old = button.innerHTML;
-  button.textContent = root.dataset.language === "de" ? "Kopiert" : "Copied";
-  window.setTimeout(() => { button.innerHTML = old; }, 1400);
-});
+document
+  .querySelector("[data-copy='install']")
+  ?.addEventListener("click", async () => {
+    const status = document.querySelector("#copy-status");
+    try {
+      await navigator.clipboard.writeText(
+        document.querySelector("#install code").textContent.trim(),
+      );
+      status.textContent =
+        root.lang === "de" ? "Befehle kopiert." : "Commands copied.";
+    } catch {
+      status.textContent =
+        root.lang === "de"
+          ? "Kopieren nicht verfügbar. Bitte die Befehle markieren und manuell kopieren."
+          : "Clipboard unavailable. Please select and copy the commands manually.";
+    }
+  });

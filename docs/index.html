@@ -1,21 +1,36 @@
 <!doctype html>
 <html lang="de">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>fastdup · Aus x86-64-Hardware wird eine High-Performance Dedup-Appliance</title>
-    <meta name="description" content="fastdup macht aus x86-64-Standardhardware eine Storage-Appliance, die gleiche Daten nur einmal speichert: Installation per RPM, Verwaltung per WebUI, Zugriff über SMB und POSIX. Offen dokumentierter Forschungsprototyp.">
-    <meta name="keywords" content="deduplication, filesystem, storage appliance, POSIX, FUSE, SMB, Samba, Rust, Rocky Linux, Zstd, backup storage">
-    <meta name="theme-color" content="#071016">
-    <meta name="robots" content="index,follow">
-    <link rel="canonical" href="https://thatiscrazy.github.io/fastdup/">
-    <meta property="og:type" content="website">
-    <meta property="og:title" content="fastdup · Deine Hardware. Deine Dedup-Appliance.">
-    <meta property="og:description" content="RPM installieren, zwei Datenträger auswählen – fertig ist eine Appliance, die gleiche Daten nur einmal speichert und per WebUI verwaltet wird.">
-    <meta property="og:url" content="https://thatiscrazy.github.io/fastdup/">
-    <meta property="og:image" content="https://thatiscrazy.github.io/fastdup/assets/webui-overview.png">
-    <meta name="twitter:card" content="summary_large_image">
-    <link rel="stylesheet" href="site.css?v=20260902-3">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>fastdup · Weniger Speicher. Dieselben Dateien. In Rust.</title>
+    <meta
+      name="description"
+      content="fastdup macht aus x86-64-Standardhardware eine Storage-Appliance, die gleiche Daten nur einmal speichert: Installation per RPM, Verwaltung per WebUI, Zugriff über SMB und POSIX. Offen dokumentierter Forschungsprototyp."
+    />
+    <meta
+      name="keywords"
+      content="deduplication, filesystem, storage appliance, POSIX, FUSE, SMB, Samba, Rust, Rocky Linux, Zstd, backup storage"
+    />
+    <meta name="theme-color" content="#071016" />
+    <meta name="robots" content="index,follow" />
+    <link rel="canonical" href="https://thatiscrazy.github.io/fastdup/" />
+    <meta property="og:type" content="website" />
+    <meta
+      property="og:title"
+      content="fastdup · Weniger Speicher. Dieselben Dateien. In Rust."
+    />
+    <meta
+      property="og:description"
+      content="Storage-Appliance in Rust mit Exact Dedup, optionaler Online-Similarity und HTTPS-WebUI. Aktuelle Messungen, offene Architektur und klare Grenzen."
+    />
+    <meta property="og:url" content="https://thatiscrazy.github.io/fastdup/" />
+    <meta
+      property="og:image"
+      content="https://thatiscrazy.github.io/fastdup/assets/webui-overview.png"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="stylesheet" href="site.css?v=20260905-1" />
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
@@ -23,14 +38,15 @@
         "name": "fastdup",
         "applicationCategory": "StorageApplication",
         "operatingSystem": "Rocky Linux 10 x86-64",
-        "softwareVersion": "0.5.0",
+        "softwareVersion": "0.6.0",
         "license": "https://www.apache.org/licenses/LICENSE-2.0",
-        "downloadUrl": "https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm",
+        "downloadUrl": "https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm",
         "codeRepository": "https://github.com/ThatIsCraZy/fastdup"
       }
     </script>
   </head>
   <body>
+    <a class="skip-link" href="#top">Zum Inhalt / Skip to content</a>
     <header class="site-header">
       <a class="brand" href="#top" aria-label="fastdup Startseite">
         <span class="brand-mark" aria-hidden="true">◇</span>
@@ -41,8 +57,7 @@
         <a class="lang-en" href="#ueberblick">Overview</a>
         <a class="lang-de" href="#performance">Leistung</a>
         <a class="lang-en" href="#performance">Performance</a>
-        <a class="lang-de" href="#reduction">Reduction</a>
-        <a class="lang-en" href="#reduction">Reduction</a>
+        <a href="#rust">Rust</a>
         <a class="lang-de" href="#webui">WebUI</a>
         <a class="lang-en" href="#webui">WebUI</a>
         <a class="lang-de" href="#eignung">Eignung</a>
@@ -53,218 +68,860 @@
       </nav>
       <div class="language-switch" aria-label="Sprache / Language">
         <button type="button" data-language="de" aria-pressed="true">DE</button>
-        <button type="button" data-language="en" aria-pressed="false">EN</button>
+        <button type="button" data-language="en" aria-pressed="false">
+          EN
+        </button>
       </div>
     </header>
 
     <main id="top">
       <section class="hero section-shell">
         <div class="hero-copy">
-          <div class="eyebrow lang-de"><span></span> SOFTWARE-DEFINIERTER STORAGE FÜR X86-64</div>
-          <div class="eyebrow lang-en"><span></span> SOFTWARE-DEFINED STORAGE FOR X86-64</div>
-          <h1 class="lang-de">Mach aus deiner Kiste eine <em>High-Performance Dedup-Appliance.</em></h1>
-          <h1 class="lang-en">Turn your box into a <em>high-performance dedup appliance.</em></h1>
-          <p class="hero-lead lang-de">fastdup speichert jeden Datenblock nur einmal: Was schon auf der Platte liegt, belegt keinen zweiten Platz. Du brauchst nur geeignete x86-64-Hardware, Rocky Linux und zwei Datenträger. Ein RPM liefert Dateizugriff per SMB-Freigabe und lokalem Mountpoint, die komplette Reduktions-Pipeline und die HTTPS-WebUI zur Verwaltung.</p>
-          <p class="hero-lead lang-en">fastdup stores every block of data only once: anything already on disk does not take up space a second time. All you need is suitable x86-64 hardware, Rocky Linux, and two drives. One RPM delivers file access over an SMB share and a local mountpoint, the complete reduction pipeline, and the HTTPS WebUI for administration.</p>
-          <div class="hero-actions">
-            <a class="button primary lang-de" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">RPM herunterladen <span>↓</span></a>
-            <a class="button primary lang-en" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">Download RPM <span>↓</span></a>
-            <a class="button secondary lang-de" href="#installation">Installation ansehen</a>
-            <a class="button secondary lang-en" href="#installation">View installation</a>
+          <div class="eyebrow lang-de">
+            <span></span> SOFTWARE-DEFINIERTER STORAGE FÜR X86-64
           </div>
+          <div class="eyebrow lang-en">
+            <span></span> SOFTWARE-DEFINED STORAGE FOR X86-64
+          </div>
+          <h1 class="lang-de">
+            Weniger Speicher.<br />Dieselben Dateien.<br /><em
+              >Gebaut mit Rust.</em
+            >
+          </h1>
+          <h1 class="lang-en">
+            Less storage.<br />The same files.<br /><em>Built with Rust.</em>
+          </h1>
+          <p lang="de" class="lang-de hero-lead">
+            fastdup macht aus deiner x86-64-Hardware eine Storage-Appliance:
+            identische Inhalte wiederverwenden, neue Daten komprimieren und
+            ähnliche Versionen optional weiter reduzieren. Zugriff per SMB und
+            FUSE, Verwaltung im Browser.
+          </p>
+          <p lang="en" class="lang-en hero-lead">
+            Turn your x86-64 hardware into a storage appliance: reuse identical
+            content, compress new data, and optionally reduce similar versions
+            further. Access files over SMB and FUSE; manage everything in your
+            browser.
+          </p>
+          <div class="hero-actions">
+            <a
+              class="button primary lang-de"
+              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm"
+              >RPM herunterladen <span>↓</span></a
+            >
+            <a
+              class="button primary lang-en"
+              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm"
+              >Download RPM <span>↓</span></a
+            >
+            <a class="button secondary lang-de" href="#installation"
+              >Installation ansehen</a
+            >
+            <a class="button secondary lang-en" href="#installation"
+              >View installation</a
+            >
+          </div>
+          <p lang="de" class="lang-de hero-status">
+            Forschungsprototyp · Für Evaluation mit einer zusätzlichen Kopie
+            wichtiger Daten.
+          </p>
+          <p lang="en" class="lang-en hero-status">
+            Research prototype · Evaluate with a separate copy of important
+            data.
+          </p>
           <div class="compatibility">
-            <span>v0.5.0</span><span>Rocky Linux 10</span><span>x86-64</span><span class="lang-de">kein Spezial-Controller nötig</span><span class="lang-en">no special controller required</span>
+            <span>RPM v0.6.0</span><span>Rocky Linux 10</span><span>x86-64</span
+            ><span>Rust</span>
           </div>
         </div>
         <div class="hero-visual">
-          <div class="browser-bar"><i></i><i></i><i></i><span>https://fastdup-appliance:8080</span></div>
-          <img src="assets/webui-overview.png" alt="fastdup WebUI mit Repository-Zustand, Durchsatz und Kapazität" width="1600" height="1000">
-          <div class="live-chip"><i></i><span class="lang-de">Deine Hardware · eine Appliance</span><span class="lang-en">Your hardware · one appliance</span></div>
+          <div class="browser-bar">
+            <i></i><i></i><i></i><span>https://fastdup-appliance:8080</span>
+          </div>
+          <img
+            src="assets/webui-overview.png"
+            alt="fastdup WebUI mit Repository-Zustand, Durchsatz und Kapazität"
+            width="1600"
+            height="1000"
+          />
+          <div class="live-chip">
+            <i></i><span class="lang-de">WebUI-Vorschau · Beispieldaten</span
+            ><span class="lang-en">WebUI preview · sample data</span>
+          </div>
         </div>
       </section>
 
+      <div class="section-shell release-note">
+        <p lang="de" class="lang-de">
+          <b>Neu in v0.6 · 05.09.2026:</b> Permanente Online-Similarity, Policy
+          je Share und optimierte Telemetrie. Download: RPM 0.6.0 für Rocky
+          Linux 10. Die Messungen dokumentieren die Entwicklungsbuilds auf dem
+          Weg zu diesem Release.
+        </p>
+        <p lang="en" class="lang-en">
+          <b>New in v0.6 · 5 September 2026:</b> Persistent online similarity,
+          per-share policy, and improved telemetry. Download: RPM 0.6.0 for
+          Rocky Linux 10. Measurements document the development builds leading
+          to this release.
+        </p>
+      </div>
       <section class="trust-strip" aria-label="Produktmerkmale">
-        <div><strong>Standard x86-64</strong><span class="lang-de">softwaredefinierte Appliance</span><span class="lang-en">software-defined appliance</span></div>
-        <div><strong class="lang-de">1.022,1 MiB/s</strong><strong class="lang-en">1,022.1 MiB/s</strong><span class="lang-de">über SMB gemessen — rund 3,5 TiB pro Stunde</span><span class="lang-en">measured over SMB — roughly 3.5 TiB per hour</span></div>
-        <div><strong class="lang-de">49,07× DATA</strong><strong class="lang-en">49.07× DATA</strong><span class="lang-de">aus 103,62 GB Nutzdaten werden 2,11 GB belegter Platz</span><span class="lang-en">103.62 GB of logical data occupy 2.11 GB on disk</span></div>
-        <div><strong>HTTPS WebUI</strong><span class="lang-de">alles im Browser: Einrichten, Überwachen, Warten</span><span class="lang-en">everything in the browser: setup, monitoring, maintenance</span></div>
+        <div>
+          <strong>Standard x86-64</strong
+          ><span class="lang-de">softwaredefinierte Appliance</span
+          ><span class="lang-en">software-defined appliance</span>
+        </div>
+        <div>
+          <strong class="lang-de">1.061,0 MiB/s</strong
+          ><strong class="lang-en">1,061.0 MiB/s</strong
+          ><span class="lang-de"
+            >SMB über Loopback · Median, normale Reduktion</span
+          ><span class="lang-en"
+            >SMB over loopback · median, normal reduction</span
+          >
+        </div>
+        <div>
+          <strong class="lang-de">23,84:1 gesamt</strong
+          ><strong class="lang-en">23.84:1 total</strong
+          ><span class="lang-de"
+            >50 Linux-Versionen · inklusive aller Metadaten</span
+          ><span class="lang-en"
+            >50 Linux versions · including all metadata</span
+          >
+        </div>
+        <div>
+          <strong>HTTPS WebUI</strong
+          ><span class="lang-de"
+            >alles im Browser: Einrichten, Überwachen, Warten</span
+          ><span class="lang-en"
+            >everything in the browser: setup, monitoring, maintenance</span
+          >
+        </div>
       </section>
 
       <section id="ueberblick" class="section-shell plain-section">
         <div class="section-heading">
           <div class="eyebrow lang-de"><span></span> IN EINFACHEN WORTEN</div>
           <div class="eyebrow lang-en"><span></span> IN PLAIN WORDS</div>
-          <h2 class="lang-de">Was fastdup macht — ohne Fachbegriffe.</h2>
-          <h2 class="lang-en">What fastdup does — without the jargon.</h2>
-          <p class="lang-de">Wer den Rest dieser Seite bewerten will, braucht zuerst eine Antwort auf die einfachste Frage: Wofür ist das gut? Drei Absätze genügen.</p>
-          <p class="lang-en">Before judging the rest of this page, you need an answer to the simplest question: what is this good for? Three paragraphs are enough.</p>
+          <h2 class="lang-de">
+            Dateien bleiben Dateien. Der Platzbedarf sinkt.
+          </h2>
+          <h2 class="lang-en">The same files. A smaller footprint.</h2>
+          <p class="lang-de">
+            Wer den Rest dieser Seite bewerten will, braucht zuerst eine Antwort
+            auf die einfachste Frage: Wofür ist das gut? Drei Absätze genügen.
+          </p>
+          <p class="lang-en">
+            Before judging the rest of this page, you need an answer to the
+            simplest question: what is this good for? Three paragraphs are
+            enough.
+          </p>
         </div>
         <div class="plain-flow">
           <article>
-            <span class="lang-de">DAS PROBLEM</span><span class="lang-en">THE PROBLEM</span>
-            <strong class="lang-de">Dieselben Daten liegen immer wieder auf der Platte</strong>
-            <strong class="lang-en">The same data sits on disk again and again</strong>
-            <p class="lang-de">Backups, Snapshots, VM-Images und Software-Stände speichern zum großen Teil identische Inhalte. Jede weitere Vollsicherung belegt erneut vollen Platz, obwohl sich zwischen zwei Ständen oft nur wenige Prozent ändern. Der Kapazitätsbedarf wächst mit der Aufbewahrungsdauer, nicht mit der tatsächlichen Datenmenge.</p>
-            <p class="lang-en">Backups, snapshots, VM images, and software builds largely store identical content. Every additional full backup takes up the full space again, even though only a few percent typically change between two states. Capacity grows with retention, not with the amount of actual data.</p>
+            <span class="lang-de">DAS PROBLEM</span
+            ><span class="lang-en">THE PROBLEM</span>
+            <strong class="lang-de"
+              >Dieselben Daten liegen immer wieder auf der Platte</strong
+            >
+            <strong class="lang-en"
+              >The same data sits on disk again and again</strong
+            >
+            <p class="lang-de">
+              Backups, Snapshots, VM-Images und Software-Stände speichern zum
+              großen Teil identische Inhalte. Jede weitere Vollsicherung belegt
+              erneut vollen Platz, obwohl sich zwischen zwei Ständen oft nur
+              wenige Prozent ändern. Der Kapazitätsbedarf wächst mit der
+              Aufbewahrungsdauer, nicht mit der tatsächlichen Datenmenge.
+            </p>
+            <p class="lang-en">
+              Backups, snapshots, VM images, and software builds largely store
+              identical content. Every additional full backup takes up the full
+              space again, even though only a few percent typically change
+              between two states. Capacity grows with retention, not with the
+              amount of actual data.
+            </p>
           </article>
           <article>
-            <span class="lang-de">DIE IDEE</span><span class="lang-en">THE IDEA</span>
-            <strong class="lang-de">Jeder Block wird nur einmal gespeichert</strong>
-            <strong class="lang-en">Each block is stored only once</strong>
-            <p class="lang-de">fastdup zerlegt jede Datei beim Schreiben in Blöcke und berechnet für jeden Block einen Fingerabdruck. Ist ein Block bereits vorhanden, wird er nicht erneut geschrieben, sondern nur referenziert. Was danach übrig bleibt, wird komprimiert. Dieses Verfahren heißt Deduplizierung und läuft im Schreibpfad, nicht als nachgelagerter Aufräumjob.</p>
-            <p class="lang-en">On write, fastdup splits every file into blocks and computes a fingerprint for each one. If a block already exists, it is referenced instead of written again. Whatever remains is then compressed. This is called deduplication, and it happens in the write path rather than as a later cleanup job.</p>
+            <span class="lang-de">DIE IDEE</span
+            ><span class="lang-en">THE IDEA</span>
+            <strong class="lang-de">Vorhandene Inhalte wiederverwenden</strong>
+            <strong class="lang-en">Reuse content already stored</strong>
+            <p class="lang-de">
+              fastdup zerlegt jede Datei beim Schreiben in Blöcke und berechnet
+              für jeden Block einen Fingerabdruck. Ist ein Block bereits
+              vorhanden, wird er nicht erneut geschrieben, sondern nur
+              referenziert. Was danach übrig bleibt, wird komprimiert. Dieses
+              Verfahren heißt Deduplizierung und läuft im Schreibpfad, nicht als
+              nachgelagerter Aufräumjob.
+            </p>
+            <p class="lang-en">
+              On write, fastdup splits every file into blocks and computes a
+              fingerprint for each one. If a block already exists, it is
+              referenced instead of written again. Whatever remains is then
+              compressed. This is called deduplication, and it happens in the
+              write path rather than as a later cleanup job.
+            </p>
           </article>
           <article>
-            <span class="lang-de">FÜR ANWENDUNGEN</span><span class="lang-en">FOR APPLICATIONS</span>
-            <strong class="lang-de">Von außen ein ganz normales Dateisystem</strong>
-            <strong class="lang-en">From the outside, an ordinary filesystem</strong>
-            <p class="lang-de">Backup-Software, Skripte und Nutzer sehen Ordner und Dateien — über eine SMB-Freigabe im Netz oder einen lokalen Mountpoint auf der Appliance. Von der Deduplizierung merken sie nichts. Verwaltet wird alles im Browser: Datenträger auswählen, Freigaben anlegen, Auslastung beobachten, warten.</p>
-            <p class="lang-en">Backup software, scripts, and users see folders and files — over an SMB share on the network or a local mountpoint on the appliance. They notice nothing of the deduplication. Everything is managed in the browser: select drives, create shares, watch utilization, run maintenance.</p>
+            <span class="lang-de">FÜR ANWENDUNGEN</span
+            ><span class="lang-en">FOR APPLICATIONS</span>
+            <strong class="lang-de"
+              >Von außen ein ganz normales Dateisystem</strong
+            >
+            <strong class="lang-en"
+              >From the outside, an ordinary filesystem</strong
+            >
+            <p class="lang-de">
+              Backup-Software, Skripte und Nutzer sehen Ordner und Dateien —
+              über eine SMB-Freigabe im Netz oder einen lokalen Mountpoint auf
+              der Appliance. Von der Deduplizierung merken sie nichts. Verwaltet
+              wird alles im Browser: Datenträger auswählen, Freigaben anlegen,
+              Auslastung beobachten, warten.
+            </p>
+            <p class="lang-en">
+              Backup software, scripts, and users see folders and files — over
+              an SMB share on the network or a local mountpoint on the
+              appliance. They notice nothing of the deduplication. Everything is
+              managed in the browser: select drives, create shares, watch
+              utilization, run maintenance.
+            </p>
           </article>
         </div>
         <div class="plain-example">
           <div>
-            <span class="lang-de">EIN BEISPIEL AUS DEM MESSLAUF</span><span class="lang-en">AN EXAMPLE FROM THE TEST RUN</span>
-            <p class="lang-de">50 ISO-Versionen mit jeweils kleinen Änderungen ergeben <b>103,62 GB Nutzdaten</b>. Auf dem Datenträger belegen sie <b>2,11 GB</b> plus 99,27 MB Metadaten. Anders gesagt: Alle 50 Versionen zusammen brauchen deutlich weniger Platz als eine einzige davon.</p>
-            <p class="lang-en">50 ISO versions, each with small changes, add up to <b>103.62 GB of logical data</b>. On disk they occupy <b>2.11 GB</b> plus 99.27 MB of metadata. Put differently: all 50 versions together need considerably less space than a single one of them.</p>
+            <span lang="de" class="lang-de">GEMESSEN · 50 LINUX-VERSIONEN</span
+            ><span lang="en" class="lang-en">MEASURED · 50 LINUX VERSIONS</span>
+            <p lang="de" class="lang-de">
+              <b>72,05 GiB Dateien → 3,02 GiB Repository.</b> Im Linux-6.12-Test
+              benötigt Online-Similarity 72,35 % weniger Platz als Exact Dedup
+              und normale Kompression allein. Alle Container, Indizes und
+              Metadaten sind eingerechnet. Der Schreibdurchsatz sinkt dabei um
+              42,25 %.
+            </p>
+            <p lang="en" class="lang-en">
+              <b>72.05 GiB of files → 3.02 GiB repository.</b> In the Linux 6.12
+              test, online similarity uses 72.35% less space than Exact Dedup
+              and normal compression alone. All containers, indexes, and
+              metadata are included. Write throughput falls by 42.25%.
+            </p>
           </div>
           <div class="plain-bars" aria-hidden="true">
-            <div><i class="bar-logical"></i><small class="lang-de">103,62 GB Nutzdaten</small><small class="lang-en">103.62 GB logical</small></div>
-            <div><i class="bar-physical"></i><small class="lang-de">2,11 GB belegt</small><small class="lang-en">2.11 GB on disk</small></div>
+            <div>
+              <i class="bar-logical"></i><small>72.05 GiB · logical</small>
+            </div>
+            <div>
+              <i class="bar-physical"></i
+              ><small>3.02 GiB · DATA + metadata</small>
+            </div>
           </div>
         </div>
-        <p class="hardware-note lang-de">Wie stark ein Datenbestand schrumpft, hängt davon ab, wie viel sich zwischen den Ständen wiederholt. Einmalige, bereits komprimierte oder verschlüsselte Daten reduzieren sich kaum — dort bleibt vor allem die Kompression.</p>
-        <p class="hardware-note lang-en">How much a data set shrinks depends on how much repeats between states. One-off, already compressed, or encrypted data barely reduces at all — there, compression is what remains.</p>
+        <p lang="de" class="lang-de hardware-note">
+          Einmalige, bereits komprimierte oder verschlüsselte Inhalte bieten
+          meist wenig Einsparpotenzial. Wiederkehrende Inhalte und die
+          Änderungen zwischen Versionen entscheiden über das Ergebnis.
+        </p>
+        <p lang="en" class="lang-en hardware-note">
+          Unique, already compressed, or encrypted content usually offers little
+          room for savings. Repeated content and the changes between versions
+          determine the result.
+        </p>
       </section>
 
       <section class="section-shell appliance-section">
         <div class="section-heading">
           <div class="eyebrow"><span></span> BRING YOUR OWN HARDWARE</div>
-          <h2 class="lang-de">Deine Hardware. Deine Platten. Deine Dedup-Appliance.</h2>
-          <h2 class="lang-en">Your hardware. Your drives. Your dedup appliance.</h2>
-          <p class="lang-de">fastdup ist keine Hardware-Appliance mit festem Chassis. Installiere Rocky Linux 10 auf einem geeigneten x86-64-System, stelle einen schnellen Metadata-Tier und einen separaten DATA-Tier bereit und verwandle die Maschine per RPM in einen FUSE-/SMB-Speicher mit transparenter Datenreduktion.</p>
-          <p class="lang-en">fastdup is not tied to a fixed appliance chassis. Install Rocky Linux 10 on a suitable x86-64 system, provide a fast metadata tier and a separate DATA tier, and turn the machine into FUSE/SMB storage with transparent data reduction by installing one RPM.</p>
+          <h2 class="lang-de">
+            Deine Hardware. Deine Platten. Deine Dedup-Appliance.
+          </h2>
+          <h2 class="lang-en">
+            Your hardware. Your drives. Your dedup appliance.
+          </h2>
+          <p class="lang-de">
+            fastdup ist keine Hardware-Appliance mit festem Chassis. Installiere
+            Rocky Linux 10 auf einem geeigneten x86-64-System, stelle einen
+            schnellen Metadata-Tier und einen separaten DATA-Tier bereit und
+            verwandle die Maschine per RPM in einen FUSE-/SMB-Speicher mit
+            transparenter Datenreduktion.
+          </p>
+          <p class="lang-en">
+            fastdup is not tied to a fixed appliance chassis. Install Rocky
+            Linux 10 on a suitable x86-64 system, provide a fast metadata tier
+            and a separate DATA tier, and turn the machine into FUSE/SMB storage
+            with transparent data reduction by installing one RPM.
+          </p>
         </div>
-        <div class="appliance-flow" aria-label="Vom Server zur fastdup Appliance">
-          <article><span>01</span><strong class="lang-de">x86-64-Kiste</strong><strong class="lang-en">x86-64 box</strong><small class="lang-de">Server, Workstation oder Lab-System</small><small class="lang-en">server, workstation, or lab system</small></article>
+        <div
+          class="appliance-flow"
+          aria-label="Vom Server zur fastdup Appliance"
+        >
+          <article>
+            <span>01</span><strong class="lang-de">x86-64-Kiste</strong
+            ><strong class="lang-en">x86-64 box</strong
+            ><small class="lang-de">Server, Workstation oder Lab-System</small
+            ><small class="lang-en">server, workstation, or lab system</small>
+          </article>
           <i>→</i>
-          <article><span>02</span><strong>Rocky Linux 10 + RPM</strong><small class="lang-de">keine Rust-/Node-Toolchain nötig</small><small class="lang-en">no Rust or Node toolchain required</small></article>
+          <article>
+            <span>02</span><strong>Rocky Linux 10 + RPM</strong
+            ><small class="lang-de">keine Rust-/Node-Toolchain nötig</small
+            ><small class="lang-en">no Rust or Node toolchain required</small>
+          </article>
           <i>→</i>
-          <article><span>03</span><strong>fastdup Appliance</strong><small>FUSE · SMB · WebUI · Scrub · GC</small></article>
+          <article>
+            <span>03</span><strong>fastdup Appliance</strong
+            ><small>FUSE · SMB · WebUI · Scrub · GC</small>
+          </article>
         </div>
-        <p class="hardware-note lang-de">Für den produktiven Schreibbetrieb verlangt fastdup zwei physisch getrennte XFS-Dateisysteme. Gerätespiegelung oder RAID bleiben bewusst Aufgabe des Block-Layers.</p>
-        <p class="hardware-note lang-en">Production writes require two physically separate XFS filesystems. Device mirroring or RAID deliberately remains the block layer's responsibility.</p>
+        <p class="hardware-note lang-de">
+          Für den produktiven Schreibbetrieb verlangt fastdup zwei physisch
+          getrennte XFS-Dateisysteme. Gerätespiegelung oder RAID bleiben bewusst
+          Aufgabe des Block-Layers.
+        </p>
+        <p class="hardware-note lang-en">
+          Production writes require two physically separate XFS filesystems.
+          Device mirroring or RAID deliberately remains the block layer's
+          responsibility.
+        </p>
       </section>
 
       <section id="performance" class="performance-section">
         <div class="section-shell">
           <div class="section-heading">
-            <div class="eyebrow"><span></span> MEASURED, NOT PROJECTED</div>
-            <h2 class="lang-de">Hoher Durchsatz auf einer kleinen Notebook-CPU-VM.</h2>
-            <h2 class="lang-en">High throughput on a small notebook-CPU VM.</h2>
-            <p class="lang-de">Der Messhost war keine große Storage-CPU: eine VM auf einem Intel Core i7-1370P aus der Notebook-Klasse, mit nur zehn sichtbaren logischen CPUs, AVX2/BMI2 und ohne AVX-512. Der aktuelle SMB-Lauf blieb dabei bei 569,5 MB Peak RSS und 0 Byte Prozess-Swap.</p>
-            <p class="lang-en">The measured host was not a large storage CPU: a VM on a notebook-class Intel Core i7-1370P, exposing only ten logical CPUs, with AVX2/BMI2 and no AVX-512. The current SMB run stayed at 569.5 MB peak RSS and zero bytes of process swap.</p>
+            <div class="eyebrow">BENCHMARKS · 05.09.2026</div>
+            <h2 lang="de" class="lang-de">
+              Messwerte mit dem passenden Kontext.
+            </h2>
+            <h2 lang="en" class="lang-en">Measurements with context.</h2>
           </div>
-          <div class="reduction-context">
-            <strong class="lang-de">Drei Kopien testen nicht das maximale Reduction-Potenzial.</strong>
-            <strong class="lang-en">Three copies do not test the maximum reduction potential.</strong>
-            <p class="lang-de">Bei drei identischen Kopien kann reine Exact-Dedup höchstens 66,67 % einsparen. fastdup erreicht im dauerhaften SMB-Lauf 67,78 % inklusive Metadaten—dank zusätzlicher Reduction-Stufen sogar etwas mehr als dieses reine Dedup-Limit. Im aktuellen Live-Test mit 50 minimal veränderten ISO-Versionen steigt das Verhältnis auf 49,07× für DATA beziehungsweise 46,87× inklusive sämtlicher Metadaten.</p>
-            <p class="lang-en">With three identical copies, exact dedup alone can save at most 66.67%. fastdup reaches 67.78% in the durable SMB run including metadata—additional reduction stages push it slightly beyond that dedup-only limit. In the current live test with 50 minimally changed ISO versions, the ratio rises to 49.07× for DATA and 46.87× including all metadata.</p>
-          </div>
+          <p lang="de" class="lang-de section-lead">
+            Identische Kopien und veränderte Versionen stellen unterschiedliche
+            Anforderungen. Deshalb zeigen wir Durchsatz und Speicherbedarf für
+            beide Workloads getrennt.
+          </p>
+          <p lang="en" class="lang-en section-lead">
+            Identical copies and changed versions have different needs. We
+            report throughput and storage use separately for both workloads.
+          </p>
           <div class="metric-grid">
-            <article><span class="metric lang-de">1.022,1</span><span class="metric lang-en">1,022.1</span><strong>MiB/s</strong><h3 class="lang-de">SMB-Aggregat</h3><h3 class="lang-en">aggregate SMB</h3><p class="lang-de">Drei serielle ISO-Uploads im aktuellen Produktionspfad.</p><p class="lang-en">Three serial ISO uploads on the current production path.</p><small>END-TO-END · CURRENT RUN</small></article>
-            <article><span class="metric lang-de">601,0</span><span class="metric lang-en">601.0</span><strong>MiB/s</strong><h3 class="lang-de">Erster physischer Upload</h3><h3 class="lang-en">first physical upload</h3><p class="lang-de">Neue Chunks inklusive Container-Publication auf den DATA-Tier.</p><p class="lang-en">New chunks including container publication to the DATA tier.</p><small>END-TO-END · COPY 1</small></article>
-            <article><span class="metric lang-de">1.576,2</span><span class="metric lang-en">1,576.2</span><strong>MiB/s</strong><h3 class="lang-de">Exact-Wiederholung</h3><h3 class="lang-en">exact repeat</h3><p class="lang-de">Schnellste Einzelkopie im selben bytegenau geprüften SMB-Lauf.</p><p class="lang-en">Fastest individual copy in the same byte-verified SMB run.</p><small>END-TO-END · COPY 3</small></article>
-            <article class="accent"><span class="metric lang-de">67,78 %</span><span class="metric lang-en">67.78%</span><strong class="lang-de">bei nur drei Kopien</strong><strong class="lang-en">with only three copies</strong><h3 class="lang-de">Dedup-Limit erreicht</h3><h3 class="lang-en">dedup limit reached</h3><p class="lang-de">Reine Exact-Dedup ist bei drei identischen Kopien auf 66,67 % begrenzt.</p><p class="lang-en">Exact dedup alone is capped at 66.67% with three identical copies.</p><small class="lang-de">3,104× GESAMT · INKLUSIVE METADATEN</small><small class="lang-en">3.104× TOTAL · INCLUDING METADATA</small></article>
-            <article><span class="metric lang-de">9.568</span><span class="metric lang-en">9,568</span><strong>MiB/s</strong><h3>SeqCDC AVX2/BMI2</h3><p class="lang-de">Isolierter 1-MiB-Slice-Scanner über die Rocky-ISO.</p><p class="lang-en">Isolated 1 MiB-slice scanner over the Rocky ISO.</p><small class="lang-de">MICROBENCHMARK · 6.223 MiB/s SKALAR</small><small class="lang-en">MICROBENCHMARK · 6,223 MiB/s SCALAR</small></article>
-            <article class="accent-soft"><span class="metric lang-de">49,07×</span><span class="metric lang-en">49.07×</span><strong class="lang-de">46,87× inklusive Metadaten</strong><strong class="lang-en">46.87× including metadata</strong><h3 class="lang-de">50 Live-Versionen</h3><h3 class="lang-en">50 live versions</h3><p class="lang-de">400 unterschiedliche Byte-Änderungen; alle 50 Dateien vollständig BLAKE3-verifiziert.</p><p class="lang-en">400 distinct byte edits; all 50 files fully verified with BLAKE3.</p><small>CURRENT FUSE PATH · 97.96% DATA SAVING</small></article>
+            <article>
+              <span lang="de" class="lang-de metric">1.061,0</span
+              ><span lang="en" class="lang-en metric">1,061.0</span
+              ><strong>MiB/s</strong>
+              <h3 lang="de" class="lang-de">SMB-Schreibdurchsatz</h3>
+              <h3 lang="en" class="lang-en">SMB write throughput</h3>
+              <p lang="de" class="lang-de">
+                Normale Reduktion · Median aus drei Läufen mit je drei
+                identischen ISO-Uploads.
+              </p>
+              <p lang="en" class="lang-en">
+                Normal reduction · median of three runs, each with three
+                identical ISO uploads.
+              </p>
+            </article>
+            <article>
+              <span lang="de" class="lang-de metric">23,84:1</span
+              ><span lang="en" class="lang-en metric">23.84:1</span
+              ><strong>DATA + metadata</strong>
+              <h3 lang="de" class="lang-de">50 Linux-Versionen</h3>
+              <h3 lang="en" class="lang-en">50 Linux versions</h3>
+              <p lang="de" class="lang-de">
+                Gesamte Reduktion mit Online-Similarity: 72,05 GiB logisch auf
+                3,02 GiB physisch.
+              </p>
+              <p lang="en" class="lang-en">
+                Total reduction with online similarity: 72.05 GiB logical to
+                3.02 GiB physical.
+              </p>
+            </article>
+            <article>
+              <span lang="de" class="lang-de metric">72,35 %</span
+              ><span lang="en" class="lang-en metric">72.35%</span
+              ><strong>Linux 6.12 A/B</strong>
+              <h3 lang="de" class="lang-de">Weniger Gesamtplatz</h3>
+              <h3 lang="en" class="lang-en">Less total space</h3>
+              <p lang="de" class="lang-de">
+                Gegenüber normaler Reduktion; dafür 42,25 % geringerer
+                Schreibdurchsatz.
+              </p>
+              <p lang="en" class="lang-en">
+                Compared with normal reduction, at 42.25% lower write
+                throughput.
+              </p>
+            </article>
           </div>
-          <div class="plain-note">
-            <strong class="lang-de">Was diese Zahlen praktisch bedeuten</strong>
-            <strong class="lang-en">What these numbers mean in practice</strong>
-            <ul>
-              <li class="lang-de"><b>1.022,1 MiB/s</b> entsprechen rund 3,5 TiB pro Stunde, die über eine SMB-Freigabe hereinkommen — gemessen auf einer VM mit zehn logischen CPUs einer Notebook-CPU, nicht auf einem großen Storage-Server.</li>
-              <li class="lang-en"><b>1,022.1 MiB/s</b> is roughly 3.5 TiB per hour arriving over an SMB share — measured on a VM with ten logical CPUs of a notebook processor, not on a large storage server.</li>
-              <li class="lang-de"><b>49,07×</b> heißt: Für rund 49 GB Nutzdaten dieses Testbestands wird etwa 1 GB Platz belegt. Der Wert gilt für genau diesen Datenbestand — dein eigener Wert hängt davon ab, wie viel sich zwischen den Versionen ändert.</li>
-              <li class="lang-en"><b>49.07×</b> means about 1 GB of space holds roughly 49 GB of logical data in this test set. The number applies to exactly this data — your own ratio depends on how much changes between versions.</li>
-              <li class="lang-de"><b>569,5 MB Peak RSS</b> ist der höchste Arbeitsspeicherbedarf des Prozesses während des Laufs. Die Appliance braucht also keinen Cache in Terabyte-Größe, um diesen Durchsatz zu liefern.</li>
-              <li class="lang-en"><b>569.5 MB peak RSS</b> is the highest memory the process used during the run. The appliance does not need a terabyte-scale cache to deliver this throughput.</li>
-              <li class="lang-de"><b>Bytegenau geprüft</b> heißt: Nach dem Lauf wurde jede der 50 Dateien vollständig zurückgelesen und gegen ihre Prüfsumme verglichen. Reduktion ohne diesen Nachweis wäre wertlos.</li>
-              <li class="lang-en"><b>Byte-verified</b> means every one of the 50 files was read back in full after the run and compared against its checksum. Reduction without that proof would be worthless.</li>
-            </ul>
+          <div lang="de" class="table-wrap lang-de">
+            <table>
+              <caption>
+                Normal und Advanced im Vergleich
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Workload / Messung</th>
+                  <th scope="col">Normal</th>
+                  <th scope="col">Advanced</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th scope="row">SMB · Gesamt-MiB/s, Median</th>
+                  <td>1.061,0</td>
+                  <td>941,5</td>
+                </tr>
+                <tr>
+                  <th scope="row">SMB · Ersparnis inkl. Metadaten</th>
+                  <td>67,823 %</td>
+                  <td>67,904 %</td>
+                </tr>
+                <tr>
+                  <th scope="row">Linux TAR · Repository gesamt</th>
+                  <td>10,93 GiB</td>
+                  <td>3,02 GiB</td>
+                </tr>
+                <tr>
+                  <th scope="row">Linux TAR · Reduktionsfaktor</th>
+                  <td>6,59:1</td>
+                  <td>23,84:1</td>
+                </tr>
+                <tr>
+                  <th scope="row">Linux TAR · Copy+fsync, MiB/s</th>
+                  <td>202,48</td>
+                  <td>116,92</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
-          <div class="evidence-row">
-            <p class="lang-de">Reduction ist abhängig von Datenmix, Änderungsrate und Aufbewahrung. Der aktuelle Wert misst exakt 50 gleichzeitig live gehaltene, minimal veränderte ISO-Versionen: 103,62 GB logisch gegenüber 2,11 GB DATA und 99,27 MB Metadaten. Die Scratch-Tiers lagen für diesen Reduction-Test auf RAM; deshalb ist er keine Geräte-Performance-Messung. Advanced Reduction und GC waren aus. Alle Werte sind workload- und hostabhängig und keine SLA.</p>
-            <p class="lang-en">Reduction depends on data mix, change rate, and retention. The current result measures exactly 50 simultaneously live, minimally changed ISO versions: 103.62 GB logical versus 2.11 GB DATA and 99.27 MB of metadata. The scratch tiers were RAM-backed for this reduction test, so it is not a device-performance measurement. Advanced Reduction and GC were off. All results are workload- and host-specific, not an SLA.</p>
-            <nav><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/iso50-live-reduction-2026-09-02.md">Current 50-version run ↗</a><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/hot-buffer-reuse-2026-09-01.md#singlestream-smb-ab">Current SMB run ↗</a><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/adr/0054-use-seqcdc-v1-as-the-default-chunking-profile.md">SeqCDC decision ↗</a></nav>
+          <div lang="en" class="table-wrap lang-en">
+            <table>
+              <caption>
+                Normal and Advanced compared
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Workload / measurement</th>
+                  <th scope="col">Normal</th>
+                  <th scope="col">Advanced</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th scope="row">SMB · total MiB/s, median</th>
+                  <td>1,061.0</td>
+                  <td>941.5</td>
+                </tr>
+                <tr>
+                  <th scope="row">SMB · savings incl. metadata</th>
+                  <td>67.823%</td>
+                  <td>67.904%</td>
+                </tr>
+                <tr>
+                  <th scope="row">Linux TAR · total repository</th>
+                  <td>10.93 GiB</td>
+                  <td>3.02 GiB</td>
+                </tr>
+                <tr>
+                  <th scope="row">Linux TAR · reduction factor</th>
+                  <td>6.59:1</td>
+                  <td>23.84:1</td>
+                </tr>
+                <tr>
+                  <th scope="row">Linux TAR · copy + fsync, MiB/s</th>
+                  <td>202.48</td>
+                  <td>116.92</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="benchmark-notes">
+            <p lang="de" class="lang-de">
+              <b>SMB:</b> Zehn vCPUs, getrennte XFS-Tiers, Loopback ohne Signing
+              oder Verschlüsselung. Mediane aus drei Läufen je Modus. Die
+              späteren Abschlussläufe mit dem finalen Build erreichten 1.040,9 /
+              930,5 MiB/s. Abschluss, Dateilängen und null Prozess-Swap geprüft;
+              kein vollständiger Hash-Readback.
+            </p>
+            <p lang="en" class="lang-en">
+              <b>SMB:</b> Ten vCPUs, separate XFS tiers, loopback without
+              signing or encryption. Medians of three runs per mode. Later
+              final-build runs reached 1,040.9 / 930.5 MiB/s. Completion, file
+              lengths, and zero process swap checked; no full hash readback.
+            </p>
+            <p lang="de" class="lang-de">
+              <b>Linux:</b> 50 unkomprimierte TAR-Streams von 6.12.1 bis
+              6.12.50; je Modus ein frisches Repository und ein durchgehender
+              Mount. Alle Metadaten enthalten, keine Ziel-Readbacks. Früherer
+              Entwicklungsbuild als die SMB-Serie. Die Werte sind
+              workloadspezifisch und keine Netzwerk- oder SLA-Zusage.
+            </p>
+            <p lang="en" class="lang-en">
+              <b>Linux:</b> 50 uncompressed TAR streams from 6.12.1 to 6.12.50;
+              one fresh repository and one continuous mount per mode. All
+              metadata included, no target readbacks. An earlier development
+              build than the SMB series. Results are workload-specific, not a
+              network or SLA guarantee.
+            </p>
+          </div>
+          <div class="evidence-links">
+            <a
+              href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/hotpath-implementation3-2026-09-05.md"
+              ><span lang="de" class="lang-de">SMB: alle 14 Läufe</span
+              ><span lang="en" class="lang-en">SMB: all 14 runs</span> ↗</a
+            ><a
+              href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/linux-6.12-online-similarity-2026-09-05.md"
+              ><span lang="de" class="lang-de">Linux: vollständiges A/B</span
+              ><span lang="en" class="lang-en">Linux: full A/B</span> ↗</a
+            ><a
+              href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/iso50-live-reduction-2026-09-02.md"
+              ><span lang="de" class="lang-de"
+                >Früherer 50-ISO-Test mit Readback</span
+              ><span lang="en" class="lang-en"
+                >Earlier 50-ISO test with readback</span
+              >
+              ↗</a
+            >
           </div>
         </div>
       </section>
-
       <section id="reduction" class="section-shell reduction-section">
         <div class="section-heading">
-          <div class="eyebrow"><span></span> MULTI-STAGE DATA REDUCTION</div>
-          <h2 class="lang-de">Mehr als die klassische Exact-Dedup-plus-Kompression-Pipeline.</h2>
-          <h2 class="lang-en">Beyond the classic exact-dedup-plus-compression pipeline.</h2>
-          <p class="lang-de"><b>Reduction heißt hier schlicht: weniger belegter Platz für dieselben Daten.</b> fastdup verbindet dafür mehrere unabhängige Stufen, die beim Schreiben nacheinander greifen, und veröffentlicht ihre Grenzen, Entscheidungen und Formate. Welche internen Verfahren proprietäre Legacy-Appliances kombinieren, ist nicht vollständig offengelegt und deshalb nicht seriös zählbar—vergleichbar ist hier die offen dokumentierte Pipeline.</p>
-          <p class="lang-en"><b>Reduction simply means less space used for the same data.</b> fastdup combines several independent stages that apply one after another on write, and publishes their boundaries, decisions, and formats. Proprietary legacy appliances do not fully disclose every internal technique, so a numeric technique count would not be defensible—the meaningful difference is this openly documented pipeline.</p>
+          <div class="eyebrow">REDUCTION</div>
+          <h2 lang="de" class="lang-de">
+            Jede Stufe spart dort, wo sie hilft.
+          </h2>
+          <h2 lang="en" class="lang-en">Each stage saves where it can.</h2>
         </div>
-        <div class="legacy-note">
-          <strong class="lang-de">Der belastbare Unterschied</strong><strong class="lang-en">The defensible difference</strong>
-          <p class="lang-de">Dell Data Domain und HPE StoreOnce heben öffentlich vor allem Inline-Deduplizierung plus Kompression hervor. fastdup dokumentiert zusätzlich Sparse-/FILL-Repräsentation, metadata-only Clone-Reuse und optional Similarity-geführte Depth-1-Codecs mit Zstd-Prefix und Sparse-XOR. Das ist ein breiter dokumentierter Stack—keine Behauptung über unbekannte proprietäre Interna.</p>
-          <p class="lang-en">Dell Data Domain and HPE StoreOnce publicly emphasize inline deduplication plus compression. fastdup additionally documents sparse/FILL representation, metadata-only clone reuse, and optional similarity-guided depth-1 codecs using Zstd Prefix and Sparse-XOR. That is a broader documented stack—not a claim about unknown proprietary internals.</p>
-          <nav><a href="https://infohub.delltechnologies.com/en-us/l/dell-powerprotect-data-domain-sisl-scaling-architecture/no-data-available-191/">Dell SISL ↗</a><a href="https://www.hpe.com/us/en/collaterals/collateral.c04328820.html">HPE StoreOnce ↗</a><a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/research/webpage-performance-reduction-claims-2026-09-02.md">Claim evidence ↗</a></nav>
-        </div>
-        <div class="stage-legend" aria-label="Bedeutung der Statusabzeichen">
-          <div><span class="stage live lang-de">AKTIV</span><span class="stage live lang-en">ACTIVE</span><small class="lang-de">immer eingeschaltet</small><small class="lang-en">always on</small></div>
-          <div><span class="stage workload">WORKLOAD</span><small class="lang-de">greift nur bei passenden Zugriffsmustern</small><small class="lang-en">applies only to matching access patterns</small></div>
-          <div><span class="stage optional">OPT-IN</span><small class="lang-de">muss bewusst eingeschaltet werden</small><small class="lang-en">must be enabled deliberately</small></div>
-          <div><span class="stage research">RESEARCH</span><small class="lang-de">noch nicht im Produktpfad</small><small class="lang-en">not in the product path yet</small></div>
-        </div>
+        <p lang="de" class="lang-de section-lead">
+          Die Standard-Pipeline arbeitet beim Schreiben. Online-Similarity lässt
+          sich gezielt für passende Freigaben zuschalten.
+        </p>
+        <p lang="en" class="lang-en section-lead">
+          The default pipeline runs on write. Enable online similarity for
+          shares whose data benefits from it.
+        </p>
         <div class="reduction-grid">
-          <article><span class="stage live lang-de">AKTIV</span><span class="stage live lang-en">ACTIVE</span><h3>SeqCDC-v1</h3><p class="lang-de">Content-Defined Chunking findet stabile Grenzen trotz Einfügungen und Verschiebungen.</p><p class="lang-en">Content-defined chunking finds stable boundaries across insertions and shifts.</p><p class="plain lang-de"><b>Im Klartext:</b> Die Blockgrenzen richten sich nach dem Inhalt. Wird am Anfang einer Datei etwas eingefügt, verschieben sich nicht alle folgenden Blöcke — der Rest wird weiterhin wiedererkannt.</p><p class="plain lang-en"><b>In plain words:</b> Block boundaries follow the content. If something is inserted at the start of a file, the following blocks do not all shift — the rest is still recognized.</p></article>
-          <article><span class="stage live lang-de">AKTIV</span><span class="stage live lang-en">ACTIVE</span><h3>BLAKE3 Exact Dedup</h3><p class="lang-de">Identische Chunks werden bytegenau geprüft und nur einmal physisch referenziert.</p><p class="lang-en">Identical chunks are byte-verified and physically referenced only once.</p><p class="plain lang-de"><b>Im Klartext:</b> Jeder Block bekommt einen Fingerabdruck. Bei einem Treffer wird zusätzlich Byte für Byte verglichen, bevor auf den vorhandenen Block verwiesen wird.</p><p class="plain lang-en"><b>In plain words:</b> Every block gets a fingerprint. On a match the bytes are compared as well before the existing block is referenced.</p></article>
-          <article><span class="stage live lang-de">AKTIV</span><span class="stage live lang-en">ACTIVE</span><h3>HOLE + FILL</h3><p class="lang-de">Sparse Nullbereiche benötigen keinen DATA-Record; konstante Bytebereiche werden als FILL abgebildet.</p><p class="lang-en">Sparse zero ranges need no DATA record; constant-byte ranges become FILL extents.</p><p class="plain lang-de"><b>Im Klartext:</b> Leere und durchgängig gleiche Bereiche — etwa vorbelegte Datenbank- oder VM-Dateien — werden notiert statt gespeichert.</p><p class="plain lang-en"><b>In plain words:</b> Empty and uniformly repeating ranges — preallocated database or VM files, for example — are noted instead of stored.</p></article>
-          <article><span class="stage live lang-de">AKTIV</span><span class="stage live lang-en">ACTIVE</span><h3 class="lang-de">Gruppiertes Zstd</h3><h3 class="lang-en">Grouped Zstd</h3><p class="lang-de">Benachbarte Chunks teilen begrenzte Compression Regions; Zstd gewinnt nur oberhalb der versionierten Sparschwelle.</p><p class="lang-en">Neighboring chunks share bounded compression regions; Zstd wins only above the versioned saving threshold.</p><p class="plain lang-de"><b>Im Klartext:</b> Was nach dem Deduplizieren übrig bleibt, wird komprimiert — aber nur dort, wo es sich messbar lohnt.</p><p class="plain lang-en"><b>In plain words:</b> Whatever remains after deduplication gets compressed — but only where it measurably pays off.</p></article>
-          <article><span class="stage workload">WORKLOAD</span><h3>Metadata Fast Clone</h3><p class="lang-de"><code>copy_file_range</code> klont bereits unveränderliche Extents, ohne DATA erneut zu lesen oder zu speichern.</p><p class="lang-en"><code>copy_file_range</code> clones immutable extents without rereading or storing DATA again.</p><p class="plain lang-de"><b>Im Klartext:</b> Eine Kopie innerhalb der Appliance verweist auf vorhandene Daten, statt sie erneut zu lesen und zu schreiben. Wie viel das bringt, hängt davon ab, wie die Anwendung kopiert.</p><p class="plain lang-en"><b>In plain words:</b> A copy made inside the appliance points at existing data instead of reading and writing it again. How much this helps depends on how the application copies.</p></article>
-          <article><span class="stage optional">OPT-IN</span><h3>Similarity + Depth-1 Codecs</h3><p class="lang-de">Ein rebuildbarer Similarity Index lässt ZSTD_PREFIX und Sparse-XOR unter derselben begrenzten Sparpolitik gegeneinander antreten. Jede abhängige Kodierung hat genau eine unabhängig dekodierbare Base.</p><p class="lang-en">A rebuildable similarity index trials ZSTD_PREFIX and Sparse-XOR under the same bounded saving policy. Every dependent encoding has exactly one independently decodable base.</p><p class="plain lang-de"><b>Im Klartext:</b> Bei ähnlichen Blöcken speichert fastdup entweder nur geänderte Bytes oder komprimiert sie gemeinsam mit einer vorhandenen Basis. Der Pfad ist standardmäßig aus, solange die Messgrundlage über mehrere Workloads noch schmal ist.</p><p class="plain lang-en"><b>In plain words:</b> For similar blocks, fastdup either stores only the changed bytes or compresses them together with an existing base. This path is off by default while the evidence across workloads is still thin.</p></article>
-          <article><span class="stage research">RESEARCH</span><h3 class="lang-de">Zstd-Dictionaries</h3><h3 class="lang-en">Zstd dictionaries</h3><p class="lang-de">Inhaltsidentifizierte Dictionaries für wiederkehrende strukturierte Datenfamilien.</p><p class="lang-en">Content-identified dictionaries for recurring structured-data families.</p><p class="plain lang-de"><b>Im Klartext:</b> Noch nicht aktiv — in Erprobung für viele kleine Dateien mit gleichartigem Aufbau.</p><p class="plain lang-en"><b>In plain words:</b> Not active yet — under evaluation for large numbers of small files that share a common structure.</p></article>
+          <article>
+            <span class="stage live">DEFAULT</span>
+            <h3>SeqCDC + BLAKE3</h3>
+            <p lang="de" class="lang-de">
+              Inhaltsabhängige Chunk-Grenzen erkennen wiederkehrende Bereiche
+              auch nach Verschiebungen. Exact Dedup verwendet verifizierte
+              vorhandene Inhalte erneut.
+            </p>
+            <p lang="en" class="lang-en">
+              Content-defined chunk boundaries recognize repeated regions even
+              after shifts. Exact Dedup reuses verified existing content.
+            </p>
+          </article>
+          <article>
+            <span class="stage live">DEFAULT</span>
+            <h3>HOLE / FILL + Zstd</h3>
+            <p lang="de" class="lang-de">
+              Leere und konstante Bereiche werden kompakt beschrieben. Neue
+              Inhalte werden gruppiert komprimiert, wenn die definierte
+              Sparschwelle erreicht wird; sonst bleibt RAW.
+            </p>
+            <p lang="en" class="lang-en">
+              Sparse and constant regions use compact descriptions. New content
+              is compressed in groups when it meets the savings threshold;
+              otherwise it stays RAW.
+            </p>
+          </article>
+          <article>
+            <span class="stage workload">WORKLOAD</span>
+            <h3>Metadata Fast Clone</h3>
+            <p lang="de" class="lang-de">
+              copy_file_range klont vorhandene Extents über Metadaten. Der
+              Nutzen hängt von der Anwendung ab; Samba Fast Clone ist weiterhin
+              experimentell und nicht Veeam-qualifiziert.
+            </p>
+            <p lang="en" class="lang-en">
+              copy_file_range clones existing extents through metadata. Benefits
+              depend on the application; Samba Fast Clone remains experimental
+              and is not Veeam-qualified.
+            </p>
+          </article>
+          <article>
+            <span class="stage optional">OPT-IN</span>
+            <h3>Online-Similarity</h3>
+            <p lang="de" class="lang-de">
+              Neue unabhängige Chunks werden ohne Remount oder Offline-Rebuild
+              als Kandidaten aufgenommen. Der permanente Index bleibt neu
+              aufbaubare Beschleunigung.
+            </p>
+            <p lang="en" class="lang-en">
+              New independent chunks become candidates without a remount or
+              offline rebuild. The persistent index remains rebuildable
+              acceleration.
+            </p>
+          </article>
+          <article>
+            <span class="stage optional">OPT-IN</span>
+            <h3>ZSTD_PREFIX + Sparse-XOR</h3>
+            <p lang="de" class="lang-de">
+              Ähnliche Inhalte teilen genau eine unabhängig dekodierbare Basis.
+              Begrenzte Trials vergleichen die Einsparung. Je Share: aus, an
+              oder Repository-Standard erben.
+            </p>
+            <p lang="en" class="lang-en">
+              Similar content uses exactly one independently decodable base.
+              Bounded trials compare savings. Per share: disabled, enabled, or
+              inherit the repository default.
+            </p>
+          </article>
+          <article>
+            <span class="stage research">RESEARCH</span>
+            <h3>Zstd dictionaries</h3>
+            <p lang="de" class="lang-de">
+              Inhaltsidentifizierte Dictionaries bleiben ein Forschungspfad.
+              Similarity-Reorder wurde zugunsten guter Restore-Lokalität
+              verworfen.
+            </p>
+            <p lang="en" class="lang-en">
+              Content-identified dictionaries remain a research path. Similarity
+              reordering was rejected in favor of restore locality.
+            </p>
+          </article>
         </div>
-        <div class="pipeline-note">
-          <strong class="lang-de">Auf Performance ausgelegt:</strong><strong class="lang-en">Designed for performance:</strong>
-          <p class="lang-de">AVX2/BMI2-SeqCDC, paralleles BLAKE3, worker-lokale Zstd-Kontexte, mmap-basierte Indizes, <code>io_uring</code>-Publication und begrenzte Worker-/Speicherbudgets parallelisieren und begrenzen die Pipeline.</p>
-          <p class="lang-en">AVX2/BMI2 SeqCDC, parallel BLAKE3, worker-local Zstd contexts, mmap-backed indexes, <code>io_uring</code> publication, and bounded worker/memory budgets parallelize and bound the pipeline.</p>
+        <p lang="de" class="lang-de hardware-note">
+          Neue WebUI-Freigaben starten mit Advanced Reduction aus. Abschalten
+          verändert nur die Auswahl neuer Encodings; vorhandene abhängige Daten
+          bleiben lesbar. Bei fehlenden Kandidaten schreibt fastdup unabhängig
+          weiter.
+        </p>
+        <p lang="en" class="lang-en hardware-note">
+          New WebUI shares start with Advanced Reduction disabled. Disabling it
+          only changes new encoding selection; existing dependent data remains
+          readable. Missing candidates fall back to independent encoding.
+        </p>
+        <div class="evidence-links">
+          <a
+            href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/adr/0089-refresh-reduction-snapshots-without-remounting.md"
+            ><span lang="de" class="lang-de"
+              >Architektur der Online-Similarity</span
+            ><span lang="en" class="lang-en"
+              >Online similarity architecture</span
+            >
+            ↗</a
+          ><a
+            href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/online-similarity-share-policy-2026-09-05.md"
+            ><span lang="de" class="lang-de">Share-Policy und Prüfungen</span
+            ><span lang="en" class="lang-en">Share policy and validation</span>
+            ↗</a
+          >
         </div>
       </section>
-
+      <section id="rust" class="rust-section">
+        <div class="section-shell rust-layout">
+          <div>
+            <div class="section-heading">
+              <div class="eyebrow">BUILT WITH RUST</div>
+              <h2 lang="de" class="lang-de">
+                Speichersicherheit beginnt bei der Sprache.
+              </h2>
+              <h2 lang="en" class="lang-en">
+                Memory safety starts with the language.
+              </h2>
+            </div>
+            <p lang="de" class="lang-de section-lead">
+              Storage-Kern und Management-Dienste sind in Rust geschrieben. Safe
+              Rust verhindert ganze Klassen von Speicherfehlern, etwa Zugriffe
+              auf bereits freigegebenen Speicher. So adressieren wir eine
+              wesentliche Ursache von Sicherheitslücken in C/C++-Systemen.
+            </p>
+            <p lang="en" class="lang-en section-lead">
+              The storage core and management services are written in Rust. Safe
+              Rust prevents classes of memory errors, such as accessing freed
+              memory, addressing a major source of vulnerabilities in C/C++
+              systems.
+            </p>
+          </div>
+          <aside class="rust-evidence">
+            <span lang="de" class="lang-de eyebrow"
+              >STATISTIK AUS ANDROID · GOOGLE, NOV. 2025</span
+            ><span lang="en" class="lang-en eyebrow"
+              >ANDROID DATA · GOOGLE, NOV. 2025</span
+            ><strong lang="de" class="lang-de rust-number">&gt; 1.000×</strong
+            ><strong lang="en" class="lang-en rust-number">&gt; 1,000×</strong>
+            <p lang="de" class="lang-de">
+              geringere Dichte an Speichersicherheitslücken im Rust-Code
+              gegenüber Googles historischem C/C++-Code.
+            </p>
+            <p lang="en" class="lang-en">
+              lower memory-safety vulnerability density in Rust code compared
+              with Google’s historical C/C++ code.
+            </p>
+            <a
+              href="https://blog.google/security/rust-in-android-move-fast-fix-things/"
+              ><span lang="de" class="lang-de">Quelle und Methodik lesen</span
+              ><span lang="en" class="lang-en"
+                >Read the source and methodology</span
+              >
+              ↗</a
+            >
+          </aside>
+        </div>
+        <div class="section-shell">
+          <p lang="de" class="lang-de rust-scope">
+            Die Statistik stützt unsere Sprachwahl; sie misst weder fastdup noch
+            eine bestimmte Legacy-Appliance. Eng begrenztes unsafe, native
+            Codec-Bibliotheken und Samba bleiben Teil des Systems. Rust allein
+            garantiert keine Gesamtsicherheit oder Produktionsreife.
+          </p>
+          <p lang="en" class="lang-en rust-scope">
+            The statistic supports our language choice; it measures neither
+            fastdup nor any specific legacy appliance. Narrow unsafe interfaces,
+            native codec libraries, and Samba remain part of the system. Rust
+            alone does not guarantee overall security or production readiness.
+          </p>
+          <div class="evidence-links">
+            <a
+              href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/adr/0026-start-with-safe-deep-rust-modules.md"
+              ><span lang="de" class="lang-de">Unsere Rust-Architektur</span
+              ><span lang="en" class="lang-en">Our Rust architecture</span> ↗</a
+            ><a
+              href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/hotpath-implementation3-2026-09-05.md#reproduktion-und-unsafe-nachweis"
+              ><span lang="de" class="lang-de"
+                >Dokumentierte Unsafe-Grenzen</span
+              ><span lang="en" class="lang-en"
+                >Documented unsafe boundaries</span
+              >
+              ↗</a
+            >
+          </div>
+        </div>
+      </section>
       <section id="webui" class="section-shell feature-intro">
         <div class="section-heading">
           <div class="eyebrow lang-de"><span></span> CONTROL PLANE</div>
           <div class="eyebrow lang-en"><span></span> CONTROL PLANE</div>
-          <h2 class="lang-de">Die alltägliche Verwaltung bleibt in der WebUI.</h2>
-          <h2 class="lang-en">Everyday administration stays in the WebUI.</h2>
-          <p class="lang-de">Kein separater Management-Server und keine Gerätepfade per Copy-and-paste. Die lokale Control Plane zeigt nur erkannte Targets und schützt kritische Aktionen durch explizite Bestätigungen.</p>
-          <p class="lang-en">No separate management server and no copy-pasted device paths. The local control plane exposes only discovered targets and guards critical actions with explicit confirmation.</p>
+          <h2 class="lang-de">Speicher, Freigaben und Betrieb an einem Ort.</h2>
+          <h2 class="lang-en">Storage, shares, and operations in one place.</h2>
+          <p class="lang-de">
+            Kein separater Management-Server und keine Gerätepfade per
+            Copy-and-paste. Die lokale Control Plane zeigt nur erkannte Targets
+            und schützt kritische Aktionen durch explizite Bestätigungen.
+          </p>
+          <p class="lang-en">
+            No separate management server and no copy-pasted device paths. The
+            local control plane exposes only discovered targets and guards
+            critical actions with explicit confirmation.
+          </p>
         </div>
         <div class="feature-grid">
-          <article><span>01</span><h3 class="lang-de">Speicher provisionieren</h3><h3 class="lang-en">Provision storage</h3><p class="lang-de">Metadata und DATA anhand stabiler Identitäten auswählen. Root-, Boot-, Swap- und überlappende Geräte werden ausgeschlossen.</p><p class="lang-en">Select metadata and DATA by stable identity. Root, boot, swap, and overlapping devices are excluded.</p></article>
-          <article><span>02</span><h3 class="lang-de">Shares bereitstellen</h3><h3 class="lang-en">Publish shares</h3><p class="lang-de">SMB-Freigaben, Benutzer und Gruppen, Nur-Lesen, Verschlüsselung, ABE (Nutzer sehen nur, wofür sie berechtigt sind) und logische Quotas — Grenzen auf die Nutzdatenmenge, nicht auf den belegten Platz.</p><p class="lang-en">Manage SMB shares, users and groups, read-only state, encryption, ABE (users only see what they are entitled to), and logical quotas — limits on logical data, not on space consumed.</p></article>
-          <article><span>03</span><h3 class="lang-de">Betrieb überwachen</h3><h3 class="lang-en">Monitor operations</h3><p class="lang-de">Durchsatz, Reduktion, Kapazität, CPU/RAM, Disk-I/O, Checkpoints, Jobs und Alarme auf einen Blick.</p><p class="lang-en">See throughput, reduction, capacity, CPU/RAM, disk I/O, checkpoints, jobs, and alarms at a glance.</p></article>
-          <article><span>04</span><h3 class="lang-de">Sicher warten</h3><h3 class="lang-en">Maintain safely</h3><p class="lang-de">Einhängen, sauberes Aushängen, Offline-Scrub (Prüflauf über alle gespeicherten Daten), GC-Policy (Räumen nicht mehr referenzierter Blöcke), Wartungsfenster, Audit-Export und TLS-Verwaltung.</p><p class="lang-en">Mount, clean unmount, offline scrub (a verification pass over all stored data), GC policy (reclaiming blocks nothing references any more), maintenance windows, audit export, and TLS management.</p></article>
+          <article>
+            <span>01</span>
+            <h3 class="lang-de">Speicher provisionieren</h3>
+            <h3 class="lang-en">Provision storage</h3>
+            <p class="lang-de">
+              Metadata und DATA anhand stabiler Identitäten auswählen. Root-,
+              Boot-, Swap- und überlappende Geräte werden ausgeschlossen.
+            </p>
+            <p class="lang-en">
+              Select metadata and DATA by stable identity. Root, boot, swap, and
+              overlapping devices are excluded.
+            </p>
+          </article>
+          <article>
+            <span>02</span>
+            <h3 class="lang-de">Shares bereitstellen</h3>
+            <h3 class="lang-en">Publish shares</h3>
+            <p class="lang-de">
+              SMB-Freigaben, Benutzer und Gruppen, Nur-Lesen, Verschlüsselung,
+              ABE (Nutzer sehen nur, wofür sie berechtigt sind) und logische
+              Quotas — Grenzen auf die Nutzdatenmenge, nicht auf den belegten
+              Platz.
+            </p>
+            <p class="lang-en">
+              Manage SMB shares, users and groups, read-only state, encryption,
+              ABE (users only see what they are entitled to), and logical quotas
+              — limits on logical data, not on space consumed.
+            </p>
+          </article>
+          <article>
+            <span>03</span>
+            <h3 class="lang-de">Betrieb überwachen</h3>
+            <h3 class="lang-en">Monitor operations</h3>
+            <p class="lang-de">
+              Durchsatz, Reduktion, Kapazität und Alarme im Blick. Die
+              überarbeitete Historien-Aggregation begrenzt den Speicherbedarf;
+              lange Abfragen laufen getrennt vom Netzwerk-Worker.
+            </p>
+            <p class="lang-en">
+              Track throughput, reduction, capacity, and alarms. Updated history
+              aggregation bounds memory use; long queries run separately from
+              the network worker.
+            </p>
+          </article>
+          <article>
+            <span>04</span>
+            <h3 class="lang-de">Sicher warten</h3>
+            <h3 class="lang-en">Maintain safely</h3>
+            <p class="lang-de">
+              Einhängen, sauberes Aushängen, Offline-Scrub (Prüflauf über alle
+              gespeicherten Daten), GC-Policy (Räumen nicht mehr referenzierter
+              Blöcke), Wartungsfenster, Audit-Export und TLS-Verwaltung.
+            </p>
+            <p class="lang-en">
+              Mount, clean unmount, offline scrub (a verification pass over all
+              stored data), GC policy (reclaiming blocks nothing references any
+              more), maintenance windows, audit export, and TLS management.
+            </p>
+          </article>
         </div>
       </section>
 
       <section class="screens section-shell">
         <figure class="screen-card">
-          <div><span class="number">01</span><h3 class="lang-de">Sichere Laufwerksauswahl</h3><h3 class="lang-en">Safe drive selection</h3><p class="lang-de">Gerätemodell, Seriennummer, WWN, Kapazität und HBA-Pfad vor der Provisionierung kontrollieren.</p><p class="lang-en">Verify model, serial, WWN, capacity, and HBA path before provisioning.</p></div>
-          <img src="assets/webui-drives.png" alt="fastdup Laufwerksauswahl" width="1600" height="1000" loading="lazy">
+          <div>
+            <span class="number">01</span>
+            <h3 class="lang-de">Sichere Laufwerksauswahl</h3>
+            <h3 class="lang-en">Safe drive selection</h3>
+            <p class="lang-de">
+              Gerätemodell, Seriennummer, WWN, Kapazität und HBA-Pfad vor der
+              Provisionierung kontrollieren.
+            </p>
+            <p class="lang-en">
+              Verify model, serial, WWN, capacity, and HBA path before
+              provisioning.
+            </p>
+          </div>
+          <img
+            src="assets/webui-drives.png"
+            alt="fastdup Laufwerksauswahl"
+            width="1600"
+            height="1000"
+            loading="lazy"
+          />
         </figure>
         <figure class="screen-card reverse">
-          <div><span class="number">02</span><h3 class="lang-de">SMB-Shares ohne Konfigurationsdateien</h3><h3 class="lang-en">SMB shares without config files</h3><p class="lang-de">Freigaben und logische Quotas ändern, ohne Samba-Konfiguration manuell zu editieren oder die Appliance neu zu starten.</p><p class="lang-en">Change shares and logical quotas without manually editing Samba configuration or rebooting the appliance.</p></div>
-          <img src="assets/webui-shares.png" alt="fastdup Verwaltung von SMB-Freigaben" width="1600" height="1000" loading="lazy">
+          <div>
+            <span class="number">02</span>
+            <h3 class="lang-de">SMB-Shares ohne Konfigurationsdateien</h3>
+            <h3 class="lang-en">SMB shares without config files</h3>
+            <p class="lang-de">
+              Freigaben und logische Quotas ändern, ohne Samba-Konfiguration
+              manuell zu editieren oder die Appliance neu zu starten.
+            </p>
+            <p class="lang-en">
+              Change shares and logical quotas without manually editing Samba
+              configuration or rebooting the appliance.
+            </p>
+          </div>
+          <img
+            src="assets/webui-shares.png"
+            alt="fastdup Verwaltung von SMB-Freigaben"
+            width="1600"
+            height="1000"
+            loading="lazy"
+          />
         </figure>
-        <p class="preview-note lang-de">Screenshots aus der echten React-WebUI mit den mitgelieferten Preview-Daten.</p>
-        <p class="preview-note lang-en">Screenshots from the real React WebUI using its bundled preview data.</p>
+        <p class="preview-note lang-de">
+          Screenshots aus der echten React-WebUI mit den mitgelieferten
+          Preview-Daten.
+        </p>
+        <p class="preview-note lang-en">
+          Screenshots from the real React WebUI using its bundled preview data.
+        </p>
       </section>
 
       <section id="eignung" class="section-shell fit-section">
@@ -273,81 +930,218 @@
           <div class="eyebrow lang-en"><span></span> WHERE IT FITS</div>
           <h2 class="lang-de">Passt fastdup zu deinem Vorhaben?</h2>
           <h2 class="lang-en">Is fastdup a fit for your plan?</h2>
-          <p class="lang-de">fastdup ist ein Forschungsprototyp und wird auch so beschrieben. Diese Gegenüberstellung soll die Entscheidung abkürzen — vor dem Download, nicht danach.</p>
-          <p class="lang-en">fastdup is a research prototype and is described as one. This comparison exists to shorten the decision — before the download, not after it.</p>
+          <p class="lang-de">
+            fastdup ist ein Forschungsprototyp und wird auch so beschrieben.
+            Diese Gegenüberstellung soll die Entscheidung abkürzen — vor dem
+            Download, nicht danach.
+          </p>
+          <p class="lang-en">
+            fastdup is a research prototype and is described as one. This
+            comparison exists to shorten the decision — before the download, not
+            after it.
+          </p>
         </div>
         <div class="fit-grid">
           <article class="fit-card good">
             <h3 class="lang-de">Sinnvoll heute</h3>
             <h3 class="lang-en">A good fit today</h3>
             <ul>
-              <li class="lang-de">Evaluierung und Proof of Concept auf vorhandener Hardware, ohne Appliance-Beschaffung</li>
-              <li class="lang-en">Evaluation and proof of concept on hardware you already own, with no appliance to procure</li>
-              <li class="lang-de">Abschätzen, wie stark der eigene Datenbestand tatsächlich reduziert — mit echten Dateien statt mit Herstellerangaben</li>
-              <li class="lang-en">Estimating how much your own data actually reduces — with real files instead of vendor figures</li>
-              <li class="lang-de">Zweitkopie oder Landing-Zone für Daten, die anderswo bereits gesichert sind</li>
-              <li class="lang-en">A second copy or landing zone for data that is already backed up elsewhere</li>
-              <li class="lang-de">Labor-, Test- und Entwicklungsdaten mit vielen ähnlichen Ständen, etwa Images und Build-Artefakte</li>
-              <li class="lang-en">Lab, test, and development data with many similar states, such as images and build artifacts</li>
-              <li class="lang-de">Storage-Entwicklung und Lehre: offene Formate, dokumentierte Entwurfsentscheidungen, nachvollziehbare Messungen</li>
-              <li class="lang-en">Storage development and teaching: open formats, documented design decisions, reproducible measurements</li>
+              <li class="lang-de">
+                Evaluierung und Proof of Concept auf vorhandener Hardware, ohne
+                Appliance-Beschaffung
+              </li>
+              <li class="lang-en">
+                Evaluation and proof of concept on hardware you already own,
+                with no appliance to procure
+              </li>
+              <li class="lang-de">
+                Abschätzen, wie stark der eigene Datenbestand tatsächlich
+                reduziert — mit echten Dateien statt mit Herstellerangaben
+              </li>
+              <li class="lang-en">
+                Estimating how much your own data actually reduces — with real
+                files instead of vendor figures
+              </li>
+              <li class="lang-de">
+                Zweitkopie oder Landing-Zone für Daten, die anderswo bereits
+                gesichert sind
+              </li>
+              <li class="lang-en">
+                A second copy or landing zone for data that is already backed up
+                elsewhere
+              </li>
+              <li class="lang-de">
+                Labor-, Test- und Entwicklungsdaten mit vielen ähnlichen
+                Ständen, etwa Images und Build-Artefakte
+              </li>
+              <li class="lang-en">
+                Lab, test, and development data with many similar states, such
+                as images and build artifacts
+              </li>
+              <li class="lang-de">
+                Storage-Entwicklung und Lehre: offene Formate, dokumentierte
+                Entwurfsentscheidungen, nachvollziehbare Messungen
+              </li>
+              <li class="lang-en">
+                Storage development and teaching: open formats, documented
+                design decisions, reproducible measurements
+              </li>
             </ul>
           </article>
           <article class="fit-card limit">
             <h3 class="lang-de">Heute nicht geeignet</h3>
             <h3 class="lang-en">Not a fit today</h3>
             <ul>
-              <li class="lang-de">Als einzige Kopie wichtiger Daten — es gibt keinen eingebauten Schutz vor Geräteverlust</li>
-              <li class="lang-en">As the only copy of important data — there is no built-in protection against device loss</li>
-              <li class="lang-de">Als produktiver Primärspeicher für geschäftskritische Anwendungen</li>
-              <li class="lang-en">As production primary storage for business-critical applications</li>
-              <li class="lang-de">Bei Compliance-Vorgaben mit WORM, Retention Lock oder revisionssicherer Aufbewahrung</li>
-              <li class="lang-en">Where compliance requires WORM, retention lock, or audit-proof retention</li>
-              <li class="lang-de">Als qualifiziertes Veeam-Repository — Fast Clone ist experimentell und nicht zertifiziert</li>
-              <li class="lang-en">As a qualified Veeam repository — Fast Clone is experimental and not certified</li>
-              <li class="lang-de">Wenn Herstellersupport, Reaktionszeiten oder Kapazitätsgarantien vertraglich zugesichert sein müssen</li>
-              <li class="lang-en">When vendor support, response times, or capacity guarantees must be contractually assured</li>
+              <li class="lang-de">
+                Als einzige Kopie wichtiger Daten — es gibt keinen eingebauten
+                Schutz vor Geräteverlust
+              </li>
+              <li class="lang-en">
+                As the only copy of important data — there is no built-in
+                protection against device loss
+              </li>
+              <li class="lang-de">
+                Als produktiver Primärspeicher für geschäftskritische
+                Anwendungen
+              </li>
+              <li class="lang-en">
+                As production primary storage for business-critical applications
+              </li>
+              <li class="lang-de">
+                Bei Compliance-Vorgaben mit WORM, Retention Lock oder
+                revisionssicherer Aufbewahrung
+              </li>
+              <li class="lang-en">
+                Where compliance requires WORM, retention lock, or audit-proof
+                retention
+              </li>
+              <li class="lang-de">
+                Als qualifiziertes Veeam-Repository — Fast Clone ist
+                experimentell und nicht zertifiziert
+              </li>
+              <li class="lang-en">
+                As a qualified Veeam repository — Fast Clone is experimental and
+                not certified
+              </li>
+              <li class="lang-de">
+                Wenn Herstellersupport, Reaktionszeiten oder Kapazitätsgarantien
+                vertraglich zugesichert sein müssen
+              </li>
+              <li class="lang-en">
+                When vendor support, response times, or capacity guarantees must
+                be contractually assured
+              </li>
             </ul>
           </article>
         </div>
         <div class="fit-rule">
-          <strong class="lang-de">Faustregel</strong><strong class="lang-en">Rule of thumb</strong>
-          <p class="lang-de">Wenn der Verlust des Repositories den Betrieb stören würde, gehört mindestens eine weitere, unabhängige Kopie dazu. Kommerzielle Appliances wie Dell PowerProtect Data Domain oder HPE StoreOnce bringen Integrationen, Retention, Cyber Resilience und Support mit, die fastdup nicht hat — und auch nicht behauptet zu haben.</p>
-          <p class="lang-en">If losing the repository would disrupt operations, at least one additional independent copy belongs in the picture. Commercial appliances such as Dell PowerProtect Data Domain or HPE StoreOnce bring integrations, retention, cyber resilience, and support that fastdup does not have — and does not claim to have.</p>
+          <strong class="lang-de">Faustregel</strong
+          ><strong class="lang-en">Rule of thumb</strong>
+          <p class="lang-de">
+            Wenn der Verlust des Repositories den Betrieb stören würde, gehört
+            mindestens eine weitere, unabhängige Kopie dazu. Kommerzielle
+            Appliances wie Dell PowerProtect Data Domain oder HPE StoreOnce
+            bringen Integrationen, Retention, Cyber Resilience und Support mit,
+            die fastdup nicht hat — und auch nicht behauptet zu haben.
+          </p>
+          <p class="lang-en">
+            If losing the repository would disrupt operations, at least one
+            additional independent copy belongs in the picture. Commercial
+            appliances such as Dell PowerProtect Data Domain or HPE StoreOnce
+            bring integrations, retention, cyber resilience, and support that
+            fastdup does not have — and does not claim to have.
+          </p>
         </div>
         <div class="requirement-block">
           <h3 class="lang-de">Was du für einen Test brauchst</h3>
           <h3 class="lang-en">What you need for a test</h3>
           <dl class="requirement-grid">
             <div>
-              <dt class="lang-de">Rechner</dt><dt class="lang-en">Machine</dt>
-              <dd class="lang-de">Ein x86-64-System mit AVX2/BMI2 — Server, Workstation oder Lab-Kiste. Die veröffentlichten Messungen liefen auf zehn logischen CPUs einer Notebook-CPU. AVX-512 ist nicht nötig, ein Spezial-Controller ebenfalls nicht.</dd>
-              <dd class="lang-en">An x86-64 system with AVX2/BMI2 — server, workstation, or lab box. The published measurements ran on ten logical CPUs of a notebook processor. AVX-512 is not required, and neither is a special controller.</dd>
+              <dt class="lang-de">Rechner</dt>
+              <dt class="lang-en">Machine</dt>
+              <dd class="lang-de">
+                Ein x86-64-System mit AVX2/BMI2 — Server, Workstation oder
+                Lab-Kiste. Die veröffentlichten Messungen liefen auf zehn
+                logischen CPUs einer Notebook-CPU. AVX-512 ist nicht nötig, ein
+                Spezial-Controller ebenfalls nicht.
+              </dd>
+              <dd class="lang-en">
+                An x86-64 system with AVX2/BMI2 — server, workstation, or lab
+                box. The published measurements ran on ten logical CPUs of a
+                notebook processor. AVX-512 is not required, and neither is a
+                special controller.
+              </dd>
             </div>
             <div>
-              <dt class="lang-de">Arbeitsspeicher</dt><dt class="lang-en">Memory</dt>
-              <dd class="lang-de">Kein Dimensionierungsversprechen, aber ein Anhaltspunkt: Der aktuelle SMB-Lauf blieb bei 569,5 MB Spitzenbedarf des Prozesses und ohne Swap. RAM war in diesem Test nicht der Engpass.</dd>
-              <dd class="lang-en">No sizing promise, but a reference point: the current SMB run peaked at 569.5 MB for the process and used no swap. Memory was not the bottleneck in that test.</dd>
+              <dt class="lang-de">Arbeitsspeicher</dt>
+              <dt class="lang-en">Memory</dt>
+              <dd class="lang-de">
+                Der Bedarf hängt von Workload, Indizes und Parallelität ab.
+                Rebuildbare Caches sind begrenzt; der Repository-Prozess läuft
+                ohne Swap. Die Benchmark-Berichte nennen jeweils den Messaufbau.
+              </dd>
+              <dd class="lang-en">
+                Requirements depend on workload, indexes, and concurrency.
+                Rebuildable caches are bounded; the repository process runs
+                without swap. Each benchmark report describes its setup.
+              </dd>
             </div>
             <div>
-              <dt class="lang-de">Zwei getrennte Datenträger</dt><dt class="lang-en">Two separate drives</dt>
-              <dd class="lang-de">Ein schneller Metadata-Tier für Verzeichnisse, Manifeste und Indizes und ein physisch getrennter DATA-Tier für die Kapazität — beide mit XFS. Beide werden bei der Initialisierung vollständig gelöscht.</dd>
-              <dd class="lang-en">A fast metadata tier for directories, manifests, and indexes, and a physically separate DATA tier for capacity — both on XFS. Both are erased completely during initialization.</dd>
+              <dt class="lang-de">Zwei getrennte Datenträger</dt>
+              <dt class="lang-en">Two separate drives</dt>
+              <dd class="lang-de">
+                Ein schneller Metadata-Tier für Verzeichnisse, Manifeste und
+                Indizes und ein physisch getrennter DATA-Tier für die Kapazität
+                — beide mit XFS. Beide werden bei der Initialisierung
+                vollständig gelöscht.
+              </dd>
+              <dd class="lang-en">
+                A fast metadata tier for directories, manifests, and indexes,
+                and a physically separate DATA tier for capacity — both on XFS.
+                Both are erased completely during initialization.
+              </dd>
             </div>
             <div>
-              <dt class="lang-de">Redundanz darunter</dt><dt class="lang-en">Redundancy underneath</dt>
-              <dd class="lang-de">RAID oder Spiegelung bleiben bewusst Aufgabe des Block-Layers. fastdup bringt selbst keine Geräteredundanz mit — wer sie braucht, richtet sie unterhalb ein.</dd>
-              <dd class="lang-en">RAID or mirroring deliberately remain the block layer's job. fastdup brings no device redundancy of its own — if you need it, configure it underneath.</dd>
+              <dt class="lang-de">Redundanz darunter</dt>
+              <dt class="lang-en">Redundancy underneath</dt>
+              <dd class="lang-de">
+                RAID oder Spiegelung bleiben bewusst Aufgabe des Block-Layers.
+                fastdup bringt selbst keine Geräteredundanz mit — wer sie
+                braucht, richtet sie unterhalb ein.
+              </dd>
+              <dd class="lang-en">
+                RAID or mirroring deliberately remain the block layer's job.
+                fastdup brings no device redundancy of its own — if you need it,
+                configure it underneath.
+              </dd>
             </div>
             <div>
-              <dt class="lang-de">Betriebssystem</dt><dt class="lang-en">Operating system</dt>
-              <dd class="lang-de">Rocky Linux 10 auf x86-64. Das RPM bringt Runtime, CLI, Control Plane, WebUI, systemd-Units und Samba-Modul mit; Node.js oder Rust sind auf dem Zielsystem nicht nötig.</dd>
-              <dd class="lang-en">Rocky Linux 10 on x86-64. The RPM ships the runtime, CLI, control plane, WebUI, systemd units, and Samba module; the target system needs neither Node.js nor Rust.</dd>
+              <dt class="lang-de">Betriebssystem</dt>
+              <dt class="lang-en">Operating system</dt>
+              <dd class="lang-de">
+                Rocky Linux 10 auf x86-64. Das RPM bringt Runtime, CLI, Control
+                Plane, WebUI, systemd-Units und Samba-Modul mit; Node.js oder
+                Rust sind auf dem Zielsystem nicht nötig.
+              </dd>
+              <dd class="lang-en">
+                Rocky Linux 10 on x86-64. The RPM ships the runtime, CLI,
+                control plane, WebUI, systemd units, and Samba module; the
+                target system needs neither Node.js nor Rust.
+              </dd>
             </div>
             <div>
-              <dt class="lang-de">Zeit</dt><dt class="lang-en">Time</dt>
-              <dd class="lang-de">Drei Befehle bis zur WebUI, danach Einrichtung im Browser. Der aufwendigere Teil ist der eigene Testdatenbestand — er entscheidet, welche Reduktion du tatsächlich siehst.</dd>
-              <dd class="lang-en">Three commands to the WebUI, then setup in the browser. The bigger effort is your own test data set — it determines the reduction you will actually see.</dd>
+              <dt class="lang-de">Zeit</dt>
+              <dt class="lang-en">Time</dt>
+              <dd class="lang-de">
+                Paket prüfen und installieren, danach Einrichtung im Browser.
+                Der aufwendigere Teil ist der eigene Testdatenbestand — er
+                entscheidet, welche Reduktion du tatsächlich siehst.
+              </dd>
+              <dd class="lang-en">
+                Verify and install the package, then set up in the browser. The
+                bigger effort is your own test data set — it determines the
+                reduction you will actually see.
+              </dd>
             </div>
           </dl>
         </div>
@@ -357,27 +1151,105 @@
         <div class="section-shell install-layout">
           <div class="install-copy">
             <div class="eyebrow"><span></span> ROCKY LINUX 10 · X86-64</div>
-            <h2 class="lang-de">In drei Befehlen zur WebUI.</h2>
-            <h2 class="lang-en">Three commands to the WebUI.</h2>
-            <p class="lang-de">Das RPM bringt Runtime, Maintenance-CLI, Control Plane, WebUI, systemd-Policies und Samba-VFS-Modul mit. Node.js oder eine Rust-Toolchain sind auf dem Zielsystem nicht nötig.</p>
-            <p class="lang-en">The RPM includes the runtime, maintenance CLI, control plane, WebUI, systemd policy, and Samba VFS module. The target system needs neither Node.js nor a Rust toolchain.</p>
+            <h2 class="lang-de">Installieren. Im Browser einrichten.</h2>
+            <h2 class="lang-en">Install. Set up in your browser.</h2>
+            <p class="lang-de">
+              Das RPM bringt Runtime, Maintenance-CLI, Control Plane, WebUI,
+              systemd-Policies und Samba-VFS-Modul mit. Node.js oder eine
+              Rust-Toolchain sind auf dem Zielsystem nicht nötig.
+            </p>
+            <p class="lang-en">
+              The RPM includes the runtime, maintenance CLI, control plane,
+              WebUI, systemd policy, and Samba VFS module. The target system
+              needs neither Node.js nor a Rust toolchain.
+            </p>
             <ol>
-              <li><strong class="lang-de">Paket installieren</strong><strong class="lang-en">Install the package</strong><span class="lang-de">RPM herunterladen und mit DNF installieren.</span><span class="lang-en">Download the RPM and install it with DNF.</span></li>
-              <li><strong class="lang-de">Management starten</strong><strong class="lang-en">Start management</strong><span class="lang-de">Agent und HTTPS-Control-Plane aktivieren.</span><span class="lang-en">Enable the agent and HTTPS control plane.</span></li>
-              <li><strong class="lang-de">Im Browser einrichten</strong><strong class="lang-en">Set up in the browser</strong><span class="lang-de">Passwort ändern, zwei leere Geräte auswählen, Repository mounten und Share anlegen.</span><span class="lang-en">Change the password, select two empty devices, mount the repository, and add a share.</span></li>
+              <li>
+                <strong class="lang-de">Paket installieren</strong
+                ><strong class="lang-en">Install the package</strong
+                ><span class="lang-de"
+                  >RPM herunterladen und mit DNF installieren.</span
+                ><span class="lang-en"
+                  >Download the RPM and install it with DNF.</span
+                >
+              </li>
+              <li>
+                <strong class="lang-de">Management starten</strong
+                ><strong class="lang-en">Start management</strong
+                ><span class="lang-de"
+                  >Agent und HTTPS-Control-Plane aktivieren.</span
+                ><span class="lang-en"
+                  >Enable the agent and HTTPS control plane.</span
+                >
+              </li>
+              <li>
+                <strong class="lang-de">Im Browser einrichten</strong
+                ><strong class="lang-en">Set up in the browser</strong
+                ><span class="lang-de"
+                  >Passwort ändern, zwei leere Geräte auswählen, Repository
+                  mounten und Share anlegen.</span
+                ><span class="lang-en"
+                  >Change the password, select two empty devices, mount the
+                  repository, and add a share.</span
+                >
+              </li>
             </ol>
           </div>
           <div class="terminal" aria-label="Installationsbefehle">
-            <div class="terminal-head"><i></i><i></i><i></i><span>root@rocky:~</span><button type="button" data-copy="install"><span class="lang-de">Kopieren</span><span class="lang-en">Copy</span></button></div>
-            <pre id="install"><code><span class="prompt">$</span> curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm
-
-<span class="prompt">$</span> sudo dnf install ./fastdup-0.5.0-1.el10.x86_64.rpm
-
-<span class="prompt">$</span> sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code></pre>
-            <div class="terminal-result"><i></i><span class="lang-de">WebUI: https://&lt;appliance-host&gt;:8080/</span><span class="lang-en">WebUI: https://&lt;appliance-host&gt;:8080/</span></div>
+            <div class="terminal-head">
+              <i></i><i></i><i></i><span>root@rocky:~</span
+              ><button type="button" data-copy="install">
+                <span class="lang-de">Kopieren</span
+                ><span class="lang-en">Copy</span>
+              </button>
+            </div>
+            <pre
+              id="install"
+            ><code>curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm &amp;&amp;
+curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/SHA256SUMS &amp;&amp;
+sha256sum --check --ignore-missing SHA256SUMS &amp;&amp;
+sudo dnf install ./fastdup-0.6.0-1.el10.x86_64.rpm &amp;&amp;
+sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code></pre>
+            <p id="copy-status" role="status" aria-live="polite"></p>
+            <div class="terminal-result">
+              <i></i
+              ><span class="lang-de"
+                >WebUI: https://&lt;appliance-host&gt;:8080/</span
+              ><span class="lang-en"
+                >WebUI: https://&lt;appliance-host&gt;:8080/</span
+              >
+            </div>
           </div>
         </div>
-        <div class="section-shell caution"><strong class="lang-de">Vor der Provisionierung:</strong><strong class="lang-en">Before provisioning:</strong><p class="lang-de">Zwei leere, physisch getrennte Geräte bereitstellen. Die Initialisierung löscht Partitionstabellen und Inhalte der ausgewählten Geräte. Das Paket formatiert beim Installieren nichts automatisch.</p><p class="lang-en">Provide two empty, physically separate devices. Initialization erases partition tables and content on the selected devices. Package installation never formats anything automatically.</p></div>
+        <div class="section-shell login-note">
+          <p lang="de" class="lang-de">
+            Erster Login: <code>admin</code> / <code>fastdup01.</code>. Das
+            anfängliche Zertifikat ist selbstsigniert. Vor Management-Änderungen
+            ein neues Passwort mit mindestens zwölf Zeichen setzen. TCP 8080 nur
+            für das Management-Netz freigeben.
+          </p>
+          <p lang="en" class="lang-en">
+            First login: <code>admin</code> / <code>fastdup01.</code>. The
+            initial certificate is self-signed. Set a new password of at least
+            twelve characters before management changes. Restrict TCP 8080 to
+            your management network.
+          </p>
+        </div>
+        <div class="section-shell caution">
+          <strong class="lang-de">Vor der Provisionierung:</strong
+          ><strong class="lang-en">Before provisioning:</strong>
+          <p class="lang-de">
+            Zwei leere, physisch getrennte Geräte bereitstellen. Die
+            Initialisierung löscht Partitionstabellen und Inhalte der
+            ausgewählten Geräte. Das Paket formatiert beim Installieren nichts
+            automatisch.
+          </p>
+          <p class="lang-en">
+            Provide two empty, physically separate devices. Initialization
+            erases partition tables and content on the selected devices. Package
+            installation never formats anything automatically.
+          </p>
+        </div>
       </section>
 
       <section class="section-shell honest-section">
@@ -385,20 +1257,62 @@
           <div class="eyebrow"><span></span> STATUS</div>
           <h2 class="lang-de">Offen entwickelt. Ehrlich begrenzt.</h2>
           <h2 class="lang-en">Openly developed. Honestly limited.</h2>
-          <p class="lang-de">fastdup ist ein Forschungsprototyp für Evaluation und Storage-Entwicklung, noch kein produktionsreifes Backup-Produkt.</p>
-          <p class="lang-en">fastdup is a research prototype for evaluation and storage development—not yet a production backup product.</p>
-          <a class="text-link lang-de" href="https://github.com/ThatIsCraZy/fastdup/blob/main/README.de.md#aktuelle-grenzen">Alle Grenzen in der README →</a>
-          <a class="text-link lang-en" href="https://github.com/ThatIsCraZy/fastdup#current-limits">Read all limits →</a>
+          <p class="lang-de">
+            fastdup ist ein Forschungsprototyp für Evaluation und
+            Storage-Entwicklung, noch kein produktionsreifes Backup-Produkt.
+          </p>
+          <p class="lang-en">
+            fastdup is a research prototype for evaluation and storage
+            development—not yet a production backup product.
+          </p>
+          <a
+            class="text-link lang-de"
+            href="https://github.com/ThatIsCraZy/fastdup/blob/main/README.de.md#aktuelle-grenzen"
+            >Alle Grenzen in der README →</a
+          >
+          <a
+            class="text-link lang-en"
+            href="https://github.com/ThatIsCraZy/fastdup#current-limits"
+            >Read all limits →</a
+          >
         </div>
         <ul>
-          <li class="lang-de"><b>Kein Schutz vor Geräteverlust, keine Replikation, kein WORM.</b> Fällt ein Datenträger aus, hilft nur Redundanz im Block-Layer darunter — und eine zweite Kopie an einem anderen Ort.</li>
-          <li class="lang-en"><b>No device-loss protection, no replication, no WORM.</b> If a drive fails, only redundancy in the block layer below helps — plus a second copy somewhere else.</li>
-          <li class="lang-de"><b>POSIX-/Samba-Kompatibilität noch unvollständig.</b> Einzelne Anwendungen können sich anders verhalten als auf einem klassischen Dateisystem. Vor dem Einsatz mit der eigenen Software testen.</li>
-          <li class="lang-en"><b>POSIX/Samba compatibility remains incomplete.</b> Individual applications may behave differently than on a classic filesystem. Test with your own software before relying on it.</li>
-          <li class="lang-de"><b>Samba Fast Clone ist experimentell.</b> Als Veeam-Repository ist fastdup derzeit nicht qualifiziert.</li>
-          <li class="lang-en"><b>Samba Fast Clone is experimental.</b> fastdup is currently not qualified as a Veeam repository.</li>
-          <li class="lang-de"><b>Kein Produktions-Support, keine Performance-SLA.</b> Fragen und Fehler laufen über GitHub Issues, nicht über einen Support-Vertrag.</li>
-          <li class="lang-en"><b>No production support, no performance SLA.</b> Questions and bugs go through GitHub issues, not through a support contract.</li>
+          <li class="lang-de">
+            <b>Kein Schutz vor Geräteverlust, keine Replikation, kein WORM.</b>
+            Fällt ein Datenträger aus, hilft nur Redundanz im Block-Layer
+            darunter — und eine zweite Kopie an einem anderen Ort.
+          </li>
+          <li class="lang-en">
+            <b>No device-loss protection, no replication, no WORM.</b> If a
+            drive fails, only redundancy in the block layer below helps — plus a
+            second copy somewhere else.
+          </li>
+          <li class="lang-de">
+            <b>POSIX-/Samba-Kompatibilität noch unvollständig.</b> Einzelne
+            Anwendungen können sich anders verhalten als auf einem klassischen
+            Dateisystem. Vor dem Einsatz mit der eigenen Software testen.
+          </li>
+          <li class="lang-en">
+            <b>POSIX/Samba compatibility remains incomplete.</b> Individual
+            applications may behave differently than on a classic filesystem.
+            Test with your own software before relying on it.
+          </li>
+          <li class="lang-de">
+            <b>Samba Fast Clone ist experimentell.</b> Als Veeam-Repository ist
+            fastdup derzeit nicht qualifiziert.
+          </li>
+          <li class="lang-en">
+            <b>Samba Fast Clone is experimental.</b> fastdup is currently not
+            qualified as a Veeam repository.
+          </li>
+          <li class="lang-de">
+            <b>Kein Produktions-Support, keine Performance-SLA.</b> Fragen und
+            Fehler laufen über GitHub Issues, nicht über einen Support-Vertrag.
+          </li>
+          <li class="lang-en">
+            <b>No production support, no performance SLA.</b> Questions and bugs
+            go through GitHub issues, not through a support contract.
+          </li>
         </ul>
       </section>
 
@@ -407,93 +1321,233 @@
           <div class="eyebrow lang-de"><span></span> BEGRIFFE</div>
           <div class="eyebrow lang-en"><span></span> GLOSSARY</div>
           <h2 class="lang-de">Die Fachbegriffe dieser Seite, je ein Satz.</h2>
-          <h2 class="lang-en">Every technical term on this page, in one sentence.</h2>
+          <h2 class="lang-en">
+            Every technical term on this page, in one sentence.
+          </h2>
         </div>
         <dl class="glossary-grid">
           <div>
-            <dt class="lang-de">Deduplizierung</dt><dt class="lang-en">Deduplication</dt>
-            <dd class="lang-de">Gleiche Dateninhalte werden nur einmal physisch gespeichert; jedes weitere Vorkommen ist ein Verweis.</dd>
-            <dd class="lang-en">Identical content is physically stored once; every further occurrence is a reference.</dd>
+            <dt class="lang-de">Deduplizierung</dt>
+            <dt class="lang-en">Deduplication</dt>
+            <dd class="lang-de">
+              Gleiche Dateninhalte werden nur einmal physisch gespeichert; jedes
+              weitere Vorkommen ist ein Verweis.
+            </dd>
+            <dd class="lang-en">
+              Identical content is physically stored once; every further
+              occurrence is a reference.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">Chunk / Chunking (CDC)</dt><dt class="lang-en">Chunk / chunking (CDC)</dt>
-            <dd class="lang-de">Die Zerlegung einer Datei in Blöcke. Bei Content-Defined Chunking richten sich die Grenzen nach dem Inhalt, damit Einfügungen nicht alles Folgende verschieben.</dd>
-            <dd class="lang-en">Splitting a file into blocks. With content-defined chunking the boundaries follow the content, so an insertion does not shift everything after it.</dd>
+            <dt class="lang-de">Chunk / Chunking (CDC)</dt>
+            <dt class="lang-en">Chunk / chunking (CDC)</dt>
+            <dd class="lang-de">
+              Die Zerlegung einer Datei in Blöcke. Bei Content-Defined Chunking
+              richten sich die Grenzen nach dem Inhalt, damit Einfügungen nicht
+              alles Folgende verschieben.
+            </dd>
+            <dd class="lang-en">
+              Splitting a file into blocks. With content-defined chunking the
+              boundaries follow the content, so an insertion does not shift
+              everything after it.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">BLAKE3</dt><dt class="lang-en">BLAKE3</dt>
-            <dd class="lang-de">Das Prüfsummenverfahren, das jedem Block seinen Fingerabdruck gibt — schnell und für den Wiedererkennungs-Vergleich geeignet.</dd>
-            <dd class="lang-en">The checksum function that gives each block its fingerprint — fast and suited to the recognition lookup.</dd>
+            <dt class="lang-de">BLAKE3</dt>
+            <dt class="lang-en">BLAKE3</dt>
+            <dd class="lang-de">
+              Das Prüfsummenverfahren, das jedem Block seinen Fingerabdruck gibt
+              — schnell und für den Wiedererkennungs-Vergleich geeignet.
+            </dd>
+            <dd class="lang-en">
+              The checksum function that gives each block its fingerprint — fast
+              and suited to the recognition lookup.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">Zstd</dt><dt class="lang-en">Zstd</dt>
-            <dd class="lang-de">Ein Kompressionsverfahren, das auf das übrig gebliebene, nicht deduplizierte Datenmaterial angewendet wird.</dd>
-            <dd class="lang-en">A compression algorithm applied to the remaining, non-deduplicated data.</dd>
+            <dt class="lang-de">Zstd</dt>
+            <dt class="lang-en">Zstd</dt>
+            <dd class="lang-de">
+              Ein Kompressionsverfahren, das auf das übrig gebliebene, nicht
+              deduplizierte Datenmaterial angewendet wird.
+            </dd>
+            <dd class="lang-en">
+              A compression algorithm applied to the remaining, non-deduplicated
+              data.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">Metadata-Tier und DATA-Tier</dt><dt class="lang-en">Metadata tier and DATA tier</dt>
-            <dd class="lang-de">Zwei getrennte Datenträger: der eine hält Verzeichnisse, Manifeste und Indizes, der andere die eigentlichen Datenblöcke.</dd>
-            <dd class="lang-en">Two separate drives: one holds directories, manifests, and indexes, the other the actual data blocks.</dd>
+            <dt class="lang-de">Metadata-Tier und DATA-Tier</dt>
+            <dt class="lang-en">Metadata tier and DATA tier</dt>
+            <dd class="lang-de">
+              Zwei getrennte Datenträger: der eine hält Verzeichnisse, Manifeste
+              und Indizes, der andere die eigentlichen Datenblöcke.
+            </dd>
+            <dd class="lang-en">
+              Two separate drives: one holds directories, manifests, and
+              indexes, the other the actual data blocks.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">FUSE</dt><dt class="lang-en">FUSE</dt>
-            <dd class="lang-de">Die Linux-Schnittstelle, über die fastdup als normales Dateisystem eingehängt wird, ohne Kernel-Modul zu sein.</dd>
-            <dd class="lang-en">The Linux interface through which fastdup mounts as an ordinary filesystem without being a kernel module.</dd>
+            <dt class="lang-de">FUSE</dt>
+            <dt class="lang-en">FUSE</dt>
+            <dd class="lang-de">
+              Die Linux-Schnittstelle, über die fastdup als normales Dateisystem
+              eingehängt wird, ohne Kernel-Modul zu sein.
+            </dd>
+            <dd class="lang-en">
+              The Linux interface through which fastdup mounts as an ordinary
+              filesystem without being a kernel module.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">SMB / Samba</dt><dt class="lang-en">SMB / Samba</dt>
-            <dd class="lang-de">Das Netzwerkprotokoll für Dateifreigaben, über das Windows-Clients und Backup-Software auf die Appliance zugreifen.</dd>
-            <dd class="lang-en">The network file-sharing protocol Windows clients and backup software use to reach the appliance.</dd>
+            <dt class="lang-de">SMB / Samba</dt>
+            <dt class="lang-en">SMB / Samba</dt>
+            <dd class="lang-de">
+              Das Netzwerkprotokoll für Dateifreigaben, über das Windows-Clients
+              und Backup-Software auf die Appliance zugreifen.
+            </dd>
+            <dd class="lang-en">
+              The network file-sharing protocol Windows clients and backup
+              software use to reach the appliance.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">Scrub</dt><dt class="lang-en">Scrub</dt>
-            <dd class="lang-de">Ein Prüflauf, der gespeicherte Daten gegen ihre Prüfsummen liest und stille Fehler sichtbar macht.</dd>
-            <dd class="lang-en">A verification pass that reads stored data against its checksums and surfaces silent corruption.</dd>
+            <dt class="lang-de">Scrub</dt>
+            <dt class="lang-en">Scrub</dt>
+            <dd class="lang-de">
+              Ein Prüflauf, der gespeicherte Daten gegen ihre Prüfsummen liest
+              und stille Fehler sichtbar macht.
+            </dd>
+            <dd class="lang-en">
+              A verification pass that reads stored data against its checksums
+              and surfaces silent corruption.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">GC (Garbage Collection)</dt><dt class="lang-en">GC (garbage collection)</dt>
-            <dd class="lang-de">Das Freiräumen von Blöcken, auf die keine Datei mehr verweist — nötig, weil gelöschte Dateien nicht sofort Platz freigeben.</dd>
-            <dd class="lang-en">Reclaiming blocks no file references any more — needed because deleting a file does not immediately free space.</dd>
+            <dt class="lang-de">GC (Garbage Collection)</dt>
+            <dt class="lang-en">GC (garbage collection)</dt>
+            <dd class="lang-de">
+              Das Freiräumen von Blöcken, auf die keine Datei mehr verweist —
+              nötig, weil gelöschte Dateien nicht sofort Platz freigeben.
+            </dd>
+            <dd class="lang-en">
+              Reclaiming blocks no file references any more — needed because
+              deleting a file does not immediately free space.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">Fast Clone</dt><dt class="lang-en">Fast Clone</dt>
-            <dd class="lang-de">Eine Kopie innerhalb der Appliance, die nur Metadaten anlegt und auf vorhandene Daten verweist, statt sie erneut zu schreiben.</dd>
-            <dd class="lang-en">A copy inside the appliance that only creates metadata and points at existing data instead of writing it again.</dd>
+            <dt class="lang-de">Fast Clone</dt>
+            <dt class="lang-en">Fast Clone</dt>
+            <dd class="lang-de">
+              Eine Kopie innerhalb der Appliance, die nur Metadaten anlegt und
+              auf vorhandene Daten verweist, statt sie erneut zu schreiben.
+            </dd>
+            <dd class="lang-en">
+              A copy inside the appliance that only creates metadata and points
+              at existing data instead of writing it again.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">WORM</dt><dt class="lang-en">WORM</dt>
-            <dd class="lang-de">Write Once Read Many: Daten sind nach dem Schreiben für eine festgelegte Frist unveränderbar. fastdup bietet das nicht.</dd>
-            <dd class="lang-en">Write once, read many: data cannot be altered for a defined period after writing. fastdup does not offer this.</dd>
+            <dt class="lang-de">WORM</dt>
+            <dt class="lang-en">WORM</dt>
+            <dd class="lang-de">
+              Write Once Read Many: Daten sind nach dem Schreiben für eine
+              festgelegte Frist unveränderbar. fastdup bietet das nicht.
+            </dd>
+            <dd class="lang-en">
+              Write once, read many: data cannot be altered for a defined period
+              after writing. fastdup does not offer this.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">Logische Quota</dt><dt class="lang-en">Logical quota</dt>
-            <dd class="lang-de">Eine Obergrenze auf die Nutzdatenmenge einer Freigabe — nicht auf den nach Reduktion tatsächlich belegten Platz.</dd>
-            <dd class="lang-en">A ceiling on a share's logical data volume — not on the space actually occupied after reduction.</dd>
+            <dt class="lang-de">Logische Quota</dt>
+            <dt class="lang-en">Logical quota</dt>
+            <dd class="lang-de">
+              Eine Obergrenze auf die Nutzdatenmenge einer Freigabe — nicht auf
+              den nach Reduktion tatsächlich belegten Platz.
+            </dd>
+            <dd class="lang-en">
+              A ceiling on a share's logical data volume — not on the space
+              actually occupied after reduction.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">MiB/s und Peak RSS</dt><dt class="lang-en">MiB/s and peak RSS</dt>
-            <dd class="lang-de">Durchsatz in Mebibyte pro Sekunde (1 MiB = 1.048.576 Byte) und der höchste Arbeitsspeicherbedarf eines Prozesses während eines Laufs.</dd>
-            <dd class="lang-en">Throughput in mebibytes per second (1 MiB = 1,048,576 bytes) and the highest memory a process used during a run.</dd>
+            <dt class="lang-de">MiB/s und Peak RSS</dt>
+            <dt class="lang-en">MiB/s and peak RSS</dt>
+            <dd class="lang-de">
+              Durchsatz in Mebibyte pro Sekunde (1 MiB = 1.048.576 Byte) und der
+              höchste Arbeitsspeicherbedarf eines Prozesses während eines Laufs.
+            </dd>
+            <dd class="lang-en">
+              Throughput in mebibytes per second (1 MiB = 1,048,576 bytes) and
+              the highest memory a process used during a run.
+            </dd>
           </div>
           <div>
-            <dt class="lang-de">Control Plane</dt><dt class="lang-en">Control plane</dt>
-            <dd class="lang-de">Der lokale Verwaltungsdienst, der die WebUI ausliefert und Aktionen wie Provisionieren, Mounten oder Warten ausführt.</dd>
-            <dd class="lang-en">The local management service that serves the WebUI and carries out actions such as provisioning, mounting, and maintenance.</dd>
+            <dt class="lang-de">Control Plane</dt>
+            <dt class="lang-en">Control plane</dt>
+            <dd class="lang-de">
+              Der lokale Verwaltungsdienst, der die WebUI ausliefert und
+              Aktionen wie Provisionieren, Mounten oder Warten ausführt.
+            </dd>
+            <dd class="lang-en">
+              The local management service that serves the WebUI and carries out
+              actions such as provisioning, mounting, and maintenance.
+            </dd>
           </div>
         </dl>
       </section>
 
       <section class="final-cta section-shell">
-        <div><h2 class="lang-de">WebUI ansehen. RPM installieren. fastdup testen.</h2><h2 class="lang-en">See the WebUI. Install the RPM. Evaluate fastdup.</h2><p class="lang-de">Release 0.5.0 für Rocky Linux 10 auf x86-64. Forschungsprototyp — bitte nicht als einzige Kopie wichtiger Daten einsetzen.</p><p class="lang-en">Release 0.5.0 for Rocky Linux 10 on x86-64. Research prototype — please do not use it as the only copy of important data.</p></div>
-        <div><a class="button primary lang-de" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">RPM herunterladen <span>↓</span></a><a class="button primary lang-en" href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.5/fastdup-0.5.0-1.el10.x86_64.rpm">Download RPM <span>↓</span></a><a class="button secondary" href="https://github.com/ThatIsCraZy/fastdup">GitHub Repository</a></div>
+        <div>
+          <h2 class="lang-de">
+            WebUI ansehen. RPM installieren. fastdup testen.
+          </h2>
+          <h2 class="lang-en">
+            See the WebUI. Install the RPM. Evaluate fastdup.
+          </h2>
+          <p class="lang-de">
+            Release 0.6.0 für Rocky Linux 10 auf x86-64. Forschungsprototyp —
+            bitte nicht als einzige Kopie wichtiger Daten einsetzen.
+          </p>
+          <p class="lang-en">
+            Release 0.6.0 for Rocky Linux 10 on x86-64. Research prototype —
+            please do not use it as the only copy of important data.
+          </p>
+        </div>
+        <div>
+          <a
+            class="button primary lang-de"
+            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm"
+            >RPM herunterladen <span>↓</span></a
+          ><a
+            class="button primary lang-en"
+            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm"
+            >Download RPM <span>↓</span></a
+          ><a
+            class="button secondary"
+            href="https://github.com/ThatIsCraZy/fastdup"
+            >GitHub Repository</a
+          >
+        </div>
       </section>
     </main>
 
     <footer>
-      <div class="brand"><span class="brand-mark" aria-hidden="true">◇</span><span><strong>fastdup</strong><small>STORAGE APPLIANCE</small></span></div>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">◇</span
+        ><span><strong>fastdup</strong><small>STORAGE APPLIANCE</small></span>
+      </div>
       <p>Apache-2.0 · Samba module GPL-3.0-or-later</p>
-      <nav><a class="lang-de" href="#glossar">Begriffe</a><a class="lang-en" href="#glossar">Glossary</a><a href="https://github.com/ThatIsCraZy/fastdup/releases">Releases</a><a href="https://github.com/ThatIsCraZy/fastdup/tree/main/docs">Docs</a><a href="https://github.com/ThatIsCraZy/fastdup">Source</a></nav>
+      <nav>
+        <a class="lang-de" href="#glossar">Begriffe</a
+        ><a class="lang-en" href="#glossar">Glossary</a
+        ><a href="https://github.com/ThatIsCraZy/fastdup/releases">Releases</a
+        ><a href="https://github.com/ThatIsCraZy/fastdup/tree/main/docs">Docs</a
+        ><a href="https://github.com/ThatIsCraZy/fastdup">Source</a>
+      </nav>
     </footer>
-    <script src="site.js?v=20260902-2"></script>
+    <script src="site.js?v=20260905-1"></script>
   </body>
 </html>
