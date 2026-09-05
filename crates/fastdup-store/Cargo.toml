@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hashbrown.workspace = true
+bytes.workspace = true
 blake3.workspace = true
 crc32c.workspace = true
 fastdup-format.workspace = true

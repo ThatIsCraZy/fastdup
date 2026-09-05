@@ -40,6 +40,54 @@ describe("FastDup Control Plane UI", () => {
     );
   });
 
+  async function openUiPreferences() {
+    fireEvent.click(await screen.findByRole("button", { name: /admin administrator/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /UI-Einstellungen|UI settings/ }));
+  }
+
+  it("speichert die UI-Sprache per Session und lädt sie nach erneutem Öffnen", async () => {
+    let language = "de";
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/session/language")) language = JSON.parse(String(init?.body)).language;
+      const body = url.endsWith("/session/language") ? { uiLanguage: language }
+        : url.endsWith("/session") ? { username: "admin", csrfToken: "csrf", mustChangePassword: false, certificateFingerprint: "AA", uiLanguage: language }
+        : url.endsWith("/principals") ? { users: [], groups: [] } : previewSnapshot;
+      return Promise.resolve(new Response(JSON.stringify(body), {status:200, headers:{"content-type":"application/json"}}));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const view = render(<App />);
+    await screen.findByRole("button", { name: /admin administrator/i });
+    expect(screen.queryByRole("combobox", { name: "UI-Sprache" })).not.toBeInTheDocument();
+    await openUiPreferences();
+    fireEvent.change(await screen.findByRole("combobox", { name: "UI-Sprache" }), { target: { value: "en" } });
+    await screen.findByRole("button", { name: "Overview" });
+    expect(document.documentElement.lang).toBe("en");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/session/language", expect.objectContaining({method:"PUT", body:JSON.stringify({language:"en"})}));
+    fireEvent.click(screen.getByRole("button", { name: "Close dialog" }));
+    fireEvent.click(screen.getByRole("button", { name: "SMB Shares" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create share" }));
+    expect(screen.getByRole("dialog", { name: "New share" })).toBeVisible();
+    view.unmount();
+    render(<App />);
+    await screen.findByRole("button", { name: "Overview" });
+    await openUiPreferences();
+    expect(screen.getByRole("combobox", { name: "UI language" })).toHaveValue("en");
+  });
+
+  it("behält bei einem Speicherfehler die bisherige UI-Sprache", async () => {
+    const original = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => String(input).endsWith("/session/language")
+      ? Promise.resolve(new Response(JSON.stringify({message:"Save failed"}),{status:500}))
+      : original(input, init)));
+    render(<App />);
+    await openUiPreferences();
+    fireEvent.change(await screen.findByRole("combobox", { name: "UI-Sprache" }), { target: { value: "en" } });
+    await screen.findByText("Sprache konnte nicht gespeichert werden");
+    expect(screen.getByRole("button", { name: "Übersicht" })).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "UI-Sprache" })).toHaveValue("de");
+  });
+
   it("hält Admin und Logout dauerhaft im rechten oberen Account-Menü", async () => {
     render(<App />);
     const account = await screen.findByRole("button", {
@@ -48,6 +96,26 @@ describe("FastDup Control Plane UI", () => {
     expect(account.closest("header")).toHaveClass("topbar");
     fireEvent.click(account);
     expect(screen.getByRole("menuitem", { name: /abmelden/i })).toBeVisible();
+  });
+
+  it("öffnet echte Detailbereiche und erklärt fehlende Runtime-Daten", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Telemetrie" }));
+    expect(screen.getByRole("tab", { name: "Latenzen" })).toBeVisible();
+    expect(screen.getByText("Noch keine Messdaten verfügbar. Das Repository muss mit aktueller Runtime gemountet sein.")).toBeVisible();
+    expect(document.querySelector(".telemetry-tabs")).not.toBeInTheDocument();
+  });
+
+  it("sperrt neue Shares ohne Repository und führt zur Einrichtung", async () => {
+    const original = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => String(input).endsWith("/snapshot")
+      ? Promise.resolve(new Response(JSON.stringify({...previewSnapshot, repository: undefined})))
+      : original(input, init)));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", {name:"SMB-Freigaben"}));
+    expect(screen.getByRole("button", {name:"Freigabe anlegen"})).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", {name:"Repository einrichten"}));
+    expect(screen.getByRole("heading", {name:"Laufwerke & Provisionierung"})).toBeVisible();
   });
 
   it("öffnet jede Hauptseite mit ihrer echten Live-Ansicht", async () => {
@@ -164,7 +232,7 @@ describe("FastDup Control Plane UI", () => {
         expect.anything(),
       ),
     );
-    expect(screen.getByText("RANGE · 24 H")).toBeVisible();
+    expect(screen.getByText("Zeitraum · 24 h")).toBeVisible();
   });
 
   it("exportiert den Audit-Verlauf und bestätigt den Download", async () => {
@@ -584,6 +652,20 @@ describe("FastDup Control Plane UI", () => {
     expect(value).toHaveValue(12);
     expect(unit).toHaveValue("pb");
     expect(screen.getByText(/harte logische quota/i)).toBeVisible();
+  });
+
+  it("öffnet den Share-Editor als benanntes Modal und schließt mit Escape", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: /admin administrator/i });
+    fireEvent.click(screen.getByRole("button", { name: /smb-freigaben/i }));
+    fireEvent.click(screen.getByRole("button", { name: /freigabe anlegen/i }));
+    const dialog = screen.getByRole("dialog", { name: "Neue Freigabe" });
+    expect(dialog.tagName).toBe("DIALOG");
+    expect(dialog).toHaveAttribute("open");
+    expect(document.body.style.overflow).toBe("hidden");
+    fireEvent(dialog, new Event("cancel", { bubbles: false, cancelable: true }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(document.body.style.overflow).not.toBe("hidden");
   });
 
   it("schaltet Similarity pro Freigabe unabhängig vom Repository-Standard", async () => {

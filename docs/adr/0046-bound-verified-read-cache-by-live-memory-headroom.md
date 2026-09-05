@@ -9,6 +9,15 @@ logical length, and BLAKE3 Chunk identity have been verified. The cache is
 attached to installed Manifest readers, not recovery or scrub, so it can never
 become DATA authority or hide a missing durable dependency.
 
+A read response may retain one verified allocation across several adjacent
+DATA/DATA_SLICE extents. Its `VerifiedReadView` has only an owner and checked
+byte range, never an invented Chunk identity. Joining requires the same live
+owner and exactly adjoining source ranges. Sparse extents, RAW header/padding
+gaps, reordered ranges and different owners use bounded response assembly.
+Admission grouping uses an ephemeral backing identity while payload owners
+remain retained; large batches may index it after enough distinct owners have
+been observed. This index neither persists pointers nor changes cache charges.
+
 The same live-headroom policy also governs a separate repository-wide cache of
 independently verified immutable Exact Index pages. This cache retains only a
 hot subset of the persistent index, never the complete Chunk map. A hit removes

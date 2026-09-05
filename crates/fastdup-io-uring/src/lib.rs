@@ -5,6 +5,9 @@
 //! publishers can overlap in the kernel. Buffer ownership and the only unsafe
 //! submission call are confined to this platform crate.
 
+mod read_buffer;
+use read_buffer::ReadBuffer;
+
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::fmt;
@@ -272,11 +275,13 @@ impl StorageIo for IoUringStorageIo {
             .callers
             .borrowed_write_copy_bytes
             .fetch_add(byte_length, Ordering::Relaxed);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.path(name)?)?;
-        self.backend.write(file, offset, owned, lease)
+        self.filesystem.with_file_mutation(name, || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.path(name)?)?;
+            self.backend.write(file, offset, owned, lease)
+        })
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
@@ -285,7 +290,8 @@ impl StorageIo for IoUringStorageIo {
         if length > MAX_CONTAINER_BYTES {
             return Err(invalid_data("container exceeds the format-v1 hard limit"));
         }
-        self.backend.read(file, 0, usize_from_u64(length)?)
+        self.backend
+            .read(Arc::new(file), 0, usize_from_u64(length)?)
     }
 
     fn object_len(&self, name: &str) -> io::Result<u64> {
@@ -298,18 +304,7 @@ impl StorageIo for IoUringStorageIo {
                 "bounded storage read exceeds the hard allocation limit",
             ));
         }
-        let length_u64 =
-            u64::try_from(length).map_err(|_| invalid_input("read length does not fit u64"))?;
-        let end = offset
-            .checked_add(length_u64)
-            .ok_or_else(|| invalid_input("read range overflows"))?;
-        let file = File::open(self.path(name)?)?;
-        if end > file.metadata()?.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "bounded storage read exceeds the current object length",
-            ));
-        }
+        let file = self.filesystem.open_read_range(name, offset, length)?;
         self.backend.read(file, offset, length)
     }
 
@@ -329,7 +324,10 @@ impl StorageIo for IoUringStorageIo {
         let old_name = c_name(temporary_name)?;
         let new_name = c_name(published_name)?;
         let directory = File::open(self.filesystem.root())?;
-        self.backend.rename_noreplace(directory, old_name, new_name)
+        self.filesystem
+            .with_file_rename(temporary_name, published_name, || {
+                self.backend.rename_noreplace(directory, old_name, new_name)
+            })
     }
 
     fn remove_file(&self, name: &str) -> io::Result<()> {
@@ -592,15 +590,11 @@ impl ActiveBackend {
         receive_reply(&receive)
     }
 
-    fn read(&self, file: File, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+    fn read(&self, file: Arc<File>, offset: u64, length: usize) -> io::Result<Vec<u8>> {
         let length_u64 =
             u64::try_from(length).map_err(|_| invalid_input("read length does not fit u64"))?;
         let lease = self.budget.acquire(length_u64)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-        bytes.resize(length, 0);
+        let bytes = ReadBuffer::new(length)?;
         let (reply, receive) = mpsc::sync_channel(1);
         self.send(Command::Read {
             file,
@@ -843,9 +837,9 @@ enum Command {
         reply: mpsc::SyncSender<io::Result<()>>,
     },
     Read {
-        file: File,
+        file: Arc<File>,
         offset: u64,
-        bytes: Vec<u8>,
+        bytes: ReadBuffer,
         lease: BudgetLease,
         reply: mpsc::SyncSender<io::Result<Vec<u8>>>,
     },
@@ -1283,9 +1277,9 @@ enum Operation {
         reply: mpsc::SyncSender<io::Result<()>>,
     },
     Read {
-        file: File,
+        file: Arc<File>,
         offset: u64,
-        bytes: Vec<u8>,
+        bytes: ReadBuffer,
         progress: usize,
         _lease: BudgetLease,
         reply: mpsc::SyncSender<io::Result<Vec<u8>>>,
@@ -1335,15 +1329,18 @@ impl Operation {
                 progress,
                 ..
             } => {
-                let remaining = &mut bytes[*progress..];
-                let length = u32::try_from(remaining.len())
+                let length = u32::try_from(bytes.len() - *progress)
                     .map_err(|_| invalid_input("one io_uring read exceeds u32"))?;
                 let operation_offset = offset
                     .checked_add(u64::try_from(*progress).expect("ASSERT: usize fits u64"))
                     .ok_or_else(|| invalid_input("read progress overflows offset"))?;
-                opcode::Read::new(types::Fd(file.as_raw_fd()), remaining.as_mut_ptr(), length)
-                    .offset(operation_offset)
-                    .build()
+                opcode::Read::new(
+                    types::Fd(file.as_raw_fd()),
+                    bytes.remaining_ptr(*progress),
+                    length,
+                )
+                .offset(operation_offset)
+                .build()
             }
             Self::Fsync { file, .. }
             | Self::RootSync {
@@ -1458,7 +1455,12 @@ fn complete_storage_operation(
             }
             *progress += transferred;
             if *progress == bytes.len() {
-                let finished = std::mem::take(bytes);
+                let finished =
+                    std::mem::replace(bytes, ReadBuffer::new(0).expect("empty read capacity"));
+                // SAFETY: cumulative positive CQEs cover exactly 0..len. Each
+                // SQE wrote the next disjoint spare range. This CQE completes
+                // the last access; failures and short EOF never reach finish.
+                let finished = unsafe { finished.finish() };
                 let _ = reply.send(Ok(finished));
                 OperationCompletion::Done
             } else {
@@ -1935,4 +1937,56 @@ fn invalid_input(message: &'static str) -> io::Error {
 
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod read_completion_tests {
+    use super::*;
+
+    #[test]
+    fn partial_read_cqes_expose_bytes_only_after_full_success_and_release_errors() {
+        let budget = Arc::new(InflightBudget::new(8));
+        let counters = Counters::default();
+        for failure in [None, Some(0), Some(-libc::EIO)] {
+            let (reply, receive) = mpsc::sync_channel(1);
+            let mut bytes = ReadBuffer::new(8).unwrap();
+            bytes.write_fixture(0, b"abc");
+            let operation = Operation::Read {
+                file: Arc::new(File::open("/dev/null").unwrap()),
+                offset: 0,
+                bytes,
+                progress: 0,
+                _lease: budget.acquire(8).unwrap(),
+                reply,
+            };
+            let OperationCompletion::Pending(mut operation) =
+                complete_storage_operation(operation, 3, &counters)
+            else {
+                panic!("partial CQE must retain buffer ownership");
+            };
+            assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(budget.used.load(Ordering::Relaxed), 8);
+            let completion = failure.unwrap_or(5);
+            if failure.is_none() {
+                let Operation::Read { bytes, .. } = &mut operation else {
+                    unreachable!()
+                };
+                bytes.write_fixture(3, b"defgh");
+            }
+            assert!(matches!(
+                complete_storage_operation(operation, completion, &counters),
+                OperationCompletion::Done
+            ));
+            let result = receive.recv().unwrap();
+            match failure {
+                None => assert_eq!(result.unwrap(), b"abcdefgh"),
+                Some(0) => assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof),
+                Some(_) => assert_eq!(
+                    result.unwrap_err().kind(),
+                    io::Error::from_raw_os_error(libc::EIO).kind()
+                ),
+            }
+            assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        }
+    }
 }

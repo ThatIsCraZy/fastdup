@@ -31,6 +31,7 @@ export interface SeriesPoint {
 }
 
 export interface TelemetrySnapshot {
+  details?: import("./detail-telemetry").DetailTelemetry | null;
   sequence: number;
   observedAt: string;
   repositoryState: RepositoryState;
@@ -136,6 +137,7 @@ export interface RepositoryBinding {
   state: RepositoryState;
 }
 export interface SessionInfo {
+  uiLanguage?: "de" | "en";
   username: string;
   csrfToken: string;
   mustChangePassword: boolean;
@@ -296,7 +298,7 @@ export const previewSnapshot: ApplianceSnapshot = {
     autoMount: true,
     advancedReduction: "dependent_v1",
     onlineGcEnabled: true,
-    maintenanceWindowUtc: "Sonntag 02:00–05:00",
+    maintenanceWindowUtc: "02:00-05:00",
     pressureLowBasisPoints: 8500,
     pressureHighBasisPoints: 9000,
     smallFileExtensions: [".json", ".xml"],

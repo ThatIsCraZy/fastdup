@@ -753,6 +753,7 @@ name = "fastdup-appliance"
 version = "0.5.0"
 dependencies = [
  "blake3",
+ "bytes",
  "crc32c",
  "fastcdc",
  "fastdup-copy-metrics",
@@ -790,6 +791,7 @@ dependencies = [
  "rusqlite",
  "rust-embed",
  "rustix",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -803,6 +805,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -870,8 +873,10 @@ name = "fastdup-store"
 version = "0.5.0"
 dependencies = [
  "blake3",
+ "bytes",
  "crc32c",
  "fastdup-format",
+ "hashbrown 0.17.1",
  "libc",
  "memmap2",
  "rayon",

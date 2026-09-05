@@ -587,6 +587,12 @@ pub enum Operation<'a> {
         offset: u64,
         length: u32,
     },
+    ReadShared {
+        inode: InodeId,
+        handle: HandleId,
+        offset: u64,
+        length: u32,
+    },
     Write {
         inode: InodeId,
         handle: HandleId,
@@ -770,6 +776,7 @@ pub enum Reply {
     },
     Opened(HandleId),
     Data(Vec<u8>),
+    SharedData(Bytes),
     LinkTarget(Vec<u8>),
     Xattr(Vec<u8>),
     FileFlags(u32),
@@ -3832,7 +3839,13 @@ impl Namespace {
                 handle,
                 offset,
                 length,
-            } => self.read(inode, handle, offset, length),
+            } => self.read(inode, handle, offset, length, false),
+            Operation::ReadShared {
+                inode,
+                handle,
+                offset,
+                length,
+            } => self.read(inode, handle, offset, length, true),
             Operation::Write {
                 inode,
                 handle,
@@ -4698,6 +4711,7 @@ impl Namespace {
         handle: HandleId,
         offset: u64,
         length: u32,
+        shared: bool,
     ) -> Result<Reply, PosixError> {
         let (object, open) = self.resolve_open_file(inode, handle)?;
         if open.options.access == AccessMode::WriteOnly {
@@ -4711,9 +4725,13 @@ impl Namespace {
         );
         let plan = state.data.plan_read(offset, length)?;
         drop(state);
-        let bytes = plan.execute()?;
+        let bytes = plan.execute_shared()?;
         self.update_relatime(inode, &object);
-        Ok(Reply::Data(bytes))
+        Ok(if shared {
+            Reply::SharedData(bytes)
+        } else {
+            Reply::Data(Vec::from(bytes))
+        })
     }
 
     fn write(

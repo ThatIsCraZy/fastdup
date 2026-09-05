@@ -33,6 +33,8 @@ use fastdup_store::{
 };
 
 mod common;
+#[path = "../runtime_telemetry.rs"]
+mod runtime_telemetry;
 
 use common::metadata_gc_status_fields;
 use fuse3::raw::Session;
@@ -262,6 +264,7 @@ struct ManagementFrontendTelemetry {
     new_chunk_bytes: u64,
     logical_chunk_bytes: u64,
     physical_container_bytes: u64,
+    details: Option<serde_json::Value>,
 }
 
 struct RecoveryCheckpointRuntimeHandle {
@@ -463,8 +466,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let configuration = gc_runtime.configuration.clone();
                 let capacity_control = presented_capacity_control.clone();
                 let namespace = Arc::clone(&namespace);
+                let inspected_appliance = Arc::clone(&appliance);
+                let inspected_storage = data_storage.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_management_control(stream, telemetry, configuration, capacity_control, namespace).await {
+                    if let Err(error) = handle_management_control(stream, telemetry, configuration, capacity_control, namespace, inspected_appliance, inspected_storage).await {
                         eprintln!("management_control_error={error}");
                     }
                 });
@@ -840,6 +845,8 @@ async fn handle_management_control(
     configuration: watch::Sender<OnlineGcRuntimeConfiguration>,
     capacity_source: RuntimePresentedCapacityControl,
     namespace: Arc<Namespace>,
+    appliance: Arc<FsAppliance>,
+    storage: TelemetryStorageIo,
 ) -> Result<(), String> {
     let mut request = Vec::new();
     timeout(
@@ -849,7 +856,7 @@ async fn handle_management_control(
     .await
     .map_err(|_| "management request timed out".to_owned())?
     .map_err(|error| format!("management request read failed: {error}"))?;
-    let response = match serde_json::from_slice::<ManagementRequest>(&request) {
+    let mut response = match serde_json::from_slice::<ManagementRequest>(&request) {
         Ok(request) if request.version == MANAGEMENT_PROTOCOL_VERSION => {
             apply_management_operation(
                 request.operation,
@@ -876,6 +883,9 @@ async fn handle_management_control(
             small_file_policy: None,
         },
     };
+    if let Some(frontend) = response.frontend.as_mut() {
+        frontend.details = tokio::task::spawn_blocking(move || runtime_telemetry::snapshot(&appliance, &storage)).await.ok();
+    }
     let mut encoded = serde_json::to_vec(&response)
         .map_err(|error| format!("management response encode failed: {error}"))?;
     encoded.push(b'\n');
@@ -901,6 +911,7 @@ fn apply_management_operation(
                 ok: true,
                 error: None,
                 frontend: Some(ManagementFrontendTelemetry {
+                    details: None,
                     read_bytes: snapshot.read_bytes,
                     write_bytes: snapshot.write_bytes,
                     read_operations: snapshot.read_operations,
@@ -1232,6 +1243,7 @@ async fn run_online_gc_quantum(
     source: &'static str,
     scheduler: OnlineGcSchedulerStatus,
 ) -> String {
+    runtime_telemetry::gc_started();
     let result = match usage {
         Ok(usage) => tokio::task::spawn_blocking(move || {
             maintenance.run_adaptive_online_gc_cycle_with_workers(
@@ -1246,6 +1258,7 @@ async fn run_online_gc_quantum(
         .and_then(|result| result.map_err(|error| format!("{error}"))),
         Err(error) => Err(error),
     };
+    runtime_telemetry::gc_finished(&result);
     match result {
         Ok(report) => online_gc_status_line(source, mode, relocation_workers, &report, scheduler),
         Err(error) => format!(
@@ -1520,7 +1533,8 @@ fn emit_io_uring_state(storage: &TelemetryStorageIo) {
         concat!(
             "copy_bytes checksum_scratch_bytes={} publication_verify_materialization_bytes={} ",
             "fuse_request_adaptation_bytes={} container_assembly_bytes={} ",
-            "chunk_fragment_coalescing_bytes={} compression_region_materialization_bytes={}"
+            "chunk_fragment_coalescing_bytes={} compression_region_materialization_bytes={} ",
+            "compression_region_concatenation_bytes={}"
         ),
         copies.checksum_scratch_bytes,
         copies.publication_verify_materialization_bytes,
@@ -1528,6 +1542,7 @@ fn emit_io_uring_state(storage: &TelemetryStorageIo) {
         copies.container_assembly_bytes,
         copies.chunk_fragment_coalescing_bytes,
         copies.compression_region_materialization_bytes,
+        copies.compression_region_concatenation_bytes,
     );
 }
 
@@ -1554,7 +1569,19 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
     );
     emit_cpu_phase_state("write_through_hash_cpu", status.hash_cpu());
     emit_cpu_phase_state("write_through_encode_cpu", status.encode_cpu());
+    emit_cpu_phase_state("write_through_planning", status.planning_cpu());
+    eprintln!(
+        "write_through_materialization wall_ns={}",
+        status.materialization_wall_ns()
+    );
     let reduction = status.advanced_reduction();
+    eprintln!(
+        "advanced_reduction_timing fingerprint_ns={} candidate_lookup_ns={} base_read_ns={} codec_trial_ns={}",
+        reduction.fingerprint_ns(),
+        reduction.candidate_lookup_ns(),
+        reduction.base_read_ns(),
+        reduction.codec_trial_ns()
+    );
     let online = reduction.online();
     eprintln!(
         "online_similarity families={} batches={} compactions={} skipped_entries={} errors={}",
@@ -1923,6 +1950,7 @@ fn map_worker_result(
 }
 
 fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
+    runtime_telemetry::record_checkpoint(profiled);
     let metrics = profiled.metrics();
     TELEMETRY_EXACT_HIT_BYTES.fetch_add(metrics.exact_hit_bytes(), Ordering::Relaxed);
     TELEMETRY_NEW_CHUNK_BYTES.fetch_add(metrics.new_chunk_bytes(), Ordering::Relaxed);

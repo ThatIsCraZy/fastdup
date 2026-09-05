@@ -48,10 +48,10 @@ pub use container::{
     PrehashedContiguousRegion, PreparedDependentRecord, PreparedEncodedRecord,
     PreparedIndependentRecord, PreparedSparseXorRecord, PreparedZstdPrefixRecord,
     RECORD_HEADER_BYTES, RawRecord, RecoveryIndexCandidate, SealedContainer,
-    SealedContainerDescriptor, SparseXorRecord, SparseXorRun, VerifiedChunkLocation,
-    VerifiedChunkPayload, VerifiedContainerImage, VerifiedContainerPublication,
-    VerifiedRawLocation, VerifiedRecordPayloads, VerifiedRecoveryIndex, ZstdPrefixDependency,
-    ZstdPrefixRecord,
+    SealedContainerDescriptor, SparseXorRecord, SparseXorRun, VerifiedChunkBackingId,
+    VerifiedChunkLocation, VerifiedChunkPayload, VerifiedContainerImage,
+    VerifiedContainerPublication, VerifiedRawLocation, VerifiedReadView, VerifiedRecordPayloads,
+    VerifiedRecoveryIndex, ZstdPrefixDependency, ZstdPrefixRecord,
 };
 pub use container_generation_high_water::{
     CONTAINER_GENERATION_HIGH_WATER_RECORD_BYTES, ContainerGenerationHighWaterFormatError,

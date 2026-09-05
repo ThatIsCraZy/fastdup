@@ -448,6 +448,12 @@ where
             .map_err(|_| PosixError::Io)
     }
 
+    fn read_shared_at(&self, offset: u64, length: u32) -> Result<bytes::Bytes, PosixError> {
+        self.file
+            .read_shared_at(offset, length)
+            .map_err(|_| PosixError::Io)
+    }
+
     fn prepared_clone_extents(
         &self,
         offset: u64,

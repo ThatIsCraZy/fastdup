@@ -6,6 +6,7 @@
 //! The frozen-pair constructor remains available for offline callers.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,7 +20,9 @@ use crate::online_similarity::OnlineSimilarityRepository;
 use crate::reduction_prefix::{BaseChunkRef, VerifiedBaseChunk, ZstdPrefixCodec};
 use crate::reduction_similarity::SimilarityFingerprint;
 use crate::reduction_similarity::{IndependentBaseRef, SparseXorDelta};
-use crate::similarity_index_repository::{RecoveredSimilarityIndex, SimilarityIndexStoreError};
+use crate::similarity_index_repository::{
+    RecoveredSimilarityIndex, SimilarityBaseCandidate, SimilarityIndexStoreError,
+};
 use crate::{ContainerRepository, SimilarityIndexPageCacheStatus, StorageIo, VerifiedReadCache};
 use fastdup_format::SimilarityIndexEntry;
 
@@ -44,6 +47,10 @@ struct ReductionCounterStripe {
     no_candidate_fallbacks: AtomicU64,
     saved_payload_bytes: AtomicU64,
     errors: AtomicU64,
+    fingerprint_ns: AtomicU64,
+    candidate_lookup_ns: AtomicU64,
+    base_read_ns: AtomicU64,
+    codec_trial_ns: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -81,6 +88,10 @@ impl ReductionCounters {
                     no_candidate_fallbacks: stripe.no_candidate_fallbacks.load(Ordering::Relaxed),
                     saved_payload_bytes: stripe.saved_payload_bytes.load(Ordering::Relaxed),
                     errors: stripe.errors.load(Ordering::Relaxed),
+                    fingerprint_ns: stripe.fingerprint_ns.load(Ordering::Relaxed),
+                    candidate_lookup_ns: stripe.candidate_lookup_ns.load(Ordering::Relaxed),
+                    base_read_ns: stripe.base_read_ns.load(Ordering::Relaxed),
+                    codec_trial_ns: stripe.codec_trial_ns.load(Ordering::Relaxed),
                 });
                 total
             })
@@ -101,6 +112,10 @@ struct ReductionCounterValues {
     no_candidate_fallbacks: u64,
     saved_payload_bytes: u64,
     errors: u64,
+    fingerprint_ns: u64,
+    candidate_lookup_ns: u64,
+    base_read_ns: u64,
+    codec_trial_ns: u64,
 }
 
 impl ReductionCounterValues {
@@ -129,6 +144,12 @@ impl ReductionCounterValues {
             .saved_payload_bytes
             .saturating_add(other.saved_payload_bytes);
         self.errors = self.errors.saturating_add(other.errors);
+        self.fingerprint_ns = self.fingerprint_ns.saturating_add(other.fingerprint_ns);
+        self.candidate_lookup_ns = self
+            .candidate_lookup_ns
+            .saturating_add(other.candidate_lookup_ns);
+        self.base_read_ns = self.base_read_ns.saturating_add(other.base_read_ns);
+        self.codec_trial_ns = self.codec_trial_ns.saturating_add(other.codec_trial_ns);
     }
 }
 
@@ -144,6 +165,26 @@ enum ReductionSource<I> {
         similarity: Arc<RecoveredSimilarityIndex<I>>,
     },
     Online(Arc<OnlineSimilarityRepository<I>>),
+}
+
+struct ReductionBatchSnapshot<I> {
+    online: Option<Arc<crate::online_similarity::OnlineReductionGeneration<I>>>,
+    exact: Option<ExactIndexGenerationPin<I>>,
+}
+
+enum PreparedChunkTrial<'a> {
+    Ready(PersistentChunkPlan),
+    Trials(ChunkTrial<'a>),
+}
+
+struct ChunkTrial<'a> {
+    target_id: ChunkId,
+    target: &'a [u8],
+    independent: PreparedIndependentRecord,
+    candidates: std::vec::IntoIter<SimilarityBaseCandidate>,
+    maximum_encoded_payload_bytes: usize,
+    best: Option<(usize, PreparedDependentRecord)>,
+    remaining_trials: usize,
 }
 
 impl<I: Clone + StorageIo> fmt::Debug for PersistentReductionIndex<I> {
@@ -190,6 +231,136 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         }
     }
 
+    fn pin_batch(&self) -> ReductionBatchSnapshot<I> {
+        let online = match &self.source {
+            ReductionSource::Online(repository) => repository.pin(),
+            ReductionSource::Frozen { .. } => None,
+        };
+        let exact = match &self.source {
+            ReductionSource::Frozen { exact, .. } => exact.try_pin(),
+            ReductionSource::Online(_) => online
+                .as_ref()
+                .and_then(|generation| generation.pin_exact()),
+        };
+        ReductionBatchSnapshot { online, exact }
+    }
+
+    /// Plans a bounded ingest batch against one pinned Exact/Similarity view.
+    /// The caller owns target-byte admission; CPU phases acquire shared permits
+    /// and release them before the coordinator performs bounded Base reads.
+    /// Results retain input order, including independent fallbacks after errors.
+    ///
+    /// # Panics
+    /// Panics if a worker fails to return its uniquely assigned result.
+    pub fn plan_batch_for_publication_cached<C: StorageIo + Sync>(
+        &self,
+        containers: &ContainerRepository<C>,
+        targets: &[PrehashedChunk<'_>],
+        cache: Option<&VerifiedReadCache>,
+        workers: NonZeroUsize,
+        admission: &crate::WorkerPermits,
+    ) -> Vec<(PersistentChunkPlan, Option<SimilarityIndexEntry>)>
+    where
+        I: Send + Sync,
+    {
+        let snapshot = self.pin_batch();
+        let prepared = map_admitted(targets.to_vec(), workers, admission, |target| {
+            let counters = self.counters.for_chunk(target.chunk_id());
+            let fingerprint = timed_fingerprint(target.bytes(), counters)
+                .map_err(|_| SimilarityIndexStoreError::InvalidTarget)?;
+            let entry = SimilarityIndexEntry::new(
+                target.chunk_id(),
+                u32::try_from(target.bytes().len())
+                    .map_err(|_| SimilarityIndexStoreError::InvalidTarget)?,
+                fingerprint.profile(),
+                fingerprint.superfeatures(),
+                fingerprint.sketch(),
+            )
+            .map_err(SimilarityIndexStoreError::from)?;
+            counters.queries.fetch_add(1, Ordering::Relaxed);
+            let trial = self
+                .prepare_trial(
+                    target.chunk_id(),
+                    target.bytes(),
+                    &fingerprint,
+                    counters,
+                    &snapshot,
+                )
+                .unwrap_or_else(|_| {
+                    counters.errors.fetch_add(1, Ordering::Relaxed);
+                    PreparedChunkTrial::Ready(PersistentChunkPlan::NoCandidates)
+                });
+            Ok::<_, SimilarityIndexStoreError>((trial, entry))
+        });
+        let mut ordered = std::iter::repeat_with(|| None)
+            .take(targets.len())
+            .collect::<Vec<_>>();
+        let mut trials = Vec::new();
+        for (ordinal, prepared) in prepared.into_iter().enumerate() {
+            match prepared {
+                Ok((PreparedChunkTrial::Ready(plan), hint)) => {
+                    ordered[ordinal] = Some((plan, Some(hint)));
+                }
+                Ok((PreparedChunkTrial::Trials(trial), hint)) => {
+                    trials.push((ordinal, trial, hint));
+                }
+                Err(_) => ordered[ordinal] = Some((PersistentChunkPlan::NoCandidates, None)),
+            }
+        }
+        let mut trials = trials.into_iter();
+        loop {
+            // At most eight independently verified Base owners survive a CPU
+            // boundary. No speculative candidates beyond the original trial
+            // budget are read. The coherent Exact pin lives through all waves.
+            let mut wave = trials.by_ref().take(8).collect::<Vec<_>>();
+            if wave.is_empty() {
+                break;
+            }
+            while !wave.is_empty() {
+                let mut ready = Vec::new();
+                for (ordinal, mut trial, hint) in wave {
+                    if let Some((candidate, base)) =
+                        self.read_next_trial_base(&mut trial, containers, cache, &snapshot)
+                    {
+                        ready.push((ordinal, trial, hint, candidate, base));
+                    } else {
+                        let plan = trial.finish(self.counters.for_chunk(hint.chunk_id()));
+                        let hint =
+                            (!matches!(plan, PersistentChunkPlan::Dependent(_))).then_some(hint);
+                        ordered[ordinal] = Some((plan, hint));
+                    }
+                }
+                let completed = map_admitted(
+                    ready,
+                    workers,
+                    admission,
+                    |(ordinal, mut trial, hint, candidate, base)| {
+                        let counters = self.counters.for_chunk(trial.target_id);
+                        let result = trial.run_base(candidate, base.as_slice(), counters);
+                        if result.is_err() {
+                            counters.errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        (ordinal, result.map(|()| trial), hint)
+                    },
+                );
+                wave = Vec::new();
+                for (ordinal, result, hint) in completed {
+                    match result {
+                        Ok(trial) => wave.push((ordinal, trial, hint)),
+                        Err(_) => {
+                            ordered[ordinal] =
+                                Some((PersistentChunkPlan::NoCandidates, Some(hint)));
+                        }
+                    }
+                }
+            }
+        }
+        ordered
+            .into_iter()
+            .map(|plan| plan.expect("ASSERT: every bounded planning job completed"))
+            .collect()
+    }
+
     /// Fingerprints once for both lookup and later independent-base admission.
     /// The returned entry is only an optimization hint; callers may publish it
     /// after the corresponding independent Container and Exact Location.
@@ -217,7 +388,19 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         target: &[u8],
         cache: Option<&VerifiedReadCache>,
     ) -> Result<(PersistentChunkPlan, Option<SimilarityIndexEntry>), PersistentReductionError> {
-        let fingerprint = SimilarityFingerprint::v1(target)
+        let snapshot = self.pin_batch();
+        self.plan_publication_in_batch(containers, target_id, target, cache, &snapshot)
+    }
+
+    fn plan_publication_in_batch<C: StorageIo>(
+        &self,
+        containers: &ContainerRepository<C>,
+        target_id: ChunkId,
+        target: &[u8],
+        cache: Option<&VerifiedReadCache>,
+        snapshot: &ReductionBatchSnapshot<I>,
+    ) -> Result<(PersistentChunkPlan, Option<SimilarityIndexEntry>), PersistentReductionError> {
+        let fingerprint = timed_fingerprint(target, self.counters.for_chunk(target_id))
             .map_err(|_| SimilarityIndexStoreError::InvalidTarget)?;
         let entry = SimilarityIndexEntry::new(
             target_id,
@@ -229,9 +412,15 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         .map_err(SimilarityIndexStoreError::from)?;
         let counters = self.counters.for_chunk(target_id);
         counters.queries.fetch_add(1, Ordering::Relaxed);
-        let plan = if let Ok(plan) =
-            self.plan_chunk_inner(containers, target_id, target, &fingerprint, counters, cache)
-        {
+        let plan = if let Ok(plan) = self.plan_chunk_inner(
+            containers,
+            target_id,
+            target,
+            &fingerprint,
+            counters,
+            cache,
+            snapshot,
+        ) {
             plan
         } else {
             counters.errors.fetch_add(1, Ordering::Relaxed);
@@ -263,6 +452,10 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             no_candidate_fallbacks: counters.no_candidate_fallbacks,
             saved_payload_bytes: counters.saved_payload_bytes,
             errors: counters.errors,
+            fingerprint_ns: counters.fingerprint_ns,
+            candidate_lookup_ns: counters.candidate_lookup_ns,
+            base_read_ns: counters.base_read_ns,
+            codec_trial_ns: counters.codec_trial_ns,
         }
     }
 
@@ -295,11 +488,19 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         target_id: ChunkId,
         target: &[u8],
     ) -> Result<PersistentChunkPlan, PersistentReductionError> {
-        let fingerprint = SimilarityFingerprint::v1(target)
+        let fingerprint = timed_fingerprint(target, self.counters.for_chunk(target_id))
             .map_err(|_| SimilarityIndexStoreError::InvalidTarget)?;
         let counters = self.counters.for_chunk(target_id);
         counters.queries.fetch_add(1, Ordering::Relaxed);
-        match self.plan_chunk_inner(containers, target_id, target, &fingerprint, counters, None) {
+        match self.plan_chunk_inner(
+            containers,
+            target_id,
+            target,
+            &fingerprint,
+            counters,
+            None,
+            &self.pin_batch(),
+        ) {
             Ok(plan) => Ok(plan),
             Err(error) => {
                 counters.errors.fetch_add(1, Ordering::Relaxed);
@@ -308,7 +509,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     fn plan_chunk_inner<C: StorageIo>(
         &self,
         containers: &ContainerRepository<C>,
@@ -317,20 +518,37 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         fingerprint: &SimilarityFingerprint,
         counters: &ReductionCounterStripe,
         cache: Option<&VerifiedReadCache>,
+        snapshot: &ReductionBatchSnapshot<I>,
     ) -> Result<PersistentChunkPlan, PersistentReductionError> {
-        let online = match &self.source {
-            ReductionSource::Online(repository) => repository.pin(),
-            ReductionSource::Frozen { .. } => None,
-        };
-        let exact = match &self.source {
-            ReductionSource::Frozen { exact, .. } => exact.try_pin(),
-            ReductionSource::Online(_) => online.as_ref().and_then(|g| g.pin_exact()),
-        };
-        let Some(exact) = exact else {
+        match self.prepare_trial(target_id, target, fingerprint, counters, snapshot)? {
+            PreparedChunkTrial::Ready(plan) => Ok(plan),
+            PreparedChunkTrial::Trials(mut trial) => {
+                while let Some((candidate, base)) =
+                    self.read_next_trial_base(&mut trial, containers, cache, snapshot)
+                {
+                    trial.run_base(candidate, base.as_slice(), counters)?;
+                }
+                Ok(trial.finish(counters))
+            }
+        }
+    }
+
+    fn prepare_trial<'a>(
+        &self,
+        target_id: ChunkId,
+        target: &'a [u8],
+        fingerprint: &SimilarityFingerprint,
+        counters: &ReductionCounterStripe,
+        snapshot: &ReductionBatchSnapshot<I>,
+    ) -> Result<PreparedChunkTrial<'a>, PersistentReductionError> {
+        let lookup_phase = ReductionTimer::new(&counters.candidate_lookup_ns);
+        let online = &snapshot.online;
+        let exact = snapshot.exact.as_ref();
+        let Some(_) = exact else {
             counters
                 .no_candidate_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(PersistentChunkPlan::NoCandidates);
+            return Ok(PreparedChunkTrial::Ready(PersistentChunkPlan::NoCandidates));
         };
         let length =
             u32::try_from(target.len()).map_err(|_| SimilarityIndexStoreError::InvalidTarget)?;
@@ -343,6 +561,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
                 .ok_or(PersistentReductionError::IndexBindingMismatch)?
                 .candidates(target_id, fingerprint, length)?,
         };
+        drop(lookup_phase);
         counters.candidates.fetch_add(
             u64::try_from(candidates.len()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -351,116 +570,175 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             counters
                 .no_candidate_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(PersistentChunkPlan::NoCandidates);
+            return Ok(PreparedChunkTrial::Ready(PersistentChunkPlan::NoCandidates));
         }
+        let codec_phase = ReductionTimer::new(&counters.codec_trial_ns);
         let independent = SealedContainer::prepare_prehashed_independent_record(
             PrehashedChunk::new(target_id, target),
             IncompressibilityGatePolicy::Off,
         )
         .map_err(|_| PersistentReductionError::IndependentCodec)?;
+        drop(codec_phase);
         let Some(maximum_encoded_payload_bytes) =
             dependent_payload_cap(independent.encoded_payload_bytes())
         else {
             counters
                 .independent_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(PersistentChunkPlan::Independent(independent));
+            return Ok(PreparedChunkTrial::Ready(PersistentChunkPlan::Independent(
+                independent,
+            )));
         };
-        let mut best: Option<(usize, PreparedDependentRecord)> = None;
-        let mut remaining_trials = MAXIMUM_DEPENDENT_TRIALS_V1;
-        for candidate in candidates.into_iter().take(4) {
-            if remaining_trials == 0 {
-                break;
-            }
+        Ok(PreparedChunkTrial::Trials(ChunkTrial {
+            target_id,
+            target,
+            independent,
+            candidates: candidates
+                .into_iter()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter(),
+            maximum_encoded_payload_bytes,
+            best: None,
+            remaining_trials: MAXIMUM_DEPENDENT_TRIALS_V1,
+        }))
+    }
+
+    fn read_next_trial_base<C: StorageIo>(
+        &self,
+        trial: &mut ChunkTrial<'_>,
+        containers: &ContainerRepository<C>,
+        cache: Option<&VerifiedReadCache>,
+        snapshot: &ReductionBatchSnapshot<I>,
+    ) -> Option<(
+        SimilarityBaseCandidate,
+        fastdup_format::VerifiedChunkPayload,
+    )> {
+        if trial.remaining_trials == 0 {
+            return None;
+        }
+        let exact = snapshot.exact.as_ref()?;
+        let counters = self.counters.for_chunk(trial.target_id);
+        let _base_phase = ReductionTimer::new(&counters.base_read_ns);
+        for candidate in trial.candidates.by_ref() {
             counters.base_reads.fetch_add(1, Ordering::Relaxed);
-            let Some(base_bytes) = containers.find_verified_independent_base_payload_with_index(
-                &exact,
+            if let Some(base) = containers.find_verified_independent_base_payload_with_index(
+                exact,
                 candidate.chunk_id(),
                 candidate.logical_length(),
                 cache,
-            ) else {
-                continue;
-            };
-            counters.base_read_bytes.fetch_add(
-                u64::try_from(base_bytes.len()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            let base_bytes = base_bytes.as_slice();
-            let trial_cap = best
-                .as_ref()
-                .map_or(maximum_encoded_payload_bytes, |(bytes, _)| {
-                    maximum_encoded_payload_bytes.min(bytes.saturating_sub(1))
-                });
-            let expected = BaseChunkRef::new(candidate.chunk_id(), candidate.logical_length());
-            let base = VerifiedBaseChunk::from_verified_location(expected, base_bytes)
-                .map_err(|_| PersistentReductionError::VerifiedBaseMismatch)?;
-            let sparse_base = IndependentBaseRef::from_verified_identity(
-                candidate.chunk_id(),
-                candidate.logical_length(),
-                base_bytes,
-            )
+            ) {
+                counters.base_read_bytes.fetch_add(
+                    u64::try_from(base.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                return Some((candidate, base));
+            }
+        }
+        None
+    }
+}
+
+impl ChunkTrial<'_> {
+    fn run_base(
+        &mut self,
+        candidate: SimilarityBaseCandidate,
+        base_bytes: &[u8],
+        counters: &ReductionCounterStripe,
+    ) -> Result<(), PersistentReductionError> {
+        let _trial_phase = ReductionTimer::new(&counters.codec_trial_ns);
+        let Self {
+            target_id,
+            target,
+            maximum_encoded_payload_bytes,
+            best,
+            remaining_trials,
+            ..
+        } = self;
+        let trial_cap = best
+            .as_ref()
+            .map_or(*maximum_encoded_payload_bytes, |(bytes, _)| {
+                (*maximum_encoded_payload_bytes).min(bytes.saturating_sub(1))
+            });
+        let expected = BaseChunkRef::new(candidate.chunk_id(), candidate.logical_length());
+        let base = VerifiedBaseChunk::from_verified_location(expected, base_bytes)
             .map_err(|_| PersistentReductionError::VerifiedBaseMismatch)?;
-            counters.sparse_xor_trials.fetch_add(1, Ordering::Relaxed);
-            remaining_trials -= 1;
-            let sparse = SparseXorDelta::encode_bounded_prehashed_trial(
-                sparse_base,
-                base_bytes,
-                target_id,
+        let sparse_base = IndependentBaseRef::from_verified_identity(
+            candidate.chunk_id(),
+            candidate.logical_length(),
+            base_bytes,
+        )
+        .map_err(|_| PersistentReductionError::VerifiedBaseMismatch)?;
+        counters.sparse_xor_trials.fetch_add(1, Ordering::Relaxed);
+        *remaining_trials -= 1;
+        let sparse = SparseXorDelta::encode_bounded_prehashed_trial(
+            sparse_base,
+            base_bytes,
+            *target_id,
+            target,
+            trial_cap,
+        )
+        .map_err(|_| PersistentReductionError::SparseXorCodec)?;
+        if let Some(sparse) = sparse.filter(|s| s.cost().run_count() != 0) {
+            let sparse_bytes = usize::try_from(sparse.cost().encoded_payload_bytes())
+                .map_err(|_| PersistentReductionError::SparseXorCodec)?;
+            let prepared = sparse
+                .into_encoding()
+                .into_prepared_record()
+                .map(PreparedDependentRecord::from)
+                .map_err(|_| PersistentReductionError::SparseXorCodec)?;
+            if best.as_ref().is_none_or(|(bytes, _)| sparse_bytes < *bytes) {
+                *best = Some((sparse_bytes, prepared));
+            }
+        }
+
+        if *remaining_trials != 0 {
+            counters.prefix_trials.fetch_add(1, Ordering::Relaxed);
+            *remaining_trials -= 1;
+            if let Some(trial) = ZstdPrefixCodec::encode_prehashed_trial(
+                base,
+                *target_id,
                 target,
-                trial_cap,
+                best.as_ref()
+                    .map_or(*maximum_encoded_payload_bytes, |(bytes, _)| {
+                        (*maximum_encoded_payload_bytes).min(bytes.saturating_sub(1))
+                    }),
             )
-            .map_err(|_| PersistentReductionError::SparseXorCodec)?;
-            if let Some(sparse) = sparse.filter(|s| s.cost().run_count() != 0) {
-                let sparse_bytes = usize::try_from(sparse.cost().encoded_payload_bytes())
-                    .map_err(|_| PersistentReductionError::SparseXorCodec)?;
-                let prepared = sparse
+            .map_err(|_| PersistentReductionError::PrefixCodec)?
+            {
+                let prefix_bytes = usize::try_from(trial.encoded_payload_bytes())
+                    .map_err(|_| PersistentReductionError::PrefixCodec)?;
+                let prepared = trial
                     .into_encoding()
                     .into_prepared_record()
                     .map(PreparedDependentRecord::from)
-                    .map_err(|_| PersistentReductionError::SparseXorCodec)?;
-                if best.as_ref().is_none_or(|(bytes, _)| sparse_bytes < *bytes) {
-                    best = Some((sparse_bytes, prepared));
-                }
-            }
-
-            if remaining_trials != 0 {
-                counters.prefix_trials.fetch_add(1, Ordering::Relaxed);
-                remaining_trials -= 1;
-                if let Some(trial) = ZstdPrefixCodec::encode_prehashed_trial(
-                    base,
-                    target_id,
-                    target,
-                    best.as_ref()
-                        .map_or(maximum_encoded_payload_bytes, |(bytes, _)| {
-                            maximum_encoded_payload_bytes.min(bytes.saturating_sub(1))
-                        }),
-                )
-                .map_err(|_| PersistentReductionError::PrefixCodec)?
-                {
-                    let prefix_bytes = usize::try_from(trial.encoded_payload_bytes())
-                        .map_err(|_| PersistentReductionError::PrefixCodec)?;
-                    let prepared = trial
-                        .into_encoding()
-                        .into_prepared_record()
-                        .map(PreparedDependentRecord::from)
-                        .map_err(|_| PersistentReductionError::PrefixCodec)?;
-                    if best.as_ref().is_none_or(|(bytes, _)| prefix_bytes < *bytes) {
-                        best = Some((prefix_bytes, prepared));
-                    }
+                    .map_err(|_| PersistentReductionError::PrefixCodec)?;
+                if best.as_ref().is_none_or(|(bytes, _)| prefix_bytes < *bytes) {
+                    *best = Some((prefix_bytes, prepared));
                 }
             }
         }
+        Ok(())
+    }
+
+    fn finish(self, counters: &ReductionCounterStripe) -> PersistentChunkPlan {
+        let Self {
+            independent,
+            best,
+            target_id,
+            ..
+        } = self;
         let Some((best_bytes, best)) = best else {
             counters
                 .independent_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(PersistentChunkPlan::Independent(independent));
+            return PersistentChunkPlan::Independent(independent);
         };
         if !accept_dependent_v1(independent.encoded_payload_bytes(), best_bytes) {
             counters
                 .independent_fallbacks
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(PersistentChunkPlan::Independent(independent));
+            return PersistentChunkPlan::Independent(independent);
         }
         let saved_payload_bytes = independent
             .encoded_payload_bytes()
@@ -482,8 +760,50 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             u64::try_from(saved_payload_bytes).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        Ok(PersistentChunkPlan::Dependent(best))
+        PersistentChunkPlan::Dependent(best)
     }
+}
+
+struct ReductionTimer<'a> {
+    counter: &'a AtomicU64,
+    started: std::time::Instant,
+}
+
+impl<'a> ReductionTimer<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        Self {
+            counter,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for ReductionTimer<'_> {
+    fn drop(&mut self) {
+        let ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let _ = self
+            .counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(ns))
+            });
+    }
+}
+
+fn timed_fingerprint(
+    target: &[u8],
+    counters: &ReductionCounterStripe,
+) -> Result<SimilarityFingerprint, crate::reduction_similarity::SimilarityError> {
+    let _phase = ReductionTimer::new(&counters.fingerprint_ns);
+    SimilarityFingerprint::v1(target)
+}
+
+fn map_admitted<T: Send, R: Send>(
+    inputs: Vec<T>,
+    desired: NonZeroUsize,
+    admission: &crate::WorkerPermits,
+    apply: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    admission.map(inputs, desired, apply)
 }
 
 fn reduction_counter_stripe(chunk_id: ChunkId) -> usize {
@@ -512,6 +832,10 @@ pub struct PersistentReductionStatus {
     no_candidate_fallbacks: u64,
     saved_payload_bytes: u64,
     errors: u64,
+    fingerprint_ns: u64,
+    candidate_lookup_ns: u64,
+    base_read_ns: u64,
+    codec_trial_ns: u64,
 }
 
 macro_rules! reduction_status_getter {
@@ -524,6 +848,11 @@ macro_rules! reduction_status_getter {
 }
 
 impl PersistentReductionStatus {
+    reduction_status_getter!(fingerprint_ns, fingerprint_ns, u64);
+    reduction_status_getter!(candidate_lookup_ns, candidate_lookup_ns, u64);
+    reduction_status_getter!(base_read_ns, base_read_ns, u64);
+    reduction_status_getter!(codec_trial_ns, codec_trial_ns, u64);
+
     reduction_status_getter!(online, online, crate::OnlineSimilarityStatus);
     reduction_status_getter!(enabled, enabled, bool);
     reduction_status_getter!(queries, queries, u64);
@@ -606,6 +935,28 @@ mod tests {
     use std::mem::{align_of, size_of};
 
     use super::*;
+
+    #[test]
+    fn small_cpu_batches_leave_unused_permits_for_concurrent_stages() {
+        let total = NonZeroUsize::new(10).unwrap();
+        let admission = crate::WorkerPermits::new(total);
+        let observed = map_admitted(vec![()], total, &admission, |()| {
+            let spare = admission
+                .try_acquire(NonZeroUsize::new(9).unwrap())
+                .unwrap();
+            spare.workers().get()
+        });
+        assert_eq!(observed, [9]);
+        assert_eq!(admission.available(), 10);
+        assert!(map_admitted(Vec::<()>::new(), total, &admission, |()| ()).is_empty());
+
+        let held = admission.acquire(NonZeroUsize::new(8).unwrap());
+        let outputs = map_admitted((0..32).collect(), total, &admission, |n| n * n);
+        assert_eq!(outputs, (0..32).map(|n| n * n).collect::<Vec<_>>());
+        assert_eq!(admission.available(), 2);
+        drop(held);
+        assert_eq!(admission.available(), 10);
+    }
 
     #[test]
     fn dependent_caps_match_both_acceptance_thresholds_including_rounding() {

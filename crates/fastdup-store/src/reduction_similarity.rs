@@ -16,6 +16,10 @@ const MAX_LOGICAL_CHUNK_BYTES_U32: u32 = 256 * 1_024;
 const SHINGLE_BYTES: usize = 32;
 const SHINGLE_ROTATION: u32 = 32;
 const MINIMIZER_SPAN: usize = 64;
+const MAX_MINIMIZERS_V1: usize = MAX_LOGICAL_CHUNK_BYTES.div_ceil(MINIMIZER_SPAN);
+// Every minimizer contributes one +/-1 vote. Keep the accumulator width tied
+// to the durable profile's Chunk/span bounds, including the final partial span.
+const _: () = assert!(MAX_MINIMIZERS_V1 <= i16::MAX as usize);
 const DELTA_DEPENDENCY_BYTES: u32 = 32;
 const DELTA_RUN_COUNT_BYTES: u32 = 4;
 const DELTA_RUN_ENTRY_BYTES: u32 = 8;
@@ -77,12 +81,25 @@ impl SimilarityFingerprint {
             }
             accumulator.observe_shingle(rolling);
 
-            for offset in SHINGLE_BYTES..bytes.len() {
-                let outgoing = byte_hash(bytes[offset - SHINGLE_BYTES]);
-                let incoming = byte_hash(bytes[offset]);
-                rolling =
-                    rolling.rotate_left(1) ^ outgoing.rotate_left(SHINGLE_ROTATION) ^ incoming;
-                accumulator.observe_shingle(rolling);
+            // The first shingle already occupies one slot. Keep the rolling
+            // dependency in the inner loop, but commit span bookkeeping once
+            // per 64 shingles. This preserves the exact v1 minimizer boundaries.
+            let mut offset = SHINGLE_BYTES;
+            while offset < bytes.len() {
+                let take = (MINIMIZER_SPAN - accumulator.span_length).min(bytes.len() - offset);
+                let mut minimum = accumulator.span_minimum;
+                for position in offset..offset + take {
+                    rolling = rolling.rotate_left(1)
+                        ^ byte_hash(bytes[position - SHINGLE_BYTES]).rotate_left(SHINGLE_ROTATION)
+                        ^ byte_hash(bytes[position]);
+                    minimum = minimum.min(rolling);
+                }
+                accumulator.span_minimum = minimum;
+                accumulator.span_length += take;
+                if accumulator.span_length == MINIMIZER_SPAN {
+                    accumulator.commit_minimizer();
+                }
+                offset += take;
             }
         }
 
@@ -141,7 +158,7 @@ impl SimilarityFingerprint {
 
 struct FingerprintAccumulator {
     superfeatures: [u64; 4],
-    sketch_votes: [i32; 512],
+    sketch_votes: [i16; 512],
     span_minimum: u64,
     span_length: usize,
     minimizer_count: usize,
@@ -169,6 +186,10 @@ impl FingerprintAccumulator {
     }
 
     fn commit_minimizer(&mut self) {
+        assert!(
+            self.minimizer_count < MAX_MINIMIZERS_V1,
+            "ASSERT: v1 vote accumulation remains inside its i16 bound"
+        );
         assert_ne!(
             self.span_length, 0,
             "ASSERT: a minimizer commit always has an observed shingle"
@@ -1550,6 +1571,41 @@ mod tests {
             ]
         );
         assert_eq!(fingerprint.distance(fingerprint), Ok(0));
+    }
+
+    #[test]
+    fn blocked_shingles_match_the_original_bytewise_profile_at_span_edges() {
+        let mut lengths = (1..=224).collect::<Vec<_>>();
+        lengths.extend([4095, 4096, 4097, 65535, 65536, 65537, 262_144]);
+        for length in lengths {
+            let bytes = fixture_bytes(length, 0x8295);
+            let mut accumulator = super::FingerprintAccumulator::new(false);
+            if length < super::SHINGLE_BYTES {
+                let rolling = bytes.iter().fold(0_u64, |rolling, &byte| {
+                    rolling.rotate_left(1) ^ byte_hash(byte)
+                });
+                accumulator.observe_shingle(rolling);
+            } else {
+                let mut rolling = bytes[..super::SHINGLE_BYTES]
+                    .iter()
+                    .fold(0_u64, |rolling, &byte| {
+                        rolling.rotate_left(1) ^ byte_hash(byte)
+                    });
+                accumulator.observe_shingle(rolling);
+                for offset in super::SHINGLE_BYTES..length {
+                    rolling = rolling.rotate_left(1)
+                        ^ byte_hash(bytes[offset - super::SHINGLE_BYTES])
+                            .rotate_left(super::SHINGLE_ROTATION)
+                        ^ byte_hash(bytes[offset]);
+                    accumulator.observe_shingle(rolling);
+                }
+            }
+            assert_eq!(
+                SimilarityFingerprint::v1(&bytes).unwrap(),
+                accumulator.finish(),
+                "v1 changed at length {length}"
+            );
+        }
     }
 
     #[test]

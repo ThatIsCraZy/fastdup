@@ -21,6 +21,8 @@ pub enum StoreError {
     RevisionConflict,
     #[error("an incomplete provisioning journal requires operator recovery")]
     ProvisioningIncomplete,
+    #[error("invalid UI language or unknown user")]
+    InvalidUserPreference,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +50,10 @@ impl ControlStore {
                 must_change INTEGER NOT NULL,
                 failed_attempts INTEGER NOT NULL DEFAULT 0,
                 locked_until INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                username TEXT PRIMARY KEY REFERENCES users(username),
+                ui_language TEXT NOT NULL CHECK(ui_language IN ('de', 'en'))
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
@@ -110,6 +116,38 @@ impl ControlStore {
         };
         store.ensure_default_settings()?;
         Ok(store)
+    }
+
+    pub fn user_ui_language(&self, username: &str) -> Result<String, StoreError> {
+        let language: Option<String> = self
+            .locked()?
+            .query_row(
+                "SELECT ui_language FROM user_preferences WHERE username = ?1",
+                [username],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match language.as_deref() {
+            None | Some("de") => Ok("de".into()),
+            Some("en") => Ok("en".into()),
+            Some(_) => Err(StoreError::InvalidUserPreference),
+        }
+    }
+
+    pub fn set_user_ui_language(&self, username: &str, language: &str) -> Result<(), StoreError> {
+        if !matches!(language, "de" | "en") {
+            return Err(StoreError::InvalidUserPreference);
+        }
+        let changed = self.locked()?.execute(
+            "INSERT INTO user_preferences(username, ui_language)
+             SELECT username, ?2 FROM users WHERE username = ?1
+             ON CONFLICT(username) DO UPDATE SET ui_language = excluded.ui_language",
+            params![username, language],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidUserPreference);
+        }
+        Ok(())
     }
 
     fn locked(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
@@ -397,6 +435,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> Result<JobStatus, rusqlite::Error> {
 
 #[derive(Clone, Debug)]
 pub struct TelemetryStore {
+    path: std::path::PathBuf,
     connection: Arc<Mutex<Connection>>,
 }
 
@@ -408,6 +447,7 @@ impl TelemetryStore {
             })?;
         }
         let connection = Connection::open(path)?;
+        connection.busy_timeout(std::time::Duration::from_millis(500))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.execute_batch(
@@ -432,6 +472,7 @@ impl TelemetryStore {
         )?;
         make_database_group_writable(path)?;
         Ok(Self {
+            path: path.to_path_buf(),
             connection: Arc::new(Mutex::new(connection)),
         })
     }
@@ -441,12 +482,15 @@ impl TelemetryStore {
     }
 
     pub fn insert(&self, observed_at: i64, snapshot: &TelemetrySnapshot) -> Result<(), StoreError> {
+        // The live chart is a sliding window, not part of one historical measurement.
+        let mut measurement = snapshot.clone();
+        measurement.series.clear();
         self.locked()?.execute(
             "INSERT OR REPLACE INTO samples_raw(observed_at, sequence, body) VALUES(?1, ?2, ?3)",
             params![
                 observed_at,
                 snapshot.sequence,
-                serde_json::to_string(snapshot)?
+                serde_json::to_string(&measurement)?
             ],
         )?;
         Ok(())
@@ -458,8 +502,13 @@ impl TelemetryStore {
         to: i64,
         limit: usize,
     ) -> Result<Vec<TelemetrySnapshot>, StoreError> {
+        if limit == 0 || from > to {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(1_500);
         let connection = self.locked()?;
         let span = to.saturating_sub(from);
+        let bucket_seconds = (span / i64::try_from(limit).unwrap_or(1_500)).saturating_add(1);
         let table = if span > 604_800 {
             "samples_60s"
         } else if span > 86_400 {
@@ -468,11 +517,20 @@ impl TelemetryStore {
             "samples_raw"
         };
         let sql = format!(
-            "SELECT body FROM {table} WHERE observed_at >= ?1 AND observed_at <= ?2 ORDER BY observed_at LIMIT ?3"
+            // SQLite takes bare columns from the row supplying MIN(observed_at).
+            // Return a representative measurement across the entire selected range.
+            "SELECT json_set(body, '$.series', json('[]')), MIN(observed_at) FROM {table}
+             WHERE observed_at >= ?1 AND observed_at <= ?2
+             GROUP BY (observed_at - ?1) / ?3 ORDER BY MIN(observed_at) LIMIT ?4"
         );
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
-            params![from, to, i64::try_from(limit).unwrap_or(i64::MAX)],
+            params![
+                from,
+                to,
+                bucket_seconds,
+                i64::try_from(limit).unwrap_or(1_500)
+            ],
             |row| row.get::<_, String>(0),
         )?;
         let mut result = Vec::new();
@@ -483,24 +541,39 @@ impl TelemetryStore {
     }
 
     pub fn retain_and_roll_up(&self, now: i64) -> Result<(), StoreError> {
-        let connection = self.locked()?;
-        roll_up(&connection, "samples_raw", "samples_10s", 10, now - 604_800)?;
+        // Maintenance uses its own bounded SQLite cache and never holds the sampler mutex.
+        let connection = Connection::open(&self.path)?;
+        connection.busy_timeout(std::time::Duration::from_millis(500))?;
+        connection.pragma_update(None, "cache_size", -2048)?;
+        let writer = Connection::open(&self.path)?;
+        writer.busy_timeout(std::time::Duration::from_millis(500))?;
+        writer.pragma_update(None, "cache_size", -2048)?;
+        writer.pragma_update(None, "synchronous", "NORMAL")?;
         roll_up(
             &connection,
+            &writer,
+            "samples_raw",
+            "samples_10s",
+            10,
+            now - 604_800,
+        )?;
+        roll_up(
+            &connection,
+            &writer,
             "samples_10s",
             "samples_60s",
             60,
             now - 7_776_000,
         )?;
-        connection.execute(
+        writer.execute(
             "DELETE FROM samples_raw WHERE observed_at < ?1",
             [now - 86_400],
         )?;
-        connection.execute(
+        writer.execute(
             "DELETE FROM samples_10s WHERE observed_at < ?1",
             [now - 604_800],
         )?;
-        connection.execute(
+        writer.execute(
             "DELETE FROM samples_60s WHERE observed_at < ?1",
             [now - 7_776_000],
         )?;
@@ -534,70 +607,281 @@ fn io_store_error(error: std::io::Error) -> StoreError {
     StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
+/// One bucket stays in memory regardless of retention length or sample count.
+struct TelemetryAverage {
+    latest: TelemetrySnapshot,
+    sums: [f64; 6],
+    count: u64,
+}
+
+impl TelemetryAverage {
+    fn new() -> Self {
+        Self {
+            latest: TelemetrySnapshot::default(),
+            sums: [0.0; 6],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, mut sample: TelemetrySnapshot) {
+        for (sum, value) in self.sums.iter_mut().zip([
+            sample.frontend_read_mbps,
+            sample.frontend_write_mbps,
+            sample.dedup_rate,
+            sample.reduction_ratio,
+            sample.cpu_percent,
+            sample.ram_percent,
+        ]) {
+            *sum += value;
+        }
+        self.count += 1;
+        sample.series.clear();
+        self.latest = sample;
+    }
+
+    fn finish(mut self) -> TelemetrySnapshot {
+        let count = self.count.max(1) as f64;
+        self.latest.frontend_read_mbps = self.sums[0] / count;
+        self.latest.frontend_write_mbps = self.sums[1] / count;
+        self.latest.dedup_rate = self.sums[2] / count;
+        self.latest.reduction_ratio = self.sums[3] / count;
+        self.latest.cpu_percent = self.sums[4] / count;
+        self.latest.ram_percent = self.sums[5] / count;
+        self.latest
+    }
+}
+
 fn roll_up(
     connection: &Connection,
+    writer: &Connection,
     source: &str,
     target: &str,
     bucket_seconds: i64,
     from: i64,
 ) -> Result<(), StoreError> {
+    // Strip legacy chart windows before decoding; old databases need no migration.
     let sql = format!(
-        "SELECT observed_at, body FROM {source} WHERE observed_at >= ?1 ORDER BY observed_at"
+        "SELECT observed_at, json_set(body, '$.series', json('[]')) FROM {source}
+         WHERE observed_at >= ?1 ORDER BY observed_at"
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map([from], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
-    let mut buckets = std::collections::BTreeMap::<i64, Vec<TelemetrySnapshot>>::new();
+    let insert = format!("INSERT OR REPLACE INTO {target}(observed_at, body) VALUES(?1, ?2)");
+    let mut pending: Option<(i64, TelemetryAverage)> = None;
     for row in rows {
         let (observed_at, body) = row?;
-        buckets
-            .entry(observed_at - observed_at.rem_euclid(bucket_seconds))
-            .or_default()
+        let bucket = observed_at - observed_at.rem_euclid(bucket_seconds);
+        if pending.as_ref().is_some_and(|(time, _)| *time != bucket) {
+            let (time, average) = pending.take().expect("pending bucket exists");
+            writer.execute(
+                &insert,
+                params![time, serde_json::to_string(&average.finish())?],
+            )?;
+        }
+        pending
+            .get_or_insert_with(|| (bucket, TelemetryAverage::new()))
+            .1
             .push(serde_json::from_str(&body)?);
     }
-    let insert = format!("INSERT OR REPLACE INTO {target}(observed_at, body) VALUES(?1, ?2)");
-    for (observed_at, samples) in buckets {
-        let snapshot = average_snapshots(&samples);
-        connection.execute(
+    if let Some((time, average)) = pending {
+        writer.execute(
             &insert,
-            params![observed_at, serde_json::to_string(&snapshot)?],
+            params![time, serde_json::to_string(&average.finish())?],
         )?;
     }
     Ok(())
 }
 
-fn average_snapshots(samples: &[TelemetrySnapshot]) -> TelemetrySnapshot {
-    let mut result = samples.last().cloned().unwrap_or_default();
-    if samples.is_empty() {
-        return result;
-    }
-    let count = samples.len() as f64;
-    result.frontend_read_mbps = samples
-        .iter()
-        .map(|sample| sample.frontend_read_mbps)
-        .sum::<f64>()
-        / count;
-    result.frontend_write_mbps = samples
-        .iter()
-        .map(|sample| sample.frontend_write_mbps)
-        .sum::<f64>()
-        / count;
-    result.dedup_rate = samples.iter().map(|sample| sample.dedup_rate).sum::<f64>() / count;
-    result.reduction_ratio = samples
-        .iter()
-        .map(|sample| sample.reduction_ratio)
-        .sum::<f64>()
-        / count;
-    result.cpu_percent = samples.iter().map(|sample| sample.cpu_percent).sum::<f64>() / count;
-    result.ram_percent = samples.iter().map(|sample| sample.ram_percent).sum::<f64>() / count;
-    result.series.clear();
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_language_is_validated_persisted_and_isolated_per_user() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        {
+            let store = ControlStore::open(&path).unwrap();
+            store.locked().unwrap().execute(
+                "INSERT INTO users(username,password_hash,must_change) VALUES('alice','test',0),('bob','test',0)", [],
+            ).unwrap();
+            assert_eq!(store.user_ui_language("alice").unwrap(), "de");
+            store.set_user_ui_language("alice", "en").unwrap();
+            assert_eq!(store.user_ui_language("bob").unwrap(), "de");
+            assert!(store.set_user_ui_language("bob", "fr").is_err());
+            assert!(store.set_user_ui_language("unknown", "en").is_err());
+            assert!(
+                store
+                    .locked()
+                    .unwrap()
+                    .execute("INSERT INTO user_preferences VALUES('bob','fr')", [])
+                    .is_err()
+            );
+        }
+        let store = ControlStore::open(&path).unwrap();
+        assert_eq!(store.user_ui_language("alice").unwrap(), "en");
+        assert_eq!(store.user_ui_language("bob").unwrap(), "de");
+    }
+
+    #[test]
+    fn historical_samples_do_not_repeat_live_chart_series() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = TelemetryStore::open(&directory.path().join("telemetry.db")).unwrap();
+        let snapshot = TelemetrySnapshot {
+            sequence: 1,
+            series: vec![
+                crate::SeriesPoint {
+                    time: "sample".into(),
+                    read: 4.0,
+                    write: 2.0
+                };
+                900
+            ],
+            ..TelemetrySnapshot::default()
+        };
+        store.insert(100, &snapshot).unwrap();
+        let body: String = store
+            .locked()
+            .unwrap()
+            .query_row("SELECT body FROM samples_raw", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            body.len() < 4096,
+            "history must store one measurement, not 900 repeated chart points"
+        );
+        assert_eq!(snapshot.series.len(), 900, "live chart remains intact");
+        assert!(store.query(0, 200, 10).unwrap()[0].series.is_empty());
+    }
+
+    #[test]
+    fn history_bounds_legacy_series_and_covers_the_requested_range() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = TelemetryStore::open(&directory.path().join("telemetry.db")).unwrap();
+        let snapshot = TelemetrySnapshot {
+            series: vec![
+                crate::SeriesPoint {
+                    time: "legacy".into(),
+                    read: 1.0,
+                    write: 2.0
+                };
+                900
+            ],
+            ..TelemetrySnapshot::default()
+        };
+        let body = serde_json::to_string(&snapshot).unwrap();
+        store
+            .locked()
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<99)
+             INSERT INTO samples_raw SELECT x,x,json_set(?1, '$.sequence', x) FROM n",
+                [&body],
+            )
+            .unwrap();
+        let samples = store.query(0, 99, 10).unwrap();
+        assert_eq!(samples.len(), 10);
+        assert_eq!(
+            samples.last().unwrap().sequence,
+            90,
+            "cover the end, not just the first ten seconds"
+        );
+        assert!(samples.iter().all(|sample| sample.series.is_empty()));
+        assert!(store.query(0, 99, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rollup_can_publish_while_the_sampler_advances_its_read_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.db");
+        let store = TelemetryStore::open(&path).unwrap();
+        store.insert(100, &TelemetrySnapshot::default()).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        let mut statement = reader.prepare("SELECT body FROM samples_raw").unwrap();
+        let mut rows = statement.query([]).unwrap();
+        assert!(rows.next().unwrap().is_some());
+        // A concurrent sampler commits after maintenance acquired its read snapshot.
+        store.insert(101, &TelemetrySnapshot::default()).unwrap();
+        roll_up(&reader, &writer, "samples_raw", "samples_10s", 10, 0).unwrap();
+        assert_eq!(
+            writer
+                .query_row("SELECT count(*) FROM samples_10s", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn streaming_rollup_preserves_averages_and_latest_metadata() {
+        let mut average = TelemetryAverage::new();
+        for value in [2.0, 4.0, 9.0] {
+            average.push(TelemetrySnapshot {
+                observed_at: value.to_string(),
+                frontend_read_mbps: value,
+                frontend_write_mbps: value * 2.0,
+                dedup_rate: value * 3.0,
+                reduction_ratio: value * 4.0,
+                cpu_percent: value * 5.0,
+                ram_percent: value * 6.0,
+                ..TelemetrySnapshot::default()
+            });
+        }
+        let result = average.finish();
+        assert_eq!(result.observed_at, "9");
+        for (actual, expected) in [
+            (result.frontend_read_mbps, 5.0),
+            (result.frontend_write_mbps, 10.0),
+            (result.dedup_rate, 15.0),
+            (result.reduction_ratio, 20.0),
+            (result.cpu_percent, 25.0),
+            (result.ram_percent, 30.0),
+        ] {
+            assert!((actual - expected).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual RSS probe; run directly under /usr/bin/time"]
+    fn telemetry_rollup_memory_probe() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = TelemetryStore::open(&directory.path().join("telemetry.db")).unwrap();
+        let snapshot = TelemetrySnapshot {
+            series: vec![
+                crate::SeriesPoint {
+                    time: "2026-09-05T12:00:00Z".into(),
+                    read: 100.0,
+                    write: 50.0
+                };
+                900
+            ],
+            ..TelemetrySnapshot::default()
+        };
+        let body = serde_json::to_string(&snapshot).unwrap();
+        store
+            .locked()
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<3599)
+             INSERT INTO samples_raw SELECT 100000+x,x,?1 FROM n",
+                [&body],
+            )
+            .unwrap();
+        let start = std::time::Instant::now();
+        store.retain_and_roll_up(103_600).unwrap();
+        eprintln!("rollup elapsed: {:?}", start.elapsed());
+        assert_eq!(
+            store
+                .locked()
+                .unwrap()
+                .query_row("SELECT count(*) FROM samples_10s", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            360
+        );
+    }
 
     #[test]
     fn settings_update_is_revision_guarded() {

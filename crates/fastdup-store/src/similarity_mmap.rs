@@ -31,6 +31,7 @@ impl ImmutableSimilarityRun {
     pub(crate) fn open(
         lease: ImmutableFileLease,
         expected: SimilarityIndexRunDescriptor,
+        observe_bucket_page: impl FnMut(SimilarityBucketKey),
     ) -> Result<Self, SimilarityIndexStoreError> {
         let metadata = lease.file().metadata()?;
         if !metadata.is_file() || metadata.len() != expected.file_length() {
@@ -61,7 +62,8 @@ impl ImmutableSimilarityRun {
             return Err(SimilarityIndexStoreError::IdentityMismatch);
         }
 
-        let (minimum_bucket_key, maximum_bucket_key) = audit_mapping(&mapping, descriptor)?;
+        let (minimum_bucket_key, maximum_bucket_key) =
+            audit_mapping(&mapping, descriptor, observe_bucket_page)?;
         Ok(Self {
             mapping,
             _lease: lease,
@@ -93,6 +95,7 @@ impl ImmutableSimilarityRun {
 fn audit_mapping(
     mapping: &[u8],
     descriptor: SimilarityIndexRunDescriptor,
+    mut observe_bucket_page: impl FnMut(SimilarityBucketKey),
 ) -> Result<(SimilarityBucketKey, SimilarityBucketKey), SimilarityIndexStoreError> {
     let mut audit = descriptor.start_hash_audit();
     let header = exact_range(mapping, 0, SIMILARITY_INDEX_HEADER_BYTES)?;
@@ -119,6 +122,7 @@ fn audit_mapping(
         let page = descriptor.decode_bucket_page(ordinal, bytes)?;
         minimum_bucket_key.get_or_insert_with(|| page.first_key());
         maximum_bucket_key = Some(page.last_key());
+        observe_bucket_page(page.last_key());
         for reference in page.references() {
             let entry = mapped_entry(
                 mapping,

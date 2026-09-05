@@ -27,9 +27,15 @@ impl TlsIdentity {
         hostnames: &[String],
     ) -> Result<Self, TlsIdentityError> {
         std::fs::create_dir_all(directory)?;
-        let certificate_path = directory.join("control-plane.crt");
-        let private_key_path = directory.join("control-plane.key");
-        if !certificate_path.exists() || !private_key_path.exists() {
+        let active = directory.join("active");
+        let selected = if std::fs::symlink_metadata(&active).is_ok() {
+            active
+        } else {
+            directory.to_path_buf()
+        };
+        let certificate_path = selected.join("control-plane.crt");
+        let private_key_path = selected.join("control-plane.key");
+        if selected == directory && (!certificate_path.exists() || !private_key_path.exists()) {
             generate(&certificate_path, &private_key_path, hostnames)?;
         }
         ensure_private_mode(&certificate_path)?;
@@ -43,15 +49,52 @@ impl TlsIdentity {
     }
 
     pub fn regenerate(directory: &Path, hostnames: &[String]) -> Result<Self, TlsIdentityError> {
+        let (certificate, key) = Self::self_signed_pem(hostnames)?;
+        Self::publish_pem(directory, &certificate, &key)
+    }
+
+    pub fn self_signed_pem(hostnames: &[String]) -> Result<(Vec<u8>, Vec<u8>), TlsIdentityError> {
+        let mut names = hostnames.to_vec();
+        if !names.iter().any(|name| name == "localhost") {
+            names.push("localhost".to_owned());
+        }
+        let generated = generate_simple_self_signed(names)?;
+        Ok((
+            generated.cert.pem().into_bytes(),
+            generated.signing_key.serialize_pem().into_bytes(),
+        ))
+    }
+
+    /// Publishes a complete pair through one atomic pointer; old identities remain recoverable.
+    pub fn publish_pem(
+        directory: &Path,
+        certificate: &[u8],
+        key: &[u8],
+    ) -> Result<Self, TlsIdentityError> {
         std::fs::create_dir_all(directory)?;
-        let certificate_path = directory.join("control-plane.crt");
-        let private_key_path = directory.join("control-plane.key");
-        generate(&certificate_path, &private_key_path, hostnames)?;
-        let certificate = std::fs::read(&certificate_path)?;
+        let name = format!("identity-{}", uuid::Uuid::new_v4());
+        let generation = directory.join(&name);
+        std::fs::create_dir(&generation)?;
+        std::fs::set_permissions(&generation, std::fs::Permissions::from_mode(0o750))?;
+        let stage = directory.join(format!(".active-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<(), std::io::Error> {
+            publish_private(&generation.join("control-plane.crt"), certificate)?;
+            publish_private(&generation.join("control-plane.key"), key)?;
+            std::os::unix::fs::symlink(&name, &stage)?;
+            std::fs::File::open(directory)?.sync_all()?;
+            std::fs::rename(&stage, directory.join("active"))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&stage);
+            let _ = std::fs::remove_dir_all(&generation);
+        }
+        result?;
+        std::fs::File::open(directory)?.sync_all()?;
         Ok(Self {
-            certificate_path,
-            private_key_path,
-            fingerprint: fingerprint(&certificate),
+            certificate_path: generation.join("control-plane.crt"),
+            private_key_path: generation.join("control-plane.key"),
+            fingerprint: fingerprint(certificate),
         })
     }
 }
@@ -102,7 +145,10 @@ fn ensure_private_mode(path: &Path) -> Result<(), std::io::Error> {
 }
 
 fn fingerprint(certificate: &[u8]) -> String {
-    let digest = Sha256::digest(certificate);
+    let der = rustls_pemfile::certs(&mut std::io::Cursor::new(certificate))
+        .next()
+        .and_then(Result::ok);
+    let digest = Sha256::digest(der.as_ref().map_or(certificate, |der| der.as_ref()));
     let mut result = String::with_capacity(digest.len() * 3 - 1);
     for (index, byte) in digest.iter().enumerate() {
         if index > 0 {

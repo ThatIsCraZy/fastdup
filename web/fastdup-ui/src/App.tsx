@@ -1,3 +1,8 @@
+import { WebUsersSettings, CertificateSettings } from "./settings-access";
+import { RecentJobs } from "./recent-jobs";
+import { DetailTelemetryPanel } from "./detail-telemetry";
+import { appendResourceSample, resourceChartOption, type ResourceSample } from "./resource-history";
+import { I18nProvider, useI18n, type UiLanguage } from "./i18n";
 import {
   FormEvent,
   useCallback,
@@ -6,12 +11,18 @@ import {
   useRef,
   useState,
 } from "react";
+import applianceMark from "./assets/fastdup-mark-impuls.svg";
 import ReactECharts from "echarts-for-react";
 import {
   Activity,
   AlertTriangle,
   Bell,
-  Box,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Layers3,
+  FolderSymlink,
+  ScrollText,
+  SlidersHorizontal,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -35,7 +46,6 @@ import {
   RefreshCcw,
   Save,
   ServerCog,
-  Settings,
   ShieldCheck,
   TerminalSquare,
   Trash2,
@@ -61,12 +71,12 @@ import {
 
 const navigation = [
   ["Übersicht", LayoutDashboard],
-  ["Repository", Database],
+  ["Repository", Layers3],
   ["Laufwerke", HardDrive],
-  ["SMB-Freigaben", Network],
+  ["SMB-Freigaben", FolderSymlink],
   ["Telemetrie", Activity],
-  ["Ereignisse", FileStack],
-  ["Einstellungen", Settings],
+  ["Ereignisse", ScrollText],
+  ["Einstellungen", SlidersHorizontal],
 ] as const;
 
 const stateLabels: Record<string, string> = {
@@ -80,6 +90,10 @@ const stateLabels: Record<string, string> = {
   scrubbing: "Offline-Scrub",
   error: "Fehler",
 };
+
+function repositoryTone(state: string) {
+  return state === "error" ? "error" : state === "online" ? "healthy" : state === "unmounted" || state === "uninitialized" ? "neutral" : "warning";
+}
 
 const jobLabels: Record<string, string> = {
   provision: "Provisionierung",
@@ -101,6 +115,60 @@ interface Notice {
   message: string;
 }
 
+function LanguageSelector({ value, onChange, disabled = false }: { value: UiLanguage; onChange: (value: UiLanguage) => void; disabled?: boolean }) {
+  const { t } = useI18n();
+  return <label className="language-control" title={t("Gilt nur für deinen Benutzer und wird auf der Appliance gespeichert.")}>
+    <span>{disabled ? t("Wird gespeichert…") : t("UI-Sprache")}</span>
+    <select aria-label={t("UI-Sprache")} value={value} onChange={event => onChange(event.target.value as UiLanguage)} disabled={disabled}>
+      <option value="de">Deutsch</option><option value="en">English</option>
+    </select>
+  </label>;
+}
+
+function UiPreferencesDialog({ language, saving, error, onChange, onClose, trigger }: {
+  language: UiLanguage;
+  saving: boolean;
+  error: string | null;
+  onChange: (language: UiLanguage) => void;
+  onClose: () => void;
+  trigger: React.RefObject<HTMLButtonElement | null>;
+}) {
+  const { t } = useI18n();
+  const modal = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = modal.current;
+    const previousOverflow = document.body.style.overflow;
+    dialog?.showModal();
+    document.body.style.overflow = "hidden";
+    return () => {
+      dialog?.close();
+      document.body.style.overflow = previousOverflow;
+      trigger.current?.focus();
+    };
+  }, [trigger]);
+  return <dialog ref={modal} className="ui-preferences-dialog" aria-labelledby="ui-preferences-title"
+    onCancel={event => { event.preventDefault(); onClose(); }}
+    onClick={event => { if (event.target === event.currentTarget) onClose(); }}
+    onKeyDown={event => {
+      if (event.key !== "Tab") return;
+      const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), select:not(:disabled)'));
+      const first = controls[0], last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }}>
+    <div className="ui-preferences-content">
+      <header><span className="preferences-icon"><SlidersHorizontal size={22} /></span>
+        <div><span className="section-kicker">{t("Persönliche Einstellungen")}</span><h2 id="ui-preferences-title">{t("UI-Einstellungen")}</h2></div>
+        <button className="preferences-close" onClick={onClose} aria-label={t("Dialog schließen")}><X size={18} /></button>
+      </header>
+      <LanguageSelector value={language} onChange={onChange} disabled={saving} />
+      <p>{t("Gilt nur für deinen Benutzer und wird auf der Appliance gespeichert.")}</p>
+      {error && <p role="alert" className="form-error">{t("Sprache konnte nicht gespeichert werden")}: {error}</p>}
+      <footer><Button onClick={onClose}>{t("Schließen")}</Button></footer>
+    </div>
+  </dialog>;
+}
+
 function NotificationCenter({
   notices,
   dismiss,
@@ -108,6 +176,7 @@ function NotificationCenter({
   notices: Notice[];
   dismiss: (id: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="notice-stack" aria-live="polite">
       {notices.map((notice) => (
@@ -127,7 +196,7 @@ function NotificationCenter({
             <strong>{notice.title}</strong>
             <small>{notice.message}</small>
           </span>
-          <button onClick={() => dismiss(notice.id)} aria-label="Meldung schließen">
+          <button onClick={() => dismiss(notice.id)} aria-label={t("Meldung schließen")}>
             <X />
           </button>
         </section>
@@ -136,7 +205,7 @@ function NotificationCenter({
   );
 }
 
-function formatBytes(value: number) {
+function formatBytes(value: number, locale: string) {
   if (!Number.isFinite(value)) return "—";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
   let current = value;
@@ -145,7 +214,7 @@ function formatBytes(value: number) {
     current /= 1000;
     unit += 1;
   }
-  return `${new Intl.NumberFormat("de-DE", { maximumFractionDigits: 1 }).format(current)} ${units[unit]}`;
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(current)} ${units[unit]}`;
 }
 
 function repositoryDisks(snapshot: ApplianceSnapshot): DiskTelemetry[] {
@@ -227,30 +296,32 @@ function AppSidebar({
   onChange: (item: string) => void;
   alarms: number;
 }) {
+  const { t } = useI18n();
   return (
     <aside className="sidebar">
       <div className="brand">
         <div className="brand-mark">
-          <Box size={21} />
+          <img src={applianceMark} alt="" />
         </div>
         <div>
           <strong>FastDup</strong>
-          <span>CONTROL PLANE</span>
+          <span>Control Plane</span>
         </div>
       </div>
       <div className="appliance-label">
-        <span>APPLIANCE</span>
+        <span>Appliance</span>
         <strong>fd-appliance-01</strong>
       </div>
-      <nav aria-label="Hauptnavigation">
+      <nav aria-label={t("Hauptnavigation")}>
         {navigation.map(([label, Icon]) => (
           <button
             key={label}
             className={active === label ? "active" : ""}
+            aria-current={active === label ? "page" : undefined}
             onClick={() => onChange(label)}
           >
             <Icon size={18} />
-            <span>{label}</span>
+            <span>{t(label)}</span>
             {label === "Ereignisse" && alarms > 0 && <i>{alarms}</i>}
           </button>
         ))}
@@ -258,8 +329,8 @@ function AppSidebar({
       <div className="sidebar-health">
         <ShieldCheck size={18} />
         <div>
-          <strong>System geschützt</strong>
-          <span>Kein Appliance-Reboot erforderlich</span>
+          <strong>{t("System geschützt")}</strong>
+          <span>{t("Kein Appliance-Reboot erforderlich")}</span>
         </div>
       </div>
     </aside>
@@ -281,6 +352,7 @@ function ConfirmDialog({
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div
       className="dialog-backdrop"
@@ -296,7 +368,7 @@ function ConfirmDialog({
         <button
           className="dialog-close"
           onClick={onClose}
-          aria-label="Schließen"
+          aria-label={t("Schließen")}
         >
           <X size={17} />
         </button>
@@ -306,9 +378,7 @@ function ConfirmDialog({
         <h2 id="dialog-title">{title}</h2>
         <div className="dialog-copy">{children}</div>
         <footer>
-          <Button variant="secondary" onClick={onClose}>
-            Abbrechen
-          </Button>
+          <Button variant="secondary" onClick={onClose}>{t("Abbrechen")}</Button>
           <Button variant={danger ? "danger" : "secondary"} onClick={onConfirm}>
             {confirmLabel}
           </Button>
@@ -327,6 +397,7 @@ function RepositoryHero({
   runCommand: (kind: "mount" | "unmount" | "offline_scrub") => void;
   busy: boolean;
 }) {
+  const { t, locale } = useI18n();
   const online = telemetry.repositoryState === "online";
   const mountable = ["unmounted", "error"].includes(
     telemetry.repositoryState,
@@ -340,20 +411,20 @@ function RepositoryHero({
           <Database size={25} />
         </span>
         <div>
-          <div className="eyebrow">FASTDUP REPOSITORY</div>
+          <div className="eyebrow">FastDup Repository</div>
           <h1>Production Repository</h1>
           <p>
-            <Badge className={online ? "healthy" : "warning"}>
+            <Badge className={repositoryTone(telemetry.repositoryState)}>
               <span className="status-dot" />
-              {stateLabels[telemetry.repositoryState]}
+              {t(stateLabels[telemetry.repositoryState])}
             </Badge>
             <span>
-              Generation {generation?.toLocaleString("de-DE") ?? "—"}
+              Generation {generation?.toLocaleString(locale) ?? "—"}
             </span>
             <span>
               {checkpointAge === undefined
                 ? "Checkpoint —"
-                : `Checkpoint vor ${checkpointAge} s`}
+                : t("Checkpoint vor {seconds} s", { seconds: checkpointAge })}
             </span>
           </p>
         </div>
@@ -388,9 +459,10 @@ function RepositoryHero({
   );
 }
 
-function throughputOption(snapshot: TelemetrySnapshot, extended = false) {
+function throughputOption(snapshot: TelemetrySnapshot, extended = false, locale = "de-DE") {
   return {
-    animationDuration: 350,
+    animation: false,
+    textStyle: { fontFamily: 'Inter, "Segoe UI", sans-serif' },
     grid: {
       left: 18,
       right: 20,
@@ -404,15 +476,15 @@ function throughputOption(snapshot: TelemetrySnapshot, extended = false) {
       borderColor: "#263947",
       textStyle: { color: "#d9e6ec" },
     },
-    legend: extended ? { top: 4, textStyle: { color: "#8297a1" } } : undefined,
+    legend: extended ? { top: 4, textStyle: { color: "#afbecb" } } : undefined,
     xAxis: {
       type: "category",
       boundaryGap: false,
       data: snapshot.series.map((point) => point.time),
       axisLabel: {
-        color: "#70838d",
+        color: "#afbecb",
         formatter: (value: string) =>
-          new Date(value).toLocaleTimeString("de-DE", {
+          new Date(value).toLocaleTimeString(locale, {
             hour: "2-digit",
             minute: "2-digit",
           }),
@@ -422,8 +494,8 @@ function throughputOption(snapshot: TelemetrySnapshot, extended = false) {
     yAxis: {
       type: "value",
       name: "MB/s",
-      nameTextStyle: { color: "#70838d" },
-      axisLabel: { color: "#70838d" },
+      nameTextStyle: { color: "#afbecb" },
+      axisLabel: { color: "#afbecb" },
       splitLine: { lineStyle: { color: "rgba(68,94,108,.24)" } },
     },
     series: [
@@ -434,6 +506,7 @@ function throughputOption(snapshot: TelemetrySnapshot, extended = false) {
         showSymbol: false,
         data: snapshot.series.map((point) => point.read),
         lineStyle: { color: "#22d3ee", width: 2 },
+        itemStyle: { color: "#22d3ee" },
         areaStyle: { color: "rgba(34,211,238,.12)" },
       },
       {
@@ -442,7 +515,8 @@ function throughputOption(snapshot: TelemetrySnapshot, extended = false) {
         smooth: 0.28,
         showSymbol: false,
         data: snapshot.series.map((point) => point.write),
-        lineStyle: { color: "#8b5cf6", width: 2 },
+        lineStyle: { color: "#b69aff", width: 2 },
+        itemStyle: { color: "#b69aff" },
         areaStyle: { color: "rgba(139,92,246,.09)" },
       },
     ],
@@ -460,7 +534,8 @@ function Overview({
   runCommand: (kind: "mount" | "unmount" | "offline_scrub") => void;
   busy: boolean;
 }) {
-  const chartOption = useMemo(() => throughputOption(snapshot), [snapshot]);
+  const { t, locale } = useI18n();
+  const chartOption = useMemo(() => throughputOption(snapshot, false, locale), [snapshot, locale]);
   const usedPercent = snapshot.dataCapacityBytes
     ? (snapshot.dataUsedBytes / snapshot.dataCapacityBytes) * 100
     : 0;
@@ -469,30 +544,30 @@ function Overview({
       <RepositoryHero telemetry={snapshot} runCommand={runCommand} busy={busy} />
       <section className="metric-grid">
         <MetricCard
-          icon={Activity}
+          icon={ArrowDownToLine}
           label="POSIX Frontend Read"
-          value={`${snapshot.frontendReadMbps.toFixed(1)} MB/s`}
-          detail="Live · 1 Sekunde"
+          value={`${snapshot.frontendReadMbps.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} MB/s`}
+          detail={t("Live · 1 Sekunde")}
         />
         <MetricCard
-          icon={Activity}
+          icon={ArrowUpFromLine}
           label="POSIX Frontend Write"
-          value={`${snapshot.frontendWriteMbps.toFixed(1)} MB/s`}
-          detail="Live · 1 Sekunde"
+          value={`${snapshot.frontendWriteMbps.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} MB/s`}
+          detail={t("Live · 1 Sekunde")}
           tone="violet"
         />
         <MetricCard
-          icon={CircleGauge}
+          icon={Layers3}
           label="Exact Dedup Rate"
-          value={`${snapshot.dedupRate.toFixed(1)} %`}
-          detail={`${snapshot.reductionRatio.toFixed(2)}× physische Gesamtreduktion`}
+          value={`${snapshot.dedupRate.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} %`}
+          detail={t("{ratio}× physische Gesamtreduktion", { ratio: snapshot.reductionRatio.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) })}
           tone="green"
         />
         <MetricCard
           icon={Cpu}
-          label="Systemressourcen"
-          value={`${snapshot.cpuPercent.toFixed(0)} % CPU`}
-          detail={`${snapshot.ramPercent.toFixed(0)} % RAM belegt`}
+          label={t("Systemressourcen")}
+          value={`${snapshot.cpuPercent.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} % CPU`}
+          detail={t("{percent} % RAM belegt", { percent: snapshot.ramPercent.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 }) })}
           tone="amber"
         />
       </section>
@@ -500,20 +575,19 @@ function Overview({
         <Card className="throughput-card">
           <CardHeader>
             <div>
-              <span className="section-kicker">LIVE PERFORMANCE</span>
+              <span className="section-kicker">Live performance</span>
               <h2>POSIX Frontend Throughput</h2>
             </div>
             <div className="legend">
               <span className="read">Read</span>
               <span className="write">Write</span>
-              <span className="range-label">Letzte 15 min</span>
+              <span className="range-label">{t("Letzte 15 min")}</span>
             </div>
           </CardHeader>
           <CardContent>
             <ReactECharts
               option={chartOption}
               style={{ height: 290 }}
-              notMerge
               lazyUpdate
             />
           </CardContent>
@@ -521,8 +595,8 @@ function Overview({
         <Card className="capacity-card">
           <CardHeader>
             <div>
-              <span className="section-kicker">DATA TIER</span>
-              <h2>Physische Kapazität</h2>
+              <span className="section-kicker">Data tier</span>
+              <h2>{t("Physische Kapazität")}</h2>
             </div>
             <Gauge size={19} />
           </CardHeader>
@@ -534,31 +608,30 @@ function Overview({
               }
             >
               <div>
-                <strong>{usedPercent.toFixed(0)}%</strong>
-                <span>belegt</span>
+                <strong>{usedPercent.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}%</strong>
+                <span>{t("belegt")}</span>
               </div>
             </div>
             <div className="capacity-numbers">
               <p>
-                <span>Verwendet</span>
-                <strong>{formatBytes(snapshot.dataUsedBytes)}</strong>
+                <span>{t("Verwendet")}</span>
+                <strong>{formatBytes(snapshot.dataUsedBytes, locale)}</strong>
               </p>
               <p>
-                <span>Verfügbar</span>
+                <span>{t("Verfügbar")}</span>
                 <strong>
                   {formatBytes(
-                    snapshot.dataCapacityBytes - snapshot.dataUsedBytes,
+                    snapshot.dataCapacityBytes - snapshot.dataUsedBytes, locale
                   )}
                 </strong>
               </p>
               <p>
-                <span>Gesamt</span>
-                <strong>{formatBytes(snapshot.dataCapacityBytes)}</strong>
+                <span>{t("Gesamt")}</span>
+                <strong>{formatBytes(snapshot.dataCapacityBytes, locale)}</strong>
               </p>
             </div>
             <div className="reserve-note">
-              <ShieldCheck size={15} /> 10 % Operating Reserve aktiv
-            </div>
+              <ShieldCheck size={15} />{t("10 % Operating Reserve aktiv")}</div>
           </CardContent>
         </Card>
       </section>
@@ -568,12 +641,13 @@ function Overview({
 }
 
 function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
+  const { t, locale } = useI18n();
   return (
     <Card className="disk-card">
       <CardHeader>
         <div>
-          <span className="section-kicker">STORAGE PATHS</span>
-          <h2>Outstanding I/O pro Target</h2>
+          <span className="section-kicker">Storage paths</span>
+          <h2>{t("Outstanding I/O pro Target")}</h2>
         </div>
         <Badge className="live">
           <span className="pulse" />1 s Sampler
@@ -581,8 +655,8 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
       </CardHeader>
       <CardContent>
         <div className="disk-table header-row">
-          <span>Rolle & Gerät</span>
-          <span>Typ / Kapazität</span>
+          <span>{t("Rolle & Gerät")}</span>
+          <span>{t("Typ / Kapazität")}</span>
           <span>HBA Port</span>
           <span>Read / Write</span>
           <span>Outstanding I/O</span>
@@ -601,17 +675,17 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
             </span>
             <span>
               <strong>{disk.kind}</strong>
-              <small>{formatBytes(disk.capacityBytes)}</small>
+              <small>{formatBytes(disk.capacityBytes, locale)}</small>
             </span>
             <span>
               <strong>{disk.hbaPort || "nicht verfügbar"}</strong>
-              <small>Hardwarepfad</small>
+              <small>{t("Hardwarepfad")}</small>
             </span>
             <span>
               <strong>
-                {disk.readMbps.toFixed(0)} / {disk.writeMbps.toFixed(0)} MB/s
+                {disk.readMbps.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} / {disk.writeMbps.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} MB/s
               </strong>
-              <small>{disk.utilization.toFixed(0)} % Utilization</small>
+              <small>{disk.utilization.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} % Utilization</small>
             </span>
             <span className="io-cell">
               <strong>{disk.outstandingIo}</strong>
@@ -623,16 +697,12 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
             </span>
             <span>
               <Badge className="healthy">
-                <span className="status-dot" />
-                Gesund
-              </Badge>
+                <span className="status-dot" />{t("Gesund")}</Badge>
             </span>
           </div>
         ))}
         {disks.length === 0 && (
-          <div className="disk-empty">
-            Kein Repository gebunden – keine relevanten Targets.
-          </div>
+          <div className="disk-empty">{t("Kein Repository gebunden – keine relevanten Targets.")}</div>
         )}
       </CardContent>
     </Card>
@@ -648,6 +718,7 @@ function RepositoryPage({
   runCommand: (kind: "mount" | "unmount" | "offline_scrub") => void;
   busy: boolean;
 }) {
+  const { t, locale } = useI18n();
   const online = snapshot.telemetry.repositoryState === "online";
   return (
     <>
@@ -660,11 +731,11 @@ function RepositoryPage({
         <Card>
           <CardHeader>
             <div>
-              <span className="section-kicker">RUNTIME</span>
-              <h2>Zustandsmaschine</h2>
+              <span className="section-kicker">Runtime</span>
+              <h2>{t("Zustandsmaschine")}</h2>
             </div>
-            <Badge className="healthy">
-              {stateLabels[snapshot.telemetry.repositoryState]}
+            <Badge className={repositoryTone(snapshot.telemetry.repositoryState)}>
+              {t(stateLabels[snapshot.telemetry.repositoryState])}
             </Badge>
           </CardHeader>
           <CardContent className="state-flow">
@@ -688,33 +759,33 @@ function RepositoryPage({
         <Card>
           <CardHeader>
             <div>
-              <span className="section-kicker">CHECKPOINT</span>
+              <span className="section-kicker">Checkpoint</span>
               <h2>Durability Status</h2>
             </div>
             <ShieldCheck size={19} />
           </CardHeader>
           <CardContent className="detail-list">
             <p>
-              <span>Aktive Generation</span>
+              <span>{t("Aktive Generation")}</span>
               <strong>
-                {snapshot.telemetry.commitGeneration?.toLocaleString("de-DE") ??
+                {snapshot.telemetry.commitGeneration?.toLocaleString(locale) ??
                   "—"}
               </strong>
             </p>
             <p>
-              <span>Checkpoint-Alter</span>
+              <span>{t("Checkpoint-Alter")}</span>
               <strong>
                 {snapshot.telemetry.lastCheckpointSeconds === undefined
                   ? "—"
-                  : `${snapshot.telemetry.lastCheckpointSeconds} Sekunden`}
+                  : t("{seconds} Sekunden", { seconds: snapshot.telemetry.lastCheckpointSeconds ?? "—" })}
               </strong>
             </p>
             <p>
               <span>Recovery-Latch</span>
-              <strong className="ok">Bereit</strong>
+              <strong className="ok">{t("Bereit")}</strong>
             </p>
             <p>
-              <span>Swap-Grenze</span>
+              <span>{t("Swap-Grenze")}</span>
               <strong>0 B</strong>
             </p>
           </CardContent>
@@ -723,8 +794,8 @@ function RepositoryPage({
       <Card className="action-card">
         <CardHeader>
           <div>
-            <span className="section-kicker">WARTUNG</span>
-            <h2>Repository-Aktionen</h2>
+            <span className="section-kicker">{t("Wartung")}</span>
+            <h2>{t("Repository-Aktionen")}</h2>
           </div>
         </CardHeader>
         <CardContent>
@@ -732,27 +803,19 @@ function RepositoryPage({
             <TerminalSquare />
             <span>
               <strong>Offline-Scrub</strong>
-              <small>
-                Prüft Pool-Identität, Metadaten und DATA-Container. SMB wird
-                kontrolliert unterbrochen.
-              </small>
+              <small>{t("Prüft Pool-Identität, Metadaten und DATA-Container. SMB wird kontrolliert unterbrochen.")}</small>
             </span>
             <Button
               variant="secondary"
               onClick={() => runCommand("offline_scrub")}
               disabled={!online || busy}
-            >
-              Starten
-            </Button>
+            >{t("Starten")}</Button>
           </div>
           <div>
             <RefreshCcw />
             <span>
-              <strong>Sauberer Remount</strong>
-              <small>
-                SIGINT, Checkpoint, FUSE-Unmount, Start und Health-Check ohne
-                Appliance-Reboot.
-              </small>
+              <strong>{t("Sauberer Remount")}</strong>
+              <small>{t("SIGINT, Checkpoint, FUSE-Unmount, Start und Health-Check ohne Appliance-Reboot.")}</small>
             </span>
             <Button
               variant="secondary"
@@ -779,6 +842,7 @@ function TargetCard({
   onSelect: () => void;
   role: string;
 }) {
+  const { t, locale } = useI18n();
   return (
     <button
       className={`target-card ${selected ? "selected" : ""}`}
@@ -792,7 +856,7 @@ function TargetCard({
         <em>{role}</em>
         <strong>{target.model || target.kernelName}</strong>
         <small>
-          {target.targetType} · {formatBytes(target.capacityBytes)}
+          {target.targetType} · {formatBytes(target.capacityBytes, locale)}
         </small>
         <small>{target.hbaPort || "HBA-Port nicht verfügbar"}</small>
         <small>
@@ -800,7 +864,7 @@ function TargetCard({
           {target.filesystem || "unformatiert"}
         </small>
         {target.backingDisks.length > 0 && (
-          <small>{target.backingDisks.length} physische Backing-Disks</small>
+          <small>{target.backingDisks.length}{t("physische Backing-Disks")}</small>
         )}
         {!target.eligible && <b>{target.eligibilityReason}</b>}
       </span>
@@ -818,6 +882,7 @@ function DrivesPage({
   submit: (body: unknown) => Promise<void>;
   busy: boolean;
 }) {
+  const { t, locale } = useI18n();
   const [metadata, setMetadata] = useState("");
   const [data, setData] = useState("");
   const [confirm, setConfirm] = useState(false);
@@ -840,24 +905,19 @@ function DrivesPage({
     <>
       <div className="page-title">
         <div>
-          <span className="section-kicker">BLOCK INVENTORY</span>
-          <h1>Laufwerke & Provisionierung</h1>
-          <p>
-            Nur erkannte, sichere Targets können ausgewählt werden. Gerätepfade
-            sind niemals Freitext.
-          </p>
+          <span className="section-kicker">Block inventory</span>
+          <h1>{t("Laufwerke & Provisionierung")}</h1>
+          <p>{t("Nur erkannte, sichere Targets können ausgewählt werden. Gerätepfade sind niemals Freitext.")}</p>
         </div>
         <Badge>
-          <RefreshCcw size={12} />
-          Inventar aktuell
-        </Badge>
+          <RefreshCcw size={12} />{t("Inventar aktuell")}</Badge>
       </div>
       <div className="selection-columns">
         <Card>
           <CardHeader>
             <div>
               <span className="step-number">1</span>
-              <h2>Metadata-Target auswählen</h2>
+              <h2>{t("Metadata-Target auswählen")}</h2>
             </div>
           </CardHeader>
           <CardContent className="target-list">
@@ -876,7 +936,7 @@ function DrivesPage({
           <CardHeader>
             <div>
               <span className="step-number">2</span>
-              <h2>DATA-Target auswählen</h2>
+              <h2>{t("DATA-Target auswählen")}</h2>
             </div>
           </CardHeader>
           <CardContent className="target-list">
@@ -896,11 +956,8 @@ function DrivesPage({
         <span>
           <ShieldCheck size={18} />
           <span>
-            <strong>Schutzprüfung aktiv</strong>
-            <small>
-              Root, Boot, Swap, Mounts, Holder und gemeinsame physische
-              Abstammung werden ausgeschlossen.
-            </small>
+            <strong>{t("Schutzprüfung aktiv")}</strong>
+            <small>{t("Root, Boot, Swap, Mounts, Holder und gemeinsame physische Abstammung werden ausgeschlossen.")}</small>
           </span>
         </span>
         <Button
@@ -914,14 +971,13 @@ function DrivesPage({
           }
           onClick={() => setConfirm(true)}
         >
-          <Trash2 size={15} /> Neues Repository initialisieren
-        </Button>
+          <Trash2 size={15} />{t("Neues Repository initialisieren")}</Button>
       </div>
       {confirm && selectedMeta && selectedData && (
         <ConfirmDialog
           danger
-          title="Targets vollständig löschen?"
-          confirmLabel="LÖSCHEN & INITIALISIEREN"
+          title={t("Targets vollständig löschen?")}
+          confirmLabel={t("LÖSCHEN & INITIALISIEREN")}
           onClose={() => setConfirm(false)}
           onConfirm={() => {
             setConfirm(false);
@@ -934,23 +990,18 @@ function DrivesPage({
             });
           }}
         >
-          <p>
-            Diese Aktion entfernt unwiderruflich alle Daten auf beiden Targets.
-          </p>
+          <p>{t("Diese Aktion entfernt unwiderruflich alle Daten auf beiden Targets.")}</p>
           <div className="wipe-summary">
             <strong>METADATA</strong>
             <span>
-              {selectedMeta.model} · {formatBytes(selectedMeta.capacityBytes)}
+              {selectedMeta.model} · {formatBytes(selectedMeta.capacityBytes, locale)}
             </span>
             <strong>DATA</strong>
             <span>
-              {selectedData.model} · {formatBytes(selectedData.capacityBytes)}
+              {selectedData.model} · {formatBytes(selectedData.capacityBytes, locale)}
             </span>
           </div>
-          <p>
-            GPT und XFS werden neu angelegt; anschließend wird die
-            Pool-Identität geschrieben und das Repository online gebracht.
-          </p>
+          <p>{t("GPT und XFS werden neu angelegt; anschließend wird die Pool-Identität geschrieben und das Repository online gebracht.")}</p>
         </ConfirmDialog>
       )}
     </>
@@ -975,35 +1026,44 @@ const emptyShare: ShareSettings = {
 };
 
 function SharesPage({
+  repositoryError,
+  repositoryReady,
+  setupRepository,
   shares,
   save,
   remove,
   principals,
 }: {
+  repositoryError: boolean;
+  repositoryReady: boolean;
+  setupRepository: () => void;
   shares: ShareSettings[];
   save: (share: ShareSettings) => void;
   remove: (share: ShareSettings) => void;
   principals: { users: string[]; groups: string[] };
 }) {
+  const { t } = useI18n();
   const [editing, setEditing] = useState<ShareSettings | null>(null);
   return (
     <>
       <div className="page-title">
         <div>
-          <span className="section-kicker">SAMBA 4.23.5</span>
-          <h1>SMB-Freigaben</h1>
-          <p>
-            FastDup-optimierte Shares werden atomar validiert und ohne Reboot
-            neu geladen.
-          </p>
+          <span className="section-kicker">Samba 4.23.5</span>
+          <h1>{t("SMB-Freigaben")}</h1>
+          <p>{t("FastDup-optimierte Shares werden atomar validiert und ohne Reboot neu geladen.")}</p>
         </div>
         <Button
           variant="secondary"
+          disabled={!repositoryReady}
           onClick={() => setEditing({ ...emptyShare, id: crypto.randomUUID() })}
         >
-          <Plus size={15} /> Freigabe anlegen
-        </Button>
+          <Plus size={15} />{t("Freigabe anlegen")}</Button>
       </div>
+      {!repositoryReady && <div className="repository-required">
+        <Database size={22} /><div><strong>{t(repositoryError ? "Repository prüfen" : "Zuerst ein Repository einrichten")}</strong>
+        <p>{t(repositoryError ? "Das Repository meldet einen Fehler. Behebe diesen vor dem Anlegen neuer Shares." : "Shares benötigen ein eingerichtetes Repository als Speicherziel.")}</p></div>
+        <Button variant="secondary" onClick={setupRepository}>{t(repositoryError ? "Repository öffnen" : "Repository einrichten")}</Button>
+      </div>}
       <div className="share-grid">
         {shares.map((share) => (
           <Card className="share-card" key={share.id}>
@@ -1015,7 +1075,7 @@ function SharesPage({
                   <small>{share.description}</small>
                 </div>
               </div>
-              <Badge>{share.hidden ? "Versteckt" : "Sichtbar"}</Badge>
+              <Badge>{share.hidden ? t("Versteckt") : t("Sichtbar")}</Badge>
             </CardHeader>
             <CardContent>
               <div className="share-flags">
@@ -1025,14 +1085,14 @@ function SharesPage({
                     ? "Encryption required"
                     : "Encryption desired"}
                 </span>
-                <span>{share.accessBasedEnumeration ? "ABE" : "Kein ABE"}</span>
+                <span>{share.accessBasedEnumeration ? "ABE" : t("Kein ABE")}</span>
                 <span className={share.guestAccess ? "danger-text" : ""}>
-                  {share.guestAccess ? "Gastzugriff" : "Authentifiziert"}
+                  {share.guestAccess ? t("Gastzugriff") : t("Authentifiziert")}
                 </span>
                 <span className={share.logicalQuota ? "quota-flag" : ""}>
                   {share.logicalQuota
                     ? `Quota ${share.logicalQuota.value} ${share.logicalQuota.unit.toUpperCase()}`
-                    : "Repository-Kapazität"}
+                    : t("Repository-Kapazität")}
                 </span>
               </div>
               <div className="fixed-profile">
@@ -1041,18 +1101,16 @@ function SharesPage({
                   <strong>FastDup Optimized VFS</strong>
                   <small>64 KiB Clone Alignment · 1 GiB Maximum</small>
                 </span>
-                <Badge className="warning">EXPERIMENTELL</Badge>
+                <Badge className="warning">{t("EXPERIMENTELL")}</Badge>
               </div>
               <footer>
                 <Button
                   variant="ghost"
                   onClick={() => setEditing({ ...share })}
                 >
-                  <Pencil size={14} /> Bearbeiten
-                </Button>
+                  <Pencil size={14} />{t("Bearbeiten")}</Button>
                 <Button variant="ghost" onClick={() => remove(share)}>
-                  <Trash2 size={14} /> Löschen
-                </Button>
+                  <Trash2 size={14} />{t("Löschen")}</Button>
               </footer>
             </CardContent>
           </Card>
@@ -1113,6 +1171,20 @@ function ShareEditor({
   onSave: (share: ShareSettings) => void;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
+  const modal = useRef<HTMLDialogElement>(null);
+  const [returnFocus] = useState(() => document.activeElement);
+  useEffect(() => {
+    const dialog = modal.current;
+    const previousOverflow = document.body.style.overflow;
+    dialog?.showModal();
+    document.body.style.overflow = "hidden";
+    return () => {
+      dialog?.close();
+      document.body.style.overflow = previousOverflow;
+      if (returnFocus instanceof HTMLElement) returnFocus.focus();
+    };
+  }, [returnFocus]);
   const [draft, setDraft] = useState(share);
   const [guestWarning, setGuestWarning] = useState(false);
   const set = <K extends keyof ShareSettings>(
@@ -1135,36 +1207,62 @@ function ShareEditor({
     onSave(draft);
   };
   return (
-    <div
-      className="drawer-backdrop"
-      onMouseDown={(event) => event.target === event.currentTarget && onClose()}
+    <dialog
+      ref={modal}
+      className="share-modal"
+      aria-labelledby="share-editor-title"
+      onKeyDown={(event) => {
+        if (event.key !== "Tab") return;
+        const scope = guestWarning
+          ? event.currentTarget.querySelector(".dialog")
+          : event.currentTarget;
+        const controls = Array.from(scope?.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]',
+        ) ?? []).filter((element) => element.getClientRects().length > 0);
+        const first = controls[0];
+        const last = controls[controls.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }}
+      onCancel={(event) => {
+        event.preventDefault();
+        if (guestWarning) setGuestWarning(false);
+        else onClose();
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget && !guestWarning) onClose();
+      }}
     >
-      <form className="drawer" onSubmit={submit}>
+      <form className="share-editor" onSubmit={submit}>
         <header>
           <div>
-            <span className="section-kicker">SMB SHARE</span>
-            <h2>{share.revision ? "Freigabe bearbeiten" : "Neue Freigabe"}</h2>
+            <span className="section-kicker">SMB Share</span>
+            <h2 id="share-editor-title">{share.revision ? t("Freigabe bearbeiten") : t("Neue Freigabe")}</h2>
           </div>
-          <button type="button" onClick={onClose}>
+          <button type="button" onClick={onClose} aria-label={t("Dialog schließen")}>
             <X />
           </button>
         </header>
-        <div className="drawer-body">
+        <div className="share-editor-body">
           <label className="field">
-            <span>Freigabename</span>
+            <span>{t("Freigabename")}</span>
             <input
+              autoFocus
               required
               pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
               value={draft.name}
               onChange={(event) => set("name", event.target.value)}
-              placeholder="z. B. production"
+              placeholder={t("z. B. production")}
             />
-            <small>
-              Nur Buchstaben, Ziffern, Punkt, Unterstrich und Bindestrich.
-            </small>
+            <small>{t("Nur Buchstaben, Ziffern, Punkt, Unterstrich und Bindestrich.")}</small>
           </label>
           <label className="field">
-            <span>Beschreibung</span>
+            <span>{t("Beschreibung")}</span>
             <input
               maxLength={120}
               value={draft.description}
@@ -1172,10 +1270,10 @@ function ShareEditor({
             />
           </label>
           <label className="field">
-            <span>Logisches Schreiblimit</span>
+            <span>{t("Logisches Schreiblimit")}</span>
             <div className="capacity-input">
               <input
-                aria-label="Kapazitätswert"
+                aria-label={t("Kapazitätswert")}
                 type="number"
                 inputMode="numeric"
                 min={1}
@@ -1194,7 +1292,7 @@ function ShareEditor({
                 }}
               />
               <select
-                aria-label="Kapazitätseinheit"
+                aria-label={t("Kapazitätseinheit")}
                 value={draft.logicalQuota?.unit ?? "none"}
                 onChange={(event) => {
                   const unit = event.target.value;
@@ -1209,51 +1307,47 @@ function ShareEditor({
                   );
                 }}
               >
-                <option value="none">Keine</option>
+                <option value="none">{t("Keine")}</option>
                 <option value="gb">GB</option>
                 <option value="tb">TB</option>
                 <option value="pb">PB</option>
               </select>
             </div>
-            <small>
-              1–999 · Wird am Share-Root angezeigt und als harte logische
-              Quota erzwungen. Dedup- und Clone-Daten zählen vollständig;
-              Sparse-Holes nicht.
-            </small>
+            <small>{t("1–999 · Wird am Share-Root angezeigt und als harte logische Quota erzwungen. Dedup- und Clone-Daten zählen vollständig; Sparse-Holes nicht.")}</small>
           </label>
           <label className="field">
-            <span>Advanced Reduction für diese Freigabe</span>
+            <span>{t("Advanced Reduction für diese Freigabe")}</span>
             <select value={draft.advancedReduction ?? "inherit"}
               onChange={(event) => set("advancedReduction", event.target.value === "inherit" ? undefined : event.target.value as ShareSettings["advancedReduction"])}>
-              <option value="off">Aus</option>
-              <option value="dependent_v1">Similarity aktiv</option>
-              <option value="inherit">Repository-Standard</option>
+              <option value="off">{t("Aus")}</option>
+              <option value="dependent_v1">{t("Similarity aktiv")}</option>
+              <option value="inherit">{t("Repository-Standard")}</option>
             </select>
-            <small>Wirkt online auf neue Schreibvorgänge. Exact Dedup und normale Kompression bleiben aktiv. Aktivierte Freigaben verwenden einen gemeinsamen Kandidatenindex.</small>
+            <small>{t("Wirkt online auf neue Schreibvorgänge. Exact Dedup und normale Kompression bleiben aktiv. Aktivierte Freigaben verwenden einen gemeinsamen Kandidatenindex.")}</small>
           </label>
           <div className="toggle-stack">
             <Toggle
               checked={draft.enabled}
               onChange={(value) => set("enabled", value)}
-              label="Freigabe aktiv"
+              label={t("Freigabe aktiv")}
             />
             <Toggle
               checked={draft.hidden}
               onChange={(value) => set("hidden", value)}
-              label="Versteckt"
-              detail="Setzt browseable = no; der Name bleibt unverändert."
+              label={t("Versteckt")}
+              detail={t("Setzt browseable = no; der Name bleibt unverändert.")}
             />
             <Toggle
               checked={draft.readOnly}
               onChange={(value) => set("readOnly", value)}
-              label="Schreibgeschützt"
+              label={t("Schreibgeschützt")}
             />
             <Toggle
               dangerous
               checked={draft.guestAccess}
               onChange={(value) => set("guestAccess", value)}
-              label="Gastzugriff erlauben"
-              detail="Erlaubt Zugriff ohne authentifizierten Benutzer."
+              label={t("Gastzugriff erlauben")}
+              detail={t("Erlaubt Zugriff ohne authentifizierten Benutzer.")}
             />
             <Toggle
               checked={draft.accessBasedEnumeration}
@@ -1262,7 +1356,7 @@ function ShareEditor({
             />
           </div>
           <label className="field">
-            <span>SMB-Verschlüsselung</span>
+            <span>{t("SMB-Verschlüsselung")}</span>
             <select
               value={draft.encryption}
               onChange={(event) =>
@@ -1272,18 +1366,18 @@ function ShareEditor({
                 )
               }
             >
-              <option value="desired">Gewünscht</option>
-              <option value="required">Erforderlich</option>
+              <option value="desired">{t("Gewünscht")}</option>
+              <option value="required">{t("Erforderlich")}</option>
             </select>
           </label>
       <PrincipalPicker
-        title="Erlaubte Samba-Benutzer"
+        title={t("Erlaubte Samba-Benutzer")}
         items={[...new Set([...principals.users, ...draft.allowedUsers])]}
             selected={draft.allowedUsers}
             onToggle={(item) => toggleItem("allowedUsers", item)}
           />
       <PrincipalPicker
-        title="Erlaubte lokale Gruppen"
+        title={t("Erlaubte lokale Gruppen")}
         items={[...new Set([...principals.groups, ...draft.allowedGroups])]}
             selected={draft.allowedGroups}
             onToggle={(item) => toggleItem("allowedGroups", item)}
@@ -1291,42 +1385,32 @@ function ShareEditor({
           <div className="profile-lock">
             <LockKeyhole />
             <span>
-              <strong>Optimiertes Profil fest vorgegeben</strong>
-              <small>
-                vfs objects = fastdup · FastDup aktiv · 64 KiB Alignment · 1 GiB
-                Maximum
-              </small>
+              <strong>{t("Optimiertes Profil fest vorgegeben")}</strong>
+              <small>{t("vfs objects = fastdup · FastDup aktiv · 64 KiB Alignment · 1 GiB Maximum")}</small>
             </span>
           </div>
         </div>
         <footer>
-          <Button type="button" variant="secondary" onClick={onClose}>
-            Abbrechen
-          </Button>
+          <Button type="button" variant="secondary" onClick={onClose}>{t("Abbrechen")}</Button>
           <Button type="submit" variant="secondary">
-            <Save size={15} /> Aktivieren
-          </Button>
+            <Save size={15} />{t("Aktivieren")}</Button>
         </footer>
       </form>
       {guestWarning && (
         <ConfirmDialog
           danger
-          title="Gastzugriff aktivieren?"
-          confirmLabel="Gastzugriff aktivieren"
+          title={t("Gastzugriff aktivieren?")}
+          confirmLabel={t("Gastzugriff aktivieren")}
           onClose={() => setGuestWarning(false)}
           onConfirm={() => {
             setGuestWarning(false);
             onSave(draft);
           }}
         >
-          <p>
-            Nicht authentifizierte Clients erhalten entsprechend der
-            Freigaberechte Zugriff. Diese Änderung wird sofort per Samba-Reload
-            aktiviert.
-          </p>
+          <p>{t("Nicht authentifizierte Clients erhalten entsprechend der Freigaberechte Zugriff. Diese Änderung wird sofort per Samba-Reload aktiviert.")}</p>
         </ConfirmDialog>
       )}
-    </div>
+    </dialog>
   );
 }
 
@@ -1362,12 +1446,15 @@ function TelemetryPage({
   snapshot,
   disks,
   loadHistory,
+  liveResources,
 }: {
   snapshot: TelemetrySnapshot;
   disks: DiskTelemetry[];
   loadHistory: (seconds: number) => Promise<TelemetrySnapshot[]>;
+  liveResources: ResourceSample[];
 }) {
-  const [range, setRange] = useState("15 min");
+  const { t, locale } = useI18n();
+  const [range, setRange] = useState("Live");
   const [history, setHistory] = useState<TelemetrySnapshot[] | null>(null);
   const [loading, setLoading] = useState(false);
   const ranges = [
@@ -1403,63 +1490,29 @@ function TelemetryPage({
         : snapshot,
     [history, snapshot],
   );
-  const resourceSamples = history ?? [snapshot];
+  const resourceSamples = history ?? liveResources;
+  const historyRequest = useRef(0);
   const selectRange = (item: string) => {
+    const request = ++historyRequest.current;
     setRange(item);
     if (item === "Live") {
       setHistory(null);
+      setLoading(false);
       return;
     }
     setLoading(true);
     void loadHistory(rangeSeconds[item] ?? 900)
-      .then(setHistory)
-      .finally(() => setLoading(false));
+      .then(samples => { if (request === historyRequest.current) setHistory(samples); })
+      .finally(() => { if (request === historyRequest.current) setLoading(false); });
   };
-  const resourceOption = useMemo(
-    () => ({
-      ...throughputOption(displayedSnapshot, true),
-      xAxis: {
-        type: "category",
-        data: resourceSamples.map((sample) => sample.observedAt),
-        axisLabel: { color: "#70838d" },
-        axisLine: { lineStyle: { color: "#324650" } },
-      },
-      yAxis: {
-        type: "value",
-        max: 100,
-        name: "%",
-        axisLabel: { color: "#70838d" },
-        splitLine: { lineStyle: { color: "rgba(68,94,108,.24)" } },
-      },
-      series: [
-        {
-          name: "CPU",
-          type: "line",
-          showSymbol: false,
-          data: resourceSamples.map((sample) => sample.cpuPercent),
-          lineStyle: { color: "#f5b84b" },
-        },
-        {
-          name: "RAM",
-          type: "line",
-          showSymbol: false,
-          data: resourceSamples.map((sample) => sample.ramPercent),
-          lineStyle: { color: "#3ddc97" },
-        },
-      ],
-    }),
-    [displayedSnapshot, resourceSamples],
-  );
+  const resourceOption = useMemo(() => resourceChartOption(resourceSamples, locale), [resourceSamples, locale]);
   return (
     <>
       <div className="page-title telemetry-title">
         <div>
-          <span className="section-kicker">OBSERVABILITY</span>
-          <h1>Tiefentelemetrie</h1>
-          <p>
-            Synchronisierte Live-Daten aus POSIX-Rand, Host, Prozess und
-            physischem Block-Layer.
-          </p>
+          <span className="section-kicker">Observability</span>
+          <h1>{t("Tiefentelemetrie")}</h1>
+          <p>{t("Synchronisierte Live-Daten aus POSIX-Rand, Host, Prozess und physischem Block-Layer.")}</p>
         </div>
         <div className="range-picker">
           {ranges.map((item) => (
@@ -1477,20 +1530,20 @@ function TelemetryPage({
         <MetricCard
           icon={Activity}
           label="Frontend Read"
-          value={`${snapshot.frontendReadMbps.toFixed(1)} MB/s`}
-          detail="POSIX erfolgreich"
+          value={`${snapshot.frontendReadMbps.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} MB/s`}
+          detail={t("POSIX erfolgreich")}
         />
         <MetricCard
           icon={Activity}
           label="Frontend Write"
-          value={`${snapshot.frontendWriteMbps.toFixed(1)} MB/s`}
-          detail="POSIX erfolgreich"
+          value={`${snapshot.frontendWriteMbps.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} MB/s`}
+          detail={t("POSIX erfolgreich")}
           tone="violet"
         />
         <MetricCard
           icon={CircleGauge}
           label="Dedup Rate"
-          value={`${snapshot.dedupRate.toFixed(1)} %`}
+          value={`${snapshot.dedupRate.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} %`}
           detail="exact / (exact + new)"
           tone="green"
         />
@@ -1502,7 +1555,7 @@ function TelemetryPage({
               ? "—"
               : `${snapshot.lastCheckpointSeconds} s`
           }
-          detail="Alter der aktiven Generation"
+          detail={t("Alter der aktiven Generation")}
           tone="amber"
         />
       </section>
@@ -1510,18 +1563,18 @@ function TelemetryPage({
         <CardHeader>
           <div>
             <span className="section-kicker">
-              RANGE · {range.toUpperCase()}
+              {t("Zeitraum")} · {range}
             </span>
-            <h2>POSIX Throughput & gemeinsamer Zeitcursor</h2>
+            <h2>{t("POSIX Throughput & gemeinsamer Zeitcursor")}</h2>
           </div>
           <Badge className={loading ? "warning" : "live"}>
             <span className="pulse" />
-            {loading ? "LÄDT" : range === "Live" ? "LIVE" : range.toUpperCase()}
+            {loading ? t("Lädt") : range === "Live" ? "Live" : range}
           </Badge>
         </CardHeader>
         <CardContent>
           <ReactECharts
-            option={throughputOption(displayedSnapshot, true)}
+            option={throughputOption(displayedSnapshot, true, locale)}
             style={{ height: 330 }}
           />
         </CardContent>
@@ -1530,19 +1583,21 @@ function TelemetryPage({
         <Card className="telemetry-chart">
           <CardHeader>
             <div>
-              <span className="section-kicker">HOST & PROCESS</span>
-              <h2>CPU und RAM</h2>
+              <span className="section-kicker">Host & process</span>
+              <h2>{t("CPU und RAM")}</h2>
             </div>
           </CardHeader>
           <CardContent>
+            {history === null && resourceSamples.length < 2 && <p className="chart-note">{t("Live-Messwerte werden gesammelt…")}</p>}
+            {history?.length === 0 && <p className="chart-note">{t("Keine Messwerte im gewählten Zeitraum.")}</p>}
             <ReactECharts option={resourceOption} style={{ height: 260 }} />
           </CardContent>
         </Card>
         <Card>
           <CardHeader>
             <div>
-              <span className="section-kicker">REDUCTION</span>
-              <h2>Dedup & physische Reduktion</h2>
+              <span className="section-kicker">Reduction</span>
+              <h2>{t("Dedup & physische Reduktion")}</h2>
             </div>
           </CardHeader>
           <CardContent className="reduction-panel">
@@ -1554,7 +1609,7 @@ function TelemetryPage({
                   } as React.CSSProperties
                 }
               >
-                <strong>{snapshot.dedupRate.toFixed(1)}%</strong>
+                <strong>{snapshot.dedupRate.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%</strong>
               </span>
               <small>Exact Dedup</small>
             </div>
@@ -1566,25 +1621,16 @@ function TelemetryPage({
                   } as React.CSSProperties
                 }
               >
-                <strong>{snapshot.reductionRatio.toFixed(2)}×</strong>
+                <strong>{snapshot.reductionRatio.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}×</strong>
               </span>
-              <small>Gesamtreduktion</small>
+              <small>{t("Gesamtreduktion")}</small>
             </div>
-            <p>
-              FILL und Recipe-Reuse sind bewusst nicht in der Exact-Dedup-Rate
-              enthalten.
-            </p>
+            <p>{t("FILL und Recipe-Reuse sind bewusst nicht in der Exact-Dedup-Rate enthalten.")}</p>
           </CardContent>
         </Card>
       </div>
       <DiskTelemetryTable disks={disks} />
-      <div className="telemetry-tabs">
-        <span>Latenzen p50/p95/p99</span>
-        <span>io_uring In-Flight</span>
-        <span>Cache Hit Rates</span>
-        <span>GC & Reduction</span>
-        <span>Checkpoint Phasen</span>
-      </div>
+      <DetailTelemetryPanel sample={history === null ? snapshot : history.at(-1)} historical={history !== null} loading={loading} />
     </>
   );
 }
@@ -1598,25 +1644,23 @@ function EventsPage({
   alerts: string[];
   exportAudit: () => void;
 }) {
+  const { t, locale } = useI18n();
   return (
     <>
       <div className="page-title">
         <div>
-          <span className="section-kicker">AUDIT & JOBS</span>
-          <h1>Ereignisse</h1>
-          <p>
-            Nachvollziehbare Managementaktionen, Jobs, Warnungen und Alarme.
-          </p>
+          <span className="section-kicker">Audit & jobs</span>
+          <h1>{t("Ereignisse")}</h1>
+          <p>{t("Nachvollziehbare Managementaktionen, Jobs, Warnungen und Alarme.")}</p>
         </div>
         <Button variant="secondary" onClick={exportAudit}>
-          <FileStack size={15} /> Audit exportieren
-        </Button>
+          <FileStack size={15} />{t("Audit exportieren")}</Button>
       </div>
       {alerts.map((alert, index) => (
         <div className="alarm-banner" key={`${alert}-${index}`}>
           <AlertTriangle />
           <span>
-            <strong>Kritischer Alarm</strong>
+            <strong>{t("Kritischer Alarm")}</strong>
             <small>{alert}</small>
           </span>
         </div>
@@ -1624,22 +1668,22 @@ function EventsPage({
       <Card className="events-table">
         <CardHeader>
           <div>
-            <span className="section-kicker">LETZTE VORGÄNGE</span>
-            <h2>Job-Verlauf</h2>
+            <span className="section-kicker">{t("Letzte Vorgänge")}</span>
+            <h2>{t("Job-Verlauf")}</h2>
           </div>
         </CardHeader>
         <CardContent>
           <div className="event-row event-head">
-            <span>Zeit</span>
-            <span>Aktion</span>
+            <span>{t("Zeit")}</span>
+            <span>{t("Aktion")}</span>
             <span>Status</span>
-            <span>Fortschritt</span>
-            <span>Ergebnis</span>
+            <span>{t("Fortschritt")}</span>
+            <span>{t("Ergebnis")}</span>
           </div>
           {jobs.map((job) => (
             <div className="event-row" key={job.id}>
               <span>
-                {new Date(job.updatedAt * 1000).toLocaleString("de-DE")}
+                {new Date(job.updatedAt * 1000).toLocaleString(locale)}
               </span>
               <strong>{job.kind.replaceAll("_", " ")}</strong>
               <Badge
@@ -1657,13 +1701,13 @@ function EventsPage({
                 <i>
                   <b style={{ width: `${job.progressBasisPoints / 100}%` }} />
                 </i>
-                {(job.progressBasisPoints / 100).toFixed(0)} %
+                {(job.progressBasisPoints / 100).toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} %
               </span>
               <span>{job.message}</span>
             </div>
           ))}
           {jobs.length === 0 && (
-            <div className="event-empty">Noch keine Managementvorgänge.</div>
+            <div className="event-empty">{t("Noch keine Managementvorgänge.")}</div>
           )}
         </CardContent>
       </Card>
@@ -1671,72 +1715,36 @@ function EventsPage({
   );
 }
 
-function SettingsPage({
-  settings,
-  fingerprint,
-  save,
-  password,
-  regenerateTls,
-}: {
-  settings: RepositorySettings;
-  fingerprint: string;
-  save: (value: RepositorySettings) => void;
-  password: () => void;
-  regenerateTls: () => void;
+function SettingsPage({ settings, fingerprint, save, password, regenerateTls, csrfToken, username, onCertificateChanged }: {
+  settings: RepositorySettings; fingerprint: string; save: (value: RepositorySettings) => void;
+  password: () => void; regenerateTls: () => void; csrfToken: string; username: string; onCertificateChanged: (fingerprint: string) => void;
 }) {
+  const { t } = useI18n();
+  const [section, setSection] = useState("Repository");
   const [draft, setDraft] = useState(settings);
-  const [extensionDraft, setExtensionDraft] = useState(
-    settings.smallFileExtensions.join("\n"),
-  );
-  useEffect(() => {
-    setDraft(settings);
-    setExtensionDraft(settings.smallFileExtensions.join("\n"));
-  }, [settings]);
-  const set = <K extends keyof RepositorySettings>(
-    key: K,
-    value: RepositorySettings[K],
-  ) => setDraft((current) => ({ ...current, [key]: value }));
-  return (
-    <>
-      <div className="page-title">
-        <div>
-          <span className="section-kicker">RUNTIME CONFIGURATION</span>
-          <h1>Einstellungen</h1>
-          <p>
-            Bestätigte Änderungen werden sofort aktiv oder vollständig
-            zurückgerollt.
-          </p>
-        </div>
-        <Button
-          variant="secondary"
-          onClick={() => save(draft)}
-        >
-          <Save size={15} /> Übernehmen
-        </Button>
-      </div>
-      <div className="settings-layout">
-        <Card>
-          <CardHeader>
-            <div>
-              <span className="section-kicker">REPOSITORY</span>
-              <h2>Betriebsrichtlinien</h2>
-            </div>
-          </CardHeader>
-          <CardContent className="settings-form">
+  const [extensionDraft, setExtensionDraft] = useState(settings.smallFileExtensions.join("\n"));
+  const request = useCallback(<T,>(path: string, init?: RequestInit) => api<T>(path, init, csrfToken), [csrfToken]);
+  useEffect(() => { setDraft(settings); setExtensionDraft(settings.smallFileExtensions.join("\n")); }, [settings]);
+  const set = <K extends keyof RepositorySettings>(key: K, value: RepositorySettings[K]) => setDraft(current => ({...current, [key]: value}));
+  const validPressure = draft.pressureLowBasisPoints >= 5000 && draft.pressureHighBasisPoints <= 9950 && draft.pressureLowBasisPoints < draft.pressureHighBasisPoints;
+  return <>
+    <div className="page-title"><div><h1>{t("Einstellungen")}</h1><p>{t("Repository-Betrieb, Web-Benutzer und HTTPS-Zertifikate verwalten.")}</p></div>
+      {section === "Repository" && <Button variant="secondary" disabled={!validPressure} onClick={() => save(draft)}><Save size={15}/>{t("Übernehmen")}</Button>}
+    </div>
+    <nav className="settings-nav" aria-label={t("Einstellungsbereiche")}>
+      {["Repository", "Web-Benutzer", "Zertifikate"].map(name => <button key={name} aria-pressed={section === name} onClick={() => setSection(name)}>{t(name)}</button>)}
+    </nav>
+    {section === "Repository" && <div className="settings-cards">
+      <Card><CardHeader><div><h2>{t("Start & Datenablage")}</h2><p>{t("Startverhalten, Datenreduktion und Dateien auf dem schnellen Metadata-Tier.")}</p></div></CardHeader><CardContent className="settings-form">
             <Toggle
               checked={draft.autoMount}
               onChange={(value) => set("autoMount", value)}
               label="Auto-Mount"
-              detail="Repository nach Dienststart automatisch online bringen."
+              detail={t("Repository nach Dienststart automatisch online bringen.")}
             />
-            <Toggle
-              checked={draft.onlineGcEnabled}
-              onChange={(value) => set("onlineGcEnabled", value)}
-              label="Online-GC"
-              detail="Hot-fähig; wird sofort über den Management-Socket aktiviert."
-            />
+
             <label className="field">
-              <span>Advanced Reduction: Repository-Standard</span>
+              <span>{t("Advanced Reduction: Repository-Standard")}</span>
               <select
                 value={draft.advancedReduction}
                 onChange={(event) =>
@@ -1747,25 +1755,14 @@ function SettingsPage({
                   )
                 }
               >
-                <option value="off">Aus</option>
-                <option value="dependent_v1">Similarity aktiv</option>
+                <option value="off">{t("Aus")}</option>
+                <option value="dependent_v1">{t("Similarity aktiv")}</option>
               </select>
-              <small>
-                Wird online aktiv. Pro Freigabe überschreibbar; neue Basen werden inkrementell aufgenommen.
-              </small>
+              <small>{t("Wird online aktiv. Pro Freigabe überschreibbar; neue Basen werden inkrementell aufgenommen.")}</small>
             </label>
+
             <label className="field">
-              <span>Wartungsfenster (UTC)</span>
-              <input
-                value={draft.maintenanceWindowUtc || ""}
-                onChange={(event) =>
-                  set("maintenanceWindowUtc", event.target.value)
-                }
-                placeholder="Sonntag 02:00–05:00"
-              />
-            </label>
-            <label className="field">
-              <span>Small-File-Tier · Dateiendungen</span>
+              <span>{t("Small-File-Tier · Dateiendungen")}</span>
               <textarea
                 rows={5}
                 value={extensionDraft}
@@ -1782,85 +1779,41 @@ function SettingsPage({
                 placeholder={".json\n.xml\n.vmdk"}
                 spellCheck={false}
               />
-              <small>
-                Eine Endung pro Zeile, inklusive Punkt. Groß-/Kleinschreibung
-                wird ignoriert; maximal 64 Endungen. Die Änderung wird ohne
-                Remount aktiv.
-              </small>
+              <small>{t("Eine Endung pro Zeile, inklusive Punkt. Groß-/Kleinschreibung wird ignoriert; maximal 64 Endungen. Die Änderung wird ohne Remount aktiv.")}</small>
             </label>
-            <div className="thresholds">
-              <label className="field">
-                <span>Pressure Low</span>
-                <input
-                  type="number"
-                  min="5000"
-                  max="9900"
-                  value={draft.pressureLowBasisPoints}
-                  onChange={(event) =>
-                    set("pressureLowBasisPoints", Number(event.target.value))
-                  }
-                />
-                <small>Basispunkte</small>
-              </label>
-              <label className="field">
-                <span>Pressure High</span>
-                <input
-                  type="number"
-                  min="5000"
-                  max="9950"
-                  value={draft.pressureHighBasisPoints}
-                  onChange={(event) =>
-                    set("pressureHighBasisPoints", Number(event.target.value))
-                  }
-                />
-                <small>Basispunkte</small>
-              </label>
-            </div>
-          </CardContent>
-        </Card>
-        <aside>
-          <Card>
-            <CardHeader>
-              <div>
-                <span className="section-kicker">SICHERHEIT</span>
-                <h2>Administrator</h2>
-              </div>
-              <UserRound size={18} />
-            </CardHeader>
-            <CardContent className="security-card">
-              <p>
-                <span>Benutzer</span>
-                <strong>admin</strong>
-              </p>
-              <p>
-                <span>Rolle</span>
-                <strong>Administrator</strong>
-              </p>
-              <Button variant="secondary" onClick={password}>
-                <KeyRound size={15} /> Passwort ändern
-              </Button>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader>
-              <div>
-                <span className="section-kicker">TLS</span>
-                <h2>Zertifikat-Fingerprint</h2>
-              </div>
-              <ShieldCheck size={18} />
-            </CardHeader>
-            <CardContent className="fingerprint">
-              <code>{fingerprint}</code>
-              <small>SHA-256 · lokal selbstsigniert · Reload ohne Reboot</small>
-              <Button variant="secondary" onClick={regenerateTls}>
-                <RefreshCcw size={14} /> Zertifikat regenerieren
-              </Button>
-            </CardContent>
-          </Card>
-        </aside>
-      </div>
-    </>
-  );
+
+      </CardContent></Card>
+      <Card><CardHeader><div><h2>{t("Speicherbereinigung (Online-GC)")}</h2><p>{t("Der GC gibt Speicher nicht mehr benötigter Daten frei. Die Schwellen beziehen sich auf die Belegung des Data-Tiers, nicht auf RAM oder CPU.")}</p></div></CardHeader><CardContent className="settings-form">
+            <Toggle
+              checked={draft.onlineGcEnabled}
+              onChange={(value) => set("onlineGcEnabled", value)}
+              label="Online-GC"
+              detail={t("Nicht mehr benötigte Daten werden im laufenden Betrieb bereinigt.")}
+            />
+
+        <div className="thresholds">
+          <label className="field"><span>{t("Druckmodus beenden bei (%)")}</span><input type="number" min="50" max="99" step="0.1" value={draft.pressureLowBasisPoints / 100} onChange={event => set("pressureLowBasisPoints", Math.round(Number(event.target.value) * 100))}/><small>{t("Pressure Low: Fällt die Belegung auf diesen Wert, endet der GC-Druckmodus.")}</small></label>
+          <label className="field"><span>{t("Druckmodus starten ab (%)")}</span><input type="number" min="50" max="99.5" step="0.1" value={draft.pressureHighBasisPoints / 100} onChange={event => set("pressureHighBasisPoints", Math.round(Number(event.target.value) * 100))}/><small>{t("Pressure High: Ab dieser Belegung wird die Bereinigung priorisiert.")}</small></label>
+        </div>
+        {!validPressure && <p className="form-error" role="alert">{t("Die untere Schwelle muss kleiner als die obere sein (50–99,5 %).")}</p>}
+        <p className="settings-explanation">{t("Beispiel: Ab 90 % startet der Druckmodus und bleibt aktiv, bis höchstens 85 % belegt sind. Das verhindert ständiges Ein- und Ausschalten. Regulärer GC kann auch unterhalb dieser Schwellen laufen.")}</p>
+            <label className="field">
+              <span>{t("Wartungsfenster (UTC)")}</span>
+              <input
+                value={draft.maintenanceWindowUtc || ""}
+                onChange={(event) =>
+                  set("maintenanceWindowUtc", event.target.value || undefined)
+                }
+                placeholder="02:00-05:00"
+              />
+              <small>{t("Täglich in UTC, Format HH:MM-HH:MM. Leer lassen, um kein festes Zeitfenster vorzugeben.")}</small>
+            </label>
+
+      </CardContent></Card>
+    </div>}
+    {section === "Web-Benutzer" && <WebUsersSettings request={request} username={username} changePassword={password}/>}
+    {section === "Zertifikate" && <CertificateSettings request={request} fingerprint={fingerprint} regenerate={regenerateTls} onImported={onCertificateChanged}/>}
+  </>;
 }
 
 function PasswordPage({
@@ -1872,6 +1825,7 @@ function PasswordPage({
   onChanged: (session: SessionInfo) => void;
   onLogout: () => void;
 }) {
+  const { t } = useI18n();
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [repeat, setRepeat] = useState("");
@@ -1880,7 +1834,7 @@ function PasswordPage({
     event.preventDefault();
     if (next.length < 12 || next !== repeat) {
       setError(
-        "Das neue Passwort muss mindestens 12 Zeichen lang sein und übereinstimmen.",
+        t("Das neue Passwort muss mindestens 12 Zeichen lang sein und übereinstimmen."),
       );
       return;
     }
@@ -1900,21 +1854,19 @@ function PasswordPage({
       <Card>
         <CardHeader>
           <div>
-            <span className="section-kicker">ERSTZUGANG</span>
-            <h2>Initialpasswort ändern</h2>
+            <span className="section-kicker">{t("Erstzugang")}</span>
+            <h2>{t("Initialpasswort ändern")}</h2>
           </div>
           <KeyRound />
         </CardHeader>
         <CardContent>
           <div className="gate-note">
             <AlertTriangle />
-            <span>
-              Bis zum Passwortwechsel sind alle Managementaktionen gesperrt.
-            </span>
+            <span>{t("Bis zum Passwortwechsel sind alle Managementaktionen gesperrt.")}</span>
           </div>
           <form onSubmit={submit}>
             <label className="field">
-              <span>Aktuelles Passwort</span>
+              <span>{t("Aktuelles Passwort")}</span>
               <input
                 type="password"
                 autoComplete="current-password"
@@ -1923,7 +1875,7 @@ function PasswordPage({
               />
             </label>
             <label className="field">
-              <span>Neues Passwort</span>
+              <span>{t("Neues Passwort")}</span>
               <input
                 type="password"
                 minLength={12}
@@ -1933,7 +1885,7 @@ function PasswordPage({
               />
             </label>
             <label className="field">
-              <span>Neues Passwort wiederholen</span>
+              <span>{t("Neues Passwort wiederholen")}</span>
               <input
                 type="password"
                 minLength={12}
@@ -1943,13 +1895,9 @@ function PasswordPage({
               />
             </label>
             {error && <p className="form-error">{error}</p>}
-            <Button type="submit" variant="secondary">
-              Passwort setzen & aktivieren
-            </Button>
+            <Button type="submit" variant="secondary">{t("Passwort setzen & aktivieren")}</Button>
           </form>
-          <button className="text-button" onClick={onLogout}>
-            Abmelden
-          </button>
+          <button className="text-button" onClick={onLogout}>{t("Abmelden")}</button>
         </CardContent>
       </Card>
     </div>
@@ -1957,6 +1905,7 @@ function PasswordPage({
 }
 
 function Login({ onLogin }: { onLogin: (session: SessionInfo) => void }) {
+  const { t, language, setLanguage } = useI18n();
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -1975,28 +1924,29 @@ function Login({ onLogin }: { onLogin: (session: SessionInfo) => void }) {
   };
   return (
     <main className="login-page">
+      <div className="login-language"><LanguageSelector value={language} onChange={setLanguage} /></div>
       <section className="login-brand">
         <div className="brand-mark">
-          <Box size={25} />
+          <img src={applianceMark} alt="" />
         </div>
         <div>
           <strong>FastDup</strong>
-          <span>APPLIANCE CONTROL PLANE</span>
+          <span>Appliance Control Plane</span>
         </div>
       </section>
       <Card className="login-card">
         <CardHeader>
           <div>
-            <span className="section-kicker">SICHERE VERBINDUNG</span>
-            <h2>Administrator-Anmeldung</h2>
+            <span className="section-kicker">{t("Sichere Verbindung")}</span>
+            <h2>{t("Administrator-Anmeldung")}</h2>
           </div>
           <ShieldCheck size={20} />
         </CardHeader>
         <CardContent>
-          <p>Lokale Verwaltung der FastDup Storage Appliance.</p>
+          <p>{t("Lokale Verwaltung der FastDup Storage Appliance.")}</p>
           <form onSubmit={submit}>
             <label className="field">
-              <span>Benutzername</span>
+              <span>{t("Benutzername")}</span>
               <input
                 autoFocus
                 autoComplete="username"
@@ -2005,7 +1955,7 @@ function Login({ onLogin }: { onLogin: (session: SessionInfo) => void }) {
               />
             </label>
             <label className="field">
-              <span>Passwort</span>
+              <span>{t("Passwort")}</span>
               <input
                 type="password"
                 autoComplete="current-password"
@@ -2015,29 +1965,66 @@ function Login({ onLogin }: { onLogin: (session: SessionInfo) => void }) {
             </label>
             {error && <p className="form-error">{error}</p>}
             <Button type="submit" variant="secondary" disabled={busy}>
-              {busy ? "Anmeldung…" : "Anmelden"}
+              {busy ? t("Anmeldung…") : t("Anmelden")}
             </Button>
           </form>
           <div className="local-note">
-            <LockKeyhole size={15} /> Appliance-lokal · HttpOnly Session ·
-            Argon2id
-          </div>
+            <LockKeyhole size={15} />{t("Appliance-lokal · HttpOnly Session · Argon2id")}</div>
         </CardContent>
       </Card>
     </main>
   );
 }
 
-export function App() {
+function Application() {
+  const { t, language, setLanguage } = useI18n();
   const [active, setActive] = useState("Übersicht");
+  const workspaceScroll = useRef<HTMLElement>(null);
+  useEffect(() => { if (workspaceScroll.current) workspaceScroll.current.scrollTop = 0; }, [active]);
   const [snapshot, setSnapshot] = useState<ApplianceSnapshot>(() =>
     emptyApplianceSnapshot(),
   );
   const [session, setSession] = useState<SessionInfo | null | undefined>(
     undefined,
   );
+  const [savingLanguage, setSavingLanguage] = useState(false);
+  const [languageError, setLanguageError] = useState<string | null>(null);
+  const [uiPreferencesOpen, setUiPreferencesOpen] = useState(false);
+  const accountTrigger = useRef<HTMLButtonElement>(null);
+  const accountMenu = useRef<HTMLDivElement>(null);
+  const [liveResources, setLiveResources] = useState<ResourceSample[]>([]);
+  useEffect(() => {
+    if (session) setLanguage(session.uiLanguage === "en" ? "en" : "de");
+  }, [session?.username, session?.uiLanguage, setLanguage]);
+  const changeLanguage = async (next: UiLanguage) => {
+    if (!session || savingLanguage) return;
+    setSavingLanguage(true);
+    setLanguageError(null);
+    const username = session.username;
+    try {
+      const result = await api<{ uiLanguage: UiLanguage }>(
+        "/api/v1/session/language", { method: "PUT", body: JSON.stringify({ language: next }) }, session.csrfToken,
+      );
+      setSession(current => current?.username === username ? { ...current, uiLanguage: result.uiLanguage } : current);
+    } catch (error) {
+      setLanguageError(error instanceof Error ? error.message : t("Unbekannter Fehler"));
+      notify({ id: "ui-language", tone: "error", title: t("Sprache konnte nicht gespeichert werden"), message: error instanceof Error ? error.message : t("Unbekannter Fehler") });
+    } finally { setSavingLanguage(false); }
+  };
   const [fresh, setFresh] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
+  useEffect(() => {
+    if (!accountOpen) return;
+    const outside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !accountMenu.current?.contains(event.target)) setAccountOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setAccountOpen(false); accountTrigger.current?.focus(); }
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape);
+    return () => { document.removeEventListener("pointerdown", outside); document.removeEventListener("keydown", escape); };
+  }, [accountOpen]);
   const [confirmAction, setConfirmAction] = useState<
     "mount" | "unmount" | "offline_scrub" | null
   >(null);
@@ -2060,6 +2047,7 @@ export function App() {
       api<ApplianceSnapshot>("/api/v1/snapshot")
         .then((value) => {
           setSnapshot(value);
+          setLiveResources(current => appendResourceSample(current, value.telemetry));
           setFresh(true);
         })
         .catch(() => setFresh(false)),
@@ -2089,12 +2077,13 @@ export function App() {
       lastSample.current = Date.now();
       setFresh(true);
       setSnapshot((current) => ({ ...current, telemetry }));
+      setLiveResources(current => appendResourceSample(current, telemetry));
     });
     source.addEventListener("job", (event) => {
       const job = JSON.parse((event as MessageEvent).data) as JobStatus;
       setSnapshot((current) => ({
         ...current,
-        jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)],
+        jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)].slice(0, 20),
       }));
       notify({
         id: `job-${job.id}`,
@@ -2104,12 +2093,12 @@ export function App() {
             : job.state === "succeeded"
               ? "success"
               : "working",
-        title: `${jobLabels[job.kind] ?? job.kind} ${
+        title: `${t(jobLabels[job.kind] ?? job.kind)} ${
           job.state === "failed"
-            ? "fehlgeschlagen"
+            ? t("fehlgeschlagen")
             : job.state === "succeeded"
-              ? "abgeschlossen"
-              : "läuft"
+              ? t("abgeschlossen")
+              : t("läuft")
         }`,
         message: job.message,
       });
@@ -2123,7 +2112,7 @@ export function App() {
       notify({
         id: `alert-${Date.now()}`,
         tone: "error",
-        title: "Appliance-Alarm",
+        title: t("Appliance-Alarm"),
         message: alert.message,
       });
     });
@@ -2154,18 +2143,18 @@ export function App() {
       notify({
         id: `job-${job.id}`,
         tone: "working",
-        title: `${jobLabels[job.kind] ?? job.kind} gestartet`,
+        title: t("{job} gestartet", { job: t(jobLabels[job.kind] ?? job.kind) }),
         message: job.message,
       });
     } catch (reason) {
       notify({
         id: `request-${Date.now()}`,
         tone: "error",
-        title: "Aktion nicht gestartet",
+        title: t("Aktion nicht gestartet"),
         message:
           reason instanceof Error
             ? reason.message
-            : "Die Appliance-Anfrage ist fehlgeschlagen",
+            : t("Die Appliance-Anfrage ist fehlgeschlagen"),
       });
     }
   };
@@ -2186,22 +2175,22 @@ export function App() {
       notify({
         id: `job-${job.id}`,
         tone: "working",
-        title: "SMB-Freigabe wird aktiviert",
+        title: t("SMB-Freigabe wird aktiviert"),
         message: job.message,
       });
     } catch (reason) {
       notify({
         id: `share-${Date.now()}`,
         tone: "error",
-        title: "Freigabe nicht geändert",
-        message: reason instanceof Error ? reason.message : "Unbekannter Fehler",
+        title: t("Freigabe nicht geändert"),
+        message: reason instanceof Error ? reason.message : t("Unbekannter Fehler"),
       });
     }
   };
   const removeShare = (share: ShareSettings) => {
     if (
       !window.confirm(
-        `Freigabe „${share.name}“ löschen? Aktive Sessions werden getrennt.`,
+        t("Freigabe „{name}“ löschen? Aktive Sessions werden getrennt.", { name: share.name }),
       ) ||
       !session
     )
@@ -2219,7 +2208,7 @@ export function App() {
         notify({
           id: `job-${job.id}`,
           tone: "working",
-          title: "Share-Löschung gestartet",
+          title: t("Share-Löschung gestartet"),
           message: job.message,
         });
       })
@@ -2227,7 +2216,7 @@ export function App() {
         notify({
           id: `share-delete-${Date.now()}`,
           tone: "error",
-          title: "Freigabe nicht gelöscht",
+          title: t("Freigabe nicht gelöscht"),
           message: reason.message,
         }),
       );
@@ -2244,7 +2233,7 @@ export function App() {
       const cell = (value: string | number) =>
         `"${String(value).replaceAll('"', '""')}"`;
       const csv = [
-        ["Zeit", "Akteur", "Aktion", "Ergebnis", "Details"],
+        [t("Zeit"), t("Akteur"), t("Aktion"), t("Ergebnis"), "Details"],
         ...records.map((record) => [
           new Date(record.timestamp * 1000).toISOString(),
           record.actor,
@@ -2266,15 +2255,15 @@ export function App() {
       notify({
         id: "audit-export",
         tone: "success",
-        title: "Audit exportiert",
-        message: `${records.length} Audit-Einträge wurden als CSV bereitgestellt.`,
+        title: t("Audit exportiert"),
+        message: t("{count} Audit-Einträge wurden als CSV bereitgestellt.", { count: records.length }),
       });
     } catch (reason) {
       notify({
         id: "audit-export",
         tone: "error",
-        title: "Audit-Export fehlgeschlagen",
-        message: reason instanceof Error ? reason.message : "Unbekannter Fehler",
+        title: t("Audit-Export fehlgeschlagen"),
+        message: reason instanceof Error ? reason.message : t("Unbekannter Fehler"),
       });
     }
   };
@@ -2282,14 +2271,14 @@ export function App() {
     const now = Math.floor(Date.now() / 1000);
     try {
       return await api<TelemetrySnapshot[]>(
-        `/api/v1/telemetry/history?from=${now - seconds}&to=${now}&limit=50000`,
+        `/api/v1/telemetry/history?from=${now - seconds}&to=${now}&limit=1500`,
       );
     } catch (reason) {
       notify({
         id: "telemetry-history",
         tone: "error",
-        title: "Telemetrie-Zeitraum nicht geladen",
-        message: reason instanceof Error ? reason.message : "Unbekannter Fehler",
+        title: t("Telemetrie-Zeitraum nicht geladen"),
+        message: reason instanceof Error ? reason.message : t("Unbekannter Fehler"),
       });
       return [];
     }
@@ -2301,12 +2290,12 @@ export function App() {
       { method: "POST" },
       session.csrfToken,
     )
-      .then(() => setSession(null))
+      .then(() => { setSession(null); setLiveResources([]); })
       .catch((reason: Error) =>
         notify({
           id: "logout",
           tone: "error",
-          title: "Abmeldung fehlgeschlagen",
+          title: t("Abmeldung fehlgeschlagen"),
           message: reason.message,
         }),
       );
@@ -2316,9 +2305,9 @@ export function App() {
     return (
       <div className="boot-screen">
         <div className="brand-mark">
-          <Box />
+          <img src={applianceMark} alt="" />
         </div>
-        <span>Control Plane wird geladen…</span>
+        <span>{t("Control Plane wird geladen…")}</span>
       </div>
     );
   if (!session) return <Login onLogin={setSession} />;
@@ -2360,6 +2349,9 @@ export function App() {
   else if (active === "SMB-Freigaben")
     content = (
       <SharesPage
+        repositoryError={snapshot.repository?.state === "error"}
+        repositoryReady={!!snapshot.repository && ["online", "unmounted"].includes(snapshot.repository.state)}
+        setupRepository={() => setActive(snapshot.repository?.state === "error" ? "Repository" : "Laufwerke")}
         shares={snapshot.shares}
         principals={principals}
         save={(share) => void saveShare(share)}
@@ -2372,6 +2364,7 @@ export function App() {
         snapshot={snapshot.telemetry}
         disks={repositoryDisks(snapshot)}
         loadHistory={loadTelemetryHistory}
+        liveResources={liveResources}
       />
     );
   else if (active === "Ereignisse")
@@ -2381,6 +2374,12 @@ export function App() {
   else
     content = (
       <SettingsPage
+        csrfToken={session.csrfToken}
+        username={session.username}
+        onCertificateChanged={fingerprint => {
+          setSnapshot(current => ({...current, certificateFingerprint: fingerprint}));
+          setSession(current => current ? {...current, certificateFingerprint: fingerprint} : current);
+        }}
         settings={snapshot.settings}
         fingerprint={
           snapshot.certificateFingerprint || session.certificateFingerprint
@@ -2401,15 +2400,15 @@ export function App() {
               notify({
                 id: "tls-regenerate",
                 tone: "success",
-                title: "TLS-Zertifikat erneuert",
-                message: "Das neue Zertifikat ist ohne Reboot aktiv.",
+                title: t("TLS-Zertifikat erneuert"),
+                message: t("Das neue Zertifikat ist ohne Reboot aktiv."),
               });
             })
             .catch((reason: Error) =>
               notify({
                 id: "tls-regenerate",
                 tone: "error",
-                title: "TLS-Zertifikat nicht erneuert",
+                title: t("TLS-Zertifikat nicht erneuert"),
                 message: reason.message,
               }),
             );
@@ -2420,32 +2419,34 @@ export function App() {
   return (
     <div className="app-shell">
       <AppSidebar active={active} onChange={setActive} alarms={alerts.length} />
-      <main>
+      <main ref={workspaceScroll}>
         <header className="topbar">
           <div>
-            <h2>{session.mustChangePassword ? "Sicherheit" : active}</h2>
+            <h2>{session.mustChangePassword ? t("Sicherheit") : t(active)}</h2>
             <span>Appliance Control Plane</span>
           </div>
           <div className="topbar-actions">
             <Badge className={fresh ? "live" : "stale"}>
               <span className="pulse" />
-              {fresh ? "LIVE" : "TELEMETRIE VERALTET"}
+              <span className="telemetry-status-full">{fresh ? "Live" : t("Telemetrie veraltet")}</span>
+              <span className="telemetry-status-compact">{fresh ? "Live" : t("Veraltet")}</span>
             </Badge>
             <button
-              aria-label="Benachrichtigungen"
+              aria-label={t("Benachrichtigungen")}
               onClick={() => setActive("Ereignisse")}
             >
               <Bell size={18} />
               {alerts.length > 0 && <i>{alerts.length}</i>}
             </button>
-            <div className="account-menu">
+            <div className="account-menu" ref={accountMenu}>
               <button
                 className="account-trigger"
+                ref={accountTrigger}
                 aria-haspopup="menu"
                 aria-expanded={accountOpen}
                 onClick={() => setAccountOpen((value) => !value)}
               >
-                <span className="avatar">AD</span>
+                <span className="avatar">{session.username.slice(0, 2).toUpperCase()}</span>
                 <span>
                   <strong>{session.username}</strong>
                   <small>Administrator</small>
@@ -2453,7 +2454,13 @@ export function App() {
                 <ChevronDown size={14} />
               </button>
               {accountOpen && (
-                <div className="account-popover" role="menu">
+                <div className="account-popover" role="menu" onKeyDown={event => {
+                  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+                  const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
+                  const index = items.findIndex(item => item === document.activeElement);
+                  const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowUp" ? -1 : 1) + items.length) % items.length;
+                  event.preventDefault(); items[next]?.focus();
+                }}>
                   <div>
                     <UserRound size={16} />
                     <span>
@@ -2461,18 +2468,18 @@ export function App() {
                       <small>Administrator</small>
                     </span>
                   </div>
+                  <button role="menuitem" autoFocus onClick={() => {
+                    setAccountOpen(false); setLanguageError(null); setUiPreferencesOpen(true);
+                  }}><SlidersHorizontal size={16} />{t("UI-Einstellungen")}</button>
                   <button
                     role="menuitem"
                     onClick={() => {
                       setAccountOpen(false);
                       setActive("Einstellungen");
                     }}
-                  >
-                    Passwort ändern
-                  </button>
+                  ><KeyRound size={16} />{t("Passwort ändern")}</button>
                   <button role="menuitem" className="logout" onClick={logout}>
-                    <LogOut size={15} /> Abmelden
-                  </button>
+                    <LogOut size={15} />{t("Abmelden")}</button>
                 </div>
               )}
             </div>
@@ -2480,18 +2487,21 @@ export function App() {
         </header>
         <div className="page-content">{content}</div>
       </main>
+      {!session.mustChangePassword && <RecentJobs jobs={snapshot.jobs} />}
+      {uiPreferencesOpen && <UiPreferencesDialog language={language} saving={savingLanguage} error={languageError}
+        onChange={changeLanguage} onClose={() => setUiPreferencesOpen(false)} trigger={accountTrigger} />}
       {confirmAction && (
         <ConfirmDialog
           danger={confirmAction !== "mount"}
           title={
             confirmAction === "offline_scrub"
-              ? "Offline-Scrub starten?"
-              : "Repository unmounten?"
+              ? t("Offline-Scrub starten?")
+              : t("Repository unmounten?")
           }
           confirmLabel={
             confirmAction === "offline_scrub"
-              ? "SMB unterbrechen & prüfen"
-              : "Kontrolliert unmounten"
+              ? t("SMB unterbrechen & prüfen")
+              : t("Kontrolliert unmounten")
           }
           onClose={() => setConfirmAction(null)}
           onConfirm={() => {
@@ -2502,8 +2512,8 @@ export function App() {
         >
           <p>
             {confirmAction === "offline_scrub"
-              ? "Alle SMB-Sessions werden kontrolliert getrennt. Nach erfolgreicher Prüfung wird das Repository automatisch wieder online gebracht. Bei einem Fehler bleibt es sicher unmounted."
-              : "Der Daemon erhält SIGINT, schreibt einen Checkpoint und hängt FUSE sauber aus. Ein automatisches SIGKILL wird niemals verwendet."}
+              ? t("Alle SMB-Sessions werden kontrolliert getrennt. Nach erfolgreicher Prüfung wird das Repository automatisch wieder online gebracht. Bei einem Fehler bleibt es sicher unmounted.")
+              : t("Der Daemon erhält SIGINT, schreibt einen Checkpoint und hängt FUSE sauber aus. Ein automatisches SIGKILL wird niemals verwendet.")}
           </p>
         </ConfirmDialog>
       )}
@@ -2515,4 +2525,8 @@ export function App() {
       />
     </div>
   );
+}
+
+export function App() {
+  return <I18nProvider><Application /></I18nProvider>;
 }

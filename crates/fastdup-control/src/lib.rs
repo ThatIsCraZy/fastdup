@@ -12,14 +12,19 @@
 
 mod auth;
 mod control;
+mod detail_telemetry;
 mod inventory;
+mod firewall;
 mod samba;
 mod store;
 mod telemetry;
 mod tls;
+mod pfx;
+pub use pfx::decode_pfx;
 
-pub use auth::{AuthError, AuthenticatedSession, LoginResult, SessionManager};
+pub use auth::{AuthError, AuthenticatedSession, LoginResult, SessionManager, WebUser};
 pub use control::{AgentControl, AgentRuntime, ApplianceControl, InMemoryControl};
+pub use detail_telemetry::*;
 pub use inventory::{BlockInventory, InventoryError};
 pub use samba::{SambaConfig, SambaError};
 pub use store::{ControlStore, StoreError, TelemetryStore};
@@ -241,6 +246,8 @@ pub struct SeriesPoint {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelemetrySnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Box<DetailTelemetry>>,
     pub sequence: u64,
     pub observed_at: String,
     pub repository_state: RepositoryState,
@@ -263,6 +270,7 @@ pub struct TelemetrySnapshot {
 impl Default for TelemetrySnapshot {
     fn default() -> Self {
         Self {
+            details: None,
             sequence: 0,
             observed_at: unix_seconds().to_string(),
             repository_state: RepositoryState::Uninitialized,

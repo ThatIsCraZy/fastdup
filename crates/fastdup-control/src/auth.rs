@@ -15,6 +15,13 @@ const SESSION_SECONDS: i64 = 8 * 60 * 60;
 const MAX_FAILURES: u32 = 5;
 const LOCK_SECONDS: i64 = 5 * 60;
 
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebUser {
+    pub username: String,
+    pub must_change_password: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoginResult {
     pub session_token: String,
@@ -44,6 +51,10 @@ pub enum AuthError {
     Store(#[from] StoreError),
     #[error("authentication database failed: {0}")]
     Sql(#[from] rusqlite::Error),
+    #[error("username must be 1–32 ASCII letters, digits, dots, underscores or hyphens")]
+    InvalidUsername,
+    #[error("username already exists")]
+    UserExists,
     #[error("password hash failed")]
     PasswordHash,
 }
@@ -77,6 +88,43 @@ impl SessionManager {
                 "INSERT INTO users(username, password_hash, must_change, failed_attempts, locked_until) VALUES(?1, ?2, 1, 0, 0)",
                 params![INITIAL_USERNAME, password_hash],
             )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_users(&self) -> Result<Vec<WebUser>, AuthError> {
+        let connection = self.store.connection();
+        let connection = connection.lock().map_err(|_| StoreError::Poisoned)?;
+        let mut statement =
+            connection.prepare("SELECT username, must_change FROM users ORDER BY username")?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(WebUser {
+                    username: row.get(0)?,
+                    must_change_password: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn create_user(&self, username: &str, password: &str) -> Result<(), AuthError> {
+        if username.is_empty()
+            || username.len() > 32
+            || !username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return Err(AuthError::InvalidUsername);
+        }
+        if !(12..=128).contains(&password.chars().count()) {
+            return Err(AuthError::WeakPassword);
+        }
+        let hash = hash_password(password)?;
+        let connection = self.store.connection();
+        let connection = connection.lock().map_err(|_| StoreError::Poisoned)?;
+        let changed = connection.execute("INSERT INTO users(username,password_hash,must_change,failed_attempts,locked_until) VALUES(?1,?2,1,0,0) ON CONFLICT(username) DO NOTHING", params![username,hash])?;
+        if changed == 0 {
+            return Err(AuthError::UserExists);
         }
         Ok(())
     }
@@ -233,6 +281,56 @@ fn token_hash(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_users_have_independent_passwords_and_first_login_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let sessions =
+            SessionManager::new(ControlStore::open(&directory.path().join("users.db")).unwrap())
+                .unwrap();
+        sessions
+            .create_user("alice", "initial-alice-password")
+            .unwrap();
+        sessions.create_user("bob", "initial-bob-password").unwrap();
+        assert!(matches!(
+            sessions.create_user("alice", "replacement-password"),
+            Err(AuthError::UserExists)
+        ));
+        assert!(matches!(
+            sessions.create_user("../invalid", "long-enough-password"),
+            Err(AuthError::InvalidUsername)
+        ));
+        assert!(matches!(
+            sessions.create_user("short", "short"),
+            Err(AuthError::WeakPassword)
+        ));
+        assert!(sessions.login("alice", "initial-bob-password").is_err());
+        let alice = sessions.login("alice", "initial-alice-password").unwrap();
+        assert!(alice.must_change_password);
+        let changed = sessions
+            .change_password(
+                &alice.session_token,
+                "initial-alice-password",
+                "changed-alice-password",
+            )
+            .unwrap();
+        assert!(!changed.must_change_password);
+        assert!(
+            sessions
+                .login("bob", "initial-bob-password")
+                .unwrap()
+                .must_change_password
+        );
+        let users = sessions.list_users().unwrap();
+        assert_eq!(users.len(), 3);
+        assert!(
+            !users
+                .iter()
+                .find(|user| user.username == "alice")
+                .unwrap()
+                .must_change_password
+        );
+    }
 
     #[test]
     fn initial_login_requires_a_password_change_and_rotates_session() {

@@ -16,6 +16,7 @@ Requires:       systemd
 Requires:       systemd-udev
 Requires:       util-linux
 Requires:       xfsprogs
+Requires:       openssl
 
 %description
 fastdup is an experimental single-node POSIX storage appliance. This package

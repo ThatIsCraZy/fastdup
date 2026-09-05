@@ -920,7 +920,7 @@ impl Filesystem for FuseFilesystem {
             .run_blocking(move || {
                 namespace.dispatch(
                     request,
-                    Operation::Read {
+                    Operation::ReadShared {
                         inode,
                         handle,
                         offset,
@@ -936,12 +936,12 @@ impl Filesystem for FuseFilesystem {
                 return Err(errno(error));
             }
         };
-        let data = expect_data(reply);
+        let Reply::SharedData(data) = reply else {
+            unreachable!("ASSERT: a shared read returns shared DATA");
+        };
         self.frontend_telemetry
             .record_read(Some(data.len()), started);
-        Ok(ReplyData {
-            data: Bytes::from(data),
-        })
+        Ok(ReplyData { data })
     }
 
     async fn write(
@@ -2016,13 +2016,6 @@ fn expect_opened(reply: &Reply) -> HandleId {
         panic!("ASSERT: namespace open returned a non-opened reply");
     };
     handle
-}
-
-fn expect_data(reply: Reply) -> Vec<u8> {
-    let Reply::Data(data) = reply else {
-        panic!("ASSERT: namespace read returned a non-data reply");
-    };
-    data
 }
 
 fn expect_written(reply: &Reply) -> (u32, u64, u64) {

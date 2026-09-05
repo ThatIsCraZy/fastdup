@@ -166,9 +166,124 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             pending.push((key, entries));
         }
         flush(&mut pending, &mut build)?;
-        let staged = self.stage_built_family(generation, &build, None)?;
-        self.activate_staged_family(staged)?;
-        self.recover_generation(generation)
+        self.publish_built_online_family(generation, &build)
+    }
+
+    /// Audits the published immutable objects once and carries their leases
+    /// through family activation. A crash before the manifest leaves orphans.
+    fn publish_built_online_family(
+        &self,
+        generation: u64,
+        build: &PartitionedSimilarityBuild,
+    ) -> Result<RecoveredSimilarityIndex<I>, SimilarityIndexStoreError> {
+        let _guard = self
+            .publish_lock
+            .lock()
+            .expect("ASSERT: Similarity publication lock poisoned");
+        let temporary = format!(".similarity-family-{generation:016x}.building");
+        let mut cleanup = build
+            .partitions
+            .iter()
+            .map(|part| part.temporary_name.clone())
+            .collect::<Vec<_>>();
+        cleanup.push(temporary.clone());
+        let _cleanup = TemporarySimilarityFiles::new(&self.storage, cleanup);
+        for part in &build.partitions {
+            self.storage.sync_file(&part.temporary_name)?;
+        }
+        self.publish_physical_partitions(&build.partitions)?;
+        let count = u16::try_from(build.partitions.len())
+            .map_err(|_| SimilarityIndexStoreError::TooManyPartitions)?;
+        let mut references = Vec::new();
+        let mut verified = Vec::new();
+        for (ordinal, part) in build.partitions.iter().enumerate() {
+            let observed = self.recover_partition_named(&part.published_name)?;
+            verify_expected_descriptor(part.descriptor, observed.descriptor)?;
+            if observed.minimum_bucket_key != part.minimum_bucket_key
+                || observed.maximum_bucket_key != part.maximum_bucket_key
+            {
+                return Err(SimilarityIndexStoreError::IndexCorruption);
+            }
+            references.push(SimilarityIndexPartitionRef::new(
+                generation,
+                u16::try_from(ordinal).map_err(|_| SimilarityIndexStoreError::TooManyPartitions)?,
+                count,
+                observed.descriptor,
+                observed.minimum_bucket_key,
+                observed.maximum_bucket_key,
+            )?);
+            verified.push(observed);
+        }
+        let family = SimilarityIndexRunFamily::new(
+            SIMILARITY_FINGERPRINT_PROFILE_V1,
+            SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+            generation,
+            build.logical_entry_count,
+            references,
+        )?;
+        // Durable Runs precede the only selection point. Mapping owners keep
+        // exactly the audited bytes immutable through and after this barrier.
+        self.storage.sync_root()?;
+        self.publish_family_manifest(
+            &family_name(generation),
+            &temporary,
+            &family,
+            &family.encode()?,
+        )?;
+        self.index_from_verified_family(&family, verified)
+    }
+
+    fn index_from_verified_family(
+        &self,
+        family: &SimilarityIndexRunFamily,
+        verified: Vec<VerifiedSimilarityPartition>,
+    ) -> Result<RecoveredSimilarityIndex<I>, SimilarityIndexStoreError> {
+        if family.partitions().len() != verified.len() {
+            return Err(SimilarityIndexStoreError::IdentityMismatch);
+        }
+        let mut partitions = Vec::new();
+        let mut buckets = 0_u64;
+        for (reference, verified) in family.partitions().iter().copied().zip(verified) {
+            verify_partition_reference(
+                reference,
+                verified.descriptor,
+                verified.minimum_bucket_key,
+                verified.maximum_bucket_key,
+            )?;
+            buckets = buckets
+                .checked_add(reference.bucket_count())
+                .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
+            partitions.push(RecoveredSimilarityPartition {
+                name: partition_name(family.generation(), reference.partition_ordinal()),
+                descriptor: verified.descriptor,
+                minimum_bucket_key: verified.minimum_bucket_key,
+                maximum_bucket_key: verified.maximum_bucket_key,
+                mapping: verified.mapping,
+                page_cache: Arc::clone(&self.page_cache),
+            });
+        }
+        let mapped = partitions
+            .iter()
+            .filter(|part| part.mapping.is_some())
+            .count();
+        let read_mode = match mapped {
+            0 => SimilarityIndexReadMode::ReadExactAt,
+            n if n == partitions.len() => SimilarityIndexReadMode::Mmap,
+            _ => return Err(SimilarityIndexStoreError::IdentityMismatch),
+        };
+        Ok(RecoveredSimilarityIndex {
+            storage: self.storage.clone(),
+            partitions: partitions.into_boxed_slice(),
+            page_cache: Arc::clone(&self.page_cache),
+            status: SimilarityIndexRebuildStatus {
+                generation: family.generation(),
+                entries_streamed: family.logical_entry_count(),
+                resident_representatives: 0,
+                buckets,
+                read_mode,
+                source_exact_run_set_id: family.source_exact_run_set_id(),
+            },
+        })
     }
 
     pub(crate) fn remove_family(&self, generation: u64) -> Result<(), SimilarityIndexStoreError> {
@@ -573,75 +688,22 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         &self,
         generation: u64,
     ) -> Result<RecoveredSimilarityIndex<I>, SimilarityIndexStoreError> {
-        let publication = LatestSimilarityPublication {
-            generation,
-            name: family_name(generation),
-        };
-        let (generation, entries_streamed, buckets, source_exact_run_set_id, partitions) = {
-            let LatestSimilarityPublication { generation, name } = publication;
-            let family = self.read_family(&name)?;
-            require_v1_profiles(family.fingerprint_profile(), family.bucket_profile())?;
-            if family.generation() != generation {
-                return Err(SimilarityIndexStoreError::IdentityMismatch);
-            }
-            let mut partitions = Vec::new();
-            partitions
-                .try_reserve_exact(family.partitions().len())
-                .map_err(|_| SimilarityIndexStoreError::OutOfMemory)?;
-            let mut buckets = 0_u64;
-            for reference in family.partitions().iter().copied() {
-                let partition_name = partition_name(generation, reference.partition_ordinal());
-                let verified = self.recover_partition_named(&partition_name)?;
-                let descriptor = verified.descriptor;
-                verify_partition_reference(
-                    reference,
-                    descriptor,
-                    verified.minimum_bucket_key,
-                    verified.maximum_bucket_key,
-                )?;
-                buckets = buckets
-                    .checked_add(reference.bucket_count())
-                    .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-                partitions.push(RecoveredSimilarityPartition {
-                    name: partition_name,
-                    descriptor,
-                    minimum_bucket_key: verified.minimum_bucket_key,
-                    maximum_bucket_key: verified.maximum_bucket_key,
-                    mapping: verified.mapping,
-                    page_cache: Arc::clone(&self.page_cache),
-                });
-            }
-            (
-                generation,
-                family.logical_entry_count(),
-                buckets,
-                family.source_exact_run_set_id(),
-                partitions,
-            )
-        };
-        let mapped_partitions = partitions
+        let family = self.read_family(&family_name(generation))?;
+        require_v1_profiles(family.fingerprint_profile(), family.bucket_profile())?;
+        if family.generation() != generation {
+            return Err(SimilarityIndexStoreError::IdentityMismatch);
+        }
+        let verified = family
+            .partitions()
             .iter()
-            .filter(|partition| partition.mapping.is_some())
-            .count();
-        let read_mode = match mapped_partitions {
-            0 => SimilarityIndexReadMode::ReadExactAt,
-            count if count == partitions.len() => SimilarityIndexReadMode::Mmap,
-            _ => return Err(SimilarityIndexStoreError::IdentityMismatch),
-        };
-        let status = SimilarityIndexRebuildStatus {
-            generation,
-            entries_streamed,
-            resident_representatives: 0,
-            buckets,
-            read_mode,
-            source_exact_run_set_id,
-        };
-        Ok(RecoveredSimilarityIndex {
-            storage: self.storage.clone(),
-            partitions: partitions.into_boxed_slice(),
-            page_cache: Arc::clone(&self.page_cache),
-            status,
-        })
+            .map(|reference| {
+                self.recover_partition_named(&partition_name(
+                    generation,
+                    reference.partition_ordinal(),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.index_from_verified_family(&family, verified)
     }
 
     /// Recovers only a family produced from the supplied active Exact Run Set.
@@ -942,7 +1004,26 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             .storage
             .lease_immutable_file(name, envelope.descriptor.file_length())?
         {
-            let mapping = Arc::new(ImmutableSimilarityRun::open(lease, envelope.descriptor)?);
+            // Optional acceleration has a fixed per-open allocation ceiling.
+            // Only the successfully audited Run hash may enter the governor.
+            let count = envelope.descriptor.bucket_page_count();
+            let mut fences = Vec::new();
+            let collect = count <= MAX_BUCKET_FENCE_BYTES / size_of::<SimilarityBucketKey>()
+                && self.page_cache.target_pages.load(AtomicOrdering::Acquire) != 0
+                && fences.try_reserve_exact(count).is_ok();
+            let mapping = Arc::new(ImmutableSimilarityRun::open(
+                lease,
+                envelope.descriptor,
+                |key| {
+                    if collect {
+                        fences.push(key);
+                    }
+                },
+            )?);
+            if collect {
+                self.page_cache
+                    .insert_fences(envelope.descriptor.run_hash(), fences);
+            }
             return Ok(VerifiedSimilarityPartition {
                 descriptor: mapping.descriptor(),
                 minimum_bucket_key: mapping.minimum_bucket_key(),
@@ -1108,7 +1189,6 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             page: 0,
             reference: 0,
             cached: None,
-            previous: None,
             failed: false,
         }
     }
@@ -1281,14 +1361,21 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             .get(partition_ordinal)
             .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
         let mut lower = 0_usize;
-        let mut upper = partition.descriptor.bucket_page_count();
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2;
-            let page = self.read_bucket_page(partition_ordinal, middle)?;
-            if page.last_key() < key {
-                lower = middle + 1;
-            } else {
-                upper = middle;
+        if let Some(fences) = partition
+            .page_cache
+            .get_fences(partition.descriptor.run_hash())
+        {
+            lower = fences.partition_point(|last| *last < key);
+        } else {
+            let mut upper = partition.descriptor.bucket_page_count();
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2;
+                let page = self.read_bucket_page(partition_ordinal, middle)?;
+                if page.last_key() < key {
+                    lower = middle + 1;
+                } else {
+                    upper = middle;
+                }
             }
         }
 
@@ -1458,7 +1545,17 @@ impl<P> DirectSimilarityPageCache<P> {
     }
 }
 
+const MAX_BUCKET_FENCE_BYTES: usize = 64 * 1_024;
+const MAX_BUCKET_FENCE_RUNS: usize = 16;
+
+struct CachedBucketFences {
+    run_hash: [u8; 32],
+    keys: Arc<[SimilarityBucketKey]>,
+    charged_pages: u64,
+}
+
 struct SimilarityPageCache {
+    fences: Mutex<Vec<CachedBucketFences>>,
     entry_pages: DirectSimilarityPageCache<SimilarityIndexPage>,
     bucket_pages: DirectSimilarityPageCache<SimilarityBucketPage>,
     admission: Mutex<()>,
@@ -1488,6 +1585,7 @@ impl fmt::Debug for SimilarityPageCache {
 impl SimilarityPageCache {
     fn new(snapshot: MemoryPressureSnapshot, automatic_pressure: bool) -> Self {
         let cache = Self {
+            fences: Mutex::new(Vec::new()),
             entry_pages: DirectSimilarityPageCache::new(),
             bucket_pages: DirectSimilarityPageCache::new(),
             admission: Mutex::new(()),
@@ -1506,6 +1604,66 @@ impl SimilarityPageCache {
         };
         cache.apply_pressure_snapshot(snapshot);
         cache
+    }
+
+    fn get_fences(&self, run_hash: [u8; 32]) -> Option<Arc<[SimilarityBucketKey]>> {
+        self.refresh_pressure_if_due();
+        self.fences
+            .lock()
+            .expect("ASSERT: Similarity fence cache lock poisoned")
+            .iter()
+            .find(|entry| entry.run_hash == run_hash)
+            .map(|entry| Arc::clone(&entry.keys))
+    }
+
+    fn insert_fences(&self, run_hash: [u8; 32], keys: Vec<SimilarityBucketKey>) {
+        self.refresh_pressure_if_due();
+        let bytes = keys.len().saturating_mul(size_of::<SimilarityBucketKey>());
+        if keys.is_empty() || bytes > MAX_BUCKET_FENCE_BYTES {
+            return;
+        }
+        let charged_pages = u64::try_from(bytes + size_of::<CachedBucketFences>())
+            .unwrap_or(u64::MAX)
+            .div_ceil(SIMILARITY_INDEX_PAGE_BYTES as u64);
+        let _admission = self
+            .admission
+            .lock()
+            .expect("ASSERT: Similarity page-cache admission lock poisoned");
+        let target = self.target_pages.load(AtomicOrdering::Acquire);
+        // At most one quarter of admitted pages may be directories. Readers
+        // retain at most a 64-KiB view through one bounded lookup after purge.
+        if charged_pages > target / 4 {
+            return;
+        }
+        let mut fences = self
+            .fences
+            .lock()
+            .expect("ASSERT: Similarity fence cache lock poisoned");
+        if fences.iter().any(|entry| entry.run_hash == run_hash) {
+            return;
+        }
+        while !fences.is_empty()
+            && (fences.len() == MAX_BUCKET_FENCE_RUNS
+                || fences.iter().map(|entry| entry.charged_pages).sum::<u64>() + charged_pages
+                    > target / 4
+                || self.resident_pages.load(AtomicOrdering::Acquire) + charged_pages > target)
+        {
+            let removed = fences.remove(0);
+            self.resident_pages
+                .fetch_sub(removed.charged_pages, AtomicOrdering::Relaxed);
+            self.evictions
+                .fetch_add(removed.charged_pages, AtomicOrdering::Relaxed);
+        }
+        if self.resident_pages.load(AtomicOrdering::Acquire) + charged_pages > target {
+            return;
+        }
+        fences.push(CachedBucketFences {
+            run_hash,
+            keys: keys.into(),
+            charged_pages,
+        });
+        self.resident_pages
+            .fetch_add(charged_pages, AtomicOrdering::Relaxed);
     }
 
     fn get_entry(
@@ -1682,7 +1840,13 @@ impl SimilarityPageCache {
             .admission
             .lock()
             .expect("ASSERT: Similarity page-cache admission lock poisoned");
-        let removed = self.entry_pages.purge() + self.bucket_pages.purge();
+        let mut fences = self
+            .fences
+            .lock()
+            .expect("ASSERT: Similarity fence cache lock poisoned");
+        let fence_pages = fences.iter().map(|entry| entry.charged_pages).sum::<u64>();
+        fences.clear();
+        let removed = self.entry_pages.purge() + self.bucket_pages.purge() + fence_pages;
         let previous = self.resident_pages.swap(0, AtomicOrdering::AcqRel);
         assert_eq!(
             removed, previous,
@@ -1819,19 +1983,18 @@ pub(crate) struct SimilarityBuckets<'a, I> {
     partition: usize,
     page: usize,
     reference: usize,
-    cached: Option<SimilarityBucketPage>,
-    previous: Option<SimilarityBucketKey>,
+    cached: Option<Arc<SimilarityBucketPage>>,
     failed: bool,
 }
 
-impl<I: Clone + StorageIo> Iterator for SimilarityBuckets<'_, I> {
-    type Item = Result<(SimilarityBucketKey, Vec<SimilarityIndexEntry>), SimilarityIndexStoreError>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
+impl<I: Clone + StorageIo> SimilarityBuckets<'_, I> {
+    fn peek_reference(
+        &mut self,
+    ) -> Result<Option<fastdup_format::SimilarityBucketReference>, SimilarityIndexStoreError> {
         loop {
-            let part = self.index.partitions.get(self.partition)?;
+            let Some(part) = self.index.partitions.get(self.partition) else {
+                return Ok(None);
+            };
             if self.page >= part.descriptor.bucket_page_count() {
                 self.partition += 1;
                 self.page = 0;
@@ -1840,45 +2003,69 @@ impl<I: Clone + StorageIo> Iterator for SimilarityBuckets<'_, I> {
                 continue;
             }
             if self.cached.is_none() {
-                let result = part
-                    .descriptor
-                    .bucket_page_offset(self.page)
-                    .ok_or(SimilarityIndexStoreError::IndexCorruption)
-                    .and_then(|offset| {
-                        self.index
-                            .storage
-                            .read_exact_at(&part.name, offset, SIMILARITY_INDEX_PAGE_BYTES)
-                            .map_err(Into::into)
-                    })
-                    .and_then(|bytes| {
-                        part.descriptor
-                            .decode_bucket_page(self.page, &bytes)
-                            .map_err(Into::into)
-                    });
-                match result {
-                    Ok(page) => self.cached = Some(page),
-                    Err(e) => {
-                        self.failed = true;
-                        return Some(Err(e));
-                    }
-                }
+                self.cached = Some(self.index.read_bucket_page(self.partition, self.page)?);
             }
-            let page = self.cached.as_ref()?;
-            let Some(reference) = page.references().get(self.reference) else {
-                self.page += 1;
-                self.reference = 0;
-                self.cached = None;
-                continue;
-            };
+            if let Some(reference) = self
+                .cached
+                .as_ref()
+                .and_then(|page| page.references().get(self.reference))
+                .copied()
+            {
+                return Ok(Some(reference));
+            }
+            self.page += 1;
+            self.reference = 0;
+            self.cached = None;
+        }
+    }
+
+    fn next_bucket(
+        &mut self,
+    ) -> Result<Option<(SimilarityBucketKey, Vec<SimilarityIndexEntry>)>, SimilarityIndexStoreError>
+    {
+        let Some(first) = self.peek_reference()? else {
+            return Ok(None);
+        };
+        let key = first.key();
+        let mut entries = Vec::new();
+        while let Some(reference) = self.peek_reference()? {
+            if reference.key() != key {
+                break;
+            }
+            if entries.len() == 64 {
+                return Err(SimilarityIndexStoreError::IndexCorruption);
+            }
+            let entry = self
+                .index
+                .read_entry(self.partition, reference.entry_ordinal())?;
+            validate_query_entry(entry, key, usize::from(key.slot()))?;
+            if entries
+                .last()
+                .is_some_and(|previous: &SimilarityIndexEntry| {
+                    previous.chunk_id() >= entry.chunk_id()
+                })
+            {
+                return Err(SimilarityIndexStoreError::IndexCorruption);
+            }
+            entries.push(entry);
             self.reference += 1;
-            let key = reference.key();
-            if self.previous == Some(key) {
-                continue;
+        }
+        Ok(Some((key, entries)))
+    }
+}
+
+impl<I: Clone + StorageIo> Iterator for SimilarityBuckets<'_, I> {
+    type Item = Result<(SimilarityBucketKey, Vec<SimilarityIndexEntry>), SimilarityIndexStoreError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        match self.next_bucket() {
+            Ok(bucket) => bucket.map(Ok),
+            Err(error) => {
+                self.failed = true;
+                Some(Err(error))
             }
-            self.previous = Some(key);
-            let result = self.index.bucket_entries(key).map(|entries| (key, entries));
-            self.failed = result.is_err();
-            return Some(result);
         }
     }
 }
@@ -2284,6 +2471,87 @@ impl From<SimilarityIndexFamilyError> for SimilarityIndexStoreError {
 #[cfg(test)]
 mod tests {
     use super::BucketOrdinals;
+
+    #[test]
+    fn streamed_buckets_cross_pages_and_fence_eviction_preserves_lookup() {
+        use super::*;
+        use std::collections::BTreeMap;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/tests")
+            .join(format!("similarity-fences-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        let storage = crate::FsStorageIo::open(&root).unwrap();
+        let repository = SimilarityIndexRepository::new_with_memory_snapshot(
+            storage,
+            MemoryPressureSnapshot::new(32 << 30, 30 << 30, 0),
+        );
+        let mut expected = BTreeMap::<SimilarityBucketKey, Vec<SimilarityIndexEntry>>::new();
+        let entries = (1..=2048_u64)
+            .map(|ordinal| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&ordinal.to_be_bytes());
+                let features = [ordinal / 4; 4];
+                let entry = SimilarityIndexEntry::new(
+                    ChunkId::from_bytes(id),
+                    65536,
+                    1,
+                    features,
+                    [ordinal; 8],
+                )
+                .unwrap();
+                for slot in 0..4 {
+                    expected
+                        .entry(SimilarityBucketKey::new(1, slot, 65536, ordinal / 4).unwrap())
+                        .or_default()
+                        .push(entry);
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        repository.publish_entries(1, entries).unwrap();
+        let index = repository.recover_generation(1).unwrap();
+        assert!(
+            repository
+                .page_cache
+                .get_fences(index.partitions[0].descriptor.run_hash())
+                .is_some()
+        );
+        assert_eq!(
+            index
+                .buckets()
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .unwrap(),
+            expected
+        );
+        for (&key, entries) in &expected {
+            assert_eq!(&index.bucket_entries(key).unwrap(), entries);
+        }
+        repository
+            .page_cache
+            .apply_pressure_snapshot(MemoryPressureSnapshot::new(32 << 30, 0, 1));
+        assert_eq!(repository.page_cache.status().resident_pages(), 0);
+        assert!(
+            repository
+                .page_cache
+                .get_fences(index.partitions[0].descriptor.run_hash())
+                .is_none()
+        );
+        for (&key, entries) in &expected {
+            assert_eq!(&index.bucket_entries(key).unwrap(), entries);
+        }
+        assert_eq!(
+            index
+                .buckets()
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .unwrap(),
+            expected
+        );
+        drop(index);
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn bucket_ordinals_returns_none_at_capacity() {

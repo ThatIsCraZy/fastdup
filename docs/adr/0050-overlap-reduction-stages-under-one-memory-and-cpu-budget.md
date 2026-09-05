@@ -129,3 +129,36 @@ budget may apply backpressure sooner when DATA persistence stalls for a long
 time, but it cannot grow into Swap. Exact and metadata batching reduce repeated
 NVMe page reads and directory syncs without changing any source-of-truth or
 crash-recovery rule.
+
+## Shared planning and demand-decode admission (2026-09-05)
+
+Write-through Advanced Reduction materializes a Compression Region once and pins
+one coherent Exact/Similarity view for its bounded detached Container batch.
+Fingerprint, candidate lookup and independent-codec preparation use admitted
+parallel jobs; the publication coordinator then reads at most eight verified
+Base owners per wave, with CPU permits released. Admitted codec-trial jobs
+consume those Bases and return ordered results. Trial budgets, savings thresholds,
+independent fallback and the publication/retirement guard remain unchanged.
+Receive fragmentation does not choose a compression boundary. Prepared records
+are assembled in logical input order, including the ordered checkpoint tail.
+
+Hash and encode jobs acquire the next small task dynamically within the granted
+worker count. Demand reads keep ascending physical coalescing capped at 1 MiB;
+independent decode batches of at least 256 KiB may opportunistically acquire up
+to four of the same CPU permits. Saturated pools and callers already executing
+inside Rayon decode synchronously, so a nested Base read never waits for its
+own permit. Singleflight leaders still complete or release on every outcome.
+
+Advanced phase telemetry separates fingerprint, candidate lookup, verified Base
+read, and codec-trial elapsed time. Summed parallel elapsed time is neither pure
+CPU time nor end-to-end latency; the coordinator's planning wall time also
+includes admission waits and I/O. Existing encode timing keeps its prior scope.
+
+Compression Region preparation now uses the same admission for independent
+materialization jobs. Cheap borrowed-view construction stays with the
+coordinator; only regions requiring owned contiguous bytes enter CPU jobs.
+The existing detached-payload/region bounds are unchanged, and completed owners
+are collected in region order before any planning borrows them. Empty batches
+take no permits; every batch caps its requested permits by its actual job count
+before admission, including small Base-trial waves. Preparation wall telemetry
+includes admission waiting and is reported separately from encoding.

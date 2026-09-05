@@ -37,6 +37,7 @@ const SHARE_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct RuntimeFrontendCounters {
+    details: crate::DetailTelemetry,
     read_bytes: u64,
     write_bytes: u64,
     exact_hit_bytes: u64,
@@ -258,9 +259,37 @@ impl AgentRuntime {
         let mut shutdown = self.shutdown.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = interval.tick() => runtime.sample_once(),
+                    _ = interval.tick() => {
+                        let runtime = Arc::clone(&runtime);
+                        // procfs, SQLite and local management sockets are blocking I/O.
+                        if let Err(error) = tokio::task::spawn_blocking(move || runtime.sample_once()).await {
+                            tracing::warn!(%error, "telemetry sampler failed");
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
+        let runtime = Arc::clone(self);
+        let mut shutdown = self.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_hours(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // First maintenance pass is due in one hour.
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let store = runtime.telemetry_store.clone();
+                        match tokio::task::spawn_blocking(move || store.retain_and_roll_up(unix_seconds())).await {
+                            Ok(Ok(())) => {}
+                            result => tracing::warn!(?result, "telemetry maintenance failed"),
+                        }
+                    }
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() { break; }
                     }
@@ -277,6 +306,13 @@ impl AgentRuntime {
         if dry_run() {
             return;
         }
+        let runtime = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            if let Ok(shares) = runtime.store.shares()
+                && let Err(error) = crate::firewall::ensure_smb(shares.len()) {
+                tracing::warn!(?error, "SMB firewall reconciliation failed");
+            }
+        });
         let Ok(Some(binding)) = self.store.repository_binding() else {
             return;
         };
@@ -284,6 +320,11 @@ impl AgentRuntime {
             if binding.state != RepositoryState::Online {
                 let _ = self.set_state(RepositoryState::Online);
             }
+            return;
+        }
+        // An agent restart must not retry a failed/provisioning repository.
+        // Recovery remains an explicit operator action.
+        if matches!(binding.state, RepositoryState::Error | RepositoryState::Provisioning | RepositoryState::Uninitialized) {
             return;
         }
         let Ok(settings) = self.store.settings() else {
@@ -307,7 +348,7 @@ impl AgentRuntime {
                 binding.state.clone()
             });
         let frontend = read_frontend_counters();
-        let snapshot = {
+        let mut snapshot = {
             let Ok(mut sampler) = self.sampler.lock() else {
                 return;
             };
@@ -332,6 +373,11 @@ impl AgentRuntime {
             }
             sampler.sample()
         };
+        snapshot.details = frontend.as_ref().map(|frontend| Box::new(frontend.details.clone()));
+        if let Some(checkpoint) = snapshot.details.as_ref().and_then(|d| d.runtime.as_ref()).and_then(|r| r.checkpoint.as_ref()) {
+            snapshot.commit_generation = Some(checkpoint.generation);
+            snapshot.last_checkpoint_seconds = Some(u64::try_from(unix_seconds()).unwrap_or_default().saturating_sub(checkpoint.completed_at));
+        }
         if let Some(frontend) = &frontend
             && let Ok(shares) = self.store.shares()
             && frontend.presented_capacity_revision != share_capacity_revision(&shares)
@@ -342,9 +388,6 @@ impl AgentRuntime {
             latest.clone_from(&snapshot);
         }
         let _ = self.telemetry_store.insert(unix_seconds(), &snapshot);
-        if snapshot.sequence % 3_600 == 0 {
-            let _ = self.telemetry_store.retain_and_roll_up(unix_seconds());
-        }
         let _ = self.events.send(ControlEvent::Snapshot { snapshot });
     }
 
@@ -525,6 +568,8 @@ impl AgentRuntime {
                 expected_revision,
                 share,
             } => {
+                let binding = self.store.repository_binding().map_err(problem("binding_failed"))?;
+                require_share_repository(binding.as_ref())?;
                 let current = self.store.shares().map_err(problem("shares_failed"))?;
                 let mut candidate = current.clone();
                 if let Some(existing) = candidate
@@ -942,6 +987,7 @@ fn apply_samba(samba: &SambaConfig, shares: &[ShareSettings]) -> Result<(), Cont
             .map(|_| ())
             .map_err(problem("samba_invalid"))
     } else {
+        crate::firewall::ensure_smb(shares.len())?;
         samba.apply(shares).map_err(problem("samba_apply"))
     }
 }
@@ -1153,10 +1199,11 @@ fn read_frontend_counters() -> Option<RuntimeFrontendCounters> {
         .ok()?;
     stream.shutdown(Shutdown::Write).ok()?;
     let mut response = Vec::new();
-    stream.take(16 * 1_024).read_to_end(&mut response).ok()?;
+    stream.take(64 * 1_024).read_to_end(&mut response).ok()?;
     let response: serde_json::Value = serde_json::from_slice(&response).ok()?;
     if response.get("ok")?.as_bool()? {
         Some(RuntimeFrontendCounters {
+            details: crate::detail_telemetry::parse_details(response.get("frontend")?),
             read_bytes: response.pointer("/frontend/read_bytes")?.as_u64()?,
             write_bytes: response.pointer("/frontend/write_bytes")?.as_u64()?,
             exact_hit_bytes: response.pointer("/frontend/exact_hit_bytes")?.as_u64()?,
@@ -1382,9 +1429,36 @@ fn problem<E: std::fmt::Display>(code: &'static str) -> impl FnOnce(E) -> Contro
     move |error| ControlProblem::new(code, error.to_string())
 }
 
+
+fn require_share_repository(binding: Option<&RepositoryBinding>) -> Result<(), ControlProblem> {
+    if binding.is_none_or(|binding| !matches!(binding.state, RepositoryState::Online | RepositoryState::Unmounted)) {
+        return Err(ControlProblem::new("repository_uninitialized", "Vor dem Anlegen einer Freigabe muss ein Repository eingerichtet werden"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_creation_requires_a_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ControlStore::open(&directory.path().join("control.db")).unwrap();
+        let runtime = AgentRuntime::new(
+            store.clone(), TelemetryStore::open(&directory.path().join("telemetry.db")).unwrap(),
+            SambaConfig::new(directory.path().join("shares.conf")), String::new(),
+        );
+        let share: ShareSettings = serde_json::from_value(serde_json::json!({
+            "id":"test", "revision":0, "name":"test", "description":"", "enabled":true,
+            "hidden":false, "readOnly":false, "guestAccess":false, "encryption":"desired",
+            "accessBasedEnumeration":true, "allowedUsers":[], "allowedGroups":[]
+        })).unwrap();
+        let error = runtime.execute_command(Command::UpsertShare {expected_revision:None, share}).unwrap_err();
+        assert_eq!(error.code, "repository_uninitialized");
+        assert!(store.shares().unwrap().is_empty());
+        assert!(!directory.path().join("shares.conf").exists());
+    }
 
     #[test]
     fn mount_owners_share_the_host_mount_namespace() {

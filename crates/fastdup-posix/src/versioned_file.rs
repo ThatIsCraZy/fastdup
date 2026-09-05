@@ -8,6 +8,7 @@ use std::ops::Bound::Excluded;
 use std::sync::{Arc, RwLock};
 
 use crate::CommitToken;
+use bytes::Bytes;
 
 /// Type-erased, independently verified immutable content behind a POSIX inode.
 pub trait CommittedFile: fmt::Debug + Send + Sync {
@@ -31,6 +32,14 @@ pub trait CommittedFile: fmt::Debug + Send + Sync {
     /// Returns [`PosixError::Io`] for I/O or integrity failures and a bounded
     /// resource error when the requested output cannot be represented.
     fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError>;
+
+    /// Reads a range while retaining immutable backing when available.
+    ///
+    /// # Errors
+    /// Returns the same failures as `read_at`.
+    fn read_shared_at(&self, offset: u64, length: u32) -> Result<Bytes, PosixError> {
+        self.read_at(offset, length).map(Bytes::from)
+    }
 
     /// Verifies that one complete candidate payload is exactly this source.
     ///
@@ -981,6 +990,9 @@ impl CommittedFile for FrozenCommit {
 
     fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
         self.plan_read(offset, length)?.execute()
+    }
+    fn read_shared_at(&self, offset: u64, length: u32) -> Result<Bytes, PosixError> {
+        self.plan_read(offset, length)?.execute_shared()
     }
 }
 
@@ -1950,8 +1962,12 @@ impl ReadPlan {
     }
 
     pub(super) fn execute(self) -> Result<Vec<u8>, PosixError> {
+        self.execute_shared().map(Vec::from)
+    }
+
+    pub(super) fn execute_shared(self) -> Result<Bytes, PosixError> {
         if self.read_start >= self.read_end {
-            return Ok(Vec::new());
+            return Ok(Bytes::new());
         }
         if self.read_end <= self.committed.logical_size()
             && self
@@ -1961,7 +1977,7 @@ impl ReadPlan {
         {
             let length = u32::try_from(self.read_end - self.read_start)
                 .expect("ASSERT: a planned read length originated from u32");
-            let bytes = self.committed.read_at(self.read_start, length)?;
+            let bytes = self.committed.read_shared_at(self.read_start, length)?;
             if bytes.len() != usize::try_from(length).expect("ASSERT: u32 read length fits usize") {
                 return Err(PosixError::Io);
             }
@@ -1991,7 +2007,7 @@ impl ReadPlan {
         for epoch in &self.epochs {
             epoch.apply(&mut output, self.read_start, self.read_end);
         }
-        Ok(output)
+        Ok(Bytes::from(output))
     }
 }
 

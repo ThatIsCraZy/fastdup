@@ -2,9 +2,9 @@
 
 #![allow(unsafe_code)]
 
-#[repr(C, align(32))]
+#[repr(C, align(16))]
 #[derive(Clone, Copy)]
-struct VoteDeltas([i32; 8]);
+struct VoteDeltas([i16; 8]);
 
 #[repr(C, align(32))]
 struct VoteDeltaTable([VoteDeltas; 256]);
@@ -35,13 +35,14 @@ pub(crate) fn available() -> bool {
 /// The safe seam is callable only after [`available`] selected AVX2. Durable
 /// fingerprint semantics remain defined by the scalar implementation in the
 /// parent module.
-pub(crate) fn update_votes(votes: &mut [i32; 512], words: [u64; 8]) {
+pub(crate) fn update_votes(votes: &mut [i16; 512], words: [u64; 8]) {
     assert!(
         available(),
         "ASSERT: Similarity AVX2 dispatch is feature-gated"
     );
     // SAFETY: runtime detection above establishes AVX2. The kernel accesses
-    // exactly 512 initialized i32 votes and immutable aligned table entries.
+    // exactly 512 initialized i16 votes and immutable aligned table entries.
+    // Profile v1 admits at most 4096 additions, checked by its accumulator.
     unsafe { update_votes_avx2(votes, words) };
 }
 
@@ -144,24 +145,38 @@ unsafe fn scan_sparse_xor_avx2(
 
 #[target_feature(enable = "avx2")]
 #[allow(clippy::cast_ptr_alignment)]
-unsafe fn update_votes_avx2(votes: &mut [i32; 512], words: [u64; 8]) {
+unsafe fn update_votes_avx2(votes: &mut [i16; 512], words: [u64; 8]) {
     use std::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_load_si256, _mm256_loadu_si256, _mm256_storeu_si256,
+        __m128i, __m256i, _mm_load_si128, _mm256_add_epi16, _mm256_loadu_si256, _mm256_set_m128i,
+        _mm256_storeu_si256,
     };
 
     for (word_ordinal, word) in words.into_iter().enumerate() {
         let word_bytes = word.to_le_bytes();
-        for (byte_ordinal, byte) in word_bytes.into_iter().enumerate() {
-            let byte = usize::from(byte);
-            let vote_offset = word_ordinal * 64 + byte_ordinal * 8;
+        for (pair_ordinal, pair) in word_bytes.chunks_exact(2).enumerate() {
+            let vote_offset = word_ordinal * 64 + pair_ordinal * 16;
             // SAFETY: both loop bounds prove the vote range and table entry
-            // contain eight i32 lanes. VoteDeltas is 32-byte aligned.
+            // contain sixteen i16 votes and two eight-i16 delta rows. Each
+            // VoteDeltas row is 16-byte aligned. No load touches a neighboring
+            // row, and the caller's v1 bound prevents signed vote overflow.
             unsafe {
                 let current = _mm256_loadu_si256(votes.as_ptr().add(vote_offset).cast::<__m256i>());
-                let delta = _mm256_load_si256(VOTE_DELTAS.0[byte].0.as_ptr().cast::<__m256i>());
+                let low = _mm_load_si128(
+                    VOTE_DELTAS.0[usize::from(pair[0])]
+                        .0
+                        .as_ptr()
+                        .cast::<__m128i>(),
+                );
+                let high = _mm_load_si128(
+                    VOTE_DELTAS.0[usize::from(pair[1])]
+                        .0
+                        .as_ptr()
+                        .cast::<__m128i>(),
+                );
+                let delta = _mm256_set_m128i(high, low);
                 _mm256_storeu_si256(
                     votes.as_mut_ptr().add(vote_offset).cast::<__m256i>(),
-                    _mm256_add_epi32(current, delta),
+                    _mm256_add_epi16(current, delta),
                 );
             }
         }
@@ -171,6 +186,26 @@ unsafe fn update_votes_avx2(votes: &mut [i32; 512], words: [u64; 8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrow_votes_match_i32_oracle_at_both_profile_extremes() {
+        if !available() {
+            return;
+        }
+        for words in [[0; 8], [u64::MAX; 8], [0x96a5_0123_fedc_ba78; 8]] {
+            let mut votes = [0_i16; 512];
+            let mut oracle = [0_i32; 512];
+            for _ in 0..4096 {
+                update_votes(&mut votes, words);
+                for (ordinal, word) in words.iter().enumerate() {
+                    for bit in 0..64 {
+                        oracle[ordinal * 64 + bit] += if word & (1 << bit) == 0 { -1 } else { 1 };
+                    }
+                }
+            }
+            assert_eq!(votes.map(i32::from), oracle);
+        }
+    }
 
     #[test]
     fn vote_delta_table_maps_low_to_high_bits_to_minus_or_plus_one() {

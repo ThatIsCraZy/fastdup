@@ -104,7 +104,7 @@ async fn handle_client(
         .read_line(&mut line)
         .await?;
     let response = match serde_json::from_str::<AgentRequest>(&line) {
-        Ok(request) => runtime.handle_request(request),
+        Ok(request) => tokio::task::spawn_blocking(move || runtime.handle_request(request)).await?,
         Err(error) => AgentResponse {
             version: fastdup_control::AGENT_PROTOCOL_VERSION,
             request_id: "invalid".to_owned(),

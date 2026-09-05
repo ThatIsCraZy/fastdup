@@ -19,6 +19,8 @@ mime_guess = "2.0.5"
 rand = "0.9.2"
 rcgen = { version = "0.14.3", features = ["pem", "ring"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
+rustls-pemfile = "2.2.0"
+x509-parser = "0.18.1"
 rust-embed = "8.7.2"
 rustix.workspace = true
 serde = { version = "1.0.219", features = ["derive"] }

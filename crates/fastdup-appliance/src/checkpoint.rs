@@ -1,3 +1,5 @@
+use fastdup_store::{WorkerPermitLease, WorkerPermits};
+#[cfg(test)]
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -15,8 +17,7 @@ use fastdup_format::{
     DurableTimestamp, DurableXattr, ExactIndexEntry, ExactIndexProfileId,
     IncompressibilityGateMetrics, MAX_LOGICAL_CHUNK_BYTES, ManifestExtent, ManifestLeaf,
     MetadataFormatError, MetadataObjectId, NamespaceEntry, NamespaceRoot, PolicySetId,
-    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, PreparedDependentRecord,
-    PreparedIndependentRecord,
+    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
 };
 use fastdup_posix::{
     CommitInode, CommitRange, CommittedFile, CommittedFileInstall, ExternalizedExtent, InodeId,
@@ -196,6 +197,8 @@ pub struct WriteThroughStatus {
     ingest_ring_wait_ns: u64,
     hash_cpu: CpuPhaseStatus,
     encode_cpu: CpuPhaseStatus,
+    planning_cpu: CpuPhaseStatus,
+    materialization_wall_ns: u64,
     advanced_reduction: PersistentReductionStatus,
     degraded: bool,
 }
@@ -279,6 +282,18 @@ impl WriteThroughStatus {
     #[must_use]
     pub const fn encode_cpu(self) -> CpuPhaseStatus {
         self.encode_cpu
+    }
+
+    /// Bounded Advanced planning wall time, including candidate Base reads.
+    #[must_use]
+    pub const fn planning_cpu(self) -> CpuPhaseStatus {
+        self.planning_cpu
+    }
+
+    /// Summed preparation wall time, including CPU admission waits.
+    #[must_use]
+    pub const fn materialization_wall_ns(self) -> u64 {
+        self.materialization_wall_ns
     }
 
     #[must_use]
@@ -1267,13 +1282,6 @@ struct PreparedCompressionRegions<'a> {
     order: Vec<CompressionRegionOrder>,
 }
 
-struct PreparedWriteThroughReduction<'a> {
-    ordinary_chunks: Vec<&'a PendingWriteThroughChunk>,
-    independent: Vec<PreparedIndependentRecord>,
-    dependents: Vec<PreparedDependentRecord>,
-    similarity_entries: Vec<fastdup_format::SimilarityIndexEntry>,
-}
-
 #[derive(Debug)]
 struct ChunkFragments {
     parts: Vec<MutationPayload>,
@@ -1334,6 +1342,7 @@ impl ChunkFragments {
         ChunkId::from_bytes(*hasher.finalize().as_bytes())
     }
 
+    #[cfg(test)]
     fn materialize_new_chunk(&self) -> Result<Cow<'_, [u8]>, DurableNamespaceError> {
         if self.parts.len() == 1 {
             return Ok(Cow::Borrowed(self.parts[0].as_bytes()));
@@ -1382,16 +1391,19 @@ impl ChunkFragments {
 
 fn prepare_compression_regions<'a>(
     new_chunks: &[&'a PendingWriteThroughChunk],
+    workers: NonZeroUsize,
+    admission: &WorkerPermits,
 ) -> Result<PreparedCompressionRegions<'a>, DurableNamespaceError> {
     let mut plans = Vec::<CompressionRegionPlan<'_>>::new();
     for chunk in new_chunks {
         let materialized = chunk.bytes.contiguous_bytes().is_none();
         let needs_region = plans.last().is_none_or(|region| {
-            region.materialized != materialized
-                || region
-                    .decoded_length
-                    .checked_add(chunk.bytes.len())
-                    .is_none_or(|length| length > COMPRESSION_REGION_TARGET_BYTES)
+            region.chunks.last().is_some_and(|previous| {
+                previous.offset + previous.bytes.len() as u64 != chunk.offset
+            }) || region
+                .decoded_length
+                .checked_add(chunk.bytes.len())
+                .is_none_or(|length| length > COMPRESSION_REGION_TARGET_BYTES)
         });
         if needs_region {
             plans
@@ -1410,6 +1422,7 @@ fn prepare_compression_regions<'a>(
             .chunks
             .try_reserve(1)
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        region.materialized |= materialized;
         region.chunks.push(chunk);
         region.decoded_length = region
             .decoded_length
@@ -1426,6 +1439,7 @@ fn prepare_compression_regions<'a>(
         .order
         .try_reserve_exact(plans.len())
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    let mut materializing = Vec::new();
     for plan in plans {
         if !plan.materialized {
             let mut chunks = Vec::new();
@@ -1448,33 +1462,88 @@ fn prepare_compression_regions<'a>(
                 .push(CompressionRegionOrder::Borrowed(ordinal));
             continue;
         }
-        let mut decoded = Vec::new();
-        decoded
-            .try_reserve_exact(plan.decoded_length)
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        let mut chunks = Vec::new();
-        chunks
-            .try_reserve_exact(plan.chunks.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for chunk in plan.chunks {
-            let start = decoded.len();
-            chunk.bytes.append_to_compression_region(&mut decoded);
-            chunks.push((chunk.chunk_id, start..decoded.len()));
-        }
-        assert_eq!(
-            decoded.len(),
-            plan.decoded_length,
-            "ASSERT: one Compression Region is materialized exactly once"
-        );
-        let ordinal = prepared.materialized.len();
-        prepared
-            .materialized
-            .push(MaterializedCompressionRegion { decoded, chunks });
+        let ordinal = materializing.len();
+        materializing.push(plan);
         prepared
             .order
             .push(CompressionRegionOrder::Materialized(ordinal));
     }
+    prepared.materialized = admission
+        .map(materializing, workers, materialize_compression_region)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(prepared)
+}
+
+fn materialize_compression_region(
+    plan: CompressionRegionPlan<'_>,
+) -> Result<MaterializedCompressionRegion, DurableNamespaceError> {
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(plan.decoded_length)
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    let mut chunks = Vec::new();
+    chunks
+        .try_reserve_exact(plan.chunks.len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    for chunk in plan.chunks {
+        let start = decoded.len();
+        chunk.bytes.append_to_compression_region(&mut decoded);
+        chunks.push((chunk.chunk_id, start..decoded.len()));
+    }
+    assert_eq!(
+        decoded.len(),
+        plan.decoded_length,
+        "ASSERT: one Compression Region is materialized exactly once"
+    );
+    Ok(MaterializedCompressionRegion { decoded, chunks })
+}
+
+/// Retains prepared region owners and splits only at a selected codec boundary.
+/// `NoCandidate` uses identical grouping regardless of receive fragmentation.
+fn ordinary_region_slices<'a>(
+    regions: &[PrehashedAdaptiveRegion<'a>],
+    ordinary: &[bool],
+) -> Result<Vec<PrehashedAdaptiveRegion<'a>>, DurableNamespaceError> {
+    let mut result = Vec::new();
+    let mut ordinal = 0;
+    for region in regions {
+        let (chunks, decoded) = match *region {
+            PrehashedAdaptiveRegion::Borrowed(chunks) => (chunks, None),
+            PrehashedAdaptiveRegion::Contiguous(region) => {
+                (region.chunks(), Some(region.decoded()))
+            }
+        };
+        let mut position = 0;
+        let mut byte_offset = 0;
+        while position < chunks.len() {
+            let start = position;
+            let start_byte = byte_offset;
+            let include = ordinary[ordinal + position];
+            while position < chunks.len() && ordinary[ordinal + position] == include {
+                byte_offset += chunks[position].bytes().len();
+                position += 1;
+            }
+            if include {
+                let chunks = &chunks[start..position];
+                result.push(match decoded {
+                    Some(decoded) => PrehashedAdaptiveRegion::Contiguous(
+                        PrehashedContiguousRegion::new(chunks, &decoded[start_byte..byte_offset])
+                            .map_err(|_| DurableNamespaceError::FrozenViewMismatch)?,
+                    ),
+                    None => PrehashedAdaptiveRegion::Borrowed(chunks),
+                });
+            }
+        }
+        ordinal += chunks.len();
+    }
+    assert_eq!(
+        ordinal,
+        ordinary.len(),
+        "ASSERT: one encoding plan per prepared target"
+    );
+    Ok(result)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1717,24 +1786,45 @@ fn classify_stable_chunk_batch(
     if workers.get() == 1 {
         return classify_stable_chunk_shard(batch);
     }
+    let next = AtomicUsize::new(0);
     let worker_results = (0..workers.get())
         .into_par_iter()
-        .map(|worker| {
-            let (start, end) = contiguous_worker_shard(batch.len(), workers.get(), worker);
-            classify_stable_chunk_shard(&batch[start..end])
+        .map(|_| {
+            let mut completed = Vec::new();
+            loop {
+                let start = next.fetch_add(4, Ordering::Relaxed);
+                if start >= batch.len() {
+                    break;
+                }
+                for (relative, chunk) in batch[start..(start + 4).min(batch.len())]
+                    .iter()
+                    .enumerate()
+                {
+                    completed.push((
+                        start + relative,
+                        (!chunk.bytes.is_fill()).then(|| chunk.bytes.chunk_id()),
+                    ));
+                }
+            }
+            completed
         })
         .collect::<Vec<_>>();
     let mut classified = Vec::new();
     classified
         .try_reserve_exact(batch.len())
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-    for result in worker_results {
-        classified.extend(result?);
+    classified.resize(batch.len(), None);
+    let mut completed_count = 0;
+    for completed in worker_results {
+        for (ordinal, id) in completed {
+            classified[ordinal] = id;
+            completed_count += 1;
+        }
     }
     assert_eq!(
-        classified.len(),
+        completed_count,
         batch.len(),
-        "ASSERT: hash-worker shards partition the stable Chunk batch"
+        "ASSERT: every stable Chunk has one hash worker owner"
     );
     Ok(classified)
 }
@@ -1751,28 +1841,6 @@ fn classify_stable_chunk_shard(
         classified.push((!chunk.bytes.is_fill()).then(|| chunk.bytes.chunk_id()));
     }
     Ok(classified)
-}
-
-fn contiguous_worker_shard(jobs: usize, workers: usize, worker: usize) -> (usize, usize) {
-    assert!(
-        jobs >= workers && worker < workers,
-        "ASSERT: hash worker receives one nonempty stable Chunk shard"
-    );
-    let base = jobs / workers;
-    let extra = jobs % workers;
-    let start = worker
-        .checked_mul(base)
-        .and_then(|offset| offset.checked_add(worker.min(extra)))
-        .expect("ASSERT: bounded hash-worker shard start cannot overflow");
-    let length = base + usize::from(worker < extra);
-    let end = start
-        .checked_add(length)
-        .expect("ASSERT: bounded hash-worker shard end cannot overflow");
-    assert!(
-        start < end && end <= jobs,
-        "ASSERT: hash-worker shard is nonempty and in bounds"
-    );
-    (start, end)
 }
 
 #[derive(Debug, Default)]
@@ -1889,12 +1957,14 @@ struct WriteThroughIngest<C> {
     container_generations: ContainerGenerationAllocator<C>,
     index: Arc<dyn ManifestReaderPolicy<C>>,
     worker_budget: NonZeroUsize,
-    worker_permits: WorkerPermits,
+    worker_permits: Arc<WorkerPermits>,
     active_writers: AtomicUsize,
     hash_batches: AtomicUsize,
     maximum_hash_workers: AtomicUsize,
     hash_cpu: CpuPhaseTelemetry,
     encode_cpu: CpuPhaseTelemetry,
+    planning_cpu: CpuPhaseTelemetry,
+    materialization_wall_ns: AtomicU64,
     registry: Mutex<WriteThroughRegistry>,
     queue: Arc<IngestQueue>,
     publication_queue: Arc<PublicationQueue>,
@@ -2805,101 +2875,6 @@ fn next_ingest_batch_expiry(state: &IngestQueueState, now: Instant) -> Option<Du
         .min()
 }
 
-struct WorkerPermits {
-    total: NonZeroUsize,
-    available: Mutex<usize>,
-    changed: Condvar,
-}
-
-impl WorkerPermits {
-    fn new(total: NonZeroUsize) -> Self {
-        Self {
-            total,
-            available: Mutex::new(total.get()),
-            changed: Condvar::new(),
-        }
-    }
-
-    fn acquire(&self, desired: NonZeroUsize) -> WorkerPermitLease<'_> {
-        assert!(
-            desired.get() <= self.total.get(),
-            "ASSERT: requested encode workers exceed the write-through worker budget"
-        );
-        let wait_started = Instant::now();
-        let mut blocked = false;
-        let mut available = self
-            .available
-            .lock()
-            .expect("ASSERT: encode worker permit lock poisoned");
-        while *available == 0 {
-            blocked = true;
-            available = self
-                .changed
-                .wait(available)
-                .expect("ASSERT: encode worker permit lock poisoned while waiting");
-        }
-        assert!(
-            *available <= self.total.get(),
-            "ASSERT: available encode workers exceed the write-through worker budget"
-        );
-        let acquired = desired.get().min(*available);
-        assert!(acquired != 0, "ASSERT: a granted worker lease is nonempty");
-        *available -= acquired;
-        WorkerPermitLease {
-            pool: self,
-            acquired: NonZeroUsize::new(acquired)
-                .expect("ASSERT: a granted worker lease is nonempty"),
-            requested: desired,
-            wait_ns: duration_ns_saturating(wait_started.elapsed()),
-            blocked,
-        }
-    }
-}
-
-struct WorkerPermitLease<'a> {
-    pool: &'a WorkerPermits,
-    acquired: NonZeroUsize,
-    requested: NonZeroUsize,
-    wait_ns: u64,
-    blocked: bool,
-}
-
-impl WorkerPermitLease<'_> {
-    const fn workers(&self) -> NonZeroUsize {
-        self.acquired
-    }
-
-    const fn requested_workers(&self) -> NonZeroUsize {
-        self.requested
-    }
-
-    const fn wait_ns(&self) -> u64 {
-        self.wait_ns
-    }
-
-    const fn blocked(&self) -> bool {
-        self.blocked
-    }
-}
-
-impl Drop for WorkerPermitLease<'_> {
-    fn drop(&mut self) {
-        let mut available = self
-            .pool
-            .available
-            .lock()
-            .expect("ASSERT: encode worker permit lock poisoned during retirement");
-        *available = available
-            .checked_add(self.acquired.get())
-            .expect("ASSERT: encode worker permit accounting cannot overflow");
-        assert!(
-            *available <= self.pool.total.get(),
-            "ASSERT: encode worker retirement exceeded the write-through worker budget"
-        );
-        self.pool.changed.notify_all();
-    }
-}
-
 #[derive(Debug, Default)]
 #[repr(align(64))]
 struct CpuPhaseTelemetry {
@@ -3405,6 +3380,8 @@ where
             ingest_ring_wait_ns: ingest.ingest_ring_wait_ns,
             hash_cpu: self.hash_cpu.status(),
             encode_cpu: self.encode_cpu.status(),
+            planning_cpu: self.planning_cpu.status(),
+            materialization_wall_ns: self.materialization_wall_ns.load(Ordering::Relaxed),
             advanced_reduction: self.index.advanced_reduction_status(),
             degraded: snapshot.degraded,
         }
@@ -3788,6 +3765,8 @@ where
                 PublicationClaim::Acquired => new_chunks.push(chunk),
             }
         }
+        // Claims are acquired in key order; physical output follows file order.
+        new_chunks.sort_unstable_by_key(|chunk| chunk.offset);
         let advanced = self.index.advanced_reduction_available()
             && self
                 .namespace
@@ -3825,6 +3804,10 @@ where
         Ok((externalized, sealed))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single owner for materialized input, admitted plans and ordered publication"
+    )]
     fn publish_new_chunks(
         &self,
         new_chunks: &[&PendingWriteThroughChunk],
@@ -3846,13 +3829,16 @@ where
                 .all(|chunk| chunk.placement == new_chunks[0].placement),
             "ASSERT: one Container cannot cross physical placement tiers"
         );
-        let PreparedWriteThroughReduction {
-            ordinary_chunks,
-            independent,
-            dependents,
-            similarity_entries,
-        } = self.plan_new_chunk_encodings(new_chunks, advanced)?;
-        let prepared_regions = prepare_compression_regions(&ordinary_chunks)?;
+        let active_writers = self.active_writers.load(Ordering::Acquire);
+        let desired_workers = workers_per_ingest_job(self.worker_budget, active_writers);
+        let materialization_started = Instant::now();
+        let prepared_regions =
+            prepare_compression_regions(new_chunks, desired_workers, &self.worker_permits);
+        self.materialization_wall_ns.fetch_add(
+            u64::try_from(materialization_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let prepared_regions = prepared_regions?;
         let materialized_chunks = prepared_regions
             .materialized
             .iter()
@@ -3887,12 +3873,49 @@ where
             })
             .collect::<Vec<_>>();
         let generation = self.container_generations.reserve_generation()?;
-        let active_writers = self.active_writers.load(Ordering::Acquire);
-        let desired_workers = workers_per_ingest_job(self.worker_budget, active_writers);
+        let targets = regions
+            .iter()
+            .flat_map(|region| match region {
+                PrehashedAdaptiveRegion::Borrowed(chunks) => chunks.iter().copied(),
+                PrehashedAdaptiveRegion::Contiguous(region) => region.chunks().iter().copied(),
+            })
+            .collect::<Vec<_>>();
+        let mut independent = Vec::new();
+        let mut dependents = Vec::new();
+        let mut similarity_entries = Vec::new();
+        let mut ordinary = Vec::with_capacity(targets.len());
+        if advanced {
+            let phase = self.planning_cpu.begin();
+            let plans = self.index.plan_similarity_batch(
+                &self.containers,
+                &targets,
+                desired_workers,
+                &self.worker_permits,
+            );
+            drop(phase);
+            for (plan, hint) in plans {
+                if let Some(hint) = hint {
+                    similarity_entries.push(hint);
+                }
+                ordinary.push(matches!(plan, PersistentChunkPlan::NoCandidates));
+                match plan {
+                    PersistentChunkPlan::NoCandidates => {}
+                    PersistentChunkPlan::Independent(record) => independent.push(record),
+                    PersistentChunkPlan::Dependent(record) => dependents.push(record),
+                }
+            }
+        } else {
+            ordinary.resize(targets.len(), true);
+        }
+        let ordinary_regions = ordinary_region_slices(&regions, &ordinary)?;
+        let chunk_order = targets
+            .iter()
+            .map(|target| target.chunk_id())
+            .collect::<Vec<_>>();
         let worker_lease = self.worker_permits.acquire(desired_workers);
+        let workers = worker_lease.workers();
         self.encode_cpu.record_permit(&worker_lease);
         let cpu_phase = self.encode_cpu.begin();
-        let workers = worker_lease.workers();
         assert!(
             workers.get() <= self.worker_budget.get(),
             "ASSERT: one encode job cannot exceed the write-through worker budget"
@@ -3900,10 +3923,11 @@ where
         let prepared = ContainerRepository::<C>::prepare_mixed_prehashed_reduction_parallel(
             random_container_id()?,
             generation,
-            &regions,
+            &ordinary_regions,
             independent,
             dependents,
             workers,
+            Some(&chunk_order),
         )?;
         drop(cpu_phase);
         drop(worker_lease);
@@ -3920,78 +3944,6 @@ where
             })
             .collect();
         Ok((entries, similarity_entries))
-    }
-
-    fn plan_new_chunk_encodings<'a>(
-        &self,
-        new_chunks: &[&'a PendingWriteThroughChunk],
-        advanced: bool,
-    ) -> Result<PreparedWriteThroughReduction<'a>, DurableNamespaceError> {
-        let mut planned = PreparedWriteThroughReduction {
-            ordinary_chunks: Vec::new(),
-            independent: Vec::new(),
-            dependents: Vec::new(),
-            similarity_entries: Vec::new(),
-        };
-        planned
-            .ordinary_chunks
-            .try_reserve_exact(new_chunks.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        planned
-            .independent
-            .try_reserve_exact(new_chunks.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        planned
-            .dependents
-            .try_reserve_exact(new_chunks.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for chunk in new_chunks {
-            if !advanced {
-                planned.ordinary_chunks.push(*chunk);
-                continue;
-            }
-            let target = chunk.bytes.materialize_new_chunk()?;
-            let (plan, entry) =
-                self.index
-                    .plan_similarity_chunk(&self.containers, chunk.chunk_id, &target);
-            if let Some(entry) = entry {
-                planned.similarity_entries.push(entry);
-            }
-            match plan {
-                PersistentChunkPlan::NoCandidates if matches!(target, Cow::Owned(_)) => {
-                    let record =
-                        fastdup_format::SealedContainer::prepare_prehashed_independent_record(
-                            PrehashedChunk::new(chunk.chunk_id, &target),
-                            fastdup_format::IncompressibilityGatePolicy::Off,
-                        )
-                        .map_err(|_| DurableNamespaceError::FrozenViewMismatch)?;
-                    planned.independent.push(record);
-                }
-                PersistentChunkPlan::NoCandidates => planned.ordinary_chunks.push(*chunk),
-                PersistentChunkPlan::Independent(record) => {
-                    assert_eq!(
-                        record.target_id(),
-                        chunk.chunk_id,
-                        "ASSERT: prepared independent fallback retains its target identity"
-                    );
-                    planned.independent.push(record);
-                }
-                PersistentChunkPlan::Dependent(record) => {
-                    assert_eq!(
-                        record.target_id(),
-                        chunk.chunk_id,
-                        "ASSERT: prepared dependent record retains its target identity"
-                    );
-                    planned.dependents.push(record);
-                }
-            }
-        }
-        assert_eq!(
-            planned.ordinary_chunks.len() + planned.independent.len() + planned.dependents.len(),
-            new_chunks.len(),
-            "ASSERT: every unique new Chunk has exactly one encoding plan"
-        );
-        Ok(planned)
     }
 
     fn externalize_chunks(
@@ -4144,17 +4096,21 @@ fn install_write_through<C>(
 where
     C: Clone + Send + Sync + StorageIo + 'static,
 {
+    let worker_permits = Arc::new(WorkerPermits::new(worker_budget));
+    containers.install_cpu_admission(Arc::clone(&worker_permits));
     let write_through = Arc::new(WriteThroughIngest {
         containers,
         container_generations,
         index,
         worker_budget,
-        worker_permits: WorkerPermits::new(worker_budget),
+        worker_permits,
         active_writers: AtomicUsize::new(0),
         hash_batches: AtomicUsize::new(0),
         maximum_hash_workers: AtomicUsize::new(0),
         hash_cpu: CpuPhaseTelemetry::default(),
         encode_cpu: CpuPhaseTelemetry::default(),
+        planning_cpu: CpuPhaseTelemetry::default(),
+        materialization_wall_ns: AtomicU64::new(0),
         registry: Mutex::new(WriteThroughRegistry::default()),
         queue: Arc::new(IngestQueue::new()),
         publication_queue: Arc::new(PublicationQueue::new()),
@@ -4189,6 +4145,21 @@ trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
         PersistentChunkPlan,
         Option<fastdup_format::SimilarityIndexEntry>,
     );
+    fn plan_similarity_batch(
+        &self,
+        containers: &ContainerRepository<C>,
+        targets: &[PrehashedChunk<'_>],
+        _workers: NonZeroUsize,
+        _admission: &WorkerPermits,
+    ) -> Vec<(
+        PersistentChunkPlan,
+        Option<fastdup_format::SimilarityIndexEntry>,
+    )> {
+        targets
+            .iter()
+            .map(|target| self.plan_similarity_chunk(containers, target.chunk_id(), target.bytes()))
+            .collect()
+    }
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>);
     fn publish_reduction_batch(
         &self,
@@ -4592,6 +4563,35 @@ where
                     .ok()
             })
             .unwrap_or((PersistentChunkPlan::NoCandidates, None))
+    }
+
+    fn plan_similarity_batch(
+        &self,
+        containers: &ContainerRepository<C>,
+        targets: &[PrehashedChunk<'_>],
+        workers: NonZeroUsize,
+        admission: &WorkerPermits,
+    ) -> Vec<(
+        PersistentChunkPlan,
+        Option<fastdup_format::SimilarityIndexEntry>,
+    )> {
+        self.reduction.as_ref().map_or_else(
+            || {
+                targets
+                    .iter()
+                    .map(|_| (PersistentChunkPlan::NoCandidates, None))
+                    .collect()
+            },
+            |reduction| {
+                reduction.plan_batch_for_publication_cached(
+                    containers,
+                    targets,
+                    Some(&self.read_cache),
+                    workers,
+                    admission,
+                )
+            },
+        )
     }
 
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>) {
@@ -6892,10 +6892,12 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
                     PersistentChunkPlan::NoCandidates => (),
                     PersistentChunkPlan::Independent(record) => {
                         independent.push(record);
+                        region_bytes = 0;
                         continue;
                     }
                     PersistentChunkPlan::Dependent(record) => {
                         dependents.push(record);
+                        region_bytes = 0;
                         continue;
                     }
                 }
@@ -6941,6 +6943,7 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             independent,
             dependents,
             self.workers,
+            Some(&self.chunk_ids),
         )?;
         let (verified, publish_metrics) = self
             .containers
@@ -7393,7 +7396,12 @@ mod tests {
         ];
         let references = chunks.iter().collect::<Vec<_>>();
 
-        let regions = prepare_compression_regions(&references).expect("prepare fixture regions");
+        let regions = prepare_compression_regions(
+            &references,
+            NonZeroUsize::new(4).unwrap(),
+            &WorkerPermits::new(NonZeroUsize::new(4).unwrap()),
+        )
+        .expect("prepare fixture regions");
 
         assert!(regions.borrowed.is_empty());
         assert_eq!(regions.materialized.len(), 1);
@@ -7403,6 +7411,80 @@ mod tests {
         );
         assert_eq!(regions.materialized[0].chunks[0].1, 0..22);
         assert_eq!(regions.materialized[0].chunks[1].1, 22..33);
+    }
+
+    fn materialization_fixture(count: u8) -> Vec<PendingWriteThroughChunk> {
+        (0..count)
+            .map(|n| {
+                let bytes = vec![n; 128 * 1024];
+                let parts = if n < 4 {
+                    vec![MutationPayload::try_copy_from_slice(&bytes).unwrap()]
+                } else {
+                    vec![
+                        MutationPayload::try_copy_from_slice(&bytes[..17]).unwrap(),
+                        MutationPayload::try_copy_from_slice(&bytes[17..]).unwrap(),
+                    ]
+                };
+                PendingWriteThroughChunk {
+                    offset: u64::from(n) * 128 * 1024,
+                    chunk_id: ChunkId::of(&bytes),
+                    bytes: ChunkFragments::new(parts, 128 * 1024),
+                    placement: ContainerPlacement::Data,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_materialization_preserves_regions_views_and_byte_order() {
+        let chunks = materialization_fixture(32);
+        let references = chunks.iter().collect::<Vec<_>>();
+        let admission = WorkerPermits::new(NonZeroUsize::new(4).unwrap());
+        let serial =
+            prepare_compression_regions(&references, NonZeroUsize::MIN, &admission).unwrap();
+        let parallel =
+            prepare_compression_regions(&references, NonZeroUsize::new(4).unwrap(), &admission)
+                .unwrap();
+        assert_eq!(serial.borrowed.len(), 1);
+        assert_eq!(serial.materialized.len(), 7);
+        assert_eq!(serial.order.len(), parallel.order.len());
+        for (left, right) in serial.order.iter().zip(&parallel.order) {
+            assert_eq!(std::mem::discriminant(left), std::mem::discriminant(right));
+        }
+        for (left, right) in serial.materialized.iter().zip(&parallel.materialized) {
+            assert_eq!(left.decoded, right.decoded);
+            assert_eq!(left.chunks, right.chunks);
+        }
+        assert_eq!(admission.available(), 4);
+    }
+
+    #[test]
+    #[ignore = "manual release-mode Compression Region materialization A/B"]
+    fn parallel_materialization_microbenchmark() {
+        let chunks = materialization_fixture(255);
+        let references = chunks.iter().collect::<Vec<_>>();
+        let admission = WorkerPermits::new(NonZeroUsize::new(8).unwrap());
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..11 {
+            for side in 0..2 {
+                let side = (side + round) % 2;
+                let workers = NonZeroUsize::new(if side == 0 { 1 } else { 8 }).unwrap();
+                let start = Instant::now();
+                std::hint::black_box(
+                    prepare_compression_regions(&references, workers, &admission).unwrap(),
+                );
+                samples[side].push(start.elapsed());
+            }
+        }
+        for samples in &mut samples {
+            samples.sort_unstable();
+        }
+        println!(
+            "region_materialization serial_ms={:.3} parallel_ms={:.3} speedup={:.3}",
+            samples[0][5].as_secs_f64() * 1000.0,
+            samples[1][5].as_secs_f64() * 1000.0,
+            samples[0][5].as_secs_f64() / samples[1][5].as_secs_f64()
+        );
     }
 
     #[test]
@@ -7664,13 +7746,7 @@ mod tests {
         assert_eq!(active.granted_workers(), 10);
         assert_eq!(active.partial_grants(), 1);
         assert_eq!(active.permit_blocked_phases(), 0);
-        assert_eq!(
-            *permits
-                .available
-                .lock()
-                .expect("fixture permit lock is not poisoned"),
-            0
-        );
+        assert_eq!(permits.available(), 0);
         drop(second_phase);
         drop(first_phase);
         drop(second);
@@ -7679,13 +7755,7 @@ mod tests {
         assert_eq!(completed.active(), 0);
         assert!(completed.runnable_wall_ns() > 0);
         assert!(completed.maximum_permit_wait_ns() <= completed.permit_wait_ns());
-        assert_eq!(
-            *permits
-                .available
-                .lock()
-                .expect("fixture permit lock is not poisoned"),
-            budget.get()
-        );
+        assert_eq!(permits.available(), budget.get());
     }
 
     #[test]

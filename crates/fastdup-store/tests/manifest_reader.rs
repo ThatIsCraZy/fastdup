@@ -168,6 +168,9 @@ fn a_long_lived_manifest_reader_pins_exact_only_for_each_bounded_read() {
     let root = unique_test_root("manifest-reader-exact-pin-drain");
     let storage = FsStorageIo::open(&root).expect("open shared test repository");
     let containers = ContainerRepository::new(storage.clone());
+    containers.install_cpu_admission(Arc::new(fastdup_store::WorkerPermits::new(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    )));
     let first_id = ContainerId::new([0x82; 16]).expect("container identity is nonzero");
     let first_payload = b"a manifest reader may outlive its Exact generation";
     containers
@@ -233,6 +236,9 @@ fn adjacent_chunks_in_one_encoding_record_need_one_data_range_read() {
     let root = unique_test_root("manifest-reader-one-record-read");
     let storage = RangeTrackingStorage::open(&root);
     let containers = ContainerRepository::new(storage.clone());
+    containers.install_cpu_admission(Arc::new(fastdup_store::WorkerPermits::new(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    )));
     let container_id = ContainerId::new([0x91; 16]).expect("container identity is nonzero");
     let first = (0..192 * 1_024)
         .map(|index| b'a' + u8::try_from(index % 19).expect("fixture remainder fits u8"))
@@ -304,10 +310,14 @@ fn adjacent_chunks_in_one_encoding_record_need_one_data_range_read() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn adjacent_chunks_prefer_active_locations_in_the_same_container() {
     let root = unique_test_root("manifest-reader-local-location");
     let storage = RangeTrackingStorage::open(&root);
     let containers = ContainerRepository::new(storage.clone());
+    containers.install_cpu_admission(Arc::new(fastdup_store::WorkerPermits::new(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    )));
     let local_id = ContainerId::new([0xa1; 16]).expect("container identity is nonzero");
     let newer_id = ContainerId::new([0xa2; 16]).expect("container identity is nonzero");
     let first = b"first logical Chunk stays in the original Container".to_vec();
@@ -415,6 +425,9 @@ fn adjacent_record_coalescing_never_exceeds_the_storage_range_bound() {
     let root = unique_test_root("manifest-reader-bounded-record-coalescing");
     let storage = RangeTrackingStorage::open(&root);
     let containers = ContainerRepository::new(storage.clone());
+    containers.install_cpu_admission(Arc::new(fastdup_store::WorkerPermits::new(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    )));
     let container_id = ContainerId::new([0xa4; 16]).expect("container identity is nonzero");
     let chunks = (1_u8..=4)
         .map(|byte| vec![byte; 256 * 1_024])
@@ -479,6 +492,9 @@ fn repeated_chunk_in_one_read_reuses_exact_lookup_scratch_and_record_decode() {
     let root = unique_test_root("manifest-reader-repeated-exact-key");
     let storage = RangeTrackingStorage::open(&root);
     let containers = ContainerRepository::new(storage.clone());
+    containers.install_cpu_admission(Arc::new(fastdup_store::WorkerPermits::new(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    )));
     let container_id = ContainerId::new([0xb1; 16]).expect("container identity is nonzero");
     let payload = b"one immutable Chunk appears twice in the logical recipe".repeat(512);
     containers
@@ -542,6 +558,9 @@ fn dependent_reads_reuse_verified_bases_across_requests_but_scrub_reads_storage(
     let root = unique_test_root("manifest-base-cache");
     let storage = RangeTrackingStorage::open(&root);
     let containers = ContainerRepository::new(storage.clone());
+    containers.install_cpu_admission(Arc::new(fastdup_store::WorkerPermits::new(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    )));
     let base = (0_u32..16384)
         .map(|i| u8::try_from(i % 251).unwrap())
         .collect::<Vec<_>>();
@@ -650,6 +669,9 @@ fn coalesced_raw_cache_charges_shared_encoded_backing_once() {
     let root = unique_test_root("manifest-raw-backing-cache");
     let storage = RangeTrackingStorage::open(&root);
     let containers = ContainerRepository::new(storage.clone());
+    containers.install_cpu_admission(Arc::new(fastdup_store::WorkerPermits::new(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    )));
     let chunks = [vec![31; 16384], vec![91; 16384]];
     let id = ContainerId::new([0xc4; 16]).unwrap();
     containers
@@ -702,4 +724,168 @@ fn coalesced_raw_cache_charges_shared_encoded_backing_once() {
     assert_eq!(file.read_at(0, 32768).unwrap(), chunks.concat());
     assert_eq!(cache.status().resident_bytes(), retained);
     assert_eq!(cache.status().entry_count(), 2);
+}
+
+#[test]
+fn shared_manifest_reply_retains_verified_owner_and_slice_coordinates() {
+    use fastdup_store::{MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig};
+    use std::num::NonZeroUsize;
+    let root = unique_test_root("manifest-shared-reply");
+    let containers = ContainerRepository::new(FsStorageIo::open(&root).unwrap());
+    let payload = b"0123456789abcdef";
+    containers
+        .publish_raw(ContainerId::new([0xd8; 16]).unwrap(), 1, &[payload])
+        .unwrap();
+    let cache = Arc::new(
+        VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(
+                4 * 1024 * 1024,
+                1024 * 1024,
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .unwrap(),
+            MemoryPressureSnapshot::new(64 * 1024 * 1024, 32 * 1024 * 1024, 0),
+        )
+        .unwrap(),
+    );
+    let manifest = ManifestLeaf::new(
+        16,
+        vec![ManifestExtent::Data {
+            logical_length: 16,
+            chunk_id: ChunkId::of(payload),
+        }],
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers)
+        .unwrap()
+        .with_verified_read_cache(cache);
+    let whole = file.read_shared_at(0, 16).unwrap();
+    let slice = file.read_shared_at(3, 7).unwrap();
+    assert_eq!(slice, payload[3..10]);
+    assert_eq!(
+        slice.as_ptr(),
+        whole[3..].as_ptr(),
+        "cached immutable payload reaches the reply without a copy"
+    );
+    drop(whole);
+    drop(file);
+    assert_eq!(
+        slice,
+        b"3456789".as_slice(),
+        "reply owns the payload after reader and cache drop"
+    );
+}
+
+fn shared_extent_fixture(label: &str) -> (VerifiedManifestFile<FsStorageIo>, Vec<u8>) {
+    use fastdup_store::{MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig};
+    use std::num::NonZeroUsize;
+    let root = unique_test_root(label);
+    let storage = FsStorageIo::open(&root).unwrap();
+    let containers = ContainerRepository::new(storage.clone());
+    let first = vec![0x51; 128 * 1024];
+    let second = vec![0x72; 128 * 1024];
+    let id = ContainerId::new([0xdb; 16]).unwrap();
+    containers
+        .publish_adaptive_regions(id, 1, &[&[&first, &second]])
+        .unwrap();
+    let verified = containers.read(id).unwrap();
+    assert_eq!(verified.zstd_record_count(), 1);
+    let entries = verified
+        .locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let indexes = ExactIndexRunRepository::new(storage);
+    indexes
+        .append_level_zero(ExactIndexProfileId::new([0xda; 32]).unwrap(), entries)
+        .unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    let cache = Arc::new(
+        VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(8 * 1024 * 1024, 0, NonZeroUsize::MIN).unwrap(),
+            MemoryPressureSnapshot::new(128 * 1024 * 1024, 64 * 1024 * 1024, 0),
+        )
+        .unwrap(),
+    );
+    let manifest = ManifestLeaf::new(
+        256 * 1024 + 16,
+        vec![
+            ManifestExtent::Data {
+                logical_length: 128 * 1024,
+                chunk_id: ChunkId::of(&first),
+            },
+            ManifestExtent::Data {
+                logical_length: 128 * 1024,
+                chunk_id: ChunkId::of(&second),
+            },
+            ManifestExtent::Hole { logical_length: 16 },
+        ],
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers)
+        .unwrap()
+        .with_active_index(&active)
+        .with_verified_read_cache(cache);
+    (file, [first, second].concat())
+}
+
+#[test]
+fn multiple_data_extents_share_reply_owner_and_sparse_suffix_assembles_correctly() {
+    let (file, expected) = shared_extent_fixture("manifest-multiple-shared-reply");
+    let whole = file.read_shared_at(0, 256 * 1024).unwrap();
+    let left = file.read_shared_at(0, 128 * 1024).unwrap();
+    let across = file.read_shared_at(128 * 1024 - 7, 19).unwrap();
+    assert_eq!(whole, expected);
+    assert_eq!(
+        whole.as_ptr(),
+        left.as_ptr(),
+        "two DATA extents retain the cache owner"
+    );
+    assert_eq!(across.as_ptr(), whole[128 * 1024 - 7..].as_ptr());
+    assert_eq!(across, expected[128 * 1024 - 7..128 * 1024 + 12]);
+    let mixed = file.read_shared_at(0, 256 * 1024 + 16).unwrap();
+    assert_eq!(&mixed[..expected.len()], expected);
+    assert_eq!(&mixed[expected.len()..], &[0; 16]);
+    drop(file);
+    drop(whole);
+    drop(left);
+    assert_eq!(across, expected[128 * 1024 - 7..128 * 1024 + 12]);
+}
+
+#[test]
+#[ignore = "manual release-mode cached multi-Extent Read Reply A/B"]
+fn shared_extent_reply_microbenchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let (file, expected) = shared_extent_fixture("manifest-multiple-shared-benchmark");
+    assert_eq!(file.read_shared_at(0, 256 * 1024).unwrap(), expected);
+    for length in [4096, 65536, 262_144] {
+        let offset = 131_072 - u64::from(length / 2);
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..11 {
+            for side in 0..2 {
+                let side = (side + round) % 2;
+                let start = Instant::now();
+                for _ in 0..2500 {
+                    if side == 0 {
+                        black_box(file.read_at(offset, length).unwrap());
+                    } else {
+                        black_box(file.read_shared_at(offset, length).unwrap());
+                    }
+                }
+                samples[side].push(start.elapsed());
+            }
+        }
+        for samples in &mut samples {
+            samples.sort_unstable();
+        }
+        println!(
+            "multi_extent_reply length={length} vec_ns={:.1} shared_ns={:.1} speedup={:.3}",
+            samples[0][5].as_secs_f64() * 400_000.0,
+            samples[1][5].as_secs_f64() * 400_000.0,
+            samples[0][5].as_secs_f64() / samples[1][5].as_secs_f64()
+        );
+    }
 }

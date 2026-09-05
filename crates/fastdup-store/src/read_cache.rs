@@ -218,8 +218,23 @@ impl VerifiedChunkRead {
         requested: Vec<VerifiedChunkPayload>,
         admission_groups: Vec<Vec<VerifiedChunkPayload>>,
     ) -> Self {
+        if admission_groups.len() <= 1 {
+            let admission_groups = if admission_groups.first().is_some_and(Vec::is_empty) {
+                Vec::new()
+            } else {
+                admission_groups
+            };
+            return Self {
+                requested,
+                admission_groups,
+            };
+        }
         let mut merged: Vec<Vec<VerifiedChunkPayload>> = Vec::new();
-        for group in admission_groups {
+        let mut groups = admission_groups.into_iter();
+        // Keep the allocation-free scan for small reads and shared-owner
+        // batches. Promote only after seeing 32 different owners with enough
+        // remaining work to amortize building the temporary index.
+        while let Some(group) = groups.next() {
             let Some(first) = group.first() else {
                 continue;
             };
@@ -230,6 +245,29 @@ impl VerifiedChunkRead {
                 existing.extend(group);
             } else {
                 merged.push(group);
+            }
+            if merged.len() == 32 && groups.len() >= 32 {
+                break;
+            }
+        }
+        if groups.len() != 0 {
+            let mut owners = hashbrown::HashMap::with_capacity(merged.len() + groups.len());
+            owners.extend(
+                merged
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, group)| (group[0].backing_id(), ordinal)),
+            );
+            for group in groups {
+                let Some(first) = group.first() else {
+                    continue;
+                };
+                let ordinal = *owners.entry(first.backing_id()).or_insert(merged.len());
+                if ordinal < merged.len() {
+                    merged[ordinal].extend(group);
+                } else {
+                    merged.push(group);
+                }
             }
         }
         Self {
@@ -763,6 +801,87 @@ fn cache_hash(key: CacheKey) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linear_groups(groups: Vec<Vec<VerifiedChunkPayload>>) -> Vec<Vec<VerifiedChunkPayload>> {
+        let mut merged: Vec<Vec<VerifiedChunkPayload>> = Vec::new();
+        for group in groups {
+            let Some(first) = group.first() else {
+                continue;
+            };
+            if let Some(existing) = merged
+                .iter_mut()
+                .find(|existing| existing[0].shares_backing_with(first))
+            {
+                existing.extend(group);
+            } else {
+                merged.push(group);
+            }
+        }
+        merged
+    }
+
+    #[test]
+    fn admission_group_index_preserves_first_owner_and_payload_order() {
+        let owners = (0..128_u32)
+            .map(|n| verified_payload(&n.to_le_bytes()))
+            .collect::<Vec<_>>();
+        for count in [1, 4, 16, 32, 64, 128] {
+            for unique in [4, 128] {
+                let groups = (0..count)
+                    .map(|n| vec![owners[n % unique].clone()])
+                    .collect::<Vec<_>>();
+                let expected = linear_groups(groups.clone());
+                let (_, actual) =
+                    VerifiedChunkRead::new(vec![owners[0].clone()], groups).into_parts();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual[0].backing_id(), expected[0].backing_id());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode read admission grouping A/B"]
+    fn read_admission_grouping_microbenchmark() {
+        use std::hint::black_box;
+        let owners = (0..256_u32)
+            .map(|n| verified_payload(&n.to_le_bytes()))
+            .collect::<Vec<_>>();
+        for count in [1, 4, 16, 32, 64, 128, 256] {
+            for unique in [4, count] {
+                let fixture = (0..count)
+                    .map(|n| vec![owners[n % unique].clone()])
+                    .collect::<Vec<_>>();
+                let mut samples = [Vec::new(), Vec::new()];
+                for round in 0..11 {
+                    for side in 0..2 {
+                        let side = (side + round) % 2;
+                        let batches = (0..500).map(|_| fixture.clone()).collect::<Vec<_>>();
+                        let start = Instant::now();
+                        for groups in batches {
+                            if side == 0 {
+                                black_box(linear_groups(groups));
+                            } else {
+                                black_box(VerifiedChunkRead::new(Vec::new(), groups));
+                            }
+                        }
+                        samples[side].push(start.elapsed());
+                    }
+                }
+                for samples in &mut samples {
+                    samples.sort_unstable();
+                }
+                println!(
+                    "read_grouping groups={count} unique={unique} linear_ns={:.1} indexed_ns={:.1} speedup={:.3}",
+                    samples[0][5].as_secs_f64() * 2_000_000.0,
+                    samples[1][5].as_secs_f64() * 2_000_000.0,
+                    samples[0][5].as_secs_f64() / samples[1][5].as_secs_f64()
+                );
+            }
+        }
+    }
 
     fn verified_payload(bytes: &[u8]) -> VerifiedChunkPayload {
         let encoded = fastdup_format::RawRecord::encode(bytes).expect("encode fixture Record");

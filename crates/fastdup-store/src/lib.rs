@@ -2,6 +2,9 @@
 
 //! Durable container lifecycle behind an injectable storage boundary.
 
+mod cpu_admission;
+pub use cpu_admission::{WorkerPermitLease, WorkerPermits};
+
 mod container_descriptor_cache;
 mod container_generation_allocator;
 mod exact_activation_log;
@@ -739,15 +742,131 @@ pub trait StorageIo {
     }
 }
 
-type ImmutableLeaseCounts = BTreeMap<String, usize>;
-type SharedImmutableLeaseCounts = Arc<Mutex<ImmutableLeaseCounts>>;
+const CONTAINER_READ_FD_CAPACITY: usize = 128;
+const FILE_REGISTRY_SHARDS: usize = 8;
+
+type FileAccess = Arc<Mutex<usize>>;
+
+#[derive(Debug)]
+struct CachedReadFile {
+    file: Arc<File>,
+    length: u64,
+    // Keeps the name's synchronization identity alive while it is cached.
+    _access: FileAccess,
+}
+
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct FileRegistryShard {
+    names: Mutex<BTreeMap<String, Weak<Mutex<usize>>>>,
+    reads: Mutex<BTreeMap<String, CachedReadFile>>,
+}
+
+#[derive(Debug, Default)]
+struct ImmutableFileRegistry {
+    shards: [FileRegistryShard; FILE_REGISTRY_SHARDS],
+    read_order: Mutex<std::collections::VecDeque<String>>,
+}
+
+impl ImmutableFileRegistry {
+    fn shard(&self, name: &str) -> &FileRegistryShard {
+        let hash = name.bytes().fold(0_usize, |hash, byte| {
+            hash.wrapping_mul(31) ^ usize::from(byte)
+        });
+        &self.shards[hash % FILE_REGISTRY_SHARDS]
+    }
+
+    fn access(&self, name: &str) -> io::Result<FileAccess> {
+        let mut names = self
+            .shard(name)
+            .names
+            .lock()
+            .map_err(|_| io::Error::other("immutable file registry is poisoned"))?;
+        if let Some(access) = names.get(name).and_then(Weak::upgrade) {
+            return Ok(access);
+        }
+        // Dead names are rebuildable bookkeeping, never retained per file forever.
+        if names.len() >= 256 {
+            names.retain(|_, access| access.strong_count() != 0);
+        }
+        let access = Arc::new(Mutex::new(0));
+        names.insert(name.to_owned(), Arc::downgrade(&access));
+        Ok(access)
+    }
+
+    fn reads(
+        &self,
+        name: &str,
+    ) -> io::Result<std::sync::MutexGuard<'_, BTreeMap<String, CachedReadFile>>> {
+        self.shard(name)
+            .reads
+            .lock()
+            .map_err(|_| io::Error::other("Container FD cache is poisoned"))
+    }
+
+    fn invalidate(&self, name: &str) -> io::Result<()> {
+        let mut order = self
+            .read_order
+            .lock()
+            .map_err(|_| io::Error::other("FD admission lock is poisoned"))?;
+        if self.reads(name)?.remove(name).is_some() {
+            order.retain(|cached| cached != name);
+        }
+        Ok(())
+    }
+
+    fn cache_file(&self, name: &str, file: CachedReadFile) -> io::Result<()> {
+        // Only admissions/invalidations take the FIFO lock. Hot reads take one
+        // shard lock, while all shards retain the full shared 128-FD capacity.
+        let mut order = self
+            .read_order
+            .lock()
+            .map_err(|_| io::Error::other("FD admission lock is poisoned"))?;
+        if self.reads(name)?.remove(name).is_some() {
+            order.retain(|cached| cached != name);
+        }
+        if order.len() == CONTAINER_READ_FD_CAPACITY {
+            let oldest = order
+                .pop_front()
+                .expect("ASSERT: full FD cache has an oldest entry");
+            self.reads(&oldest)?.remove(&oldest);
+        }
+        self.reads(name)?.insert(name.to_owned(), file);
+        order.push_back(name.to_owned());
+        Ok(())
+    }
+
+    fn cached(&self, name: &str, end: u64) -> io::Result<Option<Arc<File>>> {
+        self.reads(name)?
+            .get(name)
+            .map(|cached| {
+                check_read_end(end, cached.length)?;
+                Ok(Arc::clone(&cached.file))
+            })
+            .transpose()
+    }
+}
+
+type SharedImmutableFileRegistry = Arc<ImmutableFileRegistry>;
+
+fn check_read_end(end: u64, length: u64) -> io::Result<()> {
+    if end > length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "bounded storage read exceeds the current object length",
+        ));
+    }
+    Ok(())
+}
 
 /// An opaque read-only file capability whose lifetime prevents cooperating
 /// [`FsStorageIo`] adapters from mutating the same published name.
 pub struct ImmutableFileLease {
     file: File,
-    name: String,
-    counts: SharedImmutableLeaseCounts,
+    access: FileAccess,
+    // Keep the canonical-root registry discoverable even if every adapter
+    // drops before the mapping. A reopened adapter must see this same lease.
+    _registry: SharedImmutableFileRegistry,
 }
 
 impl ImmutableFileLease {
@@ -760,33 +879,20 @@ impl fmt::Debug for ImmutableFileLease {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ImmutableFileLease")
-            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
 
 impl Drop for ImmutableFileLease {
     fn drop(&mut self) {
-        let Ok(mut counts) = self.counts.lock() else {
+        let Ok(mut count) = self.access.lock() else {
             return;
         };
-        let remove = match counts.get_mut(&self.name) {
-            Some(count) if *count > 1 => {
-                *count -= 1;
-                false
-            }
-            Some(_) => true,
-            None => {
-                debug_assert!(
-                    false,
-                    "ASSERT: immutable file lease count exists until drop"
-                );
-                false
-            }
-        };
-        if remove {
-            counts.remove(&self.name);
-        }
+        assert!(
+            *count != 0,
+            "ASSERT: immutable file lease count exists until drop"
+        );
+        *count -= 1;
     }
 }
 
@@ -795,6 +901,7 @@ pub struct ContainerRepository<I> {
     storage: I,
     descriptors: Arc<container_descriptor_cache::ContainerDescriptorCache>,
     record_reads: Arc<RecordReadCoordinator>,
+    cpu_admission: Arc<OnceLock<Arc<WorkerPermits>>>,
     retiring: Arc<RwLock<BTreeMap<[u8; 16], usize>>>,
     reduction_publications: Arc<std::sync::atomic::AtomicUsize>,
     generation_allocator_barrier: Arc<Mutex<()>>,
@@ -1107,6 +1214,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                 container_descriptor_cache::ContainerDescriptorCache::new_system(),
             ),
             record_reads: Arc::new(RecordReadCoordinator::new()),
+            cpu_admission: Arc::new(OnceLock::new()),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
             reduction_publications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             generation_allocator_barrier: Arc::new(Mutex::new(())),
@@ -1114,6 +1222,17 @@ impl<I: StorageIo> ContainerRepository<I> {
                 container_generation_allocator::ContainerGenerationAllocatorRegistry::default(),
             ),
         }
+    }
+
+    /// Shares ingest CPU permits with bounded demand Record decode jobs.
+    /// Install once before serving the repository or its cloned views.
+    ///
+    /// # Panics
+    /// Panics if CPU admission was already installed.
+    pub fn install_cpu_admission(&self, admission: Arc<WorkerPermits>) {
+        self.cpu_admission
+            .set(admission)
+            .expect("ASSERT: one CPU admission per Container repository");
     }
 
     /// Opens the durable Container-generation allocator.
@@ -1174,6 +1293,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             storage,
             descriptors: Arc::clone(&self.descriptors),
             record_reads: Arc::clone(&self.record_reads),
+            cpu_admission: Arc::clone(&self.cpu_admission),
             retiring: Arc::clone(&self.retiring),
             reduction_publications: Arc::clone(&self.reduction_publications),
             generation_allocator_barrier: Arc::clone(&self.generation_allocator_barrier),
@@ -1197,6 +1317,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                 container_descriptor_cache::ContainerDescriptorCache::new_with_snapshot(snapshot),
             ),
             record_reads: Arc::new(RecordReadCoordinator::new()),
+            cpu_admission: Arc::new(OnceLock::new()),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
             reduction_publications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             generation_allocator_barrier: Arc::new(Mutex::new(())),
@@ -1715,6 +1836,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         independent: Vec<fastdup_format::PreparedIndependentRecord>,
         dependents: Vec<fastdup_format::PreparedDependentRecord>,
         workers: NonZeroUsize,
+        chunk_order: Option<&[fastdup_format::ChunkId]>,
     ) -> Result<PreparedAdaptiveContainer, StoreError> {
         let encode_wall_started = Instant::now();
         let encode_cpu_started = process_cpu_time();
@@ -1727,6 +1849,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                 dependents,
                 workers,
                 IncompressibilityGatePolicy::Off,
+                chunk_order,
             )?;
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
@@ -2865,7 +2988,6 @@ impl<I: StorageIo> ContainerRepository<I> {
 
         planned.sort_unstable_by_key(|&(key, request_ordinal, _)| (key, request_ordinal));
         let mut group_start = 0_usize;
-        let mut exact_candidates = Vec::new();
         let mut current_descriptor = None::<([u8; 16], u64, SealedContainerDescriptor)>;
         let mut pending_join = None;
         while group_start < planned.len() {
@@ -2989,6 +3111,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             let encoded_batch = Arc::new(encoded_batch);
             let mut joins = joins.into_iter();
             let mut record_start = group_start;
+            let mut jobs = Vec::new();
             while record_start < batch_end {
                 let join = joins.next().expect("one coordinated read per Record group");
                 let record_key = planned[record_start].0;
@@ -3020,34 +3143,84 @@ impl<I: StorageIo> ContainerRepository<I> {
                     record_start = record_end;
                     continue;
                 }
-                exact_candidates.clear();
-                exact_candidates
-                    .try_reserve(record_candidates.len())
-                    .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-                exact_candidates
-                    .extend(record_candidates.iter().map(|(_, _, candidate)| *candidate));
-                let Ok(verified) = descriptor.decode_owned_candidate_payloads(
-                    &exact_candidates,
-                    &encoded_batch,
-                    relative_start..relative_end,
-                ) else {
-                    record_start = record_end;
-                    continue;
-                };
+                jobs.push((join, relative_start..relative_end, record_start..record_end));
+                record_start = record_end;
+            }
+            let decode = |(join, range, ordinals): (
+                CoordinatedRecordRead,
+                std::ops::Range<usize>,
+                std::ops::Range<usize>,
+            )| {
+                let exact_candidates = planned[ordinals.clone()]
+                    .iter()
+                    .map(|(_, _, candidate)| *candidate)
+                    .collect::<Vec<_>>();
+                let verified = descriptor
+                    .decode_owned_candidate_payloads(&exact_candidates, &encoded_batch, range)
+                    .ok()?;
                 let (records, all) = verified.into_parts();
-                assert_eq!(
-                    records.len(),
-                    record_candidates.len(),
-                    "ASSERT: a verified Record group returns one Chunk per candidate"
-                );
                 if let CoordinatedRecordRead::Leader(leader) = join {
                     leader.complete(Arc::new(all.clone()));
                 }
+                Some((ordinals, records, all))
+            };
+            // I/O remains one ascending coalesced read. Only independent CPU
+            // verification enters the shared pool, and only with spare ingest
+            // permits. Nested Base reads and saturated pools stay synchronous.
+            let decoded_bytes = jobs
+                .iter()
+                .map(|(_, _, ordinals)| {
+                    u64::from(planned[ordinals.start].2.location().record_decoded_length())
+                })
+                .sum::<u64>();
+            let lease = (jobs.len() > 1 && decoded_bytes >= 256 * 1_024)
+                .then(|| {
+                    self.cpu_admission.get().and_then(|admission| {
+                        admission.try_acquire(
+                            NonZeroUsize::new(jobs.len().min(4)).expect("nonempty decode batch"),
+                        )
+                    })
+                })
+                .flatten();
+            let workers = lease.as_ref().map_or(1, |lease| lease.workers().get());
+            let completed = if workers == 1 {
+                jobs.into_iter().filter_map(decode).collect::<Vec<_>>()
+            } else {
+                let jobs = Mutex::new(std::collections::VecDeque::from(jobs));
+                (0..workers)
+                    .into_par_iter()
+                    .map(|_| {
+                        let mut results = Vec::new();
+                        loop {
+                            let job = jobs
+                                .lock()
+                                .expect("ASSERT: decode job lock poisoned")
+                                .pop_front();
+                            let Some(job) = job else {
+                                break;
+                            };
+                            if let Some(result) = decode(job) {
+                                results.push(result);
+                            }
+                        }
+                        results
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            };
+            drop(lease);
+            for (ordinals, records, all) in completed {
+                assert_eq!(
+                    ordinals.len(),
+                    records.len(),
+                    "ASSERT: one verified result per requested Chunk"
+                );
                 admission_groups.push(all);
-                for (&(_, request_ordinal, _), payload) in record_candidates.iter().zip(records) {
+                for (&(_, request_ordinal, _), payload) in planned[ordinals].iter().zip(records) {
                     resolved[request_ordinal] = Some(payload);
                 }
-                record_start = record_end;
             }
             group_start = batch_end;
         }
@@ -3715,13 +3888,13 @@ fn publish_owned_container_synchronously<I: StorageIo + ?Sized>(
 }
 
 static FS_IMMUTABLE_LEASE_REGISTRIES: OnceLock<
-    Mutex<BTreeMap<PathBuf, Weak<Mutex<ImmutableLeaseCounts>>>>,
+    Mutex<BTreeMap<PathBuf, Weak<ImmutableFileRegistry>>>,
 > = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct FsStorageIo {
     root: PathBuf,
-    immutable_leases: SharedImmutableLeaseCounts,
+    immutable_leases: SharedImmutableFileRegistry,
 }
 
 impl FsStorageIo {
@@ -3741,7 +3914,7 @@ impl FsStorageIo {
             .get(&root)
             .and_then(Weak::upgrade)
             .unwrap_or_else(|| {
-                let counts = Arc::new(Mutex::new(BTreeMap::new()));
+                let counts = Arc::new(ImmutableFileRegistry::default());
                 registries.insert(root.clone(), Arc::downgrade(&counts));
                 counts
             });
@@ -3756,24 +3929,123 @@ impl FsStorageIo {
         &self.root
     }
 
-    fn path(&self, name: &str) -> io::Result<PathBuf> {
+    fn validate_name(name: &str) -> io::Result<()> {
         if name.is_empty() || name.contains('/') || name == "." || name == ".." {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "container name is not one path component",
             ));
         }
+        Ok(())
+    }
+
+    fn path(&self, name: &str) -> io::Result<PathBuf> {
+        Self::validate_name(name)?;
         Ok(self.root.join(name))
     }
 
-    fn immutable_lease_guard(&self) -> io::Result<std::sync::MutexGuard<'_, ImmutableLeaseCounts>> {
-        self.immutable_leases
+    /// Opens a bounded read while retaining at most 128 immutable Container
+    /// descriptors per canonical root. Mutations invalidate the cache across
+    /// all adapters; an in-flight read alone may keep an unlinked file alive.
+    ///
+    /// # Errors
+    /// Rejects invalid names, overflowing ranges, missing files, and EOF.
+    ///
+    /// # Panics
+    /// Panics if bounded FD-cache and FIFO ownership diverge.
+    pub fn open_read_range(&self, name: &str, offset: u64, length: usize) -> io::Result<Arc<File>> {
+        Self::validate_name(name)?;
+        let end = offset
+            .checked_add(
+                u64::try_from(length).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+            )
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // Hits take only a cache-shard lock. A hit linearizes before a racing
+        // invalidation, like an already-open in-flight range read. Misses wait
+        // only for mutation of this name; no registry/cache lock spans I/O.
+        if let Some(file) = self.immutable_leases.cached(name, end)? {
+            return Ok(file);
+        }
+        let access = self.immutable_leases.access(name)?;
+        let _guard = access
             .lock()
-            .map_err(|_| io::Error::other("immutable lease registry is poisoned"))
+            .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
+        if let Some(file) = self.immutable_leases.cached(name, end)? {
+            return Ok(file);
+        }
+        let file = Arc::new(File::open(self.root.join(name))?);
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        check_read_end(end, metadata.len())?;
+        if matches!(parse_published_name(name), Ok(Some(_))) {
+            self.immutable_leases.cache_file(
+                name,
+                CachedReadFile {
+                    file: Arc::clone(&file),
+                    length: metadata.len(),
+                    _access: Arc::clone(&access),
+                },
+            )?;
+        }
+        Ok(file)
     }
 
-    fn reject_leased(counts: &ImmutableLeaseCounts, name: &str) -> io::Result<()> {
-        if counts.get(name).copied().unwrap_or(0) != 0 {
+    /// Serializes mutation of one name with immutable leases and FD invalidation.
+    /// Unrelated files keep making progress while the backend performs I/O.
+    ///
+    /// # Errors
+    /// Rejects invalid names, active immutable readers, or backend I/O failure.
+    pub fn with_file_mutation<T>(
+        &self,
+        name: &str,
+        action: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        Self::validate_name(name)?;
+        let access = self.immutable_leases.access(name)?;
+        let count = access
+            .lock()
+            .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
+        Self::reject_leased(*count)?;
+        self.immutable_leases.invalidate(name)?;
+        action()
+    }
+
+    /// Locks both rename names in lexical order, then invalidates their FDs.
+    /// The backend must preserve no-replace semantics.
+    ///
+    /// # Errors
+    /// Returns name, immutable-lease, or backend rename failures.
+    pub fn with_file_rename<T>(
+        &self,
+        old: &str,
+        new: &str,
+        action: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        Self::validate_name(old)?;
+        Self::validate_name(new)?;
+        if old == new {
+            return self.with_file_mutation(old, action);
+        }
+        let (first, second) = if old < new { (old, new) } else { (new, old) };
+        let first_access = self.immutable_leases.access(first)?;
+        let second_access = self.immutable_leases.access(second)?;
+        let first_count = first_access
+            .lock()
+            .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
+        let second_count = second_access
+            .lock()
+            .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
+        Self::reject_leased(*first_count)?;
+        Self::reject_leased(*second_count)?;
+        self.immutable_leases.invalidate(old)?;
+        self.immutable_leases.invalidate(new)?;
+        action()
+    }
+
+    fn reject_leased(count: usize) -> io::Result<()> {
+        if count != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "published object has active immutable readers",
@@ -3785,12 +4057,14 @@ impl FsStorageIo {
 
 impl StorageIo for FsStorageIo {
     fn create_new(&self, name: &str) -> io::Result<()> {
-        OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(self.path(name)?)?;
-        Ok(())
+        self.with_file_mutation(name, || {
+            OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(self.path(name)?)?;
+            Ok(())
+        })
     }
 
     fn exists(&self, name: &str) -> io::Result<bool> {
@@ -3798,13 +4072,13 @@ impl StorageIo for FsStorageIo {
     }
 
     fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        let leases = self.immutable_lease_guard()?;
-        Self::reject_leased(&leases, name)?;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.path(name)?)?
-            .write_all_at(bytes, offset)
+        self.with_file_mutation(name, || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.path(name)?)?
+                .write_all_at(bytes, offset)
+        })
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
@@ -3836,18 +4110,7 @@ impl StorageIo for FsStorageIo {
                 "bounded storage read exceeds the hard allocation limit",
             ));
         }
-        let length_u64 = u64::try_from(length)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "read length is too large"))?;
-        let end = offset
-            .checked_add(length_u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read range overflows"))?;
-        let file = File::open(self.path(name)?)?;
-        if end > file.metadata()?.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "bounded storage read exceeds the current object length",
-            ));
-        }
+        let file = self.open_read_range(name, offset, length)?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(length)
@@ -3884,12 +4147,12 @@ impl StorageIo for FsStorageIo {
     }
 
     fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
-        let leases = self.immutable_lease_guard()?;
-        Self::reject_leased(&leases, name)?;
-        OpenOptions::new()
-            .write(true)
-            .open(self.path(name)?)?
-            .set_len(length)
+        self.with_file_mutation(name, || {
+            OpenOptions::new()
+                .write(true)
+                .open(self.path(name)?)?
+                .set_len(length)
+        })
     }
 
     fn sync_file(&self, name: &str) -> io::Result<()> {
@@ -3897,26 +4160,21 @@ impl StorageIo for FsStorageIo {
     }
 
     fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
-        self.path(temporary_name)?;
-        self.path(published_name)?;
-        let leases = self.immutable_lease_guard()?;
-        Self::reject_leased(&leases, temporary_name)?;
-        Self::reject_leased(&leases, published_name)?;
-        let directory = File::open(&self.root)?;
-        rustix::fs::renameat_with(
-            &directory,
-            temporary_name,
-            &directory,
-            published_name,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(io::Error::from)
+        self.with_file_rename(temporary_name, published_name, || {
+            let directory = File::open(&self.root)?;
+            rustix::fs::renameat_with(
+                &directory,
+                temporary_name,
+                &directory,
+                published_name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(io::Error::from)
+        })
     }
 
     fn remove_file(&self, name: &str) -> io::Result<()> {
-        let leases = self.immutable_lease_guard()?;
-        Self::reject_leased(&leases, name)?;
-        std::fs::remove_file(self.path(name)?)
+        self.with_file_mutation(name, || std::fs::remove_file(self.path(name)?))
     }
 
     fn sync_root(&self) -> io::Result<()> {
@@ -3929,7 +4187,10 @@ impl StorageIo for FsStorageIo {
         expected_length: u64,
     ) -> io::Result<Option<ImmutableFileLease>> {
         let path = self.path(name)?;
-        let mut counts = self.immutable_lease_guard()?;
+        let access = self.immutable_leases.access(name)?;
+        let mut count = access
+            .lock()
+            .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
         let file = File::open(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() != expected_length {
@@ -3938,15 +4199,14 @@ impl StorageIo for FsStorageIo {
                 "immutable object identity or length changed before lease acquisition",
             ));
         }
-        let count = counts.entry(name.to_owned()).or_insert(0);
         *count = count
             .checked_add(1)
             .ok_or_else(|| io::Error::other("immutable lease count overflow"))?;
-        drop(counts);
+        drop(count);
         Ok(Some(ImmutableFileLease {
             file,
-            name: name.to_owned(),
-            counts: Arc::clone(&self.immutable_leases),
+            access,
+            _registry: Arc::clone(&self.immutable_leases),
         }))
     }
 }
