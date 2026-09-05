@@ -175,14 +175,16 @@ trait VerifiedChunkReader: fmt::Debug + Send + Sync {
         &self,
         chunk_id: ChunkId,
         logical_length: u64,
+        cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError>;
 
     fn read_verified_chunks(
         &self,
         requests: &[(ChunkId, u64)],
+        cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError> {
         read_chunks_scalar(requests, |chunk_id, logical_length| {
-            self.read_verified_chunk(chunk_id, logical_length)
+            self.read_verified_chunk(chunk_id, logical_length, cache)
         })
     }
 }
@@ -209,6 +211,7 @@ where
         &self,
         chunk_id: ChunkId,
         logical_length: u64,
+        cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError> {
         let Some(index) = self.index.try_pin() else {
             return self
@@ -216,12 +219,13 @@ where
                 .read_verified_chunk_payload(chunk_id, logical_length);
         };
         self.containers
-            .read_verified_chunk_payload_with_index(&index, chunk_id, logical_length)
+            .read_verified_chunk_payload_cached(&index, chunk_id, logical_length, cache)
     }
 
     fn read_verified_chunks(
         &self,
         requests: &[(ChunkId, u64)],
+        cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError> {
         let Some(index) = self.index.try_pin() else {
             return read_chunks_scalar(requests, |chunk_id, logical_length| {
@@ -230,7 +234,7 @@ where
             });
         };
         self.containers
-            .read_verified_chunks_with_index(&index, requests)
+            .read_verified_chunks_with_index(&index, requests, cache)
     }
 }
 
@@ -411,8 +415,10 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             self.read_at_using(
                 offset,
                 length,
-                |chunk_id, logical_length| reader.read_verified_chunk(chunk_id, logical_length),
-                |requests| reader.read_verified_chunks(requests),
+                |chunk_id, logical_length| {
+                    reader.read_verified_chunk(chunk_id, logical_length, self.read_cache.as_deref())
+                },
+                |requests| reader.read_verified_chunks(requests, self.read_cache.as_deref()),
             )
         } else {
             self.read_at_using(
@@ -455,15 +461,19 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             offset,
             length,
             |chunk_id, logical_length| {
-                self.containers.read_verified_chunk_payload_with_index(
+                self.containers.read_verified_chunk_payload_cached(
                     index,
                     chunk_id,
                     logical_length,
+                    self.read_cache.as_deref(),
                 )
             },
             |requests| {
-                self.containers
-                    .read_verified_chunks_with_index(index, requests)
+                self.containers.read_verified_chunks_with_index(
+                    index,
+                    requests,
+                    self.read_cache.as_deref(),
+                )
             },
         )
     }
@@ -687,7 +697,6 @@ where
     output
         .try_reserve_exact(output_length)
         .map_err(|_| ManifestReadError::OutOfMemory)?;
-    output.resize(output_length, 0);
     let mut covered_until = offset;
     for located in extents {
         let extent = located.extent();
@@ -706,10 +715,15 @@ where
             .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
         let target_end = usize::try_from(copy_end - offset)
             .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
+        assert_eq!(
+            output.len(),
+            target_start,
+            "Manifest output remains contiguous"
+        );
         match *extent {
-            ManifestExtent::Hole { .. } => {}
+            ManifestExtent::Hole { .. } => output.resize(target_end, 0),
             ManifestExtent::Fill { value, .. } => {
-                output[target_start..target_end].fill(value);
+                output.resize(target_end, value);
             }
             ManifestExtent::Data {
                 logical_length,
@@ -720,8 +734,7 @@ where
                     .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
                 let source_end = usize::try_from(copy_end - extent_start)
                     .map_err(|_| ManifestReadError::ArithmeticOverflow)?;
-                output[target_start..target_end]
-                    .copy_from_slice(&payload.as_slice()[source_start..source_end]);
+                output.extend_from_slice(&payload.as_slice()[source_start..source_end]);
             }
             ManifestExtent::DataSlice {
                 chunk_id,
@@ -739,8 +752,7 @@ where
                 if source_end > payload.len() {
                     return Err(ManifestReadError::ArithmeticOverflow);
                 }
-                output[target_start..target_end]
-                    .copy_from_slice(&payload.as_slice()[source_start..source_end]);
+                output.extend_from_slice(&payload.as_slice()[source_start..source_end]);
             }
         }
         covered_until = copy_end;

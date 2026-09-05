@@ -45,17 +45,15 @@ pub(crate) fn update_votes(votes: &mut [i32; 512], words: [u64; 8]) {
     unsafe { update_votes_avx2(votes, words) };
 }
 
-/// Finds the exact differing-byte runs and their concatenated XOR payload.
-///
-/// The safe caller has already selected AVX2 and proved equal input lengths.
-/// Durable run semantics remain defined by the scalar implementation in the
-/// parent module; differential tests exercise both implementations.
-pub(crate) fn scan_sparse_xor(
+/// Returns false as soon as the canonical payload cannot fit the cost cap.
+/// The caller discards partial output on rejection.
+pub(crate) fn scan_sparse_xor_bounded(
     base: &[u8],
     target: &[u8],
     runs: &mut Vec<(usize, usize)>,
     xor_bytes: &mut Vec<u8>,
-) {
+    maximum_bytes: usize,
+) -> bool {
     assert!(
         available(),
         "ASSERT: sparse-XOR AVX2 dispatch is feature-gated"
@@ -68,7 +66,7 @@ pub(crate) fn scan_sparse_xor(
     // SAFETY: runtime detection above establishes AVX2. The kernel bounds
     // every unaligned load by the equal input lengths and uses safe Vec pushes
     // for all emitted run and payload bytes.
-    unsafe { scan_sparse_xor_avx2(base, target, runs, xor_bytes) };
+    unsafe { scan_sparse_xor_avx2(base, target, runs, xor_bytes, maximum_bytes) }
 }
 
 #[target_feature(enable = "avx2")]
@@ -78,13 +76,18 @@ unsafe fn scan_sparse_xor_avx2(
     target: &[u8],
     runs: &mut Vec<(usize, usize)>,
     xor_bytes: &mut Vec<u8>,
-) {
+    maximum_bytes: usize,
+) -> bool {
     use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
 
     runs.clear();
     xor_bytes.clear();
     let mut cursor = 0_usize;
     let mut run_start = None;
+    let mut encoded_bytes = 36_usize;
+    if encoded_bytes > maximum_bytes {
+        return false;
+    }
     while cursor.saturating_add(32) <= target.len() {
         // SAFETY: the loop condition and equal input lengths prove both
         // unaligned 32-byte loads lie inside their respective slices.
@@ -104,6 +107,12 @@ unsafe fn scan_sparse_xor_avx2(
             continue;
         }
 
+        let changed = !equal_mask;
+        let starts = (changed & !(changed << 1)) & !u32::from(run_start.is_some());
+        encoded_bytes += changed.count_ones() as usize + 8 * starts.count_ones() as usize;
+        if encoded_bytes > maximum_bytes {
+            return false;
+        }
         for lane in 0..32 {
             if equal_mask & (1_u32 << lane) == 0 {
                 run_start.get_or_insert(cursor);
@@ -116,6 +125,10 @@ unsafe fn scan_sparse_xor_avx2(
     }
     while cursor < target.len() {
         if base[cursor] != target[cursor] {
+            encoded_bytes += 1 + 8 * usize::from(run_start.is_none());
+            if encoded_bytes > maximum_bytes {
+                return false;
+            }
             run_start.get_or_insert(cursor);
             xor_bytes.push(base[cursor] ^ target[cursor]);
         } else if let Some(start) = run_start.take() {
@@ -126,6 +139,7 @@ unsafe fn scan_sparse_xor_avx2(
     if let Some(start) = run_start {
         runs.push((start, cursor - start));
     }
+    true
 }
 
 #[target_feature(enable = "avx2")]

@@ -244,6 +244,7 @@ mod tests {
 
     fn share() -> ShareSettings {
         ShareSettings {
+            advanced_reduction: None,
             id: "one".to_owned(),
             revision: 1,
             name: "backup".to_owned(),

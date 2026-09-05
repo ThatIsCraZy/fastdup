@@ -2159,6 +2159,24 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
         maintenance.garbage_collect_proved_candidates(exact_stale_proof),
         Err(MaintenanceError::StaleGcPlan)
     ));
+    let pending_reduction = containers
+        .with_maintenance_storage(data.clone())
+        .try_pin_reduction_publication()
+        .expect("admit dependent publication");
+    let blocked_proof = maintenance
+        .prove_gc_candidates(&current_shortlist, DataPoolUsage::new(50, 100).unwrap())
+        .unwrap();
+    let before_blocked = data.operation_count();
+    assert!(matches!(
+        maintenance.begin_online_gc_retirement(blocked_proof),
+        Err(MaintenanceError::StaleGcPlan)
+    ));
+    assert_eq!(
+        data.operation_count(),
+        before_blocked,
+        "blocked GC performs no speculative DATA I/O"
+    );
+    drop(pending_reduction);
     let current_proof = maintenance
         .prove_gc_candidates(
             &current_shortlist,
@@ -2173,6 +2191,10 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
         .begin_online_gc_retirement(current_proof)
         .expect("replacement and RETIRING transition activate atomically");
     assert_eq!(retirement.victim_containers(), 2);
+    assert!(
+        containers.try_pin_reduction_publication().is_none(),
+        "RETIRING selects independent fallback without waiting"
+    );
     assert!(!retirement.pins_drained());
     let restarted_indexes = ExactIndexRunRepository::new(restart_metadata);
     let restarted_generation = restarted_indexes
@@ -2205,6 +2227,7 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
     assert_eq!(report.containers_removed(), 2);
     assert_eq!(report.replacement_containers(), 1);
     assert_eq!(report.chunks_relocated(), 2);
+    assert!(containers.try_pin_reduction_publication().is_some());
     assert_eq!(
         containers
             .audit_published()

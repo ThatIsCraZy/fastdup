@@ -958,6 +958,7 @@ function DrivesPage({
 }
 
 const emptyShare: ShareSettings = {
+  advancedReduction: "off",
   id: "",
   revision: 0,
   name: "",
@@ -1219,6 +1220,16 @@ function ShareEditor({
               Quota erzwungen. Dedup- und Clone-Daten zählen vollständig;
               Sparse-Holes nicht.
             </small>
+          </label>
+          <label className="field">
+            <span>Advanced Reduction für diese Freigabe</span>
+            <select value={draft.advancedReduction ?? "inherit"}
+              onChange={(event) => set("advancedReduction", event.target.value === "inherit" ? undefined : event.target.value as ShareSettings["advancedReduction"])}>
+              <option value="off">Aus</option>
+              <option value="dependent_v1">Similarity aktiv</option>
+              <option value="inherit">Repository-Standard</option>
+            </select>
+            <small>Wirkt online auf neue Schreibvorgänge. Exact Dedup und normale Kompression bleiben aktiv. Aktivierte Freigaben verwenden einen gemeinsamen Kandidatenindex.</small>
           </label>
           <div className="toggle-stack">
             <Toggle
@@ -1677,7 +1688,6 @@ function SettingsPage({
   const [extensionDraft, setExtensionDraft] = useState(
     settings.smallFileExtensions.join("\n"),
   );
-  const [confirm, setConfirm] = useState(false);
   useEffect(() => {
     setDraft(settings);
     setExtensionDraft(settings.smallFileExtensions.join("\n"));
@@ -1686,7 +1696,6 @@ function SettingsPage({
     key: K,
     value: RepositorySettings[K],
   ) => setDraft((current) => ({ ...current, [key]: value }));
-  const needsRemount = draft.advancedReduction !== settings.advancedReduction;
   return (
     <>
       <div className="page-title">
@@ -1700,7 +1709,7 @@ function SettingsPage({
         </div>
         <Button
           variant="secondary"
-          onClick={() => (needsRemount ? setConfirm(true) : save(draft))}
+          onClick={() => save(draft)}
         >
           <Save size={15} /> Übernehmen
         </Button>
@@ -1727,7 +1736,7 @@ function SettingsPage({
               detail="Hot-fähig; wird sofort über den Management-Socket aktiviert."
             />
             <label className="field">
-              <span>Advanced Reduction</span>
+              <span>Advanced Reduction: Repository-Standard</span>
               <select
                 value={draft.advancedReduction}
                 onChange={(event) =>
@@ -1739,11 +1748,10 @@ function SettingsPage({
                 }
               >
                 <option value="off">Aus</option>
-                <option value="prefix_v1">Prefix v1</option>
+                <option value="dependent_v1">Similarity aktiv</option>
               </select>
               <small>
-                Eine Änderung erfordert automatischen Remount und gegebenenfalls
-                Index-Rebuild.
+                Wird online aktiv. Pro Freigabe überschreibbar; neue Basen werden inkrementell aufgenommen.
               </small>
             </label>
             <label className="field">
@@ -1851,23 +1859,6 @@ function SettingsPage({
           </Card>
         </aside>
       </div>
-      {confirm && (
-        <ConfirmDialog
-          title="Automatischen Remount durchführen?"
-          confirmLabel="Änderung aktivieren"
-          onClose={() => setConfirm(false)}
-          onConfirm={() => {
-            setConfirm(false);
-            save(draft);
-          }}
-        >
-          <p>
-            Advanced Reduction überschreitet eine Prozessgrenze. FastDup führt
-            kontrolliert Unmount, Indexprüfung, Start und Health-Check aus. Bei
-            einem Fehler wird die vorherige Konfiguration wiederhergestellt.
-          </p>
-        </ConfirmDialog>
-      )}
     </>
   );
 }

@@ -411,7 +411,7 @@ fn write_bucket_partition<I: StorageIo>(
     })
 }
 
-fn stream_partition_vectors<I: StorageIo>(
+pub(crate) fn stream_partition_vectors<I: StorageIo>(
     storage: &I,
     output_name: &str,
     layout: SimilarityIndexRunLayout,

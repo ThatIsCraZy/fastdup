@@ -8,7 +8,7 @@
 use std::fmt;
 
 use fastdup_format::ChunkId;
-use zstd::zstd_safe::{CCtx, CParameter, DCtx};
+use zstd::zstd_safe::DCtx;
 
 const MAXIMUM_LOGICAL_CHUNK_BYTES_V1: usize = 256 * 1_024;
 const BASE_DEPENDENCY_BYTES: usize = 32;
@@ -303,25 +303,14 @@ impl ZstdPrefixCodec {
         }
 
         let mut frame = allocate_zeroed(frame_capacity)?;
-        let mut context = CCtx::try_create().ok_or(ZstdPrefixError::AllocationFailed)?;
-        context
-            .set_parameter(CParameter::CompressionLevel(ZSTD_PREFIX_LEVEL_V1))
-            .map_err(|_| ZstdPrefixError::CompressionFailed)?;
-        context
-            .set_parameter(CParameter::NbWorkers(0))
-            .map_err(|_| ZstdPrefixError::CompressionFailed)?;
-        context
-            .set_pledged_src_size(Some(
-                u64::try_from(target.len()).map_err(|_| ZstdPrefixError::ArithmeticOverflow)?,
-            ))
-            .map_err(|_| ZstdPrefixError::CompressionFailed)?;
-        context
-            .ref_prefix(base.bytes)
-            .map_err(|_| ZstdPrefixError::CompressionFailed)?;
-        let written = match context.compress2(frame.as_mut_slice(), target) {
-            Ok(written) => written,
-            Err(error) if destination_too_small(error) => return Ok(None),
-            Err(_) => return Err(ZstdPrefixError::CompressionFailed),
+        let Some(written) = crate::prefix_context::compress(
+            base.bytes,
+            target,
+            frame.as_mut_slice(),
+            ZSTD_PREFIX_LEVEL_V1,
+        )?
+        else {
+            return Ok(None);
         };
         assert!(
             written <= frame_capacity,
@@ -416,10 +405,6 @@ fn allocate_zeroed(length: usize) -> Result<Vec<u8>, ZstdPrefixError> {
 
 fn length_u32(length: usize) -> Result<u32, ZstdPrefixError> {
     u32::try_from(length).map_err(|_| ZstdPrefixError::ArithmeticOverflow)
-}
-
-fn destination_too_small(error: zstd::zstd_safe::ErrorCode) -> bool {
-    zstd::zstd_safe::get_error_name(error) == "Destination buffer is too small"
 }
 
 #[cfg(test)]

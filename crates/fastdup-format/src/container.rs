@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use fastdup_copy_metrics::{CopyClass, record_copy};
 
 use crate::crc32c_with_zeroed_u32;
-use crate::exact_index::{ExactIndexEntry, ExactLocationTransition};
+use crate::exact_index::{ExactIndexEntry, ExactIndexLocation, ExactLocationTransition};
 
 pub const HEADER_BYTES: usize = 4_096;
 pub const RECORD_HEADER_BYTES: usize = 128;
@@ -63,6 +63,8 @@ const FOOTER_SUMMARY_OFFSET: usize = 192;
 
 thread_local! {
     static ADAPTIVE_ENCODER_V1: RefCell<Option<AdaptiveEncoderV1>> =
+        const { RefCell::new(None) };
+    static RECORD_DECODER: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
         const { RefCell::new(None) };
 }
 const FOOTER_CRC_OFFSET: usize = 128;
@@ -866,6 +868,35 @@ impl SealedContainerDescriptor {
         candidates: &[ExactIndexEntry],
         record_bytes: &[u8],
     ) -> Result<VerifiedRecordPayloads, FormatError> {
+        self.decode_candidate_payloads_using(candidates, record_bytes, None)
+    }
+
+    /// Verifies an owned Record range, retaining RAW bytes without copying.
+    /// Shared batches remain bounded by the storage range limit; callers charge
+    /// the complete backing capacity when admitting any views to a cache.
+    ///
+    /// # Errors
+    /// Returns the same verification errors as `decode_candidate_payloads`, or
+    /// an invalid range. No bytes are exposed before CRC and Chunk verification.
+    pub fn decode_owned_candidate_payloads(
+        self,
+        candidates: &[ExactIndexEntry],
+        backing: &Arc<Vec<u8>>,
+        range: std::ops::Range<usize>,
+    ) -> Result<VerifiedRecordPayloads, FormatError> {
+        let record = backing
+            .get(range.clone())
+            .ok_or(FormatError::ExactLocationMismatch)?;
+        self.decode_candidate_payloads_using(candidates, record, Some((backing, range.start)))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn decode_candidate_payloads_using(
+        self,
+        candidates: &[ExactIndexEntry],
+        record_bytes: &[u8],
+        backing: Option<(&Arc<Vec<u8>>, usize)>,
+    ) -> Result<VerifiedRecordPayloads, FormatError> {
         let Some(&first) = candidates.first() else {
             return Ok(VerifiedRecordPayloads {
                 requested: Vec::new(),
@@ -930,11 +961,18 @@ impl SealedContainerDescriptor {
             ordinals.push(ordinal);
         }
 
-        let decoded = decode_encoding_record(record_bytes)?;
+        let decoded = decode_encoding_record_mode(record_bytes, true, backing)?;
+        let source = first_location;
         let all = decoded
             .chunks
             .into_iter()
-            .map(RawRecord::into_verified_payload)
+            .enumerate()
+            .map(|(ordinal, record)| {
+                let mut payload = record.into_verified_payload();
+                payload.source = Some(source);
+                payload.chunk_ordinal = u32::try_from(ordinal).expect("bounded Chunk ordinal");
+                payload
+            })
             .collect::<Vec<_>>();
         let mut requested = Vec::new();
         requested
@@ -974,9 +1012,7 @@ impl SealedContainerDescriptor {
         if candidate.location().codec_id() != ZSTD_PREFIX_CODEC {
             return Err(FormatError::ExactLocationMismatch);
         }
-        self.decode_dependent_candidate_using(candidate, record_bytes, |bytes| {
-            ZstdPrefixRecord::decode(bytes, base)
-        })
+        self.decode_dependent_candidate_using(candidate, record_bytes, |record| record.decode(base))
     }
 
     /// Fully validates one codec-3 candidate while reusing the identity already
@@ -997,8 +1033,8 @@ impl SealedContainerDescriptor {
         if candidate.location().codec_id() != ZSTD_PREFIX_CODEC {
             return Err(FormatError::ExactLocationMismatch);
         }
-        self.decode_dependent_candidate_using(candidate, record_bytes, |bytes| {
-            ZstdPrefixRecord::decode_with_verified_base(bytes, base)
+        self.decode_dependent_candidate_using(candidate, record_bytes, |record| {
+            record.decode_with_verified_base(base)
         })
     }
 
@@ -1013,9 +1049,7 @@ impl SealedContainerDescriptor {
         record_bytes: &[u8],
         base: &[u8],
     ) -> Result<RawRecord, FormatError> {
-        self.decode_dependent_candidate_using(candidate, record_bytes, |bytes| {
-            DependentRecord::decode(bytes, base)
-        })
+        self.decode_dependent_candidate_using(candidate, record_bytes, |record| record.decode(base))
     }
 
     /// Fully validates any durable dependent candidate using an already
@@ -1030,8 +1064,8 @@ impl SealedContainerDescriptor {
         record_bytes: &[u8],
         base: &VerifiedChunkPayload,
     ) -> Result<RawRecord, FormatError> {
-        self.decode_dependent_candidate_using(candidate, record_bytes, |bytes| {
-            DependentRecord::decode_with_verified_base(bytes, base)
+        self.decode_dependent_candidate_using(candidate, record_bytes, |record| {
+            record.decode_with_verified_base(base)
         })
     }
 
@@ -1039,7 +1073,7 @@ impl SealedContainerDescriptor {
         self,
         candidate: ExactIndexEntry,
         record_bytes: &[u8],
-        decode: impl FnOnce(&[u8]) -> Result<RawRecord, FormatError>,
+        decode: impl FnOnce(ValidatedDependentRecord<'_>) -> Result<RawRecord, FormatError>,
     ) -> Result<RawRecord, FormatError> {
         let location = candidate.location();
         if !is_dependent_codec(location.codec_id()) {
@@ -1059,13 +1093,14 @@ impl SealedContainerDescriptor {
         {
             return Err(FormatError::ExactLocationMismatch);
         }
-        let dependency = DependentRecord::dependency(record_bytes)?;
+        let validated = ValidatedDependentRecord::new(record_bytes)?;
+        let dependency = validated.dependency;
         if dependency.chunk_id().bytes() != location.dependency_id()
             || dependency.logical_length() != candidate.logical_length()
         {
             return Err(FormatError::ExactLocationMismatch);
         }
-        let record = decode(record_bytes)?;
+        let record = decode(validated)?;
         if record.chunk_id() != candidate.chunk_id()
             || usize::try_from(candidate.logical_length()) != Ok(record.payload().len())
         {
@@ -3374,7 +3409,8 @@ fn encode_prehashed_zstd_record_into(
     if bytes.len() != record_length {
         return Err(FormatError::InvalidRecordLength(bytes.len()));
     }
-    bytes.fill(0);
+    bytes[..payload_offset].fill(0);
+    bytes[payload_end..].fill(0);
     bytes[0..8].copy_from_slice(RECORD_MAGIC);
     put_u16(bytes, 8, FORMAT_VERSION);
     put_u16(bytes, 10, RECORD_HEADER_BYTES_U16);
@@ -3683,37 +3719,21 @@ fn zstd_record_wins(raw_bytes: usize, zstd_bytes: usize) -> Result<bool, FormatE
 
 #[allow(clippy::too_many_lines)]
 fn decode_encoding_record(bytes: &[u8]) -> Result<DecodedEncodingRecord, FormatError> {
-    decode_encoding_record_mode(bytes, true)
+    decode_encoding_record_mode(bytes, true, None)
 }
 
 #[allow(clippy::too_many_lines)]
 fn verify_encoding_record(bytes: &[u8]) -> Result<DecodedEncodingRecord, FormatError> {
-    decode_encoding_record_mode(bytes, false)
+    decode_encoding_record_mode(bytes, false, None)
 }
 
 #[allow(clippy::too_many_lines)]
 fn decode_encoding_record_mode(
     bytes: &[u8],
     retain_payloads: bool,
+    backing: Option<(&Arc<Vec<u8>>, usize)>,
 ) -> Result<DecodedEncodingRecord, FormatError> {
-    if bytes.len() < MIN_RAW_RECORD_BYTES
-        || bytes.len() > MAX_RECORD_BYTES
-        || !bytes.len().is_multiple_of(usize::from(RECORD_ALIGNMENT))
-    {
-        return Err(FormatError::InvalidRecordLength(bytes.len()));
-    }
-    if &bytes[0..8] != RECORD_MAGIC {
-        return Err(FormatError::InvalidRecordMagic);
-    }
-    let declared_length =
-        usize::try_from(get_u32(bytes, 32)).map_err(|_| FormatError::ArithmeticOverflow)?;
-    if declared_length != bytes.len() {
-        return Err(FormatError::InvalidRecordLength(declared_length));
-    }
-    let stored_checksum = get_u32(bytes, RECORD_CRC_OFFSET);
-    if crc32c_with_zeroed_field(bytes, RECORD_CRC_OFFSET) != stored_checksum {
-        return Err(FormatError::RecordChecksumMismatch);
-    }
+    let validated = ValidatedRecord::new(bytes)?;
     if get_u16(bytes, 8) != FORMAT_VERSION
         || usize::from(get_u16(bytes, 10)) != RECORD_HEADER_BYTES
         || get_u16(bytes, 14) != 0
@@ -3727,12 +3747,23 @@ fn decode_encoding_record_mode(
         return Err(FormatError::InvalidZstdRecord);
     }
     if get_u16(bytes, 12) == RAW_CODEC {
-        let (chunk_id, payload) = decode_raw_record_view(bytes)?;
+        let (chunk_id, payload) = decode_raw_record_validated(validated)?;
         let logical_bytes =
             u64::try_from(payload.len()).map_err(|_| FormatError::ArithmeticOverflow)?;
         let chunks = if retain_payloads {
             vec![RawRecord {
-                payload: VerifiedChunkPayload::from_owned(chunk_id, payload.to_vec()),
+                payload: if let Some((owner, start)) = backing {
+                    let mut view = VerifiedChunkPayload::from_shared(
+                        chunk_id,
+                        Arc::clone(owner),
+                        start + RAW_PAYLOAD_OFFSET,
+                        payload.len(),
+                    )?;
+                    view.decoded_offset = 0;
+                    view
+                } else {
+                    VerifiedChunkPayload::from_owned(chunk_id, payload.to_vec())
+                },
             }]
         } else {
             Vec::new()
@@ -3799,8 +3830,16 @@ fn decode_encoding_record_mode(
         return Err(FormatError::InvalidZstdRecord);
     }
 
-    let decoded = zstd::bulk::decompress(&bytes[payload_offset..payload_end], decoded_length)
-        .map_err(|_| FormatError::ZstdFailure)?;
+    let decoded = RECORD_DECODER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::bulk::Decompressor::new().map_err(|_| FormatError::ZstdFailure)?);
+        }
+        slot.as_mut()
+            .expect("initialized Record decoder")
+            .decompress(&bytes[payload_offset..payload_end], decoded_length)
+            .map_err(|_| FormatError::ZstdFailure)
+    })?;
     if decoded.len() != decoded_length {
         return Err(FormatError::InvalidZstdRecord);
     }
@@ -4630,6 +4669,59 @@ impl SparseXorRecord {
     }
 }
 
+/// Validated bytes and dependency cannot be separated or forged by callers.
+/// Decode reuses their CRC/run-geometry proof while checking Base and target.
+struct ValidatedDependentRecord<'a> {
+    bytes: &'a [u8],
+    dependency: DependentDependency,
+}
+
+impl<'a> ValidatedDependentRecord<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self, FormatError> {
+        Ok(Self {
+            bytes,
+            dependency: DependentRecord::dependency(bytes)?,
+        })
+    }
+
+    fn base_mismatch(&self) -> FormatError {
+        if get_u16(self.bytes, 12) == ZSTD_PREFIX_CODEC {
+            FormatError::ZstdPrefixBaseMismatch
+        } else {
+            FormatError::DependentBaseMismatch
+        }
+    }
+
+    fn decode(self, base: &[u8]) -> Result<RawRecord, FormatError> {
+        if usize::try_from(self.dependency.logical_length()) != Ok(base.len())
+            || ChunkId::of(base) != self.dependency.chunk_id()
+        {
+            return Err(self.base_mismatch());
+        }
+        self.decode_after_base_verification(base)
+    }
+
+    fn decode_with_verified_base(
+        self,
+        base: &VerifiedChunkPayload,
+    ) -> Result<RawRecord, FormatError> {
+        if usize::try_from(self.dependency.logical_length()) != Ok(base.len())
+            || base.chunk_id() != self.dependency.chunk_id()
+        {
+            return Err(self.base_mismatch());
+        }
+        self.decode_after_base_verification(base.as_slice())
+    }
+
+    fn decode_after_base_verification(self, base: &[u8]) -> Result<RawRecord, FormatError> {
+        match get_u16(self.bytes, 12) {
+            ZSTD_PREFIX_CODEC => ZstdPrefixRecord::decode_after_base_verification(self.bytes, base),
+            SPARSE_XOR_CODEC => SparseXorRecord::decode_after_base_verification(self.bytes, base),
+            _ => unreachable!("validated dependent codec"),
+        }
+    }
+}
+
 /// Codec-independent dispatcher for every durable Depth-1 record.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DependentRecord;
@@ -4719,15 +4811,23 @@ fn validate_sparse_xor_parts(
     runs: &[SparseXorRun],
     xor_bytes: &[u8],
 ) -> Result<(), FormatError> {
+    validate_sparse_xor_runs(logical_length, runs.iter().copied(), xor_bytes)
+}
+
+fn validate_sparse_xor_runs(
+    logical_length: u32,
+    runs: impl ExactSizeIterator<Item = SparseXorRun>,
+    xor_bytes: &[u8],
+) -> Result<(), FormatError> {
     let logical_length =
         usize::try_from(logical_length).map_err(|_| FormatError::ArithmeticOverflow)?;
     validate_logical_chunk_length(logical_length)?;
-    if runs.is_empty() || xor_bytes.is_empty() || xor_bytes.contains(&0) {
+    if runs.len() == 0 || xor_bytes.is_empty() || xor_bytes.contains(&0) {
         return Err(FormatError::InvalidSparseXorRecord);
     }
     let mut previous_end = 0_usize;
     let mut payload_bytes = 0_usize;
-    for (ordinal, run) in runs.iter().copied().enumerate() {
+    for (ordinal, run) in runs.enumerate() {
         let start =
             usize::try_from(run.logical_offset).map_err(|_| FormatError::ArithmeticOverflow)?;
         let length = usize::try_from(run.length).map_err(|_| FormatError::ArithmeticOverflow)?;
@@ -4883,17 +4983,10 @@ fn validate_sparse_xor_record(bytes: &[u8]) -> Result<(), FormatError> {
     {
         return Err(FormatError::InvalidSparseXorRecord);
     }
-    let mut runs = Vec::new();
-    runs.try_reserve_exact(run_count)
-        .map_err(|_| FormatError::ArithmeticOverflow)?;
-    for ordinal in 0..run_count {
-        let offset = RAW_PAYLOAD_OFFSET + ordinal * 8;
-        runs.push(SparseXorRun::new(
-            get_u32(bytes, offset),
-            get_u32(bytes, offset + 4),
-        ));
-    }
-    validate_sparse_xor_parts(logical_length, &runs, &bytes[xor_offset..payload_end])
+    let runs = bytes[RAW_PAYLOAD_OFFSET..xor_offset]
+        .chunks_exact(8)
+        .map(|entry| SparseXorRun::new(get_u32(entry, 0), get_u32(entry, 4)));
+    validate_sparse_xor_runs(logical_length, runs, &bytes[xor_offset..payload_end])
 }
 
 /// One decoded logical Chunk whose complete stored Encoding Record and BLAKE3
@@ -4907,6 +5000,9 @@ pub struct VerifiedChunkPayload {
     backing: Arc<Vec<u8>>,
     offset: usize,
     length: usize,
+    decoded_offset: usize,
+    chunk_ordinal: u32,
+    source: Option<ExactIndexLocation>,
 }
 
 impl VerifiedChunkPayload {
@@ -4917,6 +5013,9 @@ impl VerifiedChunkPayload {
             backing: Arc::new(bytes),
             offset: 0,
             length,
+            decoded_offset: 0,
+            chunk_ordinal: 0,
+            source: None,
         }
     }
 
@@ -4937,6 +5036,9 @@ impl VerifiedChunkPayload {
             backing,
             offset,
             length,
+            decoded_offset: offset,
+            chunk_ordinal: 0,
+            source: None,
         })
     }
 
@@ -4955,12 +5057,38 @@ impl VerifiedChunkPayload {
         self.length == 0
     }
 
-    /// Offset of this logical Chunk inside its verified decoded Record
-    /// backing. Exact-location waiters use it to pair a shared Singleflight
+    /// Logical offset inside the decoded Record, independent of the physical
+    /// backing offset (RAW views retain their encoded header). Waiters use it
+    /// to pair a shared Singleflight
     /// result with the requested Chunk-table coordinate in O(1).
     #[must_use]
     pub const fn decoded_offset(&self) -> usize {
-        self.offset
+        self.decoded_offset
+    }
+
+    /// Matches a current independent Exact candidate against the physical
+    /// Record and Chunk coordinates independently verified at decode time.
+    #[must_use]
+    pub fn matches_independent_candidate(&self, candidate: ExactIndexEntry) -> bool {
+        let Some(source) = &self.source else {
+            return false;
+        };
+        let location = candidate.location();
+        candidate.transition() == ExactLocationTransition::Active
+            && self.chunk_id == candidate.chunk_id()
+            && u64::try_from(self.length) == Ok(u64::from(candidate.logical_length()))
+            && self.chunk_ordinal == location.chunk_ordinal()
+            && u64::try_from(self.decoded_offset) == Ok(u64::from(location.decoded_offset()))
+            && source.dependency_id() == [0; 32]
+            && location.dependency_id() == [0; 32]
+            && source.container_id() == location.container_id()
+            && source.container_generation() == location.container_generation()
+            && source.record_offset() == location.record_offset()
+            && source.record_length() == location.record_length()
+            && source.record_crc32c() == location.record_crc32c()
+            && source.record_decoded_length() == location.record_decoded_length()
+            && source.record_payload_length() == location.record_payload_length()
+            && source.codec_id() == location.codec_id()
     }
 
     #[must_use]
@@ -4969,7 +5097,7 @@ impl VerifiedChunkPayload {
     }
 
     /// Returns the one allocation retained by this payload and every sibling
-    /// view from the same Encoding Record.
+    /// view from the same decoded Record or coalesced encoded RAW batch.
     #[must_use]
     pub fn backing_allocation_bytes(&self) -> usize {
         self.backing.capacity()
@@ -5085,7 +5213,8 @@ fn encode_prehashed_raw_record_into(
     if bytes.len() != record_length {
         return Err(FormatError::InvalidRecordLength(bytes.len()));
     }
-    bytes.fill(0);
+    bytes[..RAW_PAYLOAD_OFFSET].fill(0);
+    bytes[RAW_PAYLOAD_OFFSET + payload.len()..].fill(0);
     let record_length_u32 =
         u32::try_from(record_length).map_err(|_| FormatError::ArithmeticOverflow)?;
     let payload_length_u32 =
@@ -5112,25 +5241,42 @@ fn encode_prehashed_raw_record_into(
     Ok(())
 }
 
+/// Length, magic, declared length and complete CRC checked exactly once.
+#[derive(Clone, Copy)]
+struct ValidatedRecord<'a>(&'a [u8]);
+
+impl<'a> ValidatedRecord<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self, FormatError> {
+        if bytes.len() < MIN_RAW_RECORD_BYTES
+            || bytes.len() > MAX_RECORD_BYTES
+            || !bytes.len().is_multiple_of(usize::from(RECORD_ALIGNMENT))
+        {
+            return Err(FormatError::InvalidRecordLength(bytes.len()));
+        }
+        if &bytes[0..8] != RECORD_MAGIC {
+            return Err(FormatError::InvalidRecordMagic);
+        }
+        let declared_length =
+            usize::try_from(get_u32(bytes, 32)).map_err(|_| FormatError::ArithmeticOverflow)?;
+        if declared_length != bytes.len() {
+            return Err(FormatError::InvalidRecordLength(declared_length));
+        }
+        let stored_checksum = get_u32(bytes, RECORD_CRC_OFFSET);
+        if crc32c_with_zeroed_field(bytes, RECORD_CRC_OFFSET) != stored_checksum {
+            return Err(FormatError::RecordChecksumMismatch);
+        }
+        Ok(Self(bytes))
+    }
+}
+
 fn decode_raw_record_view(bytes: &[u8]) -> Result<(ChunkId, &[u8]), FormatError> {
-    if bytes.len() < MIN_RAW_RECORD_BYTES
-        || bytes.len() > MAX_RECORD_BYTES
-        || !bytes.len().is_multiple_of(usize::from(RECORD_ALIGNMENT))
-    {
-        return Err(FormatError::InvalidRecordLength(bytes.len()));
-    }
-    if &bytes[0..8] != RECORD_MAGIC {
-        return Err(FormatError::InvalidRecordMagic);
-    }
-    let declared_length =
-        usize::try_from(get_u32(bytes, 32)).map_err(|_| FormatError::ArithmeticOverflow)?;
-    if declared_length != bytes.len() {
-        return Err(FormatError::InvalidRecordLength(declared_length));
-    }
-    let stored_checksum = get_u32(bytes, RECORD_CRC_OFFSET);
-    if crc32c_with_zeroed_u32(bytes, RECORD_CRC_OFFSET) != stored_checksum {
-        return Err(FormatError::RecordChecksumMismatch);
-    }
+    decode_raw_record_validated(ValidatedRecord::new(bytes)?)
+}
+
+fn decode_raw_record_validated(
+    record: ValidatedRecord<'_>,
+) -> Result<(ChunkId, &[u8]), FormatError> {
+    let bytes = record.0;
     validate_raw_record_constants(bytes)?;
 
     let decoded_length =

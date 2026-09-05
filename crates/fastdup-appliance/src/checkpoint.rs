@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -574,6 +573,9 @@ impl PhaseStarted {
 /// repository uses this Policy Set from its first Commit. Disabling dependent
 /// selection or lacking a usable Similarity snapshot selects the independent
 /// RAW/Zstd fallback without changing the Policy Set.
+/// The legacy `paired-exact-v1`/`contiguous-only` spelling remains byte-stable
+/// for existing repositories: online hint refresh and one-time materialization
+/// change candidate admission, not any permitted durable record or codec.
 ///
 /// # Panics
 ///
@@ -1033,7 +1035,12 @@ impl<'a> PublicationClaims<'a> {
         claim
     }
 
-    fn finish(mut self, entries: &[ExactIndexEntry]) {
+    fn finish(mut self, entries: &mut [ExactIndexEntry]) {
+        // Reduction planning groups ordinary, independent, and dependent
+        // records. The resulting writer Locations therefore follow encoding
+        // group order, while claims follow Chunk-ID order. Restore the claim
+        // order before pairing each verified Location with its key.
+        entries.sort_unstable_by_key(|entry| (entry.chunk_id(), entry.logical_length()));
         self.proofs.finish_publications(entries, &self.keys);
         self.finished = true;
     }
@@ -1264,6 +1271,7 @@ struct PreparedWriteThroughReduction<'a> {
     ordinary_chunks: Vec<&'a PendingWriteThroughChunk>,
     independent: Vec<PreparedIndependentRecord>,
     dependents: Vec<PreparedDependentRecord>,
+    similarity_entries: Vec<fastdup_format::SimilarityIndexEntry>,
 }
 
 #[derive(Debug)]
@@ -1326,7 +1334,6 @@ impl ChunkFragments {
         ChunkId::from_bytes(*hasher.finalize().as_bytes())
     }
 
-    #[cfg(test)]
     fn materialize_new_chunk(&self) -> Result<Cow<'_, [u8]>, DurableNamespaceError> {
         if self.parts.len() == 1 {
             return Ok(Cow::Borrowed(self.parts[0].as_bytes()));
@@ -3781,10 +3788,20 @@ where
                 PublicationClaim::Acquired => new_chunks.push(chunk),
             }
         }
-        let entries = if new_chunks.is_empty() {
-            Vec::new()
+        let advanced = self.index.advanced_reduction_available()
+            && self
+                .namespace
+                .get()
+                .and_then(Weak::upgrade)
+                .is_some_and(|namespace| namespace.advanced_reduction_enabled(inode));
+        let publication_guard = advanced
+            .then(|| self.containers.try_pin_reduction_publication())
+            .flatten();
+        let advanced = publication_guard.is_some();
+        let (mut entries, similarity_entries) = if new_chunks.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            self.publish_new_chunks(&new_chunks)?
+            self.publish_new_chunks(&new_chunks, advanced)?
         };
         locations.extend(entries.iter().copied());
         locations.sort_unstable_by_key(ExactIndexEntry::chunk_id);
@@ -3794,7 +3811,7 @@ where
                 .all(|pair| pair[0].chunk_id() < pair[1].chunk_id()),
             "ASSERT: one unique candidate Chunk has exactly one publication result"
         );
-        claims.finish(&entries);
+        claims.finish(&mut entries);
         let sealed = !entries.is_empty();
         assert!(
             chunks
@@ -3803,14 +3820,22 @@ where
             "ASSERT: detached work sequence covers every published Chunk"
         );
         let externalized = self.externalize_chunks(chunks, inode, &locations)?;
-        self.index.publish_level_zero(entries);
+        self.index
+            .publish_reduction_batch(entries, similarity_entries, publication_guard);
         Ok((externalized, sealed))
     }
 
     fn publish_new_chunks(
         &self,
         new_chunks: &[&PendingWriteThroughChunk],
-    ) -> Result<Vec<ExactIndexEntry>, DurableNamespaceError> {
+        advanced: bool,
+    ) -> Result<
+        (
+            Vec<ExactIndexEntry>,
+            Vec<fastdup_format::SimilarityIndexEntry>,
+        ),
+        DurableNamespaceError,
+    > {
         assert!(
             !new_chunks.is_empty(),
             "ASSERT: a new-Chunk Container must contain at least one Chunk"
@@ -3825,7 +3850,8 @@ where
             ordinary_chunks,
             independent,
             dependents,
-        } = self.plan_new_chunk_encodings(new_chunks)?;
+            similarity_entries,
+        } = self.plan_new_chunk_encodings(new_chunks, advanced)?;
         let prepared_regions = prepare_compression_regions(&ordinary_chunks)?;
         let materialized_chunks = prepared_regions
             .materialized
@@ -3893,17 +3919,19 @@ where
                     .expect("ASSERT: verified write-through Location forms an Exact Index entry")
             })
             .collect();
-        Ok(entries)
+        Ok((entries, similarity_entries))
     }
 
     fn plan_new_chunk_encodings<'a>(
         &self,
         new_chunks: &[&'a PendingWriteThroughChunk],
+        advanced: bool,
     ) -> Result<PreparedWriteThroughReduction<'a>, DurableNamespaceError> {
         let mut planned = PreparedWriteThroughReduction {
             ordinary_chunks: Vec::new(),
             independent: Vec::new(),
             dependents: Vec::new(),
+            similarity_entries: Vec::new(),
         };
         planned
             .ordinary_chunks
@@ -3918,17 +3946,27 @@ where
             .try_reserve_exact(new_chunks.len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         for chunk in new_chunks {
-            let Some(target) = chunk.bytes.contiguous_bytes() else {
-                // Segmented fingerprinting needs its own scalar-equivalent
-                // implementation. Until then, fragmented Chunks retain the
-                // existing single-materialization adaptive path.
+            if !advanced {
                 planned.ordinary_chunks.push(*chunk);
                 continue;
-            };
-            match self
-                .index
-                .plan_similarity_chunk(&self.containers, chunk.chunk_id, target)
-            {
+            }
+            let target = chunk.bytes.materialize_new_chunk()?;
+            let (plan, entry) =
+                self.index
+                    .plan_similarity_chunk(&self.containers, chunk.chunk_id, &target);
+            if let Some(entry) = entry {
+                planned.similarity_entries.push(entry);
+            }
+            match plan {
+                PersistentChunkPlan::NoCandidates if matches!(target, Cow::Owned(_)) => {
+                    let record =
+                        fastdup_format::SealedContainer::prepare_prehashed_independent_record(
+                            PrehashedChunk::new(chunk.chunk_id, &target),
+                            fastdup_format::IncompressibilityGatePolicy::Off,
+                        )
+                        .map_err(|_| DurableNamespaceError::FrozenViewMismatch)?;
+                    planned.independent.push(record);
+                }
                 PersistentChunkPlan::NoCandidates => planned.ordinary_chunks.push(*chunk),
                 PersistentChunkPlan::Independent(record) => {
                     assert_eq!(
@@ -4130,6 +4168,9 @@ where
 }
 
 trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
+    fn advanced_reduction_available(&self) -> bool {
+        false
+    }
     fn prepare(&self, file: VerifiedManifestFile<C>) -> VerifiedManifestFile<C>;
     fn graph_verifier(&self, containers: ContainerRepository<C>) -> Box<dyn RequiredChunkVerifier>;
     fn exact_index_run_count(&self) -> usize;
@@ -4144,8 +4185,19 @@ trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
         containers: &ContainerRepository<C>,
         target_id: ChunkId,
         target: &[u8],
-    ) -> PersistentChunkPlan;
+    ) -> (
+        PersistentChunkPlan,
+        Option<fastdup_format::SimilarityIndexEntry>,
+    );
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>);
+    fn publish_reduction_batch(
+        &self,
+        entries: Vec<ExactIndexEntry>,
+        _similarities: Vec<fastdup_format::SimilarityIndexEntry>,
+        _guard: Option<fastdup_store::ReductionPublicationGuard>,
+    ) {
+        self.publish_level_zero(entries);
+    }
     fn flush_level_zero(&self);
     fn exact_index_degraded(&self) -> bool;
     fn exact_index_page_cache_status(&self) -> ExactIndexPageCacheStatus;
@@ -4187,8 +4239,11 @@ impl<C: StorageIo + 'static> ManifestReaderPolicy<C> for ScanManifestReaders {
         _containers: &ContainerRepository<C>,
         _target_id: ChunkId,
         _target: &[u8],
-    ) -> PersistentChunkPlan {
-        PersistentChunkPlan::NoCandidates
+    ) -> (
+        PersistentChunkPlan,
+        Option<fastdup_format::SimilarityIndexEntry>,
+    ) {
+        (PersistentChunkPlan::NoCandidates, None)
     }
 
     fn publish_level_zero(&self, _entries: Vec<ExactIndexEntry>) {}
@@ -4232,10 +4287,16 @@ struct ExactPublisherCore<X> {
     profile: ExactIndexProfileId,
     degraded: AtomicBool,
     recent: RwLock<BTreeMap<(ChunkId, u32), ExactIndexEntry>>,
+    similarity: Option<SimilarityPublicationQueue<X>>,
+    failed_reduction_guard: Mutex<Option<fastdup_store::ReductionPublicationGuard>>,
 }
 
 enum ExactPublicationCommand {
-    Publish(Vec<ExactIndexEntry>),
+    Publish(
+        Vec<ExactIndexEntry>,
+        Vec<fastdup_format::SimilarityIndexEntry>,
+        Option<fastdup_store::ReductionPublicationGuard>,
+    ),
     Flush(mpsc::SyncSender<()>),
     Shutdown,
 }
@@ -4243,6 +4304,59 @@ enum ExactPublicationCommand {
 struct ExactPublicationQueue {
     sender: mpsc::SyncSender<ExactPublicationCommand>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+type SimilarityBatch = Vec<fastdup_format::SimilarityIndexEntry>;
+
+struct SimilarityPublicationQueue<X> {
+    sender: mpsc::SyncSender<Option<SimilarityBatch>>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    repository: Arc<fastdup_store::OnlineSimilarityRepository<X>>,
+}
+
+impl<X: Clone + Send + Sync + StorageIo + 'static> SimilarityPublicationQueue<X> {
+    fn start(repository: Arc<fastdup_store::OnlineSimilarityRepository<X>>) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<Option<SimilarityBatch>>(2);
+        let worker_repository = Arc::clone(&repository);
+        let worker = std::thread::Builder::new()
+            .name("fastdup-similarity-publisher".to_owned())
+            .spawn(move || {
+                while let Ok(Some(entries)) = receiver.recv() {
+                    if let Err(error) = worker_repository.append_current(&entries) {
+                        eprintln!("online Similarity publication degraded: {error}");
+                    }
+                }
+            })?;
+        Ok(Self {
+            sender,
+            worker: Mutex::new(Some(worker)),
+            repository,
+        })
+    }
+
+    fn publish(&self, mut entries: Vec<fastdup_format::SimilarityIndexEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let limit = fastdup_store::ONLINE_SIMILARITY_BATCH_ENTRIES;
+        if entries.len() > limit {
+            self.repository.skip(entries.len() - limit);
+            entries.truncate(limit);
+        }
+        let count = entries.len();
+        if self.sender.try_send(Some(entries)).is_err() {
+            self.repository.skip(count);
+        }
+    }
+}
+
+impl<X> Drop for SimilarityPublicationQueue<X> {
+    fn drop(&mut self) {
+        let _ = self.sender.send(None);
+        if let Some(worker) = self.worker.lock().expect("Similarity worker lock").take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl<X: Clone + StorageIo> fmt::Debug for IndexedManifestReaders<X> {
@@ -4276,9 +4390,20 @@ impl ExactPublicationQueue {
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
                     match command {
-                        ExactPublicationCommand::Publish(entries) => {
-                            if core.try_publish_level_zero(entries.clone()).is_err() {
+                        ExactPublicationCommand::Publish(entries, similarities, guard) => {
+                            if core
+                                .try_publish_level_zero(entries.clone(), similarities)
+                                .is_err()
+                            {
                                 core.degraded.store(true, Ordering::Release);
+                                // One retained admission is enough to prevent
+                                // GC unlink after an unindexed dependent write.
+                                if let Some(guard) = guard {
+                                    core.failed_reduction_guard
+                                        .lock()
+                                        .expect("failed reduction guard lock")
+                                        .get_or_insert(guard);
+                                }
                             }
                             core.forget_recent(&entries);
                         }
@@ -4295,9 +4420,18 @@ impl ExactPublicationQueue {
         })
     }
 
-    fn publish(&self, entries: Vec<ExactIndexEntry>) {
+    fn publish(
+        &self,
+        entries: Vec<ExactIndexEntry>,
+        similarities: Vec<fastdup_format::SimilarityIndexEntry>,
+        guard: Option<fastdup_store::ReductionPublicationGuard>,
+    ) {
         self.sender
-            .send(ExactPublicationCommand::Publish(entries))
+            .send(ExactPublicationCommand::Publish(
+                entries,
+                similarities,
+                guard,
+            ))
             .expect("ASSERT: permanent Exact publisher remains alive while mounted");
     }
 
@@ -4381,6 +4515,15 @@ where
     C: Clone + Send + Sync + StorageIo + 'static,
     X: Clone + Send + Sync + StorageIo + 'static,
 {
+    fn advanced_reduction_available(&self) -> bool {
+        self.reduction.is_some()
+            && self
+                .core
+                .failed_reduction_guard
+                .lock()
+                .expect("failed reduction guard lock")
+                .is_none()
+    }
     fn prepare(&self, file: VerifiedManifestFile<C>) -> VerifiedManifestFile<C> {
         let file = match self.core.repository.pin_active_generation() {
             Some(active) => file.with_active_index(&active),
@@ -4432,11 +4575,23 @@ where
         containers: &ContainerRepository<C>,
         target_id: ChunkId,
         target: &[u8],
-    ) -> PersistentChunkPlan {
+    ) -> (
+        PersistentChunkPlan,
+        Option<fastdup_format::SimilarityIndexEntry>,
+    ) {
         self.reduction
             .as_ref()
-            .and_then(|reduction| reduction.plan_chunk(containers, target_id, target).ok())
-            .unwrap_or(PersistentChunkPlan::NoCandidates)
+            .and_then(|reduction| {
+                reduction
+                    .plan_chunk_for_publication_cached(
+                        containers,
+                        target_id,
+                        target,
+                        Some(&self.read_cache),
+                    )
+                    .ok()
+            })
+            .unwrap_or((PersistentChunkPlan::NoCandidates, None))
     }
 
     fn publish_level_zero(&self, entries: Vec<ExactIndexEntry>) {
@@ -4444,7 +4599,20 @@ where
             return;
         }
         self.core.remember_recent(&entries);
-        self.publisher.publish(entries);
+        self.publisher.publish(entries, Vec::new(), None);
+    }
+
+    fn publish_reduction_batch(
+        &self,
+        entries: Vec<ExactIndexEntry>,
+        similarities: Vec<fastdup_format::SimilarityIndexEntry>,
+        guard: Option<fastdup_store::ReductionPublicationGuard>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        self.core.remember_recent(&entries);
+        self.publisher.publish(entries, similarities, guard);
     }
 
     fn flush_level_zero(&self) {
@@ -4495,8 +4663,12 @@ where
     fn try_publish_level_zero(
         &self,
         entries: Vec<ExactIndexEntry>,
+        similarities: Vec<fastdup_format::SimilarityIndexEntry>,
     ) -> Result<(), fastdup_store::ExactIndexStoreError> {
         self.repository.append_level_zero(self.profile, entries)?;
+        if let Some(queue) = &self.similarity {
+            queue.publish(similarities);
+        }
         self.degraded.store(false, Ordering::Release);
         Ok(())
     }
@@ -4622,17 +4794,23 @@ where
         });
         let initially_degraded = recovered.is_err();
         let active = recovered.ok().flatten();
-        let reduction = active.as_ref().and_then(|exact| {
-            let exact_id = exact.run_set().id().ok()?;
-            let similarity = similarities?
-                .recover_latest_for_exact(exact_id)
-                .ok()
-                .flatten()
-                .map(Arc::new)?;
-            PersistentReductionIndex::new(exact, similarity)
-                .ok()
-                .map(Arc::new)
-        });
+        let online =
+            similarities.and_then(
+                |repository| match fastdup_store::OnlineSimilarityRepository::open(
+                    repository.clone(),
+                    indexes,
+                ) {
+                    Ok(online) => Some(Arc::new(online)),
+                    Err(error) => {
+                        eprintln!("online Similarity recovery disabled: {error}");
+                        None
+                    }
+                },
+            );
+        let reduction = online
+            .as_ref()
+            .map(|online| Arc::new(PersistentReductionIndex::online(Arc::clone(online))));
+        let similarity = online.map(SimilarityPublicationQueue::start).transpose()?;
         let profile = active
             .as_ref()
             .map_or_else(checkpoint_exact_index_profile_v1, |index| {
@@ -4643,6 +4821,8 @@ where
             profile,
             degraded: AtomicBool::new(initially_degraded),
             recent: RwLock::new(BTreeMap::new()),
+            similarity,
+            failed_reduction_guard: Mutex::new(None),
         });
         let publisher = ExactPublicationQueue::start(Arc::clone(&core))?;
         let manifest_readers: Arc<dyn ManifestReaderPolicy<C>> = Arc::new(IndexedManifestReaders {
@@ -4968,6 +5148,8 @@ where
                 } else {
                     ContainerPlacement::Data
                 },
+                self.manifest_readers.advanced_reduction_available()
+                    && self.namespace.advanced_reduction_enabled(inode.inode()),
             )?;
             let previous = installed_manifests
                 .binary_search_by_key(&inode.inode().get(), |manifest| manifest.inode)
@@ -6457,6 +6639,8 @@ struct AdaptiveCommitWriter<'a, C> {
     index: &'a dyn ManifestReaderPolicy<C>,
     seen: BTreeMap<ChunkId, u64>,
     chunks: Vec<Vec<u8>>,
+    chunk_ids: Vec<ChunkId>,
+    advanced: bool,
     level_zero_entries: Vec<ExactIndexEntry>,
     payload_bytes: usize,
     workers: NonZeroUsize,
@@ -6481,6 +6665,8 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             index,
             seen: BTreeMap::new(),
             chunks: Vec::new(),
+            chunk_ids: Vec::new(),
+            advanced: false,
             level_zero_entries: Vec::new(),
             payload_bytes: 0,
             workers,
@@ -6496,10 +6682,12 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
         &mut self,
         inode: InodeId,
         placement: ContainerPlacement,
+        advanced: bool,
     ) -> Result<(), DurableNamespaceError> {
-        if self.placement != placement {
+        if self.placement != placement || self.advanced != advanced {
             self.flush()?;
             self.placement = placement;
+            self.advanced = advanced;
         }
         self.current_inode = Some(inode.get());
         Ok(())
@@ -6648,6 +6836,7 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             .try_reserve(1)
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         self.chunks.push(bytes);
+        self.chunk_ids.push(chunk_id);
         self.metrics.peak_buffered_chunk_bytes = self.metrics.peak_buffered_chunk_bytes.max(
             u64::try_from(self.payload_bytes)
                 .expect("ASSERT: a bounded checkpoint Container payload byte count fits u64"),
@@ -6682,9 +6871,35 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             return Ok(());
         }
         let id = random_container_id()?;
-        let mut regions = Vec::<Vec<&[u8]>>::new();
+        let publication_guard = (self.advanced && self.index.advanced_reduction_available())
+            .then(|| self.containers.try_pin_reduction_publication())
+            .flatten();
+        let advanced = publication_guard.is_some();
+        let mut regions = Vec::<Vec<PrehashedChunk<'_>>>::new();
+        let mut independent = Vec::new();
+        let mut dependents = Vec::new();
+        let mut similarities = Vec::new();
         let mut region_bytes = 0_usize;
-        for chunk in &self.chunks {
+        for (chunk, &chunk_id) in self.chunks.iter().zip(&self.chunk_ids) {
+            if advanced {
+                let (plan, hint) =
+                    self.index
+                        .plan_similarity_chunk(self.containers, chunk_id, chunk);
+                if let Some(entry) = hint {
+                    similarities.push(entry);
+                }
+                match plan {
+                    PersistentChunkPlan::NoCandidates => (),
+                    PersistentChunkPlan::Independent(record) => {
+                        independent.push(record);
+                        continue;
+                    }
+                    PersistentChunkPlan::Dependent(record) => {
+                        dependents.push(record);
+                        continue;
+                    }
+                }
+            }
             let next_region_bytes = region_bytes
                 .checked_add(chunk.len())
                 .ok_or(DurableNamespaceError::OutOfMemory)?;
@@ -6705,7 +6920,7 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             region
                 .try_reserve(1)
                 .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-            region.push(chunk.as_slice());
+            region.push(PrehashedChunk::new(chunk_id, chunk));
             region_bytes = region_bytes
                 .checked_add(chunk.len())
                 .ok_or(DurableNamespaceError::OutOfMemory)?;
@@ -6714,19 +6929,25 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
                 "ASSERT: no logical Chunk may exceed a Compression Region"
             );
         }
-        let region_refs = regions.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let region_refs = regions
+            .iter()
+            .map(|r| PrehashedAdaptiveRegion::Borrowed(r))
+            .collect::<Vec<_>>();
         let generation = self.container_generations.reserve_generation()?;
+        let prepared = ContainerRepository::<C>::prepare_mixed_prehashed_reduction_parallel(
+            id,
+            generation,
+            &region_refs,
+            independent,
+            dependents,
+            self.workers,
+        )?;
         let (verified, publish_metrics) = self
             .containers
-            .publish_adaptive_regions_parallel_profiled_with_placement(
-                id,
-                generation,
-                &region_refs,
-                self.workers,
-                self.placement,
-            )?;
+            .publish_prepared_adaptive_profiled_with_placement(prepared, self.placement)?;
         self.record_container_metrics(publish_metrics);
-        self.level_zero_entries
+        let mut published_entries = Vec::new();
+        published_entries
             .try_reserve(verified.locations().len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         for location in verified.locations().iter().copied() {
@@ -6735,9 +6956,12 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             );
             self.online_dependency_proofs
                 .remember_frozen(entry, OnlineProofAdmission::Published);
-            self.level_zero_entries.push(entry);
+            published_entries.push(entry);
         }
+        self.index
+            .publish_reduction_batch(published_entries, similarities, publication_guard);
         self.chunks.clear();
+        self.chunk_ids.clear();
         self.payload_bytes = 0;
         Ok(())
     }
@@ -6910,6 +7134,41 @@ mod tests {
     use fastdup_testkit::MemoryStorageIo;
 
     #[test]
+    fn failed_exact_publication_retains_one_gc_guard_until_owner_teardown() {
+        let containers = ContainerRepository::new(MemoryStorageIo::new());
+        let core = Arc::new(ExactPublisherCore {
+            repository: ExactIndexRunRepository::new(MemoryStorageIo::with_fail_before(0)),
+            profile: checkpoint_exact_index_profile_v1(),
+            degraded: AtomicBool::new(false),
+            recent: RwLock::new(BTreeMap::new()),
+            similarity: None,
+            failed_reduction_guard: Mutex::new(None),
+        });
+        let queue = ExactPublicationQueue::start(Arc::clone(&core)).unwrap();
+        let location =
+            ExactIndexLocation::raw(ContainerId::new([7; 16]).unwrap(), 1, 4096, 256, 0).unwrap();
+        let entry = ExactIndexEntry::active(ChunkId::of(b"target"), 6, location).unwrap();
+        queue.publish(
+            vec![entry],
+            Vec::new(),
+            containers.try_pin_reduction_publication(),
+        );
+        queue.flush();
+        assert!(core.degraded.load(Ordering::Acquire));
+        assert!(core.failed_reduction_guard.lock().unwrap().is_some());
+        // A later successful Exact write must not release the earlier failed
+        // target's protection. One retained guard remains a bounded safe stop.
+        queue.publish(
+            vec![entry],
+            Vec::new(),
+            containers.try_pin_reduction_publication(),
+        );
+        queue.flush();
+        assert!(!core.degraded.load(Ordering::Acquire));
+        assert!(core.failed_reduction_guard.lock().unwrap().is_some());
+    }
+
+    #[test]
     fn completing_one_publication_batch_is_atomic_with_generation_freeze() {
         const ENTRY_COUNT: usize = 16_384;
 
@@ -6977,6 +7236,48 @@ mod tests {
         assert!(
             !observed_partial_batch,
             "a Generation freeze observed only part of one published Container"
+        );
+    }
+
+    #[test]
+    fn publication_claims_match_grouped_encoder_locations_by_chunk_key() {
+        let proofs = OnlineDependencyProofs::new().expect("allocate proof sets");
+        let container_id = ContainerId::new([0xB8; 16]).expect("fixture ID is nonzero");
+        let low_id = ChunkId::from_bytes([0x11; 32]);
+        let high_id = ChunkId::from_bytes([0xEE; 32]);
+        let logical_length = 1_u32;
+        let low_location = ExactIndexLocation::raw(container_id, 1, 4_096, 256, 0)
+            .expect("construct low fixture Location");
+        let high_location = ExactIndexLocation::raw(container_id, 1, 8_192, 256, 1)
+            .expect("construct high fixture Location");
+        let low_entry = ExactIndexEntry::active(low_id, logical_length, low_location)
+            .expect("construct low fixture Exact entry");
+        let high_entry = ExactIndexEntry::active(high_id, logical_length, high_location)
+            .expect("construct high fixture Exact entry");
+
+        let mut claims = PublicationClaims::new(&proofs, 2).expect("allocate claims");
+        assert!(matches!(
+            claims.claim(low_id, logical_length),
+            PublicationClaim::Acquired
+        ));
+        assert!(matches!(
+            claims.claim(high_id, logical_length),
+            PublicationClaim::Acquired
+        ));
+
+        // Advanced reduction groups ordinary, independent, and dependent
+        // records before encoding, so writer Locations need not retain the
+        // Chunk-ID order in which publication claims were acquired.
+        let mut entries = [high_entry, low_entry];
+        claims.finish(&mut entries);
+
+        assert_eq!(
+            proofs.verified_entry(low_id, u64::from(logical_length)),
+            Some(low_entry)
+        );
+        assert_eq!(
+            proofs.verified_entry(high_id, u64::from(logical_length)),
+            Some(high_entry)
         );
     }
 

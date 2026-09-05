@@ -40,6 +40,153 @@ pub struct SimilarityIndexRepository<I> {
 }
 
 impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
+    pub(crate) fn storage(&self) -> &I {
+        &self.storage
+    }
+
+    pub(crate) fn family_hash(
+        &self,
+        generation: u64,
+    ) -> Result<[u8; 32], SimilarityIndexStoreError> {
+        Ok(*blake3::hash(&self.read_family(&family_name(generation))?.encode()?).as_bytes())
+    }
+
+    /// Publishes complete replacement buckets using the existing audited,
+    /// leased partition format. Only one bounded partition is materialized.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bounded partition construction and ordered immutable publication"
+    )]
+    pub(crate) fn publish_buckets(
+        &self,
+        generation: u64,
+        buckets: impl IntoIterator<
+            Item = Result<
+                (SimilarityBucketKey, Vec<SimilarityIndexEntry>),
+                SimilarityIndexStoreError,
+            >,
+        >,
+    ) -> Result<RecoveredSimilarityIndex<I>, SimilarityIndexStoreError> {
+        use crate::similarity_external_sort::stream_partition_vectors;
+        use fastdup_format::{SimilarityBucketReference, SimilarityIndexRunLayout};
+        use std::collections::BTreeMap;
+        let mut build = PartitionedSimilarityBuild {
+            logical_entry_count: 0,
+            partitions: Vec::new(),
+        };
+        let mut pending = Vec::new();
+        let mut reference_count = 0;
+        let mut previous = None;
+        let flush = |pending: &mut Vec<(SimilarityBucketKey, Vec<SimilarityIndexEntry>)>,
+                     build: &mut PartitionedSimilarityBuild|
+         -> Result<(), SimilarityIndexStoreError> {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let mut unique = BTreeMap::new();
+            for (_, entries) in pending.iter() {
+                for &entry in entries {
+                    if unique
+                        .insert(entry.chunk_id(), entry)
+                        .is_some_and(|old| old != entry)
+                    {
+                        return Err(SimilarityIndexStoreError::IndexCorruption);
+                    }
+                }
+            }
+            let entries: Vec<_> = unique.into_values().collect();
+            let mut references = Vec::new();
+            for (key, values) in pending.iter() {
+                for entry in values {
+                    let ordinal = entries
+                        .binary_search_by_key(&entry.chunk_id(), |e| e.chunk_id())
+                        .map_err(|_| SimilarityIndexStoreError::IndexCorruption)?;
+                    references.push(SimilarityBucketReference::new(
+                        *key,
+                        u32::try_from(ordinal)
+                            .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
+                    ));
+                }
+            }
+            let ordinal = u16::try_from(build.partitions.len())
+                .map_err(|_| SimilarityIndexStoreError::TooManyPartitions)?;
+            let published_name = partition_name(generation, ordinal);
+            let temporary_name = format!(".online-{generation:016x}-{ordinal:04x}.building");
+            let layout = SimilarityIndexRunLayout::new(
+                SIMILARITY_FINGERPRINT_PROFILE_V1,
+                SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+                generation,
+                entries.len(),
+                pending.len(),
+                references.len(),
+                [entries[0].chunk_id(), entries[entries.len() - 1].chunk_id()],
+            )?;
+            let descriptor = stream_partition_vectors(
+                &self.storage,
+                &temporary_name,
+                layout,
+                &entries,
+                &references,
+            )?;
+            build.logical_entry_count = build
+                .logical_entry_count
+                .checked_add(
+                    u64::try_from(entries.len())
+                        .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
+                )
+                .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
+            build.partitions.push(BuiltSimilarityPartition {
+                temporary_name,
+                published_name,
+                descriptor,
+                minimum_bucket_key: pending[0].0,
+                maximum_bucket_key: pending[pending.len() - 1].0,
+            });
+            pending.clear();
+            Ok(())
+        };
+        for item in buckets {
+            let (key, entries) = item?;
+            if previous.is_some_and(|old| old >= key) || entries.is_empty() || entries.len() > 64 {
+                return Err(SimilarityIndexStoreError::IndexCorruption);
+            }
+            for (ordinal, &entry) in entries.iter().enumerate() {
+                validate_query_entry(entry, key, usize::from(key.slot()))?;
+                if ordinal > 0 && entries[ordinal - 1].chunk_id() >= entry.chunk_id() {
+                    return Err(SimilarityIndexStoreError::IndexCorruption);
+                }
+            }
+            previous = Some(key);
+            // At most ~6 MiB of entry metadata plus sort/reference workspace.
+            if reference_count + entries.len() > 32_768 {
+                flush(&mut pending, &mut build)?;
+                reference_count = 0;
+            }
+            reference_count += entries.len();
+            pending.push((key, entries));
+        }
+        flush(&mut pending, &mut build)?;
+        let staged = self.stage_built_family(generation, &build, None)?;
+        self.activate_staged_family(staged)?;
+        self.recover_generation(generation)
+    }
+
+    pub(crate) fn remove_family(&self, generation: u64) -> Result<(), SimilarityIndexStoreError> {
+        let name = family_name(generation);
+        if !self.storage.exists(&name)? {
+            return Ok(());
+        }
+        let family = self.read_family(&name)?;
+        for part in family.partitions() {
+            let name = partition_name(generation, part.partition_ordinal());
+            if self.storage.exists(&name)? {
+                self.storage.remove_file(&name)?;
+            }
+        }
+        self.storage.remove_file(&name)?;
+        self.storage.sync_root()?;
+        Ok(())
+    }
     #[must_use]
     pub fn new(storage: I) -> Self {
         let snapshot = MemoryPressureSnapshot::read_system()
@@ -419,6 +566,17 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         let Some(publication) = self.latest_published()? else {
             return Ok(None);
         };
+        self.recover_generation(publication.generation).map(Some)
+    }
+
+    pub(crate) fn recover_generation(
+        &self,
+        generation: u64,
+    ) -> Result<RecoveredSimilarityIndex<I>, SimilarityIndexStoreError> {
+        let publication = LatestSimilarityPublication {
+            generation,
+            name: family_name(generation),
+        };
         let (generation, entries_streamed, buckets, source_exact_run_set_id, partitions) = {
             let LatestSimilarityPublication { generation, name } = publication;
             let family = self.read_family(&name)?;
@@ -478,12 +636,12 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             read_mode,
             source_exact_run_set_id,
         };
-        Ok(Some(RecoveredSimilarityIndex {
+        Ok(RecoveredSimilarityIndex {
             storage: self.storage.clone(),
             partitions: partitions.into_boxed_slice(),
             page_cache: Arc::clone(&self.page_cache),
             status,
-        }))
+        })
     }
 
     /// Recovers only a family produced from the supplied active Exact Run Set.
@@ -500,14 +658,31 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         &self,
         exact_run_set_id: ExactIndexRunSetId,
     ) -> Result<Option<RecoveredSimilarityIndex<I>>, SimilarityIndexStoreError> {
-        let recovered = self.recover_latest()?;
-        if recovered
-            .as_ref()
-            .is_some_and(|index| index.status().source_exact_run_set_id() != Some(exact_run_set_id))
+        let Some(publication) = self.latest_published()? else {
+            return Ok(None);
+        };
+        if self
+            .read_family(&publication.name)?
+            .source_exact_run_set_id()
+            != Some(exact_run_set_id)
         {
             return Ok(None);
         }
-        Ok(recovered)
+        self.recover_generation(publication.generation).map(Some)
+    }
+
+    pub(crate) fn latest_bound_generation(
+        &self,
+        exact: fastdup_format::ExactIndexRunSetId,
+    ) -> Result<Option<u64>, SimilarityIndexStoreError> {
+        let Some(publication) = self.latest_published()? else {
+            return Ok(None);
+        };
+        Ok((self
+            .read_family(&publication.name)?
+            .source_exact_run_set_id()
+            == Some(exact))
+        .then_some(publication.generation))
     }
 
     /// Streams and verifies the newest complete Similarity snapshot without
@@ -528,6 +703,17 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             return Ok(None);
         };
         self.audit_publication(publication)
+    }
+
+    pub(crate) fn audit_generation(
+        &self,
+        generation: u64,
+    ) -> Result<(), SimilarityIndexStoreError> {
+        self.audit_publication(LatestSimilarityPublication {
+            generation,
+            name: family_name(generation),
+        })?;
+        Ok(())
     }
 
     fn audit_publication(
@@ -898,6 +1084,34 @@ struct RecoveredSimilarityPartition {
 }
 
 impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
+    pub(crate) fn bucket_entries(
+        &self,
+        key: SimilarityBucketKey,
+    ) -> Result<Vec<SimilarityIndexEntry>, SimilarityIndexStoreError> {
+        let Some(partition) = self.partition_for_key(key) else {
+            return Ok(Vec::new());
+        };
+        let ordinals = self.read_bucket(partition, key)?;
+        let mut entries = Vec::with_capacity(usize::from(ordinals.len));
+        for n in 0..usize::from(ordinals.len) {
+            let entry = self.read_entry(partition, ordinals.values[n])?;
+            validate_query_entry(entry, key, usize::from(key.slot()))?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn buckets(&self) -> SimilarityBuckets<'_, I> {
+        SimilarityBuckets {
+            index: self,
+            partition: 0,
+            page: 0,
+            reference: 0,
+            cached: None,
+            previous: None,
+            failed: false,
+        }
+    }
     #[must_use]
     pub const fn status(&self) -> SimilarityIndexRebuildStatus {
         self.status
@@ -943,6 +1157,15 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         let fingerprint = SimilarityFingerprint::v1(target).map_err(map_similarity_error)?;
         let logical_length =
             u32::try_from(target.len()).map_err(|_| SimilarityIndexStoreError::InvalidTarget)?;
+        self.candidates_fingerprinted(target_id, &fingerprint, logical_length)
+    }
+
+    pub(crate) fn candidates_fingerprinted(
+        &self,
+        target_id: ChunkId,
+        fingerprint: &SimilarityFingerprint,
+        logical_length: u32,
+    ) -> Result<Vec<SimilarityBaseCandidate>, SimilarityIndexStoreError> {
         let target_superfeatures = fingerprint.superfeatures();
         let mut cursors: [Option<QueryBucketCursor>; 4] = [None, None, None, None];
         for (slot, superfeature) in target_superfeatures.into_iter().enumerate() {
@@ -1038,7 +1261,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         Ok(candidates)
     }
 
-    fn partition_for_key(&self, key: SimilarityBucketKey) -> Option<usize> {
+    pub(crate) fn partition_for_key(&self, key: SimilarityBucketKey) -> Option<usize> {
         let ordinal = self
             .partitions
             .partition_point(|partition| partition.maximum_bucket_key < key);
@@ -1525,7 +1748,7 @@ impl BucketOrdinals {
     }
 
     fn get(self, index: usize) -> Option<u32> {
-        (index < usize::from(self.len)).then_some(self.values[index])
+        (index < usize::from(self.len)).then(|| self.values[index])
     }
 }
 
@@ -1573,6 +1796,91 @@ pub struct SimilarityBaseCandidate {
     chunk_id: ChunkId,
     logical_length: u32,
     sketch_distance: u16,
+}
+
+impl SimilarityBaseCandidate {
+    pub(crate) fn from_entry(
+        entry: SimilarityIndexEntry,
+        fingerprint: &SimilarityFingerprint,
+    ) -> Result<Self, SimilarityIndexStoreError> {
+        Ok(Self {
+            chunk_id: entry.chunk_id(),
+            logical_length: entry.logical_length(),
+            sketch_distance: fingerprint
+                .distance_from_sketch(entry.fingerprint_profile(), entry.sketch())
+                .map_err(map_similarity_error)?,
+        })
+    }
+}
+
+/// Streams one complete bucket at a time; memory does not grow with the pool.
+pub(crate) struct SimilarityBuckets<'a, I> {
+    index: &'a RecoveredSimilarityIndex<I>,
+    partition: usize,
+    page: usize,
+    reference: usize,
+    cached: Option<SimilarityBucketPage>,
+    previous: Option<SimilarityBucketKey>,
+    failed: bool,
+}
+
+impl<I: Clone + StorageIo> Iterator for SimilarityBuckets<'_, I> {
+    type Item = Result<(SimilarityBucketKey, Vec<SimilarityIndexEntry>), SimilarityIndexStoreError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            let part = self.index.partitions.get(self.partition)?;
+            if self.page >= part.descriptor.bucket_page_count() {
+                self.partition += 1;
+                self.page = 0;
+                self.reference = 0;
+                self.cached = None;
+                continue;
+            }
+            if self.cached.is_none() {
+                let result = part
+                    .descriptor
+                    .bucket_page_offset(self.page)
+                    .ok_or(SimilarityIndexStoreError::IndexCorruption)
+                    .and_then(|offset| {
+                        self.index
+                            .storage
+                            .read_exact_at(&part.name, offset, SIMILARITY_INDEX_PAGE_BYTES)
+                            .map_err(Into::into)
+                    })
+                    .and_then(|bytes| {
+                        part.descriptor
+                            .decode_bucket_page(self.page, &bytes)
+                            .map_err(Into::into)
+                    });
+                match result {
+                    Ok(page) => self.cached = Some(page),
+                    Err(e) => {
+                        self.failed = true;
+                        return Some(Err(e));
+                    }
+                }
+            }
+            let page = self.cached.as_ref()?;
+            let Some(reference) = page.references().get(self.reference) else {
+                self.page += 1;
+                self.reference = 0;
+                self.cached = None;
+                continue;
+            };
+            self.reference += 1;
+            let key = reference.key();
+            if self.previous == Some(key) {
+                continue;
+            }
+            self.previous = Some(key);
+            let result = self.index.bucket_entries(key).map(|entries| (key, entries));
+            self.failed = result.is_err();
+            return Some(result);
+        }
+    }
 }
 
 impl SimilarityBaseCandidate {
@@ -1970,5 +2278,21 @@ impl From<SimilarityIndexFamilyError> for SimilarityIndexStoreError {
             SimilarityIndexFamilyError::ArithmeticOverflow => Self::CounterOverflow,
             _ => Self::IndexCorruption,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BucketOrdinals;
+
+    #[test]
+    fn bucket_ordinals_returns_none_at_capacity() {
+        let mut ordinals = BucketOrdinals::default();
+        for ordinal in 0..64_u32 {
+            ordinals.push(ordinal).expect("fill representative bucket");
+        }
+
+        assert_eq!(ordinals.get(63), Some(63));
+        assert_eq!(ordinals.get(64), None);
     }
 }

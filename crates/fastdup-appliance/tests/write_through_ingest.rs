@@ -208,6 +208,424 @@ fn assert_accepted_advanced_reduction(reduction: PersistentReductionStatus) {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end live mount and Share-policy lifecycle"
+)]
+fn online_similarity_learns_new_bases_and_obeys_live_share_overrides() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let indexes = ExactIndexRunRepository::new(MemoryStorageIo::new());
+    let similarities = SimilarityIndexRepository::new(MemoryStorageIo::new());
+    let appliance = DurableNamespace::open_with_reduction_indexes(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, checkpoint_policy_set()),
+        ContainerRepository::new(data),
+        &indexes,
+        &similarities,
+        32,
+    )
+    .unwrap();
+    let namespace = appliance.namespace();
+    let make_dir = |name: &[u8]| {
+        let Reply::Entry(entry) = namespace
+            .dispatch(
+                CALLER,
+                Operation::Mkdir {
+                    parent: ROOT_INODE,
+                    name,
+                    mode: 0o770,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("directory")
+        };
+        entry.attr.inode
+    };
+    let on = make_dir(b"similarity-on");
+    let off = make_dir(b"similarity-off");
+    namespace
+        .replace_share_reduction(false, vec![(on, true), (off, false)])
+        .unwrap();
+    let write = |parent, name: &[u8], bytes: &[u8]| {
+        let Reply::Created { entry, handle } = namespace
+            .dispatch(
+                CALLER,
+                Operation::Create {
+                    parent,
+                    name,
+                    mode: 0o600,
+                    options: OpenOptions::READ_WRITE,
+                    exclusive: true,
+                    truncate: false,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("file")
+        };
+        namespace
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode: entry.attr.inode,
+                    handle,
+                    offset: 0,
+                    data: bytes,
+                },
+            )
+            .unwrap();
+        appliance.checkpoint().unwrap();
+        (entry.attr.inode, handle)
+    };
+    let base = pseudo_random_bytes(1_024 * 1_024);
+    write(on, b"base", &base);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while appliance
+        .write_through_status()
+        .advanced_reduction()
+        .online()
+        .published_batches
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "new base must become visible without rebuild or remount"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (target, _, changed_offset) = mutate_preserving_seqcdc(base);
+    let before = appliance.write_through_status().advanced_reduction();
+    let (inode, handle) = write(on, b"target", &target);
+    let after = appliance.write_through_status().advanced_reduction();
+    assert!(after.queries() > before.queries());
+    assert!(after.saved_payload_bytes() > before.saved_payload_bytes());
+    assert!(after.accepted_sparse_xor() + after.accepted_prefixes() > 0);
+    let mut off_target = target.clone();
+    off_target[changed_offset] ^= 0x17;
+    write(off, b"target", &off_target);
+    let disabled = appliance.write_through_status().advanced_reduction();
+    assert_eq!(
+        after.queries(),
+        disabled.queries(),
+        "off Share must bypass fingerprint and candidate planning"
+    );
+    // Turning off an already open Share changes future encodings, while old
+    // dependent data remains readable through the unchanged decoding path.
+    namespace
+        .replace_share_reduction(false, vec![(on, false), (off, false)])
+        .unwrap();
+    let Reply::Data(read) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Read {
+                inode,
+                handle,
+                offset: 0,
+                length: u32::try_from(target.len()).unwrap(),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("read")
+    };
+    assert_eq!(read, target);
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: changed_offset as u64,
+                data: &[0x93],
+            },
+        )
+        .unwrap();
+    appliance.checkpoint().unwrap();
+    assert_eq!(
+        disabled.queries(),
+        appliance
+            .write_through_status()
+            .advanced_reduction()
+            .queries()
+    );
+}
+
+#[test]
+#[ignore = "explicit release-mode online Similarity A/B benchmark"]
+fn online_similarity_performance_ab() {
+    let base = pseudo_random_bytes(4 * 1_024 * 1_024);
+    let ranges = seqcdc_ranges(&base);
+    for enabled in [false, true] {
+        let metadata = MemoryStorageIo::new();
+        let data = MemoryStorageIo::new();
+        let index_storage = MemoryStorageIo::new();
+        let similarity_storage = MemoryStorageIo::new();
+        let indexes = ExactIndexRunRepository::new(index_storage);
+        let similarities = SimilarityIndexRepository::new(similarity_storage.clone());
+        let appliance = DurableNamespace::open_with_reduction_indexes(
+            NamespaceConfig::default(),
+            GenerationRepository::new(metadata, checkpoint_policy_set()),
+            ContainerRepository::new(data.clone()),
+            &indexes,
+            &similarities,
+            32,
+        )
+        .unwrap();
+        appliance
+            .namespace()
+            .set_advanced_reduction_default(enabled);
+        let started = std::time::Instant::now();
+        for version in 0..9_u8 {
+            let mut bytes = base.clone();
+            if version != 0 {
+                for range in &ranges {
+                    bytes[range.start + range.len() / 2] ^= version;
+                }
+            }
+            let (inode, handle) = create_file(&appliance, format!("version-{version}").as_bytes());
+            appliance
+                .namespace()
+                .dispatch(
+                    CALLER,
+                    Operation::Write {
+                        inode,
+                        handle,
+                        offset: 0,
+                        data: &bytes,
+                    },
+                )
+                .unwrap();
+            appliance.checkpoint().unwrap();
+            if enabled && version == 0 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while appliance
+                    .write_through_status()
+                    .advanced_reduction()
+                    .online()
+                    .published_batches
+                    == 0
+                {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        let reduction = appliance.write_through_status().advanced_reduction();
+        drop(appliance);
+        let payload_bytes: u64 = data
+            .list_names()
+            .unwrap()
+            .iter()
+            .filter(|n| {
+                std::path::Path::new(n)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("fdc"))
+            })
+            .map(|n| data.object_len(n).unwrap())
+            .sum();
+        let index_bytes: u64 = similarity_storage
+            .list_names()
+            .unwrap()
+            .iter()
+            .map(|n| similarity_storage.object_len(n).unwrap())
+            .sum();
+        println!(
+            "online_similarity_ab enabled={enabled} logical_bytes={} data_bytes={payload_bytes} similarity_index_bytes={index_bytes} elapsed_ms={} queries={} saved_payload_bytes={} batches={} compactions={} skipped={} errors={}",
+            base.len() * 9,
+            elapsed.as_millis(),
+            reduction.queries(),
+            reduction.saved_payload_bytes(),
+            reduction.online().published_batches,
+            reduction.online().compactions,
+            reduction.online().skipped_entries,
+            reduction.online().errors
+        );
+        if enabled {
+            assert!(reduction.saved_payload_bytes() > 20 * 1_024 * 1_024);
+        } else {
+            assert_eq!(reduction.queries(), 0);
+        }
+    }
+}
+
+#[test]
+fn blocked_similarity_publication_does_not_block_exact_or_checkpoint() {
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        "reduction-head.",
+    );
+    let exact_storage = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        "never-paused",
+    );
+    let appliance = Arc::new(
+        DurableNamespace::open_with_reduction_indexes(
+            NamespaceConfig::default(),
+            GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set()),
+            ContainerRepository::new(MemoryStorageIo::new()),
+            &ExactIndexRunRepository::new(exact_storage),
+            &SimilarityIndexRepository::new(paused.clone()),
+            32,
+        )
+        .unwrap(),
+    );
+    paused.arm();
+    let (sender, receiver) = mpsc::channel();
+    let writer_appliance = Arc::clone(&appliance);
+    let writer = std::thread::spawn(move || {
+        for version in 0..8_u8 {
+            let (inode, handle) =
+                create_file(&writer_appliance, format!("queued-{version}").as_bytes());
+            let mut bytes = pseudo_random_bytes(256 * 1024);
+            for byte in &mut bytes {
+                *byte ^= version;
+            }
+            writer_appliance
+                .namespace()
+                .dispatch(
+                    CALLER,
+                    Operation::Write {
+                        inode,
+                        handle,
+                        offset: 0,
+                        data: &bytes,
+                    },
+                )
+                .unwrap();
+            writer_appliance.checkpoint().unwrap();
+        }
+        sender.send(()).unwrap();
+    });
+    let reached = paused.wait_until_reached(STORAGE_REACH_TIMEOUT);
+    let completed = receiver.recv_timeout(Duration::from_secs(10)).is_ok();
+    let status = appliance
+        .write_through_status()
+        .advanced_reduction()
+        .online();
+    // Always release the fixture before assertions or joining owner teardown.
+    paused.resume();
+    writer.join().unwrap();
+    assert!(
+        reached,
+        "Similarity must reach its blocked head publication"
+    );
+    assert!(
+        completed,
+        "DATA/Exact/checkpoint must not wait for Similarity"
+    );
+    assert!(
+        status.skipped_entries > 0,
+        "a full bounded queue sheds only hints"
+    );
+    assert_eq!(status.published_batches, 0);
+    assert_eq!(status.errors, 0);
+}
+
+#[test]
+fn online_similarity_reopens_without_rebuild_and_preserves_dependent_data() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let exact_storage = MemoryStorageIo::new();
+    let similarity_storage = MemoryStorageIo::new();
+    let open = || {
+        DurableNamespace::open_with_reduction_indexes(
+            NamespaceConfig::default(),
+            GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
+            ContainerRepository::new(data.clone()),
+            &ExactIndexRunRepository::new(exact_storage.clone()),
+            &SimilarityIndexRepository::new(similarity_storage.clone()),
+            32,
+        )
+        .unwrap()
+    };
+    let write = |appliance: &Appliance, name: &[u8], bytes: &[u8]| {
+        let (inode, handle) = create_file(appliance, name);
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset: 0,
+                    data: bytes,
+                },
+            )
+            .unwrap();
+        appliance.checkpoint().unwrap();
+    };
+    let appliance = open();
+    let base = pseudo_random_bytes(1024 * 1024);
+    write(&appliance, b"base", &base);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while appliance
+        .write_through_status()
+        .advanced_reduction()
+        .online()
+        .published_batches
+        == 0
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (mut target, _, changed_offset) = mutate_preserving_seqcdc(base);
+    write(&appliance, b"dependent", &target);
+    assert!(
+        appliance
+            .write_through_status()
+            .advanced_reduction()
+            .saved_payload_bytes()
+            > 0
+    );
+    drop(appliance);
+    for storage in [&metadata, &data, &exact_storage, &similarity_storage] {
+        storage.crash();
+    }
+    let recovered = open();
+    assert_eq!(read_named_all(recovered.namespace(), b"dependent"), target);
+    target[changed_offset] ^= 0x37;
+    write(&recovered, b"after-restart", &target);
+    assert!(
+        recovered
+            .write_through_status()
+            .advanced_reduction()
+            .saved_payload_bytes()
+            > 0,
+        "persisted online bases remain useful without an offline rebuild"
+    );
+    assert_eq!(
+        read_named_all(recovered.namespace(), b"after-restart"),
+        target
+    );
+    drop(recovered);
+    rebuild_pool_indexes(
+        &metadata,
+        &data,
+        &ExactIndexRunRepository::new(exact_storage.clone()),
+        &SimilarityIndexRepository::new(similarity_storage.clone()),
+    );
+    let rebuilt = open();
+    assert_eq!(
+        rebuilt
+            .write_through_status()
+            .advanced_reduction()
+            .online()
+            .active_families,
+        1,
+        "a newer explicit offline rebuild replaces the older online run set"
+    );
+    assert_eq!(
+        read_named_all(rebuilt.namespace(), b"after-restart"),
+        target
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn pool_wide_similarity_emits_depth_one_sparse_xor_in_write_through() {
     let metadata = MemoryStorageIo::new();

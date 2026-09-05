@@ -1057,6 +1057,7 @@ impl SparseXorDelta {
 
     /// Builds a trial from target and Base identities already established by
     /// the write-through hash and verified Exact read paths.
+    #[cfg(test)]
     pub(crate) fn encode_prehashed_trial(
         base: IndependentBaseRef,
         base_bytes: &[u8],
@@ -1079,6 +1080,42 @@ impl SparseXorDelta {
         target_bytes: &[u8],
         vector: bool,
     ) -> Result<DeltaTrial, SimilarityError> {
+        Self::encode_bounded_with_vector(
+            base,
+            base_bytes,
+            target_id,
+            target_bytes,
+            vector,
+            usize::MAX,
+        )?
+        .ok_or(SimilarityError::ArithmeticOverflow)
+    }
+
+    pub(crate) fn encode_bounded_prehashed_trial(
+        base: IndependentBaseRef,
+        base_bytes: &[u8],
+        target_id: ChunkId,
+        target_bytes: &[u8],
+        maximum_bytes: usize,
+    ) -> Result<Option<DeltaTrial>, SimilarityError> {
+        Self::encode_bounded_with_vector(
+            base,
+            base_bytes,
+            target_id,
+            target_bytes,
+            crate::similarity_simd::available(),
+            maximum_bytes,
+        )
+    }
+
+    fn encode_bounded_with_vector(
+        base: IndependentBaseRef,
+        base_bytes: &[u8],
+        target_id: ChunkId,
+        target_bytes: &[u8],
+        vector: bool,
+        maximum_bytes: usize,
+    ) -> Result<Option<DeltaTrial>, SimilarityError> {
         validate_chunk_length(target_bytes.len())?;
         if usize::try_from(base.logical_length) != Ok(base_bytes.len())
             || base_bytes.len() != target_bytes.len()
@@ -1088,7 +1125,11 @@ impl SparseXorDelta {
 
         let logical_length =
             u32::try_from(target_bytes.len()).map_err(|_| SimilarityError::ArithmeticOverflow)?;
-        let (run_ranges, xor_bytes) = sparse_xor_parts(base_bytes, target_bytes, vector);
+        let Some((run_ranges, xor_bytes)) =
+            sparse_xor_parts_bounded(base_bytes, target_bytes, vector, maximum_bytes)
+        else {
+            return Ok(None);
+        };
         let mut payload_start = 0_usize;
         let runs = run_ranges
             .into_iter()
@@ -1130,7 +1171,7 @@ impl SparseXorDelta {
             runs: runs.into_boxed_slice(),
             xor_bytes: xor_bytes.into_boxed_slice(),
         };
-        Ok(DeltaTrial {
+        Ok(Some(DeltaTrial {
             encoding,
             cost: DeltaTrialCost {
                 target_bytes: logical_length,
@@ -1138,7 +1179,7 @@ impl SparseXorDelta {
                 xor_bytes: xor_length,
                 encoded_payload_bytes,
             },
-        })
+        }))
     }
 
     #[must_use]
@@ -1236,15 +1277,37 @@ impl SparseXorDelta {
     }
 }
 
+type SparseXorParts = (Vec<(usize, usize)>, Vec<u8>);
+
+#[cfg(test)]
 fn sparse_xor_parts(base: &[u8], target: &[u8], vector: bool) -> (Vec<(usize, usize)>, Vec<u8>) {
+    sparse_xor_parts_bounded(base, target, vector, usize::MAX).expect("unbounded sparse scan")
+}
+
+fn sparse_xor_parts_bounded(
+    base: &[u8],
+    target: &[u8],
+    vector: bool,
+    maximum_bytes: usize,
+) -> Option<SparseXorParts> {
     let mut runs = Vec::new();
     let mut xor_bytes = Vec::new();
     if vector {
-        crate::similarity_simd::scan_sparse_xor(base, target, &mut runs, &mut xor_bytes);
-        return (runs, xor_bytes);
+        return crate::similarity_simd::scan_sparse_xor_bounded(
+            base,
+            target,
+            &mut runs,
+            &mut xor_bytes,
+            maximum_bytes,
+        )
+        .then_some((runs, xor_bytes));
     }
 
     let mut cursor = 0_usize;
+    let mut encoded_bytes = 36_usize;
+    if encoded_bytes > maximum_bytes {
+        return None;
+    }
     while cursor < target.len() {
         if base[cursor] == target[cursor] {
             cursor += 1;
@@ -1252,13 +1315,18 @@ fn sparse_xor_parts(base: &[u8], target: &[u8], vector: bool) -> (Vec<(usize, us
         }
 
         let run_start = cursor;
+        encoded_bytes += 8;
         while cursor < target.len() && base[cursor] != target[cursor] {
+            encoded_bytes += 1;
+            if encoded_bytes > maximum_bytes {
+                return None;
+            }
             xor_bytes.push(base[cursor] ^ target[cursor]);
             cursor += 1;
         }
         runs.push((run_start, cursor - run_start));
     }
-    (runs, xor_bytes)
+    Some((runs, xor_bytes))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1354,6 +1422,104 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn bounded_sparse_trials_preserve_canonical_runs_at_every_lane_boundary() {
+        for length in [1, 31, 32, 33, 63, 64, 65, 4096, 262_144] {
+            let base_bytes = vec![17; length];
+            let base = IndependentBaseRef::from_verified_bytes(&base_bytes).unwrap();
+            for pattern in 0..4 {
+                let mut target = base_bytes.clone();
+                for (offset, byte) in target.iter_mut().enumerate() {
+                    if match pattern {
+                        0 => false,
+                        1 => offset % 2 == 0,
+                        2 => (30..66).contains(&offset),
+                        _ => offset % 4096 == 31,
+                    } {
+                        *byte ^= 0x63;
+                    }
+                }
+                let id = ChunkId::of(&target);
+                let full =
+                    SparseXorDelta::encode_prehashed_trial(base, &base_bytes, id, &target).unwrap();
+                let cost = usize::try_from(full.cost().encoded_payload_bytes()).unwrap();
+                for cap in [0, 32, 35, 36, cost.saturating_sub(1), cost, cost + 1] {
+                    let scalar = SparseXorDelta::encode_bounded_with_vector(
+                        base,
+                        &base_bytes,
+                        id,
+                        &target,
+                        false,
+                        cap,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        scalar.as_ref().map(DeltaTrial::encoding),
+                        (cap >= cost).then_some(full.encoding())
+                    );
+                    if crate::similarity_simd::available() {
+                        let vector = SparseXorDelta::encode_bounded_with_vector(
+                            base,
+                            &base_bytes,
+                            id,
+                            &target,
+                            true,
+                            cap,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            scalar, vector,
+                            "length {length}, pattern {pattern}, cap {cap}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode A/B for exact Sparse-XOR cost rejection"]
+    fn bounded_sparse_rejection_ab() {
+        let base_bytes = vec![17; 256 * 1024];
+        let base = IndependentBaseRef::from_verified_bytes(&base_bytes).unwrap();
+        let mut target = base_bytes.clone();
+        for offset in (0..target.len()).step_by(2) {
+            target[offset] ^= 0x63;
+        }
+        let id = ChunkId::of(&target);
+        let mut samples = [Vec::new(), Vec::new()];
+        for sample in 0..11 {
+            for side in 0..2 {
+                let mode = (sample + side) % 2;
+                let cap = if mode == 0 { usize::MAX } else { 4096 };
+                let started = Instant::now();
+                for _ in 0..128 {
+                    let result = SparseXorDelta::encode_bounded_prehashed_trial(
+                        base,
+                        black_box(&base_bytes),
+                        id,
+                        black_box(&target),
+                        cap,
+                    )
+                    .unwrap();
+                    assert_eq!(result.is_some(), mode == 0);
+                    black_box(result);
+                }
+                samples[mode].push(started.elapsed().as_secs_f64() * 1e9 / 128.0);
+            }
+        }
+        for sample in &mut samples {
+            sample.sort_by(f64::total_cmp);
+        }
+        eprintln!(
+            "sparse-rejection bytes={} cap=4096 full_ns={:.1} bounded_ns={:.1} speedup={:.3}",
+            target.len(),
+            samples[0][5],
+            samples[1][5],
+            samples[0][5] / samples[1][5]
+        );
+    }
 
     #[test]
     fn scalar_profile_v1_has_a_stable_golden_fingerprint() {

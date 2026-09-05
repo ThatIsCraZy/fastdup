@@ -19,7 +19,9 @@ mod long_lived_arena;
 mod maintenance;
 mod maintenance_ioprio;
 mod memory_budget;
+mod online_similarity;
 mod persistent_reduction;
+mod prefix_context;
 mod read_cache;
 mod recovery_checkpoint;
 mod reduction;
@@ -73,6 +75,9 @@ pub use manifest_tree::ManifestTreeError;
 pub use memory_budget::{
     MemoryBudgetGovernor, MemoryBudgetGovernorStatus, MemoryPressureSnapshot,
     system_memory_budget_governor,
+};
+pub use online_similarity::{
+    ONLINE_SIMILARITY_BATCH_ENTRIES, OnlineSimilarityRepository, OnlineSimilarityStatus,
 };
 pub use persistent_reduction::{
     PersistentChunkPlan, PersistentReductionError, PersistentReductionIndex,
@@ -791,9 +796,29 @@ pub struct ContainerRepository<I> {
     descriptors: Arc<container_descriptor_cache::ContainerDescriptorCache>,
     record_reads: Arc<RecordReadCoordinator>,
     retiring: Arc<RwLock<BTreeMap<[u8; 16], usize>>>,
+    reduction_publications: Arc<std::sync::atomic::AtomicUsize>,
     generation_allocator_barrier: Arc<Mutex<()>>,
     generation_allocator_registry:
         Arc<container_generation_allocator::ContainerGenerationAllocatorRegistry>,
+}
+
+/// Keeps online GC from authorizing retirement between Base selection and
+/// durable Exact publication of a dependent target. Does not hold an I/O lock.
+#[derive(Debug)]
+pub struct ReductionPublicationGuard {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for ReductionPublicationGuard {
+    fn drop(&mut self) {
+        let previous = self
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+        assert!(
+            previous > 0,
+            "reduction publication admission has a matching release"
+        );
+    }
 }
 
 const RECORD_READ_SHARDS: usize = 64;
@@ -921,6 +946,48 @@ impl RecordReadCoordinator {
     }
 }
 
+/// RAII completion prevents failed batch planning/I/O from stranding waiters.
+struct RecordReadLeader {
+    coordinator: Arc<RecordReadCoordinator>,
+    key: RecordReadKey,
+    flight: Option<Arc<RecordReadFlight>>,
+}
+
+impl RecordReadLeader {
+    fn complete(mut self, payloads: Arc<Vec<VerifiedChunkPayload>>) {
+        let flight = self.flight.take().expect("active Record read leader");
+        self.coordinator.complete(self.key, &flight, Some(payloads));
+    }
+}
+
+impl Drop for RecordReadLeader {
+    fn drop(&mut self) {
+        if let Some(flight) = self.flight.take() {
+            self.coordinator.complete(self.key, &flight, None);
+        }
+    }
+}
+
+enum CoordinatedRecordRead {
+    Leader(RecordReadLeader),
+    Follower(Arc<RecordReadFlight>),
+    Bypass,
+}
+
+impl RecordReadCoordinator {
+    fn coordinate(self: &Arc<Self>, key: RecordReadKey) -> CoordinatedRecordRead {
+        match self.join(key) {
+            RecordReadJoin::Leader(flight) => CoordinatedRecordRead::Leader(RecordReadLeader {
+                coordinator: Arc::clone(self),
+                key,
+                flight: Some(flight),
+            }),
+            RecordReadJoin::Follower(flight) => CoordinatedRecordRead::Follower(flight),
+            RecordReadJoin::Bypass => CoordinatedRecordRead::Bypass,
+        }
+    }
+}
+
 struct RetiringSelectionBarrier {
     retiring: Arc<RwLock<BTreeMap<[u8; 16], usize>>>,
     containers: Vec<[u8; 16]>,
@@ -1041,6 +1108,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             ),
             record_reads: Arc::new(RecordReadCoordinator::new()),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
+            reduction_publications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             generation_allocator_barrier: Arc::new(Mutex::new(())),
             generation_allocator_registry: Arc::new(
                 container_generation_allocator::ContainerGenerationAllocatorRegistry::default(),
@@ -1107,6 +1175,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             descriptors: Arc::clone(&self.descriptors),
             record_reads: Arc::clone(&self.record_reads),
             retiring: Arc::clone(&self.retiring),
+            reduction_publications: Arc::clone(&self.reduction_publications),
             generation_allocator_barrier: Arc::clone(&self.generation_allocator_barrier),
             generation_allocator_registry: Arc::clone(&self.generation_allocator_registry),
         }
@@ -1129,6 +1198,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             ),
             record_reads: Arc::new(RecordReadCoordinator::new()),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
+            reduction_publications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             generation_allocator_barrier: Arc::new(Mutex::new(())),
             generation_allocator_registry: Arc::new(
                 container_generation_allocator::ContainerGenerationAllocatorRegistry::default(),
@@ -1140,6 +1210,31 @@ impl<I: StorageIo> ContainerRepository<I> {
     #[must_use]
     pub fn descriptor_cache_status(&self) -> ContainerDescriptorCacheStatus {
         self.descriptors.status()
+    }
+
+    /// Admits a bounded dependent-write transaction, or returns `None` while
+    /// GC is retiring Containers. Hold until the target's Exact publication;
+    /// on publication failure retain until writable-owner teardown. Callers
+    /// falling back to independent encoding need no guard.
+    ///
+    /// # Panics
+    /// Panics on a poisoned lifecycle lock or impossible admission overflow.
+    #[must_use]
+    pub fn try_pin_reduction_publication(&self) -> Option<ReductionPublicationGuard> {
+        let retiring = self.retiring.read().expect("Container selection lock");
+        if !retiring.is_empty() {
+            return None;
+        }
+        self.reduction_publications
+            .fetch_update(
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .expect("bounded reduction publications cannot overflow");
+        Some(ReductionPublicationGuard {
+            active: Arc::clone(&self.reduction_publications),
+        })
     }
 
     /// Excludes RETIRING Containers from directory-scan selection fallbacks.
@@ -1173,6 +1268,13 @@ impl<I: StorageIo> ContainerRepository<I> {
             .retiring
             .write()
             .expect("ASSERT: retiring Container selection lock poisoned");
+        if self
+            .reduction_publications
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            return Err(crate::maintenance::MaintenanceError::StaleGcPlan);
+        }
         for container_id in containers.keys().copied() {
             let count = retiring.entry(container_id).or_insert(0);
             *count = count
@@ -2150,43 +2252,23 @@ impl<I: StorageIo> ContainerRepository<I> {
             return Err(StoreError::ExactLocationMismatch);
         }
         let descriptor = self.read_candidate_descriptor(candidate)?;
-        let key = RecordReadCoordinator::key(candidate);
-        match self.record_reads.join(key) {
-            RecordReadJoin::Follower(flight) => {
-                let payloads = RecordReadCoordinator::wait(&flight)
-                    .ok_or(StoreError::ExactLocationMismatch)?;
-                verified_record_read(candidate, payloads.as_slice())
-            }
-            RecordReadJoin::Leader(flight) => {
-                let decoded = self
-                    .read_candidate_record_with_descriptor(candidate, descriptor)
-                    .and_then(|encoded_record| {
-                        descriptor
-                            .decode_candidate_payloads(&[candidate], &encoded_record)
-                            .map_err(map_exact_location_error)
-                    })
-                    .map(|verified| Arc::new(verified.into_parts().1));
-                match decoded {
-                    Ok(payloads) => {
-                        self.record_reads
-                            .complete(key, &flight, Some(Arc::clone(&payloads)));
-                        verified_record_read(candidate, payloads.as_slice())
-                    }
-                    Err(error) => {
-                        self.record_reads.complete(key, &flight, None);
-                        Err(error)
-                    }
-                }
-            }
-            RecordReadJoin::Bypass => {
-                let encoded_record =
-                    self.read_candidate_record_with_descriptor(candidate, descriptor)?;
-                let verified = descriptor
-                    .decode_candidate_payloads(&[candidate], &encoded_record)
-                    .map_err(map_exact_location_error)?;
-                verified_record_read(candidate, &verified.into_parts().1)
-            }
+        let join = self
+            .record_reads
+            .coordinate(RecordReadCoordinator::key(candidate));
+        if let CoordinatedRecordRead::Follower(flight) = join {
+            let payloads =
+                RecordReadCoordinator::wait(&flight).ok_or(StoreError::ExactLocationMismatch)?;
+            return verified_record_read(candidate, &payloads);
         }
+        let encoded = Arc::new(self.read_candidate_record_with_descriptor(candidate, descriptor)?);
+        let verified = descriptor
+            .decode_owned_candidate_payloads(&[candidate], &encoded, 0..encoded.len())
+            .map_err(map_exact_location_error)?;
+        let payloads = Arc::new(verified.into_parts().1);
+        if let CoordinatedRecordRead::Leader(leader) = join {
+            leader.complete(Arc::clone(&payloads));
+        }
+        verified_record_read(candidate, &payloads)
     }
 
     /// Resolves one codec-3 target after its named Base was independently
@@ -2218,16 +2300,33 @@ impl<I: StorageIo> ContainerRepository<I> {
         candidate: ExactIndexEntry,
         verified_base: &VerifiedChunkPayload,
     ) -> Result<VerifiedChunkRead, StoreError> {
-        let (descriptor, encoded_record) = self.read_candidate_record(candidate)?;
-        let record = descriptor
-            .decode_dependent_candidate_with_verified_base(
-                candidate,
-                &encoded_record,
-                verified_base,
-            )
+        if candidate.transition() != ExactLocationTransition::Active
+            || candidate.location().dependency_id() != verified_base.chunk_id().bytes()
+            || u64::try_from(verified_base.len()) != Ok(u64::from(candidate.logical_length()))
+        {
+            return Err(StoreError::ExactLocationMismatch);
+        }
+        let descriptor = self.read_candidate_descriptor(candidate)?;
+        descriptor
+            .record_range(candidate)
             .map_err(map_exact_location_error)?;
-        let payload = record.into_verified_payload();
-        Ok(VerifiedChunkRead::single(payload.clone(), vec![payload]))
+        let join = self
+            .record_reads
+            .coordinate(RecordReadCoordinator::key(candidate));
+        if let CoordinatedRecordRead::Follower(flight) = join {
+            let payloads =
+                RecordReadCoordinator::wait(&flight).ok_or(StoreError::ExactLocationMismatch)?;
+            return verified_record_read(candidate, &payloads);
+        }
+        let encoded = self.read_candidate_record_with_descriptor(candidate, descriptor)?;
+        let record = descriptor
+            .decode_dependent_candidate_with_verified_base(candidate, &encoded, verified_base)
+            .map_err(map_exact_location_error)?;
+        let payloads = Arc::new(vec![record.into_verified_payload()]);
+        if let CoordinatedRecordRead::Leader(leader) = join {
+            leader.complete(Arc::clone(&payloads));
+        }
+        verified_record_read(candidate, &payloads)
     }
 
     fn read_candidate_record(
@@ -2382,6 +2481,16 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u64,
     ) -> Option<(ExactIndexEntry, VerifiedChunkRead)> {
+        self.find_verified_candidate_payload_cached(index, chunk_id, logical_length, None)
+    }
+
+    fn find_verified_candidate_payload_cached<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+        cache: Option<&VerifiedReadCache>,
+    ) -> Option<(ExactIndexEntry, VerifiedChunkRead)> {
         let Ok(index_length) = u32::try_from(logical_length) else {
             return None;
         };
@@ -2428,6 +2537,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                     index,
                     base_id,
                     index_length,
+                    cache,
                 ) else {
                     continue;
                 };
@@ -2455,18 +2565,28 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u32,
     ) -> Option<Vec<u8>> {
-        self.find_verified_independent_base_payload_with_index(index, chunk_id, logical_length)
-            .map(VerifiedChunkPayload::into_payload)
+        self.find_verified_independent_base_payload_with_index(
+            index,
+            chunk_id,
+            logical_length,
+            None,
+        )
+        .map(VerifiedChunkPayload::into_payload)
     }
 
-    fn find_verified_independent_base_payload_with_index<J: StorageIo>(
+    pub(crate) fn find_verified_independent_base_payload_with_index<J: StorageIo>(
         &self,
         index: &ActivatedExactIndex<J>,
         chunk_id: fastdup_format::ChunkId,
         logical_length: u32,
+        cache: Option<&VerifiedReadCache>,
     ) -> Option<VerifiedChunkPayload> {
-        let read =
-            self.find_verified_independent_base_read_with_index(index, chunk_id, logical_length)?;
+        let read = self.find_verified_independent_base_read_with_index(
+            index,
+            chunk_id,
+            logical_length,
+            cache,
+        )?;
         let (mut requested, _) = read.into_parts();
         requested.pop()
     }
@@ -2476,6 +2596,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         index: &ActivatedExactIndex<J>,
         chunk_id: fastdup_format::ChunkId,
         logical_length: u32,
+        cache: Option<&VerifiedReadCache>,
     ) -> Option<VerifiedChunkRead> {
         let lookup = index.lookup_transitions(chunk_id, logical_length).ok()?;
         let mut seen_locations: [Option<ExactIndexLocation>; MAX_EXACT_LOOKUP_CANDIDATES] =
@@ -2512,7 +2633,20 @@ impl<I: StorageIo> ContainerRepository<I> {
                 break;
             }
             attempted += 1;
+            if let Some(payload) = cache
+                .and_then(|cache| cache.get(chunk_id, u64::from(logical_length)))
+                .filter(|payload| payload.matches_independent_candidate(candidate))
+            {
+                return Some(VerifiedChunkRead::single(payload, Vec::new()));
+            }
             if let Ok(read) = self.read_verified_location_payload(candidate) {
+                if let Some(cache) = cache {
+                    let (requested, groups) = read.into_parts();
+                    for group in groups {
+                        cache.admit_decoded_group(group);
+                    }
+                    return Some(VerifiedChunkRead::new(requested, Vec::new()));
+                }
                 return Some(read);
             }
         }
@@ -2562,8 +2696,18 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u64,
     ) -> Result<VerifiedChunkRead, StoreError> {
+        self.read_verified_chunk_payload_cached(index, chunk_id, logical_length, None)
+    }
+
+    fn read_verified_chunk_payload_cached<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+        cache: Option<&VerifiedReadCache>,
+    ) -> Result<VerifiedChunkRead, StoreError> {
         if let Some((_, read)) =
-            self.find_verified_candidate_payload_with_index(index, chunk_id, logical_length)
+            self.find_verified_candidate_payload_cached(index, chunk_id, logical_length, cache)
         {
             return Ok(read);
         }
@@ -2586,10 +2730,11 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         index: &ActivatedExactIndex<J>,
         requests: &[(fastdup_format::ChunkId, u64)],
+        cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError> {
         if requests.len() == 1 {
             let (chunk_id, logical_length) = requests[0];
-            return self.read_verified_chunk_payload_with_index(index, chunk_id, logical_length);
+            return self.read_verified_chunk_payload_cached(index, chunk_id, logical_length, cache);
         }
         let mut resolved = Vec::new();
         resolved
@@ -2722,7 +2867,9 @@ impl<I: StorageIo> ContainerRepository<I> {
         let mut group_start = 0_usize;
         let mut exact_candidates = Vec::new();
         let mut current_descriptor = None::<([u8; 16], u64, SealedContainerDescriptor)>;
+        let mut pending_join = None;
         while group_start < planned.len() {
+            let retained_join = pending_join.take();
             let key = planned[group_start].0;
             let group_end = group_start
                 + planned[group_start..]
@@ -2762,6 +2909,23 @@ impl<I: StorageIo> ContainerRepository<I> {
                 group_start = group_end;
                 continue;
             };
+            let join = retained_join.unwrap_or_else(|| {
+                self.record_reads
+                    .coordinate(RecordReadCoordinator::key(first))
+            });
+            if let CoordinatedRecordRead::Follower(flight) = join {
+                if let Some(payloads) = RecordReadCoordinator::wait(&flight) {
+                    for &(_, ordinal, candidate) in candidates {
+                        if let Ok(payload) = verified_record_payload(candidate, &payloads) {
+                            resolved[ordinal] = Some(payload);
+                        }
+                    }
+                    admission_groups.push(payloads.as_ref().clone());
+                }
+                group_start = group_end;
+                continue;
+            }
+            let mut joins = vec![join];
             let Some(mut physical_end) = first_range
                 .offset()
                 .checked_add(u64::try_from(first_range.length()).unwrap_or(u64::MAX))
@@ -2798,6 +2962,14 @@ impl<I: StorageIo> ContainerRepository<I> {
                 {
                     break;
                 }
+                let join = self
+                    .record_reads
+                    .coordinate(RecordReadCoordinator::key(next));
+                if matches!(join, CoordinatedRecordRead::Follower(_)) {
+                    pending_join = Some(join);
+                    break;
+                }
+                joins.push(join);
                 physical_end = next_end;
                 batch_end = next_group_end;
             }
@@ -2814,8 +2986,11 @@ impl<I: StorageIo> ContainerRepository<I> {
                 continue;
             };
 
+            let encoded_batch = Arc::new(encoded_batch);
+            let mut joins = joins.into_iter();
             let mut record_start = group_start;
             while record_start < batch_end {
+                let join = joins.next().expect("one coordinated read per Record group");
                 let record_key = planned[record_start].0;
                 let record_end = record_start
                     + planned[record_start..batch_end]
@@ -2841,19 +3016,21 @@ impl<I: StorageIo> ContainerRepository<I> {
                     record_start = record_end;
                     continue;
                 };
-                let Some(encoded_record) = encoded_batch.get(relative_start..relative_end) else {
+                if encoded_batch.get(relative_start..relative_end).is_none() {
                     record_start = record_end;
                     continue;
-                };
+                }
                 exact_candidates.clear();
                 exact_candidates
                     .try_reserve(record_candidates.len())
                     .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
                 exact_candidates
                     .extend(record_candidates.iter().map(|(_, _, candidate)| *candidate));
-                let Ok(verified) =
-                    descriptor.decode_candidate_payloads(&exact_candidates, encoded_record)
-                else {
+                let Ok(verified) = descriptor.decode_owned_candidate_payloads(
+                    &exact_candidates,
+                    &encoded_batch,
+                    relative_start..relative_end,
+                ) else {
                     record_start = record_end;
                     continue;
                 };
@@ -2863,6 +3040,9 @@ impl<I: StorageIo> ContainerRepository<I> {
                     record_candidates.len(),
                     "ASSERT: a verified Record group returns one Chunk per candidate"
                 );
+                if let CoordinatedRecordRead::Leader(leader) = join {
+                    leader.complete(Arc::new(all.clone()));
+                }
                 admission_groups.push(all);
                 for (&(_, request_ordinal, _), payload) in record_candidates.iter().zip(records) {
                     resolved[request_ordinal] = Some(payload);
@@ -2900,6 +3080,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                             index,
                             base_id,
                             index_length,
+                            cache,
                         )
                         .and_then(|read| {
                             let (mut requested, groups) = read.into_parts();
@@ -2930,7 +3111,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         for (request_ordinal, &(chunk_id, logical_length)) in requests.iter().enumerate() {
             if resolved[request_ordinal].is_none() {
                 let (mut requested, groups) = self
-                    .read_verified_chunk_payload_with_index(index, chunk_id, logical_length)?
+                    .read_verified_chunk_payload_cached(index, chunk_id, logical_length, cache)?
                     .into_parts();
                 resolved[request_ordinal] = requested.pop();
                 admission_groups.extend(groups);
@@ -4061,6 +4242,16 @@ fn verified_record_read(
     candidate: ExactIndexEntry,
     payloads: &[VerifiedChunkPayload],
 ) -> Result<VerifiedChunkRead, StoreError> {
+    Ok(VerifiedChunkRead::single(
+        verified_record_payload(candidate, payloads)?,
+        payloads.to_vec(),
+    ))
+}
+
+fn verified_record_payload(
+    candidate: ExactIndexEntry,
+    payloads: &[VerifiedChunkPayload],
+) -> Result<VerifiedChunkPayload, StoreError> {
     let ordinal = usize::try_from(candidate.location().chunk_ordinal())
         .map_err(|_| StoreError::ExactLocationMismatch)?;
     let requested = payloads
@@ -4073,7 +4264,7 @@ fn verified_record_read(
         })
         .cloned()
         .ok_or(StoreError::ExactLocationMismatch)?;
-    Ok(VerifiedChunkRead::single(requested, payloads.to_vec()))
+    Ok(requested)
 }
 
 fn map_exact_location_error(error: FormatError) -> StoreError {

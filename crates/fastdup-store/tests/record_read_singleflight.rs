@@ -12,6 +12,7 @@ struct DelayedCountingStorage {
     inner: FsStorageIo,
     count_records: Arc<AtomicBool>,
     record_reads: Arc<AtomicUsize>,
+    fail_records: Arc<AtomicBool>,
 }
 
 impl DelayedCountingStorage {
@@ -20,6 +21,7 @@ impl DelayedCountingStorage {
             inner: FsStorageIo::open(root).expect("open fixture storage"),
             count_records: Arc::new(AtomicBool::new(false)),
             record_reads: Arc::new(AtomicUsize::new(0)),
+            fail_records: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -35,6 +37,13 @@ impl StorageIo for DelayedCountingStorage {
         self.inner.write_at(name, offset, bytes)
     }
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        if self.fail_records.load(Ordering::Acquire)
+            && std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("fdc"))
+        {
+            return Err(io::Error::other("injected DATA read failure"));
+        }
         self.inner.read(name)
     }
     fn object_len(&self, name: &str) -> io::Result<u64> {
@@ -49,6 +58,13 @@ impl StorageIo for DelayedCountingStorage {
         {
             self.record_reads.fetch_add(1, Ordering::AcqRel);
             std::thread::sleep(Duration::from_millis(100));
+        }
+        if self.fail_records.load(Ordering::Acquire)
+            && std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("fdc"))
+        {
+            return Err(io::Error::other("injected DATA range failure"));
         }
         self.inner.read_exact_at(name, offset, length)
     }
@@ -145,4 +161,125 @@ fn test_root(name: &str) -> PathBuf {
         .join("../..")
         .join(".artifacts/tests")
         .join(format!("{name}-{}", std::process::id()))
+}
+
+#[test]
+fn concurrent_batched_raw_reads_share_the_coalesced_io() {
+    concurrent_plans(false, false);
+}
+
+#[test]
+fn failed_batched_record_leader_releases_all_waiters() {
+    concurrent_plans(false, true);
+}
+
+#[test]
+fn concurrent_dependent_reads_share_both_base_and_target_io() {
+    concurrent_plans(true, false);
+}
+
+#[allow(clippy::too_many_lines)]
+fn concurrent_plans(dependent: bool, fail: bool) {
+    use fastdup_format::{ChunkId, ExactIndexProfileId, ManifestExtent, ManifestLeaf};
+    use fastdup_store::{ExactIndexRunRepository, VerifiedManifestFile};
+    let root = test_root(&format!("coordinated-plans-{dependent}-{fail}"));
+    let storage = DelayedCountingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let chunks = [vec![31; 16384], vec![51; 16384]];
+    let id = ContainerId::new([0xd1; 16]).unwrap();
+    containers
+        .publish_raw(id, 1, &[&chunks[0], &chunks[1]])
+        .unwrap();
+    let image = containers.read(id).unwrap();
+    let mut entries = image
+        .locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut targets = chunks.to_vec();
+    if dependent {
+        let mut target = chunks[0].clone();
+        target[31] ^= 0x63;
+        let publication = containers
+            .publish_zstd_prefix_pairs_verified(
+                ContainerId::new([0xd2; 16]).unwrap(),
+                2,
+                &[(&chunks[0], &target)],
+            )
+            .unwrap();
+        entries.extend(
+            publication
+                .locations()
+                .iter()
+                .copied()
+                .map(ExactIndexEntry::from_verified)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        targets = vec![target];
+    }
+    let indexes = ExactIndexRunRepository::new(storage.clone());
+    indexes
+        .append_level_zero(
+            ExactIndexProfileId::new([0xd3; 32]).unwrap(),
+            entries.clone(),
+        )
+        .unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    let expected = targets.concat();
+    let length = u32::try_from(expected.len()).unwrap();
+    let manifest = ManifestLeaf::new(
+        u64::from(length),
+        targets
+            .iter()
+            .map(|bytes| ManifestExtent::Data {
+                logical_length: u64::try_from(bytes.len()).unwrap(),
+                chunk_id: ChunkId::of(bytes),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers.clone())
+        .unwrap()
+        .with_active_index(&active);
+    file.read_at(0, length).unwrap(); // warm descriptors, without a DATA cache
+    storage.record_reads.store(0, Ordering::Release);
+    storage.fail_records.store(fail, Ordering::Release);
+    storage.count_records.store(true, Ordering::Release);
+    let barrier = Arc::new(Barrier::new(3));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let handles = (0..2)
+        .map(|_| {
+            let file = file.clone();
+            let barrier = Arc::clone(&barrier);
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                sender.send(file.read_at(0, length)).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for _ in 0..2 {
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a failed leader must not strand a waiter");
+        if fail {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    if !fail {
+        assert_eq!(
+            storage.record_reads.load(Ordering::Acquire),
+            if dependent { 2 } else { 1 }
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }

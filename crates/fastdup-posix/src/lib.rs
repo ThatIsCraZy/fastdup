@@ -2586,10 +2586,26 @@ pub struct Namespace {
     mutation_observer: RwLock<Option<Arc<dyn MutationObserver>>>,
     commit_capacity_admission: OnceLock<Arc<dyn CommitCapacityAdmission>>,
     logical_quotas: LogicalQuotaTable,
+    reduction_policy: RwLock<ShareReductionPolicy>,
     catalog: RwLock<Catalog>,
     locks: Mutex<LockTable>,
     lock_change_sequence: AtomicU64,
     lock_changed: Notify,
+}
+
+#[derive(Debug)]
+struct ShareReductionPolicy {
+    default_enabled: bool,
+    by_inode: BTreeMap<InodeId, (InodeId, bool)>,
+}
+
+impl Default for ShareReductionPolicy {
+    fn default() -> Self {
+        Self {
+            default_enabled: true,
+            by_inode: BTreeMap::new(),
+        }
+    }
 }
 
 impl Namespace {
@@ -2633,6 +2649,7 @@ impl Namespace {
             mutation_observer: RwLock::new(None),
             commit_capacity_admission: OnceLock::new(),
             logical_quotas: LogicalQuotaTable::default(),
+            reduction_policy: RwLock::new(ShareReductionPolicy::default()),
             catalog: RwLock::new(Catalog {
                 next_inode: ROOT_INODE.get() + 1,
                 inode_reservation_end: u64::MAX,
@@ -2897,6 +2914,7 @@ impl Namespace {
             mutation_observer: RwLock::new(None),
             commit_capacity_admission: OnceLock::new(),
             logical_quotas: LogicalQuotaTable::default(),
+            reduction_policy: RwLock::new(ShareReductionPolicy::default()),
             catalog: RwLock::new(Catalog {
                 next_inode: snapshot.next_inode,
                 inode_reservation_end: snapshot.inode_reservation_end,
@@ -3157,6 +3175,131 @@ impl Namespace {
     #[must_use]
     pub fn logical_quota_revision(&self) -> String {
         self.logical_quotas.revision()
+    }
+
+    /// Sets the default writer policy and explicit Share subtree overrides.
+    /// Replacement is fenced against namespace mutations; hot writes perform
+    /// one membership lookup per Container, never a path walk per Chunk.
+    ///
+    /// # Errors
+    /// Rejects missing/non-directory roots, nested or overlapping Shares and
+    /// existing cross-Share hardlinks whose writer policy would be ambiguous.
+    ///
+    /// # Panics
+    /// Panics if namespace locks were poisoned by an invariant violation.
+    pub fn replace_share_reduction(
+        &self,
+        default_enabled: bool,
+        rules: Vec<(InodeId, bool)>,
+    ) -> Result<(), PosixError> {
+        if rules.len() > 4096 {
+            return Err(PosixError::InvalidArgument);
+        }
+        let _fence = self
+            .mutations_admitted
+            .write()
+            .expect("mutation admission lock");
+        let catalog = self.catalog.read().expect("catalog lock");
+        let mut roots = BTreeMap::new();
+        for (root, enabled) in rules {
+            if roots.insert(root, enabled).is_some() {
+                return Err(PosixError::InvalidArgument);
+            }
+            validate_directory(&catalog, root)?;
+        }
+        let mut by_inode = BTreeMap::new();
+        for (&root, &enabled) in &roots {
+            let mut pending = vec![root];
+            while let Some(inode) = pending.pop() {
+                if inode != root && roots.contains_key(&inode) {
+                    return Err(PosixError::InvalidArgument);
+                }
+                if let Some(old) = by_inode.insert(inode, (root, enabled)) {
+                    if old.0 != root {
+                        return Err(PosixError::InvalidArgument);
+                    }
+                    continue;
+                }
+                for ((parent, _), &child) in catalog.entries.range((inode, Vec::new())..) {
+                    if *parent != inode {
+                        break;
+                    }
+                    pending.push(child);
+                }
+            }
+        }
+        for ((parent, _), target) in &catalog.entries {
+            if let Some(&(root, _)) = by_inode.get(target)
+                && *target != root
+                && by_inode.get(parent).map(|p| p.0) != Some(root)
+            {
+                return Err(PosixError::InvalidArgument);
+            }
+        }
+        let mut policy = self.reduction_policy.write().expect("Share reduction lock");
+        // Open orphans retain their Share until the final handle disappears.
+        for (&inode, &(root, _)) in &policy.by_inode {
+            if !by_inode.contains_key(&inode)
+                && let Some(object) = catalog.inodes.get(&inode)
+                && object.state.read().expect("inode lock").link_count == 0
+                && let Some(&enabled) = roots.get(&root)
+            {
+                by_inode.insert(inode, (root, enabled));
+            }
+        }
+        *policy = ShareReductionPolicy {
+            default_enabled,
+            by_inode,
+        };
+        Ok(())
+    }
+
+    /// Whether new encodings for this inode may use Advanced Reduction.
+    ///
+    /// # Panics
+    /// Panics if a previous invariant failure poisoned the policy lock.
+    #[must_use]
+    pub fn advanced_reduction_enabled(&self, inode: InodeId) -> bool {
+        let policy = self.reduction_policy.read().expect("Share reduction lock");
+        policy
+            .by_inode
+            .get(&inode)
+            .map_or(policy.default_enabled, |p| p.1)
+    }
+
+    /// Changes the default without replacing explicit Share overrides.
+    ///
+    /// # Panics
+    /// Panics if a previous invariant failure poisoned the policy lock.
+    pub fn set_advanced_reduction_default(&self, enabled: bool) {
+        self.reduction_policy
+            .write()
+            .expect("Share reduction lock")
+            .default_enabled = enabled;
+    }
+
+    /// Current default for inodes without an explicit Share override.
+    ///
+    /// # Panics
+    /// Panics if a previous invariant failure poisoned the policy lock.
+    #[must_use]
+    pub fn advanced_reduction_default(&self) -> bool {
+        self.reduction_policy
+            .read()
+            .expect("Share reduction lock")
+            .default_enabled
+    }
+
+    fn associate_reduction_child(&self, parent: InodeId, inode: InodeId) {
+        let mut policy = self.reduction_policy.write().expect("Share reduction lock");
+        if let Some(rule) = policy.by_inode.get(&parent).copied() {
+            policy.by_inode.insert(inode, rule);
+        }
+    }
+
+    fn same_reduction_share(&self, inode: InodeId, parent: InodeId) -> bool {
+        let policy = self.reduction_policy.read().expect("Share reduction lock");
+        policy.by_inode.get(&inode).map(|p| p.0) == policy.by_inode.get(&parent).map(|p| p.0)
     }
 
     #[must_use]
@@ -4126,7 +4269,9 @@ impl Namespace {
         if state.kind == FileKind::Directory {
             return Err(PosixError::PermissionDenied);
         }
-        if !self.logical_quotas.same_domain(inode, new_parent) {
+        if !self.logical_quotas.same_domain(inode, new_parent)
+            || !self.same_reduction_share(inode, new_parent)
+        {
             return Err(PosixError::CrossDevice);
         }
         if context.uid != 0 && context.uid != state.uid {
@@ -4208,6 +4353,7 @@ impl Namespace {
         assert!(catalog.lookup_counts.insert(inode, 1).is_none());
         assert!(catalog.entries.insert(key, inode).is_none());
         self.logical_quotas.associate_child(parent, inode);
+        self.associate_reduction_child(parent, inode);
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
         if self.commit_capacity_admission.get().is_some() {
             assert!(
@@ -4349,6 +4495,7 @@ impl Namespace {
         if let Ok(Reply::Created { entry, .. }) = &result {
             self.logical_quotas
                 .associate_child(request.parent, entry.attr.inode);
+            self.associate_reduction_child(request.parent, entry.attr.inode);
         }
         if let Ok(Reply::Created { entry, .. }) = &result
             && self.commit_capacity_admission.get().is_some()
@@ -4445,6 +4592,7 @@ impl Namespace {
             "ASSERT: mkdir replaced an existing directory entry"
         );
         self.logical_quotas.associate_child(parent, inode);
+        self.associate_reduction_child(parent, inode);
         parent_state.link_count = next_parent_links;
         parent_state.mutation_sequence = next_parent_sequence;
         drop(parent_state);
@@ -5568,7 +5716,9 @@ impl Namespace {
         if replaced_inode == Some(source_inode) {
             return Ok(Reply::Empty);
         }
-        if !self.logical_quotas.same_domain(source_inode, new_parent) {
+        if !self.logical_quotas.same_domain(source_inode, new_parent)
+            || !self.same_reduction_share(source_inode, new_parent)
+        {
             return Err(PosixError::CrossDevice);
         }
         let source_kind = catalog
@@ -5900,6 +6050,11 @@ impl Namespace {
         };
         drop(state);
         self.logical_quotas.remove_inode(inode, allocated_bytes);
+        self.reduction_policy
+            .write()
+            .expect("Share reduction lock")
+            .by_inode
+            .remove(&inode);
     }
 
     fn resolve_inode(&self, inode: InodeId) -> Result<Arc<Inode>, PosixError> {

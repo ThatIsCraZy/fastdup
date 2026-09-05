@@ -1176,6 +1176,17 @@ where
     where
         X: Send + Sync + 'static,
     {
+        // Cheap preflight avoids speculative replacement I/O while a new
+        // dependent target is still being published. Rechecked atomically
+        // under the selection barrier immediately before RETIRING activation.
+        if self
+            .containers
+            .reduction_publications
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            return Err(MaintenanceError::StaleGcPlan);
+        }
         let retirement_started = Instant::now();
         let GcCandidateProof {
             generation_proof,

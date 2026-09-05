@@ -533,3 +533,173 @@ fn repeated_chunk_in_one_read_reuses_exact_lookup_scratch_and_record_decode() {
     assert_eq!(active.membership_status().probes() - probes_before, 1);
     assert_eq!(storage.data_range_reads().len(), 1);
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dependent_reads_reuse_verified_bases_across_requests_but_scrub_reads_storage() {
+    use fastdup_store::{MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig};
+    use std::num::NonZeroUsize;
+    let root = unique_test_root("manifest-base-cache");
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let base = (0_u32..16384)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect::<Vec<_>>();
+    let mut first = base.clone();
+    first[31] ^= 0x63;
+    let mut second = base.clone();
+    second[4096] ^= 31;
+    let base_id = ContainerId::new([0xc1; 16]).unwrap();
+    let target_id = ContainerId::new([0xc2; 16]).unwrap();
+    containers.publish_raw(base_id, 1, &[&base]).unwrap();
+    let publication = containers
+        .publish_zstd_prefix_pairs_verified(target_id, 2, &[(&base, &first), (&base, &second)])
+        .unwrap();
+    let base_container = containers.read(base_id).unwrap();
+    let mut entries = base_container
+        .locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    entries.extend(
+        publication
+            .locations()
+            .iter()
+            .copied()
+            .map(ExactIndexEntry::from_verified)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+    );
+    let indexes = ExactIndexRunRepository::new(storage.clone());
+    indexes
+        .append_level_zero(ExactIndexProfileId::new([0xc3; 32]).unwrap(), entries)
+        .unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    let cache = Arc::new(
+        VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(
+                4 * 1024 * 1024,
+                1024 * 1024,
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .unwrap(),
+            MemoryPressureSnapshot::new(64 * 1024 * 1024, 32 * 1024 * 1024, 0),
+        )
+        .unwrap(),
+    );
+    let manifest = ManifestLeaf::new(
+        32768,
+        vec![
+            ManifestExtent::Data {
+                logical_length: 16384,
+                chunk_id: ChunkId::of(&first),
+            },
+            ManifestExtent::Data {
+                logical_length: 16384,
+                chunk_id: ChunkId::of(&second),
+            },
+        ],
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers.clone())
+        .unwrap()
+        .with_active_index(&active)
+        .with_verified_read_cache(Arc::clone(&cache));
+    assert_eq!(file.read_at(0, 16384).unwrap(), first);
+    storage.clear_range_reads();
+    assert_eq!(file.read_at(16384, 16384).unwrap(), second);
+    let base_name = format!("{}.fdc", "c1".repeat(16));
+    assert!(
+        storage
+            .data_range_reads()
+            .iter()
+            .all(|(name, _, _)| name != &base_name),
+        "second Target must reuse the already verified Base"
+    );
+    storage.clear_range_reads();
+    containers.read_with_index(target_id, &active).unwrap();
+    assert!(
+        storage
+            .data_range_reads()
+            .iter()
+            .any(|(name, _, _)| name == &base_name),
+        "independent full verification must reread Base storage"
+    );
+    cache.update_memory_pressure(MemoryPressureSnapshot::new(
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+        4096,
+    ));
+    storage.clear_range_reads();
+    assert_eq!(file.read_at(16384, 16384).unwrap(), second);
+    assert!(
+        storage
+            .data_range_reads()
+            .iter()
+            .any(|(name, _, _)| name == &base_name)
+    );
+    assert_eq!(cache.status().resident_bytes(), 0);
+}
+
+#[test]
+fn coalesced_raw_cache_charges_shared_encoded_backing_once() {
+    use fastdup_store::{MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig};
+    use std::num::NonZeroUsize;
+    let root = unique_test_root("manifest-raw-backing-cache");
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let chunks = [vec![31; 16384], vec![91; 16384]];
+    let id = ContainerId::new([0xc4; 16]).unwrap();
+    containers
+        .publish_raw(id, 1, &[&chunks[0], &chunks[1]])
+        .unwrap();
+    let image = containers.read(id).unwrap();
+    let entries = image
+        .locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let retained = entries
+        .iter()
+        .map(|e| usize::try_from(e.location().record_length()).unwrap())
+        .sum::<usize>();
+    let indexes = ExactIndexRunRepository::new(storage);
+    indexes
+        .append_level_zero(ExactIndexProfileId::new([0xc5; 32]).unwrap(), entries)
+        .unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    let cache = Arc::new(
+        VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(
+                4 * 1024 * 1024,
+                1024 * 1024,
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .unwrap(),
+            MemoryPressureSnapshot::new(64 * 1024 * 1024, 32 * 1024 * 1024, 0),
+        )
+        .unwrap(),
+    );
+    let manifest = ManifestLeaf::new(
+        32768,
+        chunks
+            .iter()
+            .map(|b| ManifestExtent::Data {
+                logical_length: 16384,
+                chunk_id: ChunkId::of(b),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers)
+        .unwrap()
+        .with_active_index(&active)
+        .with_verified_read_cache(Arc::clone(&cache));
+    assert_eq!(file.read_at(0, 32768).unwrap(), chunks.concat());
+    assert_eq!(cache.status().resident_bytes(), retained);
+    assert_eq!(cache.status().entry_count(), 2);
+}

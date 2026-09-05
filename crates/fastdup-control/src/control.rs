@@ -500,7 +500,6 @@ impl AgentRuntime {
                     ));
                 }
                 settings.revision = expected_revision.saturating_add(1);
-                let requires_remount = current.advanced_reduction != settings.advanced_reduction;
                 let was_online = self
                     .store
                     .repository_binding()
@@ -508,28 +507,7 @@ impl AgentRuntime {
                     .flatten()
                     .is_some_and(|binding| binding.state == RepositoryState::Online);
                 write_runtime_environment(&settings)?;
-                if requires_remount {
-                    let activation = (|| {
-                        if was_online {
-                            systemctl("stop", REPOSITORY_UNIT)?;
-                        }
-                        if settings.advanced_reduction == AdvancedReduction::DependentV1 {
-                            maintenance("rebuild-pool-indexes")?;
-                        }
-                        if was_online {
-                            self.start_repository()?;
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = activation {
-                        let _ = write_runtime_environment(&current);
-                        if was_online {
-                            let _ = self.start_repository();
-                        }
-                        return Err(error);
-                    }
-                } else if was_online && let Err(error) = send_hot_settings_configuration(&settings)
-                {
+                if was_online && let Err(error) = send_hot_settings_configuration(&settings) {
                     let _ = write_runtime_environment(&current);
                     let _ = send_hot_settings_configuration(&current);
                     return Err(error);
@@ -537,12 +515,7 @@ impl AgentRuntime {
                 if let Err(error) = self.store.update_settings(expected_revision, settings) {
                     let _ = write_runtime_environment(&current);
                     if was_online {
-                        if requires_remount {
-                            let _ = systemctl("stop", REPOSITORY_UNIT);
-                            let _ = self.start_repository();
-                        } else {
-                            let _ = send_hot_settings_configuration(&current);
-                        }
+                        let _ = send_hot_settings_configuration(&current);
                     }
                     return Err(ControlProblem::new("settings_conflict", error.to_string()));
                 }
@@ -1213,6 +1186,11 @@ fn share_capacity_revision(shares: &[ShareSettings]) -> String {
     for share in shares {
         digest.update(share.id.as_bytes());
         digest.update([0]);
+        digest.update([match share.advanced_reduction {
+            None => 0,
+            Some(AdvancedReduction::Off) => 1,
+            Some(AdvancedReduction::DependentV1) => 2,
+        }]);
         if let Some(capacity) = share.logical_quota {
             digest.update(capacity.bytes().unwrap_or_default().to_le_bytes());
         } else {
@@ -1230,9 +1208,16 @@ fn sync_share_capacities(shares: &[ShareSettings]) -> Result<(), ControlProblem>
         ));
     }
     let mut rules = Vec::new();
+    let mut reduction_rules = Vec::new();
     for share in shares {
         let path = SambaConfig::share_path(share);
         std::fs::create_dir_all(&path).map_err(problem("share_directory"))?;
+        if let Some(policy) = share.advanced_reduction {
+            reduction_rules.push(serde_json::json!({
+                "inode": std::fs::metadata(&path).map_err(problem("share_directory"))?.ino(),
+                "enabled": policy == AdvancedReduction::DependentV1,
+            }));
+        }
         if let Some(capacity) = share.logical_quota {
             let capacity_bytes = capacity.bytes().ok_or_else(|| {
                 ControlProblem::new(
@@ -1254,14 +1239,16 @@ fn sync_share_capacities(shares: &[ShareSettings]) -> Result<(), ControlProblem>
         "kind": "update_presented_capacities",
         "revision": revision,
         "rules": rules,
+        "reduction_rules": reduction_rules,
     }))?;
-    persist_share_capacity_manifest(&revision, &rules)?;
+    persist_share_capacity_manifest(&revision, &rules, &reduction_rules)?;
     Ok(())
 }
 
 fn persist_share_capacity_manifest(
     revision: &str,
     rules: &[serde_json::Value],
+    reduction_rules: &[serde_json::Value],
 ) -> Result<(), ControlProblem> {
     if dry_run() {
         return Ok(());
@@ -1288,6 +1275,7 @@ fn persist_share_capacity_manifest(
             "version": 1,
             "revision": revision,
             "rules": rules,
+            "reduction_rules": reduction_rules,
         }),
     )
     .map_err(problem("share_capacity_manifest_write"))?;
@@ -1360,6 +1348,10 @@ fn send_hot_settings_configuration(
     if dry_run() {
         return Ok(());
     }
+    send_management_operation(&serde_json::json!({
+        "kind": "update_advanced_reduction_default",
+        "enabled": settings.advanced_reduction == AdvancedReduction::DependentV1,
+    }))?;
     send_management_operation(&serde_json::json!({
         "kind": "update_small_file_extensions",
         "revision": format!("settings-{}", settings.revision),
@@ -1471,6 +1463,7 @@ mod tests {
 
     fn test_share(id: &str) -> ShareSettings {
         ShareSettings {
+            advanced_reduction: None,
             id: id.to_owned(),
             revision: 1,
             name: id.to_owned(),

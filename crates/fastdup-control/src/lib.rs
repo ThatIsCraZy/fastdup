@@ -201,6 +201,10 @@ pub struct ShareSettings {
     pub access_based_enumeration: bool,
     pub allowed_users: Vec<String>,
     pub allowed_groups: Vec<String>,
+    /// Absent legacy values inherit the repository default. Explicit values
+    /// govern only new writer work beneath this Share root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advanced_reduction: Option<AdvancedReduction>,
     #[serde(
         default,
         alias = "presentedCapacity",

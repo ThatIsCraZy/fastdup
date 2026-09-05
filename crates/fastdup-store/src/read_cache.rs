@@ -205,8 +205,8 @@ struct CacheBackingCharge {
 /// Result of one verified read operation.
 ///
 /// Requested payloads retain logical caller order. Admission groups retain all
-/// unique Chunk views sharing one decoded Encoding Record backing so the cache
-/// can account and admit that allocation exactly once.
+/// Chunk views sharing one decoded Record or encoded RAW batch backing so the
+/// cache can account and admit that allocation exactly once.
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedChunkRead {
     requested: Vec<VerifiedChunkPayload>,
@@ -218,9 +218,23 @@ impl VerifiedChunkRead {
         requested: Vec<VerifiedChunkPayload>,
         admission_groups: Vec<Vec<VerifiedChunkPayload>>,
     ) -> Self {
+        let mut merged: Vec<Vec<VerifiedChunkPayload>> = Vec::new();
+        for group in admission_groups {
+            let Some(first) = group.first() else {
+                continue;
+            };
+            if let Some(existing) = merged
+                .iter_mut()
+                .find(|existing| existing[0].shares_backing_with(first))
+            {
+                existing.extend(group);
+            } else {
+                merged.push(group);
+            }
+        }
         Self {
             requested,
-            admission_groups,
+            admission_groups: merged,
         }
     }
 
@@ -558,7 +572,7 @@ impl VerifiedReadCache {
             );
             assert!(
                 first.shares_backing_with(payload),
-                "ASSERT: one cache admission group must share one decoded Record backing"
+                "ASSERT: one cache admission group must share one backing allocation"
             );
             assert_eq!(
                 payload.backing_allocation_bytes(),

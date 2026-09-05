@@ -74,7 +74,7 @@ export interface BlockTarget {
 export interface RepositorySettings {
   revision: number;
   autoMount: boolean;
-  advancedReduction: "off" | "prefix_v1";
+  advancedReduction: "off" | "dependent_v1";
   onlineGcEnabled: boolean;
   maintenanceWindowUtc?: string;
   pressureLowBasisPoints: number;
@@ -82,6 +82,7 @@ export interface RepositorySettings {
   smallFileExtensions: string[];
 }
 export interface ShareSettings {
+  advancedReduction?: "off" | "dependent_v1";
   id: string;
   revision: number;
   name: string;
@@ -293,7 +294,7 @@ export const previewSnapshot: ApplianceSnapshot = {
   settings: {
     revision: 4,
     autoMount: true,
-    advancedReduction: "prefix_v1",
+    advancedReduction: "dependent_v1",
     onlineGcEnabled: true,
     maintenanceWindowUtc: "Sonntag 02:00–05:00",
     pressureLowBasisPoints: 8500,

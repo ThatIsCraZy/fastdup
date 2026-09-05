@@ -108,6 +108,10 @@ describe("FastDup Control Plane UI", () => {
       screen.getByRole("textbox", { name: /small-file-tier.*dateiendungen/i }),
       { target: { value: ".vmdk\n.XML" } },
     );
+    fireEvent.change(
+      screen.getByRole("combobox", { name: /advanced reduction.*repository-standard/i }),
+      { target: { value: "dependent_v1" } },
+    );
     fireEvent.click(screen.getByRole("button", { name: /übernehmen/i }));
 
     await waitFor(() =>
@@ -121,6 +125,8 @@ describe("FastDup Control Plane UI", () => {
     );
     const submitted = JSON.parse(String(commandCall?.[1]?.body));
     expect(submitted.settings.smallFileExtensions).toEqual([".vmdk", ".XML"]);
+    expect(submitted.settings.advancedReduction).toBe("dependent_v1");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("lädt ausgewählte Telemetrie-Zeiträume aus der Historien-API", async () => {
@@ -578,5 +584,19 @@ describe("FastDup Control Plane UI", () => {
     expect(value).toHaveValue(12);
     expect(unit).toHaveValue("pb");
     expect(screen.getByText(/harte logische quota/i)).toBeVisible();
+  });
+
+  it("schaltet Similarity pro Freigabe unabhängig vom Repository-Standard", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: /admin administrator/i });
+    fireEvent.click(screen.getByRole("button", { name: /smb-freigaben/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /freigabe anlegen/i }));
+    const policy = screen.getByRole("combobox", { name: /advanced reduction für diese freigabe/i });
+    expect(policy).toHaveValue("off");
+    fireEvent.change(policy, { target: { value: "dependent_v1" } });
+    expect(policy).toHaveValue("dependent_v1");
+    fireEvent.change(policy, { target: { value: "inherit" } });
+    expect(policy).toHaveValue("inherit");
+    expect(screen.getByText(/gemeinsamen kandidatenindex/i)).toBeVisible();
   });
 });

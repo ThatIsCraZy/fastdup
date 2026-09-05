@@ -127,6 +127,11 @@ enum ManagementOperation {
     UpdatePresentedCapacities {
         revision: String,
         rules: Vec<ManagementPresentedCapacityRule>,
+        #[serde(default)]
+        reduction_rules: Option<Vec<ManagementReductionRule>>,
+    },
+    UpdateAdvancedReductionDefault {
+        enabled: bool,
     },
     UpdateSmallFileExtensions {
         revision: String,
@@ -145,6 +150,31 @@ struct ShareCapacityManifest {
     version: u16,
     revision: String,
     rules: Vec<ManagementPresentedCapacityRule>,
+    #[serde(default)]
+    reduction_rules: Vec<ManagementReductionRule>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct ManagementReductionRule {
+    inode: u64,
+    enabled: bool,
+}
+
+fn apply_reduction_rules(
+    namespace: &Namespace,
+    rules: Vec<ManagementReductionRule>,
+) -> Result<(), String> {
+    let rules = rules
+        .into_iter()
+        .map(|r| {
+            InodeId::new(r.inode)
+                .map(|inode| (inode, r.enabled))
+                .ok_or_else(|| "Share inode must be nonzero".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    namespace
+        .replace_share_reduction(namespace.advanced_reduction_default(), rules)
+        .map_err(|e| format!("{e:?}"))
 }
 
 trait PresentedCapacityControl: Send + Sync {
@@ -323,6 +353,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_online_gc_recovery(recovered.online_gc_recovery);
     let appliance = Arc::new(recovered.appliance);
     let namespace = appliance.namespace_arc();
+    namespace
+        .set_advanced_reduction_default(advanced_reduction == AdvancedReductionPolicy::DependentV1);
     namespace.replace_small_file_extensions(small_file_policy_revision, small_file_extensions)?;
     capacity_source.attach_logical_quota_namespace(&namespace)?;
     let presented_capacity_control = RuntimePresentedCapacityControl {
@@ -330,6 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         namespace: Arc::clone(&namespace),
     };
     if let Some(manifest) = load_share_capacity_manifest()? {
+        apply_reduction_rules(&namespace, manifest.reduction_rules)?;
         presented_capacity_control.replace(
             manifest.revision,
             manifest
@@ -634,10 +667,10 @@ fn recover_appliance(
     );
     let online_gc_recovery = online_maintenance.finalize_recovered_online_gc()?;
     let gc_catalog = GcCandidateCatalogRepository::new(FsStorageIo::open(metadata_root)?);
-    let similarities = (advanced_reduction == AdvancedReductionPolicy::DependentV1)
-        .then(|| SimilarityIndexRepository::new(metadata_storage));
+    let similarities = Some(SimilarityIndexRepository::new(metadata_storage));
     if restored_from_data_tier.is_some() {
-        if let Some(similarities) = &similarities {
+        if advanced_reduction == AdvancedReductionPolicy::DependentV1 {
+            let similarities = similarities.as_ref().expect("Similarity repository exists");
             let rebuilt = online_maintenance.rebuild_pool_indexes(similarities)?;
             eprintln!(
                 "data_tier_recovery_indexes_ok=true exact_generation={} similarity_generation={}",
@@ -652,25 +685,19 @@ fn recover_appliance(
             );
         }
     }
-    let appliance = match advanced_reduction {
-        AdvancedReductionPolicy::Off => DurableNamespace::open_with_index(
-            NamespaceConfig::default(),
-            generations.clone(),
-            containers.clone(),
-            &indexes,
-            INODE_RESERVATION_SPAN_V1,
-        )?,
-        AdvancedReductionPolicy::DependentV1 => DurableNamespace::open_with_reduction_indexes(
-            NamespaceConfig::default(),
-            generations.clone(),
-            containers.clone(),
-            &indexes,
-            similarities
-                .as_ref()
-                .expect("ASSERT: Prefix policy constructs Similarity repository"),
-            INODE_RESERVATION_SPAN_V1,
-        )?,
-    };
+    let appliance = DurableNamespace::open_with_reduction_indexes(
+        NamespaceConfig::default(),
+        generations.clone(),
+        containers.clone(),
+        &indexes,
+        similarities
+            .as_ref()
+            .expect("ASSERT: Prefix policy constructs Similarity repository"),
+        INODE_RESERVATION_SPAN_V1,
+    )?;
+    appliance
+        .namespace_arc()
+        .set_advanced_reduction_default(advanced_reduction == AdvancedReductionPolicy::DependentV1);
     Ok(RecoveredAppliance {
         appliance,
         online_gc_recovery,
@@ -858,6 +885,7 @@ async fn handle_management_control(
         .map_err(|error| format!("management response write failed: {error}"))
 }
 
+#[allow(clippy::too_many_lines, reason = "typed management operation dispatch")]
 fn apply_management_operation(
     operation: ManagementOperation,
     telemetry: &FrontendTelemetry,
@@ -937,8 +965,31 @@ fn apply_management_operation(
                 },
             }
         }
-        ManagementOperation::UpdatePresentedCapacities { revision, rules } => {
-            update_presented_capacities(capacity_source, revision, rules)
+        ManagementOperation::UpdatePresentedCapacities {
+            revision,
+            rules,
+            reduction_rules,
+        } => {
+            let mut response = update_presented_capacities(capacity_source, revision, rules);
+            if response.ok
+                && let Some(rules) = reduction_rules
+                && let Err(error) = apply_reduction_rules(namespace, rules)
+            {
+                response.ok = false;
+                response.error = Some(error);
+            }
+            response
+        }
+        ManagementOperation::UpdateAdvancedReductionDefault { enabled } => {
+            namespace.set_advanced_reduction_default(enabled);
+            ManagementResponse {
+                version: MANAGEMENT_PROTOCOL_VERSION,
+                ok: true,
+                error: None,
+                frontend: None,
+                presented_capacity_revision: None,
+                small_file_policy: None,
+            }
         }
         ManagementOperation::UpdateSmallFileExtensions {
             revision,
@@ -1504,6 +1555,15 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
     emit_cpu_phase_state("write_through_hash_cpu", status.hash_cpu());
     emit_cpu_phase_state("write_through_encode_cpu", status.encode_cpu());
     let reduction = status.advanced_reduction();
+    let online = reduction.online();
+    eprintln!(
+        "online_similarity families={} batches={} compactions={} skipped_entries={} errors={}",
+        online.active_families,
+        online.published_batches,
+        online.compactions,
+        online.skipped_entries,
+        online.errors
+    );
     eprintln!(
         concat!(
             "advanced_reduction enabled={} queries={} candidates={} base_reads={} ",
@@ -2160,6 +2220,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persisted_share_reduction_and_hot_default_are_backward_compatible() {
+        let namespace = Namespace::new_volatile(NamespaceConfig::default());
+        namespace.set_advanced_reduction_default(false);
+        let legacy: ShareCapacityManifest =
+            serde_json::from_str(r#"{"version":1,"revision":"old","rules":[]}"#).unwrap();
+        assert!(legacy.reduction_rules.is_empty());
+        let selected: ShareCapacityManifest = serde_json::from_str(
+            r#"{"version":1,"revision":"new","rules":[],"reduction_rules":[{"inode":1,"enabled":true}]}"#,
+        ).unwrap();
+        apply_reduction_rules(&namespace, selected.reduction_rules).unwrap();
+        assert!(namespace.advanced_reduction_enabled(fastdup_posix::ROOT_INODE));
+        let (configuration, _rx) = watch::channel(OnlineGcRuntimeConfiguration {
+            enabled: false,
+            policy: OnlineGcPolicy::default(),
+        });
+        let response = apply_management_operation(
+            ManagementOperation::UpdateAdvancedReductionDefault { enabled: false },
+            &FrontendTelemetry::default(),
+            &configuration,
+            &TestPresentedCapacityControl::default(),
+            &namespace,
+        );
+        assert!(response.ok);
+        assert!(
+            namespace.advanced_reduction_enabled(fastdup_posix::ROOT_INODE),
+            "an explicit Share override survives a default update"
+        );
+        apply_reduction_rules(&namespace, legacy.reduction_rules).unwrap();
+        assert!(!namespace.advanced_reduction_enabled(fastdup_posix::ROOT_INODE));
+        assert!(
+            apply_reduction_rules(
+                &namespace,
+                vec![ManagementReductionRule {
+                    inode: 0,
+                    enabled: true
+                }]
+            )
+            .is_err()
+        );
+        assert!(!namespace.advanced_reduction_enabled(fastdup_posix::ROOT_INODE));
+    }
+
+    #[test]
     fn management_protocol_exposes_frontend_counters_and_hot_gc_policy() {
         let telemetry = FrontendTelemetry::default();
         let initial = OnlineGcRuntimeConfiguration {
@@ -2196,6 +2299,7 @@ mod tests {
 
         let quota = apply_management_operation(
             ManagementOperation::UpdatePresentedCapacities {
+                reduction_rules: None,
                 revision: "shares-r1".to_owned(),
                 rules: vec![ManagementPresentedCapacityRule {
                     inode: 42,

@@ -76,6 +76,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if command == "scrub" {
         print_scrub(maintenance.scrub()?);
+        let similarities = SimilarityIndexRepository::new(metadata.clone());
+        if fastdup_store::OnlineSimilarityRepository::exists(&similarities)? {
+            let families = fastdup_store::OnlineSimilarityRepository::audit(&similarities)?;
+            println!("online_similarity_scrub_ok=true active_families={families}");
+        }
     } else if command == "scrub-gc" || command == "gc-now" {
         let usage = data_pool_usage(&container_root)?;
         let mode = if command == "gc-now" {
