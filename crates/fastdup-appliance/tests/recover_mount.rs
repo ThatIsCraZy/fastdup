@@ -376,8 +376,8 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
         .count();
     assert_eq!(object_lengths, 0);
     assert_eq!(
-        bounded_reads, 2,
-        "writable recovery reads only the paired fixed high-water slots: {writable_recovery_operations:?}"
+        bounded_reads, 1,
+        "writable recovery verifies the DATA record once and reuses that proof for inode reservation: {writable_recovery_operations:?}"
     );
     let writable_baseline = container_storage.operation_count();
     let Reply::Entry(writable_entry) = writable
@@ -595,5 +595,95 @@ fn current_index_reader_keeps_inflight_generation_pinned_until_data_read_finishe
     assert!(
         drain.is_drained(),
         "completed read must release its operation pin"
+    );
+}
+
+#[test]
+fn writable_restart_proves_data_once_before_reserving_new_inode_ids() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let policy = PolicySetId::new([0xe7; 32]).unwrap();
+    let payload = b"a fresh recovery proof survives its inode-only successor";
+    {
+        let containers = ContainerRepository::new(data.clone());
+        let generation = containers
+            .open_generation_allocator(1024)
+            .unwrap()
+            .reserve_generation()
+            .unwrap();
+        containers
+            .publish_raw(
+                ContainerId::new([0xe8; 16]).unwrap(),
+                generation,
+                &[payload.as_slice()],
+            )
+            .unwrap();
+        let generations = GenerationRepository::new(metadata.clone(), policy);
+        generations
+            .commit_namespace(&NamespaceRoot::new(4096, 2, 0, vec![], vec![]).unwrap())
+            .unwrap();
+        let length = u64::try_from(payload.len()).unwrap();
+        let manifest = generations
+            .publish_manifest(
+                &ManifestLeaf::new(
+                    length,
+                    vec![ManifestExtent::Data {
+                        logical_length: length,
+                        chunk_id: ChunkId::of(payload),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let root = NamespaceRoot::new(
+            4096,
+            3,
+            1,
+            vec![DurableInode::new(2, 0o640, 1000, 1000, 1, 1, length, manifest).unwrap()],
+            vec![NamespaceEntry::new(1, 2, b"recovered".to_vec()).unwrap()],
+        )
+        .unwrap();
+        generations
+            .commit_namespace_with_data(&root, &containers)
+            .unwrap();
+    }
+    metadata.crash();
+    data.crash();
+    let baseline = data.operation_count();
+    let appliance = DurableNamespace::open(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, policy),
+        ContainerRepository::new(data.clone()),
+        16,
+    )
+    .unwrap();
+    let reads = data.operations()[baseline..]
+        .iter()
+        .filter(|operation| **operation == StorageOperation::Read)
+        .count();
+    assert_eq!(
+        reads, 1,
+        "the inode reservation must reuse the freshly verified recovery graph"
+    );
+    let Reply::Created { entry, .. } = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"after-restart",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("create returns an entry");
+    };
+    assert!(
+        entry.attr.inode.get() >= 4096,
+        "restart skips the previous inode reservation"
     );
 }

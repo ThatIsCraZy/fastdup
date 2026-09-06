@@ -5257,6 +5257,10 @@ where
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keep recovery, inode reservation and mutation admission in lifecycle order"
+    )]
     fn open_using(
         config: NamespaceConfig,
         generations: GenerationRepository<M>,
@@ -5268,8 +5272,15 @@ where
             return Err(DurableNamespaceError::InvalidReservationSpan);
         }
         let graph_verifier = manifest_readers.graph_verifier(containers.clone());
+        let proof_started = Instant::now();
+        eprintln!("recovery_phase=namespace_data_proof state=started");
         let recovered = generations
             .recover_latest_with_verified_files_using(&containers, graph_verifier.as_ref())?;
+        eprintln!(
+            "recovery_phase=namespace_data_proof state=complete elapsed_ms={}",
+            proof_started.elapsed().as_millis()
+        );
+        let reservation_started = Instant::now();
         let (root, next_inode, reservation_end, installed_record, verified_files) = match recovered
         {
             None => {
@@ -5293,7 +5304,7 @@ where
                 )
             }
             Some(recovered) => {
-                let (recovered, _prior_files) = recovered.into_parts();
+                let (recovered, prior_files) = recovered.into_parts();
                 let previous = recovered.namespace_root();
                 let next_inode = recovered.inode_reservation_end_high_water();
                 let reservation_end = next_inode
@@ -5307,11 +5318,39 @@ where
                     previous.inodes().to_vec(),
                     previous.entries().to_vec(),
                 )?;
-                let committed = generations.commit_namespace_with_verified_files_using(
-                    &root,
-                    &containers,
-                    graph_verifier.as_ref(),
-                )?;
+                let committed = if recovered.rejected_newer_generations() == 0 {
+                    // Recovery just established a fresh complete graph proof.
+                    // Reserving IDs preserves every inode/Manifest binding; the
+                    // ordinary successor fence must still match the WAL head.
+                    let predecessor =
+                        SuccessorPredecessor::from_committed_record(recovered.record());
+                    let proofs: Vec<_> = prior_files
+                        .iter()
+                        .map(|file| {
+                            generations.reuse_manifest_successor(
+                                predecessor,
+                                file.manifest_summary().expect(
+                                    "ASSERT: recovered files retain verified Manifest roots",
+                                ),
+                            )
+                        })
+                        .collect();
+                    generations.commit_namespace_with_successor_proofs_using(
+                        &root,
+                        &containers,
+                        predecessor,
+                        &proofs,
+                        graph_verifier.as_ref(),
+                    )?
+                } else {
+                    // A fallback graph is not the current WAL head. Preserve
+                    // the existing complete verification/transition path.
+                    generations.commit_namespace_with_verified_files_using(
+                        &root,
+                        &containers,
+                        graph_verifier.as_ref(),
+                    )?
+                };
                 let (installed_record, verified_files) = committed.into_parts();
                 (
                     root,
@@ -5322,6 +5361,10 @@ where
                 )
             }
         };
+        eprintln!(
+            "recovery_phase=inode_reservation state=complete elapsed_ms={}",
+            reservation_started.elapsed().as_millis()
+        );
         let container_generations =
             containers.open_generation_allocator(CONTAINER_GENERATION_RESERVATION_SPAN_V1)?;
         let manifests = load_manifest_cache(&root, &verified_files)?;

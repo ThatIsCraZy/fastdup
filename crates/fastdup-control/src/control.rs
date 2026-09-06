@@ -34,8 +34,8 @@ const REPOSITORY_UNIT: &str = "fastdup-repository.service";
 const SCRUB_UNIT: &str = "fastdup-maintenance@scrub.service";
 const MANAGEMENT_SOCKET: &str = "/var/lib/fastdup/repository/metadata/.fastdup-management.sock";
 // Type=simple becomes active before recovery has verified and mounted the pool.
-// Match the repository service lifecycle budget instead of treating recovery as
-// a five-second share-configuration update.
+// Bound the synchronous management wait, not the lifetime of healthy recovery.
+// A deadline leaves a still-active Runtime Mounting; sampling completes activation.
 const REPOSITORY_START_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Debug)]
@@ -370,6 +370,17 @@ impl AgentRuntime {
                 binding.state.clone()
             });
         let frontend = read_frontend_counters();
+        let state = if state == RepositoryState::Mounting
+            && frontend.is_some()
+            && let Ok(shares) = self.store.shares()
+            && sync_share_capacities(&shares).is_ok()
+            && apply_samba(&self.samba, &shares).is_ok()
+            && self.set_state(RepositoryState::Online).is_ok()
+        {
+            RepositoryState::Online
+        } else {
+            state
+        };
         let mut snapshot = {
             let Ok(mut sampler) = self.sampler.lock() else {
                 return;
@@ -533,7 +544,7 @@ impl AgentRuntime {
             Command::Mount => {
                 self.set_state(RepositoryState::Mounting)?;
                 if let Err(error) = self.start_repository() {
-                    let _ = self.set_state(RepositoryState::Error);
+                    let _ = self.set_state(repository_start_error_state(&error));
                     return Err(error);
                 }
                 self.set_state(RepositoryState::Online)?;
@@ -671,7 +682,17 @@ impl AgentRuntime {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(error) => {
-                    let _ = systemctl("stop", REPOSITORY_UNIT);
+                    // A response deadline is not evidence of failed recovery.
+                    // Keep a still-running Runtime alive so a large repository
+                    // can finish its independent proof after this Job returns.
+                    if !repository_mount_is_active()
+                        && run_process("systemctl", &["is-active", REPOSITORY_UNIT]).is_ok()
+                    {
+                        return Err(ControlProblem::new(
+                            "repository_start_pending",
+                            "Repository-Recovery läuft weiter; der Mount wird nach Abschluss automatisch verfügbar",
+                        ));
+                    }
                     return Err(error);
                 }
             }
@@ -821,7 +842,7 @@ impl AgentRuntime {
             .map_err(problem("binding_failed"))?;
         write_runtime_environment(&self.store.settings().map_err(problem("settings_failed"))?)?;
         if let Err(error) = self.start_repository() {
-            let _ = self.set_state(RepositoryState::Error);
+            let _ = self.set_state(repository_start_error_state(&error));
             return Err(error);
         }
         self.set_state(RepositoryState::Online)?;
@@ -886,7 +907,7 @@ impl AgentRuntime {
         }
         if was_online {
             if let Err(error) = self.start_repository() {
-                let _ = self.set_state(RepositoryState::Error);
+                let _ = self.set_state(repository_start_error_state(&error));
                 return Err(error);
             }
             self.set_state(RepositoryState::Online)?;
@@ -1462,6 +1483,14 @@ fn problem<E: std::fmt::Display>(code: &'static str) -> impl FnOnce(E) -> Contro
 }
 
 
+fn repository_start_error_state(error: &ControlProblem) -> RepositoryState {
+    if error.code == "repository_start_pending" {
+        RepositoryState::Mounting
+    } else {
+        RepositoryState::Error
+    }
+}
+
 fn require_share_repository(binding: Option<&RepositoryBinding>) -> Result<(), ControlProblem> {
     if binding.is_none_or(|binding| !matches!(binding.state, RepositoryState::Online | RepositoryState::Unmounted)) {
         return Err(ControlProblem::new("repository_uninitialized", "Vor dem Anlegen einer Freigabe muss ein Repository eingerichtet werden"));
@@ -1472,6 +1501,14 @@ fn require_share_repository(binding: Option<&RepositoryBinding>) -> Result<(), C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_deadline_keeps_pending_recovery_distinct_from_failure() {
+        let pending = ControlProblem::new("repository_start_pending", "still verifying");
+        assert_eq!(repository_start_error_state(&pending), RepositoryState::Mounting);
+        let failure = ControlProblem::new("command_failed", "runtime exited");
+        assert_eq!(repository_start_error_state(&failure), RepositoryState::Error);
+    }
 
     #[test]
     fn share_creation_requires_a_repository() {

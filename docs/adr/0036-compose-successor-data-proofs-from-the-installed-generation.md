@@ -126,3 +126,17 @@ cut inside DATA must first reconstruct and reduce the complete retained byte
 fragments into new independently verified DATA extents. The Metadata objects
 are durable before the Namespace Root and Commit WAL; recovery and scrub still
 verify the complete selected tree rather than trusting the online shortcut.
+
+## Inode reservation immediately after recovery
+
+Writable startup first proves the newest complete generation independently of
+any predecessor process. If no newer generation was rejected, that fresh opaque
+Manifest evidence may authorize the immediately following inode-reservation
+Commit: every inode and Manifest binding is preserved, and only the reserved
+ID interval advances. The successor proof carries the exact recovered Commit
+Record, and the ordinary serialized WAL-head fence must still match before
+publication. No mutation is admitted between proof construction and this
+reservation. This removes a second complete DATA proof during one startup;
+it does not reuse evidence from before a restart. Recovery fallback to an
+older generation retains the existing complete verification and transition
+path because the selected graph is not the current WAL head.

@@ -1137,3 +1137,104 @@ fn cache_working_set_transition_benchmark() {
         );
     }
 }
+
+#[test]
+fn recovery_verifier_decodes_a_shared_record_once_and_rechecks_on_the_next_pass() {
+    use fastdup_store::{IndexedRequiredChunkVerifier, RequiredChunkVerifier};
+    let root = unique_test_root("recovery-shared-record");
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let chunks: Vec<_> = (1_u8..=16).map(|value| vec![value; 16384]).collect();
+    let parts: Vec<_> = chunks.iter().map(Vec::as_slice).collect();
+    let id = ContainerId::new([0xe5; 16]).unwrap();
+    containers
+        .publish_adaptive_regions(id, 1, &[&parts])
+        .unwrap();
+    let container = containers.read(id).unwrap();
+    let entries = container
+        .locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let indexes = ExactIndexRunRepository::new(storage.clone());
+    indexes
+        .append_level_zero(
+            ExactIndexProfileId::new([0xe6; 32]).unwrap(),
+            entries.clone(),
+        )
+        .unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    containers.read_verified_location(entries[0]).unwrap();
+    let required = chunks
+        .iter()
+        .map(|chunk| (ChunkId::of(chunk), chunk.len() as u64))
+        .collect();
+    let verifier = IndexedRequiredChunkVerifier::new(containers, active);
+    storage.clear_range_reads();
+    verifier.verify_required_chunks(&required).unwrap();
+    let reads = storage.data_range_reads();
+    assert_eq!(
+        reads.len(),
+        1,
+        "a fresh complete proof must decode the shared Record once"
+    );
+    let (name, offset, _) = &reads[0];
+    let original = storage.inner.read_exact_at(name, *offset, 1).unwrap()[0];
+    storage.write_at(name, *offset, &[original ^ 0x80]).unwrap();
+    assert!(
+        verifier.verify_required_chunks(&required).is_err(),
+        "a new proof must discover DATA corruption instead of trusting a prior pass"
+    );
+}
+
+#[test]
+#[ignore = "manual release-mode fresh recovery proof A/B"]
+fn recovery_record_proof_benchmark() {
+    use fastdup_store::{IndexedRequiredChunkVerifier, RequiredChunkVerifier};
+    let root = unique_test_root("recovery-record-benchmark");
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let chunks: Vec<_> = (1_u8..=16).map(|value| vec![value; 16384]).collect();
+    let parts: Vec<_> = chunks.iter().map(Vec::as_slice).collect();
+    let id = ContainerId::new([0xe5; 16]).unwrap();
+    containers
+        .publish_adaptive_regions(id, 1, &[&parts])
+        .unwrap();
+    let container = containers.read(id).unwrap();
+    let entries = container
+        .locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let indexes = ExactIndexRunRepository::new(storage.clone());
+    indexes
+        .append_level_zero(
+            ExactIndexProfileId::new([0xe6; 32]).unwrap(),
+            entries.clone(),
+        )
+        .unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    containers.read_verified_location(entries[0]).unwrap();
+    let required = chunks
+        .iter()
+        .map(|chunk| (ChunkId::of(chunk), chunk.len() as u64))
+        .collect();
+    let verifier = IndexedRequiredChunkVerifier::new(containers, active);
+    for round in 0..7 {
+        storage.clear_range_reads();
+        let started = std::time::Instant::now();
+        for _ in 0..256 {
+            verifier.verify_required_chunks(&required).unwrap();
+        }
+        println!(
+            "recovery_record round={round} proofs=256 data_reads={} elapsed_ns={}",
+            storage.data_range_reads().len(),
+            started.elapsed().as_nanos()
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
