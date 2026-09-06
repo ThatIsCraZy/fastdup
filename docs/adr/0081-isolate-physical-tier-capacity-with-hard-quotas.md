@@ -17,8 +17,12 @@ is `required`; malformed policy fails before either storage root is opened.
 
 The Metadata filesystem also contains the Small-File Container directory from
 ADR 0084. Startup assigns it an inheriting XFS project and installs a hard
-quota through `SmallFileTierIsolation::prepare`; configuration that would
-consume the protected Metadata floor is rejected. The lab policy reports quota
+quota through `SmallFileTierIsolation::prepare`; an oversized requested quota is reduced to a KiB-aligned 20% of filesystem
+capacity, bounded by capacity minus the protected Metadata floor. A warning
+reports requested and effective limits in the journal and WebUI. A filesystem
+that cannot preserve the commit floor plus a nonzero quota still fails closed.
+The effective hard quota is passed to write admission and re-derived at startup;
+no durable format or recovery authority changes. The lab policy reports quota
 enforcement as bypassed. Any future disk-backed cache needs the same independent
 capacity boundary.
 

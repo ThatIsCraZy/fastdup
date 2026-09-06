@@ -671,8 +671,8 @@ _Avoid_: Transfer limit, physical reservation, reduction allowance
 
 **Share capacity presentation**:
 The `statfs` geometry derived from one Logical Share quota. Total bytes equal
-the quota; free and available bytes are the minimum of remaining logical quota
-and current Repository-wide physical availability.
+the quota; free and available bytes equal quota minus allocated logical bytes,
+saturated at zero. Physical availability remains a separate capacity boundary.
 _Avoid_: Storage authority, physical capacity, independent quota
 
 **Provisioning target**:

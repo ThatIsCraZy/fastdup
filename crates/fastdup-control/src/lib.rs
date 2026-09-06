@@ -16,6 +16,8 @@ mod detail_telemetry;
 mod inventory;
 mod firewall;
 mod samba;
+mod samba_users;
+pub use samba_users::SambaUserRequest;
 mod store;
 mod telemetry;
 mod tls;
@@ -247,6 +249,8 @@ pub struct SeriesPoint {
 #[serde(rename_all = "camelCase")]
 pub struct TelemetrySnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub small_file_quota: Option<SmallFileQuotaStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Box<DetailTelemetry>>,
     pub sequence: u64,
     pub observed_at: String,
@@ -267,9 +271,17 @@ pub struct TelemetrySnapshot {
     pub series: Vec<SeriesPoint>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmallFileQuotaStatus {
+    pub requested_bytes: u64,
+    pub effective_bytes: u64,
+}
+
 impl Default for TelemetrySnapshot {
     fn default() -> Self {
         Self {
+            small_file_quota: None,
             details: None,
             sequence: 0,
             observed_at: unix_seconds().to_string(),
@@ -398,6 +410,8 @@ pub struct AgentRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentOperation {
     Inspect,
+    SambaUsers,
+    CreateSambaUser { request: SambaUserRequest },
     Submit {
         command: Command,
         idempotency_key: String,
@@ -415,6 +429,8 @@ pub struct AgentResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentResult {
+    SambaUsers { users: Vec<String> },
+    SambaUserCreated,
     Snapshot { snapshot: Box<ApplianceSnapshot> },
     Job { job: JobStatus },
 }

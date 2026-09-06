@@ -67,3 +67,43 @@ export function CertificateSettings({request,fingerprint,regenerate,onImported}:
     </CardContent></Card>
   </div>;
 }
+
+export function SambaUsersSettings({ request, onCreated }: { request: SettingsRequest; onCreated: () => void }) {
+  const { t } = useI18n();
+  const [users, setUsers] = useState<string[]>([]);
+  const [name, setName] = useState('');
+  const [password, setPassword] = useState('');
+  const [repeat, setRepeat] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  useEffect(() => { let active = true; request<string[]>('/api/v1/samba/users').then(value => { if(active) setUsers(value); }).catch(error => { if(active) setError(error.message); }); return () => { active = false; }; }, [request]);
+  const create = async (event: FormEvent) => {
+    event.preventDefault(); setError(''); setSuccess('');
+    if(password !== repeat) { setError(t('Die Passwörter stimmen nicht überein.')); return; }
+    setBusy(true);
+    try {
+      const result = await request<{username:string}>('/api/v1/samba/users', { method:'POST', body:JSON.stringify({username:name,password}) });
+      setUsers(current => [...current,result.username].sort());
+      setName(''); setPassword(''); setRepeat('');
+      setSuccess(t('SMB-Benutzer {name} wurde angelegt. Bitte in der Freigabe erlauben.', {name:result.username}));
+      onCreated();
+    } catch(error) { setError((error as Error).message); } finally { setBusy(false); }
+  };
+  return <div className="settings-cards">
+    <Card><CardHeader><div><h2>{t('SMB-Benutzer')}</h2><p>{t('Diese Konten gelten für SMB-Freigaben. Sie haben keinen WebUI- oder SSH-Zugang.')}</p></div></CardHeader><CardContent>
+      <div className="settings-user-list">{users.map(user => <div key={user}><strong>{user}</strong></div>)}</div>
+      {!users.length && <p>{t('Noch keine SMB-Benutzer vorhanden.')}</p>}
+    </CardContent></Card>
+    <Card><CardHeader><h2>{t('SMB-Benutzer anlegen')}</h2></CardHeader><CardContent>
+      <form className="settings-form" onSubmit={create}>
+        <label className="field"><span>{t('SMB-Benutzername')}</span><input required maxLength={32} pattern="[a-z][a-z0-9_-]*" autoComplete="off" value={name} onChange={event=>setName(event.target.value)}/></label>
+        <label className="field"><span>{t('SMB-Passwort')}</span><input type="password" required minLength={12} maxLength={256} autoComplete="new-password" value={password} onChange={event=>setPassword(event.target.value)}/></label>
+        <label className="field"><span>{t('SMB-Passwort wiederholen')}</span><input type="password" required autoComplete="new-password" value={repeat} onChange={event=>setRepeat(event.target.value)}/></label>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        {success && <p className="settings-success" role="status">{success}</p>}
+        <Button type="submit" disabled={busy}><UserPlus size={15}/>{t(busy?'Wird angelegt…':'SMB-Benutzer anlegen')}</Button>
+      </form>
+    </CardContent></Card>
+  </div>;
+}

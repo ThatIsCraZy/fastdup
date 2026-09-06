@@ -31,6 +31,7 @@ export interface SeriesPoint {
 }
 
 export interface TelemetrySnapshot {
+  smallFileQuota?: { requestedBytes: number; effectiveBytes: number };
   details?: import("./detail-telemetry").DetailTelemetry | null;
   sequence: number;
   observedAt: string;

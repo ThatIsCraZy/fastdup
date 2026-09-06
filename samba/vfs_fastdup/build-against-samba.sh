@@ -8,7 +8,8 @@ fi
 
 workspace=${FASTDUP_WORKSPACE:-/source/fastdup}
 samba_tree=$1
-artifact_root="$workspace/.artifacts/samba-vfs-fastdup"
+workspace_artifacts=${FASTDUP_ARTIFACT_ROOT:-$workspace/.artifacts}
+artifact_root="$workspace_artifacts/samba-vfs-fastdup"
 # Samba's PIDL generators still derive generated include paths from the
 # conventional in-tree `bin/default` location even when waf is given an
 # external --out directory.  The Samba checkout itself is already a disposable
@@ -18,16 +19,16 @@ module_dir="$samba_tree/source3/modules"
 wscript="$module_dir/wscript_build"
 
 case "$samba_tree" in
-	"$workspace"/.artifacts/*) ;;
+	"$workspace_artifacts"/*) ;;
 	*)
-		echo "Samba build tree must be under $workspace/.artifacts" >&2
+		echo "Samba build tree must be under $workspace_artifacts" >&2
 		exit 2
 		;;
 esac
 
 test -f "$samba_tree/VERSION"
 test -f "$wscript"
-mkdir -p "$artifact_root" "$build_root" "$workspace/.artifacts/tmp"
+mkdir -p "$artifact_root" "$build_root" "$workspace_artifacts/tmp"
 
 cp "$workspace/samba/vfs_fastdup/vfs_fastdup.c" "$module_dir/vfs_fastdup.c"
 cp "$workspace/samba/vfs_fastdup/vfs_fastdup_contract.c" \
@@ -40,7 +41,7 @@ if ! grep -q "SAMBA3_MODULE('vfs_fastdup'" "$wscript"; then
 fi
 
 cd "$samba_tree"
-TMPDIR="$workspace/.artifacts/tmp" ./configure \
+TMPDIR="$workspace_artifacts/tmp" ./configure \
 	--without-ad-dc \
 	--without-ads \
 	--without-ldap \
@@ -56,7 +57,7 @@ TMPDIR="$workspace/.artifacts/tmp" ./configure \
 	--disable-python \
 	--with-shared-modules='vfs_fastdup,!vfs_snapper'
 
-TMPDIR="$workspace/.artifacts/tmp" PYTHONHASHSEED=1 ./buildtools/bin/waf \
+TMPDIR="$workspace_artifacts/tmp" PYTHONHASHSEED=1 ./buildtools/bin/waf \
 	build --targets=vfs_fastdup
 
 module=$(find "$build_root" -type f -name 'libvfs_module_fastdup.so' -print \

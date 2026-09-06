@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           fastdup
-Version:        0.6.1
+Version:        0.6.4
 Release:        1%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
@@ -17,6 +17,9 @@ Requires:       systemd-udev
 Requires:       util-linux
 Requires:       xfsprogs
 Requires:       openssl
+Requires:       policycoreutils
+Requires:       shadow-utils
+Requires:       findutils
 
 %description
 fastdup is an experimental single-node POSIX storage appliance. This package
@@ -66,6 +69,10 @@ if [ -f %{_sysconfdir}/samba/smb.conf ] \
     sed -i '/^[[:space:]]*\[global\][[:space:]]*$/a\# BEGIN fastdup managed include\n\tinclude = %{_sysconfdir}/samba/fastdup-shares.conf\n# END fastdup managed include' \
         %{_sysconfdir}/samba/smb.conf
 fi
+# Enable the narrow SELinux permission needed for Samba exports of FUSE.
+if selinuxenabled; then
+    setsebool -P samba_share_fusefs on || exit 1
+fi
 systemctl daemon-reload >/dev/null 2>&1 || :
 
 %preun
@@ -101,6 +108,11 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-1
+- Fix guest and authenticated SMB filesystem access and SELinux FUSE policy.
+- Create separate SMB accounts through the authenticated WebUI and root agent.
+- Refresh inventory after login and adapt oversized Small-File quotas with warnings.
+
 * Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.1-1
 - Optimize ingest, reads, rechunking, and bounded worker/cache coordination.
 - Retain SIGINT notifications during supervisor work for reliable shutdown.

@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/fastdup-0.6.4-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Produktseite</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6.1">Release-Informationen</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6.4">Release-Informationen</a>
 </p>
 
 fastdup ist eine experimentelle, softwaredefinierte Single-Node-
@@ -31,6 +31,24 @@ HTTPS-WebUI hält die Administration einfach.
 > fastdup ist ein Forschungsprototyp und kein produktionsreifes Backup-Produkt.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
+
+## Neu in v0.6.4 · 6. September 2026
+
+Freier Share-Speicher entspricht jetzt der Quota abzüglich logisch belegter
+Bytes. Leere Shares erscheinen nicht mehr durch die physische Poolgröße belegt.
+Verschachtelte SMB-Verzeichnisse (unter anderem VeeamZIP) funktionieren auch
+für Gastzugriff. AVX-512 wird mit CPU-Erkennung und AVX2-/Skalar-Fallback genutzt.
+
+Gast- und authentifizierter SMB-Zugriff verwenden eine eigene Dienstidentität
+und die notwendige SELinux-FUSE-Freigabe. Unter **Einstellungen → SMB-Benutzer**
+einen Benutzer mit Passwort anlegen und anschließend in der Freigabe erlauben.
+WebUI- und Linux-Passwörter sind keine SMB-Zugangsdaten. Windows kann Gastzugriff
+per Richtlinie blockieren; dafür einen eigenen SMB-Benutzer verwenden.
+
+Das Laufwerksinventar lädt direkt nach Login und initialem Passwortwechsel.
+Auf kleinen Metadata-Volumes wird ein zu großes Small-File-Limit automatisch
+reduziert. Eine Warnung zeigt angefordertes und wirksames Limit an; die
+Metadata-Reserve bleibt geschützt. Siehe [Release-Notes](docs/releases/v0.6.4.md).
 
 ## Neu in v0.6.1 · 6. September 2026
 
@@ -138,11 +156,11 @@ Benötigt werden:
 Aktuelles Binärpaket herunterladen und installieren:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/fastdup-0.6.4-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.6.1-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.6.4-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

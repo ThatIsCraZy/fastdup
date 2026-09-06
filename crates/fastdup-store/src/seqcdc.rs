@@ -1,4 +1,4 @@
-//! Scalar reference and AVX2/BMI2 `SeqCDC` boundary scanner.
+//! Scalar reference and runtime-dispatched AVX-512/AVX2/BMI2 `SeqCDC` boundary scanner.
 
 #![allow(unsafe_code)]
 
@@ -11,8 +11,29 @@ pub struct SeqCdcConfig {
     pub maximum_bytes: usize,
 }
 
+#[cfg(target_arch = "x86_64")]
+fn avx512_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("bmi2")
+}
+
+// Cascade Lake measurements favor AVX2 on changing input and AVX-512 on
+// long equal stretches. This bounded probe keeps the faster measured path.
+#[cfg(target_arch = "x86_64")]
+fn flat_probe(bytes: &[u8], offset: usize) -> bool {
+    bytes
+        .get(offset..offset.saturating_add(64))
+        .is_some_and(|lane| lane.iter().all(|byte| *byte == lane[0]))
+}
+
 #[must_use]
 pub fn seqcdc_cut(bytes: &[u8], config: SeqCdcConfig) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if avx512_available() && flat_probe(bytes, config.minimum_bytes) {
+        // SAFETY: CPU/OS feature detection and kernel bounds protect all loads.
+        return unsafe { cut_avx512(bytes, config) };
+    }
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("bmi2") {
         // SAFETY: runtime feature detection establishes AVX2 and BMI2 support.
@@ -105,18 +126,27 @@ where
             segment[local - 1]
         };
 
+        #[cfg(target_arch = "x86_64")]
+        let wide = vector && avx512_available() && flat_probe(segment, local);
+        #[cfg(target_arch = "x86_64")]
+        let vector_width = if wide { 64 } else { 32 };
         while position < segment_end && position < size {
             #[cfg(target_arch = "x86_64")]
             if vector
                 && local != 0
-                && local.saturating_add(32) <= segment.len()
-                && position.saturating_add(32) <= size
+                && local.saturating_add(vector_width) <= segment.len()
+                && position.saturating_add(vector_width) <= size
             {
                 // SAFETY: runtime feature detection selected `vector`, and
                 // the conditions above prove both unaligned loads are inside
                 // this segment.
                 let decision = unsafe {
-                    classify_avx2_bmi2(
+                    let classifier = if wide {
+                        classify_avx512
+                    } else {
+                        classify_avx2_bmi2
+                    };
+                    classifier(
                         segment.as_ptr().add(local - 1),
                         segment.as_ptr().add(local),
                         config,
@@ -141,11 +171,15 @@ where
                         local = position - segment_start;
                         previous = segment[local - 1];
                     }
-                    VectorDecision::Advance { opposing, sequence } => {
+                    VectorDecision::Advance {
+                        opposing,
+                        sequence,
+                        bytes,
+                    } => {
                         opposing_slopes = opposing;
                         sequence_length = sequence;
-                        position += 32;
-                        local += 32;
+                        position += bytes;
+                        local += bytes;
                         previous = segment[local - 1];
                     }
                 }
@@ -272,10 +306,73 @@ unsafe fn cut_avx2_bmi2(bytes: &[u8], config: SeqCdcConfig) -> usize {
                 opposing_slopes = 0;
                 sequence_length = 0;
             }
-            VectorDecision::Advance { opposing, sequence } => {
+            VectorDecision::Advance {
+                opposing,
+                sequence,
+                bytes,
+            } => {
                 opposing_slopes = opposing;
                 sequence_length = sequence;
-                position += 32;
+                position += bytes;
+            }
+        }
+    }
+
+    cut_scalar_from(
+        bytes,
+        size,
+        config,
+        position,
+        opposing_slopes,
+        sequence_length,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,bmi2")]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn cut_avx512(bytes: &[u8], config: SeqCdcConfig) -> usize {
+    validate(config);
+    if bytes.len() < config.minimum_bytes {
+        return bytes.len();
+    }
+    let size = bytes.len().min(config.maximum_bytes);
+    let mut position = config.minimum_bytes;
+    let mut opposing_slopes = 0_u16;
+    let mut sequence_length = 0_u16;
+
+    while position.saturating_add(64) <= size {
+        // SAFETY: the loop condition proves that `position..position + 64`
+        // lies inside `bytes`. `position` is at least `minimum_bytes`, which
+        // is nonzero, so the preceding 64-byte load is also in bounds.
+        // SAFETY: the loop condition proves both unaligned loads are inside
+        // `bytes`, and this function requires AVX-512F/BW plus BMI2.
+        let decision = unsafe {
+            classify_avx512(
+                bytes.as_ptr().add(position - 1),
+                bytes.as_ptr().add(position),
+                config,
+                opposing_slopes,
+                sequence_length,
+            )
+        };
+        match decision {
+            VectorDecision::Boundary(lane) => return position + lane,
+            VectorDecision::Skip(lane) => {
+                position = position
+                    .saturating_add(lane + 1)
+                    .saturating_add(config.skip_bytes);
+                opposing_slopes = 0;
+                sequence_length = 0;
+            }
+            VectorDecision::Advance {
+                opposing,
+                sequence,
+                bytes,
+            } => {
+                opposing_slopes = opposing;
+                sequence_length = sequence;
+                position += bytes;
             }
         }
     }
@@ -294,7 +391,11 @@ unsafe fn cut_avx2_bmi2(bytes: &[u8], config: SeqCdcConfig) -> usize {
 enum VectorDecision {
     Boundary(usize),
     Skip(usize),
-    Advance { opposing: u16, sequence: u16 },
+    Advance {
+        opposing: u16,
+        sequence: u16,
+        bytes: usize,
+    },
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -309,7 +410,7 @@ unsafe fn classify_avx2_bmi2(
 ) -> VectorDecision {
     use std::arch::x86_64::{
         __m256i, _mm256_cmpgt_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
-        _mm256_xor_si256, _pdep_u32, _pext_u32,
+        _mm256_xor_si256,
     };
 
     // SAFETY: callers prove that both pointers address 32 readable bytes.
@@ -324,11 +425,26 @@ unsafe fn classify_avx2_bmi2(
     let current = _mm256_xor_si256(current, bias);
     let greater = _mm256_movemask_epi8(_mm256_cmpgt_epi8(current, previous)).cast_unsigned();
     let lesser = _mm256_movemask_epi8(_mm256_cmpgt_epi8(previous, current)).cast_unsigned();
+    classify_masks(greater, lesser, config, opposing_slopes, sequence_length)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+#[inline]
+fn classify_masks(
+    greater: u32,
+    lesser: u32,
+    config: SeqCdcConfig,
+    opposing_slopes: u16,
+    sequence_length: u16,
+) -> VectorDecision {
+    use std::arch::x86_64::{_pdep_u32, _pext_u32};
     let non_equal = greater | lesser;
     if non_equal == 0 {
         return VectorDecision::Advance {
             opposing: opposing_slopes,
             sequence: sequence_length,
+            bytes: 32,
         };
     }
 
@@ -374,8 +490,59 @@ unsafe fn classify_avx2_bmi2(
                 u16::try_from(aligned.leading_ones())
                     .expect("ASSERT: one AVX2 vector has at most 32 increasing slopes")
             };
-            VectorDecision::Advance { opposing, sequence }
+            VectorDecision::Advance {
+                opposing,
+                sequence,
+                bytes: 32,
+            }
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,bmi2")]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn classify_avx512(
+    previous: *const u8,
+    current: *const u8,
+    config: SeqCdcConfig,
+    opposing: u16,
+    sequence: u16,
+) -> VectorDecision {
+    use std::arch::x86_64::{__m512i, _mm512_cmpgt_epu8_mask, _mm512_loadu_si512};
+    // SAFETY: both callers establish 64 initialized readable bytes at each pointer.
+    let (previous, current) = unsafe {
+        (
+            _mm512_loadu_si512(previous.cast::<__m512i>()),
+            _mm512_loadu_si512(current.cast::<__m512i>()),
+        )
+    };
+    let greater = _mm512_cmpgt_epu8_mask(current, previous);
+    let lesser = _mm512_cmpgt_epu8_mask(previous, current);
+    if greater | lesser == 0 {
+        return VectorDecision::Advance {
+            opposing,
+            sequence,
+            bytes: 64,
+        };
+    }
+    let low = |bits: u64| u32::try_from(bits & u64::from(u32::MAX)).expect("32-bit mask");
+    match classify_masks(low(greater), low(lesser), config, opposing, sequence) {
+        VectorDecision::Advance {
+            opposing, sequence, ..
+        } => VectorDecision::Advance {
+            opposing,
+            sequence,
+            // Consume the equal upper half without another BMI2 state update.
+            // Otherwise continue at the next 32-byte boundary, preserving all
+            // scalar cut/skip ordering while using AVX-512 comparison masks.
+            bytes: if (greater | lesser) >> 32 == 0 {
+                64
+            } else {
+                32
+            },
+        },
+        early => early,
     }
 }
 
@@ -394,6 +561,52 @@ mod tests {
         minimum_bytes: 16 * 1_024,
         maximum_bytes: 256 * 1_024,
     };
+
+    #[test]
+    #[ignore = "release-mode scalar/AVX2/AVX-512 A/B on AVX-512 host"]
+    fn avx512_seqcdc_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        assert!(avx512_available());
+        for fixture in [0, 1] {
+            let mut state = 0x1234_5678_9abc_def0u64;
+            let bytes: Vec<u8> = (0..262144)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    if fixture == 0 {
+                        u8::try_from(state & 255).unwrap()
+                    } else {
+                        17
+                    }
+                })
+                .collect();
+            assert_eq!(seqcdc_cut_scalar(&bytes, CONFIG), unsafe {
+                cut_avx512(&bytes, CONFIG)
+            });
+            for variant in 0..4 {
+                let mut samples = vec![];
+                for _ in 0..9 {
+                    let start = Instant::now();
+                    for _ in 0..2000 {
+                        let cut = match variant {
+                            0 => seqcdc_cut_scalar(black_box(&bytes), CONFIG),
+                            1 => unsafe { cut_avx2_bmi2(black_box(&bytes), CONFIG) },
+                            2 => unsafe { cut_avx512(black_box(&bytes), CONFIG) },
+                            _ => seqcdc_cut(black_box(&bytes), CONFIG),
+                        };
+                        black_box(cut);
+                    }
+                    samples.push(start.elapsed().as_nanos() / 2000);
+                }
+                samples.sort_unstable();
+                eprintln!(
+                    "seqcdc fixture={fixture} variant={variant} ns_per_cut={}",
+                    samples[4]
+                );
+            }
+        }
+    }
 
     #[test]
     fn dispatcher_matches_scalar_on_random_and_low_entropy_inputs() {

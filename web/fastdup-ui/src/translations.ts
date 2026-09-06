@@ -1,5 +1,15 @@
 // German source messages keep familiar storage terminology.
 export const english: Record<string, string> = {
+  "SMB-Benutzer": "SMB users",
+  "SMB-Benutzer anlegen": "Create SMB user",
+  "SMB-Benutzername": "SMB username",
+  "SMB-Passwort": "SMB password",
+  "SMB-Passwort wiederholen": "Repeat SMB password",
+  "Diese Konten gelten für SMB-Freigaben. Sie haben keinen WebUI- oder SSH-Zugang.": "These accounts access SMB shares. They cannot sign in to the WebUI or SSH.",
+  "Noch keine SMB-Benutzer vorhanden.": "No SMB users yet.",
+  "SMB-Benutzer {name} wurde angelegt. Bitte in der Freigabe erlauben.": "SMB user {name} created. Allow this user in the share settings.",
+  "Small-File-Limit wegen kleinem Metadata-Volume von {requested} auf {effective} reduziert.": "Small-File limit reduced from {requested} to {effective} because the Metadata volume is small.",
+
   "Täglich in UTC, Format HH:MM-HH:MM. Leer lassen, um kein festes Zeitfenster vorzugeben.": "Daily in UTC, format HH:MM-HH:MM. Leave empty for no fixed schedule.",
   "Web-Benutzer": "Web users",
   "Zertifikate": "Certificates",

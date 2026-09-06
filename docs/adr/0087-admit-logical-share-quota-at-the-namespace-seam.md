@@ -33,8 +33,10 @@ Namespace ledger through the typed root-only management socket; the web process
 never owns or performs quota admission.
 
 Share `statfs` total equals the logical quota. Free and available bytes are the
-minimum of remaining logical quota and current Repository-wide physical
-availability. Physical commit-capacity admission remains independent and may
+remaining logical quota: `max(0, quota - logical allocated bytes)`. An empty
+Share therefore reports its entire quota free, even when that quota exceeds
+the physical Pool size. Physical availability does not masquerade as logical
+usage. Shares without a quota retain repository-wide physical reporting. Physical commit-capacity admission remains independent and may
 return `ENOSPC` before the logical quota when reduced data cannot fit on the
 actual Pools. A Logical Share quota is not a physical reservation or a promise
 that its nominal logical size can be reached for every workload.

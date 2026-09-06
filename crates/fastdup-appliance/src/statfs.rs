@@ -456,14 +456,8 @@ fn presented_snapshot(
     let quota_available_bytes = quota_available_bytes.unwrap_or(capacity_bytes);
     StatFsSnapshot::new(
         capacity_bytes,
-        snapshot
-            .free_bytes()
-            .min(capacity_bytes)
-            .min(quota_available_bytes),
-        snapshot
-            .available_bytes()
-            .min(capacity_bytes)
-            .min(quota_available_bytes),
+        capacity_bytes.min(quota_available_bytes),
+        capacity_bytes.min(quota_available_bytes),
         snapshot.files(),
         snapshot.free_files(),
         snapshot.block_size(),
@@ -601,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn presented_capacity_changes_geometry_without_inventing_availability() {
+    fn share_free_space_is_quota_minus_logical_allocation() {
         let physical = StatFsSnapshot::new(100_000, 80_000, 70_000, 100, 90, 4_096, 255)
             .expect("valid physical snapshot");
         let smaller = presented_snapshot(physical, 25_000, None).expect("smaller presentation");
@@ -611,8 +605,14 @@ mod tests {
 
         let larger = presented_snapshot(physical, 1_000_000, None).expect("larger presentation");
         assert_eq!(larger.capacity_bytes(), 1_000_000);
-        assert_eq!(larger.free_bytes(), 80_000);
-        assert_eq!(larger.available_bytes(), 70_000);
+        assert_eq!(larger.free_bytes(), 1_000_000);
+        assert_eq!(larger.available_bytes(), 1_000_000);
+        let used = presented_snapshot(physical, 1_000_000, Some(876_544)).unwrap();
+        assert_eq!(used.free_bytes(), 876_544);
+        assert_eq!(used.available_bytes(), 876_544);
+        let physically_full = StatFsSnapshot::new(100_000, 0, 0, 100, 90, 4096, 255).unwrap();
+        assert_eq!(presented_snapshot(physically_full, 1_000_000, Some(876_544)).unwrap().available_bytes(), 876_544);
+        assert_eq!(presented_snapshot(physical, 1_000_000, Some(0)).unwrap().available_bytes(), 0);
     }
 
     #[test]

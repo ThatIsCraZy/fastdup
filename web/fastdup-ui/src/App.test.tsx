@@ -682,3 +682,31 @@ describe("FastDup Control Plane UI", () => {
     expect(screen.getByText(/gemeinsamen kandidatenindex/i)).toBeVisible();
   });
 });
+
+it("loads inventory after interactive login without a browser reload", async () => {
+  let loggedIn = false;
+  const fetch = vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/session") && !loggedIn) return Promise.resolve(new Response("{}", { status: 401 }));
+    if (url.endsWith("/session/login")) loggedIn = true;
+    const body = url.endsWith("/session/login") ? { username: "admin", csrfToken: "csrf", mustChangePassword: false }
+      : url.endsWith("/principals") ? { users: [], groups: [] } : previewSnapshot;
+    return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+  });
+  vi.stubGlobal("fetch", fetch);
+  render(<App />);
+  fireEvent.change(await screen.findByLabelText("Passwort"), { target: { value: "test-password" } });
+  fireEvent.click(screen.getByRole("button", { name: "Anmelden" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Laufwerke" }));
+  await waitFor(() => expect(document.querySelectorAll(".target-card:enabled").length).toBeGreaterThan(0));
+});
+
+it("displays an adapted Small-File quota as a warning", async () => {
+ vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+   const url=String(input);
+   const body=url.endsWith("/session")?{username:"admin",csrfToken:"csrf",mustChangePassword:false}:url.endsWith("/principals")?{users:[],groups:[]}:{...previewSnapshot,telemetry:{...previewSnapshot.telemetry,smallFileQuota:{requestedBytes:68719476736,effectiveBytes:10737418240}}};
+   return Promise.resolve(new Response(JSON.stringify(body),{status:200}));
+ }));
+ render(<App/>);
+ expect(await screen.findByText(/Small-File-Limit wegen kleinem Metadata-Volume/)).toBeVisible();
+});

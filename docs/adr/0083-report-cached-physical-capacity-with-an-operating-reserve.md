@@ -17,6 +17,7 @@ mutation admission and `ENOSPC` remain authoritative.
 
 The reporting primitive remains separate from admission. ADR 0087 couples it
 to each managed Share's Logical Share quota: total bytes equal that quota, while
-free and available bytes never exceed either the remaining logical quota or the
-current repository-wide snapshot. The physical reserve and physical mutation
+free and available bytes equal quota minus POSIX-allocated logical bytes in
+that Share, saturated at zero. The physical snapshot does not clamp a Share
+with a logical quota. Shares without a quota retain physical reporting. The physical reserve and physical mutation
 admission in this record remain authoritative and independent.

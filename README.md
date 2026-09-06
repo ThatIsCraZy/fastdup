@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm">Download the RPM</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/fastdup-0.6.4-1.el10.x86_64.rpm">Download the RPM</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Product page</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6.1">Release notes</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6.4">Release notes</a>
 </p>
 
 fastdup is an experimental, software-defined single-node storage appliance for
@@ -29,6 +29,25 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > [!WARNING]
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
+
+## New in v0.6.4 · 6 September 2026
+
+- Share free space now equals logical quota minus logically allocated bytes.
+  Empty thin-provisioned shares no longer appear partly used by the physical
+  storage limit. Physical write admission remains independent.
+- Fix nested SMB directory creation for guest sessions (including VeeamZIP).
+- Add measured runtime AVX-512 acceleration with AVX2/scalar fallback.
+
+Guest and authenticated SMB access now use a dedicated storage identity and the
+required SELinux FUSE permission. Create SMB credentials under **Settings → SMB
+users**, then allow the user in the share settings. WebUI and Linux passwords do
+not automatically create SMB credentials. Windows guest restrictions remain a
+client policy; use an SMB account for authenticated access.
+
+Drive inventory loads immediately after login or the initial password change.
+On small Metadata volumes, an oversized Small-File quota is reduced automatically
+and a warning shows the requested and effective limits. The Metadata commit
+reserve remains protected. See [release notes](docs/releases/v0.6.4.md).
 
 ## New in v0.6.1 · 6 September 2026
 
@@ -129,11 +148,11 @@ You need:
 Download and install the current binary package:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/fastdup-0.6.4-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.6.1-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.6.4-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

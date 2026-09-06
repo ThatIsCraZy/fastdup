@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
-import { WebUsersSettings, CertificateSettings } from './settings-access';
+import { SambaUsersSettings, WebUsersSettings, CertificateSettings } from './settings-access';
 import { I18nProvider } from './i18n';
 afterEach(cleanup);
 it('creates a web account, requires matching passwords, and clears the secret', async()=>{
@@ -25,4 +25,18 @@ it('keeps the displayed certificate on failed PFX import',async()=>{
  fireEvent.submit(screen.getByRole('button',{name:'Importieren & aktivieren'}).closest('form')!);
  await waitFor(()=>expect(screen.getByRole('alert')).toHaveTextContent('Invalid PFX password'));
  expect(updated).not.toHaveBeenCalled();expect(screen.getByText('AA:BB')).toBeVisible();
+});
+
+it('creates an SMB account and refreshes share principals without exposing its password', async () => {
+ const request=vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce({username:'backup'});
+ const created=vi.fn();
+ render(<I18nProvider><SambaUsersSettings request={request} onCreated={created}/></I18nProvider>);
+ await waitFor(()=>expect(request).toHaveBeenCalledWith('/api/v1/samba/users'));
+ fireEvent.change(screen.getByLabelText('SMB-Benutzername'),{target:{value:'backup'}});
+ fireEvent.change(screen.getByLabelText('SMB-Passwort'),{target:{value:'test-backup-password'}});
+ fireEvent.change(screen.getByLabelText('SMB-Passwort wiederholen'),{target:{value:'test-backup-password'}});
+ fireEvent.submit(screen.getByRole('button',{name:'SMB-Benutzer anlegen'}).closest('form')!);
+ expect(await screen.findByRole('status')).toHaveTextContent('backup');
+ expect(created).toHaveBeenCalledOnce();
+ expect(screen.getByLabelText('SMB-Passwort')).toHaveValue('');
 });

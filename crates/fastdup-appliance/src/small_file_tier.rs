@@ -17,6 +17,7 @@ pub struct SmallFileTierIsolation {
     root: PathBuf,
     project_id: u32,
     hard_limit_bytes: u64,
+    requested_limit_bytes: u64,
     enforced: bool,
 }
 
@@ -66,6 +67,7 @@ impl SmallFileTierIsolation {
                 root,
                 project_id,
                 hard_limit_bytes,
+                requested_limit_bytes: hard_limit_bytes,
                 enforced: false,
             });
         }
@@ -75,11 +77,10 @@ impl SmallFileTierIsolation {
             .f_blocks
             .checked_mul(statistics.f_frsize.max(1))
             .ok_or(SmallFileTierIsolationError::InvalidConfiguration)?;
-        let maximum_noncritical = capacity_bytes
-            .checked_sub(COMMIT_METADATA_FLOOR_BYTES_V1)
-            .ok_or(SmallFileTierIsolationError::MetadataReserveAtRisk)?;
-        if hard_limit_bytes > maximum_noncritical {
-            return Err(SmallFileTierIsolationError::MetadataReserveAtRisk);
+        let requested_limit_bytes = hard_limit_bytes;
+        let hard_limit_bytes = effective_quota(capacity_bytes, requested_limit_bytes)?;
+        if hard_limit_bytes < requested_limit_bytes {
+            eprintln!("warning=small_file_quota_reduced requested_bytes={requested_limit_bytes} effective_bytes={hard_limit_bytes} metadata_capacity_bytes={capacity_bytes}");
         }
 
         let project_command = format!("chproj -R {project_id}");
@@ -105,6 +106,7 @@ impl SmallFileTierIsolation {
             root,
             project_id,
             hard_limit_bytes,
+            requested_limit_bytes,
             enforced: true,
         })
     }
@@ -117,6 +119,11 @@ impl SmallFileTierIsolation {
     #[must_use]
     pub const fn project_id(&self) -> u32 {
         self.project_id
+    }
+
+    #[must_use]
+    pub const fn requested_limit_bytes(&self) -> u64 {
+        self.requested_limit_bytes
     }
 
     #[must_use]
@@ -208,5 +215,30 @@ impl std::error::Error for SmallFileTierIsolationError {}
 impl From<io::Error> for SmallFileTierIsolationError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+// Oversized configuration is a capacity hint, not a reason to reject a healthy
+// Metadata filesystem. Keep ample metadata headroom when adapting the default.
+fn effective_quota(capacity: u64, requested: u64) -> Result<u64, SmallFileTierIsolationError> {
+    let available = capacity.checked_sub(COMMIT_METADATA_FLOOR_BYTES_V1)
+        .ok_or(SmallFileTierIsolationError::MetadataReserveAtRisk)?;
+    let limit = if requested <= available { requested } else { (capacity / 5).min(available) / 1024 * 1024 };
+    if limit == 0 { return Err(SmallFileTierIsolationError::MetadataReserveAtRisk); }
+    Ok(limit)
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+    #[test]
+    fn small_metadata_adapts_the_default_without_consuming_the_commit_floor() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(effective_quota(50 * gib, 64 * gib).unwrap(), 10 * gib);
+        assert_eq!(effective_quota(100 * gib, 64 * gib).unwrap(), 64 * gib);
+        assert_eq!(effective_quota(50 * gib, 8 * gib).unwrap(), 8 * gib);
+        let capacity = COMMIT_METADATA_FLOOR_BYTES_V1 + 8192;
+        assert_eq!(effective_quota(capacity, 64 * gib).unwrap(), 8192);
+        assert!(effective_quota(COMMIT_METADATA_FLOOR_BYTES_V1, 64 * gib).is_err());
     }
 }

@@ -333,6 +333,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let small_file_isolation =
         SmallFileTierIsolation::prepare(&metadata_root, pool_isolation_policy)?;
     emit_small_file_tier(&small_file_isolation);
+    if let Some(path) = std::env::var_os("FASTDUP_SMALL_FILE_QUOTA_STATUS") {
+        let path = PathBuf::from(path);
+        let status = serde_json::json!({
+            "requestedBytes": small_file_isolation.requested_limit_bytes(),
+            "effectiveBytes": small_file_isolation.hard_limit_bytes(),
+        });
+        let staged = path.with_extension("json.staged");
+        // Ephemeral, derived management information; never recovery authority.
+        if let Err(error) = std::fs::write(&staged, status.to_string()).and_then(|()| std::fs::rename(&staged, &path)) {
+            eprintln!("warning=small_file_quota_status_unavailable error={error}");
+        }
+    }
     let small_file_root = small_file_isolation.root().to_path_buf();
     let capacity_source = TieredStatFsSource::open_with_small_file_tier(
         &container_root,

@@ -187,6 +187,7 @@ impl SystemSampler {
             .and_then(filesystem_usage)
             .unwrap_or((0, 0));
         TelemetrySnapshot {
+            small_file_quota: None,
             details: None,
             sequence: self.sequence,
             observed_at,

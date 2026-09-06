@@ -55,6 +55,12 @@ pub trait ApplianceControl: Send + Sync {
         command: Command,
         idempotency_key: String,
     ) -> Result<JobStatus, ControlProblem>;
+    async fn samba_users(&self) -> Result<Vec<String>, ControlProblem> {
+        Err(ControlProblem::new("unsupported", "SMB account management is unavailable"))
+    }
+    async fn create_samba_user(&self, _request: crate::SambaUserRequest) -> Result<(), ControlProblem> {
+        Err(ControlProblem::new("unsupported", "SMB account management is unavailable"))
+    }
     fn subscribe(&self) -> broadcast::Receiver<ControlEvent>;
 }
 
@@ -130,7 +136,7 @@ impl AgentControl {
     async fn inspect_remote(&self) -> Result<ApplianceSnapshot, ControlProblem> {
         match self.request(AgentOperation::Inspect).await? {
             AgentResult::Snapshot { snapshot } => Ok(*snapshot),
-            AgentResult::Job { .. } => Err(ControlProblem::new(
+            _ => Err(ControlProblem::new(
                 "protocol_mismatch",
                 "Expected snapshot",
             )),
@@ -140,6 +146,19 @@ impl AgentControl {
 
 #[async_trait]
 impl ApplianceControl for AgentControl {
+    async fn samba_users(&self) -> Result<Vec<String>, ControlProblem> {
+        match self.request(AgentOperation::SambaUsers).await? {
+            AgentResult::SambaUsers { users } => Ok(users),
+            _ => Err(ControlProblem::new("protocol_mismatch", "Expected SMB users")),
+        }
+    }
+    async fn create_samba_user(&self, request: crate::SambaUserRequest) -> Result<(), ControlProblem> {
+        match self.request(AgentOperation::CreateSambaUser { request }).await? {
+            AgentResult::SambaUserCreated => Ok(()),
+            _ => Err(ControlProblem::new("protocol_mismatch", "Expected SMB account result")),
+        }
+    }
+
     async fn inspect(&self) -> Result<ApplianceSnapshot, ControlProblem> {
         self.inspect_remote().await
     }
@@ -157,7 +176,7 @@ impl ApplianceControl for AgentControl {
             .await?
         {
             AgentResult::Job { job } => Ok(job),
-            AgentResult::Snapshot { .. } => {
+            _ => {
                 Err(ControlProblem::new("protocol_mismatch", "Expected job"))
             }
         }
@@ -373,6 +392,9 @@ impl AgentRuntime {
             }
             sampler.sample()
         };
+        snapshot.small_file_quota = if frontend.is_some() {
+            std::fs::read("/run/fastdup/small-file-quota.json").ok().and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        } else { None };
         snapshot.details = frontend.as_ref().map(|frontend| Box::new(frontend.details.clone()));
         if let Some(checkpoint) = snapshot.details.as_ref().and_then(|d| d.runtime.as_ref()).and_then(|r| r.checkpoint.as_ref()) {
             snapshot.commit_generation = Some(checkpoint.generation);
@@ -892,6 +914,13 @@ impl AgentRuntime {
         let request_id = request.request_id.clone();
         let result = if request.version == AGENT_PROTOCOL_VERSION {
             match request.operation {
+                AgentOperation::SambaUsers => crate::samba_users::list().map(|users| AgentResult::SambaUsers { users }),
+                AgentOperation::CreateSambaUser { request } => {
+                    static ACCOUNTS: Mutex<()> = Mutex::new(());
+                    let _guard = ACCOUNTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    crate::samba_users::create(&request).map(|()| AgentResult::SambaUserCreated)
+                }
+
                 AgentOperation::Inspect => self.inspect().map(|snapshot| AgentResult::Snapshot {
                     snapshot: Box::new(snapshot),
                 }),
@@ -1258,7 +1287,7 @@ fn sync_share_capacities(shares: &[ShareSettings]) -> Result<(), ControlProblem>
     let mut reduction_rules = Vec::new();
     for share in shares {
         let path = SambaConfig::share_path(share);
-        std::fs::create_dir_all(&path).map_err(problem("share_directory"))?;
+        SambaConfig::prepare_share_directory(share).map_err(problem("share_directory"))?;
         if let Some(policy) = share.advanced_reduction {
             reduction_rules.push(serde_json::json!({
                 "inode": std::fs::metadata(&path).map_err(problem("share_directory"))?.ino(),

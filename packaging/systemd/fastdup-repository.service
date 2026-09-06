@@ -11,6 +11,7 @@ EnvironmentFile=-/etc/fastdup/repository.env
 Environment=FASTDUP_REQUIRE_CGROUP_NO_SWAP=1
 Environment=FASTDUP_POOL_ISOLATION=required
 Environment=FASTDUP_SMALL_FILE_QUOTA_BYTES=68719476736
+Environment=FASTDUP_SMALL_FILE_QUOTA_STATUS=/run/fastdup/small-file-quota.json
 Environment=FASTDUP_SMALL_FILE_PROJECT_ID=17988
 Environment=FASTDUP_IO_TELEMETRY=1
 Environment=FASTDUP_SHARE_CAPACITY_MANIFEST=/etc/fastdup/share-capacities.json

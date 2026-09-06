@@ -1,4 +1,4 @@
-import { WebUsersSettings, CertificateSettings } from "./settings-access";
+import { SambaUsersSettings, WebUsersSettings, CertificateSettings } from "./settings-access";
 import { RecentJobs } from "./recent-jobs";
 import { DetailTelemetryPanel } from "./detail-telemetry";
 import { appendResourceSample, resourceChartOption, type ResourceSample } from "./resource-history";
@@ -1715,8 +1715,8 @@ function EventsPage({
   );
 }
 
-function SettingsPage({ settings, fingerprint, save, password, regenerateTls, csrfToken, username, onCertificateChanged }: {
-  settings: RepositorySettings; fingerprint: string; save: (value: RepositorySettings) => void;
+function SettingsPage({ settings, fingerprint, save, password, regenerateTls, csrfToken, username, onCertificateChanged, onSambaUserCreated }: {
+  onSambaUserCreated: () => void; settings: RepositorySettings; fingerprint: string; save: (value: RepositorySettings) => void;
   password: () => void; regenerateTls: () => void; csrfToken: string; username: string; onCertificateChanged: (fingerprint: string) => void;
 }) {
   const { t } = useI18n();
@@ -1732,7 +1732,7 @@ function SettingsPage({ settings, fingerprint, save, password, regenerateTls, cs
       {section === "Repository" && <Button variant="secondary" disabled={!validPressure} onClick={() => save(draft)}><Save size={15}/>{t("Übernehmen")}</Button>}
     </div>
     <nav className="settings-nav" aria-label={t("Einstellungsbereiche")}>
-      {["Repository", "Web-Benutzer", "Zertifikate"].map(name => <button key={name} aria-pressed={section === name} onClick={() => setSection(name)}>{t(name)}</button>)}
+      {["Repository", "Web-Benutzer", "SMB-Benutzer", "Zertifikate"].map(name => <button key={name} aria-pressed={section === name} onClick={() => setSection(name)}>{t(name)}</button>)}
     </nav>
     {section === "Repository" && <div className="settings-cards">
       <Card><CardHeader><div><h2>{t("Start & Datenablage")}</h2><p>{t("Startverhalten, Datenreduktion und Dateien auf dem schnellen Metadata-Tier.")}</p></div></CardHeader><CardContent className="settings-form">
@@ -1811,6 +1811,7 @@ function SettingsPage({ settings, fingerprint, save, password, regenerateTls, cs
 
       </CardContent></Card>
     </div>}
+    {section === "SMB-Benutzer" && <SambaUsersSettings request={request} onCreated={onSambaUserCreated}/>}
     {section === "Web-Benutzer" && <WebUsersSettings request={request} username={username} changePassword={password}/>}
     {section === "Zertifikate" && <CertificateSettings request={request} fingerprint={fingerprint} regenerate={regenerateTls} onImported={onCertificateChanged}/>}
   </>;
@@ -1977,7 +1978,7 @@ function Login({ onLogin }: { onLogin: (session: SessionInfo) => void }) {
 }
 
 function Application() {
-  const { t, language, setLanguage } = useI18n();
+  const { t, locale, language, setLanguage } = useI18n();
   const [active, setActive] = useState("Übersicht");
   const workspaceScroll = useRef<HTMLElement>(null);
   useEffect(() => { if (workspaceScroll.current) workspaceScroll.current.scrollTop = 0; }, [active]);
@@ -2057,18 +2058,15 @@ function Application() {
     api<SessionInfo>("/api/v1/session")
       .then((value) => {
         setSession(value);
-        if (!value.mustChangePassword) void refresh();
-        if (!value.mustChangePassword)
-          void api<{ users: string[]; groups: string[] }>(
-            "/api/v1/samba/principals",
-          )
-            .then(setPrincipals)
-            .catch(() => setPrincipals({ users: [], groups: [] }));
+
       })
       .catch(() => setSession(null));
   }, [refresh]);
   useEffect(() => {
     if (!session || session.mustChangePassword) return;
+    void refresh();
+    void api<{ users: string[]; groups: string[] }>("/api/v1/samba/principals")
+      .then(setPrincipals).catch(() => setPrincipals({ users: [], groups: [] }));
     const source = new EventSource("/api/v1/events", { withCredentials: true });
     source.addEventListener("snapshot", (event) => {
       const telemetry = JSON.parse(
@@ -2374,6 +2372,7 @@ function Application() {
   else
     content = (
       <SettingsPage
+        onSambaUserCreated={() => { void api<{users: string[]; groups: string[]}>("/api/v1/samba/principals").then(setPrincipals).catch(() => setPrincipals({users: [], groups: []})); }}
         csrfToken={session.csrfToken}
         username={session.username}
         onCertificateChanged={fingerprint => {
@@ -2485,7 +2484,9 @@ function Application() {
             </div>
           </div>
         </header>
-        <div className="page-content">{content}</div>
+        <div className="page-content">
+          {snapshot.telemetry.smallFileQuota && snapshot.telemetry.smallFileQuota.effectiveBytes < snapshot.telemetry.smallFileQuota.requestedBytes && <div className="alarm-banner" role="status"><AlertTriangle/><span>{t("Small-File-Limit wegen kleinem Metadata-Volume von {requested} auf {effective} reduziert.", { requested: formatBytes(snapshot.telemetry.smallFileQuota.requestedBytes, locale), effective: formatBytes(snapshot.telemetry.smallFileQuota.effectiveBytes, locale) })}</span></div>}
+          {content}</div>
       </main>
       {!session.mustChangePassword && <RecentJobs jobs={snapshot.jobs} />}
       {uiPreferencesOpen && <UiPreferencesDialog language={language} saving={savingLanguage} error={languageError}
