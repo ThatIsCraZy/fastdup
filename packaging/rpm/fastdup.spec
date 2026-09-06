@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.6.4
-Release:        11%{?dist}
+Release:        12%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,12 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Mon Sep 07 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-12
+- Share cache RAM by measured benefit with a 92-percent operating ceiling.
+- Expose cache budgets, tier priorities and reservations in the WebUI.
+- Partition large logical Manifest layouts and keep mixed shrink updates path-local.
+- Bind GC catalog bootstrap counts to one concurrent-publication name snapshot.
+
 * Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-8
 - Serve management requests independently of checkpoint waits.
 - Read reduction telemetry without locking ingest lanes.
