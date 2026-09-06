@@ -14,7 +14,7 @@ use fastdup_copy_metrics::{CopyClass, record_copy};
 use fastdup_format::{
     ChunkId, CommitRecord, ContainerId, DurableInode, DurableRootMetadata, DurableTimes,
     DurableTimestamp, DurableXattr, ExactIndexEntry, ExactIndexProfileId,
-    IncompressibilityGateMetrics, MAX_LOGICAL_CHUNK_BYTES, ManifestExtent, ManifestLeaf,
+    IncompressibilityGateMetrics, MAX_LOGICAL_CHUNK_BYTES, ManifestExtent, ManifestLayout,
     MetadataFormatError, MetadataObjectId, NamespaceEntry, NamespaceRoot, PolicySetId,
     PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
 };
@@ -5732,7 +5732,7 @@ where
                 ManifestPublication::Complete { manifest } => {
                     let proof = self
                         .generations
-                        .stage_manifest_successor(predecessor, manifest)?;
+                        .stage_manifest_layout_successor(predecessor, manifest)?;
                     (proof.summary().root(), proof)
                 }
             };
@@ -5984,7 +5984,7 @@ enum ManifestPublication {
         allocated_bytes: u64,
     },
     Complete {
-        manifest: ManifestLeaf,
+        manifest: ManifestLayout,
     },
 }
 
@@ -6024,90 +6024,11 @@ fn plan_checkpoint_manifest<M: StorageIo, C: StorageIo>(
         return plan_append_manifest(inode, previous, writer);
     }
 
-    if let Some(previous) = previous
-        && previous.logical_size < logical_size
-    {
+    if let Some(previous) = previous {
         return plan_path_local_manifest(inode, previous, &changed, generations, writer);
     }
-
-    if let Some(previous) = previous
-        && previous.logical_size > logical_size
-        && changed.is_empty()
-    {
-        return plan_truncate_manifest(inode, previous, generations, writer);
-    }
-
-    let previous_manifest = match previous {
-        Some(previous) if previous.logical_size <= logical_size => {
-            Some(generations.read_manifest(previous.root)?)
-        }
-        Some(_) | None => None,
-    };
-    let manifest = plan_manifest(inode, previous_manifest.as_ref(), writer)?;
+    let manifest = plan_full_manifest(inode, writer)?;
     Ok(ManifestPublication::Complete { manifest })
-}
-
-fn plan_truncate_manifest<M: StorageIo, C: StorageIo>(
-    inode: &CommitInode,
-    previous: InstalledManifest,
-    generations: &GenerationRepository<M>,
-    writer: &mut AdaptiveCommitWriter<'_, C>,
-) -> Result<ManifestPublication, DurableNamespaceError> {
-    let logical_size = inode.logical_size();
-    assert!(
-        logical_size < previous.logical_size,
-        "ASSERT: truncate plan must shrink the file"
-    );
-    let mut replacements = Vec::new();
-    if logical_size > 0 {
-        let boundary = generations.read_manifest_range(
-            previous.root,
-            previous.logical_size,
-            logical_size - 1..logical_size,
-        )?;
-        let extent = boundary
-            .first()
-            .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
-        let extent_end = extent
-            .logical_offset()
-            .checked_add(extent_length(extent.extent()))
-            .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
-        if matches!(extent.extent(), ManifestExtent::Data { .. }) && extent_end > logical_size {
-            let prefix_length = logical_size
-                .checked_sub(extent.logical_offset())
-                .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
-            let mut stack = Vec::new();
-            stack
-                .try_reserve_exact(128)
-                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-            let mut extents = Vec::new();
-            plan_manifest_range_with_prepared(
-                inode,
-                extent.logical_offset(),
-                prefix_length,
-                writer,
-                &mut stack,
-                &mut extents,
-            )?;
-            assert!(
-                stack.is_empty(),
-                "ASSERT: truncate boundary planner must consume its complete work stack"
-            );
-            extents.push(ManifestExtent::Hole {
-                logical_length: extent_end - logical_size,
-            });
-            replacements.push(ManifestReplacement {
-                replaced: extent.logical_offset()..extent_end,
-                extents,
-            });
-        }
-    }
-    Ok(ManifestPublication::Truncate {
-        previous: previous.summary,
-        replacements,
-        logical_size,
-        allocated_bytes: inode.allocated_bytes(),
-    })
 }
 
 fn plan_append_manifest<C: StorageIo>(
@@ -6163,31 +6084,9 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
     generations: &GenerationRepository<M>,
     writer: &mut AdaptiveCommitWriter<'_, C>,
 ) -> Result<ManifestPublication, DurableNamespaceError> {
-    assert!(
-        previous.logical_size <= inode.logical_size(),
-        "ASSERT: path-local replacement retains the previous logical range"
-    );
-    let mut rewrites = rewrite_ranges_before(changed, inode.logical_size(), previous.logical_size)?;
-    for rewrite in &mut rewrites {
-        let touched = generations.read_manifest_range(
-            previous.root,
-            previous.logical_size,
-            rewrite.start..rewrite.end,
-        )?;
-        for extent in touched {
-            if !matches!(extent.extent(), ManifestExtent::Data { .. }) {
-                continue;
-            }
-            let extent_end = extent
-                .logical_offset()
-                .checked_add(extent_length(extent.extent()))
-                .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
-            rewrite.start = rewrite.start.min(extent.logical_offset());
-            rewrite.end = rewrite.end.max(extent_end);
-        }
-    }
-    coalesce_rewrites(&mut rewrites);
-
+    let logical_size = inode.logical_size();
+    let shrinking = logical_size < previous.logical_size;
+    let rewrites = manifest_rewrites(logical_size, previous, changed, generations)?;
     let mut replacements = Vec::new();
     replacements
         .try_reserve_exact(rewrites.len())
@@ -6208,7 +6107,7 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
         plan_manifest_range_with_prepared(
             inode,
             rewrite.start,
-            rewrite.end - rewrite.start,
+            rewrite.end.min(logical_size) - rewrite.start,
             writer,
             &mut stack,
             &mut extents,
@@ -6217,12 +6116,12 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
             stack.is_empty(),
             "ASSERT: path-local range planner must consume its complete work stack"
         );
-        let mut verified_extents = Vec::new();
-        verified_extents
-            .try_reserve_exact(extents.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        verified_extents.extend_from_slice(&extents);
-        ManifestLeaf::new(rewrite.end - rewrite.start, verified_extents)?;
+        if rewrite.end > logical_size {
+            extents.push(ManifestExtent::Hole {
+                logical_length: rewrite.end - logical_size,
+            });
+        }
+        ManifestLayout::validate(rewrite.end - rewrite.start, &extents)?;
         let added = manifest_extent_allocation(&extents)?;
         allocated_bytes = allocated_bytes
             .checked_sub(removed)
@@ -6247,6 +6146,14 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
             .checked_add(manifest_extent_allocation(&appended)?)
             .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
     }
+    if shrinking {
+        return Ok(ManifestPublication::Truncate {
+            previous: previous.summary,
+            replacements,
+            logical_size,
+            allocated_bytes: inode.allocated_bytes(),
+        });
+    }
     if allocated_bytes != inode.allocated_bytes() {
         return Err(DurableNamespaceError::FrozenViewMismatch);
     }
@@ -6255,6 +6162,61 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
         replacements,
         appended,
     })
+}
+
+fn manifest_rewrites<M: StorageIo>(
+    logical_size: u64,
+    previous: InstalledManifest,
+    changed: &[CommitRange],
+    generations: &GenerationRepository<M>,
+) -> Result<Vec<RewriteRange>, DurableNamespaceError> {
+    let mut rewrites = rewrite_ranges_before(
+        changed,
+        logical_size,
+        previous.logical_size.min(logical_size),
+    )?;
+    if logical_size < previous.logical_size && logical_size > 0 {
+        let boundary = generations.read_manifest_range(
+            previous.root,
+            previous.logical_size,
+            logical_size - 1..logical_size,
+        )?;
+        let extent = boundary
+            .first()
+            .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
+        let end = extent
+            .logical_offset()
+            .checked_add(extent_length(extent.extent()))
+            .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+        if matches!(extent.extent(), ManifestExtent::Data { .. }) && end > logical_size {
+            rewrites.push(RewriteRange {
+                start: extent.logical_offset(),
+                end,
+            });
+            rewrites.sort_unstable_by_key(|range| range.start);
+        }
+    }
+    for rewrite in &mut rewrites {
+        let touched = generations.read_manifest_range(
+            previous.root,
+            previous.logical_size,
+            rewrite.start..rewrite.end,
+        )?;
+        for extent in touched {
+            if !matches!(extent.extent(), ManifestExtent::Data { .. }) {
+                continue;
+            }
+            let extent_end = extent
+                .logical_offset()
+                .checked_add(extent_length(extent.extent()))
+                .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+            rewrite.start = rewrite.start.min(extent.logical_offset());
+            rewrite.end = rewrite.end.max(extent_end);
+        }
+    }
+    coalesce_rewrites(&mut rewrites);
+
+    Ok(rewrites)
 }
 
 fn manifest_extent_allocation(extents: &[ManifestExtent]) -> Result<u64, DurableNamespaceError> {
@@ -6348,43 +6310,27 @@ fn load_manifest_cache<I: StorageIo>(
     Ok(manifests)
 }
 
-fn plan_manifest<C: StorageIo>(
-    inode: &CommitInode,
-    previous: Option<&ManifestLeaf>,
-    writer: &mut AdaptiveCommitWriter<'_, C>,
-) -> Result<ManifestLeaf, DurableNamespaceError> {
-    let logical_size = inode.logical_size();
-    if logical_size == 0 {
-        if inode.allocated_bytes() != 0 {
-            return Err(DurableNamespaceError::FrozenViewMismatch);
-        }
-        return ManifestLeaf::new(0, Vec::new()).map_err(Into::into);
-    }
-    let changed = inode.changed_ranges()?;
-    if let Some(previous) = previous
-        && previous.file_length() <= logical_size
-    {
-        if changed.is_empty() && previous.file_length() == logical_size {
-            verify_manifest_allocation(previous, inode)?;
-            return Ok(previous.clone());
-        }
-        return plan_incremental_manifest(inode, previous, &changed, writer);
-    }
-    plan_full_manifest(inode, writer)
-}
-
 fn plan_full_manifest<C: StorageIo>(
     inode: &CommitInode,
     writer: &mut AdaptiveCommitWriter<'_, C>,
-) -> Result<ManifestLeaf, DurableNamespaceError> {
+) -> Result<ManifestLayout, DurableNamespaceError> {
     let logical_size = inode.logical_size();
     let mut stack = Vec::new();
     stack
         .try_reserve_exact(128)
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
     let mut extents = Vec::new();
-    plan_manifest_range_with_prepared(inode, 0, logical_size, writer, &mut stack, &mut extents)?;
-    let manifest = ManifestLeaf::new(logical_size, extents)?;
+    if logical_size != 0 {
+        plan_manifest_range_with_prepared(
+            inode,
+            0,
+            logical_size,
+            writer,
+            &mut stack,
+            &mut extents,
+        )?;
+    }
+    let manifest = ManifestLayout::new(logical_size, extents)?;
     verify_manifest_allocation(&manifest, inode)?;
     Ok(manifest)
 }
@@ -6393,122 +6339,6 @@ fn plan_full_manifest<C: StorageIo>(
 struct RewriteRange {
     start: u64,
     end: u64,
-}
-
-#[derive(Clone, Copy)]
-struct LocatedExtent<'a> {
-    start: u64,
-    end: u64,
-    extent: &'a ManifestExtent,
-}
-
-fn plan_incremental_manifest<C: StorageIo>(
-    inode: &CommitInode,
-    previous: &ManifestLeaf,
-    changed: &[CommitRange],
-    writer: &mut AdaptiveCommitWriter<'_, C>,
-) -> Result<ManifestLeaf, DurableNamespaceError> {
-    assert!(
-        previous.file_length() <= inode.logical_size(),
-        "ASSERT: incremental planning cannot preserve bytes beyond the new EOF"
-    );
-    assert!(
-        !changed.is_empty() || previous.file_length() < inode.logical_size(),
-        "ASSERT: incremental planning requires a changed range or an append"
-    );
-    let located = locate_extents(previous)?;
-    let previous_length = previous.file_length();
-    let logical_size = inode.logical_size();
-    let mut rewrites = rewrite_ranges_before(changed, logical_size, previous_length)?;
-    if previous_length < logical_size {
-        // A completed SeqCDC Chunk is a reset point. Replaying the final DATA
-        // Chunk therefore reconstructs exactly the CDC state needed for an
-        // appended suffix while bounding old-prefix work by the format maximum.
-        // FILL and HOLE already force a region boundary and need no replay.
-        let append_start = located.last().map_or(0, |last| {
-            if matches!(last.extent, ManifestExtent::Data { .. }) {
-                last.start
-            } else {
-                previous_length
-            }
-        });
-        rewrites
-            .try_reserve(1)
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        rewrites.push(RewriteRange {
-            start: append_start,
-            end: logical_size,
-        });
-        rewrites.sort_unstable_by_key(|rewrite| rewrite.start);
-    }
-    expand_rewrites_over_data(&mut rewrites, &located)?;
-    coalesce_rewrites(&mut rewrites);
-
-    let capacity = previous
-        .extents()
-        .len()
-        .checked_add(rewrites.len())
-        .ok_or(DurableNamespaceError::OutOfMemory)?;
-    let mut extents = Vec::new();
-    extents
-        .try_reserve_exact(capacity)
-        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-    let mut cursor = 0_u64;
-    let mut stack = Vec::new();
-    stack
-        .try_reserve_exact(128)
-        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-    for rewrite in rewrites {
-        if rewrite.start < cursor || rewrite.end > logical_size {
-            return Err(DurableNamespaceError::FrozenViewMismatch);
-        }
-        if rewrite.start > previous_length {
-            return Err(DurableNamespaceError::FrozenViewMismatch);
-        }
-        preserve_range(&located, cursor, rewrite.start, &mut extents)?;
-        plan_manifest_range_with_prepared(
-            inode,
-            rewrite.start,
-            rewrite.end - rewrite.start,
-            writer,
-            &mut stack,
-            &mut extents,
-        )?;
-        assert!(
-            stack.is_empty(),
-            "ASSERT: range planner must consume its complete work stack"
-        );
-        cursor = rewrite.end;
-    }
-    if cursor < previous_length {
-        preserve_range(&located, cursor, previous_length, &mut extents)?;
-    } else if cursor != logical_size {
-        return Err(DurableNamespaceError::FrozenViewMismatch);
-    }
-    let manifest = ManifestLeaf::new(logical_size, extents)?;
-    verify_manifest_allocation(&manifest, inode)?;
-    Ok(manifest)
-}
-
-fn locate_extents(
-    manifest: &ManifestLeaf,
-) -> Result<Vec<LocatedExtent<'_>>, DurableNamespaceError> {
-    let mut located = Vec::new();
-    located
-        .try_reserve_exact(manifest.extents().len())
-        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-    let mut start = 0_u64;
-    for extent in manifest.extents() {
-        let end = start
-            .checked_add(extent_length(extent))
-            .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
-        located.push(LocatedExtent { start, end, extent });
-        start = end;
-    }
-    if start != manifest.file_length() {
-        return Err(DurableNamespaceError::FrozenViewMismatch);
-    }
-    Ok(located)
 }
 
 fn rewrite_ranges_before(
@@ -6558,31 +6388,6 @@ fn rewrite_ranges_before(
     Ok(rewrites)
 }
 
-fn expand_rewrites_over_data(
-    rewrites: &mut [RewriteRange],
-    located: &[LocatedExtent<'_>],
-) -> Result<(), DurableNamespaceError> {
-    for rewrite in rewrites {
-        let first = located.partition_point(|extent| extent.end <= rewrite.start);
-        for extent in &located[first..] {
-            if extent.start >= rewrite.end {
-                break;
-            }
-            if extent.end <= rewrite.start {
-                continue;
-            }
-            if matches!(extent.extent, ManifestExtent::Data { .. }) {
-                rewrite.start = rewrite.start.min(extent.start);
-                rewrite.end = rewrite.end.max(extent.end);
-            }
-        }
-        if rewrite.start >= rewrite.end {
-            return Err(DurableNamespaceError::FrozenViewMismatch);
-        }
-    }
-    Ok(())
-}
-
 fn coalesce_rewrites(rewrites: &mut Vec<RewriteRange>) {
     let mut output = 0_usize;
     for input in 0..rewrites.len() {
@@ -6620,85 +6425,6 @@ fn coalesced_ranges(ranges: &[Range<u64>]) -> Result<Vec<Range<u64>>, DurableNam
         }
     }
     Ok(output)
-}
-
-fn preserve_range(
-    located: &[LocatedExtent<'_>],
-    start: u64,
-    end: u64,
-    output: &mut Vec<ManifestExtent>,
-) -> Result<(), DurableNamespaceError> {
-    if start == end {
-        return Ok(());
-    }
-    if start > end {
-        return Err(DurableNamespaceError::FrozenViewMismatch);
-    }
-    let first = located.partition_point(|extent| extent.end <= start);
-    let mut cursor = start;
-    for located_extent in &located[first..] {
-        if located_extent.start >= end {
-            break;
-        }
-        let overlap_start = located_extent.start.max(start);
-        let overlap_end = located_extent.end.min(end);
-        if overlap_start != cursor || overlap_start >= overlap_end {
-            return Err(DurableNamespaceError::FrozenViewMismatch);
-        }
-        let logical_length = overlap_end - overlap_start;
-        let extent = match located_extent.extent {
-            ManifestExtent::Data {
-                logical_length: original_length,
-                chunk_id,
-            } => {
-                if overlap_start == located_extent.start
-                    && overlap_end == located_extent.end
-                    && logical_length == *original_length
-                {
-                    ManifestExtent::Data {
-                        logical_length,
-                        chunk_id: *chunk_id,
-                    }
-                } else {
-                    ManifestExtent::DataSlice {
-                        logical_length,
-                        chunk_id: *chunk_id,
-                        chunk_length: u32::try_from(*original_length)
-                            .map_err(|_| DurableNamespaceError::ArithmeticOverflow)?,
-                        chunk_offset: u32::try_from(overlap_start - located_extent.start)
-                            .map_err(|_| DurableNamespaceError::ArithmeticOverflow)?,
-                    }
-                }
-            }
-            ManifestExtent::DataSlice {
-                chunk_id,
-                chunk_length,
-                chunk_offset,
-                ..
-            } => ManifestExtent::DataSlice {
-                logical_length,
-                chunk_id: *chunk_id,
-                chunk_length: *chunk_length,
-                chunk_offset: chunk_offset
-                    .checked_add(
-                        u32::try_from(overlap_start - located_extent.start)
-                            .map_err(|_| DurableNamespaceError::ArithmeticOverflow)?,
-                    )
-                    .ok_or(DurableNamespaceError::ArithmeticOverflow)?,
-            },
-            ManifestExtent::Hole { .. } => ManifestExtent::Hole { logical_length },
-            ManifestExtent::Fill { value, .. } => ManifestExtent::Fill {
-                logical_length,
-                value: *value,
-            },
-        };
-        push_extent(output, extent)?;
-        cursor = overlap_end;
-    }
-    if cursor != end {
-        return Err(DurableNamespaceError::FrozenViewMismatch);
-    }
-    Ok(())
 }
 
 const fn extent_length(extent: &ManifestExtent) -> u64 {
@@ -7072,7 +6798,7 @@ impl Read for CommitRangeReader<'_> {
 }
 
 fn verify_manifest_allocation(
-    manifest: &ManifestLeaf,
+    manifest: &ManifestLayout,
     inode: &CommitInode,
 ) -> Result<(), DurableNamespaceError> {
     let planned_allocated = manifest.extents().iter().try_fold(0_u64, |total, extent| {
@@ -7744,7 +7470,8 @@ mod tests {
         owned.historical = HistoricalProofCache::new_with_snapshot(
             crate::historical_proof_cache::HistoricalProofCacheConfig::conservative(snapshot),
             snapshot,
-        ).unwrap();
+        )
+        .unwrap();
         let proofs = Arc::new(owned);
         for ordinal in 0..MAX_ONLINE_DEPENDENCY_PROOFS_V1 / 2 {
             proofs.remember_active(budget_entry(ordinal), OnlineProofAdmission::Published);

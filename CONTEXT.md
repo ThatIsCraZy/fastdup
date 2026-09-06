@@ -157,6 +157,12 @@ An immutable recipe for reconstructing one file version from logical chunk IDs
 and file-layout metadata.
 _Avoid_: File, index entry
 
+**Manifest layout**:
+A validated in-memory extent partition for a file or edited range. Publication
+splits this logical layout into bounded physical Manifest leaves; its size is
+independent of one Metadata Object's limit.
+_Avoid_: Serialized Manifest leaf, committed root, successor proof
+
 **Manifest root**:
 The identity of an immutable extent tree representing one complete file version,
 including data and sparse holes.

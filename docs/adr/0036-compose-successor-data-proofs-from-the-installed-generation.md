@@ -153,3 +153,23 @@ reservation. This removes a second complete DATA proof during one startup;
 it does not reuse evidence from before a restart. Recovery fallback to an
 older generation retains the existing complete verification and transition
 path because the selected graph is not the current WAL head.
+
+## Logical layouts and mixed shrink (2026-09-07)
+
+A validated in-memory Manifest Layout is separate from one physical Manifest
+Leaf. Complete files, appended suffixes and replacement/splice sequences may
+contain more extents than fit in one 16-MiB Metadata Object. Layout validation
+checks every extent, checked total length and exact partition without imposing
+that physical bound. The store partitions layouts into the existing bounded
+leaf sequence, publishes child-first, and derives the same opaque successor
+proof and introduced dependencies. Physical leaf encoders/decoders retain all
+object-size limits; recovery and scrub traverse and validate the same format.
+
+A shrink combined with dirty writes composes replacements over the surviving
+range with authenticated truncation in one successor. A cutoff inside DATA
+re-encodes the retained prefix and uses a temporary HOLE suffix before removing
+it. Header rewrites and cutoff rewrites coalesce before planning. Distant
+unchanged subtrees keep their IDs and predecessor proof; no whole-file read or
+flattened intermediate leaf is needed. The final stored allocation must equal
+the frozen inode's allocation. Faults around publication must expose either
+the complete old header/length or the complete new header/length, never a mix.

@@ -3521,3 +3521,41 @@ fn every_rebuild_metadata_fault_recovers_only_no_index_or_the_complete_new_index
         }
     }
 }
+
+#[test]
+fn catalog_bootstrap_uses_one_name_snapshot_during_concurrent_publication() {
+    let (generations, containers, indexes, profile) = seeded_repositories();
+    let maintenance = MaintenanceRepository::new(generations, containers.clone(), indexes, profile);
+    let storage = MemoryStorageIo::new();
+    let paused = PausedStorageIo::before(storage.clone(), StorageOperation::CreateNew);
+    let catalog = GcCandidateCatalogRepository::new(paused.clone());
+    let worker = std::thread::spawn(move || maintenance.rebuild_gc_candidate_catalog(&catalog, 1));
+    assert!(
+        paused.wait_until_reached(Duration::from_secs(5)),
+        "bootstrap reached publication after its name snapshot"
+    );
+    let concurrent = containers.publish_raw(
+        ContainerId::new([0xfb; 16]).unwrap(),
+        1000,
+        &[b"concurrent ingest"],
+    );
+    paused.resume();
+    concurrent.unwrap();
+    let descriptor = worker
+        .join()
+        .unwrap()
+        .expect("a new Container cannot change this catalog's declared row count");
+    let recovered = GcCandidateCatalogRepository::new(storage)
+        .recover_latest()
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.descriptor(), descriptor);
+    assert!(
+        !recovered
+            .shortlist(GcCandidateSelectionMode::Urgent, 4096, u64::MAX)
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|row| row.container_id() == ContainerId::new([0xfb; 16]).unwrap())
+    );
+}

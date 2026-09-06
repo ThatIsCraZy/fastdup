@@ -15,8 +15,8 @@ use crate::metadata_mark_catalog::{
 use crate::{ContainerRepository, StorageIo, StoreError, VerifiedManifestFile};
 use fastdup_format::{
     CommitFormatError, CommitRecord, CommitRecordHash, MAX_METADATA_OBJECT_BYTES, ManifestExtent,
-    ManifestLeaf, MetadataFormatError, MetadataMarkCatalogRunKind, MetadataObjectId,
-    NamespaceGraphRoot, NamespaceRoot, PolicySetId,
+    ManifestLayout, ManifestLeaf, MetadataFormatError, MetadataMarkCatalogRunKind,
+    MetadataObjectId, NamespaceGraphRoot, NamespaceRoot, PolicySetId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -305,8 +305,7 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
             let (_, groups) = read.into_parts();
             for payload in groups.iter().flatten() {
                 let id = payload.chunk_id();
-                if id > *chunk_id
-                    && required.get(&id).copied() == u64::try_from(payload.len()).ok()
+                if id > *chunk_id && required.get(&id).copied() == u64::try_from(payload.len()).ok()
                 {
                     co_verified.insert(id);
                 }
@@ -652,7 +651,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         manifest: &ManifestLeaf,
     ) -> Result<MetadataObjectId, GenerationError> {
         Ok(self
-            .publish_complete_manifest(manifest, true)?
+            .publish_complete_manifest(manifest.file_length(), manifest.extents(), true)?
             .summary
             .root())
     }
@@ -694,13 +693,35 @@ impl<I: StorageIo> GenerationRepository<I> {
         self.publish_manifest_successor_with_sync(predecessor, manifest, false)
     }
 
+    /// Stages a complete logical layout as bounded physical Manifest leaves.
+    /// Namespace publication supplies the metadata-directory durability barrier.
+    ///
+    /// # Errors
+    /// Returns layout, allocation, identity or publication failures.
+    pub fn stage_manifest_layout_successor(
+        &self,
+        predecessor: SuccessorPredecessor,
+        layout: &ManifestLayout,
+    ) -> Result<ManifestSuccessorProof, GenerationError> {
+        let published =
+            self.publish_complete_manifest(layout.file_length(), layout.extents(), false)?;
+        Ok(ManifestSuccessorProof {
+            predecessor,
+            summary: published.summary,
+            introduced_chunks: published.introduced_chunks,
+            introduced_metadata: published.introduced_metadata,
+            metadata_root_pin: published.metadata_root_pin,
+        })
+    }
+
     fn publish_manifest_successor_with_sync(
         &self,
         predecessor: SuccessorPredecessor,
         manifest: &ManifestLeaf,
         sync_root: bool,
     ) -> Result<ManifestSuccessorProof, GenerationError> {
-        let published = self.publish_complete_manifest(manifest, sync_root)?;
+        let published =
+            self.publish_complete_manifest(manifest.file_length(), manifest.extents(), sync_root)?;
         Ok(ManifestSuccessorProof {
             predecessor,
             summary: published.summary,
@@ -712,14 +733,15 @@ impl<I: StorageIo> GenerationRepository<I> {
 
     fn publish_complete_manifest(
         &self,
-        manifest: &ManifestLeaf,
+        logical_size: u64,
+        extents: &[ManifestExtent],
         sync_root: bool,
     ) -> Result<PublishedManifestProof, GenerationError> {
         let _publication_guard = self
             .metadata_gc_barrier
             .read()
             .expect("ASSERT: Metadata GC publication barrier poisoned");
-        let tree = encode_manifest_tree(manifest)?;
+        let tree = encode_manifest_tree(logical_size, extents)?;
         let mut introduced_metadata = BTreeSet::new();
         for (expected_id, encoded) in tree.objects() {
             let staged = self.stage_metadata_with_status(encoded)?;
@@ -736,12 +758,12 @@ impl<I: StorageIo> GenerationRepository<I> {
         }
         let summary = ManifestTreeSummary::new(
             tree.root(),
-            manifest.file_length(),
-            manifest_allocated_bytes(manifest.extents())?,
+            logical_size,
+            manifest_allocated_bytes(extents)?,
         );
         Ok(PublishedManifestProof {
             summary,
-            introduced_chunks: manifest_dependencies(manifest.extents())?,
+            introduced_chunks: manifest_dependencies(extents)?,
             introduced_metadata,
             metadata_root_pin: self.pin_metadata_root(summary.root()),
         })

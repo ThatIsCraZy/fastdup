@@ -41,7 +41,9 @@ cannot fall back to candidates from an older nonempty pool view.
 
 If no catalog exists, adaptive Online GC bootstraps one by counting canonical
 published names and then streaming Container-ID-ordered rows from paired
-Header/Footer intrinsic summaries. Bootstrap reads no record payload and keeps
+Header/Footer intrinsic summaries. The count and row stream use the same sorted
+name snapshot. Concurrently published Containers belong to a later hint
+refresh; a second directory listing must not change the declared row count. Bootstrap reads no record payload and keeps
 no pool-sized row map. These envelope facts remain hints; local proof fully
 verifies every shortlisted victim. A stale liveness base or a completed
 relocation may publish a fresh bootstrap generation before incremental deltas

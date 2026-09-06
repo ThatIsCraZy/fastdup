@@ -148,3 +148,20 @@ fn manifest_v2_chunk_slice_round_trips_and_rejects_out_of_bounds_ranges() {
         Err(MetadataFormatError::InvalidExtent)
     );
 }
+
+#[test]
+fn logical_layout_can_exceed_one_leaf_while_physical_leaf_bounds_remain_enforced() {
+    use fastdup_format::ManifestLayout;
+    let extents = vec![
+        ManifestExtent::Fill {
+            logical_length: 1,
+            value: 31
+        };
+        322_191
+    ];
+    assert!(ManifestLeaf::new(322_191, extents.clone()).is_err());
+    let layout = ManifestLayout::new(322_191, extents).unwrap();
+    assert_eq!(layout.extents().len(), 322_191);
+    assert!(ManifestLayout::validate(322_190, layout.extents()).is_err());
+    assert!(ManifestLayout::new(0, vec![ManifestExtent::Hole { logical_length: 0 }]).is_err());
+}

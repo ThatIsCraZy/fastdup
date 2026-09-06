@@ -76,7 +76,7 @@ pub use gc_candidate_catalog::{
     GcCandidateCatalogRow, GcCandidateCatalogStreamEncoder, GcCandidateLivenessEstimate,
     GcCandidateLocationState, GcDependencyEstimate, GcRecordLivenessEstimate,
 };
-pub use manifest::{MANIFEST_HEADER_BYTES, ManifestExtent, ManifestLeaf};
+pub use manifest::{MANIFEST_HEADER_BYTES, ManifestExtent, ManifestLayout, ManifestLeaf};
 pub use manifest_inner::{
     MANIFEST_CHILD_RANGE_BYTES, MANIFEST_INNER_HEADER_BYTES, ManifestChildRange, ManifestInnerNode,
     ManifestInnerNodeError,

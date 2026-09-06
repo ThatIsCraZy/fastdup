@@ -798,11 +798,14 @@ where
         catalog: &GcCandidateCatalogRepository<G>,
         catalog_generation: u64,
     ) -> Result<GcCandidateCatalogDescriptor, MaintenanceError> {
-        let row_count = self.containers.published_container_count()?;
+        let names = self.containers.published_container_names()?;
+        let row_count = u64::try_from(names.len())
+            .map_err(|_| GcCandidateCatalogStoreError::CounterOverflow)?;
         Ok(
             catalog.publish_generated(catalog_generation, 0, 0, row_count, |emit| {
                 self.containers
                     .visit_published_intrinsic_summaries::<GcCandidateCatalogStoreError, _>(
+                        names,
                         |container_id, container_generation, physical_bytes, summary| {
                             emit(GcCandidateCatalogRow::from_intrinsic_summary(
                                 container_id,

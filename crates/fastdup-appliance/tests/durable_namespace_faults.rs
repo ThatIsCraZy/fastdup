@@ -477,8 +477,17 @@ fn recovery_mount_installs_the_verified_graph_without_a_duplicate_data_scan() {
 
 #[test]
 fn every_path_local_truncate_fault_recovers_the_previous_or_exact_cut() {
+    check_truncate_faults(false);
+}
+
+#[test]
+fn every_mixed_shrink_fault_recovers_the_previous_or_complete_header_and_cut() {
+    check_truncate_faults(true);
+}
+
+fn check_truncate_faults(rewrite_header: bool) {
     const PREVIOUS_SIZE: u64 = 1_048_576;
-    const TRUNCATED_SIZE: u64 = 128;
+    let truncated_size: u64 = if rewrite_header { 8 } else { 128 };
     let probe_metadata = MemoryStorageIo::new();
     let probe_containers = MemoryStorageIo::new();
     let probe = open(probe_metadata.clone(), probe_containers);
@@ -490,10 +499,24 @@ fn every_path_local_truncate_fault_recovers_the_previous_or_exact_cut() {
             Operation::SetLength {
                 inode: probe_inode,
                 handle: Some(probe_handle),
-                length: TRUNCATED_SIZE,
+                length: truncated_size,
             },
         )
         .expect("truncate probe predecessor");
+    if rewrite_header {
+        probe
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode: probe_inode,
+                    handle: probe_handle,
+                    offset: 0,
+                    data: b"HEAD",
+                },
+            )
+            .unwrap();
+    }
     let baseline = probe_metadata.operation_count();
     probe
         .checkpoint()
@@ -520,10 +543,24 @@ fn every_path_local_truncate_fault_recovers_the_previous_or_exact_cut() {
                     Operation::SetLength {
                         inode,
                         handle: Some(handle),
-                        length: TRUNCATED_SIZE,
+                        length: truncated_size,
                     },
                 )
                 .expect("truncate injected predecessor");
+            if rewrite_header {
+                appliance
+                    .namespace()
+                    .dispatch(
+                        CALLER,
+                        Operation::Write {
+                            inode,
+                            handle,
+                            offset: 0,
+                            data: b"HEAD",
+                        },
+                    )
+                    .unwrap();
+            }
             assert!(
                 appliance.checkpoint().is_err(),
                 "truncate fault relative={relative} after={fail_after} unexpectedly returned success"
@@ -545,13 +582,45 @@ fn every_path_local_truncate_fault_recovers_the_previous_or_exact_cut() {
                 panic!("ASSERT: getattr returned the wrong reply variant");
             };
             let expected = if fail_after && relative == final_sync {
-                TRUNCATED_SIZE
+                truncated_size
             } else {
                 PREVIOUS_SIZE
             };
             assert_eq!(
                 attr.size, expected,
                 "fault relative={relative} after={fail_after} exposed a mixed truncate"
+            );
+            let Reply::Opened(handle) = recovered
+                .dispatch(
+                    CALLER,
+                    Operation::Open {
+                        inode,
+                        options: OpenOptions::READ_ONLY,
+                        truncate: false,
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("open recovered shrink")
+            };
+            let header = if rewrite_header && expected == truncated_size {
+                b"HEAD".to_vec()
+            } else {
+                PAYLOAD[..4].to_vec()
+            };
+            assert_eq!(
+                recovered
+                    .dispatch(
+                        CALLER,
+                        Operation::Read {
+                            inode,
+                            handle,
+                            offset: 0,
+                            length: 4
+                        }
+                    )
+                    .unwrap(),
+                Reply::Data(header)
             );
         }
     }

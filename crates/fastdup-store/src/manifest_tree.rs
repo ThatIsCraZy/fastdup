@@ -1,7 +1,7 @@
 use fastdup_format::{
     MANIFEST_HEADER_BYTES, MAX_METADATA_OBJECT_BYTES, ManifestChildRange, ManifestExtent,
-    ManifestInnerNode, ManifestInnerNodeError, ManifestLeaf, MetadataFormatError, MetadataObjectId,
-    MetadataObjectKind, metadata_object_kind,
+    ManifestInnerNode, ManifestInnerNodeError, ManifestLayout, ManifestLeaf, MetadataFormatError,
+    MetadataObjectId, MetadataObjectKind, metadata_object_kind,
 };
 use std::collections::BTreeSet;
 use std::fmt;
@@ -106,11 +106,13 @@ struct NodeRef {
 }
 
 pub(crate) fn encode_manifest_tree(
-    manifest: &ManifestLeaf,
+    logical_size: u64,
+    extents: &[ManifestExtent],
 ) -> Result<EncodedManifestTree, ManifestTreeError> {
+    ManifestLayout::validate(logical_size, extents)?;
     let mut objects = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut current = encode_leaves(manifest, &mut objects, &mut seen)?;
+    let mut current = encode_leaves(extents, &mut objects, &mut seen)?;
     let mut level = 1_u16;
     while current.len() > 1 {
         if level > MAX_TREE_LEVEL {
@@ -183,12 +185,7 @@ where
     if replaced_length != replacement_length {
         return Err(ManifestTreeError::InvalidReplacement);
     }
-    let mut verified_replacement = Vec::new();
-    verified_replacement
-        .try_reserve_exact(replacement.len())
-        .map_err(|_| ManifestTreeError::OutOfMemory)?;
-    verified_replacement.extend_from_slice(replacement);
-    ManifestLeaf::new(replacement_length, verified_replacement)?;
+    ManifestLayout::validate(replacement_length, replacement)?;
     if replaced.is_empty() {
         return Ok(EncodedManifestTree {
             root,
@@ -322,15 +319,10 @@ where
         .checked_add(appended_allocated)
         .ok_or(ManifestTreeError::ArithmeticOverflow)?;
 
-    let mut verified_appended = Vec::new();
-    verified_appended
-        .try_reserve_exact(appended.len())
-        .map_err(|_| ManifestTreeError::OutOfMemory)?;
-    verified_appended.extend_from_slice(appended);
-    let appended_manifest = ManifestLeaf::new(appended_length, verified_appended)?;
+    ManifestLayout::validate(appended_length, appended)?;
     let mut objects = Vec::new();
     let mut seen = BTreeSet::new();
-    let appended_leaves = encode_leaves(&appended_manifest, &mut objects, &mut seen)?;
+    let appended_leaves = encode_leaves(appended, &mut objects, &mut seen)?;
     let (mut level, mut forest) = append_leaves_to_right_spine(
         PendingNode {
             object_id: previous.root(),
@@ -373,12 +365,9 @@ where
         return Err(ManifestTreeError::InvalidReplacement);
     }
     if logical_size == 0 {
-        let empty = ManifestLeaf::new(0, Vec::new())?;
-        let tree = encode_manifest_tree(&empty)?;
-        return Ok((
-            tree,
-            ManifestTreeSummary::new(MetadataObjectId::from_encoded(&empty.encode()?)?, 0, 0),
-        ));
+        let tree = encode_manifest_tree(0, &[])?;
+        let summary = ManifestTreeSummary::new(tree.root(), 0, 0);
+        return Ok((tree, summary));
     }
 
     let mut objects = Vec::new();
@@ -429,8 +418,7 @@ where
             .ok_or(ManifestTreeError::ArithmeticOverflow)
     })?;
     let replacement_allocated = manifest_allocated_bytes(replacement)?;
-    let replacement_copy = copy_extents(replacement)?;
-    ManifestLeaf::new(replacement_length, replacement_copy)?;
+    ManifestLayout::validate(replacement_length, replacement)?;
     let logical_size = previous
         .logical_size()
         .checked_sub(replaced.end - replaced.start)
@@ -450,8 +438,7 @@ where
         .ok_or(ManifestTreeError::ArithmeticOverflow)?;
 
     if logical_size == 0 {
-        let empty = ManifestLeaf::new(0, Vec::new())?;
-        let tree = encode_manifest_tree(&empty)?;
+        let tree = encode_manifest_tree(0, &[])?;
         let root = tree.root();
         return Ok((tree, ManifestTreeSummary::new(root, 0, 0)));
     }
@@ -536,8 +523,8 @@ where
             if logical_length == 0 {
                 return Ok((0, Vec::new()));
             }
-            let manifest = ManifestLeaf::new(logical_length, extents)?;
-            Ok((0, encode_leaves(&manifest, objects, seen)?))
+            ManifestLayout::validate(logical_length, &extents)?;
+            Ok((0, encode_leaves(&extents, objects, seen)?))
         }
         DecodedManifestNode::Inner(node) => {
             let node_allocated = node.allocated_bytes()?;
@@ -711,8 +698,8 @@ fn encode_extents_at_level(
             .checked_add(extent_length(extent))
             .ok_or(ManifestTreeError::ArithmeticOverflow)
     })?;
-    let manifest = ManifestLeaf::new(logical_length, copy_extents(extents)?)?;
-    let mut forest = encode_leaves(&manifest, objects, seen)?;
+    ManifestLayout::validate(logical_length, extents)?;
+    let mut forest = encode_leaves(extents, objects, seen)?;
     let mut level = 0_u16;
     while level < target_level {
         level = level.checked_add(1).ok_or(ManifestTreeError::TreeTooDeep)?;
@@ -1238,12 +1225,12 @@ fn slice_extents(
 }
 
 fn encode_leaves(
-    manifest: &ManifestLeaf,
+    extents: &[ManifestExtent],
     objects: &mut Vec<(MetadataObjectId, Vec<u8>)>,
     seen: &mut BTreeSet<MetadataObjectId>,
 ) -> Result<Vec<NodeRef>, ManifestTreeError> {
-    if manifest.extents().is_empty() {
-        let encoded = manifest.encode()?;
+    if extents.is_empty() {
+        let encoded = ManifestLeaf::new(0, Vec::new())?.encode()?;
         let object_id = MetadataObjectId::from_encoded(&encoded)?;
         remember_object(object_id, encoded, objects, seen)?;
         return Ok(vec![NodeRef {
@@ -1254,7 +1241,7 @@ fn encode_leaves(
     }
 
     let mut leaves = Vec::new();
-    let estimated = manifest.extents().len().div_ceil(MAX_LEAF_EXTENTS);
+    let estimated = extents.len().div_ceil(MAX_LEAF_EXTENTS);
     leaves
         .try_reserve_exact(estimated)
         .map_err(|_| ManifestTreeError::OutOfMemory)?;
@@ -1262,14 +1249,14 @@ fn encode_leaves(
     let mut leaf_start = 0_u64;
     let mut cursor = 0_u64;
     let mut window_end = next_window_end(leaf_start);
-    for (ordinal, extent) in manifest.extents().iter().enumerate() {
+    for (ordinal, extent) in extents.iter().enumerate() {
         cursor = cursor
             .checked_add(extent_length(extent))
             .ok_or(ManifestTreeError::ArithmeticOverflow)?;
         let extent_count = ordinal - extent_start + 1;
         if extent_count == MAX_LEAF_EXTENTS || cursor >= window_end {
             push_leaf(
-                &manifest.extents()[extent_start..=ordinal],
+                &extents[extent_start..=ordinal],
                 cursor - leaf_start,
                 &mut leaves,
                 objects,
@@ -1280,17 +1267,14 @@ fn encode_leaves(
             window_end = next_window_end(leaf_start);
         }
     }
-    if extent_start < manifest.extents().len() {
+    if extent_start < extents.len() {
         push_leaf(
-            &manifest.extents()[extent_start..],
+            &extents[extent_start..],
             cursor - leaf_start,
             &mut leaves,
             objects,
             seen,
         )?;
-    }
-    if cursor != manifest.file_length() {
-        return Err(ManifestTreeError::InvalidTree);
     }
     Ok(leaves)
 }

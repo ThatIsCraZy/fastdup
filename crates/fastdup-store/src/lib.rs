@@ -3482,13 +3482,31 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(count)
     }
 
-    pub(crate) fn visit_published_intrinsic_summaries<E, F>(&self, mut visitor: F) -> Result<(), E>
+    // One name snapshot binds the catalog count and row stream. Publication
+    // may continue concurrently; later names belong to a later hint generation.
+    pub(crate) fn published_container_names(&self) -> Result<Vec<String>, StoreError> {
+        let mut names = self.storage.list_names()?;
+        let mut selected = 0;
+        for index in 0..names.len() {
+            if parse_published_name(&names[index])?.is_some() {
+                names.swap(selected, index);
+                selected += 1;
+            }
+        }
+        names.truncate(selected);
+        names.sort_unstable();
+        Ok(names)
+    }
+
+    pub(crate) fn visit_published_intrinsic_summaries<E, F>(
+        &self,
+        names: Vec<String>,
+        mut visitor: F,
+    ) -> Result<(), E>
     where
         E: From<StoreError>,
         F: FnMut(ContainerId, u64, u64, ContainerIntrinsicSummary) -> Result<(), E>,
     {
-        let mut names = self.storage.list_names().map_err(StoreError::from)?;
-        names.sort_unstable();
         for name in names {
             let Some(expected_id) = parse_published_name(&name).map_err(E::from)? else {
                 continue;

@@ -14,6 +14,10 @@ const CALLER: RequestContext = RequestContext {
 
 #[test]
 fn growing_a_large_manifest_while_rewriting_its_header_stays_path_local() {
+    check_large_manifest_edit(false);
+}
+
+fn check_large_manifest_edit(shrinking: bool) {
     let metadata = MemoryStorageIo::new();
     let data = MemoryStorageIo::new();
     let containers = ContainerRepository::new(data.clone());
@@ -127,18 +131,26 @@ fn growing_a_large_manifest_while_rewriting_its_header_stays_path_local() {
         .namespace()
         .dispatch(
             CALLER,
-            Operation::Write {
-                inode,
-                handle,
-                offset: 134_217_728,
-                data: b"TAIL",
+            if shrinking {
+                Operation::SetLength {
+                    inode,
+                    handle: Some(handle),
+                    length: 134_217_216,
+                }
+            } else {
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset: 134_217_728,
+                    data: b"TAIL",
+                }
             },
         )
         .unwrap();
     let metadata_baseline = metadata.operation_count();
     appliance
         .checkpoint()
-        .expect("mixed overwrite and growth must not flatten the complete prior Manifest")
+        .expect("mixed overwrite and size change must not flatten the complete prior Manifest")
         .unwrap();
     let metadata_reads = metadata.operations()[metadata_baseline..]
         .iter()
@@ -146,7 +158,7 @@ fn growing_a_large_manifest_while_rewriting_its_header_stays_path_local() {
         .count();
     assert!(
         metadata_reads < 64,
-        "mixed growth must read only touched tree paths: {metadata_reads}"
+        "mixed size change must read only touched tree paths: {metadata_reads}"
     );
     drop(appliance);
     metadata.crash();
@@ -192,14 +204,23 @@ fn growing_a_large_manifest_while_rewriting_its_header_stays_path_local() {
                 Operation::Read {
                     inode,
                     handle,
-                    offset: 134_217_724,
+                    offset: if shrinking { 134_217_212 } else { 134_217_724 },
                     length: 8
                 }
             )
             .unwrap(),
-        Reply::Data(vec![91, 91, 91, 91, b'T', b'A', b'I', b'L'])
+        Reply::Data(if shrinking {
+            vec![31, 31, 31, 31]
+        } else {
+            vec![91, 91, 91, 91, b'T', b'A', b'I', b'L']
+        })
     );
     generations.scrub_all_with_data(&containers).unwrap();
+}
+
+#[test]
+fn shrinking_a_large_manifest_while_rewriting_its_header_stays_path_local() {
+    check_large_manifest_edit(true);
 }
 
 #[test]
@@ -286,4 +307,75 @@ fn appended_successor_still_requires_data_introduced_by_earlier_replacement() {
         generations.recover_latest().unwrap().unwrap().record(),
         record
     );
+}
+
+#[test]
+fn one_large_append_is_partitioned_into_bounded_metadata_objects() {
+    check_large_layout(false);
+}
+
+#[test]
+fn one_large_complete_layout_is_partitioned_into_bounded_metadata_objects() {
+    check_large_layout(true);
+}
+
+fn check_large_layout(complete: bool) {
+    let metadata = MemoryStorageIo::new();
+    let containers = ContainerRepository::new(MemoryStorageIo::new());
+    let generations = GenerationRepository::new(metadata, PolicySetId::new([0xec; 32]).unwrap());
+    let record = generations
+        .commit_namespace(&NamespaceRoot::new(4096, 2, 0, vec![], vec![]).unwrap())
+        .unwrap();
+    let predecessor = SuccessorPredecessor::from_committed_record(record);
+    let empty = generations
+        .publish_manifest_successor(predecessor, &ManifestLeaf::new(0, vec![]).unwrap())
+        .unwrap();
+    // This is exactly the in-memory leaf payload rejected on the Veeam VM:
+    // 322,191 extents * 64 bytes + 64-byte Manifest header = 20,620,288.
+    let extents: Vec<_> = (0..322_191)
+        .map(|i| ManifestExtent::Fill {
+            logical_length: 512,
+            value: if i % 2 == 0 { 31 } else { 91 },
+        })
+        .collect();
+    let proof = if complete {
+        generations.stage_manifest_layout_successor(
+            predecessor,
+            &fastdup_format::ManifestLayout::new(322_191 * 512, extents).unwrap(),
+        )
+    } else {
+        generations.stage_manifest_append_successor(empty, &extents)
+    }
+    .expect("a logical extent sequence is not one on-disk Metadata Object");
+    assert_eq!(proof.summary().logical_size(), 322_191 * 512);
+    let root = NamespaceRoot::new(
+        4096,
+        3,
+        1,
+        vec![
+            DurableInode::new(
+                2,
+                0o640,
+                1000,
+                1000,
+                1,
+                1,
+                proof.summary().logical_size(),
+                proof.summary().root(),
+            )
+            .unwrap(),
+        ],
+        vec![NamespaceEntry::new(1, 2, b"large-append".to_vec()).unwrap()],
+    )
+    .unwrap();
+    generations
+        .commit_namespace_with_successor_proofs_using(
+            &root,
+            &containers,
+            predecessor,
+            &[proof],
+            &containers,
+        )
+        .unwrap();
+    generations.scrub_all_with_data(&containers).unwrap();
 }

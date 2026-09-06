@@ -45,6 +45,53 @@ impl ManifestExtent {
     }
 }
 
+/// Validated in-memory layout of a complete file or replacement range.
+///
+/// This is not a serialized Metadata Object. Writers partition its extents
+/// into bounded Manifest leaves before publishing a tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestLayout {
+    file_length: u64,
+    extents: Vec<ManifestExtent>,
+}
+
+impl ManifestLayout {
+    /// Validates a complete partition independently of physical leaf size.
+    ///
+    /// # Errors
+    /// Rejects invalid extents, arithmetic overflow and incomplete partitions.
+    pub fn new(
+        file_length: u64,
+        extents: Vec<ManifestExtent>,
+    ) -> Result<Self, MetadataFormatError> {
+        Self::validate(file_length, &extents)?;
+        Ok(Self {
+            file_length,
+            extents,
+        })
+    }
+
+    /// Checks a borrowed layout without copying its extents.
+    ///
+    /// # Errors
+    /// Rejects invalid extents, arithmetic overflow and incomplete partitions.
+    pub fn validate(
+        file_length: u64,
+        extents: &[ManifestExtent],
+    ) -> Result<(), MetadataFormatError> {
+        validate_partition(file_length, extents)
+    }
+
+    #[must_use]
+    pub const fn file_length(&self) -> u64 {
+        self.file_length
+    }
+    #[must_use]
+    pub fn extents(&self) -> &[ManifestExtent] {
+        &self.extents
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManifestLeaf {
     file_length: u64,
