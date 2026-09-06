@@ -61,3 +61,32 @@ TMPDIR=/source/fastdup/.artifacts/tmp \
 cargo test --release -p fastdup-appliance --lib \
   ingest_queue_admission_benchmark -- --ignored --nocapture
 ```
+
+## Installed SMB validation
+
+RPM `fastdup-0.6.4-6.el10.x86_64` was installed on the test VM. The disconnected
+mount left by the aborted process was detached after stopping that service.
+Normal recovery completed with PID 31250, which started at 21:05:32 CEST and
+mounted the repository at 21:09:03. The same process remained active with zero
+restarts after the test.
+
+The encrypted SMB 3.1.1 loopback test wrote 10 GiB of random, repeated, locally
+modified, and zero-filled content through irregular request fragments. The
+initial 2 GiB used one connection and took 53.62 seconds. Then a second
+connection repeatedly opened a small file, wrote and read-verified 4 KiB, and
+closed it: 10,000 complete cycles finished while the main write continued.
+All SMB connections and payload processing ran on the VM; SSH over the VPN
+only orchestrated the test.
+
+The complete main write took 309.696 seconds, including the additional file
+activity. The maximum measured one-MiB write batch, spanning several SMB
+requests, was 0.046 seconds. Full readback of all 10 GiB took 186.971 seconds
+and matched SHA-256
+`0d1b877dc0a0976263d3ae3fba8c175da37ac83b598463d71ee0ac076dcff34a`.
+A sample of 516 completed checkpoints had a maximum wall time of 0.171 seconds
+and no critical errors. Temporary files, the test share, and its Samba account
+were removed successfully. This mixed-activity workload is not an end-to-end
+A/B against the earlier single-connection workload and does not measure the
+Veeam client's LAN throughput. An actual Veeam retry is still required.
+
+RPM SHA-256: `2bf257efb8b90c0f4dc1d6e02b12e8d3dcc34b3a686ce7bbf177c35cfc6af22d`.
