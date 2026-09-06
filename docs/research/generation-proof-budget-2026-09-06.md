@@ -43,3 +43,25 @@ horizontal overflow.
 
 Build, VM evidence, and browser artifacts are local under
 `.artifacts/ui-quota-notice/` and are excluded from source control.
+
+## Installed validation
+
+RPM `fastdup-0.6.4-5.el10.x86_64` was installed on the VM. After removing the
+already disconnected FUSE mount, normal recovery verified the previous durable
+generation and mounted the repository. Runtime PID 28321 started at 20:38:19
+CEST and remained running with zero restarts throughout validation. Runtime
+details, current checkpoint generation, and the effective Small-File quota
+were again available through the agent.
+
+An encrypted SMB 3.1.1 loopback test wrote 10 GiB using a mixture of random,
+repeated, locally modified, and zero-filled content, irregular request
+fragments, and a flush every 256 MiB. It then read every byte back and compared
+SHA-256: `a31d0dd308c4393addbc8f4c8c9d4350656dc3f6e9ea19807302f80d52e50e2a`.
+Write time was 268.506 seconds; full readback took 179.314 seconds. The longest
+measured one-MiB write batch, spanning several SMB requests, was 0.040 seconds.
+A sample of 462 checkpoints had no critical failure and a maximum wall time of
+0.466 seconds. SSH over the VPN only orchestrated the test; this is not a
+measurement of Veeam's LAN throughput. The temporary file, Samba account, and
+share were removed successfully. The actual Veeam job still needs a client retry.
+
+RPM SHA-256: `36a23fb8931589164b9dffea9816c995f3cfcee5250cd11039ffb2203c69e9f7`.
