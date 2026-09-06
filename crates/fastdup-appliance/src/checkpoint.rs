@@ -4895,10 +4895,7 @@ where
                 .is_none()
     }
     fn prepare(&self, file: VerifiedManifestFile<C>) -> VerifiedManifestFile<C> {
-        let file = match self.core.repository.pin_active_generation() {
-            Some(active) => file.with_active_index(&active),
-            None => file,
-        };
+        let file = file.with_index_repository(&self.core.repository);
         file.with_verified_read_cache(Arc::clone(&self.read_cache))
     }
 

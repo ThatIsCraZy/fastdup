@@ -15,6 +15,7 @@ use fastdup_store::{
 struct RangeTrackingStorage {
     inner: FsStorageIo,
     range_reads: Arc<Mutex<Vec<(String, u64, usize)>>>,
+    full_reads: Arc<Mutex<Vec<String>>>,
 }
 
 impl RangeTrackingStorage {
@@ -22,6 +23,7 @@ impl RangeTrackingStorage {
         Self {
             inner: FsStorageIo::open(root).expect("create range-tracking storage"),
             range_reads: Arc::new(Mutex::new(Vec::new())),
+            full_reads: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -58,6 +60,7 @@ impl StorageIo for RangeTrackingStorage {
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        self.full_reads.lock().unwrap().push(name.to_owned());
         self.inner.read(name)
     }
 
@@ -940,5 +943,94 @@ fn live_publication_batches_one_record_without_exact_activation() {
     assert!(
         file.read_at(0, 16384).is_err(),
         "writer-carried Locations cannot authorize corrupt reads"
+    );
+}
+
+#[test]
+fn manifest_reads_follow_index_turnover_without_container_scans() {
+    let root = unique_test_root("manifest-reader-index-turnover-no-scan");
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let mut entries = Vec::new();
+    let mut payload = Vec::new();
+    for ordinal in 1..=9_u8 {
+        let bytes = vec![ordinal; 65536];
+        let id = ContainerId::new([ordinal; 16]).unwrap();
+        containers.publish_raw(id, 1, &[&bytes]).unwrap();
+        let container = containers.read(id).unwrap();
+        entries.push(ExactIndexEntry::from_verified_raw(container.raw_locations()[0]).unwrap());
+        payload = bytes;
+    }
+    let indexes = ExactIndexRunRepository::new(storage.clone());
+    let profile = ExactIndexProfileId::new([0x93; 32]).unwrap();
+    indexes.append_level_zero(profile, entries.clone()).unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    let manifest = ManifestLeaf::new(
+        payload.len() as u64,
+        vec![ManifestExtent::Data {
+            logical_length: payload.len() as u64,
+            chunk_id: ChunkId::of(&payload),
+        }],
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers)
+        .unwrap()
+        .with_index_repository(&indexes);
+    drop(active);
+    storage.full_reads.lock().unwrap().clear();
+    assert_eq!(file.read_at(0, 4096).unwrap(), payload[..4096]);
+    let before = storage
+        .full_reads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|name| name.ends_with(".fdc"))
+        .count();
+    let transition = indexes.append_level_zero(profile, entries.clone()).unwrap();
+    let drain = transition.into_retired().unwrap();
+    assert!(
+        drain.is_drained(),
+        "dormant file must not block retired generation drain"
+    );
+    storage.full_reads.lock().unwrap().clear();
+    assert_eq!(file.read_at(0, 4096).unwrap(), payload[..4096]);
+    let after = storage
+        .full_reads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|name| name.ends_with(".fdc"))
+        .count();
+    eprintln!("full Container reads before index turnover={before}, after={after}");
+    assert_eq!(before, 0);
+    assert_eq!(
+        after, 0,
+        "ordinary index turnover must not turn a bounded read into a Container scan"
+    );
+    for _ in 0..2 {
+        let transition = indexes.append_level_zero(profile, entries.clone()).unwrap();
+        assert!(transition.into_retired().unwrap().is_drained());
+        storage.full_reads.lock().unwrap().clear();
+        assert_eq!(file.read_at(0, 4096).unwrap(), payload[..4096]);
+        assert!(
+            !storage
+                .full_reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|name| name.ends_with(".fdc"))
+        );
+    }
+    let name = format!("{}.fdc", "09".repeat(16));
+    storage
+        .write_at(
+            &name,
+            entries.last().unwrap().location().record_offset() + 32,
+            &[0xff],
+        )
+        .unwrap();
+    assert!(
+        file.read_at(0, 4096).is_err(),
+        "current index cannot authorize corrupt DATA"
     );
 }

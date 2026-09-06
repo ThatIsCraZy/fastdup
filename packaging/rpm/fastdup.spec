@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.6.4
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,11 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-3
+- Keep checkpoint and recovered readers on the current Exact index after activation.
+- Avoid repeated full Container scans while retaining bounded GC operation pins.
+- Allow repository recovery to finish before startup share activation times out.
+
 * Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-2
 - Fix Veeam ReFs.SetFileIntegrity: persist and report enabled SMB integrity policy.
 - Validate handle permissions and clone integrity-policy compatibility.

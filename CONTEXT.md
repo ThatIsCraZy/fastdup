@@ -632,10 +632,10 @@ _Avoid_: Snapshot, reference count
 A temporary authorization to select and read physical Locations through one
 immutable Exact Index generation. A retiring generation admits no new pins;
 pins from every still-live predecessor generation must drain before any
-shadowed Container is removed. Cached or dormant Manifest readers retain only
-an uncounted generation snapshot and acquire a pin for each bounded DATA read;
-after retirement closes admission they fall back to verified Container
-discovery.
+shadowed Container is removed. A dormant Manifest reader holds no operation
+pin. Each bounded DATA read selects and pins the current generation; an
+explicitly fixed-generation reader cannot acquire new pins after that
+generation retires.
 _Avoid_: Exact Index reference, Container reference count
 
 **Corruption**:

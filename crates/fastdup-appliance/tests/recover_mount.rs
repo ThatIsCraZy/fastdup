@@ -283,6 +283,18 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
         !recovery_operations.contains(&StorageOperation::Read),
         "healthy indexed recovery must use bounded Location verification"
     );
+    // The recovered file must follow ordinary index activation before its first
+    // cold read, instead of retaining the generation installed at mount time.
+    indexes
+        .activate(
+            &ExactIndexRunSet::new(
+                profile,
+                2,
+                vec![ExactIndexRunRef::new(0, descriptor).unwrap()],
+            )
+            .unwrap(),
+        )
+        .expect("activate a successor while the recovered file remains open");
     let baseline = container_storage.operation_count();
 
     let Reply::Entry(entry) = namespace
@@ -527,4 +539,61 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
     let fallback_operations = &container_storage.operations()[fallback_baseline..];
     assert!(fallback_operations.contains(&StorageOperation::Read));
     assert!(fallback_operations.contains(&StorageOperation::ListNames));
+}
+
+#[test]
+fn current_index_reader_keeps_inflight_generation_pinned_until_data_read_finishes() {
+    use fastdup_store::VerifiedManifestFile;
+    use fastdup_testkit::PausedStorageIo;
+    use std::time::Duration;
+
+    let data = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::ReadExactAt,
+        "a4",
+    );
+    let containers = ContainerRepository::new(data.clone());
+    let id = ContainerId::new([0xa4; 16]).unwrap();
+    let payload = b"a bounded cold read must protect its selected physical location";
+    containers.publish_raw(id, 1, &[payload]).unwrap();
+    let verified = containers.read(id).unwrap();
+    let entry = ExactIndexEntry::from_verified_raw(verified.raw_locations()[0]).unwrap();
+    let indexes = ExactIndexRunRepository::new(MemoryStorageIo::new());
+    let profile = ExactIndexProfileId::new([0xa5; 32]).unwrap();
+    indexes.append_level_zero(profile, vec![entry]).unwrap();
+    let manifest = ManifestLeaf::new(
+        payload.len() as u64,
+        vec![ManifestExtent::Data {
+            logical_length: payload.len() as u64,
+            chunk_id: ChunkId::of(payload),
+        }],
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers)
+        .unwrap()
+        .with_index_repository(&indexes);
+    data.arm();
+    let reader = std::thread::spawn(move || file.read_at(0, 4096));
+    let reached = data.wait_until_reached(Duration::from_secs(10));
+    if !reached {
+        data.resume();
+        reader.join().unwrap().unwrap();
+        panic!("bounded DATA read did not reach the storage pause");
+    }
+    let drain = indexes
+        .append_level_zero(profile, vec![entry])
+        .unwrap()
+        .into_retired()
+        .unwrap();
+    let protected = !drain.is_drained();
+    data.resume();
+    assert_eq!(reader.join().unwrap().unwrap(), payload);
+    assert!(
+        protected,
+        "retirement must wait for the in-flight DATA read"
+    );
+    assert!(
+        drain.is_drained(),
+        "completed read must release its operation pin"
+    );
 }

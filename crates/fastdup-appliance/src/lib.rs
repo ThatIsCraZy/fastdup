@@ -118,8 +118,8 @@ where
 /// The Exact Index is non-authoritative acceleration state. An absent or
 /// unreadable activation therefore mounts the verified namespace through its
 /// Container-scan fallback instead of rolling metadata back or making content
-/// unavailable. Once recovered, one immutable Run Set is pinned for the
-/// lifetime of every returned committed file reader.
+/// unavailable. Each bounded read pins the current immutable Run Set;
+/// dormant committed file readers do not retain operation pins.
 ///
 /// # Errors
 ///
@@ -165,7 +165,7 @@ where
         return Ok(None);
     };
     mount_recovered(config, recovered, |file| match &active {
-        Some(index) => file.with_active_index(index),
+        Some(_) => file.with_index_repository(indexes),
         None => file,
     })
     .map(Some)

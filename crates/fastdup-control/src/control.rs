@@ -33,7 +33,10 @@ const SHARE_CAPACITY_MANIFEST: &str = "/etc/fastdup/share-capacities.json";
 const REPOSITORY_UNIT: &str = "fastdup-repository.service";
 const SCRUB_UNIT: &str = "fastdup-maintenance@scrub.service";
 const MANAGEMENT_SOCKET: &str = "/var/lib/fastdup/repository/metadata/.fastdup-management.sock";
-const SHARE_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+// Type=simple becomes active before recovery has verified and mounted the pool.
+// Match the repository service lifecycle budget instead of treating recovery as
+// a five-second share-configuration update.
+const REPOSITORY_START_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Debug)]
 struct RuntimeFrontendCounters {
@@ -657,7 +660,7 @@ impl AgentRuntime {
         ensure_filesystem_mounted(&binding.data_uuid, Path::new(DATA_ROOT))?;
         systemctl("start", REPOSITORY_UNIT)?;
         let shares = self.store.shares().map_err(problem("shares_failed"))?;
-        let deadline = std::time::Instant::now() + SHARE_SYNC_TIMEOUT;
+        let deadline = std::time::Instant::now() + REPOSITORY_START_TIMEOUT;
         loop {
             match sync_share_capacities(&shares) {
                 Ok(()) => {

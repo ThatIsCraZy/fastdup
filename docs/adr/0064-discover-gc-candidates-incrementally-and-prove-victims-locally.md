@@ -123,12 +123,16 @@ Recovery derives the scan-selection barrier from effective RETIRING
 transitions; Scrub verifies only effective ACTIVE dependencies while
 authenticating all transition bytes.
 
-Long-lived and cached Manifest readers retain an uncounted Exact-generation
-snapshot, not a generation pin. Each bounded DATA read attempts one operation
-pin; if retirement has closed admission, that read uses verified Container
-discovery instead. This keeps Exact acceleration coherent for the operation
-without allowing an idle file object or an already closed frontend read to
-stall RETIRING drain indefinitely.
+Long-lived and cached appliance Manifest readers retain access to the current
+Exact repository head, not an operation pin. Each bounded DATA read atomically
+selects and pins the current generation. Ordinary activation therefore does not
+strand dormant files on full Container discovery. If no usable index exists,
+the verified discovery fallback and its scan-selection barrier still apply.
+Explicit fixed-generation readers retain an uncounted snapshot and use verified
+discovery after that snapshot closes admission. Neither reader form allows an
+idle file object to stall RETIRING drain; in-flight reads keep their selected
+predecessor pinned until verification and decoding finish. Candidate identity,
+Record integrity, and reconstructed Chunk verification remain mandatory.
 
 Before admitting frontend I/O, the writable appliance runs the Online GC
 recovery finalizer. A restarted process has no surviving predecessor-generation

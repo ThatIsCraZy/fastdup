@@ -4,7 +4,7 @@ use crate::manifest_tree::{
 };
 use crate::{
     ActivatedExactIndex, ContainerRepository, ExactIndexEntry, ExactIndexGenerationPin,
-    ExactIndexGenerationSnapshot, StorageIo, StoreError, VerifiedReadCache,
+    ExactIndexRunRepository, StorageIo, StoreError, VerifiedReadCache,
     generation::MetadataRootPin,
     read_cache::{VerifiedChunkPayload, VerifiedChunkRead},
 };
@@ -250,7 +250,7 @@ trait VerifiedChunkReader: fmt::Debug + Send + Sync {
 
 struct ActiveIndexChunkReader<I, J> {
     containers: ContainerRepository<I>,
-    index: ExactIndexGenerationSnapshot<J>,
+    index: Box<dyn Fn() -> Option<ExactIndexGenerationPin<J>> + Send + Sync>,
 }
 
 impl<I, J> fmt::Debug for ActiveIndexChunkReader<I, J> {
@@ -272,7 +272,7 @@ where
         logical_length: u64,
         cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError> {
-        let Some(index) = self.index.try_pin() else {
+        let Some(index) = (self.index)() else {
             return self
                 .containers
                 .read_verified_chunk_payload(chunk_id, logical_length);
@@ -287,7 +287,7 @@ where
         requests: &[(ChunkId, u64)],
         cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError> {
-        let pin = self.index.try_pin();
+        let pin = (self.index)();
         self.containers.read_verified_chunks_with_locations(
             pin.as_deref(),
             locations,
@@ -301,7 +301,7 @@ where
         requests: &[(ChunkId, u64)],
         cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError> {
-        let Some(index) = self.index.try_pin() else {
+        let Some(index) = (self.index)() else {
             return read_chunks_scalar(requests, |chunk_id, logical_length| {
                 self.containers
                     .read_verified_chunk_payload(chunk_id, logical_length)
@@ -430,9 +430,32 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         I: Clone + Send + Sync + 'static,
         J: Send + Sync + StorageIo + 'static,
     {
+        let snapshot = index.snapshot();
         self.indexed_reader = Some(Arc::new(ActiveIndexChunkReader {
             containers: self.containers.clone(),
-            index: index.snapshot(),
+            index: Box::new(move || snapshot.try_pin()),
+        }));
+        self
+    }
+
+    /// Uses the repository's current Exact generation for each bounded read.
+    ///
+    /// Ordinary activations must not strand a long-lived file on the full
+    /// Container-scan path. The repository atomically selects and pins the
+    /// current generation; the pin lives only through that read. An idle file
+    /// holds no operation pin and cannot delay GC retirement. Candidates still
+    /// undergo complete Record/Chunk verification, and an absent or unusable
+    /// index retains the verified scan fallback.
+    #[must_use]
+    pub fn with_index_repository<J>(mut self, repository: &ExactIndexRunRepository<J>) -> Self
+    where
+        I: Clone + Send + Sync + 'static,
+        J: Clone + Send + Sync + StorageIo + 'static,
+    {
+        let repository = repository.clone();
+        self.indexed_reader = Some(Arc::new(ActiveIndexChunkReader {
+            containers: self.containers.clone(),
+            index: Box::new(move || repository.pin_active_generation()),
         }));
         self
     }
