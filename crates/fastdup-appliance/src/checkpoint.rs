@@ -72,7 +72,8 @@ type AdaptiveCommitFinish = (
 );
 const EXACT_PUBLICATION_QUEUE_BATCHES: usize = 8;
 const MAX_RECENT_EXACT_LOCATIONS: usize = 8_192;
-// Combined Active and Frozen 512-MiB generations at SeqCDC-v1's 16-KiB minimum.
+// Shared admission cap for cached Active and Frozen dependency proofs.
+// Externalized DATA and short boundary Chunks are not bounded by resident bytes.
 const MAX_ONLINE_DEPENDENCY_PROOFS_V1: usize = 65_536;
 const WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1: usize = 400 * 1_024 * 1_024;
 const WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1: usize = 32 * 1_024 * 1_024;
@@ -746,6 +747,27 @@ struct GenerationProofState {
     publishing: BTreeSet<(ChunkId, u32)>,
 }
 
+impl GenerationProofState {
+    /// Keep admitted proofs pinned until commit completion. At capacity, a new
+    /// dependency remains uncached and the successor verifier must verify it
+    /// through storage. Resident Dirty DATA does not bound externalized Chunks.
+    fn remember(&mut self, key: (ChunkId, u32), proof: GenerationProof, frozen: bool) -> bool {
+        let count = self.active.len() + self.frozen.as_ref().map_or(0, GenerationProofMap::len);
+        let target = if frozen {
+            self.frozen
+                .as_mut()
+                .expect("ASSERT: commit-only proof requires one Frozen Generation")
+        } else {
+            &mut self.active
+        };
+        if count >= MAX_ONLINE_DEPENDENCY_PROOFS_V1 && target.get(&key).is_none() {
+            return false;
+        }
+        target.insert(key, proof);
+        true
+    }
+}
+
 #[derive(Debug)]
 struct OnlineDependencyProofs {
     generation: Mutex<GenerationProofState>,
@@ -796,35 +818,22 @@ impl OnlineDependencyProofs {
             .generation
             .lock()
             .expect("ASSERT: Generation Proof Set lock poisoned");
-        let target = if frozen {
-            state
-                .frozen
-                .as_mut()
-                .expect("ASSERT: commit-only proof requires one Frozen Generation")
-        } else {
-            &mut state.active
-        };
         let historical_admission = match admission {
             OnlineProofAdmission::Published => HistoricalProofAdmission::Published,
             OnlineProofAdmission::ExactReuse | OnlineProofAdmission::Touch => {
                 HistoricalProofAdmission::ExactReuse
             }
         };
-        target.insert(
+        if !state.remember(
             key,
             GenerationProof {
                 entry,
                 admission: historical_admission,
             },
-        );
-        let active_proofs = state.active.len();
-        let frozen_proofs = state.frozen.as_ref().map_or(0, GenerationProofMap::len);
-        assert!(
-            active_proofs
-                .checked_add(frozen_proofs)
-                .is_some_and(|total| total <= MAX_ONLINE_DEPENDENCY_PROOFS_V1),
-            "ASSERT: combined Active and Frozen Generation Proof Sets exceeded their budget"
-        );
+            frozen,
+        ) {
+            return;
+        }
         drop(state);
         let key = ProofKey::new(entry.chunk_id(), entry.logical_length());
         let verify_bytes = entry.location().record_length();
@@ -947,7 +956,8 @@ impl OnlineDependencyProofs {
     }
 
     /// Finds and promotes a proof for ingest under one Generation lock. A
-    /// Frozen/history hit must enter Active before the new extent uses it.
+    /// Frozen/history hits are promoted when capacity permits; otherwise the
+    /// successor verifier independently verifies uncached dependencies.
     fn verified_entry_for_active(
         &self,
         chunk_id: ChunkId,
@@ -960,32 +970,27 @@ impl OnlineDependencyProofs {
                 .generation
                 .lock()
                 .expect("ASSERT: Generation Proof Set lock poisoned");
-            let GenerationProofState { active, frozen, .. } = &mut *state;
-            let entry = if let Some(proof) = active.get_mut(&key) {
+            if let Some(proof) = state.active.get_mut(&key) {
                 proof.admission = HistoricalProofAdmission::ExactReuse;
                 Some(proof.entry)
             } else {
-                frozen
+                let entry = state
+                    .frozen
                     .as_ref()
                     .and_then(|proofs| proofs.get(&key))
-                    .map(|proof| {
-                        let entry = proof.entry;
-                        active.insert(
-                            key,
-                            GenerationProof {
-                                entry,
-                                admission: HistoricalProofAdmission::ExactReuse,
-                            },
-                        );
-                        entry
-                    })
-            };
-            assert!(
-                state.active.len() + state.frozen.as_ref().map_or(0, GenerationProofMap::len)
-                    <= MAX_ONLINE_DEPENDENCY_PROOFS_V1,
-                "ASSERT: combined Generation Proof Sets exceeded their budget"
-            );
-            entry
+                    .map(|proof| proof.entry);
+                if let Some(entry) = entry {
+                    state.remember(
+                        key,
+                        GenerationProof {
+                            entry,
+                            admission: HistoricalProofAdmission::ExactReuse,
+                        },
+                        false,
+                    );
+                }
+                entry
+            }
         };
         let entry =
             generation_entry.or_else(|| self.historical.get(chunk_id, u64::from(logical_length)));
@@ -1067,17 +1072,16 @@ impl OnlineDependencyProofs {
                 "ASSERT: completed publication must own its Chunk claim"
             );
             assert!(
-                state
-                    .active
-                    .insert(
-                        *key,
-                        GenerationProof {
-                            entry: *entry,
-                            admission: HistoricalProofAdmission::Published,
-                        },
-                    )
-                    .is_none(),
+                state.active.get(key).is_none(),
                 "ASSERT: an owned publication claim cannot already have an active proof"
+            );
+            state.remember(
+                *key,
+                GenerationProof {
+                    entry: *entry,
+                    admission: HistoricalProofAdmission::Published,
+                },
+                false,
             );
         }
         for key in claimed {
@@ -7608,6 +7612,145 @@ mod tests {
         queue.wait_for_retirement(inode, target);
         assert_eq!(queue.buffered_bytes(), 16_384);
         queue.finish(&later);
+    }
+
+    fn budget_entry(ordinal: usize) -> ExactIndexEntry {
+        let location =
+            ExactIndexLocation::raw(ContainerId::new([29; 16]).unwrap(), 1, 4096, 256, 0).unwrap();
+        ExactIndexEntry::active(ChunkId::of(&ordinal.to_le_bytes()), 8, location).unwrap()
+    }
+
+    #[test]
+    fn proof_budget_overflow_keeps_existing_proofs_and_verifies_uncached_dependencies() {
+        let proofs = Arc::new(OnlineDependencyProofs::new().unwrap());
+        for ordinal in 0..MAX_ONLINE_DEPENDENCY_PROOFS_V1 / 2 {
+            proofs.remember_active(budget_entry(ordinal), OnlineProofAdmission::Published);
+        }
+        assert!(proofs.freeze_for_commit());
+        for ordinal in MAX_ONLINE_DEPENDENCY_PROOFS_V1 / 2..MAX_ONLINE_DEPENDENCY_PROOFS_V1 {
+            proofs.remember_active(budget_entry(ordinal), OnlineProofAdmission::Published);
+        }
+        let overflow = budget_entry(MAX_ONLINE_DEPENDENCY_PROOFS_V1);
+        proofs.remember_frozen(overflow, OnlineProofAdmission::ExactReuse);
+        proofs.remember_active(overflow, OnlineProofAdmission::Published);
+        assert_eq!(
+            proofs.generation_status().active_proofs() + proofs.generation_status().frozen_proofs(),
+            MAX_ONLINE_DEPENDENCY_PROOFS_V1
+        );
+        assert_eq!(proofs.verified_entry(overflow.chunk_id(), 8), None);
+        let resident = budget_entry(0);
+        assert_eq!(
+            proofs.verified_entry_for_active(resident.chunk_id(), 8),
+            Some(resident)
+        );
+        assert!(matches!(
+            proofs.claim_publication(resident.chunk_id(), 8),
+            PublicationClaim::Existing(_)
+        ));
+        assert_eq!(
+            proofs.generation_status().active_proofs(),
+            MAX_ONLINE_DEPENDENCY_PROOFS_V1 / 2
+        );
+
+        struct RejectMissing;
+        impl RequiredChunkVerifier for RejectMissing {
+            fn verify_required_chunks(
+                &self,
+                required: &BTreeMap<ChunkId, u64>,
+            ) -> Result<(), StoreError> {
+                assert_eq!(required.len(), 1);
+                let (&chunk_id, &logical_length) = required.first_key_value().unwrap();
+                Err(StoreError::MissingVerifiedChunk {
+                    chunk_id,
+                    logical_length,
+                })
+            }
+        }
+        let verifier = OnlineSuccessorVerifier {
+            proofs: Arc::clone(&proofs),
+            fallback: Box::new(RejectMissing),
+        };
+        let required = BTreeMap::from([(resident.chunk_id(), 8), (overflow.chunk_id(), 8)]);
+        assert!(
+            matches!(verifier.verify_required_chunks(&required), Err(StoreError::MissingVerifiedChunk { chunk_id, .. }) if chunk_id == overflow.chunk_id())
+        );
+        // Exercise the real Container verifier, including a corrupt object,
+        // while the dependency cannot be admitted into either proof set.
+        let io = MemoryStorageIo::new();
+        let containers = ContainerRepository::new(io.clone());
+        let real_verifier = OnlineSuccessorVerifier {
+            proofs: Arc::clone(&proofs),
+            fallback: Box::new(containers.clone()),
+        };
+        assert!(real_verifier.verify_required_chunks(&required).is_err());
+        let payload = MAX_ONLINE_DEPENDENCY_PROOFS_V1.to_le_bytes();
+        containers
+            .publish_raw(ContainerId::new([31; 16]).unwrap(), 1, &[&payload])
+            .unwrap();
+        real_verifier.verify_required_chunks(&required).unwrap();
+        assert_eq!(
+            proofs.generation_status().active_proofs() + proofs.generation_status().frozen_proofs(),
+            MAX_ONLINE_DEPENDENCY_PROOFS_V1
+        );
+        let name = io.list_names().unwrap().pop().unwrap();
+        io.write_at(&name, 0, b"BAD!").unwrap();
+        assert!(real_verifier.verify_required_chunks(&required).is_err());
+
+        // Even historical hits must remain safe when promotion has no capacity.
+        proofs
+            .historical
+            .admit(overflow, HistoricalProofAdmission::ExactReuse);
+        assert!(proofs.unproven(&required).is_empty());
+        assert_eq!(
+            proofs.verified_entry_for_active(overflow.chunk_id(), 8),
+            Some(overflow)
+        );
+        assert_eq!(
+            proofs.generation_status().active_proofs() + proofs.generation_status().frozen_proofs(),
+            MAX_ONLINE_DEPENDENCY_PROOFS_V1
+        );
+        proofs.complete_frozen();
+        proofs.remember_active(overflow, OnlineProofAdmission::Published);
+        assert_eq!(
+            proofs.generation_status().active_proofs(),
+            MAX_ONLINE_DEPENDENCY_PROOFS_V1 / 2 + 1
+        );
+        assert!(proofs.freeze_for_commit());
+        proofs.cancel_new_freeze(true);
+        assert_eq!(
+            proofs.verified_entry(overflow.chunk_id(), 8),
+            Some(overflow)
+        );
+    }
+
+    #[test]
+    fn proof_budget_overflow_releases_completed_publication_claims() {
+        let proofs = OnlineDependencyProofs::new().unwrap();
+        for ordinal in 0..MAX_ONLINE_DEPENDENCY_PROOFS_V1 {
+            proofs.remember_active(budget_entry(ordinal), OnlineProofAdmission::Published);
+        }
+        assert!(proofs.freeze_for_commit());
+        let entry = budget_entry(MAX_ONLINE_DEPENDENCY_PROOFS_V1);
+        let key = (entry.chunk_id(), entry.logical_length());
+        assert!(matches!(
+            proofs.claim_publication(key.0, key.1),
+            PublicationClaim::Acquired
+        ));
+        proofs.finish_publications(&[entry], &[key]);
+        assert!(proofs.generation.lock().unwrap().publishing.is_empty());
+        assert_eq!(proofs.generation_status().active_proofs(), 0);
+        assert_eq!(
+            proofs.generation_status().frozen_proofs(),
+            MAX_ONLINE_DEPENDENCY_PROOFS_V1
+        );
+        assert!(matches!(
+            proofs.claim_publication(key.0, key.1),
+            PublicationClaim::Acquired
+        ));
+        proofs.abandon_publications(&[key]);
+        proofs.complete_frozen();
+        proofs.remember_active(entry, OnlineProofAdmission::Published);
+        assert_eq!(proofs.verified_entry(key.0, u64::from(key.1)), Some(entry));
     }
 
     #[test]

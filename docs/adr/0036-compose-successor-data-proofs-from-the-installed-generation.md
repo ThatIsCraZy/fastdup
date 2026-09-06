@@ -52,9 +52,17 @@ Chunk ID and logical length. Eviction only causes another full
 verification. Restart, recovery, scrub, and index rebuild never consume this
 cache.
 
-V1 retains at most 65,536 such capabilities, enough for two simultaneous
-512-MiB generations at FastCDC-v1's 16-KiB minimum. The cache uses bounded LRU
-replacement and remains separate from payload and Exact-page caches. A
+V1 admits at most 65,536 capabilities across the Active and Frozen Generation
+Proof Sets. Resident Dirty DATA is not a bound on the number of proofs:
+externalized DATA no longer consumes that resident budget, and boundary Chunks
+can be shorter than the CDC minimum. Reaching the admission cap rejects only
+the additional cache entry; it must not panic, evict an admitted generation
+proof, or fail publication. Existing entries can still be updated. Every
+uncached successor dependency goes through the ordinary complete storage
+verifier before the Commit WAL append. Publication claims are released even
+when their verified result cannot be cached. Completion of the Frozen
+Generation frees admission capacity. Historical replacement follows ADR 0051;
+these caches remain separate from payload and Exact-page caches. A
 successful online proof does not suppress demand-read verification or later
 scrub: immutable corruption discovered after the proof still fails the reader
 and enters the normal corruption path.

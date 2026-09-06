@@ -14,7 +14,10 @@ let fastdup use proof origin directly: newly published proofs enter Small,
 while an Exact-reused and physically reverified proof enters Main.
 
 The cache remains an optimization. Active and Frozen Generation proofs live in
-a separate pinned set and cannot be evicted. Historical S3-FIFO state starts
+a separate pinned set and cannot be evicted. Its combined admission cap may
+reject a new proof, including promotion from history; an uncached successor
+dependency must then undergo complete storage verification before commit, as
+specified in ADR 0036. Cache admission exhaustion is not a runtime failure. Historical S3-FIFO state starts
 empty after restart, may shrink to zero under memory pressure, and never
 authorizes data without a complete Chunk ID and logical-length match. A bounded
 eviction scan may reject an admission but may not fail a write or commit.
