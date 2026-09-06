@@ -4,6 +4,13 @@ status: accepted
 
 # Compose successor DATA proofs from the installed generation
 
+Current policy (2026-09-07): [ADR 0090](0090-mount-after-structural-validation-and-scrub-in-background.md)
+implements structural normal startup followed by background content scrub.
+It supersedes mandatory startup rehashing and the runtime's repeated DATA proof
+when copying an already committed graph to a Recovery Checkpoint. Full demand
+reads, disaster recovery and offline scrub retain independent content checks.
+The original rationale and remaining contracts follow below.
+
 Current-state note (2026-08-27): the successor-proof decision remains current.
 ADR 0054 replaced FastCDC with SeqCDC, ADR 0051 replaced the historical LRU
 with S3-FIFO, and ADR 0069 implemented the Appliance Lease described below as

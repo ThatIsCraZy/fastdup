@@ -5121,6 +5121,7 @@ where
             containers,
             inode_reservation_span,
             Arc::new(ScanManifestReaders { read_cache }),
+            false,
         )
     }
 
@@ -5155,6 +5156,7 @@ where
             indexes,
             None,
             inode_reservation_span,
+            false,
         )
     }
 
@@ -5187,6 +5189,35 @@ where
             indexes,
             Some(similarities),
             inode_reservation_span,
+            false,
+        )
+    }
+
+    /// Mounts after structural validation; demand reads and new DATA still use
+    /// full verification. The owning daemon must scrub in the background and
+    /// keep online deletion disabled until that pass succeeds.
+    ///
+    /// # Errors
+    /// Returns structural recovery, reservation, or Namespace setup failures.
+    pub fn open_with_structural_recovery<X>(
+        config: NamespaceConfig,
+        generations: GenerationRepository<M>,
+        containers: ContainerRepository<C>,
+        indexes: &ExactIndexRunRepository<X>,
+        similarities: &SimilarityIndexRepository<X>,
+        inode_reservation_span: u64,
+    ) -> Result<Self, DurableNamespaceError>
+    where
+        X: Clone + Send + Sync + StorageIo + 'static,
+    {
+        Self::open_with_optional_reduction_index(
+            config,
+            generations,
+            containers,
+            indexes,
+            Some(similarities),
+            inode_reservation_span,
+            true,
         )
     }
 
@@ -5197,6 +5228,7 @@ where
         indexes: &ExactIndexRunRepository<X>,
         similarities: Option<&SimilarityIndexRepository<X>>,
         inode_reservation_span: u64,
+        structural_recovery: bool,
     ) -> Result<Self, DurableNamespaceError>
     where
         X: Clone + Send + Sync + StorageIo + 'static,
@@ -5254,6 +5286,7 @@ where
             containers,
             inode_reservation_span,
             manifest_readers,
+            structural_recovery,
         )
     }
 
@@ -5267,17 +5300,27 @@ where
         containers: ContainerRepository<C>,
         inode_reservation_span: u64,
         manifest_readers: Arc<dyn ManifestReaderPolicy<C>>,
+        structural_recovery: bool,
     ) -> Result<Self, DurableNamespaceError> {
         if inode_reservation_span == 0 {
             return Err(DurableNamespaceError::InvalidReservationSpan);
         }
         let graph_verifier = manifest_readers.graph_verifier(containers.clone());
         let proof_started = Instant::now();
-        eprintln!("recovery_phase=namespace_data_proof state=started");
-        let recovered = generations
-            .recover_latest_with_verified_files_using(&containers, graph_verifier.as_ref())?;
+        let phase = if structural_recovery {
+            "namespace_structure"
+        } else {
+            "namespace_data_proof"
+        };
+        eprintln!("recovery_phase={phase} state=started");
+        let recovered = if structural_recovery {
+            generations.recover_latest_with_structural_files(&containers)?
+        } else {
+            generations
+                .recover_latest_with_verified_files_using(&containers, graph_verifier.as_ref())?
+        };
         eprintln!(
-            "recovery_phase=namespace_data_proof state=complete elapsed_ms={}",
+            "recovery_phase={phase} state=complete elapsed_ms={}",
             proof_started.elapsed().as_millis()
         );
         let reservation_started = Instant::now();
@@ -5319,7 +5362,7 @@ where
                     previous.entries().to_vec(),
                 )?;
                 let committed = if recovered.rejected_newer_generations() == 0 {
-                    // Recovery just established a fresh complete graph proof.
+                    // Recovery established the selected graph under the startup policy.
                     // Reserving IDs preserves every inode/Manifest binding; the
                     // ordinary successor fence must still match the WAL head.
                     let predecessor =

@@ -1,5 +1,11 @@
 # DATA-tier Recovery Checkpoint v1
 
+Publication policy update: ADR 0090 permits the owning runtime to copy an exact,
+pinned committed graph without repeating its DATA proof. The complete copied
+Metadata graph and checkpoint image still verify before selector publication.
+The full-verification publication API and all restore/scrub DATA checks below
+remain available; there is no byte-format change.
+
 This specification defines the only supported pre-production DATA-tier
 Recovery Checkpoint format. It is a disaster-recovery copy of one committed
 Namespace graph, not the online Commit WAL, an index, or a user snapshot. No

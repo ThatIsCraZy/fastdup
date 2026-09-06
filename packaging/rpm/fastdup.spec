@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.6.4
-Release:        12%{?dist}
+Release:        13%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,11 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Mon Sep 07 2026 fastdup contributors <fastdup@localhost> - 0.6.4-13
+- Mount after structural verification and scrub payloads in the background.
+- Bound scrub I/O, gate GC, latch integrity failures and show scrub telemetry.
+- Copy committed recovery metadata without repeated full DATA verification.
+
 * Mon Sep 07 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-12
 - Share cache RAM by measured benefit with a 92-percent operating ceiling.
 - Expose cache budgets, tier priorities and reservations in the WebUI.

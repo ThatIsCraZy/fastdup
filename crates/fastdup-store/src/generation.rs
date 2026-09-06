@@ -362,7 +362,7 @@ impl<I: StorageIo> GenerationRepository<I> {
     pub(crate) fn publish_latest_recovery_checkpoint_to<D: StorageIo>(
         &self,
         checkpoints: &crate::recovery_checkpoint::RecoveryCheckpointRepository<D>,
-        verifier: &dyn RequiredChunkVerifier,
+        verifier: Option<&dyn RequiredChunkVerifier>,
     ) -> Result<
         Option<crate::recovery_checkpoint::RecoveryCheckpointSummary>,
         crate::recovery_checkpoint::RecoveryCheckpointError,
@@ -378,7 +378,9 @@ impl<I: StorageIo> GenerationRepository<I> {
                 Err(error) if error.allows_generation_fallback() => continue,
                 Err(error) => return Err(error.into()),
             };
-            if let Err(error) = verifier.verify_required_chunks(&required) {
+            if let Some(verifier) = verifier
+                && let Err(error) = verifier.verify_required_chunks(&required)
+            {
                 let error = GenerationError::Store(error);
                 if error.allows_generation_fallback() {
                     continue;
@@ -2630,6 +2632,61 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         verifier: Option<&dyn RequiredChunkVerifier>,
     ) -> Result<Option<RecoveredGraph>, GenerationError> {
+        self.recover_latest_checked(&|required| {
+            if required.is_empty() {
+                return Ok(());
+            }
+            verifier
+                .ok_or(GenerationError::DataLocationsNotConnected)?
+                .verify_required_chunks(required)
+                .map_err(GenerationError::from)
+        })
+    }
+
+    /// Opens demand-verifying readers after complete Metadata and Container
+    /// structure validation. This does not prove payload readability. The caller
+    /// must schedule a background scrub and exclude GC until it completes.
+    /// A damaged newest graph fails closed instead of silently rolling it back.
+    ///
+    /// # Errors
+    /// Returns graph, seal, dependency, compatibility or I/O failures.
+    ///
+    /// # Panics
+    /// Panics if a prior invariant failure poisoned the commit lock.
+    pub fn recover_latest_with_structural_files<J>(
+        &self,
+        containers: &ContainerRepository<J>,
+    ) -> Result<Option<RecoveredDataGeneration<J>>, GenerationError>
+    where
+        I: Clone + Send + Sync + 'static,
+        J: Clone + StorageIo,
+    {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("generation commit lock poisoned");
+        let Some(graph) = self.recover_latest_checked(&|required| {
+            containers
+                .verify_required_chunk_structure(required)
+                .map_err(GenerationError::from)
+        })?
+        else {
+            return Ok(None);
+        };
+        if graph.generation.rejected_newer_generations() != 0 {
+            return Err(GenerationError::NoRecoverableGeneration);
+        }
+        let files = verified_files(graph.manifests, self, containers)?;
+        Ok(Some(RecoveredDataGeneration {
+            generation: graph.generation,
+            files,
+        }))
+    }
+
+    fn recover_latest_checked(
+        &self,
+        verify: &impl Fn(&BTreeMap<fastdup_format::ChunkId, u64>) -> Result<(), GenerationError>,
+    ) -> Result<Option<RecoveredGraph>, GenerationError> {
         let Some(snapshot) = GenerationLog::new(&self.storage)
             .load_for_recovery()
             .map_err(map_log_error)?
@@ -2653,7 +2710,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .select_live_recovery_graph(
                 &structurally_valid_records,
                 oldest_online_generation,
-                verifier,
+                verify,
             )?
             .ok_or(GenerationError::NoRecoverableGeneration)?;
         Ok(Some(RecoveredGraph {
@@ -2741,7 +2798,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         structurally_valid_records: &[CommitRecord],
         oldest_online_generation: u64,
-        verifier: Option<&dyn RequiredChunkVerifier>,
+        verify: &impl Fn(&BTreeMap<fastdup_format::ChunkId, u64>) -> Result<(), GenerationError>,
     ) -> Result<Option<SelectedGraph>, GenerationError> {
         for record in structurally_valid_records
             .iter()
@@ -2756,7 +2813,12 @@ impl<I: StorageIo> GenerationRepository<I> {
             if !record_matches_namespace_root(*record, &root) {
                 continue;
             }
-            let manifests = match self.verify_manifest_graph(&root, verifier) {
+            let manifests = match self.scan_manifest_graph_with_required(&root).and_then(
+                |(manifests, required)| {
+                    verify(&required)?;
+                    Ok(manifests)
+                },
+            ) {
                 Ok(manifests) => manifests,
                 Err(error) if error.allows_generation_fallback() => continue,
                 Err(error) => return Err(error),
@@ -3397,8 +3459,9 @@ pub struct CommittedDataGeneration<I> {
     files: Vec<VerifiedCommittedFile<I>>,
 }
 
-/// One recovered DATA generation and the Manifest readers proven for that same
-/// selected recovery candidate.
+/// One recovered generation and demand-verifying Manifest readers bound to that
+/// selected candidate. The recovery entry point determines whether payloads were
+/// preverified or are awaiting background scrub.
 #[derive(Debug)]
 pub struct RecoveredDataGeneration<I> {
     generation: RecoveredGeneration,
@@ -3430,7 +3493,8 @@ impl<I> CommittedDataGeneration<I> {
 }
 
 /// One inode-associated Manifest reader that can only originate from a
-/// complete committed DATA-graph verification.
+/// complete committed Metadata-graph validation. Returned bytes always undergo
+/// full DATA verification, including after a structurally verified startup.
 #[derive(Debug)]
 pub struct VerifiedCommittedFile<I> {
     inode: u64,

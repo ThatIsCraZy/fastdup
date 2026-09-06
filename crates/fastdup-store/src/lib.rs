@@ -44,6 +44,7 @@ mod similarity_external_sort;
 mod similarity_index_repository;
 mod similarity_mmap;
 mod similarity_simd;
+mod structural_recovery;
 mod tiered_storage;
 pub use fastdup_format::{SimilarityIndexPartitionRef, SimilarityIndexRunFamily};
 pub use similarity_external_sort::SIMILARITY_PARTITION_TARGET_REFERENCES;
@@ -85,6 +86,15 @@ pub use memory_budget::{
     MemoryBudgetGovernor, MemoryBudgetGovernorStatus, MemoryPressureSnapshot,
     system_memory_budget_governor,
 };
+
+/// Places the calling, dedicated maintenance thread in Linux's idle I/O class.
+/// This must not be called on a shared executor or frontend worker.
+///
+/// # Errors
+/// Returns an operating-system I/O-priority error.
+pub fn set_background_io_priority() -> io::Result<()> {
+    maintenance_ioprio::set_current_thread_idle()
+}
 pub use online_similarity::{
     ONLINE_SIMILARITY_BATCH_ENTRIES, OnlineSimilarityRepository, OnlineSimilarityStatus,
 };
@@ -661,6 +671,14 @@ pub trait StorageIo {
     /// `UnexpectedEof` for a range outside the current object, or the backend's
     /// exact-read error. Partial bytes are never returned as verified evidence.
     fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>>;
+    /// Reads scattered immutable structure without speculative payload readahead.
+    /// Adapters without read-advice support retain ordinary exact-read semantics.
+    ///
+    /// # Errors
+    /// Returns the same bounded-range/I/O errors as `read_exact_at`.
+    fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.read_exact_at(name, offset, length)
+    }
     /// Lists the current names in the container publication directory.
     ///
     /// # Errors
@@ -4148,6 +4166,24 @@ impl FsStorageIo {
 }
 
 impl StorageIo for FsStorageIo {
+    fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        if length > MAX_STORAGE_RANGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "structure read exceeds range limit",
+            ));
+        }
+        // A separate FD keeps RANDOM advice off shared foreground read handles.
+        let file = File::open(self.path(name)?)?;
+        rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Random)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        bytes.resize(length, 0);
+        file.read_exact_at(&mut bytes, offset)?;
+        Ok(bytes)
+    }
     fn create_new(&self, name: &str) -> io::Result<()> {
         self.with_file_mutation(name, || {
             OpenOptions::new()

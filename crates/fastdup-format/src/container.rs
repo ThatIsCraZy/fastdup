@@ -11,6 +11,9 @@ use fastdup_copy_metrics::{CopyClass, record_copy};
 use crate::crc32c_with_zeroed_u32;
 use crate::exact_index::{ExactIndexEntry, ExactIndexLocation, ExactLocationTransition};
 
+mod structure;
+pub use structure::{ContainerStructure, StructuralChunk};
+
 pub const HEADER_BYTES: usize = 4_096;
 pub const RECORD_HEADER_BYTES: usize = 128;
 pub const FOOTER_BYTES: u64 = 4_096;

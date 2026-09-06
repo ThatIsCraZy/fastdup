@@ -29,6 +29,7 @@ pub struct OperationLatency {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeDetails {
     pub cache_budget: Option<CacheBudgetTelemetry>,
+    pub scrub: Option<ScrubTelemetry>,
     pub runtime_id: String,
     pub io_uring: IoUringTelemetry,
     pub caches: Vec<CacheTelemetry>,
@@ -183,6 +184,7 @@ mod tests {
     #[test]
     fn shared_cache_budget_survives_runtime_parse_and_history_serialization() {
         let mut frontend = serde_json::json!({"details":{
+            "scrub":{"state":"failed","totalContainers":12,"verifiedContainers":3,"verifiedBytes":1000,"readBytes":1100,"currentContainer":"abc","error":"checksum mismatch"},
             "runtimeId":"test", "ioUring":{"ringEntries":64,"inflightBytes":0,"maxInflightBytes":1,"peakInflightBytes":0,"submitted":0,"completed":0},
             "caches":[], "reduction":{"enabled":true,"queries":0,"candidates":0,"acceptedPrefixes":0,"acceptedSparseXor":0,"savedPayloadBytes":0,"fallbacks":0,"errors":0},
             "cacheBudget":{"maximumMemoryUsedBasisPoints":9200,"effectiveLimitBytes":1000,"availableBytes":80,"budgetBytes":900,"pools":[
@@ -200,7 +202,19 @@ mod tests {
         assert_eq!(budget.maximum_memory_used_basis_points, 9200);
         assert_eq!(budget.pools[0].leased_bytes, 600);
         assert_eq!(budget.pools[0].target_bytes, 400);
+        assert_eq!(
+            details
+                .runtime
+                .as_ref()
+                .unwrap()
+                .scrub
+                .as_ref()
+                .unwrap()
+                .state,
+            "failed"
+        );
         let saved = serde_json::to_value(&details).unwrap();
+        assert_eq!(saved["runtime"]["scrub"], frontend["details"]["scrub"]);
         assert_eq!(
             saved["runtime"]["cacheBudget"],
             frontend["details"]["cacheBudget"]
@@ -215,4 +229,16 @@ mod tests {
             "old runtime samples remain readable"
         );
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrubTelemetry {
+    pub state: String,
+    pub total_containers: u64,
+    pub verified_containers: u64,
+    pub verified_bytes: u64,
+    pub read_bytes: u64,
+    pub current_container: Option<String>,
+    pub error: Option<String>,
 }

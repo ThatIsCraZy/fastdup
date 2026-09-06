@@ -136,6 +136,11 @@ where
             .read_exact_at(name, offset, length)
     }
 
+    fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.storage(self.existing(name)?)
+            .read_structure_at(name, offset, length)
+    }
+
     fn list_names(&self) -> io::Result<Vec<String>> {
         let mut names = BTreeSet::new();
         for name in self.data.list_names()? {

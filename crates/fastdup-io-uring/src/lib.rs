@@ -250,6 +250,9 @@ impl IoUringStorageIo {
 }
 
 impl StorageIo for IoUringStorageIo {
+    fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.filesystem.read_structure_at(name, offset, length)
+    }
     fn create_new(&self, name: &str) -> io::Result<()> {
         self.filesystem.create_new(name)
     }

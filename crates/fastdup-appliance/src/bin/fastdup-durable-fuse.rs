@@ -25,18 +25,19 @@ use fastdup_posix::{
 };
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo,
-    GcCandidateCatalogRepository, GenerationRepository, IndexedRequiredChunkVerifier,
-    MaintenanceRepository, OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport,
-    OnlineGcRunMode, OwnedContainerPublication, RecoveryCheckpointRepository,
-    SimilarityIndexRepository, StorageIo, StoreError, TieredStorageIo, publication_sample_ranges,
-    system_memory_budget_governor,
+    GcCandidateCatalogRepository, GenerationRepository, MaintenanceRepository,
+    OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport, OnlineGcRunMode,
+    OwnedContainerPublication, RecoveryCheckpointRepository, SimilarityIndexRepository, StorageIo,
+    StoreError, TieredStorageIo, publication_sample_ranges, system_memory_budget_governor,
 };
 
 mod common;
-#[path = "../runtime_telemetry.rs"]
-mod runtime_telemetry;
 #[path = "../runtime_management.rs"]
 mod runtime_management;
+#[path = "../runtime_scrub.rs"]
+mod runtime_scrub;
+#[path = "../runtime_telemetry.rs"]
+mod runtime_telemetry;
 
 use common::metadata_gc_status_fields;
 use fuse3::raw::Session;
@@ -343,7 +344,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         let staged = path.with_extension("json.staged");
         // Ephemeral, derived management information; never recovery authority.
-        if let Err(error) = std::fs::write(&staged, status.to_string()).and_then(|()| std::fs::rename(&staged, &path)) {
+        if let Err(error) = std::fs::write(&staged, status.to_string())
+            .and_then(|()| std::fs::rename(&staged, &path))
+        {
             eprintln!("warning=small_file_quota_status_unavailable error={error}");
         }
     }
@@ -393,6 +396,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frontend_telemetry = filesystem.frontend_telemetry();
     let session = Session::new(volatile_mount_options());
     let mount = session.mount(filesystem, &mount_path).await?;
+    let scrub_runtime = runtime_scrub::start(
+        recovered.recovery_containers.clone(),
+        recovered.recovery_indexes.clone(),
+        data_storage.clone(),
+        Arc::clone(&namespace),
+    )?;
     let gc_runtime = start_online_gc_runtime(
         recovered.online_maintenance,
         recovered.gc_catalog,
@@ -400,11 +409,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         container_root.clone(),
         online_gc_policy,
         online_gc_enabled(),
+        scrub_runtime.gate.clone(),
     );
     let recovery_checkpoint_runtime = start_recovery_checkpoint_runtime(
         recovered.recovery_generations,
-        recovered.recovery_containers,
-        recovered.recovery_indexes,
         recovered.recovery_checkpoints,
     );
     emit_mount_state(
@@ -434,7 +442,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let storage = storage.clone();
             async move {
                 if let Err(error) = handle_management_control(
-                    stream, telemetry, configuration, capacity_control, namespace, appliance, storage,
+                    stream,
+                    telemetry,
+                    configuration,
+                    capacity_control,
+                    namespace,
+                    appliance,
+                    storage,
                 )
                 .await
                 {
@@ -503,6 +517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     management_server.stop().await;
+    scrub_runtime.stop().await?;
     let clean_catch_up = stop_background_and_catch_up(
         Arc::clone(&appliance),
         gc_runtime,
@@ -510,7 +525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     mount.unmount().await?;
-    if clean_catch_up {
+    if clean_catch_up && !namespace.integrity_failed() {
         recovery_latch.mark_clean()?;
     }
     emit_verified_read_cache(&appliance);
@@ -730,7 +745,7 @@ fn recover_appliance(
             );
         }
     }
-    let appliance = DurableNamespace::open_with_reduction_indexes(
+    let appliance = DurableNamespace::open_with_structural_recovery(
         NamespaceConfig::default(),
         generations.clone(),
         containers.clone(),
@@ -757,8 +772,6 @@ fn recover_appliance(
 
 fn start_recovery_checkpoint_runtime(
     generations: GenerationRepository<FsStorageIo>,
-    containers: ContainerRepository<MaintenanceContainerStorage>,
-    indexes: ExactIndexRunRepository<FsStorageIo>,
     checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 ) -> RecoveryCheckpointRuntimeHandle {
     let (shutdown, mut shutdown_rx) = watch::channel(false);
@@ -776,14 +789,12 @@ fn start_recovery_checkpoint_runtime(
                 _ = ticks.tick() => {
                     publish_recovery_checkpoint_background(
                         generations.clone(),
-                        containers.clone(),
-                        indexes.clone(),
                         checkpoints.clone(),
                     ).await;
                 }
             }
         }
-        publish_recovery_checkpoint_once(generations, containers, indexes, checkpoints)
+        publish_recovery_checkpoint_once(generations, checkpoints)
             .await
             .map(drop)
     });
@@ -792,11 +803,9 @@ fn start_recovery_checkpoint_runtime(
 
 async fn publish_recovery_checkpoint_background(
     generations: GenerationRepository<FsStorageIo>,
-    containers: ContainerRepository<MaintenanceContainerStorage>,
-    indexes: ExactIndexRunRepository<FsStorageIo>,
     checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 ) {
-    match publish_recovery_checkpoint_once(generations, containers, indexes, checkpoints).await {
+    match publish_recovery_checkpoint_once(generations, checkpoints).await {
         Ok(Some(summary)) => eprintln!(
             "data_tier_recovery_checkpoint_ok=true generation={} metadata_objects={} metadata_bytes={} required_chunks={} file_bytes={}",
             summary.generation(),
@@ -812,21 +821,12 @@ async fn publish_recovery_checkpoint_background(
 
 async fn publish_recovery_checkpoint_once(
     generations: GenerationRepository<FsStorageIo>,
-    containers: ContainerRepository<MaintenanceContainerStorage>,
-    indexes: ExactIndexRunRepository<FsStorageIo>,
     checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 ) -> Result<Option<fastdup_store::RecoveryCheckpointSummary>, String> {
-    tokio::task::spawn_blocking(move || {
-        if let Some(index) = indexes.pin_active_generation() {
-            let verifier = IndexedRequiredChunkVerifier::new(containers, index);
-            checkpoints.publish(&generations, &verifier)
-        } else {
-            checkpoints.publish(&generations, &containers)
-        }
-    })
-    .await
-    .map_err(|error| format!("Recovery-Checkpoint worker join failed: {error}"))?
-    .map_err(|error| error.to_string())
+    tokio::task::spawn_blocking(move || checkpoints.publish_committed(&generations))
+        .await
+        .map_err(|error| format!("Recovery-Checkpoint worker join failed: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 fn emit_online_gc_recovery(report: OnlineGcRecoveryReport) {
@@ -1167,6 +1167,7 @@ fn start_online_gc_runtime(
     container_root: PathBuf,
     policy: OnlineGcPolicy,
     enabled: bool,
+    scrub_gate: runtime_scrub::ScrubGate,
 ) -> OnlineGcRuntimeHandle {
     let (requests, control) = mpsc::channel(1);
     let (configuration, configuration_rx) =
@@ -1182,6 +1183,7 @@ fn start_online_gc_runtime(
         control,
         configuration_rx,
         shutdown_rx,
+        scrub_gate,
     ));
     OnlineGcRuntimeHandle {
         requests,
@@ -1202,6 +1204,7 @@ async fn run_online_gc_runtime(
     mut control: mpsc::Receiver<OnlineGcControlRequest>,
     mut configuration: watch::Receiver<OnlineGcRuntimeConfiguration>,
     mut shutdown: watch::Receiver<bool>,
+    scrub_gate: runtime_scrub::ScrubGate,
 ) -> Result<(), String> {
     let now = Instant::now();
     let mut scheduler = OnlineGcScheduler::with_policy(
@@ -1234,6 +1237,10 @@ async fn run_online_gc_runtime(
                 let Some(request) = request else {
                     return Ok(());
                 };
+                if !scrub_gate.permits_gc() {
+                    let _ = request.response.send("Online GC waits for successful background scrub".to_owned());
+                    continue;
+                }
                 scheduler.record_immediate_start(Instant::now());
                 let relocation_workers = scheduler.relocation_workers(OnlineGcRunMode::Urgent);
                 let response = run_online_gc_quantum(
@@ -1248,7 +1255,7 @@ async fn run_online_gc_runtime(
                 let _ = request.response.send(response);
             }
             _ = ticks.tick() => {
-                if !enabled {
+                if !enabled || !scrub_gate.permits_gc() {
                     continue;
                 }
                 let usage = match data_pool_usage(&container_root) {
@@ -2179,6 +2186,9 @@ impl DataIoTelemetry {
 }
 
 impl StorageIo for TelemetryStorageIo {
+    fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.inner.read_structure_at(name, offset, length)
+    }
     fn create_new(&self, name: &str) -> io::Result<()> {
         self.inner.create_new(name)?;
         if self.enabled {

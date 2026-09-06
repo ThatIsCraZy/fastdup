@@ -1,5 +1,11 @@
 // German source messages keep familiar storage terminology.
 export const english: Record<string, string> = {
+  "Hintergrundprüfung": "Background verification",
+  "Container geprüft": "containers verified",
+  "gelesen": "read",
+  "Lesezugriffe werden vollständig geprüft. Die Hintergrundprüfung begrenzt ihre Last; automatische Speicherbereinigung wartet auf ihren Abschluss.": "Reads remain fully verified. Background verification limits its load; automatic space reclamation waits for completion.",
+  "Datenprüfung fehlgeschlagen. Neue Schreibzugriffe sind gesperrt. Details stehen im Dienstprotokoll.": "Data verification failed. New writes are blocked. Details are in the service log.",
+
   "SMB-Benutzer": "SMB users",
   "SMB-Benutzer anlegen": "Create SMB user",
   "SMB-Benutzername": "SMB username",

@@ -40,3 +40,16 @@ it("shows the shared budget, DATA priority tier and pending donor reservation in
  expect(within(screen.getByRole('row',{name:/Historical Proofs/})).getByText('—')).toBeVisible();
  expect(screen.getByRole('progressbar',{name:'Cache-Budget Belegung'})).toHaveAttribute('value','6500000000');
 });
+
+it("keeps background verification progress visible across tabs and shows a write-blocking failure", () => {
+ const runtime = details.runtime!;
+ const scrub = {state:"running",totalContainers:100,verifiedContainers:25,verifiedBytes:1000,readBytes:2000};
+ const sample = {...previewSnapshot.telemetry,details:{...details,runtime:{...runtime,scrub}}};
+ const view = render(<I18nProvider><DetailTelemetryPanel sample={sample} historical={false} loading={false}/></I18nProvider>);
+ expect(screen.getByRole('progressbar',{name:'Hintergrundprüfung'})).toHaveAttribute('value','25');
+ fireEvent.click(screen.getByRole('tab',{name:'Caches'}));
+ expect(screen.getByText(/25 \/ 100/)).toBeVisible();
+ view.rerender(<I18nProvider><DetailTelemetryPanel sample={{...sample,details:{...sample.details,runtime:{...runtime,scrub:{...scrub,state:"failed"}}}}} historical={false} loading={false}/></I18nProvider>);
+ expect(screen.getByRole('alert')).toHaveTextContent('Neue Schreibzugriffe sind gesperrt');
+ expect(screen.queryByRole('progressbar',{name:'Hintergrundprüfung'})).not.toBeInTheDocument();
+});

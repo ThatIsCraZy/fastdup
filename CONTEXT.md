@@ -144,11 +144,17 @@ canonical filename. It proves structural identity, layout, and generation for
 allocator recovery, but neither the payload hash nor any logical Chunk bytes.
 _Avoid_: Verified Container, verified Location
 
+**Container structure proof**:
+Evidence that a Container's complete local metadata and physical layout agree
+with its sealed identities and dependencies. It establishes structural
+availability without claiming that the stored payload bytes have been rehashed.
+_Avoid_: Container publication proof, verified Chunk, GC deletion proof
+
 **Container publication proof**:
 Evidence carried from the Container writer through sampled durable publication,
 or produced later by a complete independent Container read. Writer evidence
 binds prior Chunk identities to the exact serialized Locations. Independent
-read, recovery, and scrub evidence additionally recomputes checksums and logical
+content-verifying read, recovery, and scrub evidence additionally recomputes checksums and logical
 Chunk identities from stored bytes.
 _Avoid_: Read cache entry, Container envelope proof, Exact-Index hit
 
@@ -478,9 +484,11 @@ The generation-building recovery process that derives new online indexes from
 durable containers, a Recovery Checkpoint, and reachable object dependencies.
 _Avoid_: Scrub, normal startup
 
-**Degraded start**:
+**Structural start**:
 A mount after complete structural validation but before every stored chunk has
-been rehashed. Every chunk is still fully verified when read.
+been rehashed. Every chunk is fully verified when read, while background scrub
+checks stored content independently.
+_Alias_: Degraded start
 _Avoid_: Unverified read, rebuild
 
 **Re-anchoring**:

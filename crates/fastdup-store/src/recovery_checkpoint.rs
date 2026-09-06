@@ -51,7 +51,21 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         source: &GenerationRepository<M>,
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<Option<RecoveryCheckpointSummary>, RecoveryCheckpointError> {
-        source.publish_latest_recovery_checkpoint_to(self, verifier)
+        source.publish_latest_recovery_checkpoint_to(self, Some(verifier))
+    }
+
+    /// Copies a committed graph whose DATA durability was established before
+    /// its Commit WAL record. Validates the complete copied Metadata graph and
+    /// checkpoint image without repeating a full DATA scrub. Recovery and offline
+    /// scrub still independently verify DATA before restoring a lost Metadata tier.
+    ///
+    /// # Errors
+    /// Returns source/copy graph, identity, format, or durability failures.
+    pub fn publish_committed<M: StorageIo>(
+        &self,
+        source: &GenerationRepository<M>,
+    ) -> Result<Option<RecoveryCheckpointSummary>, RecoveryCheckpointError> {
+        source.publish_latest_recovery_checkpoint_to(self, None)
     }
 
     /// Selects the greatest wholly valid checkpoint and installs its exact
@@ -194,7 +208,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         &self,
         record: CommitRecord,
         object_ids: &BTreeSet<MetadataObjectId>,
-        verifier: &dyn RequiredChunkVerifier,
+        verifier: Option<&dyn RequiredChunkVerifier>,
         mut read_object: F,
     ) -> Result<RecoveryCheckpointSummary, RecoveryCheckpointError>
     where
@@ -211,7 +225,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
                 return Err(RecoveryCheckpointError::IdentityMismatch);
             }
             self.storage.sync_root()?;
-            let summary = self.verify_graph(&audited, verifier)?;
+            let summary = self.verify_publication_graph(&audited, verifier)?;
             let obsolete = self.publish_head(audited.descriptor)?;
             self.prune_obsolete(&obsolete)?;
             return Ok(summary);
@@ -314,7 +328,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         if audited.record != record || !audited.objects.keys().eq(object_ids.iter()) {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
-        let summary = self.verify_graph(&audited, verifier)?;
+        let summary = self.verify_publication_graph(&audited, verifier)?;
         self.storage.sync_file(&temporary_name)?;
         match self
             .storage
@@ -665,13 +679,32 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
             .map(|(summary, _)| summary)
     }
 
+    fn verify_publication_graph(
+        &self,
+        checkpoint: &AuditedCheckpoint,
+        verifier: Option<&dyn RequiredChunkVerifier>,
+    ) -> Result<RecoveryCheckpointSummary, RecoveryCheckpointError> {
+        self.verify_graph_policy(checkpoint, verifier)
+            .map(|(summary, _)| summary)
+    }
+
     fn verify_graph_with_chunks(
         &self,
         checkpoint: &AuditedCheckpoint,
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<(RecoveryCheckpointSummary, BTreeMap<ChunkId, u64>), RecoveryCheckpointError> {
+        self.verify_graph_policy(checkpoint, Some(verifier))
+    }
+
+    fn verify_graph_policy(
+        &self,
+        checkpoint: &AuditedCheckpoint,
+        verifier: Option<&dyn RequiredChunkVerifier>,
+    ) -> Result<(RecoveryCheckpointSummary, BTreeMap<ChunkId, u64>), RecoveryCheckpointError> {
         let (_root, required) = self.scan_graph(checkpoint)?;
-        verifier.verify_required_chunks(&required)?;
+        if let Some(verifier) = verifier {
+            verifier.verify_required_chunks(&required)?;
+        }
         Ok((
             RecoveryCheckpointSummary {
                 generation: checkpoint.record.generation(),

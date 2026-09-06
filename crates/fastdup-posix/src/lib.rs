@@ -2601,6 +2601,7 @@ pub struct Namespace {
     config: NamespaceConfig,
     mutations_supported: bool,
     mutations_admitted: RwLock<bool>,
+    integrity_failed: AtomicBool,
     admission_changed: Notify,
     dirty_payload: DirtyPayloadTracker,
     mutation_observer: RwLock<Option<Arc<dyn MutationObserver>>>,
@@ -2664,6 +2665,7 @@ impl Namespace {
             config,
             mutations_supported: true,
             mutations_admitted: RwLock::new(true),
+            integrity_failed: AtomicBool::new(false),
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
             mutation_observer: RwLock::new(None),
@@ -2929,6 +2931,7 @@ impl Namespace {
             config,
             mutations_supported: mutations_enabled,
             mutations_admitted: RwLock::new(mutations_enabled),
+            integrity_failed: AtomicBool::new(false),
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
             mutation_observer: RwLock::new(None),
@@ -2968,6 +2971,27 @@ impl Namespace {
             .expect("ASSERT: mutation admission lock poisoned") = false;
     }
 
+    /// Latches an integrity failure for this mount. New mutations fail with I/O
+    /// error, including waiters; checkpoint catch-up cannot reopen admission.
+    ///
+    /// # Panics
+    /// Panics if an invariant failure poisoned the admission lock.
+    pub fn fail_integrity(&self) {
+        let mut admitted = self
+            .mutations_admitted
+            .write()
+            .expect("mutation admission lock");
+        self.integrity_failed.store(true, Ordering::Release);
+        *admitted = false;
+        drop(admitted);
+        self.admission_changed.notify_waiters();
+    }
+
+    #[must_use]
+    pub fn integrity_failed(&self) -> bool {
+        self.integrity_failed.load(Ordering::Acquire)
+    }
+
     /// Reopens mutation admission after durable progress catches up.
     ///
     /// # Panics
@@ -2978,10 +3002,12 @@ impl Namespace {
             self.mutations_supported,
             "ASSERT: a read-only namespace cannot resume mutation admission"
         );
-        *self
+        let mut admitted = self
             .mutations_admitted
             .write()
-            .expect("ASSERT: mutation admission lock poisoned") = true;
+            .expect("ASSERT: mutation admission lock poisoned");
+        *admitted = !self.integrity_failed();
+        drop(admitted);
         self.admission_changed.notify_waiters();
     }
 
@@ -3000,6 +3026,9 @@ impl Namespace {
             let changed = self.admission_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
+            if self.integrity_failed() {
+                return Err(PosixError::Io);
+            }
             if self.mutation_admission_open() {
                 return Ok(());
             }
@@ -6134,6 +6163,9 @@ impl Namespace {
             .mutations_admitted
             .read()
             .expect("ASSERT: mutation admission lock poisoned");
+        if self.integrity_failed() {
+            return Err(PosixError::Io);
+        }
         if !*admitted {
             return Err(PosixError::Again);
         }
@@ -6886,6 +6918,25 @@ fn acquire_lookup(catalog: &mut Catalog, inode: InodeId, count: u64) -> Result<(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn integrity_failure_wakes_waiters_and_survives_checkpoint_resume() {
+        let namespace = std::sync::Arc::new(super::Namespace::new_volatile(
+            super::NamespaceConfig::default(),
+        ));
+        namespace.pause_mutation_admission();
+        let waiting = std::sync::Arc::clone(&namespace);
+        let waiter = tokio::spawn(async move { waiting.wait_for_mutation_admission().await });
+        tokio::task::yield_now().await;
+        namespace.fail_integrity();
+        namespace.resume_mutation_admission();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(super::PosixError::Io)));
+        assert!(!namespace.mutation_admission_open());
+    }
     use super::{Inode, MutationPayload, SparseData};
 
     #[test]

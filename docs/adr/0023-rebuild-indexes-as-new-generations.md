@@ -4,6 +4,13 @@ status: accepted
 
 # Rebuild indexes as new generations
 
+Current policy (2026-09-07): [ADR 0090](0090-mount-after-structural-validation-and-scrub-in-background.md)
+implements structural normal startup followed by background content scrub.
+It supersedes mandatory startup rehashing and the runtime's repeated DATA proof
+when copying an already committed graph to a Recovery Checkpoint. Full demand
+reads, disaster recovery and offline scrub retain independent content checks.
+The original rationale and remaining contracts follow below.
+
 After NVMe index loss, fastdup inventories and structurally verifies Data-Tier
 containers, builds provisional Location Sets from Recovery Indexes, selects the
 highest complete Recovery Checkpoint, traverses its namespace and dependency

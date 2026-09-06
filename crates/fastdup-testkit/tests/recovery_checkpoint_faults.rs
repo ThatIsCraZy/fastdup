@@ -367,10 +367,22 @@ fn torn_inactive_head_is_repaired_by_the_next_checkpoint_publication() {
 
 #[test]
 fn every_checkpoint_publication_fault_recovers_only_absence_or_the_complete_checkpoint() {
+    for committed_only in [false, true] {
+        checkpoint_publication_faults(committed_only);
+    }
+}
+
+fn checkpoint_publication_faults(committed_only: bool) {
     let (source, committed, namespace) = seed_source();
+    let publish = |repository: &RecoveryCheckpointRepository<MemoryStorageIo>| {
+        if committed_only {
+            repository.publish_committed(&source)
+        } else {
+            repository.publish(&source, &AcceptAllRequiredChunks)
+        }
+    };
     let probe_storage = MemoryStorageIo::new();
-    RecoveryCheckpointRepository::new(probe_storage.clone())
-        .publish(&source, &AcceptAllRequiredChunks)
+    publish(&RecoveryCheckpointRepository::new(probe_storage.clone()))
         .expect("probe publication succeeds");
     let operation_count = probe_storage.operation_count();
     assert!(operation_count > 0);
@@ -379,9 +391,7 @@ fn every_checkpoint_publication_fault_recovers_only_absence_or_the_complete_chec
         let data = MemoryStorageIo::with_fail_before(fail_before);
         let checkpoints = RecoveryCheckpointRepository::new(data.clone());
         assert!(
-            checkpoints
-                .publish(&source, &AcceptAllRequiredChunks)
-                .is_err(),
+            publish(&checkpoints).is_err(),
             "operation {fail_before} must be interrupted"
         );
         data.crash();
@@ -398,7 +408,7 @@ fn every_checkpoint_publication_fault_recovers_only_absence_or_the_complete_chec
     for fail_after in 0..operation_count {
         let data = MemoryStorageIo::with_fail_after(fail_after);
         let checkpoints = RecoveryCheckpointRepository::new(data.clone());
-        let result = checkpoints.publish(&source, &AcceptAllRequiredChunks);
+        let result = publish(&checkpoints);
         assert!(
             result.is_err(),
             "operation {fail_after} must report failure"

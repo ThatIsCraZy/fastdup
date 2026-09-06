@@ -15,6 +15,7 @@ records verified drift, source evidence, and remaining gaps. The
 | --- | --- |
 | Compatibility | 0002, 0071, 0074: current pre-production formats only; no general migration guarantee. |
 | Container integrity and allocation | 0008, 0059, 0060, 0072, 0075, 0088: Container v3, structural commitment algorithm 2, paired generation high-water reservations. |
+| Normal startup and background verification | 0090: structural mount, paced content scrub, GC gate and sticky integrity failure; 0023 retains full disaster rebuild. |
 | Manifest and Namespace graphs | 0011, 0036, 0042, 0043, 0085: Manifest Leaf/Inner v2, authenticated successors, one sharded Namespace Root. |
 | User-DATA chunking | 0054: SeqCDC-v1. Namespace sharding uses its separate FastCDC profile in 0085. |
 | Advanced Reduction | 0010, 0018, 0088, 0089: depth-one Prefix/Sparse-XOR, bounded online Similarity; 0062 retains the offline rebuild contract. |

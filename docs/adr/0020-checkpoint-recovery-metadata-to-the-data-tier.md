@@ -4,6 +4,13 @@ status: accepted
 
 # Checkpoint recovery metadata to the data tier
 
+Current policy (2026-09-07): [ADR 0090](0090-mount-after-structural-validation-and-scrub-in-background.md)
+implements structural normal startup followed by background content scrub.
+It supersedes mandatory startup rehashing and the runtime's repeated DATA proof
+when copying an already committed graph to a Recovery Checkpoint. Full demand
+reads, disaster recovery and offline scrub retain independent content checks.
+The original rationale and remaining contracts follow below.
+
 Every 90 seconds, and once during orderly shutdown, fastdup attempts to publish
 a self-contained immutable Recovery Checkpoint to the redundantly protected Data
 Tier. It embeds one Commit Record and the complete transitive Metadata graph

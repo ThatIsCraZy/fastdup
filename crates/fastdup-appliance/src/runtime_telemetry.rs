@@ -8,6 +8,14 @@ use super::{
 use serde_json::{Value, json};
 
 static CHECKPOINT: Mutex<Option<Value>> = Mutex::new(None);
+static SCRUB: Mutex<Option<Value>> = Mutex::new(None);
+
+pub fn record_scrub(value: Value) {
+    if let Ok(mut status) = SCRUB.lock() {
+        *status = Some(value);
+    }
+}
+
 static GC: Mutex<Option<Value>> = Mutex::new(None);
 
 fn unix_seconds() -> u64 {
@@ -101,6 +109,7 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
             "effectiveLimitBytes":budget.effective_limit_bytes,
             "availableBytes":budget.available_bytes,
             "budgetBytes":budget.budget_bytes, "pools":pools},
+        "scrub": SCRUB.lock().ok().and_then(|status| status.clone()),
         "runtimeId": format!("{}", std::process::id()),
         "ioUring": {"ringEntries":io.ring_entries(), "inflightBytes":io.inflight_bytes(),
             "maxInflightBytes":io.max_inflight_bytes(), "peakInflightBytes":io.peak_inflight_bytes(),

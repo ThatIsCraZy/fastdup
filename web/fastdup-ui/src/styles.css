@@ -355,3 +355,9 @@ progress { accent-color: #63c4d5; height: 6px; }
   .quota-notice-label { display: none; }
   .quota-notice-detail { right: auto; left: 0; width: 260px; }
 }
+
+.detail-scrub { margin: 0 20px 16px; display: grid; gap: 7px; color: var(--muted); font-size: 12px; }
+.detail-scrub strong { color: var(--text); }
+.detail-scrub progress { width: 100%; accent-color: #63c4d5; }
+.detail-scrub[role="alert"] { color: #f08088; }
+.detail-scrub[role="alert"] strong { color: inherit; }
