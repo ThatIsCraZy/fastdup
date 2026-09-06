@@ -2400,6 +2400,8 @@ struct IngestQueueStatus {
 
 #[derive(Debug)]
 struct IngestQueue {
+    #[cfg(test)]
+    before_fragment_wait: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     state: Mutex<IngestQueueState>,
     work_available: Condvar,
     space_available: Condvar,
@@ -2770,6 +2772,8 @@ impl IngestQueue {
 
     fn new() -> Self {
         Self {
+            #[cfg(test)]
+            before_fragment_wait: Mutex::new(None),
             state: Mutex::new(IngestQueueState::default()),
             work_available: Condvar::new(),
             space_available: Condvar::new(),
@@ -2829,6 +2833,12 @@ impl IngestQueue {
         inode: InodeId,
         fragment: IngestWriteFragment,
     ) {
+        // A mode change may leave a partial single-stream batch for this
+        // inode. Queue it before admitting any newer unbatched fragment,
+        // including when admission must release the lock for backpressure.
+        if seal_open_ingest_batch(&mut state, inode) {
+            self.work_available.notify_all();
+        }
         let wait_started = Instant::now();
         let mut waited = false;
         while state
@@ -2924,6 +2934,10 @@ impl IngestQueue {
                 return state;
             }
             waited = true;
+            #[cfg(test)]
+            if let Some(sender) = self.before_fragment_wait.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
             state = self
                 .space_available
                 .wait(state)
@@ -7622,6 +7636,20 @@ mod tests {
 
     #[test]
     fn proof_budget_overflow_keeps_existing_proofs_and_verifies_uncached_dependencies() {
+        struct RejectMissing;
+        impl RequiredChunkVerifier for RejectMissing {
+            fn verify_required_chunks(
+                &self,
+                required: &BTreeMap<ChunkId, u64>,
+            ) -> Result<(), StoreError> {
+                assert_eq!(required.len(), 1);
+                let (&chunk_id, &logical_length) = required.first_key_value().unwrap();
+                Err(StoreError::MissingVerifiedChunk {
+                    chunk_id,
+                    logical_length,
+                })
+            }
+        }
         let proofs = Arc::new(OnlineDependencyProofs::new().unwrap());
         for ordinal in 0..MAX_ONLINE_DEPENDENCY_PROOFS_V1 / 2 {
             proofs.remember_active(budget_entry(ordinal), OnlineProofAdmission::Published);
@@ -7652,20 +7680,6 @@ mod tests {
             MAX_ONLINE_DEPENDENCY_PROOFS_V1 / 2
         );
 
-        struct RejectMissing;
-        impl RequiredChunkVerifier for RejectMissing {
-            fn verify_required_chunks(
-                &self,
-                required: &BTreeMap<ChunkId, u64>,
-            ) -> Result<(), StoreError> {
-                assert_eq!(required.len(), 1);
-                let (&chunk_id, &logical_length) = required.first_key_value().unwrap();
-                Err(StoreError::MissingVerifiedChunk {
-                    chunk_id,
-                    logical_length,
-                })
-            }
-        }
         let verifier = OnlineSuccessorVerifier {
             proofs: Arc::clone(&proofs),
             fallback: Box::new(RejectMissing),
@@ -8530,6 +8544,159 @@ mod tests {
         assert_eq!(permits.available(), 0);
         drop(cpu);
         assert_eq!(permits.available(), 10);
+    }
+
+    #[test]
+    fn ingest_mode_transition_drains_older_batch_before_unbatched_write() {
+        let queue = IngestQueue::new();
+        let a = InodeId::new(2).unwrap();
+        let b = InodeId::new(3).unwrap();
+        let fragment = |sequence, offset| IngestWriteFragment {
+            offset,
+            bytes: MutationPayload::from_owned_bytes(vec![u8::try_from(sequence).unwrap(); 4096]),
+            mutation_sequence: sequence,
+            placement: ContainerPlacement::Data,
+        };
+        // One inode leaves a partial batch. A second inode changes admission
+        // mode before that batch has been consumed.
+        queue.enqueue_write_fragment(a, fragment(1, 0));
+        queue.enqueue_write_fragment(b, fragment(1, 0));
+        queue.enqueue_write_fragment(a, fragment(2, 4096));
+        queue.shutdown();
+        let mut sequences = Vec::new();
+        while let Some(job) = queue.next_job() {
+            if job.inode == a {
+                sequences.push(job.mutation_sequence);
+            }
+            queue.finish(&job);
+        }
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(queue.status().buffered_bytes, 0);
+        queue.wait_through(a, 2);
+    }
+
+    #[test]
+    fn ingest_mode_transition_during_backpressure_preserves_handle_order() {
+        let queue = Arc::new(IngestQueue::new());
+        let a = InodeId::new(2).unwrap();
+        let b = InodeId::new(3).unwrap();
+        queue.opened_write_handle(a);
+        let payload = MutationPayload::from_owned_bytes(vec![7; 1024 * 1024]);
+        for sequence in 1..=32 {
+            queue.enqueue_write_fragment(
+                a,
+                IngestWriteFragment {
+                    offset: (sequence - 1) * 1024 * 1024,
+                    bytes: payload.clone(),
+                    mutation_sequence: sequence,
+                    placement: ContainerPlacement::Data,
+                },
+            );
+        }
+        let (entered, waiting) = mpsc::channel();
+        *queue.before_fragment_wait.lock().unwrap() = Some(entered);
+        let writer_queue = Arc::clone(&queue);
+        let writer = std::thread::spawn(move || {
+            writer_queue.enqueue_write_fragment(
+                a,
+                IngestWriteFragment {
+                    offset: 32 * 1024 * 1024,
+                    bytes: MutationPayload::from_owned_bytes(vec![8; 4096]),
+                    mutation_sequence: 33,
+                    placement: ContainerPlacement::Data,
+                },
+            );
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The waiting writer selected batching with one writable inode. A
+        // second handle changes the mode while its admission lock is released.
+        queue.opened_write_handle(b);
+        let first = queue.next_job().unwrap();
+        queue.finish(&first);
+        writer.join().unwrap();
+        // Hold the batch's age below the expiry threshold deterministically.
+        queue
+            .state
+            .lock()
+            .unwrap()
+            .inodes
+            .get_mut(&a)
+            .unwrap()
+            .open
+            .as_mut()
+            .unwrap()
+            .opened_at = Instant::now() + Duration::from_mins(1);
+        for _ in 0..4 {
+            let job = queue.next_job().unwrap();
+            queue.finish(&job);
+        }
+        queue.enqueue_write_fragment(
+            a,
+            IngestWriteFragment {
+                offset: 32 * 1024 * 1024 + 4096,
+                bytes: MutationPayload::from_owned_bytes(vec![9; 4096]),
+                mutation_sequence: 34,
+                placement: ContainerPlacement::Data,
+            },
+        );
+        queue.shutdown();
+        let mut sequences = Vec::new();
+        while let Some(job) = queue.next_job() {
+            sequences.push(job.mutation_sequence);
+            queue.finish(&job);
+        }
+        assert_eq!(sequences, vec![24, 28, 32, 33, 34]);
+        queue.wait_through(a, 34);
+        assert_eq!(queue.status().buffered_bytes, 0);
+        queue.released_write_handle(a);
+        queue.released_write_handle(b);
+    }
+
+    #[test]
+    #[ignore = "manual optimized queue admission A/B benchmark"]
+    fn ingest_queue_admission_benchmark() {
+        let payload = MutationPayload::from_owned_bytes(vec![7; 1024 * 1024]);
+        for mode in ["single", "multi"] {
+            for round in 0..7 {
+                let queue = IngestQueue::new();
+                let a = InodeId::new(2).unwrap();
+                let b = InodeId::new(3).unwrap();
+                queue.opened_write_handle(a);
+                if mode == "multi" {
+                    queue.opened_write_handle(b);
+                }
+                let started = Instant::now();
+                let jobs = 200_000_u64;
+                let per_job = if mode == "single" { 4 } else { 1 };
+                for job in 0..jobs {
+                    let inode = if mode == "multi" && job % 2 == 1 {
+                        b
+                    } else {
+                        a
+                    };
+                    for part in 0..per_job {
+                        let sequence = job * per_job + part + 1;
+                        queue.enqueue_write_fragment(
+                            inode,
+                            IngestWriteFragment {
+                                offset: sequence * 1024 * 1024,
+                                bytes: std::hint::black_box(payload.clone()),
+                                mutation_sequence: sequence,
+                                placement: ContainerPlacement::Data,
+                            },
+                        );
+                    }
+                    let work = queue.next_job().unwrap();
+                    queue.finish(&work);
+                }
+                println!(
+                    "queue_bench mode={mode} round={round} fragments={} elapsed_ns={}",
+                    jobs * per_job,
+                    started.elapsed().as_nanos()
+                );
+                assert_eq!(queue.status().buffered_bytes, 0);
+            }
+        }
     }
 
     #[test]

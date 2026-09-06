@@ -31,7 +31,12 @@ releasing the inode-data lock. A separate per-inode Observer-order lock spans
 live mutation and complete queue admission, so assigned mutation sequences
 cannot overtake each other while readers and workers remain unblocked. Queue
 assertions reject decreasing sequences and more than one active job for an
-inode.
+inode. Before admitting an unbatched fragment, the queue seals any older
+partial batch for that inode, including before a backpressure wait releases
+the queue lock. Writable-handle changes can switch admission mode while an
+earlier admission is waiting; the mode switch cannot let a newer fragment
+pass the open batch. Sealing moves existing payload views into the ordered
+queue and adds neither a payload copy nor a storage operation.
 
 Each lane retains a segmented userspace Tail built from those immutable views.
 It compacts only the bounded prefix required by FastCDC, never shifts an entire
