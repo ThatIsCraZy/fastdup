@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -13,8 +14,9 @@ vi.mock("echarts-for-react", () => ({
   default: () => <div data-testid="chart" />,
 }));
 
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+
 describe("FastDup Control Plane UI", () => {
-  afterEach(cleanup);
   beforeEach(() => {
     vi.stubGlobal(
       "fetch",
@@ -102,7 +104,7 @@ describe("FastDup Control Plane UI", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Telemetrie" }));
     expect(screen.getByRole("tab", { name: "Latenzen" })).toBeVisible();
-    expect(screen.getByText("Noch keine Messdaten verfügbar. Das Repository muss mit aktueller Runtime gemountet sein.")).toBeVisible();
+    expect(screen.getByText("Runtime-Messdaten sind derzeit nicht verfügbar. Ein vorhandener Mount-Eintrag allein bestätigt keine erreichbare Runtime.")).toBeVisible();
     expect(document.querySelector(".telemetry-tabs")).not.toBeInTheDocument();
   });
 
@@ -701,12 +703,39 @@ it("loads inventory after interactive login without a browser reload", async () 
   await waitFor(() => expect(document.querySelectorAll(".target-card:enabled").length).toBeGreaterThan(0));
 });
 
-it("displays an adapted Small-File quota as a warning", async () => {
- vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
-   const url=String(input);
-   const body=url.endsWith("/session")?{username:"admin",csrfToken:"csrf",mustChangePassword:false}:url.endsWith("/principals")?{users:[],groups:[]}:{...previewSnapshot,telemetry:{...previewSnapshot.telemetry,smallFileQuota:{requestedBytes:68719476736,effectiveBytes:10737418240}}};
-   return Promise.resolve(new Response(JSON.stringify(body),{status:200}));
- }));
- render(<App/>);
- expect(await screen.findByText(/Small-File-Limit wegen kleinem Metadata-Volume/)).toBeVisible();
+it("keeps the quota warning in the topbar across missing online samples and clears it on unmount", async () => {
+  const source = new EventTarget();
+  const listener = vi.spyOn(EventSource.prototype, "addEventListener").mockImplementation(source.addEventListener.bind(source));
+  const quota = { requestedBytes: 68719476736, effectiveBytes: 10737418240 };
+  vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    const body = url.endsWith("/session") ? { username: "admin", csrfToken: "csrf", mustChangePassword: false }
+      : url.endsWith("/principals") ? { users: [], groups: [] }
+      : { ...previewSnapshot, telemetry: { ...previewSnapshot.telemetry, repositoryState: "online", smallFileQuota: quota } };
+    return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+  }));
+  const view = render(<App />);
+  const warning = await screen.findByText(/Small-File-Limit wegen kleinem Metadata-Volume/);
+  expect(warning.closest("header")).toHaveClass("topbar");
+  expect(warning.closest(".page-content")).toBeNull();
+  const sample = (smallFileQuota: typeof quota | null, repositoryState = "online") => act(() => {
+    source.dispatchEvent(new MessageEvent("snapshot", { data: JSON.stringify({
+      ...previewSnapshot.telemetry, repositoryState, smallFileQuota,
+    }) }));
+  });
+  sample(null);
+  expect(warning).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Repository" }));
+  expect(warning).toBeInTheDocument();
+  sample({ ...quota, effectiveBytes: quota.requestedBytes });
+  expect(screen.queryByText(/Small-File-Limit wegen kleinem Metadata-Volume/)).not.toBeInTheDocument();
+  sample(quota);
+  expect(screen.getByText(/Small-File-Limit wegen kleinem Metadata-Volume/)).toBeInTheDocument();
+  sample(null, "unmounted");
+  expect(screen.queryByText(/Small-File-Limit wegen kleinem Metadata-Volume/)).not.toBeInTheDocument();
+  sample(null);
+  expect(screen.queryByText(/Small-File-Limit wegen kleinem Metadata-Volume/)).not.toBeInTheDocument();
+  view.unmount();
+  listener.mockRestore();
+  vi.unstubAllGlobals();
 });

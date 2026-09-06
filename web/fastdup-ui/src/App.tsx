@@ -1977,6 +1977,28 @@ function Login({ onLogin }: { onLogin: (session: SessionInfo) => void }) {
   );
 }
 
+function SmallFileQuotaNotice({ telemetry }: { telemetry: TelemetrySnapshot }) {
+  const { t, locale } = useI18n();
+  const [lastQuota, setLastQuota] = useState(telemetry.smallFileQuota);
+  const online = telemetry.repositoryState === "online";
+  useEffect(() => {
+    // A missing telemetry sample does not change the mounted runtime's limit.
+    if (!online) setLastQuota(undefined);
+    else if (telemetry.smallFileQuota) setLastQuota(telemetry.smallFileQuota);
+  }, [online, telemetry.smallFileQuota]);
+  const quota = online ? telemetry.smallFileQuota ?? lastQuota : undefined;
+  if (!quota || quota.effectiveBytes >= quota.requestedBytes) return null;
+  const message = t("Small-File-Limit wegen kleinem Metadata-Volume von {requested} auf {effective} reduziert.", {
+    requested: formatBytes(quota.requestedBytes, locale),
+    effective: formatBytes(quota.effectiveBytes, locale),
+  });
+  return <div className="quota-notice" role="status" tabIndex={0} aria-label={message}>
+    <AlertTriangle size={16} aria-hidden="true" />
+    <span className="quota-notice-label">{t("Small-File-Limit: {effective}", { effective: formatBytes(quota.effectiveBytes, locale) })}</span>
+    <span className="quota-notice-detail">{message}</span>
+  </div>;
+}
+
 function Application() {
   const { t, locale, language, setLanguage } = useI18n();
   const [active, setActive] = useState("Übersicht");
@@ -2425,6 +2447,7 @@ function Application() {
             <span>Appliance Control Plane</span>
           </div>
           <div className="topbar-actions">
+            <SmallFileQuotaNotice telemetry={snapshot.telemetry} />
             <Badge className={fresh ? "live" : "stale"}>
               <span className="pulse" />
               <span className="telemetry-status-full">{fresh ? "Live" : t("Telemetrie veraltet")}</span>
@@ -2485,7 +2508,6 @@ function Application() {
           </div>
         </header>
         <div className="page-content">
-          {snapshot.telemetry.smallFileQuota && snapshot.telemetry.smallFileQuota.effectiveBytes < snapshot.telemetry.smallFileQuota.requestedBytes && <div className="alarm-banner" role="status"><AlertTriangle/><span>{t("Small-File-Limit wegen kleinem Metadata-Volume von {requested} auf {effective} reduziert.", { requested: formatBytes(snapshot.telemetry.smallFileQuota.requestedBytes, locale), effective: formatBytes(snapshot.telemetry.smallFileQuota.effectiveBytes, locale) })}</span></div>}
           {content}</div>
       </main>
       {!session.mustChangePassword && <RecentJobs jobs={snapshot.jobs} />}

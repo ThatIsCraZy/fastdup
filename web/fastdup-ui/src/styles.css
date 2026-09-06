@@ -345,3 +345,13 @@ progress { accent-color: #63c4d5; height: 6px; }
 .settings-cards input[type="file"] { height: auto; padding: 12px; width: 100%; }
 @media (max-width: 1000px) { .settings-cards { grid-template-columns: 1fr; } }
 @media (max-width: 700px) { .settings-nav { overflow-x: auto; }.settings-nav button { flex-shrink: 0; padding: 0 12px; } }
+
+/* Compact persistent warning; full explanation is available by pointer or keyboard. */
+.quota-notice { position: relative; display: flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 6px 8px; border: 1px solid #715b35; border-radius: 6px; color: #f2c16b; background: #292419; font-size: 12px; }
+.quota-notice-detail { display: none; position: absolute; top: calc(100% + 10px); right: 0; width: 320px; max-width: calc(100vw - 40px); padding: 12px; color: #f2c16b; background: #292419; border: 1px solid #715b35; border-radius: 6px; line-height: 1.5; box-shadow: 0 8px 24px #0006; }
+.quota-notice:hover .quota-notice-detail, .quota-notice:focus .quota-notice-detail { display: block; }
+.quota-notice:focus-visible { outline: 2px solid #f2c16b; outline-offset: 3px; }
+@media (max-width: 1000px) {
+  .quota-notice-label { display: none; }
+  .quota-notice-detail { right: auto; left: 0; width: 260px; }
+}

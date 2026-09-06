@@ -8,6 +8,7 @@ export const english: Record<string, string> = {
   "Diese Konten gelten für SMB-Freigaben. Sie haben keinen WebUI- oder SSH-Zugang.": "These accounts access SMB shares. They cannot sign in to the WebUI or SSH.",
   "Noch keine SMB-Benutzer vorhanden.": "No SMB users yet.",
   "SMB-Benutzer {name} wurde angelegt. Bitte in der Freigabe erlauben.": "SMB user {name} created. Allow this user in the share settings.",
+  "Small-File-Limit: {effective}": "Small-File limit: {effective}",
   "Small-File-Limit wegen kleinem Metadata-Volume von {requested} auf {effective} reduziert.": "Small-File limit reduced from {requested} to {effective} because the Metadata volume is small.",
 
   "Täglich in UTC, Format HH:MM-HH:MM. Leer lassen, um kein festes Zeitfenster vorzugeben.": "Daily in UTC, format HH:MM-HH:MM. Leave empty for no fixed schedule.",
@@ -65,7 +66,7 @@ export const english: Record<string, string> = {
   "Detailtelemetrie": "Detailed telemetry",
   "Letzter Messpunkt im Zeitraum": "Last sample in range",
   "Messpunkt": "Sample",
-  "Noch keine Messdaten verfügbar. Das Repository muss mit aktueller Runtime gemountet sein.": "No measurements available yet. Mount the repository with an up-to-date runtime.",
+  "Runtime-Messdaten sind derzeit nicht verfügbar. Ein vorhandener Mount-Eintrag allein bestätigt keine erreichbare Runtime.": "Runtime metrics are currently unavailable. A mount entry alone does not confirm that the runtime is reachable.",
   "Histogramm-Perzentile seit dem Mount, inklusive fehlgeschlagener Requests. Werte sind Bucket-Obergrenzen, keine Intervallmittelwerte.": "Histogram percentiles since mount, including failed requests. Values are bucket upper bounds, not interval averages.",
   "Erfolgreich": "Successful",
   "Data-Tier io_uring: aktuelle Belegung und kumulative Zähler seit dem Mount.": "Data-tier io_uring: current usage and cumulative counters since mount.",
