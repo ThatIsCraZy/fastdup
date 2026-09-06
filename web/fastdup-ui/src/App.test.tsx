@@ -104,7 +104,7 @@ describe("FastDup Control Plane UI", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Telemetrie" }));
     expect(screen.getByRole("tab", { name: "Latenzen" })).toBeVisible();
-    expect(screen.getByText("Runtime-Messdaten sind derzeit nicht verfügbar. Ein vorhandener Mount-Eintrag allein bestätigt keine erreichbare Runtime.")).toBeVisible();
+    expect(screen.getByText("Runtime-Messdaten sind momentan nicht verfügbar. Die Anzeige wird automatisch aktualisiert.")).toBeVisible();
     expect(document.querySelector(".telemetry-tabs")).not.toBeInTheDocument();
   });
 

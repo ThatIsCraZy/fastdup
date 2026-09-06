@@ -35,6 +35,8 @@ use fastdup_store::{
 mod common;
 #[path = "../runtime_telemetry.rs"]
 mod runtime_telemetry;
+#[path = "../runtime_management.rs"]
+mod runtime_management;
 
 use common::metadata_gc_status_fields;
 use fuse3::raw::Session;
@@ -416,6 +418,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         advanced_reduction,
     );
 
+    let management_server = {
+        let telemetry = Arc::clone(&frontend_telemetry);
+        let configuration = gc_runtime.configuration.clone();
+        let capacity_control = presented_capacity_control.clone();
+        let namespace = Arc::clone(&namespace);
+        let appliance = Arc::clone(&appliance);
+        let storage = data_storage.clone();
+        runtime_management::ManagementServer::start(management_listener, move |stream| {
+            let telemetry = Arc::clone(&telemetry);
+            let configuration = configuration.clone();
+            let capacity_control = capacity_control.clone();
+            let namespace = Arc::clone(&namespace);
+            let appliance = Arc::clone(&appliance);
+            let storage = storage.clone();
+            async move {
+                if let Err(error) = handle_management_control(
+                    stream, telemetry, configuration, capacity_control, namespace, appliance, storage,
+                )
+                .await
+                {
+                    eprintln!("management_control_error={error}");
+                }
+            }
+        })
+    };
+
     let mut shutdown_signal = ShutdownSignal::new()?;
     let mut ticks = interval(SCHEDULER_RESOLUTION);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -470,23 +498,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
-            accepted = management_listener.accept() => {
-                let (stream, _) = accepted?;
-                let telemetry = Arc::clone(&frontend_telemetry);
-                let configuration = gc_runtime.configuration.clone();
-                let capacity_control = presented_capacity_control.clone();
-                let namespace = Arc::clone(&namespace);
-                let inspected_appliance = Arc::clone(&appliance);
-                let inspected_storage = data_storage.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_management_control(stream, telemetry, configuration, capacity_control, namespace, inspected_appliance, inspected_storage).await {
-                        eprintln!("management_control_error={error}");
-                    }
-                });
-            }
+
         }
     }
 
+    management_server.stop().await;
     let clean_catch_up = stop_background_and_catch_up(
         Arc::clone(&appliance),
         gc_runtime,

@@ -28,7 +28,7 @@ export function DetailTelemetryPanel({ sample, historical, loading }: { sample?:
   const number = (value?: number | null) => value == null ? "—" : value.toLocaleString(locale, { maximumFractionDigits: 2 });
   const bytes = (value?: number | null) => value == null ? "—" : value >= 1e9 ? `${number(value / 1e9)} GB` : value >= 1e6 ? `${number(value / 1e6)} MB` : value >= 1e3 ? `${number(value / 1e3)} KB` : `${number(value)} B`;
   const timestamp = (value: number) => new Date(value * 1000).toLocaleString(locale);
-  const empty = <p className="detail-empty">{t("Runtime-Messdaten sind derzeit nicht verfügbar. Ein vorhandener Mount-Eintrag allein bestätigt keine erreichbare Runtime.")}</p>;
+  const empty = <p className="detail-empty">{t("Runtime-Messdaten sind momentan nicht verfügbar. Die Anzeige wird automatisch aktualisiert.")}</p>;
   const rows = (values: [string, string][]) => <dl className="telemetry-values">{values.map(([label, value]) => <div key={label}><dt>{t(label)}</dt><dd>{value}</dd></div>)}</dl>;
   const checkpoint = runtime?.checkpoint;
   const gc = runtime?.gc;

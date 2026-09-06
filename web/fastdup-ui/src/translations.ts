@@ -66,7 +66,7 @@ export const english: Record<string, string> = {
   "Detailtelemetrie": "Detailed telemetry",
   "Letzter Messpunkt im Zeitraum": "Last sample in range",
   "Messpunkt": "Sample",
-  "Runtime-Messdaten sind derzeit nicht verfügbar. Ein vorhandener Mount-Eintrag allein bestätigt keine erreichbare Runtime.": "Runtime metrics are currently unavailable. A mount entry alone does not confirm that the runtime is reachable.",
+  "Runtime-Messdaten sind momentan nicht verfügbar. Die Anzeige wird automatisch aktualisiert.": "Runtime metrics are temporarily unavailable. This view refreshes automatically.",
   "Histogramm-Perzentile seit dem Mount, inklusive fehlgeschlagener Requests. Werte sind Bucket-Obergrenzen, keine Intervallmittelwerte.": "Histogram percentiles since mount, including failed requests. Values are bucket upper bounds, not interval averages.",
   "Erfolgreich": "Successful",
   "Data-Tier io_uring: aktuelle Belegung und kumulative Zähler seit dem Mount.": "Data-tier io_uring: current usage and cumulative counters since mount.",

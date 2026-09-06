@@ -5406,6 +5406,12 @@ where
         self.manifest_readers.similarity_page_cache_status()
     }
 
+    /// Returns reduction counters without traversing ingest buffers.
+    #[must_use]
+    pub fn advanced_reduction_status(&self) -> PersistentReductionStatus {
+        self.manifest_readers.advanced_reduction_status()
+    }
+
     /// Returns bounded shared read-cache memory and hit/miss evidence.
     ///
     /// A zero target means memory or Swap pressure disabled admission and

@@ -81,7 +81,7 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
     let exact = appliance.exact_index_page_cache_status();
     let similarity = appliance.similarity_index_page_cache_status();
     let descriptors = appliance.container_descriptor_cache_status();
-    let reduction = appliance.write_through_status().advanced_reduction();
+    let reduction = appliance.advanced_reduction_status();
     json!({
         "runtimeId": format!("{}", std::process::id()),
         "ioUring": {"ringEntries":io.ring_entries(), "inflightBytes":io.inflight_bytes(),

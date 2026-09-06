@@ -11,6 +11,34 @@ const CALLER: RequestContext = RequestContext {
 };
 type Appliance = DurableNamespace<MemoryStorageIo, MemoryStorageIo>;
 
+#[test]
+fn reduction_telemetry_does_not_wait_for_busy_ingest_lanes() {
+    let appliance = Arc::new(
+        DurableNamespace::open_with_index(
+            NamespaceConfig::default(),
+            GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set()),
+            ContainerRepository::new(MemoryStorageIo::new()),
+            &ExactIndexRunRepository::new(MemoryStorageIo::new()),
+            32,
+        )
+        .unwrap(),
+    );
+    let lane = appliance.write_through.lane_for(ROOT_INODE);
+    let guard = lane.lock().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let inspected = Arc::clone(&appliance);
+    let worker = std::thread::spawn(move || {
+        sender.send(inspected.advanced_reduction_status()).unwrap();
+    });
+    let result = receiver.recv_timeout(Duration::from_millis(400));
+    drop(guard);
+    worker.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "telemetry must respond within the control sampler's deadline even while an ingest lane is busy"
+    );
+}
+
 fn write(appliance: &Appliance, inode: InodeId, handle: HandleId, bytes: &[u8]) {
     for (ordinal, block) in bytes.chunks(MIB).enumerate() {
         appliance

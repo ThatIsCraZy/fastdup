@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.6.4
-Release:        7%{?dist}
+Release:        8%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,10 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-8
+- Serve management requests independently of checkpoint waits.
+- Read reduction telemetry without locking ingest lanes.
+
 * Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-7
 - Preserve shared ingest lane ownership across truncate and checkpoint overlap.
 - Keep detached publication failure handling independent of producer lane locks.
