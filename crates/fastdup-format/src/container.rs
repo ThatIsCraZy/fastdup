@@ -3906,6 +3906,13 @@ impl AdaptiveEncoderV1 {
             for chunk in chunks {
                 let mut input = InBuffer::around(chunk.bytes);
                 while input.pos < input.src.len() {
+                    // A previous Chunk may have consumed its complete input
+                    // while filling the bounded output. Reject the trial
+                    // before feeding the next Chunk into a full destination;
+                    // no progress there is expected, not a codec failure.
+                    if output_buffer.pos() == output_buffer.capacity() {
+                        return Ok(None);
+                    }
                     let input_before = input.pos;
                     let output_before = output_buffer.pos();
                     self.zstd

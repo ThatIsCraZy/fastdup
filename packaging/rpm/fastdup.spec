@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.6.4
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,10 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-4
+- Treat a full Zstd trial output at a Chunk boundary as RAW fallback.
+- Prevent checkpoint failure and blocked SMB writes on incompressible tails.
+
 * Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-3
 - Keep checkpoint and recovered readers on the current Exact index after activation.
 - Avoid repeated full Container scans while retaining bounded GC operation pins.

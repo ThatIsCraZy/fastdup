@@ -21,7 +21,11 @@ Every encoding worker owns its mutable Zstd context and a reusable bounded
 scratch buffer. The safe LZ4 block call does not allocate per region, and no
 predictor uses a shared codec lock. An expected destination-too-small result
 selects the next fallback; any other codec failure remains an error. A failed
-bounded Zstd session is reset before the worker reuses its context.
+bounded Zstd session is reset before the worker reuses its context. A streaming
+trial whose output becomes full exactly as one Chunk is consumed must reject
+before submitting the next Chunk to Zstd. The expected lack of output room is
+not a fatal no-progress condition. Genuine codec errors and no progress with
+available output capacity remain errors.
 
 The runtime reports gate eligibility, size bypasses, LZ4 and Zstd-1 outcomes,
 target trials and outcomes, RAW selections after gate rejection, and scratch
