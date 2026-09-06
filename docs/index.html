@@ -175,8 +175,8 @@
           ><span class="lang-en">software-defined appliance</span>
         </div>
         <div>
-          <strong class="lang-de">1.061,0 MiB/s</strong
-          ><strong class="lang-en">1,061.0 MiB/s</strong
+          <strong class="lang-de">1.489,4 MiB/s</strong
+          ><strong class="lang-en">1,489.4 MiB/s</strong
           ><span class="lang-de"
             >SMB über Loopback · Median, normale Reduktion</span
           ><span class="lang-en"
@@ -408,8 +408,8 @@
           </p>
           <div class="metric-grid">
             <article>
-              <span lang="de" class="lang-de metric">1.061,0</span
-              ><span lang="en" class="lang-en metric">1,061.0</span
+              <span lang="de" class="lang-de metric">1.489,4</span
+              ><span lang="en" class="lang-en metric">1,489.4</span
               ><strong>MiB/s</strong>
               <h3 lang="de" class="lang-de">SMB-Schreibdurchsatz</h3>
               <h3 lang="en" class="lang-en">SMB write throughput</h3>
@@ -468,13 +468,13 @@
               <tbody>
                 <tr>
                   <th scope="row">SMB · Gesamt-MiB/s, Median</th>
-                  <td>1.061,0</td>
-                  <td>941,5</td>
+                  <td>1.489,4</td>
+                  <td>1.313,6</td>
                 </tr>
                 <tr>
                   <th scope="row">SMB · Ersparnis inkl. Metadaten</th>
-                  <td>67,823 %</td>
-                  <td>67,904 %</td>
+                  <td>67,828 %</td>
+                  <td>67,913 %</td>
                 </tr>
                 <tr>
                   <th scope="row">Linux TAR · Repository gesamt</th>
@@ -509,13 +509,13 @@
               <tbody>
                 <tr>
                   <th scope="row">SMB · total MiB/s, median</th>
-                  <td>1,061.0</td>
-                  <td>941.5</td>
+                  <td>1,489.4</td>
+                  <td>1,313.6</td>
                 </tr>
                 <tr>
                   <th scope="row">SMB · savings incl. metadata</th>
-                  <td>67.823%</td>
-                  <td>67.904%</td>
+                  <td>67.828%</td>
+                  <td>67.913%</td>
                 </tr>
                 <tr>
                   <th scope="row">Linux TAR · total repository</th>
@@ -537,17 +537,24 @@
           </div>
           <div class="benchmark-notes">
             <p lang="de" class="lang-de">
-              <b>SMB:</b> Zehn vCPUs, getrennte XFS-Tiers, Loopback ohne Signing
-              oder Verschlüsselung. Mediane aus drei Läufen je Modus. Die
-              späteren Abschlussläufe mit dem finalen Build erreichten 1.040,9 /
-              930,5 MiB/s. Abschluss, Dateilängen und null Prozess-Swap geprüft;
+              <b>SMB v0.6.1 · 06.09.2026:</b> Zehn vCPUs, getrennte XFS-Tiers,
+              Loopback ohne Signing oder Verschlüsselung. Drei Läufe je Modus,
+              jeweils drei serielle ISO-Uploads auf ein frisches Repository.
+              Speicherbelegung nach 12 Sekunden bei drei vorhandenen Dateien.
+              Advanced: 11,8 % weniger Durchsatz, 5,0 MiB zusätzliche Ersparnis.
+              Maximal beobachtetes RSS: 542,0 / 655,4 MiB (Normal / Advanced).
+              Alle sechs Läufe ohne Daemon-Swap und mit erfolgreichem Cleanup;
               kein vollständiger Hash-Readback.
             </p>
             <p lang="en" class="lang-en">
-              <b>SMB:</b> Ten vCPUs, separate XFS tiers, loopback without
-              signing or encryption. Medians of three runs per mode. Later
-              final-build runs reached 1,040.9 / 930.5 MiB/s. Completion, file
-              lengths, and zero process swap checked; no full hash readback.
+              <b>SMB v0.6.1 · 6 September 2026:</b> Ten vCPUs, separate XFS tiers,
+              loopback without signing or encryption. Three runs per mode,
+              each with three serial ISO uploads to a fresh repository.
+              Storage measured after 12 seconds with all three files live.
+              Advanced: 11.8% lower throughput, 5.0 MiB additional savings.
+              Peak observed RSS: 542.0 / 655.4 MiB (Normal / Advanced).
+              All six runs passed with zero daemon swap and successful cleanup;
+              no full hash readback.
             </p>
             <p lang="de" class="lang-de">
               <b>Linux:</b> 50 unkomprimierte TAR-Streams von 6.12.1 bis
@@ -566,9 +573,9 @@
           </div>
           <div class="evidence-links">
             <a
-              href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/hotpath-implementation3-2026-09-05.md"
-              ><span lang="de" class="lang-de">SMB: alle 14 Läufe</span
-              ><span lang="en" class="lang-en">SMB: all 14 runs</span> ↗</a
+              href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/smb-v0.6.1-2026-09-06.md"
+              ><span lang="de" class="lang-de">SMB v0.6.1: alle sechs Läufe</span
+              ><span lang="en" class="lang-en">SMB v0.6.1: all six runs</span> ↗</a
             ><a
               href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/benchmarks/linux-6.12-online-similarity-2026-09-05.md"
               ><span lang="de" class="lang-de">Linux: vollständiges A/B</span

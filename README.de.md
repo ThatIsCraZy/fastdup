@@ -50,7 +50,7 @@ Im Datenpfad kommen begrenzte parallele Chunk-Vorbereitung, weniger
 Lesepuffer-Kopien und feinere Dateisperren hinzu. Die Telemetrie aggregiert
 Historien jetzt mit begrenztem Speicherbedarf, damit die Verwaltung erreichbar
 bleibt. Nachweise: [Online-Similarity](docs/benchmarks/online-similarity-share-policy-2026-09-05.md),
-[Datenpfad-Messungen](docs/benchmarks/hotpath-implementation3-2026-09-05.md)
+[Aktuelle SMB-Messungen](docs/benchmarks/smb-v0.6.1-2026-09-06.md)
 und [Control Plane](docs/benchmarks/control-plane-memory-2026-09-05.md).
 
 Das Release v0.6.1 enthält Paketversion **0.6.1** für Rocky Linux 10 x86-64.
@@ -61,19 +61,22 @@ zu diesem Release; Binary-Hashes und Messgrenzen stehen im jeweiligen Bericht.
 
 | Workload | Normale Reduktion | Advanced Reduction |
 | --- | ---: | ---: |
-| Drei identische ISO-Uploads über SMB, medianer Durchsatz | **1.061,0 MiB/s** | **941,5 MiB/s** |
-| Dieselbe SMB-Serie, Ersparnis inklusive Metadaten | **67,823 %** | **67,904 %** |
+| Drei identische ISO-Uploads über SMB, medianer Durchsatz | **1.489,4 MiB/s** | **1.313,6 MiB/s** |
+| Dieselbe SMB-Serie, Ersparnis inklusive Metadaten | **67,828 %** | **67,913 %** |
 | 50 Linux-6.12-TAR-Versionen, gesamtes Repository | **10,93 GiB** | **3,02 GiB** |
 | Derselbe Linux-Korpus, gesamter Reduktionsfaktor | **6,59:1** | **23,84:1** |
 | Derselbe Linux-Korpus, Copy+fsync-Durchsatz | **202,48 MiB/s** | **116,92 MiB/s** |
 
-**SMB:** Mediane aus drei Läufen je Modus mit zehn vCPUs, getrennten
-XFS-Tiers für Metadata und DATA sowie SMB über Loopback ohne Signing und
-Verschlüsselung. Jeder Lauf lädt dieselbe Rocky-ISO dreimal nacheinander hoch.
-Die getrennt ausgewiesenen Abschlussläufe mit dem endgültigen Build erreichten
-1.040,9 / 930,5 MiB/s. Der Runner prüft Abschlüsse, Dateilängen und null
-Prozess-Swap, führt aber keinen vollständigen Hash-Readback aus.
-[Aufbau und alle 14 Läufe](docs/benchmarks/hotpath-implementation3-2026-09-05.md#smb-normal-und-advanced).
+**SMB v0.6.1 (6. September 2026):** Mediane aus drei Läufen je Modus mit
+zehn vCPUs, getrennten XFS-Tiers für Metadata und DATA sowie Loopback ohne Signing
+und Verschlüsselung. Jeder Lauf lädt dieselbe Rocky-ISO dreimal nacheinander auf
+ein frisches Repository. Die Speicherbelegung wird nach 12 Sekunden bei drei
+noch vorhandenen Dateien gemessen. Advanced ist hier **11,8 % langsamer** und
+spart zusätzlich **5,0 MiB**; identische Kopien profitieren hauptsächlich von
+Exact Dedup. Maximal beobachtetes RSS: **542,0 / 655,4 MiB** (Normal / Advanced).
+Alle sechs Läufe bestanden ohne Daemon-Swap und mit erfolgreichem Cleanup;
+ein vollständiger Hash-Readback wurde nicht durchgeführt.
+[Aufbau und alle sechs Läufe](docs/benchmarks/smb-v0.6.1-2026-09-06.md).
 
 **Online-Similarity:** 72,05 GiB unkomprimierte TAR-Streams von Linux
 6.12.1–6.12.50, zwei frische Repositories und ein durchgehender Mount je Modus.

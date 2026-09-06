@@ -47,7 +47,7 @@ The current data path also includes bounded parallel chunk preparation, fewer
 read-buffer copies, and finer-grained file locking. Telemetry aggregation now
 streams history with bounded memory so management remains responsive.
 See the [online similarity implementation](docs/benchmarks/online-similarity-share-policy-2026-09-05.md),
-[data-path measurements](docs/benchmarks/hotpath-implementation3-2026-09-05.md),
+[current SMB measurements](docs/benchmarks/smb-v0.6.1-2026-09-06.md),
 and [control-plane measurements](docs/benchmarks/control-plane-memory-2026-09-05.md).
 
 The v0.6.1 release packages version **0.6.1** for Rocky Linux 10 x86-64.
@@ -58,19 +58,21 @@ release; binary hashes and measurement limits are recorded with each run.
 
 | Workload | Normal reduction | Advanced Reduction |
 | --- | ---: | ---: |
-| Three identical ISO uploads over SMB, median throughput | **1,061.0 MiB/s** | **941.5 MiB/s** |
-| Same SMB series, storage saved including metadata | **67.823%** | **67.904%** |
+| Three identical ISO uploads over SMB, median throughput | **1,489.4 MiB/s** | **1,313.6 MiB/s** |
+| Same SMB series, storage saved including metadata | **67.828%** | **67.913%** |
 | 50 Linux 6.12 TAR versions, total repository allocation | **10.93 GiB** | **3.02 GiB** |
 | Same Linux corpus, total reduction factor | **6.59:1** | **23.84:1** |
 | Same Linux corpus, copy + fsync throughput | **202.48 MiB/s** | **116.92 MiB/s** |
 
-**SMB:** medians of three runs per mode on ten vCPUs, separate XFS metadata
-and DATA tiers, SMB over loopback with signing and encryption disabled. Each
-run uploads the same Rocky ISO three times in sequence. The final-build
-qualification runs reached 1,040.9 / 930.5 MiB/s and are reported separately
-from the medians. The runner checks completion, file lengths and zero process
-swap; it does not perform a full hash readback.
-[Setup and all 14 runs](docs/benchmarks/hotpath-implementation3-2026-09-05.md#smb-normal-und-advanced).
+**SMB v0.6.1 (6 September 2026):** medians of three runs per mode on ten
+vCPUs, separate XFS metadata and DATA tiers, loopback with signing and encryption
+disabled. Each run uploads the same Rocky ISO three times in sequence to a fresh
+repository. Storage is measured after 12 seconds with all three files live.
+Advanced is **11.8% slower** in this workload and saves an additional **5.0 MiB**;
+identical copies mainly benefit from Exact Dedup. Peak observed RSS was
+**542.0 / 655.4 MiB** (Normal / Advanced). All six runs passed with zero daemon
+swap and successful cleanup; no full hash readback was performed.
+[Setup and all six runs](docs/benchmarks/smb-v0.6.1-2026-09-06.md).
 
 **Online similarity:** 72.05 GiB of uncompressed Linux 6.12.1–6.12.50 TAR
 streams, two fresh repositories, one uninterrupted mount per mode. Advanced
