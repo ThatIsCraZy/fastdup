@@ -101,7 +101,7 @@ fn repository_wide_page_cache_obeys_shared_memory_headroom() {
 
     let pressured = SimilarityIndexRepository::new_with_memory_snapshot(
         storage,
-        MemoryPressureSnapshot::new(16 * gib, 4 * gib, 0),
+        MemoryPressureSnapshot::new(16 * gib, fastdup_store::shared_cache_reserve_bytes(16 * gib), 0),
     );
     let recovered = pressured
         .recover_latest()
