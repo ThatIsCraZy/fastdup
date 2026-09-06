@@ -13,6 +13,7 @@ pub(crate) use crate::memory_budget::{MemoryPressureSnapshot, SYSTEM_REFRESH_INT
 
 const CACHE_WAYS: usize = 4;
 const CACHE_SLOT_TARGET_BYTES: usize = 16 * 1_024;
+const MAX_RECLAIM_STEPS_PER_GROUP: usize = 256;
 const MINIMUM_SYSTEM_RESERVE_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
 const MAXIMUM_DEFAULT_CACHE_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
 
@@ -338,6 +339,11 @@ struct CacheShard {
     state: Mutex<CacheShardState>,
 }
 
+#[derive(Debug, Default)]
+struct CacheAdmission {
+    reclaim_cursor: usize,
+}
+
 /// Bounded, sharded cache of immutable bytes that have already passed complete
 /// stored-encoding and logical-identity verification.
 ///
@@ -349,7 +355,7 @@ pub struct VerifiedReadCache {
     config: VerifiedReadCacheConfig,
     shards: Box<[CacheShard]>,
     metadata_bytes: usize,
-    admission: Mutex<()>,
+    admission: Mutex<CacheAdmission>,
     target_bytes: AtomicUsize,
     resident_bytes: AtomicUsize,
     entry_count: AtomicUsize,
@@ -453,7 +459,7 @@ impl VerifiedReadCache {
             config,
             shards: shards.into_boxed_slice(),
             metadata_bytes,
-            admission: Mutex::new(()),
+            admission: Mutex::new(CacheAdmission::default()),
             target_bytes: AtomicUsize::new(0),
             resident_bytes: AtomicUsize::new(0),
             entry_count: AtomicUsize::new(0),
@@ -605,7 +611,7 @@ impl VerifiedReadCache {
             );
         }
         self.maybe_refresh_pressure();
-        let _admission = self
+        let mut admission = self
             .admission
             .lock()
             .expect("ASSERT: verified read-cache admission lock poisoned");
@@ -622,6 +628,7 @@ impl VerifiedReadCache {
             bytes: allocation_bytes,
         });
         let mut admitted_group_refs = 0_usize;
+        let mut reclaim_steps = MAX_RECLAIM_STEPS_PER_GROUP;
         for payload in payloads {
             let key = CacheKey {
                 chunk_id: payload.chunk_id(),
@@ -630,68 +637,136 @@ impl VerifiedReadCache {
             };
             let hash = cache_hash(key);
             let shard = &self.shards[hash & (self.shards.len() - 1)];
+            loop {
+                let mut state = shard
+                    .state
+                    .lock()
+                    .expect("ASSERT: verified read-cache shard lock poisoned");
+                let set_index = (hash / self.shards.len()) % state.sets.len();
+                let set = &mut state.sets[set_index];
+                if set.ways.iter().flatten().any(|entry| entry.matches(key)) {
+                    break;
+                }
+                let victim = set
+                    .ways
+                    .iter()
+                    .position(Option::is_none)
+                    .unwrap_or(set.next_victim);
+                let victim_is_group = set.ways[victim]
+                    .as_ref()
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.backing_charge, &backing_charge));
+                let victim_bytes = set.ways[victim].as_ref().map_or(0, |entry| {
+                    if victim_is_group {
+                        usize::from(admitted_group_refs == 1) * entry.backing_charge.bytes
+                    } else if Arc::strong_count(&entry.backing_charge) == 1 {
+                        entry.backing_charge.bytes
+                    } else {
+                        0
+                    }
+                });
+                let remaining_group_refs = admitted_group_refs - usize::from(victim_is_group);
+                let added_bytes = if remaining_group_refs == 0 {
+                    backing_charge.bytes
+                } else {
+                    0
+                };
+                let resident = self.resident_bytes.load(Ordering::Acquire);
+                let proposed = resident
+                    .checked_sub(victim_bytes)
+                    .and_then(|remaining| remaining.checked_add(added_bytes))
+                    .expect("ASSERT: verified read-cache resident accounting overflowed");
+                if proposed > target {
+                    if reclaim_steps != 0 {
+                        // Reclaim outside the target shard: readers only ever hold
+                        // one shard, and admission is already globally serialized.
+                        // Protect this group's admitted views so its local reference
+                        // accounting stays valid across the retry.
+                        drop(state);
+                        self.reclaim_locked(
+                            &mut admission,
+                            &mut reclaim_steps,
+                            target.saturating_sub(added_bytes),
+                            &backing_charge,
+                        );
+                        continue;
+                    }
+                    self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                let replaced = set.ways[victim].replace(CacheEntry {
+                    payload,
+                    backing_charge: Arc::clone(&backing_charge),
+                });
+                admitted_group_refs = remaining_group_refs + 1;
+                set.next_victim = (victim + 1) % CACHE_WAYS;
+                self.resident_bytes.store(proposed, Ordering::Release);
+                if replaced.is_some() {
+                    state.counters.evictions = state.counters.evictions.saturating_add(1);
+                } else {
+                    self.entry_count.fetch_add(1, Ordering::Release);
+                }
+                state.counters.admissions = state.counters.admissions.saturating_add(1);
+                assert!(
+                    proposed <= target,
+                    "ASSERT: verified read cache exceeded its current payload target"
+                );
+                assert!(
+                    proposed.saturating_add(self.metadata_bytes) <= self.config.hard_limit_bytes,
+                    "ASSERT: verified read cache exceeded its hard RAM limit"
+                );
+                break;
+            }
+        }
+    }
+
+    /// Persistent round-robin reclamation; the caller holds admission and no
+    /// shard lock. A group has a fixed probe budget even when a backing spans
+    /// many sets. Later admissions continue the cursor instead of rescanning
+    /// the same prefix. Cache hits do not touch this cursor or a global lock.
+    fn reclaim_locked(
+        &self,
+        admission: &mut CacheAdmission,
+        remaining_steps: &mut usize,
+        resident_target: usize,
+        protected: &Arc<CacheBackingCharge>,
+    ) {
+        while *remaining_steps != 0 && self.resident_bytes.load(Ordering::Acquire) > resident_target
+        {
+            *remaining_steps -= 1;
+            let cursor = admission.reclaim_cursor;
+            let shard = &self.shards[cursor % self.shards.len()];
             let mut state = shard
                 .state
                 .lock()
                 .expect("ASSERT: verified read-cache shard lock poisoned");
-            let set_index = (hash / self.shards.len()) % state.sets.len();
-            let set = &mut state.sets[set_index];
-            if set.ways.iter().flatten().any(|entry| entry.matches(key)) {
-                continue;
-            }
-            let victim = set
-                .ways
-                .iter()
-                .position(Option::is_none)
-                .unwrap_or(set.next_victim);
-            let victim_is_group = set.ways[victim]
+            let shard_cursor = cursor / self.shards.len();
+            let set_index = (shard_cursor / CACHE_WAYS) % state.sets.len();
+            let way = shard_cursor % CACHE_WAYS;
+            let slots = self.shards.len() * state.sets.len() * CACHE_WAYS;
+            admission.reclaim_cursor = (cursor + 1) % slots;
+            let slot = &mut state.sets[set_index].ways[way];
+            if slot
                 .as_ref()
-                .is_some_and(|entry| Arc::ptr_eq(&entry.backing_charge, &backing_charge));
-            let victim_bytes = set.ways[victim].as_ref().map_or(0, |entry| {
-                if victim_is_group {
-                    usize::from(admitted_group_refs == 1) * entry.backing_charge.bytes
-                } else if Arc::strong_count(&entry.backing_charge) == 1 {
-                    entry.backing_charge.bytes
-                } else {
-                    0
-                }
-            });
-            let remaining_group_refs = admitted_group_refs - usize::from(victim_is_group);
-            let added_bytes = if remaining_group_refs == 0 {
-                backing_charge.bytes
-            } else {
-                0
-            };
-            let resident = self.resident_bytes.load(Ordering::Acquire);
-            let proposed = resident
-                .checked_sub(victim_bytes)
-                .and_then(|remaining| remaining.checked_add(added_bytes))
-                .expect("ASSERT: verified read-cache resident accounting overflowed");
-            if proposed > target {
-                self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
+                .is_none_or(|entry| Arc::ptr_eq(&entry.backing_charge, protected))
+            {
                 continue;
             }
-            let replaced = set.ways[victim].replace(CacheEntry {
-                payload,
-                backing_charge: Arc::clone(&backing_charge),
-            });
-            admitted_group_refs = remaining_group_refs + 1;
-            set.next_victim = (victim + 1) % CACHE_WAYS;
-            self.resident_bytes.store(proposed, Ordering::Release);
-            if replaced.is_some() {
-                state.counters.evictions = state.counters.evictions.saturating_add(1);
-            } else {
-                self.entry_count.fetch_add(1, Ordering::Release);
+            let entry = slot
+                .take()
+                .expect("ASSERT: selected reclaim slot is populated");
+            // Caller payload views do not own CacheBackingCharge. Only the
+            // final cache view releases its one shared allocation charge.
+            if Arc::strong_count(&entry.backing_charge) == 1 {
+                let bytes = entry.backing_charge.bytes;
+                let previous = self.resident_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                assert!(
+                    previous >= bytes,
+                    "ASSERT: reclaimed backing was fully charged"
+                );
             }
-            state.counters.admissions = state.counters.admissions.saturating_add(1);
-            assert!(
-                proposed <= target,
-                "ASSERT: verified read cache exceeded its current payload target"
-            );
-            assert!(
-                proposed.saturating_add(self.metadata_bytes) <= self.config.hard_limit_bytes,
-                "ASSERT: verified read cache exceeded its hard RAM limit"
-            );
+            let previous = self.entry_count.fetch_sub(1, Ordering::AcqRel);
+            assert!(previous != 0, "ASSERT: reclaimed cache entry was counted");
+            state.counters.evictions = state.counters.evictions.saturating_add(1);
         }
     }
 
@@ -778,6 +853,10 @@ fn cache_hash(key: CacheKey) -> usize {
         usize::try_from(mixed ^ (mixed >> 32)).expect("ASSERT: folded hash fits usize")
     })
 }
+
+#[cfg(test)]
+#[path = "read_cache/reclamation_tests.rs"]
+mod reclamation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -869,6 +948,42 @@ mod tests {
         fastdup_format::RawRecord::decode(&encoded)
             .expect("decode and verify fixture Record")
             .into_verified_payload()
+    }
+
+    #[test]
+    fn full_byte_budget_admits_a_new_workload_into_an_empty_set() {
+        let cache = VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(2 * 1024 * 1024, 0, NonZeroUsize::MIN).unwrap(),
+            MemoryPressureSnapshot::new(8 * 1024 * 1024, 8 * 1024 * 1024, 0),
+        )
+        .unwrap();
+        let old = verified_payload(&vec![31; 65536]);
+        let allocation = old.backing_allocation_bytes();
+        let set_count = cache.shards[0].state.lock().unwrap().sets.len();
+        let set_for = |payload: &VerifiedChunkPayload| {
+            cache_hash(CacheKey {
+                chunk_id: payload.chunk_id(),
+                logical_length: u64::try_from(payload.len()).unwrap(),
+            }) % set_count
+        };
+        let new = (32..=255)
+            .map(|value| verified_payload(&vec![value; 65536]))
+            .find(|payload| set_for(payload) != set_for(&old))
+            .unwrap();
+        cache.update_memory_pressure(MemoryPressureSnapshot::new(
+            8 * 1024 * 1024,
+            u64::try_from(cache.status().metadata_bytes() + allocation).unwrap(),
+            0,
+        ));
+        cache.admit_decoded_group(vec![old]);
+        assert_eq!(cache.status().resident_bytes(), allocation);
+        cache.admit_decoded_group(vec![new.clone()]);
+        assert_eq!(
+            cache.get(new.chunk_id(), 65536),
+            Some(new),
+            "a full byte budget must recycle old data instead of permanently rejecting a new working set"
+        );
+        assert!(cache.status().resident_bytes() <= allocation);
     }
 
     #[test]

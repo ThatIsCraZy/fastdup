@@ -33,6 +33,26 @@ without holding a cache lock; only the final immutable admission and exact byte
 accounting are serialized. Concurrent misses may therefore repeat work, but
 they cannot duplicate one resident identity or exceed the current target.
 
+A full payload byte budget must not permanently freeze admission merely because
+an incoming key maps to an empty way or a victim that shares its backing with
+other entries. Admission may reclaim entries across sets using one persistent
+round-robin cursor under the existing admission lock. Each decoded allocation
+group probes at most 256 slots; a later admission continues where the previous
+one stopped. Only one shard lock is held at a time, and the incoming group's
+already admitted views are protected. The allocation charge is released only
+when its last cache view disappears; outstanding verified reader views remain
+valid through their own immutable ownership.
+
+This is bounded replacement, not a global LRU: hits keep their existing single
+shard lookup and acquire no new global lock or replacement metadata. Large,
+sparse geometries and widely shared backings can require multiple admission
+attempts before enough bytes are reclaimed. Exhausting the probe budget skips
+admission and uses the ordinary verified read result, without additional I/O,
+weakened verification, or exceeding the live byte target. Memory-pressure and
+process-Swap purges still take precedence. Workload-transition regression tests
+must cover a full byte budget with free set ways, multi-view allocation
+accounting, cursor progress, and concurrent reads/admissions/pressure updates.
+
 The default hard cache limit is the smaller of one eighth of effective RAM and
 8 GiB. At least the greater of one quarter of effective RAM and 4 GiB remains
 outside the cache for Dirty DATA, Ingest Lanes, codec workers, metadata/index

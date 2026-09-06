@@ -1034,3 +1034,106 @@ fn manifest_reads_follow_index_turnover_without_container_scans() {
         "current index cannot authorize corrupt DATA"
     );
 }
+
+fn cache_working_set_change(label: &str, reads: usize) -> (usize, usize, std::time::Duration) {
+    use fastdup_store::{MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig};
+    use std::num::NonZeroUsize;
+    let root = unique_test_root(label);
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let chunks = [
+        vec![31; 65536],
+        vec![91; 65536],
+        vec![47; 65536],
+        vec![107; 65536],
+    ];
+    let id = ContainerId::new([0xe3; 16]).unwrap();
+    let parts: Vec<_> = chunks.iter().map(Vec::as_slice).collect();
+    containers.publish_raw(id, 1, &parts).unwrap();
+    let entries = containers
+        .read(id)
+        .unwrap()
+        .locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let indexes = ExactIndexRunRepository::new(storage.clone());
+    indexes
+        .append_level_zero(ExactIndexProfileId::new([0xe4; 32]).unwrap(), entries)
+        .unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    let cache = Arc::new(
+        VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(4 * 1024 * 1024, 0, NonZeroUsize::new(8).unwrap())
+                .unwrap(),
+            MemoryPressureSnapshot::new(64 * 1024 * 1024, 32 * 1024 * 1024, 0),
+        )
+        .unwrap(),
+    );
+    let manifest = ManifestLeaf::new(
+        262_144,
+        chunks
+            .iter()
+            .map(|b| ManifestExtent::Data {
+                logical_length: 65536,
+                chunk_id: ChunkId::of(b),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers)
+        .unwrap()
+        .with_active_index(&active)
+        .with_verified_read_cache(Arc::clone(&cache));
+    let first = chunks[..2].concat();
+    let second = chunks[2..].concat();
+    assert_eq!(file.read_at(0, 131_072).unwrap(), first);
+    let resident = cache.status().resident_bytes();
+    assert_eq!(cache.status().entry_count(), 2);
+    cache.update_memory_pressure(MemoryPressureSnapshot::new(
+        64 * 1024 * 1024,
+        u64::try_from(cache.status().metadata_bytes() + resident).unwrap(),
+        0,
+    ));
+    storage.clear_range_reads();
+    let started = std::time::Instant::now();
+    for _ in 0..reads {
+        assert_eq!(file.read_at(131_072, 131_072).unwrap(), second);
+    }
+    let elapsed = started.elapsed();
+    let ranges = storage.data_range_reads();
+    assert!(cache.status().resident_bytes() <= resident);
+    let result = (
+        ranges.len(),
+        ranges.iter().map(|(_, _, bytes)| bytes).sum(),
+        elapsed,
+    );
+    drop(file);
+    drop(indexes);
+    drop(active);
+    std::fs::remove_dir_all(root).unwrap();
+    result
+}
+
+#[test]
+fn full_shared_backing_cache_stops_rereading_after_workload_changes() {
+    let (reads, _, _) = cache_working_set_change("cache-working-set", 32);
+    assert_eq!(
+        reads, 1,
+        "only the first read of the new coalesced RAW group may reach DATA"
+    );
+}
+
+#[test]
+#[ignore = "manual optimized read-cache workload-transition A/B benchmark"]
+fn cache_working_set_transition_benchmark() {
+    for round in 0..7 {
+        let (reads, bytes, elapsed) = cache_working_set_change("cache-working-set-bench", 2048);
+        println!(
+            "cache_transition round={round} requests=2048 data_reads={reads} data_read_bytes={bytes} elapsed_ns={}",
+            elapsed.as_nanos()
+        );
+    }
+}
