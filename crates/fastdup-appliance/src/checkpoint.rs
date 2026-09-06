@@ -5686,6 +5686,7 @@ where
                 ManifestPublication::Replace {
                     previous,
                     replacements,
+                    appended,
                 } => {
                     let mut proof = self
                         .generations
@@ -5696,6 +5697,11 @@ where
                             replacement.replaced.clone(),
                             &replacement.extents,
                         )?;
+                    }
+                    if !appended.is_empty() {
+                        proof = self
+                            .generations
+                            .stage_manifest_append_successor(proof, appended)?;
                     }
                     (proof.summary().root(), proof)
                 }
@@ -5969,6 +5975,7 @@ enum ManifestPublication {
     Replace {
         previous: ManifestTreeSummary,
         replacements: Vec<ManifestReplacement>,
+        appended: Vec<ManifestExtent>,
     },
     Truncate {
         previous: ManifestTreeSummary,
@@ -6015,6 +6022,12 @@ fn plan_checkpoint_manifest<M: StorageIo, C: StorageIo>(
             .all(|range| range.offset() >= previous.logical_size)
     {
         return plan_append_manifest(inode, previous, writer);
+    }
+
+    if let Some(previous) = previous
+        && previous.logical_size < logical_size
+    {
+        return plan_path_local_manifest(inode, previous, &changed, generations, writer);
     }
 
     if let Some(previous) = previous
@@ -6150,12 +6163,11 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
     generations: &GenerationRepository<M>,
     writer: &mut AdaptiveCommitWriter<'_, C>,
 ) -> Result<ManifestPublication, DurableNamespaceError> {
-    assert_eq!(
-        previous.logical_size,
-        inode.logical_size(),
-        "ASSERT: path-local replacement preserves the complete logical length"
+    assert!(
+        previous.logical_size <= inode.logical_size(),
+        "ASSERT: path-local replacement retains the previous logical range"
     );
-    let mut rewrites = rewrite_ranges_before(changed, inode.logical_size(), inode.logical_size())?;
+    let mut rewrites = rewrite_ranges_before(changed, inode.logical_size(), previous.logical_size)?;
     for rewrite in &mut rewrites {
         let touched = generations.read_manifest_range(
             previous.root,
@@ -6211,15 +6223,7 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         verified_extents.extend_from_slice(&extents);
         ManifestLeaf::new(rewrite.end - rewrite.start, verified_extents)?;
-        let added = extents.iter().try_fold(0_u64, |total, extent| {
-            if matches!(extent, ManifestExtent::Hole { .. }) {
-                Ok(total)
-            } else {
-                total
-                    .checked_add(extent_length(extent))
-                    .ok_or(DurableNamespaceError::ArithmeticOverflow)
-            }
-        })?;
+        let added = manifest_extent_allocation(&extents)?;
         allocated_bytes = allocated_bytes
             .checked_sub(removed)
             .and_then(|remaining| remaining.checked_add(added))
@@ -6229,12 +6233,39 @@ fn plan_path_local_manifest<M: StorageIo, C: StorageIo>(
             extents,
         });
     }
+    let mut appended = Vec::new();
+    if inode.logical_size() > previous.logical_size {
+        plan_manifest_range_with_prepared(
+            inode,
+            previous.logical_size,
+            inode.logical_size() - previous.logical_size,
+            writer,
+            &mut stack,
+            &mut appended,
+        )?;
+        allocated_bytes = allocated_bytes
+            .checked_add(manifest_extent_allocation(&appended)?)
+            .ok_or(DurableNamespaceError::ArithmeticOverflow)?;
+    }
     if allocated_bytes != inode.allocated_bytes() {
         return Err(DurableNamespaceError::FrozenViewMismatch);
     }
     Ok(ManifestPublication::Replace {
         previous: previous.summary,
         replacements,
+        appended,
+    })
+}
+
+fn manifest_extent_allocation(extents: &[ManifestExtent]) -> Result<u64, DurableNamespaceError> {
+    extents.iter().try_fold(0_u64, |total, extent| {
+        if matches!(extent, ManifestExtent::Hole { .. }) {
+            Ok(total)
+        } else {
+            total
+                .checked_add(extent_length(extent))
+                .ok_or(DurableNamespaceError::ArithmeticOverflow)
+        }
     })
 }
 

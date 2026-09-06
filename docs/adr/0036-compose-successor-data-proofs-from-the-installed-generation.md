@@ -87,6 +87,19 @@ into proof reuse. Equal-length replacement calls verify the touched predecessor
 paths, derive removed and replacement allocation totals, publish rewritten
 paths, and extend the same opaque proof with replacement DATA identities.
 
+An update that both overwrites existing bytes and grows the file composes
+these two operations in one successor: replacements are clipped to the old
+EOF and published over touched paths, then the new suffix is appended to that
+result. All introduced DATA and Metadata dependencies from both phases remain
+in the final opaque proof. The allocation scalar subtracts replaced allocation
+and adds replacement and suffix allocation; holes contribute zero. This path
+must not flatten the predecessor tree into a single Manifest leaf, whose
+bounded serialization limit is independent of the supported file size.
+Recovery and scrub still validate the complete final tree. Fault injection
+before and after every checkpoint Metadata operation must recover either the
+complete preceding generation or the complete combined update, including a
+write crossing the old EOF and a sparse gap before the appended bytes.
+
 Every append begins a new Manifest leaf sequence at the preceding committed
 EOF. This deliberately avoids rewriting the predecessor's last leaf and makes
 that commit boundary a stable structural seam; partially filled leaves at

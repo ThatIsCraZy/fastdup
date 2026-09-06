@@ -783,6 +783,41 @@ impl<I: StorageIo> GenerationRepository<I> {
         self.publish_manifest_append_with_sync(predecessor, previous, appended, false)
     }
 
+    /// Stages an append after earlier edits in the same successor, retaining
+    /// their newly introduced DATA and Metadata dependencies.
+    ///
+    /// # Errors
+    ///
+    /// Returns append, dependency-length conflict, or predecessor errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics only for the same internal publication invariants as
+    /// [`Self::stage_manifest_append`].
+    pub fn stage_manifest_append_successor(
+        &self,
+        previous: ManifestSuccessorProof,
+        appended: &[ManifestExtent],
+    ) -> Result<ManifestSuccessorProof, GenerationError> {
+        let mut next =
+            self.stage_manifest_append(previous.predecessor, previous.summary, appended)?;
+        self.mark_successor_root_release_durable(&previous)?;
+        for (chunk_id, logical_length) in previous.introduced_chunks {
+            if let Some(first_length) = next.introduced_chunks.insert(chunk_id, logical_length)
+                && first_length != logical_length
+            {
+                return Err(GenerationError::ManifestChunkLengthConflict {
+                    chunk_id,
+                    first_length,
+                    second_length: logical_length,
+                });
+            }
+        }
+        next.introduced_metadata
+            .extend(previous.introduced_metadata);
+        Ok(next)
+    }
+
     fn publish_manifest_append_with_sync(
         &self,
         predecessor: SuccessorPredecessor,

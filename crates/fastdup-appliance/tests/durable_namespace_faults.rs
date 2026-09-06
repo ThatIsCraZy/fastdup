@@ -1400,3 +1400,92 @@ fn assert_replace_image(namespace: &Namespace, committed: bool) {
 fn policy() -> PolicySetId {
     PolicySetId::new([0x6D; 32]).expect("fixture Policy Set ID is nonzero")
 }
+
+#[test]
+fn every_mixed_growth_checkpoint_fault_recovers_one_complete_layout() {
+    fn change(
+        appliance: &DurableNamespace<MemoryStorageIo, MemoryStorageIo>,
+        inode: InodeId,
+        handle: HandleId,
+        tail_offset: u64,
+    ) {
+        for (offset, bytes) in [(0, b"HEAD"), (tail_offset, b"TAIL")] {
+            appliance
+                .namespace()
+                .dispatch(
+                    CALLER,
+                    Operation::Write {
+                        inode,
+                        handle,
+                        offset,
+                        data: bytes,
+                    },
+                )
+                .unwrap();
+        }
+    }
+    for tail_offset in [4094, 4096, 8192] {
+        let probe_metadata = MemoryStorageIo::new();
+        let probe_data = MemoryStorageIo::new();
+        let probe = open(probe_metadata.clone(), probe_data);
+        let (inode, handle) = seed_truncate_predecessor(&probe, 4096);
+        change(&probe, inode, handle, tail_offset);
+        let baseline = probe_metadata.operation_count();
+        probe.checkpoint().unwrap().unwrap();
+        let operations = probe_metadata.operations()[baseline..].to_vec();
+        assert_eq!(operations.last(), Some(&StorageOperation::SyncFile));
+        for relative in 0..operations.len() {
+            for after in [false, true] {
+                let metadata = if after {
+                    MemoryStorageIo::with_fail_after(baseline + relative)
+                } else {
+                    MemoryStorageIo::with_fail_before(baseline + relative)
+                };
+                let data = MemoryStorageIo::new();
+                let appliance = open(metadata.clone(), data.clone());
+                let (inode, handle) = seed_truncate_predecessor(&appliance, 4096);
+                change(&appliance, inode, handle, tail_offset);
+                assert!(
+                    appliance.checkpoint().is_err(),
+                    "tail_offset={tail_offset} fault={relative} after={after}"
+                );
+                drop(appliance);
+                metadata.crash();
+                data.crash();
+                let recovered = recover_mount(
+                    NamespaceConfig::default(),
+                    &GenerationRepository::new(metadata, policy()),
+                    &ContainerRepository::new(data),
+                )
+                .unwrap()
+                .unwrap();
+                let Reply::Opened(handle) = recovered
+                    .dispatch(
+                        CALLER,
+                        Operation::Open {
+                            inode,
+                            options: OpenOptions::READ_ONLY,
+                            truncate: false,
+                        },
+                    )
+                    .unwrap()
+                else {
+                    panic!("reopen")
+                };
+                let complete = after && relative + 1 == operations.len();
+                let mut expected = vec![0; 4096];
+                expected[..PAYLOAD.len()].copy_from_slice(PAYLOAD);
+                if complete {
+                    expected[..4].copy_from_slice(b"HEAD");
+                    expected.resize(tail_offset as usize + 4, 0);
+                    expected[tail_offset as usize..].copy_from_slice(b"TAIL");
+                }
+                assert_eq!(
+                    read_range(&recovered, inode, handle, 0, tail_offset as u32 + 4),
+                    expected,
+                    "tail_offset={tail_offset} fault={relative} after={after}"
+                );
+            }
+        }
+    }
+}

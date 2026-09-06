@@ -94,5 +94,7 @@ libraries passed with warnings denied. Raw profiles, red/green logs, saved
 benchmark binaries and package logs are under `.artifacts/recovery-startup/`.
 
 Revision 0.6.4-10 carries these changes on top of the DATA-cache reclamation and
-telemetry fixes. Live activation and completed recovery measurements will be
-recorded after installing it; this report does not yet claim a completed mount.
+telemetry fixes. The package was installed on the test VM. Recovery was then stopped at the
+operator's request because recovery of the existing test data was unnecessary.
+No complete live mount-time comparison was obtained; the measurements above
+remain controlled fixture results. Existing test data was left intact.
