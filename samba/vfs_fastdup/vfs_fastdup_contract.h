@@ -34,18 +34,25 @@ struct fastdup_clone_request {
 };
 
 /*
- * Version 1 deliberately exposes one immutable Integrity Information state:
- * CHECKSUM_TYPE_NONE with enforcement enabled. SET succeeds only when it
- * leaves that state unchanged. This is persistent by definition and cannot
- * drift from the state returned by GET after a restart.
+ * Validate the wire request before resolving UNCHANGED against stored state.
+ * Integrity uses fastdup's native verified reads (ReFS-v2-style selection).
+ * Disabling checksum enforcement is unsupported: corrupt data never escapes.
  */
 enum fastdup_contract_status fastdup_integrity_set_v1(const uint8_t *input,
 						       size_t input_length);
 
 enum fastdup_contract_status fastdup_integrity_get_v1(uint8_t *output,
 						       size_t output_capacity,
+						       uint16_t algorithm,
 						       uint32_t cluster_size,
 						       size_t *output_length);
+
+/* The xattr representation is exactly two little-endian bytes, never a C struct. */
+enum fastdup_contract_status fastdup_integrity_decode_v1(
+	const uint8_t *input, size_t input_length, uint16_t *algorithm);
+enum fastdup_contract_status fastdup_integrity_resolve_v1(
+	const uint8_t *input, size_t input_length, uint16_t current,
+	uint32_t cluster_size, uint8_t stored[2]);
 
 enum fastdup_contract_status fastdup_validate_clone_v1(
 	const struct fastdup_clone_request *request);

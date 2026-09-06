@@ -71,7 +71,7 @@ stayed under `.artifacts/`.
 ## Samba adapter evidence (2026-08-21)
 
 `samba/vfs_fastdup` contains the VFS module and a dependency-free contract
-test. The contract test covers fixed Integrity SET/GET state, input bounds,
+test. The contract test covers Integrity SET/GET state, input bounds,
 alignment, checked source/target bounds, pre-sized destination, same-file
 overlap, request-size cap, monotonically ordered per-handle operation fences,
 and CLOSE readiness.

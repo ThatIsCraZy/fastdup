@@ -9,7 +9,7 @@ The module:
 - advertises `FILE_SUPPORTS_BLOCK_REFCOUNTING` only when explicitly enabled;
 - maps `FSCTL_DUPLICATE_EXTENTS_TO_FILE` to exactly one `copy_file_range` call
   on fastdup FUSE descriptors;
-- implements a fixed, restart-stable Integrity Information state;
+- persists SMB Integrity Information policy as ordinary inode metadata;
 - rejects unsupported, misaligned, oversized, overlapping, out-of-bounds, or
   short clones without falling back to a buffered data copy; and
 - fences CLOSE behind all previously accepted operations on that Samba handle.
@@ -55,3 +55,16 @@ The helper copies the module into the disposable Samba source tree, configures
 only workspace-local output, and builds `libvfs_module_fastdup.so`. Samba 4.23.5
 is the currently validated source tag. A real SMB 3.1.1 Veeam trace is still a
 release gate; this module must not be presented as production Veeam support.
+
+The SMB regression `tests/integrity_smb.py` requires Python with `impacket` and
+a disposable writable share. Supply `SMB_TEST_SERVER`, `SMB_TEST_SHARE`,
+`SMB_TEST_USER` and `SMB_TEST_PASSWORD` through the environment. It tests the
+real SMB 3.1.1 SET/GET path, CRC enablement, UNCHANGED, malformed requests,
+write/read, rename/reopen, read-only handle rejection and directory handles.
+It removes only its uniquely named test files and does not print credentials.
+
+Integrity enablement uses fastdup's native verified reads under the ReFS-v2
+filesystem-selected mechanism convention. NONE never disables native corruption
+checks. Enforcement-off requests remain rejected. See
+[ADR 0043](../../docs/adr/0043-expose-metadata-range-clones-for-veeam-fast-clone.md)
+for the policy's representation and persistence boundaries.

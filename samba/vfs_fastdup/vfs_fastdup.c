@@ -25,6 +25,7 @@
 #define FASTDUP_DEFAULT_MAX_CLONE ((uint64_t)1073741824)
 #define FASTDUP_LINUX_SINGLE_COPY_MAX ((uint64_t)0x7ffff000)
 #define FASTDUP_GET_INTEGRITY_BYTES ((uint32_t)16)
+#define FASTDUP_INTEGRITY_XATTR "user.fastdup.smb-integrity.v1"
 
 /* Missing from Samba 4.23's smb_constants.h. */
 #ifndef FSCTL_GET_INTEGRITY_INFORMATION
@@ -144,6 +145,27 @@ static uint32_t fastdup_fs_capabilities(
 	return capabilities;
 }
 
+static NTSTATUS fastdup_get_integrity(struct vfs_handle_struct *handle,
+				     struct files_struct *fsp,
+				     uint16_t *algorithm)
+{
+	uint8_t stored[2];
+	ssize_t length = SMB_VFS_NEXT_FGETXATTR(handle, fsp,
+		FASTDUP_INTEGRITY_XATTR, stored, sizeof(stored));
+	if (length == -1) {
+		if (errno == ENOATTR) {
+			*algorithm = FASTDUP_CHECKSUM_NONE;
+			return NT_STATUS_OK;
+		}
+		return errno == ERANGE ? NT_STATUS_DATA_ERROR : map_nt_error_from_unix(errno);
+	}
+	if (fastdup_integrity_decode_v1(stored, (size_t)length, algorithm) !=
+	    FASTDUP_CONTRACT_OK) {
+		return NT_STATUS_DATA_ERROR;
+	}
+	return NT_STATUS_OK;
+}
+
 static NTSTATUS fastdup_fsctl(struct vfs_handle_struct *handle,
 			      struct files_struct *fsp,
 			      TALLOC_CTX *ctx,
@@ -161,6 +183,10 @@ static NTSTATUS fastdup_fsctl(struct vfs_handle_struct *handle,
 	uint64_t sequence;
 	size_t produced = 0;
 	uint8_t *reply = NULL;
+	uint8_t stored[2];
+	uint16_t algorithm;
+	NTSTATUS status;
+	int result;
 
 	(void)request_flags;
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct fastdup_config,
@@ -178,8 +204,21 @@ static NTSTATUS fastdup_fsctl(struct vfs_handle_struct *handle,
 		if (contract_status != FASTDUP_CONTRACT_OK) {
 			return fastdup_contract_ntstatus(contract_status);
 		}
-		if (fsp == NULL || fsp_get_io_fd(fsp) == -1) {
+		if (fsp == NULL || fsp_get_pathref_fd(fsp) == -1) {
 			return NT_STATUS_INVALID_PARAMETER;
+		}
+		if (!CAN_WRITE(handle->conn) ||
+		    !(fsp->access_mask & (SEC_FILE_WRITE_DATA | SEC_FILE_WRITE_ATTRIBUTE))) {
+			return NT_STATUS_ACCESS_DENIED;
+		}
+		status = fastdup_get_integrity(handle, fsp, &algorithm);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+		contract_status = fastdup_integrity_resolve_v1(input, input_length,
+			algorithm, (uint32_t)config->alignment, stored);
+		if (contract_status != FASTDUP_CONTRACT_OK) {
+			return fastdup_contract_ntstatus(contract_status);
 		}
 		state = fastdup_fsp_state(handle, fsp);
 		if (state == NULL) {
@@ -188,7 +227,18 @@ static NTSTATUS fastdup_fsctl(struct vfs_handle_struct *handle,
 		if (!fastdup_handle_accept(&state->fence, &sequence)) {
 			return NT_STATUS_TOO_MANY_COMMANDS;
 		}
+		/* An atomic inode xattr mutation enters the normal checkpoint window.
+		 * UNCHANGED must not race by writing an older value back. */
+		result = 0;
+		if (input[0] != 0xff || input[1] != 0xff) {
+			result = SMB_VFS_NEXT_FSETXATTR(handle, fsp,
+				FASTDUP_INTEGRITY_XATTR, stored, sizeof(stored), 0);
+		}
+		status = result == 0 ? NT_STATUS_OK : map_nt_error_from_unix(errno);
 		SMB_ASSERT(fastdup_handle_complete(&state->fence, sequence));
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 		*output_length = 0;
 		return NT_STATUS_OK;
 
@@ -196,13 +246,17 @@ static NTSTATUS fastdup_fsctl(struct vfs_handle_struct *handle,
 		if (fsp == NULL || maximum_output_length < FASTDUP_GET_INTEGRITY_BYTES) {
 			return NT_STATUS_INVALID_PARAMETER;
 		}
+		status = fastdup_get_integrity(handle, fsp, &algorithm);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 		reply = talloc_zero_array(ctx, uint8_t,
 					  FASTDUP_GET_INTEGRITY_BYTES);
 		if (reply == NULL) {
 			return NT_STATUS_NO_MEMORY;
 		}
 		contract_status = fastdup_integrity_get_v1(
-			reply, FASTDUP_GET_INTEGRITY_BYTES,
+			reply, FASTDUP_GET_INTEGRITY_BYTES, algorithm,
 			(uint32_t)config->alignment, &produced);
 		SMB_ASSERT(contract_status == FASTDUP_CONTRACT_OK);
 		SMB_ASSERT(produced == FASTDUP_GET_INTEGRITY_BYTES);
@@ -417,6 +471,21 @@ static struct tevent_req *fastdup_offload_write_send(
 	status = vfs_stat_fsp(target_fsp);
 	if (tevent_req_nterror(request, status)) {
 		return tevent_req_post(request, event_context);
+	}
+	{
+		uint16_t source_integrity, target_integrity;
+		status = fastdup_get_integrity(handle, source_fsp, &source_integrity);
+		if (tevent_req_nterror(request, status)) {
+			return tevent_req_post(request, event_context);
+		}
+		status = fastdup_get_integrity(handle, target_fsp, &target_integrity);
+		if (tevent_req_nterror(request, status)) {
+			return tevent_req_post(request, event_context);
+		}
+		if (source_integrity != target_integrity) {
+			tevent_req_nterror(request, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(request, event_context);
+		}
 	}
 	if (source_offset < 0 || target_offset < 0 || to_copy <= 0) {
 		tevent_req_nterror(request, NT_STATUS_INVALID_PARAMETER);

@@ -26,7 +26,7 @@ static uint32_t load_u32_le(const uint8_t *bytes)
 	       ((uint32_t)bytes[3] << 24);
 }
 
-static void integrity_v1_is_a_fixed_consistent_none_state(void)
+static void integrity_wire_validation_and_default_none_state(void)
 {
 	uint8_t request[12] = {0};
 	uint8_t reply[16] = {0xff};
@@ -46,7 +46,7 @@ static void integrity_v1_is_a_fixed_consistent_none_state(void)
 
 	store_u16_le(request, FASTDUP_CHECKSUM_CRC64);
 	assert(fastdup_integrity_set_v1(request, 8) ==
-	       FASTDUP_CONTRACT_UNSUPPORTED_INTEGRITY_STATE);
+	       FASTDUP_CONTRACT_OK);
 
 	store_u16_le(request, FASTDUP_CHECKSUM_NONE);
 	store_u32_le(request + 4, FASTDUP_INTEGRITY_ENFORCEMENT_OFF);
@@ -61,17 +61,17 @@ static void integrity_v1_is_a_fixed_consistent_none_state(void)
 	assert(fastdup_integrity_set_v1(request, 8) ==
 	       FASTDUP_CONTRACT_INVALID_PARAMETER);
 
-	assert(fastdup_integrity_get_v1(NULL, sizeof(reply), 65536,
+	assert(fastdup_integrity_get_v1(NULL, sizeof(reply), FASTDUP_CHECKSUM_NONE, 65536,
 					&reply_length) ==
 	       FASTDUP_CONTRACT_INVALID_PARAMETER);
-	assert(fastdup_integrity_get_v1(reply, sizeof(reply), 65536, NULL) ==
+	assert(fastdup_integrity_get_v1(reply, sizeof(reply), FASTDUP_CHECKSUM_NONE, 65536, NULL) ==
 	       FASTDUP_CONTRACT_INVALID_PARAMETER);
-	assert(fastdup_integrity_get_v1(reply, sizeof(reply), 6144,
+	assert(fastdup_integrity_get_v1(reply, sizeof(reply), FASTDUP_CHECKSUM_NONE, 6144,
 					&reply_length) ==
 	       FASTDUP_CONTRACT_INVALID_PARAMETER);
-	assert(fastdup_integrity_get_v1(reply, 15, 65536, &reply_length) ==
+	assert(fastdup_integrity_get_v1(reply, 15, FASTDUP_CHECKSUM_NONE, 65536, &reply_length) ==
 	       FASTDUP_CONTRACT_INVALID_PARAMETER);
-	assert(fastdup_integrity_get_v1(reply, sizeof(reply), 65536,
+	assert(fastdup_integrity_get_v1(reply, sizeof(reply), FASTDUP_CHECKSUM_NONE, 65536,
 					&reply_length) == FASTDUP_CONTRACT_OK);
 	assert(reply_length == sizeof(reply));
 	assert(reply[0] == 0 && reply[1] == 0);
@@ -79,6 +79,38 @@ static void integrity_v1_is_a_fixed_consistent_none_state(void)
 	assert(load_u32_le(reply + 4) == 0);
 	assert(load_u32_le(reply + 8) == 0);
 	assert(load_u32_le(reply + 12) == 65536);
+}
+
+static void integrity_enable_roundtrips_and_unchanged_preserves_state(void)
+{
+	uint8_t request[8] = {0};
+	uint8_t stored[2] = {0};
+	uint8_t reply[16];
+	uint16_t algorithm;
+	size_t produced;
+	for (uint16_t requested = 1; requested <= 2; requested++) {
+		store_u16_le(request, requested);
+		assert(fastdup_integrity_resolve_v1(request, 8, 0, 65536, stored) == FASTDUP_CONTRACT_OK);
+		assert(stored[0] == 2 && stored[1] == 0);
+		assert(fastdup_integrity_decode_v1(stored, 2, &algorithm) == FASTDUP_CONTRACT_OK);
+		assert(fastdup_integrity_get_v1(reply, 16, algorithm, 65536, &produced) == FASTDUP_CONTRACT_OK);
+		assert(reply[0] == 2 && load_u32_le(reply + 8) == 65536);
+		store_u16_le(request, FASTDUP_CHECKSUM_UNCHANGED);
+		assert(fastdup_integrity_resolve_v1(request, 8, algorithm, 65536, stored) == FASTDUP_CONTRACT_OK);
+		assert(stored[0] == 2 && stored[1] == 0);
+	}
+	store_u16_le(request, 2);
+	assert(fastdup_integrity_resolve_v1(request, 8, 0, 4096, stored) == FASTDUP_CONTRACT_OK);
+	assert(stored[0] == 1);
+	store_u16_le(request, 0);
+	assert(fastdup_integrity_resolve_v1(request, 8, 2, 65536, stored) == FASTDUP_CONTRACT_OK);
+	assert(stored[0] == 0 && stored[1] == 0);
+	assert(fastdup_integrity_decode_v1(stored, 1, &algorithm) == FASTDUP_CONTRACT_INVALID_PARAMETER);
+	stored[0] = 3;
+	assert(fastdup_integrity_decode_v1(stored, 2, &algorithm) == FASTDUP_CONTRACT_INVALID_PARAMETER);
+	stored[0] = 0; stored[1] = 1;
+	assert(fastdup_integrity_decode_v1(stored, 2, &algorithm) == FASTDUP_CONTRACT_INVALID_PARAMETER);
+	assert(fastdup_integrity_get_v1(reply, 16, 3, 65536, &produced) == FASTDUP_CONTRACT_INVALID_PARAMETER);
 }
 
 static void duplicate_extents_is_one_bounded_presized_operation(void)
@@ -172,7 +204,8 @@ static void close_is_fenced_by_every_accepted_metadata_operation(void)
 
 int main(void)
 {
-	integrity_v1_is_a_fixed_consistent_none_state();
+	integrity_wire_validation_and_default_none_state();
+	integrity_enable_roundtrips_and_unchanged_preserves_state();
 	duplicate_extents_is_one_bounded_presized_operation();
 	close_is_fenced_by_every_accepted_metadata_operation();
 	return 0;

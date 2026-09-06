@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.6.4
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,10 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-2
+- Fix Veeam ReFs.SetFileIntegrity: persist and report enabled SMB integrity policy.
+- Validate handle permissions and clone integrity-policy compatibility.
+
 * Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.4-1
 - Fix guest and authenticated SMB filesystem access and SELinux FUSE policy.
 - Create separate SMB accounts through the authenticated WebUI and root agent.

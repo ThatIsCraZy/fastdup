@@ -73,11 +73,37 @@ successful clone. CLOSE does not add an implicit checkpoint or `fsync`: an
 acknowledged successful mutation remains governed by the ordinary checkpoint
 target and hard durability/admission window.
 
-The v1 Integrity Information state is deliberately immutable:
-`CHECKSUM_TYPE_NONE`, enforcement enabled, zero chunk size, and the configured
-clone alignment as cluster size. SET succeeds only for NONE or UNCHANGED with
-zero flags. This avoids an unauthenticated per-file state that could disagree
-after restart.
+The original fixed NONE Integrity Information state rejected Veeam's request
+to enable integrity with `STATUS_INVALID_DEVICE_REQUEST`. As of the 0.6.4-2
+hotfix, NONE, CRC32, CRC64 and UNCHANGED requests with zero flags are supported.
+Following the ReFS-v2 wire convention, either CRC request selects the filesystem's
+native integrity mechanism; GET uses the CRC32 identifier for 4 KiB geometry and
+CRC64 otherwise. fastdup's existing verified reads provide the integrity check;
+this does not introduce a second ReFS checksum stream or change stored DATA.
+NONE changes SMB-visible policy, never the mandatory native corruption checks.
+Disabling checksum enforcement remains unsupported.
+
+The selected policy is an ordinary inode xattr, `user.fastdup.smb-integrity.v1`,
+encoded as exactly two little-endian algorithm bytes (0, 1 or 2). A missing xattr
+means NONE, preserving existing repositories. Both GET and SET reject malformed
+attributes instead of inventing a state. Reserved request bytes are ignored;
+unknown algorithms and unsupported flags fail before mutation. SET requires a
+writable share and a handle with data-write or write-attributes permission,
+including directory and attribute-only handles. UNCHANGED does not write back a
+possibly stale value. Rename and reopen retain the inode policy; Duplicate
+Extents rejects differing source/target policies before cloning.
+
+This is opaque POSIX metadata, not a new durable storage invariant or a checksum
+authority. Atomic xattr replacement enters the existing mutation/checkpoint
+path; recovery and offline scrub preserve and verify its containing metadata
+objects using their existing byte-exact xattr contract. No separate state file,
+per-open cache, privileged xattr write or format migration is introduced.
+The SMB adapter validates the policy when interpreting it, even after recovery.
+Directory policy is retained on that directory; child inheritance is not added
+by this hotfix. Veeam's explicit per-file SET is the qualified operation.
+
+References: [MS-FSCC SET request](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/a4517cd5-3f5a-4058-a457-bcff2baac011),
+[Veeam KB4381](https://www.veeam.com/kb4381).
 
 ## Crash and verification pairing
 
