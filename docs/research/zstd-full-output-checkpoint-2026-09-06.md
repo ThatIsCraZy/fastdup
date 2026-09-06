@@ -48,3 +48,17 @@ checkpoint failures, write-through ingest, and recovery. Library Clippy uses
 warnings-as-errors. Command logs and the debugger capture remain under
 `.artifacts/zstd-checkpoint/`; no captured backup content is included here.
 Package revision is 0.6.4-4.
+
+## Installed verification
+
+The test VM was upgraded to 0.6.4-4 and successfully verified/mounted its last
+durable repository after the failed checkpoint. A loopback SMB 3.1.1 test then
+wrote 2 GiB using mixed random bytes, repeated content, localized changes,
+zero ranges, and irregular write sizes including 264,957-byte and 2,813-byte
+fragments. Periodic flushes exercised checkpoint publication. Complete readback
+matched SHA-256
+`bc695a2e0001e2ab8c46e497ee4008617d527dd2496bce689116e96138251061`.
+Advanced reduction exercised both Prefix and Sparse-XOR. The captured sample
+of 87 completed checkpoints had maximum wall time 0.114 seconds and no critical
+error. The temporary share, account, and file were removed. This validates the
+installed SMB path; the complete Veeam job still requires another client run.
