@@ -3628,7 +3628,8 @@ where
             job.inode.get(),
             job.mutation_sequence,
         );
-        self.mark_degraded(job.inode);
+        self.mark_degraded();
+        self.reset_lane(job.inode);
     }
 
     fn degrade_inode(&self, inode: InodeId, mutation_sequence: u64, error: &DurableNamespaceError) {
@@ -3636,37 +3637,39 @@ where
             "detached Container publication degraded; resident fallback retained: inode={} sequence={mutation_sequence} error={error:?}",
             inode.get(),
         );
-        self.mark_degraded(inode);
+        // The failed work was already detached. Later lane contents remain
+        // valid and resident; the publisher must not invalidate them or wait
+        // on a lane whose producer may need this publication to retire.
+        self.mark_degraded();
     }
 
-    fn mark_degraded(&self, inode: InodeId) {
-        let mut registry = self
-            .registry
+    fn mark_degraded(&self) {
+        self.registry
             .lock()
-            .expect("ASSERT: write-through registry lock poisoned");
-        registry.degraded = true;
-        registry.lanes.remove(&inode);
-        let mut overflow = registry
-            .overflow
-            .lock()
-            .expect("ASSERT: write-through overflow lane lock poisoned");
-        if overflow.inode == Some(inode) {
-            *overflow = WriteThroughStream::default();
-        }
+            .expect("ASSERT: write-through registry lock poisoned")
+            .degraded = true;
     }
 
     fn reset_lane(&self, inode: InodeId) {
-        let mut registry = self
-            .registry
+        let lane = {
+            let registry = self
+                .registry
+                .lock()
+                .expect("ASSERT: write-through registry lock poisoned");
+            registry.lanes.get(&inode).map_or_else(
+                || Arc::clone(&registry.overflow),
+                |lane| Arc::clone(&lane.stream),
+            )
+        };
+        // A checkpoint may have captured this Arc before the truncate barrier.
+        // Reset in place: replacing it would let that checkpoint drain stale
+        // work after a new lane has published later mutation sequences.
+        // Drop the Registry before waiting for a lane/publication backpressure.
+        let mut lane = lane
             .lock()
-            .expect("ASSERT: write-through registry lock poisoned");
-        registry.lanes.remove(&inode);
-        let mut overflow = registry
-            .overflow
-            .lock()
-            .expect("ASSERT: write-through overflow lane lock poisoned");
-        if overflow.inode == Some(inode) {
-            *overflow = WriteThroughStream::default();
+            .expect("ASSERT: write-through lane lock poisoned");
+        if lane.inode == Some(inode) {
+            *lane = WriteThroughStream::default();
         }
     }
 
@@ -7543,6 +7546,10 @@ impl From<MountError> for DurableNamespaceError {
         Self::Mount(error)
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint/lane_lifetime_tests.rs"]
+mod lane_lifetime_tests;
 
 #[cfg(test)]
 mod tests {

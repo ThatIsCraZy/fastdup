@@ -68,6 +68,15 @@ lanes are active, new inodes use one serialized overflow lane; it resets on
 every inode change and therefore trades reduction continuity for bounded memory
 without mixing file bytes.
 
+Truncate and other invalidation barriers reset a registered lane in place.
+A checkpoint may already hold a snapshot of that lane; removing it and creating
+a replacement would permit two independently drained streams for the same inode.
+Only registry-exclusive idle ownership permits eviction. The registry lock is
+released before an invalidation waits for the lane lock. A staging failure uses
+the same in-place reset. A failed detached publication marks degradation without
+resetting later lane contents or waiting for their lock: those contents remain
+valid, and their producer may be waiting for that publication's queue space.
+
 The Container-generation allocator lock covers only checked reservation of one
 number. It is never held during chunking, compression, Container I/O, Manifest
 planning, or metadata I/O. Exact-Index publication has one separate publisher
@@ -120,6 +129,12 @@ can therefore overcount temporarily but can never retire future evidence.
   restricted to registry-only `Arc` ownership. Runtime tests hold all eight
   lanes and verify that a ninth receives the overflow lane until one is
   idle.
+- Writer/recovery: a deterministic checkpoint test pins a lane snapshot, then
+  truncates and publishes a later full Container before allowing the checkpoint
+  to drain. Publication stays monotonic, live reads return the replacement, the
+  first recovered cut returns the old file, and the next cut recovers the exact
+  replacement. The previous lane-removal implementation fails the publication
+  sequence assertion in this test.
 - Writer: every planner boundary recomputes the exact Pending Chunk byte sum,
   verifies ordered non-overlapping ranges, enforces the 256-KiB Chunk maximum,
   and asserts that one lane retains at most one 32-MiB Container target plus a
