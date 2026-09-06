@@ -40,8 +40,23 @@ benchmarks were not counted as passing tests. Reproduction and validation logs
 are retained under `.artifacts/manifest-growth/`.
 
 Revision 0.6.4-11 includes this fix and the cache/recovery improvements from
-revisions 9 and 10. The operator requested prevention rather than recovery of
-the existing test data. The repository runtime remains stopped, and existing
-data is not deleted or reset. A fresh live Veeam run is still needed to validate
-the combined workload; these tests prevent recurrence of the reproduced
-checkpoint defect, not every possible storage or network failure.
+revisions 9 and 10. It was installed on the test VM. After stopping the old
+recovery, the operator explicitly requested reinitialization: the original
+Metadata and DATA targets were reformatted through the provisioning agent, and
+the existing Share settings and Samba accounts were retained.
+
+A stale `/etc/fastdup/share-capacities.json` still referred to old inode numbers
+and caused initial startup to return `NoEntry`. Moving this derived file aside
+allowed startup; the control plane recreated Share directories and regenerated
+the file with the new inodes. This operational reset was required for this
+reprovisioning and is separate from the Manifest checkpoint fix.
+
+The new repository reached `online`, with a successful provisioning job, active
+FUSE/SMB services and 10,000,000,000,000 available bytes on the empty `veeam-test`
+Share. An SMB 3.1.1 loopback test authenticated as the existing `veeam` account,
+created a directory, wrote 4 MiB, overwrote the header while appending, flushed,
+and verified every byte. The probe file and directory were then removed.
+This is a functional smoke test, not a throughput benchmark or a completed
+Veeam backup. A fresh live Veeam run is still needed to validate the combined
+workload; the tests guard the reproduced checkpoint defect, not every possible
+storage or network failure.

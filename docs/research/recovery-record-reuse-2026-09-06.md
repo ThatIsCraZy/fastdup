@@ -97,4 +97,6 @@ Revision 0.6.4-10 carries these changes on top of the DATA-cache reclamation and
 telemetry fixes. The package was installed on the test VM. Recovery was then stopped at the
 operator's request because recovery of the existing test data was unnecessary.
 No complete live mount-time comparison was obtained; the measurements above
-remain controlled fixture results. Existing test data was left intact.
+remain controlled fixture results. Existing test data was initially left intact. The operator subsequently
+requested an explicit reinitialization using revision 11; the old test
+repository was then replaced rather than recovered.
