@@ -1283,8 +1283,16 @@ impl VersionedFile {
         end: u64,
         sequence: u64,
     ) -> Result<(), PosixError> {
+        let removed = self.allocated_bytes_in_range(
+            offset.min(self.logical_size()),
+            end.min(self.logical_size()),
+        )?;
         self.active.punch_hole(offset, end, sequence)?;
-        self.recompute_live_allocated()
+        self.live_allocated_bytes = self
+            .live_allocated_bytes
+            .checked_sub(removed)
+            .expect("ASSERT: punched allocation must have been accounted");
+        Ok(())
     }
 
     pub(super) fn zero_range(
@@ -1294,9 +1302,16 @@ impl VersionedFile {
         result_size: u64,
         sequence: u64,
     ) -> Result<(), PosixError> {
+        let replaced = self.allocated_bytes_in_range(offset, end)?;
+        let allocated = self
+            .live_allocated_bytes
+            .checked_sub(replaced)
+            .and_then(|remaining| remaining.checked_add(end - offset))
+            .ok_or(PosixError::Io)?;
         self.active
             .zero_ranges(&[(offset, end)], result_size, sequence)?;
-        self.recompute_live_allocated()
+        self.live_allocated_bytes = allocated;
+        Ok(())
     }
 
     pub(super) fn allocate_zero(
@@ -1307,8 +1322,14 @@ impl VersionedFile {
         sequence: u64,
     ) -> Result<(), PosixError> {
         let ranges = self.unallocated_ranges(offset, end)?;
+        let allocated = ranges
+            .iter()
+            .try_fold(self.live_allocated_bytes, |total, &(start, end)| {
+                total.checked_add(end - start).ok_or(PosixError::Io)
+            })?;
         self.active.zero_ranges(&ranges, result_size, sequence)?;
-        self.recompute_live_allocated()
+        self.live_allocated_bytes = allocated;
+        Ok(())
     }
 
     pub(super) fn collapse_range(
@@ -1494,11 +1515,6 @@ impl VersionedFile {
         self.active.assert_valid_after_mutation();
     }
 
-    fn recompute_live_allocated(&mut self) -> Result<(), PosixError> {
-        self.live_allocated_bytes = self.allocated_bytes_in_range(0, self.logical_size())?;
-        Ok(())
-    }
-
     pub(super) fn advance_mutation_sequence(&mut self, sequence: u64) {
         self.active.assert_next_sequence(sequence);
         self.active.record_sequence(sequence);
@@ -1636,13 +1652,13 @@ impl VersionedFile {
         }
         self.committed = committed;
         self.committed_sequence = committed_sequence;
-        let recomputed = self
-            .allocated_bytes_in_range(0, self.logical_size())
-            .expect("ASSERT: installed verified allocation metadata must remain readable");
-        assert_eq!(
-            recomputed, self.live_allocated_bytes,
-            "ASSERT: installing a frozen prefix must preserve live allocated bytes"
-        );
+        // Namespace::complete_commit already checked the verified size and
+        // allocation summary against the frozen cut. Replacing that exact
+        // prefix preserves the active overlay and its live allocation count.
+        // Do not walk the new Manifest here: a range query can perform fallible
+        // metadata I/O after the WAL is durable and this inode is installed.
+        // A failure at that point would leave a partially installed commit and
+        // poison the Namespace locks instead of being an ordinary read error.
     }
 }
 

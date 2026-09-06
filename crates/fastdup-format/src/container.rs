@@ -1,6 +1,6 @@
 use core::fmt;
 use std::cell::RefCell;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1002,7 +1002,7 @@ impl SealedContainerDescriptor {
         }
 
         let decoded = decode_encoding_record_mode(record_bytes, true, backing)?;
-        let source = first_location;
+        let source = VerifiedIndependentRecord::new(first_location)?;
         let all = decoded
             .chunks
             .into_iter()
@@ -2870,6 +2870,16 @@ struct IndexEntry {
 
 impl IndexEntry {
     fn from_encoded_record(bytes: &[u8], record_offset: u64) -> Result<Vec<Self>, FormatError> {
+        let mut entries = Vec::new();
+        Self::append_from_encoded_record(bytes, record_offset, &mut entries)?;
+        Ok(entries)
+    }
+
+    fn append_from_encoded_record(
+        bytes: &[u8],
+        record_offset: u64,
+        entries: &mut Vec<Self>,
+    ) -> Result<(), FormatError> {
         let codec_id = get_u16(bytes, 12);
         let dependency_id = if is_dependent_codec(codec_id) {
             bytes[64..96]
@@ -2880,7 +2890,6 @@ impl IndexEntry {
         };
         let chunk_count =
             usize::try_from(get_u32(bytes, 56)).map_err(|_| FormatError::ArithmeticOverflow)?;
-        let mut entries = Vec::new();
         entries
             .try_reserve_exact(chunk_count)
             .map_err(|_| FormatError::ArithmeticOverflow)?;
@@ -2915,7 +2924,7 @@ impl IndexEntry {
                 record_payload_length: get_u32(bytes, 44),
             });
         }
-        Ok(entries)
+        Ok(())
     }
 
     fn encode(&self, output: &mut [u8]) {
@@ -3173,16 +3182,22 @@ fn order_adaptive_records(
     chunk_order: Option<&[ChunkId]>,
 ) -> Result<(), FormatError> {
     if let Some(order) = chunk_order {
-        let ordinals = order
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(ordinal, id)| (id, ordinal))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        if ordinals.len() != order.len() {
-            return Err(FormatError::InvalidContainerLayout);
+        let mut ordinals = hashbrown::HashTable::<usize>::with_capacity(order.len());
+        for (ordinal, &id) in order.iter().enumerate() {
+            let hash = chunk_order_hash(id);
+            if ordinals.find(hash, |&other| order[other] == id).is_some() {
+                return Err(FormatError::InvalidContainerLayout);
+            }
+            ordinals.insert_unique(hash, ordinal, |&other| chunk_order_hash(order[other]));
         }
-        records.sort_by_key(|record| ordinals.get(&record.chunk_id_at(0)).copied());
+        // Keep full identities in the caller's existing order. Cache each
+        // Record's ordinal once instead of repeating a tree lookup per comparison.
+        records.sort_by_cached_key(|record| {
+            let id = record.chunk_id_at(0);
+            ordinals
+                .find(chunk_order_hash(id), |&other| order[other] == id)
+                .copied()
+        });
         let mut expected = order.iter();
         for record in records.iter() {
             for ordinal in 0..record.chunk_count() {
@@ -3197,6 +3212,14 @@ fn order_adaptive_records(
     }
 
     Ok(())
+}
+
+fn chunk_order_hash(id: ChunkId) -> u64 {
+    u64::from_le_bytes(
+        id.bytes()[..8]
+            .try_into()
+            .expect("ASSERT: fixed Chunk ID prefix"),
+    )
 }
 
 impl AdaptiveRecordPlan<'_> {
@@ -5246,6 +5269,42 @@ fn validate_sparse_xor_record(bytes: &[u8]) -> Result<(), FormatError> {
     validate_sparse_xor_runs(logical_length, runs, &bytes[xor_offset..payload_end])
 }
 
+#[derive(Clone, Copy)]
+struct VerifiedIndependentRecord {
+    container_id: ContainerId,
+    container_generation: u64,
+    record_offset: u64,
+    record_length: NonZeroU32,
+    record_crc32c: u32,
+    record_decoded_length: u32,
+    record_payload_length: u32,
+    codec_id: u16,
+}
+
+impl VerifiedIndependentRecord {
+    // Called only after independent Record decoding and full Chunk verification.
+    // Dependency and per-Chunk coordinates are not duplicated in this RAM proof.
+    // The positive Record length also supplies the Option niche without packing.
+    fn new(location: ExactIndexLocation) -> Result<Self, FormatError> {
+        if location.dependency_id() != [0; 32]
+            || !matches!(location.codec_id(), RAW_CODEC | ZSTD_CODEC)
+        {
+            return Err(FormatError::ExactLocationMismatch);
+        }
+        Ok(Self {
+            container_id: location.container_id(),
+            container_generation: location.container_generation(),
+            record_offset: location.record_offset(),
+            record_length: NonZeroU32::new(location.record_length())
+                .ok_or(FormatError::ExactLocationMismatch)?,
+            record_crc32c: location.record_crc32c(),
+            record_decoded_length: location.record_decoded_length(),
+            record_payload_length: location.record_payload_length(),
+            codec_id: location.codec_id(),
+        })
+    }
+}
+
 /// One decoded logical Chunk whose complete stored Encoding Record and BLAKE3
 /// identity were independently verified.
 ///
@@ -5259,7 +5318,7 @@ pub struct VerifiedChunkPayload {
     length: usize,
     decoded_offset: usize,
     chunk_ordinal: u32,
-    source: Option<ExactIndexLocation>,
+    source: Option<VerifiedIndependentRecord>,
 }
 
 /// Ephemeral identity of a retained payload allocation, never durable evidence.
@@ -5405,16 +5464,15 @@ impl VerifiedChunkPayload {
             && u64::try_from(self.length) == Ok(u64::from(candidate.logical_length()))
             && self.chunk_ordinal == location.chunk_ordinal()
             && u64::try_from(self.decoded_offset) == Ok(u64::from(location.decoded_offset()))
-            && source.dependency_id() == [0; 32]
             && location.dependency_id() == [0; 32]
-            && source.container_id() == location.container_id()
-            && source.container_generation() == location.container_generation()
-            && source.record_offset() == location.record_offset()
-            && source.record_length() == location.record_length()
-            && source.record_crc32c() == location.record_crc32c()
-            && source.record_decoded_length() == location.record_decoded_length()
-            && source.record_payload_length() == location.record_payload_length()
-            && source.codec_id() == location.codec_id()
+            && source.container_id == location.container_id()
+            && source.container_generation == location.container_generation()
+            && source.record_offset == location.record_offset()
+            && source.record_length.get() == location.record_length()
+            && source.record_crc32c == location.record_crc32c()
+            && source.record_decoded_length == location.record_decoded_length()
+            && source.record_payload_length == location.record_payload_length()
+            && source.codec_id == location.codec_id()
     }
 
     #[must_use]
@@ -6779,12 +6837,13 @@ fn encode_container_from_adaptive_plans(
         record.append_to(&mut builder)?;
         assert_eq!(builder.image_length(), end);
         let container = builder.image();
-        let record_entries = writer_record_evidence(
+        writer_record_evidence(
             &header,
             &container[cursor..end],
             u64::try_from(cursor).map_err(|_| FormatError::ArithmeticOverflow)?,
             &mut locations,
             &mut raw_locations,
+            &mut index_entries,
         )?;
         logical_bytes = logical_bytes
             .checked_add(u64::from(get_u32(&container[cursor..end], 36)))
@@ -6812,7 +6871,6 @@ fn encode_container_from_adaptive_plans(
             }
             _ => return Err(FormatError::UnsupportedHeaderField),
         }
-        index_entries.extend(record_entries);
         cursor = end;
     }
     assert_eq!(
@@ -6928,12 +6986,13 @@ fn encode_container_from_records(
     let mut zstd_prefix_record_count = 0_usize;
     let mut sparse_xor_record_count = 0_usize;
     for encoded in &encoded_records {
-        let record_entries = writer_record_evidence(
+        writer_record_evidence(
             &header,
             encoded,
             record_offset,
             &mut locations,
             &mut raw_locations,
+            &mut index_entries,
         )?;
         logical_bytes = logical_bytes
             .checked_add(u64::from(get_u32(encoded, 36)))
@@ -6961,7 +7020,6 @@ fn encode_container_from_records(
             }
             _ => return Err(FormatError::UnsupportedHeaderField),
         }
-        index_entries.extend(record_entries);
         record_offset = record_offset
             .checked_add(u64::try_from(encoded.len()).map_err(|_| FormatError::ArithmeticOverflow)?)
             .ok_or(FormatError::ArithmeticOverflow)?;
@@ -7024,9 +7082,14 @@ fn writer_record_evidence(
     record_offset: u64,
     locations: &mut Vec<VerifiedChunkLocation>,
     raw_locations: &mut Vec<VerifiedRawLocation>,
-) -> Result<Vec<IndexEntry>, FormatError> {
-    let entries = IndexEntry::from_encoded_record(encoded, record_offset)?;
-    for entry in &entries {
+    index_entries: &mut Vec<IndexEntry>,
+) -> Result<(), FormatError> {
+    // The Container already reserved its complete Recovery Index. Append here
+    // instead of allocating and copying a temporary vector for every Record.
+    let start = index_entries.len();
+    IndexEntry::append_from_encoded_record(encoded, record_offset, index_entries)?;
+    let entries = &index_entries[start..];
+    for entry in entries {
         locations.push(VerifiedChunkLocation {
             chunk_id: entry.chunk_id,
             logical_length: entry.logical_length,
@@ -7055,7 +7118,7 @@ fn writer_record_evidence(
             record_crc32c: entry.record_crc32c,
         });
     }
-    Ok(entries)
+    Ok(())
 }
 
 fn validate_raw_record_constants(bytes: &[u8]) -> Result<(), FormatError> {
@@ -7173,12 +7236,13 @@ fn encode_container_from_adaptive_plans_zeroed(
             .checked_add(record_length)
             .ok_or(FormatError::ArithmeticOverflow)?;
         record.encode_into(&mut container[cursor..end])?;
-        let record_entries = writer_record_evidence(
+        writer_record_evidence(
             &header,
             &container[cursor..end],
             u64::try_from(cursor).map_err(|_| FormatError::ArithmeticOverflow)?,
             &mut locations,
             &mut raw_locations,
+            &mut index_entries,
         )?;
         logical_bytes = logical_bytes
             .checked_add(u64::from(get_u32(&container[cursor..end], 36)))
@@ -7206,7 +7270,6 @@ fn encode_container_from_adaptive_plans_zeroed(
             }
             _ => return Err(FormatError::UnsupportedHeaderField),
         }
-        index_entries.extend(record_entries);
         cursor = end;
     }
     assert_eq!(

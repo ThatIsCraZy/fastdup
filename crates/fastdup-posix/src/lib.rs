@@ -252,6 +252,20 @@ impl MutationPayload {
         })
     }
 
+    /// Removes a prefix as a shared immutable view without copying its bytes.
+    /// Both views retain the original backing allocation charge. An out-of-range
+    /// split returns `None` without changing this payload.
+    #[must_use]
+    pub fn checked_split_to(&mut self, at: usize) -> Option<Self> {
+        if at > self.len() {
+            return None;
+        }
+        Some(Self {
+            bytes: self.bytes.split_to(at),
+            backing_bytes: self.backing_bytes,
+        })
+    }
+
     fn retained_fragment(&self, start: usize, end: usize) -> Result<Self, PosixError> {
         let fragment_bytes = end
             .checked_sub(start)
@@ -6939,6 +6953,32 @@ mod tests {
         let survivor = &data.extents[&0];
         assert_eq!(survivor.as_bytes(), vec![0x41; 512 * 1_024]);
         assert!(original.starts_at_same_address(&survivor.bytes));
+    }
+
+    #[test]
+    fn consuming_splits_preserve_bytes_backing_charge_and_failure_state() {
+        let mut bytes = Vec::with_capacity(128);
+        bytes.extend_from_slice(b"shared-payload");
+        let mut payload = MutationPayload::from_owned_bytes(bytes);
+        let owner = payload.clone();
+        assert!(payload.checked_split_to(15).is_none());
+        assert_eq!(payload, owner);
+        assert!(payload.starts_at_same_address(&owner));
+
+        let empty = payload.checked_split_to(0).unwrap();
+        assert!(empty.is_empty());
+        let prefix = payload.checked_split_to(6).unwrap();
+        assert!(prefix.starts_at_same_address(&owner));
+        assert_eq!(prefix.as_bytes(), b"shared");
+        assert_eq!(payload.as_bytes(), b"-payload");
+        assert_eq!(prefix.backing_bytes, 128);
+        assert_eq!(payload.backing_bytes, 128);
+        drop(owner);
+        let suffix = payload.checked_split_to(payload.len()).unwrap();
+        assert!(payload.is_empty());
+        assert_eq!(suffix.as_bytes(), b"-payload");
+        assert_eq!(suffix.backing_bytes, 128);
+        assert_eq!(prefix.as_bytes(), b"shared");
     }
 
     #[test]

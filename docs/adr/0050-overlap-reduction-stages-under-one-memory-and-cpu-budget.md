@@ -68,6 +68,46 @@ serial-pass permit is released before requesting parallel admission; partial
 grants preserve the same Chunk identities and order. All-FILL batches retain
 one worker. The crossover evidence is in the sixth hotpath audit.
 
+Advanced fingerprint preparation separately requests at most one worker per
+64 KiB of target bytes, rounded up and bounded by target count and the shared
+CPU budget. The measured 128-KiB batch favors two workers over eight; larger
+batches retain access to the full pool. This limit applies only to candidate
+preparation, not to the separate Base/codec-trial waves. Partial grants and
+permit return preserve the original plan order and coherent batch snapshot.
+The seventh hotpath audit records the component measurements; this policy does
+not impose a process-wide thread cap.
+
+CPU admission registers Condvar waiters under the same mutex that protects
+available permits. A release broadcasts only while a waiter is registered;
+uncontended retirement does not notify an empty wait set. Registration precedes
+the atomic unlock-and-wait operation and remains registered until reacquiring
+that mutex, preserving wakeups, partial grants and RAII permit return. Tests
+cover several blocked coordinators, spurious notification and worker unwind.
+The eighth hotpath audit records permit-cycle and admitted-work measurements.
+
+Ingest Tail segments pair their immutable payload with its mutation sequence.
+A consumed whole segment transfers its owner; a partial consumption uses a
+checked consuming split that retains the original backing charge. Single-part
+Chunks store their payload inline. Multi-part extraction reserves all required
+fragment or coalescing storage before changing the Tail, including the existing
+1,024-fragment fallback. Each constructed Chunk independently validates its
+complete byte sum; local mutations preserve Tail accounting and stable-batch
+boundaries independently audit the remaining Tail. This removes per-Chunk
+rescans of the retained suffix without dropping the boundary audit.
+
+Normal Reduction directly borrows the already prepared Compression Regions.
+Only Advanced Reduction constructs a target-selection mask and splits Regions
+at codec choices. Both preserve the same Chunk order and partitions. Record
+ordering indexes the full caller-owned Chunk IDs by compact hash-table ordinals
+and computes each Record's sort key once. Full-key comparison, duplicate-ID
+rejection and the complete final partition/order check remain mandatory.
+
+Container assembly appends each Record's writer-carried Recovery Index entries
+directly to the already reserved Container-wide vector. Publication Locations
+are derived from that appended slice. This removes a temporary allocation and
+copy per Record without changing field serialization, Record CRCs, independent
+verification or the durable Recovery Index order.
+
 Pending staging validates each new Chunk's length, checked range end and
 ordering against its predecessor, and updates its byte sum in the same append
 operation. Ordinary lane-bound checks use that preserved sum. Detach transfers

@@ -9,6 +9,7 @@ blake3.workspace = true
 crc32c.workspace = true
 fastcdc.workspace = true
 fastdup-copy-metrics.workspace = true
+hashbrown.workspace = true
 lz4.workspace = true
 rayon.workspace = true
 zstd.workspace = true

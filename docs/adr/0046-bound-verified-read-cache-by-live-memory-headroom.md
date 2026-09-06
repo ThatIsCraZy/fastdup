@@ -299,3 +299,18 @@ shared allocation charging, sharding and replacement remain unchanged. Fixed
 geometry continues to derive from the actual CacheSet size. On the measured
 x86-64 build a set shrinks from 904 to 744 bytes; this is a metadata saving,
 not an equivalent reduction in total process RSS.
+
+Independent Record provenance now stores only the physical Record coordinates
+used by candidate matching. The dependency ID has already been proven zero;
+per-Chunk coordinates remain on the payload rather than being duplicated in
+the first Location. A positive Record length supplies the optional proof's
+in-memory niche. This reduces the measured x86-64 payload from 176 to 128 bytes
+and its four-way CacheSet from 744 to 552 bytes without another allocation or
+pointer lookup. It changes no durable format or independent-read verification.
+Cache geometry continues to charge its actual type sizes.
+
+Decoded-group admission consumes verified payloads directly. It derives full
+Chunk identity and logical length from each payload instead of expanding them
+into a temporary keyed vector and comparing the copied values back again.
+Shared backing identity/size checks, admission serialization, shard locks,
+victim order, pressure behavior and allocation charging remain unchanged.

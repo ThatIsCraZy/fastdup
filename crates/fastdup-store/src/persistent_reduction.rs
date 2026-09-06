@@ -252,6 +252,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
     ///
     /// # Panics
     /// Panics if a worker fails to return its uniquely assigned result.
+    #[allow(clippy::too_many_lines)]
     pub fn plan_batch_for_publication_cached<C: StorageIo + Sync>(
         &self,
         containers: &ContainerRepository<C>,
@@ -264,7 +265,8 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         I: Send + Sync,
     {
         let snapshot = self.pin_batch();
-        let prepared = map_admitted(targets.to_vec(), workers, admission, |target| {
+        let preparation_workers = fingerprint_workers(targets, workers);
+        let prepared = map_admitted(targets.to_vec(), preparation_workers, admission, |target| {
             let counters = self.counters.for_chunk(target.chunk_id());
             let fingerprint = timed_fingerprint(target.bytes(), counters)
                 .map_err(|_| SimilarityIndexStoreError::InvalidTarget)?;
@@ -806,6 +808,21 @@ impl Drop for ReductionTimer<'_> {
     }
 }
 
+fn fingerprint_workers(targets: &[PrehashedChunk<'_>], budget: NonZeroUsize) -> NonZeroUsize {
+    // The small-batch A/B favors two workers for 128 KiB. Larger preparation
+    // batches and the separate codec-trial waves keep access to the full pool.
+    let bytes = targets.iter().fold(0_usize, |bytes, target| {
+        bytes.saturating_add(target.bytes().len())
+    });
+    NonZeroUsize::new(
+        budget
+            .get()
+            .min(targets.len().max(1))
+            .min(bytes.div_ceil(64 * 1_024).max(1)),
+    )
+    .expect("ASSERT: fingerprint preparation always requests a nonzero budget")
+}
+
 fn timed_fingerprint(
     target: &[u8],
     counters: &ReductionCounterStripe,
@@ -1068,6 +1085,28 @@ mod tests {
         assert_eq!(admission.available(), 2);
         drop(held);
         assert_eq!(admission.available(), 10);
+    }
+
+    #[test]
+    fn fingerprint_admission_releases_spare_workers_and_accepts_partial_grants() {
+        let total = NonZeroUsize::new(10).unwrap();
+        let admission = crate::WorkerPermits::new(total);
+        let data = vec![71; 16 * 1_024];
+        let chunks = vec![PrehashedChunk::new(ChunkId::of(&data), &data); 8];
+        let workers = fingerprint_workers(&chunks, total);
+        assert_eq!(workers.get(), 2);
+        let occupied = admission.acquire(NonZeroUsize::new(9).unwrap());
+        let observed = map_admitted(chunks.clone(), workers, &admission, |target| {
+            SimilarityFingerprint::v1(target.bytes()).unwrap()
+        });
+        assert_eq!(observed.len(), chunks.len());
+        assert_eq!(admission.available(), 1);
+        drop(occupied);
+        assert_eq!(admission.available(), total.get());
+        let large = vec![71; 256 * 1_024];
+        let chunks = vec![PrehashedChunk::new(ChunkId::of(&large), &large); 128];
+        assert_eq!(fingerprint_workers(&chunks, total), total);
+        assert_eq!(fingerprint_workers(&chunks[..1], total), NonZeroUsize::MIN);
     }
 
     #[test]

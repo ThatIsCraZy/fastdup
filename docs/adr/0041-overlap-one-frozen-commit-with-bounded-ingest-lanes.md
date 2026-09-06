@@ -127,7 +127,10 @@ can therefore overcount temporarily but can never retire future evidence.
   disjoint leases and proves that their sum exactly exhausts, then restores,
   the cap.
 - Writer: a lane records its inode and last observed mutation sequence and
-  resets all CDC/pending state on inode, offset, or sequence discontinuity.
+  resets CDC continuity on inode, placement, offset, or sequence discontinuity.
+  Before replacing a populated lane, it drains complete Chunks from the old
+  range and detaches Pending Chunks under the old inode, placement, and carried
+  mutation sequences. Only the bounded incomplete CDC suffix is discarded.
   POSIX externalization separately verifies inode, mutation sequence, range,
   and complete content identity before releasing resident bytes.
 - Writer: the Observer-order lock makes live mutation plus queue admission one
@@ -185,3 +188,47 @@ retirement targets. A blocked
 partial-publication integration test requires same-inode forward progress and
 a second concurrent publication, then crash-recovers only the original Frozen
 prefix byte-exactly.
+
+## Preserve stable work across discontinuous writes (2026-09-06)
+
+Two adjacent writes may arrive in reversed offset order. Clearing an entire
+partially filled lane in that case discarded almost a Container of reusable
+work, even when most of the preceding range was unchanged. The checkpoint then
+had to process that resident range again. The public write/checkpoint regression
+reproduces a 30.30-MiB rechunk rest after swapping two one-MiB writes following
+a 28-MiB sequential prefix; draining before reset reduces it to 1.23 MiB.
+
+This drain uses the existing worker permits and 64-MiB detached publication
+budget. It executes in the Ingest worker and does not wait for storage durability
+while resetting the lane, apart from ordinary bounded queue backpressure. It
+preserves old sequences: a subsequent overwrite cannot authorize stale recipes
+in Active, while an earlier Frozen cut can still reuse its original bytes.
+Background publication failure retains resident fallback and degrades
+acceleration through the existing path. Truncate/barrier invalidation and idle
+lane eviction retain their existing resident-fallback policy.
+
+The drain can create partial Containers at a discontinuity. This trades some
+Container overhead for preserving the preceding stable range; it adds neither
+an unbounded staging buffer nor a new durable format. Existing reader, recovery,
+and scrub checks remain authoritative. Regression cases recover the complete
+file byte-exactly, isolate the Frozen prefix from a later overwrite, and inject
+a failed publication before retrying the checkpoint.
+
+## Complete a durable cut without fallible allocation reads (2026-09-06)
+
+Before installing any inode, Namespace completion checks every installed
+reader's verified logical size, allocated-byte summary, and mutation sequence
+against the Frozen cut. Replacing that exact prefix leaves the Active overlay
+and its already maintained live allocation count unchanged. Installation must
+not repeat an allocation-range walk through the new Manifest after retiring
+the Frozen epoch: Metadata I/O can fail even for a previously verified object,
+and a failure midway through installation would poison the Namespace locks
+after the WAL Commit was already durable.
+
+A public completion regression supplies a verified summary with unavailable
+allocation pages and preserves a later overlapping write and exact `st_blocks`.
+A storage-fault matrix combines sparse truncate/extend, replacement rename,
+Hardlinks, an open replaced inode, and post-cut truncate/unlink. Failures before
+and after Metadata/DATA operations must recover the preceding or complete
+Frozen generation, never the later Active image. Independent read, recovery,
+and scrub verification remain required.

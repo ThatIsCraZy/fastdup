@@ -8,8 +8,14 @@ use std::time::Instant;
 #[derive(Debug)]
 pub struct WorkerPermits {
     total: NonZeroUsize,
-    available: Mutex<usize>,
+    available: Mutex<PermitState>,
     changed: Condvar,
+}
+
+#[derive(Debug)]
+struct PermitState {
+    available: usize,
+    waiters: usize,
 }
 
 impl WorkerPermits {
@@ -73,7 +79,10 @@ impl WorkerPermits {
     pub fn new(total: NonZeroUsize) -> Self {
         Self {
             total,
-            available: Mutex::new(total.get()),
+            available: Mutex::new(PermitState {
+                available: total.get(),
+                waiters: 0,
+            }),
             changed: Condvar::new(),
         }
     }
@@ -83,10 +92,10 @@ impl WorkerPermits {
     /// # Panics
     /// Panics if the admission lock is poisoned.
     pub fn available(&self) -> usize {
-        *self
-            .available
+        self.available
             .lock()
             .expect("ASSERT: CPU permit lock poisoned")
+            .available
     }
 
     /// Demand reads never block while owning Singleflight leaders. Nested
@@ -102,8 +111,8 @@ impl WorkerPermits {
             .available
             .lock()
             .expect("ASSERT: CPU permit lock poisoned");
-        let acquired = NonZeroUsize::new(desired.get().min(*available))?;
-        *available -= acquired.get();
+        let acquired = NonZeroUsize::new(desired.get().min(available.available))?;
+        available.available -= acquired.get();
         Some(WorkerPermitLease {
             pool: self,
             remaining: AtomicUsize::new(acquired.get()),
@@ -129,20 +138,22 @@ impl WorkerPermits {
             .available
             .lock()
             .expect("ASSERT: encode worker permit lock poisoned");
-        while *available == 0 {
+        while available.available == 0 {
             blocked = true;
+            available.waiters += 1;
             available = self
                 .changed
                 .wait(available)
                 .expect("ASSERT: encode worker permit lock poisoned while waiting");
+            available.waiters -= 1;
         }
         assert!(
-            *available <= self.total.get(),
+            available.available <= self.total.get(),
             "ASSERT: available encode workers exceed the write-through worker budget"
         );
-        let acquired = desired.get().min(*available);
+        let acquired = desired.get().min(available.available);
         assert!(acquired != 0, "ASSERT: a granted worker lease is nonempty");
-        *available -= acquired;
+        available.available -= acquired;
         WorkerPermitLease {
             pool: self,
             remaining: AtomicUsize::new(acquired),
@@ -206,14 +217,19 @@ impl<'a> WorkerPermitLease<'a> {
             .available
             .lock()
             .expect("ASSERT: CPU permit lock poisoned during retirement");
-        *available = available
+        available.available = available
+            .available
             .checked_add(count)
             .expect("ASSERT: CPU permit accounting cannot overflow");
         assert!(
-            *available <= self.pool.total.get(),
+            available.available <= self.pool.total.get(),
             "ASSERT: CPU permit retirement exceeded budget"
         );
-        self.pool.changed.notify_all();
+        // Register waiters under this same mutex before Condvar::wait releases
+        // it. Skipping notification with no waiters cannot lose a wakeup.
+        if available.waiters != 0 {
+            self.pool.changed.notify_all();
+        }
     }
 
     #[must_use]
@@ -282,6 +298,43 @@ mod tests {
             assert_eq!(available, 3, "only the blocked worker retains its permit");
         });
         assert_eq!(permits.available(), 4);
+    }
+
+    #[test]
+    fn registered_waiters_all_progress_after_release_and_spurious_notification() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let permits = WorkerPermits::new(NonZeroUsize::new(2).unwrap());
+        for _ in 0..8 {
+            let held = permits.acquire(NonZeroUsize::new(2).unwrap());
+            let (completed, results) = mpsc::channel();
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let completed = completed.clone();
+                    let permits = &permits;
+                    scope.spawn(move || {
+                        let lease = permits.acquire(NonZeroUsize::new(2).unwrap());
+                        completed.send(lease.blocked()).unwrap();
+                    });
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let registered = loop {
+                    let count = permits.available.lock().unwrap().waiters;
+                    if count == 4 || Instant::now() >= deadline {
+                        break count;
+                    }
+                    std::thread::yield_now();
+                };
+                permits.changed.notify_all();
+                drop(held);
+                assert_eq!(registered, 4);
+                for _ in 0..4 {
+                    assert!(results.recv_timeout(Duration::from_secs(5)).unwrap());
+                }
+            });
+            assert_eq!(permits.available(), 2);
+            assert_eq!(permits.available.lock().unwrap().waiters, 0);
+        }
     }
 
     #[test]

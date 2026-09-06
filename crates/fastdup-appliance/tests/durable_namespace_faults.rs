@@ -1157,6 +1157,246 @@ fn assert_complete(namespace: &Namespace) {
     );
 }
 
+#[test]
+fn every_frozen_replace_fault_excludes_later_truncate_and_unlink() {
+    let probe_metadata = MemoryStorageIo::new();
+    let probe_data = MemoryStorageIo::new();
+    let probe = frozen_replace_fixture(probe_metadata.clone(), probe_data.clone());
+    let baselines = [
+        probe_metadata.operation_count(),
+        probe_data.operation_count(),
+    ];
+    probe.checkpoint().unwrap().unwrap();
+    let operations = [
+        probe_metadata.operations()[baselines[0]..].to_vec(),
+        probe_data.operations()[baselines[1]..].to_vec(),
+    ];
+    let commit_sync = operations[0]
+        .iter()
+        .rposition(|operation| *operation == StorageOperation::SyncFile)
+        .expect("the WAL Commit is synchronized");
+    assert!(operations[1].contains(&StorageOperation::SyncRoot));
+    drop(probe);
+    for tier in 0..2 {
+        for relative in 0..operations[tier].len() {
+            for after in [false, true] {
+                let failing = if after {
+                    MemoryStorageIo::with_fail_after(baselines[tier] + relative)
+                } else {
+                    MemoryStorageIo::with_fail_before(baselines[tier] + relative)
+                };
+                let (metadata, data) = if tier == 0 {
+                    (failing, MemoryStorageIo::new())
+                } else {
+                    (MemoryStorageIo::new(), failing)
+                };
+                let appliance = frozen_replace_fixture(metadata.clone(), data.clone());
+                let result = appliance.checkpoint();
+                if tier == 1 || relative <= commit_sync {
+                    assert!(
+                        result.is_err(),
+                        "tier={tier} relative={relative} after={after} must hit the fault"
+                    );
+                }
+                assert_eq!(
+                    named_image(appliance.namespace(), b"future").unwrap().2,
+                    b"ACTIVE!"
+                );
+                drop(appliance);
+                metadata.crash();
+                data.crash();
+                let recovered = recover_mount(
+                    NamespaceConfig::default(),
+                    &GenerationRepository::new(metadata, policy()),
+                    &ContainerRepository::new(data),
+                )
+                .unwrap()
+                .unwrap();
+                let committed =
+                    tier == 0 && (relative > commit_sync || (after && relative == commit_sync));
+                assert_replace_image(&recovered, committed);
+            }
+        }
+    }
+    eprintln!(
+        "frozen_replace_fault_cases={} metadata_operations={} data_operations={}",
+        2 * (operations[0].len() + operations[1].len()),
+        operations[0].len(),
+        operations[1].len()
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+fn frozen_replace_fixture(
+    metadata: MemoryStorageIo,
+    data: MemoryStorageIo,
+) -> DurableNamespace<MemoryStorageIo, MemoryStorageIo> {
+    let appliance = open(metadata, data);
+    write_named(&appliance, b"source", b"original-source");
+    write_named(&appliance, b"target", b"original-target");
+    let namespace = appliance.namespace();
+    let (inode, _, _) = named_image(namespace, b"source").unwrap();
+    let (old_target, _, _) = named_image(namespace, b"target").unwrap();
+    let open_writer = |inode| {
+        let Reply::Opened(handle) = namespace
+            .dispatch(
+                CALLER,
+                Operation::Open {
+                    inode,
+                    options: OpenOptions::READ_WRITE,
+                    truncate: false,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("open writer reply")
+        };
+        handle
+    };
+    let handle = open_writer(inode);
+    let orphan_handle = open_writer(old_target);
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Link {
+                inode,
+                new_parent: ROOT_INODE,
+                new_name: b"alias",
+            },
+        )
+        .unwrap();
+    appliance.checkpoint().unwrap().unwrap();
+    for operation in [
+        Operation::Write {
+            inode,
+            handle,
+            offset: 1,
+            data: b"unaligned",
+        },
+        Operation::SetLength {
+            inode,
+            handle: Some(handle),
+            length: 3,
+        },
+        Operation::SetLength {
+            inode,
+            handle: Some(handle),
+            length: 8_193,
+        },
+        Operation::Write {
+            inode,
+            handle,
+            offset: 16_391,
+            data: b"TAIL",
+        },
+        Operation::Rename {
+            parent: ROOT_INODE,
+            name: b"source",
+            new_parent: ROOT_INODE,
+            new_name: b"target",
+            no_replace: false,
+        },
+        Operation::Write {
+            inode: old_target,
+            handle: orphan_handle,
+            offset: 0,
+            data: b"ORPHAN!",
+        },
+    ] {
+        namespace.dispatch(CALLER, operation).unwrap();
+    }
+    assert_eq!(
+        read_range(namespace, old_target, orphan_handle, 0, 64),
+        b"ORPHAN!l-target"
+    );
+    namespace.begin_commit().unwrap().unwrap();
+    for operation in [
+        Operation::SetLength {
+            inode,
+            handle: Some(handle),
+            length: 7,
+        },
+        Operation::Write {
+            inode,
+            handle,
+            offset: 0,
+            data: b"ACTIVE!",
+        },
+        Operation::Rename {
+            parent: ROOT_INODE,
+            name: b"target",
+            new_parent: ROOT_INODE,
+            new_name: b"future",
+            no_replace: false,
+        },
+        Operation::Unlink {
+            parent: ROOT_INODE,
+            name: b"alias",
+        },
+    ] {
+        namespace.dispatch(CALLER, operation).unwrap();
+    }
+    appliance
+}
+
+fn named_image(namespace: &Namespace, name: &[u8]) -> Option<(InodeId, u32, Vec<u8>)> {
+    let entry = match namespace.dispatch(
+        CALLER,
+        Operation::Lookup {
+            parent: ROOT_INODE,
+            name,
+        },
+    ) {
+        Ok(Reply::Entry(entry)) => entry,
+        Err(PosixError::NoEntry) => return None,
+        other => panic!("lookup image: {other:?}"),
+    };
+    let inode = entry.attr.inode;
+    let Reply::Opened(handle) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("open image reply")
+    };
+    let bytes = read_range(namespace, inode, handle, 0, 32_768);
+    assert_eq!(bytes.len() as u64, entry.attr.size);
+    namespace
+        .dispatch(CALLER, Operation::Release { inode, handle })
+        .unwrap();
+    Some((inode, entry.attr.link_count, bytes))
+}
+
+fn assert_replace_image(namespace: &Namespace, committed: bool) {
+    assert!(named_image(namespace, b"future").is_none());
+    let alias = named_image(namespace, b"alias").unwrap();
+    let target = named_image(namespace, b"target").unwrap();
+    assert_eq!(alias.1, 2);
+    if committed {
+        assert!(named_image(namespace, b"source").is_none());
+        assert_eq!(target, alias);
+        let mut expected = vec![0; 16_395];
+        expected[..3].copy_from_slice(b"oun");
+        expected[16_391..].copy_from_slice(b"TAIL");
+        assert_eq!(
+            target.2, expected,
+            "truncate/extend must not resurrect old bytes"
+        );
+    } else {
+        assert_eq!(named_image(namespace, b"source").unwrap(), alias);
+        assert_eq!(alias.2, b"original-source");
+        assert_ne!(alias.0, target.0);
+        assert_eq!(target.1, 1);
+        assert_eq!(target.2, b"original-target");
+    }
+}
+
 fn policy() -> PolicySetId {
     PolicySetId::new([0x6D; 32]).expect("fixture Policy Set ID is nonzero")
 }

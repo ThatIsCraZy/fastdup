@@ -20,6 +20,14 @@ no physical-capacity promise. A later write may therefore still fail with
 `ENOSPC`. `KEEP_SIZE` allocation beyond EOF has no retained physical effect;
 inside EOF it converts holes to allocated FILL(0).
 
+Hole punching and zero/allocation ranges resolve all required allocation
+Metadata before mutating the Dirty epoch. Their exact removed/added allocation
+delta updates the live counter without a subsequent full-Manifest walk. An I/O
+failure must not leave changed bytes or an advanced Dirty sequence behind a
+failed syscall and a cancelled quota reservation. A public regression makes
+unrelated allocation pages unavailable, checks all three range modes and exact
+allocation counts, and requires reads and the next write to remain valid.
+
 Collapse and insert range are byte-granular metadata splices. Collapse removes
 the selected range and shifts the suffix left; insert adds a HOLE and shifts
 the suffix right. Complete DATA, DATA_SLICE, FILL, and HOLE recipes move without

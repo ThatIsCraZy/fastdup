@@ -1240,6 +1240,10 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         self.candidates_fingerprinted(target_id, &fingerprint, logical_length)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bounded cursor merge and complete candidate validation"
+    )]
     pub(crate) fn candidates_fingerprinted(
         &self,
         target_id: ChunkId,
@@ -1260,7 +1264,9 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             };
             let bucket = self.read_bucket(partition_ordinal, key)?;
             if let Some(entry_ordinal) = bucket.get(0) {
-                let entry = self.read_entry(partition_ordinal, entry_ordinal)?;
+                let mut entry_page = None;
+                let entry =
+                    self.read_entry_cached(partition_ordinal, entry_ordinal, &mut entry_page)?;
                 validate_query_entry(entry, key, slot)?;
                 cursors[slot] = Some(QueryBucketCursor {
                     key,
@@ -1268,10 +1274,14 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
                     ordinals: bucket,
                     next: 1,
                     current: entry,
+                    entry_page,
                 });
             }
         }
 
+        if cursors.iter().all(Option::is_none) {
+            return Ok(Vec::new());
+        }
         let mut candidates = Vec::with_capacity(MAX_SIMILARITY_CANDIDATES);
         while let Some(chunk_id) = cursors
             .iter()
@@ -1301,7 +1311,11 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
                         .next
                         .checked_add(1)
                         .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-                    let next = self.read_entry(active.partition_ordinal, ordinal)?;
+                    let next = self.read_entry_cached(
+                        active.partition_ordinal,
+                        ordinal,
+                        &mut active.entry_page,
+                    )?;
                     validate_query_entry(next, active.key, slot)?;
                     if next.chunk_id() <= current.chunk_id() {
                         return Err(SimilarityIndexStoreError::IndexCorruption);
@@ -1431,6 +1445,15 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         partition_ordinal: usize,
         entry_ordinal: u32,
     ) -> Result<SimilarityIndexEntry, SimilarityIndexStoreError> {
+        self.read_entry_cached(partition_ordinal, entry_ordinal, &mut None)
+    }
+
+    fn read_entry_cached(
+        &self,
+        partition_ordinal: usize,
+        entry_ordinal: u32,
+        cached: &mut Option<QueryEntryPage>,
+    ) -> Result<SimilarityIndexEntry, SimilarityIndexStoreError> {
         const ENTRIES_PER_PAGE: usize = 25;
         let partition = self
             .partitions
@@ -1442,6 +1465,16 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             return Err(SimilarityIndexStoreError::IndexCorruption);
         }
         let page_ordinal = entry_ordinal / ENTRIES_PER_PAGE;
+        if let Some(cached) = cached.as_ref().filter(|cached| {
+            cached.partition_ordinal == partition_ordinal && cached.page_ordinal == page_ordinal
+        }) {
+            return cached
+                .page
+                .entries()
+                .get(entry_ordinal % ENTRIES_PER_PAGE)
+                .copied()
+                .ok_or(SimilarityIndexStoreError::IndexCorruption);
+        }
         let run_hash = partition.descriptor.run_hash();
         let page = if let Some(page) = partition.page_cache.get_entry(run_hash, page_ordinal) {
             page
@@ -1461,10 +1494,17 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
                 .insert_entry(run_hash, page_ordinal, Arc::clone(&page));
             page
         };
-        page.entries()
+        let entry = page
+            .entries()
             .get(entry_ordinal % ENTRIES_PER_PAGE)
             .copied()
-            .ok_or(SimilarityIndexStoreError::IndexCorruption)
+            .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+        *cached = Some(QueryEntryPage {
+            partition_ordinal,
+            page_ordinal,
+            page,
+        });
+        Ok(entry)
     }
 }
 
@@ -1916,13 +1956,22 @@ impl BucketOrdinals {
     }
 }
 
-#[derive(Clone, Copy)]
+// A query retains at most one independently verified Entry page per cursor.
+// It belongs to this immutable index only and is released with the cursor;
+// no cache lock or Arc clone is needed for subsequent entries on that page.
+struct QueryEntryPage {
+    partition_ordinal: usize,
+    page_ordinal: usize,
+    page: Arc<SimilarityIndexPage>,
+}
+
 struct QueryBucketCursor {
     key: SimilarityBucketKey,
     partition_ordinal: usize,
     ordinals: BucketOrdinals,
     next: usize,
     current: SimilarityIndexEntry,
+    entry_page: Option<QueryEntryPage>,
 }
 
 fn validate_query_entry(
@@ -2548,6 +2597,69 @@ mod tests {
                 .unwrap(),
             expected
         );
+        drop(index);
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn query_entry_cursor_reuses_verified_pages_and_releases_after_pressure() {
+        use super::*;
+        let root =
+            std::env::temp_dir().join(format!("similarity-query-page-{}", std::process::id()));
+        assert!(!root.exists());
+        let repository = SimilarityIndexRepository::new_with_memory_snapshot(
+            crate::FsStorageIo::open(&root).unwrap(),
+            MemoryPressureSnapshot::new(32 << 30, 30 << 30, 0),
+        );
+        let entries = (1..=51_u64)
+            .map(|ordinal| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&ordinal.to_be_bytes());
+                SimilarityIndexEntry::new(ChunkId::from_bytes(id), 65536, 1, [7; 4], [ordinal; 8])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        repository.publish_entries(1, entries.clone()).unwrap();
+        let index = repository.recover_generation(1).unwrap();
+        let mut cached = None;
+        for (ordinal, expected) in entries.iter().enumerate() {
+            let before = index.page_cache_status();
+            assert_eq!(
+                index
+                    .read_entry_cached(0, u32::try_from(ordinal).unwrap(), &mut cached)
+                    .unwrap(),
+                *expected
+            );
+            let after = index.page_cache_status();
+            let lookups = after.hits() + after.misses() - before.hits() - before.misses();
+            assert_eq!(lookups, u64::from(ordinal % 25 == 0));
+        }
+        assert!(index.read_entry_cached(0, 51, &mut cached).is_err());
+        assert!(index.read_entry_cached(usize::MAX, 0, &mut cached).is_err());
+        // Crossing a partition must not reuse an equal page ordinal from it.
+        cached.as_mut().unwrap().partition_ordinal = 1;
+        let before = index.page_cache_status();
+        assert_eq!(
+            index.read_entry_cached(0, 50, &mut cached).unwrap(),
+            entries[50]
+        );
+        let after = index.page_cache_status();
+        assert_eq!(
+            after.hits() + after.misses() - before.hits() - before.misses(),
+            1
+        );
+        repository
+            .page_cache
+            .apply_pressure_snapshot(MemoryPressureSnapshot::new(32 << 30, 0, 1));
+        assert_eq!(index.page_cache_status().resident_pages(), 0);
+        let owner = Arc::downgrade(&cached.as_ref().unwrap().page);
+        assert_eq!(
+            index.read_entry_cached(0, 50, &mut cached).unwrap(),
+            entries[50]
+        );
+        drop(cached);
+        assert!(owner.upgrade().is_none());
         drop(index);
         drop(repository);
         std::fs::remove_dir_all(root).unwrap();

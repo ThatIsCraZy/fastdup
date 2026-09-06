@@ -580,40 +580,20 @@ impl VerifiedReadCache {
         logical_length: u64,
         payload: VerifiedChunkPayload,
     ) {
-        self.admit_verified_group(vec![(chunk_id, logical_length, payload)]);
-    }
-
-    pub(crate) fn admit_decoded_group(&self, payloads: Vec<VerifiedChunkPayload>) {
-        let keyed = payloads
-            .into_iter()
-            .map(|payload| {
-                let logical_length = u64::try_from(payload.len())
-                    .expect("ASSERT: verified logical Chunk length fits u64");
-                (payload.chunk_id(), logical_length, payload)
-            })
-            .collect();
-        self.admit_verified_group(keyed);
+        assert_eq!(payload.chunk_id(), chunk_id);
+        assert_eq!(u64::try_from(payload.len()).ok(), Some(logical_length));
+        self.admit_decoded_group(vec![payload]);
     }
 
     /// Atomically accounts one decoder backing while admitting any number of
     /// verified Chunk views from that Encoding Record.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn admit_verified_group(&self, payloads: Vec<(ChunkId, u64, VerifiedChunkPayload)>) {
-        let Some((_, _, first)) = payloads.first() else {
+    pub(crate) fn admit_decoded_group(&self, payloads: Vec<VerifiedChunkPayload>) {
+        let Some(first) = payloads.first() else {
             return;
         };
         let allocation_bytes = first.backing_allocation_bytes();
-        for (chunk_id, logical_length, payload) in &payloads {
-            assert_eq!(
-                u64::try_from(payload.len()).ok(),
-                Some(*logical_length),
-                "ASSERT: Store returned a verified Chunk with the wrong length"
-            );
-            assert_eq!(
-                payload.chunk_id(),
-                *chunk_id,
-                "ASSERT: Store returned bytes under the wrong verified Chunk ID"
-            );
+        for payload in &payloads {
             assert!(
                 first.shares_backing_with(payload),
                 "ASSERT: one cache admission group must share one backing allocation"
@@ -624,11 +604,6 @@ impl VerifiedReadCache {
                 "ASSERT: shared decoded Record views report one allocation"
             );
         }
-        assert_eq!(
-            first.chunk_id(),
-            payloads[0].0,
-            "ASSERT: first admission key retains verified identity"
-        );
         self.maybe_refresh_pressure();
         let _admission = self
             .admission
@@ -647,10 +622,11 @@ impl VerifiedReadCache {
             bytes: allocation_bytes,
         });
         let mut admitted_group_refs = 0_usize;
-        for (chunk_id, logical_length, payload) in payloads {
+        for payload in payloads {
             let key = CacheKey {
-                chunk_id,
-                logical_length,
+                chunk_id: payload.chunk_id(),
+                logical_length: u64::try_from(payload.len())
+                    .expect("ASSERT: verified logical Chunk length fits u64"),
             };
             let hash = cache_hash(key);
             let shard = &self.shards[hash & (self.shards.len() - 1)];

@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Produktseite</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6">Release-Informationen</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6.1">Release-Informationen</a>
 </p>
 
 fastdup ist eine experimentelle, softwaredefinierte Single-Node-
@@ -32,9 +32,14 @@ HTTPS-WebUI hält die Administration einfach.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
 
-## Neu in v0.6 · 5. September 2026
+## Neu in v0.6.1 · 6. September 2026
 
-Der Quellstand unterstützt jetzt **permanente Online-Similarity**: Neue,
+Dieses Patch-Release optimiert Ingest und Reads, erhält Rechunk-Arbeit und behebt
+verlorene Shutdown-Signale sowie die Behandlung von Metadata-I/O-Fehlern beim
+Commit-Abschluss und bei fallocate. Siehe [Release-Notes](docs/releases/v0.6.1.md)
+und [Crash-Konsistenz-Ergebnisse](docs/research/crash-consistency-round-2026-09-06.md).
+
+Der Quellstand unterstützt **permanente Online-Similarity**: Neue,
 unabhängig dekodierbare Chunks werden im laufenden Mount zu möglichen
 Kompressionsbasen, ohne Offline-Rebuild. Advanced Reduction lässt sich je
 SMB-Freigabe ausschalten, einschalten oder vom Repository erben. Neue
@@ -48,7 +53,7 @@ bleibt. Nachweise: [Online-Similarity](docs/benchmarks/online-similarity-share-p
 [Datenpfad-Messungen](docs/benchmarks/hotpath-implementation3-2026-09-05.md)
 und [Control Plane](docs/benchmarks/control-plane-memory-2026-09-05.md).
 
-Das Release v0.6 enthält Paketversion **0.6.0** für Rocky Linux 10 x86-64.
+Das Release v0.6.1 enthält Paketversion **0.6.1** für Rocky Linux 10 x86-64.
 Die folgenden Benchmarks dokumentieren die Entwicklungsbuilds auf dem Weg
 zu diesem Release; Binary-Hashes und Messgrenzen stehen im jeweiligen Bericht.
 
@@ -130,11 +135,11 @@ Benötigt werden:
 Aktuelles Binärpaket herunterladen und installieren:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.6.0-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.6.1-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

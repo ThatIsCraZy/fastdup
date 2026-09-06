@@ -1,5 +1,4 @@
 use fastdup_store::{WorkerPermitLease, WorkerPermits};
-#[cfg(test)]
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -1406,8 +1405,23 @@ struct PreparedCompressionRegions<'a> {
 }
 
 #[derive(Debug)]
+enum ChunkParts {
+    Single(MutationPayload),
+    Fragmented(Vec<MutationPayload>),
+}
+
+impl ChunkParts {
+    fn as_slice(&self) -> &[MutationPayload] {
+        match self {
+            Self::Single(part) => std::slice::from_ref(part),
+            Self::Fragmented(parts) => parts,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct ChunkFragments {
-    parts: Vec<MutationPayload>,
+    parts: ChunkParts,
     length: usize,
     through_sequence: u64,
 }
@@ -1418,9 +1432,19 @@ impl ChunkFragments {
         Self::new_through(parts, length, 0)
     }
 
-    fn new_through(parts: Vec<MutationPayload>, length: usize, through_sequence: u64) -> Self {
+    #[cfg(test)]
+    fn new_through(mut parts: Vec<MutationPayload>, length: usize, through_sequence: u64) -> Self {
+        let parts = if parts.len() == 1 {
+            ChunkParts::Single(parts.pop().expect("ASSERT: one fixture fragment"))
+        } else {
+            ChunkParts::Fragmented(parts)
+        };
+        Self::from_parts(parts, length, through_sequence)
+    }
+
+    fn from_parts(parts: ChunkParts, length: usize, through_sequence: u64) -> Self {
         assert!(length != 0, "ASSERT: a SeqCDC Chunk is nonempty");
-        let actual = parts.iter().fold(0_usize, |total, part| {
+        let actual = parts.as_slice().iter().fold(0_usize, |total, part| {
             assert!(!part.is_empty(), "ASSERT: Chunk fragments are nonempty");
             total
                 .checked_add(part.len())
@@ -1447,13 +1471,13 @@ impl ChunkFragments {
     }
 
     fn first_byte(&self) -> u8 {
-        self.parts[0].as_bytes()[0]
+        self.parts.as_slice()[0].as_bytes()[0]
     }
 
     fn is_fill(&self) -> bool {
         let first = self.first_byte();
         let repeated = [first; 32];
-        self.parts.iter().all(|part| {
+        self.parts.as_slice().iter().all(|part| {
             let bytes = part.as_bytes();
             // Keep immediate rejection cheap; fixed-size comparisons let the
             // compiler vectorize long FILL scans without alignment or Unsafe.
@@ -1469,7 +1493,7 @@ impl ChunkFragments {
 
     fn chunk_id(&self) -> ChunkId {
         let mut hasher = blake3::Hasher::new();
-        for part in &self.parts {
+        for part in self.parts.as_slice() {
             hasher.update(part.as_bytes());
         }
         ChunkId::from_bytes(*hasher.finalize().as_bytes())
@@ -1477,14 +1501,14 @@ impl ChunkFragments {
 
     #[cfg(test)]
     fn materialize_new_chunk(&self) -> Result<Cow<'_, [u8]>, DurableNamespaceError> {
-        if self.parts.len() == 1 {
-            return Ok(Cow::Borrowed(self.parts[0].as_bytes()));
+        if self.parts.as_slice().len() == 1 {
+            return Ok(Cow::Borrowed(self.parts.as_slice()[0].as_bytes()));
         }
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(self.length)
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for part in &self.parts {
+        for part in self.parts.as_slice() {
             bytes.extend_from_slice(part.as_bytes());
         }
         assert_eq!(
@@ -1498,7 +1522,7 @@ impl ChunkFragments {
 
     fn append_to_compression_region(&self, decoded: &mut Vec<u8>) {
         let start = decoded.len();
-        for part in &self.parts {
+        for part in self.parts.as_slice() {
             decoded.extend_from_slice(part.as_bytes());
         }
         assert_eq!(
@@ -1510,12 +1534,13 @@ impl ChunkFragments {
     }
 
     fn contiguous_bytes(&self) -> Option<&[u8]> {
-        (self.parts.len() == 1).then(|| self.parts[0].as_bytes())
+        (self.parts.as_slice().len() == 1).then(|| self.parts.as_slice()[0].as_bytes())
     }
 
     #[cfg(test)]
     fn materialize_fixture(&self) -> Vec<u8> {
         self.parts
+            .as_slice()
             .iter()
             .flat_map(|part| part.as_bytes().iter().copied())
             .collect()
@@ -1694,14 +1719,20 @@ fn ordinary_region_slices<'a>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StableExtraction {
     FillContainer,
-    DrainForCommitCut,
+    DrainStable,
+}
+
+#[derive(Debug)]
+struct IngestSegment {
+    payload: MutationPayload,
+    mutation_sequence: u64,
 }
 
 #[derive(Debug, Default)]
 struct SegmentedIngestTail {
-    segments: VecDeque<MutationPayload>,
-    mutation_sequences: VecDeque<u64>,
+    segments: VecDeque<IngestSegment>,
     length: usize,
+    #[cfg(test)]
     materialized_bytes: usize,
 }
 
@@ -1716,9 +1747,11 @@ impl SegmentedIngestTail {
 
     fn clear(&mut self) {
         self.segments.clear();
-        self.mutation_sequences.clear();
         self.length = 0;
-        self.materialized_bytes = 0;
+        #[cfg(test)]
+        {
+            self.materialized_bytes = 0;
+        }
     }
 
     fn push(&mut self, payload: MutationPayload, mutation_sequence: u64) {
@@ -1730,12 +1763,16 @@ impl SegmentedIngestTail {
             .length
             .checked_add(payload.len())
             .expect("ASSERT: bounded Ingest Tail length cannot overflow");
-        self.segments.push_back(payload);
-        self.mutation_sequences.push_back(mutation_sequence);
+        self.segments.push_back(IngestSegment {
+            payload,
+            mutation_sequence,
+        });
     }
 
     fn front_bytes(&self) -> &[u8] {
-        self.segments.front().map_or(&[], MutationPayload::as_bytes)
+        self.segments
+            .front()
+            .map_or(&[], |segment| segment.payload.as_bytes())
     }
 
     #[cfg(test)]
@@ -1746,6 +1783,7 @@ impl SegmentedIngestTail {
             .materialized_bytes
             .checked_add(length)
             .expect("ASSERT: bounded materialized-byte counter cannot overflow");
+        self.assert_valid();
         Ok(MutationPayload::from_owned_bytes(bytes))
     }
 
@@ -1757,58 +1795,102 @@ impl SegmentedIngestTail {
         if length > self.length {
             return Err(DurableNamespaceError::FrozenViewMismatch);
         }
-        let mut parts = Vec::new();
-        let mut through_sequence = 0_u64;
-        let mut remaining = length;
-        while remaining != 0 {
-            let front = self
-                .segments
-                .pop_front()
-                .expect("ASSERT: accounted Ingest Tail owns a front segment");
-            let mutation_sequence = self
-                .mutation_sequences
-                .pop_front()
-                .expect("ASSERT: every Ingest Tail segment owns one mutation sequence");
-            through_sequence = through_sequence.max(mutation_sequence);
-            let consumed = remaining.min(front.len());
-            parts
-                .try_reserve(1)
-                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-            parts.push(
-                front
-                    .checked_slice(0, consumed)
-                    .expect("ASSERT: consumed fragment lies inside front segment"),
-            );
-            if consumed < front.len() {
-                self.segments.push_front(
-                    front
-                        .checked_slice(consumed, front.len())
-                        .expect("ASSERT: retained suffix lies inside front segment"),
-                );
-                self.mutation_sequences.push_front(mutation_sequence);
-            }
-            remaining -= consumed;
-            self.length -= consumed;
+        if self.front_bytes().len() >= length {
+            let (part, sequence) = self.consume_front(length);
+            return Ok(ChunkFragments::from_parts(
+                ChunkParts::Single(part),
+                length,
+                sequence,
+            ));
         }
-        if parts.len() > MAX_CHUNK_FRAGMENTS_V1 {
-            let mut compact = Vec::new();
+
+        // Preflight only the consumed prefix. All fallible reservations precede
+        // mutation, including the pathological fragment-coalescing fallback.
+        let mut covered = 0_usize;
+        let mut count = 0_usize;
+        for segment in &self.segments {
+            covered = covered
+                .checked_add(segment.payload.len())
+                .expect("ASSERT: bounded Ingest prefix length cannot overflow");
+            count += 1;
+            if covered >= length {
+                break;
+            }
+        }
+        assert!(
+            covered >= length,
+            "ASSERT: accounted Tail covers its consumed prefix"
+        );
+        let mut parts = Vec::new();
+        let mut compact = Vec::new();
+        let coalesce = count > MAX_CHUNK_FRAGMENTS_V1;
+        if coalesce {
             compact
                 .try_reserve_exact(length)
                 .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-            for part in &parts {
+        } else {
+            parts
+                .try_reserve_exact(count)
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        }
+        let mut through_sequence = 0;
+        let mut remaining = length;
+        while remaining != 0 {
+            let consumed = remaining.min(self.front_bytes().len());
+            let (part, sequence) = self.consume_front(consumed);
+            through_sequence = through_sequence.max(sequence);
+            if coalesce {
                 compact.extend_from_slice(part.as_bytes());
+            } else {
+                parts.push(part);
             }
+            remaining -= consumed;
+        }
+        let parts = if coalesce {
             assert_eq!(
                 compact.len(),
                 length,
-                "ASSERT: fragment-limit compaction preserves the complete Chunk"
+                "ASSERT: compaction preserves the complete Chunk"
             );
             record_copy(CopyClass::ChunkFragmentCoalescing, compact.len());
-            parts.clear();
-            parts.push(MutationPayload::from_owned_bytes(compact));
-        }
-        self.assert_valid();
-        Ok(ChunkFragments::new_through(parts, length, through_sequence))
+            ChunkParts::Single(MutationPayload::from_owned_bytes(compact))
+        } else {
+            ChunkParts::Fragmented(parts)
+        };
+        Ok(ChunkFragments::from_parts(parts, length, through_sequence))
+    }
+
+    fn consume_front(&mut self, length: usize) -> (MutationPayload, u64) {
+        let front = self
+            .segments
+            .front_mut()
+            .expect("ASSERT: accounted Ingest Tail owns a front segment");
+        assert!(
+            length != 0 && length <= front.payload.len(),
+            "ASSERT: consumed prefix lies in front segment"
+        );
+        let sequence = front.mutation_sequence;
+        let payload = if length == front.payload.len() {
+            self.segments
+                .pop_front()
+                .expect("ASSERT: front was established")
+                .payload
+        } else {
+            front
+                .payload
+                .checked_split_to(length)
+                .expect("ASSERT: consumed fragment lies inside front segment")
+        };
+        self.length = self
+            .length
+            .checked_sub(length)
+            .expect("ASSERT: Tail byte accounting covers the consumed prefix");
+        assert_eq!(
+            self.segments.is_empty(),
+            self.is_empty(),
+            "ASSERT: Tail emptiness matches its byte count"
+        );
+        (payload, sequence)
     }
 
     #[cfg(test)]
@@ -1816,14 +1898,16 @@ impl SegmentedIngestTail {
         self.materialized_bytes
     }
 
+    // Independently audit the remaining Tail at a stable-batch boundary, rather
+    // than rescanning the entire retained suffix after each individual Chunk.
     fn assert_valid(&self) {
         let actual = self.segments.iter().fold(0_usize, |total, segment| {
             assert!(
-                !segment.is_empty(),
+                !segment.payload.is_empty(),
                 "ASSERT: Ingest Tail cannot retain empty segments"
             );
             total
-                .checked_add(segment.len())
+                .checked_add(segment.payload.len())
                 .expect("ASSERT: bounded Ingest Tail segment sum cannot overflow")
         });
         assert_eq!(
@@ -1834,11 +1918,6 @@ impl SegmentedIngestTail {
             self.segments.is_empty(),
             self.is_empty(),
             "ASSERT: Ingest Tail emptiness must match its byte count"
-        );
-        assert_eq!(
-            self.segments.len(),
-            self.mutation_sequences.len(),
-            "ASSERT: every Ingest Tail segment has one mutation sequence"
         );
     }
 }
@@ -1855,7 +1934,11 @@ fn segmented_seqcdc_cut(tail: &SegmentedIngestTail) -> usize {
         tail.len() > CDC_MAXIMUM_BYTES,
         "ASSERT: stable SeqCDC scan owns more than one maximum Chunk"
     );
-    let segments = || tail.segments.iter().map(MutationPayload::as_bytes);
+    let segments = || {
+        tail.segments
+            .iter()
+            .map(|segment| segment.payload.as_bytes())
+    };
     if seqcdc_force_scalar() {
         seqcdc_cut_segmented_scalar(segments(), tail.len(), SEQCDC_CONFIG_V1)
     } else {
@@ -1917,6 +2000,7 @@ fn take_stable_chunk_batch(
             break;
         }
     }
+    state.tail.assert_valid();
     Ok(batch)
 }
 
@@ -3700,6 +3784,7 @@ where
                     .last_mutation_sequence
                     .is_some_and(|previous| fragment.mutation_sequence <= previous);
             if discontinuous {
+                externalized.extend(self.drain_before_lane_reset(&mut lane)?);
                 lane.inode = Some(inode);
                 lane.placement = Some(fragment.placement);
                 lane.tail_offset = fragment.offset;
@@ -3740,7 +3825,55 @@ where
             }
             assert_bounded_write_through_lane(&lane);
         }
+        lane.tail.assert_valid();
         drop(lane);
+        Ok(externalized)
+    }
+
+    fn drain_before_lane_reset(
+        &self,
+        lane: &mut WriteThroughStream,
+    ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
+        let (Some(inode), Some(through_sequence)) = (lane.inode, lane.last_mutation_sequence)
+        else {
+            return Ok(Vec::new());
+        };
+        // A discontinuity ends CDC continuity, not the validity of the entire
+        // buffered prefix. Preserve complete Chunks under their original
+        // sequences; Namespace still rejects any subsequently overwritten range.
+        // The ordinary bounded publication queue owns pending payload before
+        // the lane starts the next range. No storage wait is added to admission.
+        let mut externalized = Vec::new();
+        loop {
+            let previous_tail = lane.tail.len();
+            externalized.extend(self.extract_stable_chunks(
+                lane,
+                inode,
+                through_sequence,
+                StableExtraction::DrainStable,
+            )?);
+            let had_pending = !lane.pending.chunks.is_empty();
+            if had_pending {
+                let pending = std::mem::take(&mut lane.pending);
+                self.publication_queue.enqueue(DetachedContainerWork::new(
+                    inode,
+                    through_sequence,
+                    pending.chunks,
+                    pending.bytes,
+                ));
+            }
+            if lane.tail.len() == previous_tail || !had_pending {
+                break;
+            }
+        }
+        assert!(
+            lane.pending.chunks.is_empty() && lane.pending.bytes == 0,
+            "ASSERT: a lane reset preserves every complete staged Chunk"
+        );
+        assert!(
+            lane.tail.len() <= CDC_MAXIMUM_BYTES * 2,
+            "ASSERT: a lane reset discards only the bounded incomplete CDC suffix"
+        );
         Ok(externalized)
     }
 
@@ -3778,7 +3911,7 @@ where
                     &mut lane,
                     inode,
                     through_sequence,
-                    StableExtraction::DrainForCommitCut,
+                    StableExtraction::DrainStable,
                 )?;
                 externalized
                     .try_reserve(extracted.len())
@@ -4100,18 +4233,18 @@ where
             })
             .collect::<Vec<_>>();
         let generation = self.container_generations.reserve_generation()?;
-        let targets = regions
-            .iter()
-            .flat_map(|region| match region {
-                PrehashedAdaptiveRegion::Borrowed(chunks) => chunks.iter().copied(),
-                PrehashedAdaptiveRegion::Contiguous(region) => region.chunks().iter().copied(),
-            })
-            .collect::<Vec<_>>();
         let mut independent = Vec::new();
         let mut dependents = Vec::new();
         let mut similarity_entries = Vec::new();
-        let mut ordinary = Vec::with_capacity(targets.len());
-        if advanced {
+        let ordinary_regions = if advanced {
+            let targets = regions
+                .iter()
+                .flat_map(|region| match region {
+                    PrehashedAdaptiveRegion::Borrowed(chunks) => chunks.iter().copied(),
+                    PrehashedAdaptiveRegion::Contiguous(region) => region.chunks().iter().copied(),
+                })
+                .collect::<Vec<_>>();
+            let mut ordinary = Vec::with_capacity(targets.len());
             let phase = self.planning_cpu.begin();
             let plans = self.index.plan_similarity_batch(
                 &self.containers,
@@ -4131,12 +4264,16 @@ where
                     PersistentChunkPlan::Dependent(record) => dependents.push(record),
                 }
             }
+            Cow::Owned(ordinary_region_slices(&regions, &ordinary)?)
         } else {
-            ordinary.resize(targets.len(), true);
-        }
-        let ordinary_regions = ordinary_region_slices(&regions, &ordinary)?;
-        let chunk_order = targets
+            Cow::Borrowed(regions.as_slice())
+        };
+        let chunk_order = regions
             .iter()
+            .flat_map(|region| match region {
+                PrehashedAdaptiveRegion::Borrowed(chunks) => chunks.iter(),
+                PrehashedAdaptiveRegion::Contiguous(region) => region.chunks().iter(),
+            })
             .map(|target| target.chunk_id())
             .collect::<Vec<_>>();
         let desired_workers =
@@ -7900,6 +8037,44 @@ mod tests {
     }
 
     #[test]
+    fn inline_and_fragmented_prefixes_keep_owners_sequences_and_error_state() {
+        let first = MutationPayload::try_copy_from_slice(b"abcdef").unwrap();
+        let first_address = first.as_bytes().as_ptr();
+        let mut tail = SegmentedIngestTail::default();
+        tail.push(first, 9);
+        tail.push(MutationPayload::try_copy_from_slice(b"ghij").unwrap(), 3);
+        assert!(tail.take_prefix_fragments(11).is_err());
+        assert_eq!(tail.len(), 10);
+        tail.assert_valid();
+        let prefix = tail.take_prefix_fragments(2).unwrap();
+        assert!(matches!(prefix.parts, ChunkParts::Single(_)));
+        assert_eq!(prefix.contiguous_bytes().unwrap().as_ptr(), first_address);
+        assert_eq!(prefix.materialize_fixture(), b"ab");
+        assert_eq!(prefix.through_sequence(), 9);
+        let spanning = tail.take_prefix_fragments(5).unwrap();
+        assert!(matches!(spanning.parts, ChunkParts::Fragmented(_)));
+        assert_eq!(spanning.materialize_fixture(), b"cdefg");
+        assert_eq!(spanning.through_sequence(), 9);
+        let remaining = tail.take_prefix_fragments(3).unwrap();
+        assert_eq!(remaining.materialize_fixture(), b"hij");
+        assert_eq!(remaining.through_sequence(), 3);
+        assert!(tail.is_empty());
+        tail.assert_valid();
+        drop(tail);
+        assert_eq!(prefix.materialize_fixture(), b"ab");
+        assert_eq!(spanning.materialize_fixture(), b"cdefg");
+    }
+
+    #[test]
+    #[should_panic(expected = "cached Ingest Tail length must match its segments")]
+    fn tail_boundary_audit_rejects_corrupted_cached_length() {
+        let mut tail = SegmentedIngestTail::default();
+        tail.push(MutationPayload::try_copy_from_slice(b"data").unwrap(), 1);
+        tail.length += 1;
+        tail.assert_valid();
+    }
+
+    #[test]
     fn pathological_tiny_writes_compact_before_chunk_fragment_metadata_can_grow_unbounded() {
         let mut tail = SegmentedIngestTail::default();
         let length = MAX_CHUNK_FRAGMENTS_V1 + 1;
@@ -7916,10 +8091,18 @@ mod tests {
             .take_prefix_fragments(length)
             .expect("bounded fragment compaction succeeds");
 
-        assert_eq!(chunk.parts.len(), 1);
+        assert_eq!(chunk.parts.as_slice().len(), 1);
         assert_eq!(chunk.len(), length);
         assert_eq!(chunk.materialize_fixture().len(), length);
+        assert_eq!(chunk.through_sequence(), u64::try_from(length).unwrap());
+        assert_eq!(
+            chunk.materialize_fixture(),
+            (0..length)
+                .map(|ordinal| u8::try_from(ordinal % 251).unwrap())
+                .collect::<Vec<_>>()
+        );
         assert!(tail.is_empty());
+        tail.assert_valid();
     }
 
     #[test]

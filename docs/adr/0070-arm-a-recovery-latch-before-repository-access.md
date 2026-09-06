@@ -36,3 +36,13 @@ explicit monotonic elapsed durations. Production obtains those durations from
 `Instant`; deterministic tests supply literal fake-clock values. No clock
 adapter, latch I/O, filesystem access, or additional synchronization enters the
 POSIX mutation or Ingest-Lane hot loops.
+
+The supervisor registers its SIGINT receiver once before entering its event
+loop and retains that registration while handling other events. Canceling an
+individual receive wait must not discard an interrupt delivered during a
+checkpoint or a scheduler branch. Pending interrupts are handled after the
+selected work returns; they do not cancel an in-progress durable publication.
+Orderly catch-up, FUSE unmount, and latch clearing retain the ordering above.
+A process-isolated regression delivers a real SIGINT after canceling the
+receive wait and before its first poll, and requires both notifications to
+remain available to the supervisor.

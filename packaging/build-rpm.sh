@@ -5,7 +5,7 @@ workspace=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 artifact_root="$workspace/.artifacts"
 package_root="$artifact_root/package"
 rpmbuild_root="$artifact_root/rpmbuild"
-stage_root="$package_root/fastdup-0.6.0"
+stage_root="$package_root/fastdup-0.6.1"
 ui_build_root="$artifact_root/webui-build"
 samba_version=4.23.5
 samba_archive="$artifact_root/downloads/samba-$samba_version.tar.gz"
@@ -84,8 +84,8 @@ cp -a "$workspace/packaging/samba" "$stage_root/"
 install -m 0644 "$workspace/README.md" "$stage_root/README.md"
 
 tar -C "$package_root" -czf \
-    "$rpmbuild_root/SOURCES/fastdup-0.6.0-x86_64.tar.gz" \
-    fastdup-0.6.0
+    "$rpmbuild_root/SOURCES/fastdup-0.6.1-x86_64.tar.gz" \
+    fastdup-0.6.1
 install -m 0644 "$workspace/packaging/rpm/fastdup.spec" \
     "$rpmbuild_root/SPECS/fastdup.spec"
 
@@ -94,4 +94,4 @@ rpmbuild -ba \
     --define "_tmppath $TMPDIR" \
     "$rpmbuild_root/SPECS/fastdup.spec"
 
-find "$rpmbuild_root/RPMS" -type f -name 'fastdup-0.6.0-*.x86_64.rpm' -print
+find "$rpmbuild_root/RPMS" -type f -name 'fastdup-0.6.1-*.x86_64.rpm' -print

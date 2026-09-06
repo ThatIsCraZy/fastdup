@@ -68,6 +68,18 @@ quarter of the admitted page budget and 16 Runs. Pressure purges them; absent
 fences use the existing checked page search. Fences never skip Record or Chunk
 verification and cannot become content or liveness evidence.
 
+Each of the four cursors in a bounded Similarity query may retain its last
+independently decoded Entry page. Entries on that page use the retained Arc
+directly instead of repeating a shared-cache lookup, lock and Arc clone. The
+reference is local to one query on one immutable index and is keyed by partition
+and page ordinal; page changes use the existing checked cache/decode path.
+Bucket relationships, full entry equality, ordering and ranking checks remain
+unchanged. At most four pages are retained, all released with the cursors even
+after shared-cache pressure eviction. This is transient query working memory,
+not additional persistent cache capacity. Empty query buckets allocate no
+candidate output buffer. The eighth hotpath audit records dense and scattered
+candidate measurements with one, four and ten threads.
+
 ## File-level synchronization and bounded FD reuse
 
 Adapters on one canonical root share a registry of per-name access states.

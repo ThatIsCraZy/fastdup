@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm">Download the RPM</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm">Download the RPM</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Product page</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6">Release notes</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6.1">Release notes</a>
 </p>
 
 fastdup is an experimental, software-defined single-node storage appliance for
@@ -30,9 +30,14 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
 
-## New in v0.6 · 5 September 2026
+## New in v0.6.1 · 6 September 2026
 
-The source tree now supports **persistent online similarity**: new independent
+This patch improves ingest and read hot paths, preserves rechunk work, and fixes
+shutdown signal loss and Metadata-I/O failure handling during Commit completion
+and fallocate. See the [release notes](docs/releases/v0.6.1.md) and
+[crash-consistency results](docs/research/crash-consistency-round-2026-09-06.md).
+
+The source tree supports **persistent online similarity**: new independent
 chunks become compression-base candidates during the same mount, without an
 offline rebuild. Advanced Reduction can be disabled, enabled, or inherited per
 SMB share; newly created WebUI shares default to disabled. Previously stored
@@ -45,7 +50,7 @@ See the [online similarity implementation](docs/benchmarks/online-similarity-sha
 [data-path measurements](docs/benchmarks/hotpath-implementation3-2026-09-05.md),
 and [control-plane measurements](docs/benchmarks/control-plane-memory-2026-09-05.md).
 
-The v0.6 release packages version **0.6.0** for Rocky Linux 10 x86-64.
+The v0.6.1 release packages version **0.6.1** for Rocky Linux 10 x86-64.
 The following benchmarks document the development builds leading to this
 release; binary hashes and measurement limits are recorded with each run.
 
@@ -122,11 +127,11 @@ You need:
 Download and install the current binary package:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/fastdup-0.6.0-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.6.0-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.6.1-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           fastdup
-Version:        0.6.0
+Version:        0.6.1
 Release:        1%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
@@ -101,6 +101,11 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Sun Sep 06 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.1-1
+- Optimize ingest, reads, rechunking, and bounded worker/cache coordination.
+- Retain SIGINT notifications during supervisor work for reliable shutdown.
+- Fix post-commit and fallocate Metadata-I/O failure handling.
+
 * Sat Sep 05 2026 fastdup maintainers <noreply@fastdup.local> - 0.6.0-1
 - Add persistent online similarity, per-share reduction policy, and Sparse-XOR.
 - Optimize storage hot paths and bound telemetry history aggregation memory.

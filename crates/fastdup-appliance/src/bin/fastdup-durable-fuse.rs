@@ -404,6 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         advanced_reduction,
     );
 
+    let mut shutdown_signal = ShutdownSignal::new()?;
     let mut ticks = interval(SCHEDULER_RESOLUTION);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticks.tick().await;
@@ -411,10 +412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut durability = DurabilitySupervisor::new(Duration::ZERO);
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                break;
-            }
+            () = shutdown_signal.recv() => break,
             _ = ticks.tick() => {
                 let action = observe_durability(
                     &appliance,
@@ -491,6 +489,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     data_storage.emit();
     emit_io_uring_state(&data_storage);
     Ok(())
+}
+
+// Keep the registration alive while another supervisor branch is running.
+// Recreating ctrl_c() in select! loses SIGINT delivered between receive waits.
+struct ShutdownSignal(tokio::signal::unix::Signal);
+
+impl ShutdownSignal {
+    fn new() -> io::Result<Self> {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).map(Self)
+    }
+
+    async fn recv(&mut self) {
+        self.0.recv().await;
+    }
 }
 
 fn arm_recovery_latch(
@@ -884,7 +896,10 @@ async fn handle_management_control(
         },
     };
     if let Some(frontend) = response.frontend.as_mut() {
-        frontend.details = tokio::task::spawn_blocking(move || runtime_telemetry::snapshot(&appliance, &storage)).await.ok();
+        frontend.details =
+            tokio::task::spawn_blocking(move || runtime_telemetry::snapshot(&appliance, &storage))
+                .await
+                .ok();
     }
     let mut encoded = serde_json::to_vec(&response)
         .map_err(|error| format!("management response encode failed: {error}"))?;
@@ -2246,6 +2261,68 @@ mod tests {
     use fastdup_format::ContainerId;
 
     use super::*;
+
+    #[test]
+    fn shutdown_signal_survives_busy_supervisor_branch() {
+        const CHILD: &str = "FASTDUP_SHUTDOWN_SIGNAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::shutdown_signal_survives_busy_supervisor_branch",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "signal child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Process isolation keeps SIGINT away from unrelated parallel tests.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for cancel_wait in [true, false] {
+                    let mut signal = ShutdownSignal::new().unwrap();
+                    let mut witness =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                            .unwrap();
+                    if cancel_wait {
+                        tokio::select! {
+                            biased;
+                            () = signal.recv() => panic!("no interrupt sent yet"),
+                            () = std::future::ready(()) => {}
+                        }
+                    }
+                    assert!(
+                        std::process::Command::new("kill")
+                            .args(["-INT", &std::process::id().to_string()])
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                    // Wait until Tokio dispatched the real signal while the
+                    // supervisor was handling a different branch, without sleeps.
+                    tokio::time::timeout(Duration::from_secs(2), witness.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_millis(200), signal.recv())
+                        .await
+                        .expect(
+                            "SIGINT received during a busy supervisor branch must remain pending",
+                        );
+                }
+            });
+    }
 
     #[test]
     fn persisted_share_reduction_and_hot_default_are_backward_compatible() {

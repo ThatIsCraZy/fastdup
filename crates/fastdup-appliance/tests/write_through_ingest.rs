@@ -1,5 +1,6 @@
 use fastdup_appliance::{
     DurableNamespace, checkpoint_exact_index_profile_v1, checkpoint_policy_set, recover_mount,
+    recover_mount_with_index,
 };
 use fastdup_format::ChunkId;
 use fastdup_posix::{
@@ -1844,6 +1845,150 @@ fn checkpoint_flushes_stable_partial_lane_before_forming_the_frozen_cut() {
     );
 }
 
+#[test]
+fn adjacent_reordered_writes_preserve_stable_ingest_prefix() {
+    let bytes = pseudo_random_bytes(40 * 1024 * 1024);
+    for freeze_prefix in [false, true] {
+        let metadata = MemoryStorageIo::new();
+        let data = MemoryStorageIo::new();
+        let indexes = MemoryStorageIo::new();
+        let appliance = open_appliance_on(metadata.clone(), data.clone(), indexes.clone());
+        let (inode, handle) = create_file(&appliance, b"reordered.iso");
+        for ordinal in (0..28_u64).chain([29, 28]).chain(30..40) {
+            let start = usize::try_from(ordinal).unwrap() * 1024 * 1024;
+            write_one_mebibyte(
+                &appliance,
+                inode,
+                handle,
+                ordinal,
+                &bytes[start..start + 1024 * 1024],
+            );
+            if freeze_prefix && ordinal == 27 {
+                appliance.namespace().begin_commit().unwrap().unwrap();
+            }
+        }
+        let committed = appliance.checkpoint_profiled().unwrap().unwrap();
+        let rechunk = committed.metrics().checkpoint_rechunk_bytes();
+        assert!(
+            rechunk <= 2 * 1024 * 1024,
+            "freeze_prefix={freeze_prefix}: adjacent reordered writes rechunked {rechunk} bytes"
+        );
+        if freeze_prefix {
+            metadata.crash();
+            data.crash();
+            assert_recovered_indexed_prefix(
+                metadata.clone(),
+                data.clone(),
+                indexes.clone(),
+                inode,
+                &bytes[..28 * 1024 * 1024],
+            );
+            appliance.checkpoint().unwrap().unwrap();
+        }
+        drop(appliance);
+        metadata.crash();
+        data.crash();
+        assert_recovered_indexed_prefix(metadata, data, indexes, inode, &bytes);
+    }
+}
+
+#[test]
+fn lane_reset_keeps_frozen_recipes_without_replacing_a_later_overwrite() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let indexes = MemoryStorageIo::new();
+    let appliance = open_appliance_on(metadata.clone(), data.clone(), indexes.clone());
+    let (inode, handle) = create_file(&appliance, b"reset-overwrite.iso");
+    let mut bytes = pseudo_random_bytes(28 * 1024 * 1024);
+    for (ordinal, block) in bytes.chunks(1024 * 1024).enumerate() {
+        write_one_mebibyte(
+            &appliance,
+            inode,
+            handle,
+            u64::try_from(ordinal).unwrap(),
+            block,
+        );
+    }
+    appliance.namespace().begin_commit().unwrap().unwrap();
+    let replacement = vec![19; 1024 * 1024];
+    write_at(&appliance, inode, handle, 12 * 1024 * 1024, &replacement);
+    let committed = appliance.checkpoint_profiled().unwrap().unwrap();
+    assert!(committed.metrics().checkpoint_rechunk_bytes() <= 1024 * 1024);
+    assert_recovered_indexed_prefix(
+        metadata.clone(),
+        data.clone(),
+        indexes.clone(),
+        inode,
+        &bytes,
+    );
+    bytes[12 * 1024 * 1024..13 * 1024 * 1024].copy_from_slice(&replacement);
+    assert_eq!(
+        read_named_all(appliance.namespace(), b"reset-overwrite.iso"),
+        bytes
+    );
+    appliance.checkpoint().unwrap().unwrap();
+    drop(appliance);
+    metadata.crash();
+    data.crash();
+    indexes.crash();
+    assert_recovered_indexed_prefix(metadata, data, indexes, inode, &bytes);
+}
+
+#[test]
+fn failed_lane_reset_publication_retains_resident_bytes_for_checkpoint_retry() {
+    let bytes = pseudo_random_bytes(30 * 1024 * 1024);
+    let write = |appliance: &Appliance, inode, handle| {
+        for ordinal in (0..28_u64).chain([29, 28]) {
+            let start = usize::try_from(ordinal).unwrap() * 1024 * 1024;
+            write_one_mebibyte(
+                appliance,
+                inode,
+                handle,
+                ordinal,
+                &bytes[start..start + 1024 * 1024],
+            );
+        }
+        fence_ingest(appliance, inode, handle);
+    };
+    let baseline_data = MemoryStorageIo::new();
+    let baseline = open_appliance_on(
+        MemoryStorageIo::new(),
+        baseline_data.clone(),
+        MemoryStorageIo::new(),
+    );
+    let (inode, handle) = create_file(&baseline, b"reset-failure.iso");
+    let before = baseline_data.operation_count();
+    write(&baseline, inode, handle);
+    let failed_operation = baseline_data
+        .operations()
+        .iter()
+        .enumerate()
+        .skip(before)
+        .find_map(|(ordinal, operation)| {
+            (*operation == StorageOperation::SyncFile).then_some(ordinal)
+        })
+        .unwrap();
+    drop(baseline);
+
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::with_fail_before(failed_operation);
+    let indexes = MemoryStorageIo::new();
+    let appliance = open_appliance_on(metadata.clone(), data.clone(), indexes.clone());
+    let (inode, handle) = create_file(&appliance, b"reset-failure.iso");
+    write(&appliance, inode, handle);
+    assert!(appliance.write_through_status().degraded());
+    assert_eq!(
+        read_named_all(appliance.namespace(), b"reset-failure.iso"),
+        bytes
+    );
+    appliance.checkpoint().unwrap().unwrap();
+    drop(appliance);
+    metadata.crash();
+    data.crash();
+    indexes.crash();
+    assert_recovered_indexed_prefix(metadata, data, indexes, inode, &bytes);
+}
+
 fn write_at(appliance: &Appliance, inode: InodeId, handle: HandleId, offset: u64, data: &[u8]) {
     appliance
         .namespace()
@@ -2060,6 +2205,28 @@ fn assert_recovered_prefix(
     )
     .unwrap()
     .unwrap();
+    assert_namespace_prefix(&recovered, inode, prefix);
+}
+
+fn assert_recovered_indexed_prefix(
+    metadata: MemoryStorageIo,
+    data: MemoryStorageIo,
+    indexes: MemoryStorageIo,
+    inode: InodeId,
+    prefix: &[u8],
+) {
+    let recovered = recover_mount_with_index(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, checkpoint_policy_set()),
+        &ContainerRepository::new(data),
+        &ExactIndexRunRepository::new(indexes),
+    )
+    .unwrap()
+    .unwrap();
+    assert_namespace_prefix(&recovered, inode, prefix);
+}
+
+fn assert_namespace_prefix(recovered: &Namespace, inode: InodeId, prefix: &[u8]) {
     let Reply::Opened(reader) = recovered
         .dispatch(
             CALLER,

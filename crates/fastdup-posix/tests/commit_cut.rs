@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use fastdup_posix::{
     CommittedEntry, CommittedFile, CommittedFileInstall, CommittedInode,
-    CommittedNamespaceSnapshot, ExternalizedExtent, InodeId, MutationObserver, MutationPayload,
-    Namespace, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE, Reply,
-    RequestContext,
+    CommittedNamespaceSnapshot, ExternalizedExtent, FallocateMode, InodeId, MutationObserver,
+    MutationPayload, Namespace, NamespaceConfig, OpenOptions, Operation, PosixError, ROOT_INODE,
+    Reply, RequestContext,
 };
 
 const CALLER: RequestContext = RequestContext {
@@ -49,6 +49,226 @@ struct SegmentedIdentityFile {
     bytes: Vec<u8>,
     contiguous_checks: AtomicUsize,
     segmented_checks: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct UnavailableAllocationPages(BytesFile);
+
+impl CommittedFile for UnavailableAllocationPages {
+    fn logical_size(&self) -> u64 {
+        self.0.logical_size()
+    }
+    fn allocated_bytes(&self) -> u64 {
+        self.0.allocated_bytes()
+    }
+    fn allocated_bytes_in_range(&self, _offset: u64, _length: u64) -> Result<u64, PosixError> {
+        Err(PosixError::Io)
+    }
+    fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+        self.0.read_at(offset, length)
+    }
+}
+
+#[derive(Debug)]
+struct PartlyAvailableAllocationPages(BytesFile);
+
+impl CommittedFile for PartlyAvailableAllocationPages {
+    fn logical_size(&self) -> u64 {
+        self.0.logical_size()
+    }
+    fn allocated_bytes(&self) -> u64 {
+        self.0.allocated_bytes()
+    }
+    fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, PosixError> {
+        if offset < 2 || offset.saturating_add(length) > 4 {
+            return Err(PosixError::Io);
+        }
+        self.0.allocated_bytes_in_range(offset, length)
+    }
+    fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+        self.0.read_at(offset, length)
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn fallocate_does_not_read_unrelated_allocation_pages_after_mutating() {
+    for (mode, expected, allocated) in [
+        (FallocateMode::PunchHole, b"ab\0\0efgh".as_slice(), 6),
+        (
+            FallocateMode::ZeroRange { keep_size: true },
+            b"ab\0\0efgh".as_slice(),
+            8,
+        ),
+        (
+            FallocateMode::Allocate { keep_size: true },
+            b"abcdefgh".as_slice(),
+            8,
+        ),
+    ] {
+        let namespace = Namespace::new_volatile(NamespaceConfig::default());
+        let Reply::Created { entry, handle } = namespace
+            .dispatch(
+                CALLER,
+                Operation::Create {
+                    parent: ROOT_INODE,
+                    name: b"partial-metadata-outage",
+                    mode: 0o600,
+                    options: OpenOptions::READ_WRITE,
+                    exclusive: true,
+                    truncate: false,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("create reply")
+        };
+        let inode = entry.attr.inode;
+        namespace
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset: 0,
+                    data: b"abcdefgh",
+                },
+            )
+            .unwrap();
+        let cut = namespace.begin_commit().unwrap().unwrap();
+        namespace
+            .complete_commit(
+                &cut,
+                vec![CommittedFileInstall::new(
+                    inode,
+                    cut.inodes()[0].mutation_sequence(),
+                    Arc::new(PartlyAvailableAllocationPages(BytesFile(
+                        b"abcdefgh".to_vec(),
+                    ))),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            namespace.dispatch(
+                CALLER,
+                Operation::Fallocate {
+                    inode,
+                    handle,
+                    offset: 0,
+                    length: 1,
+                    mode,
+                }
+            ),
+            Err(PosixError::Io),
+            "unavailable metadata inside the requested range fails before mutation"
+        );
+        assert_eq!(read_all(&namespace, inode, handle), b"abcdefgh");
+        let result = namespace.dispatch(
+            CALLER,
+            Operation::Fallocate {
+                inode,
+                handle,
+                offset: 2,
+                length: 2,
+                mode,
+            },
+        );
+        if result.is_err() {
+            assert_eq!(
+                read_all(&namespace, inode, handle),
+                b"abcdefgh",
+                "a failed allocation must not silently change bytes"
+            );
+        }
+        result.expect("allocation outside the changed range is not needed for this mutation");
+        assert_eq!(read_all(&namespace, inode, handle), expected);
+        let Reply::Attr(attr) = namespace
+            .dispatch(CALLER, Operation::GetAttr { inode })
+            .unwrap()
+        else {
+            panic!("getattr reply")
+        };
+        assert_eq!(attr.allocated_bytes, allocated);
+        namespace
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset: 2,
+                    data: b"XY",
+                },
+            )
+            .expect("the next mutation must retain a valid sequence and allocation count");
+        assert_eq!(read_all(&namespace, inode, handle), b"abXYefgh");
+    }
+}
+
+#[test]
+fn completing_a_verified_cut_does_not_reread_unavailable_allocation_pages() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let Reply::Created { entry, handle } = namespace
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"metadata-outage",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("create reply")
+    };
+    let inode = entry.attr.inode;
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 0,
+                data: b"abcdefgh",
+            },
+        )
+        .unwrap();
+    let cut = namespace.begin_commit().unwrap().unwrap();
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode,
+                handle,
+                offset: 2,
+                data: b"XY",
+            },
+        )
+        .unwrap();
+    namespace
+        .complete_commit(
+            &cut,
+            vec![CommittedFileInstall::new(
+                inode,
+                cut.inodes()[0].mutation_sequence(),
+                Arc::new(UnavailableAllocationPages(BytesFile(b"abcdefgh".to_vec()))),
+            )],
+        )
+        .expect("verified summary installation is infallible after the WAL sync");
+    assert_eq!(read_all(&namespace, inode, handle), b"abXYefgh");
+    let Reply::Attr(attr) = namespace
+        .dispatch(CALLER, Operation::GetAttr { inode })
+        .unwrap()
+    else {
+        panic!("getattr reply")
+    };
+    assert_eq!(attr.size, 8);
+    assert_eq!(attr.allocated_bytes, 8);
+    let next = namespace.begin_commit().unwrap().unwrap();
+    assert_ne!(next.token(), cut.token());
+    assert_eq!(next.inodes()[0].read_at(0, 32).unwrap(), b"abXYefgh");
 }
 
 impl CommittedFile for SegmentedIdentityFile {
