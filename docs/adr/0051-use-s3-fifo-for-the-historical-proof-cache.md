@@ -26,6 +26,7 @@ The production implementation uses sharded slot arenas with stable indices and
 FIFO rings without a global hit-path lock. Arenas grow lazily under their shard
 lock and reserve before eviction, so allocation failure rejects admission
 without losing a resident proof. Capacity comes from a byte budget
-that preserves the process memory reserve and leaves Swap unused. The 192-byte
+assigned by the shared reuse-based broker in ADR 0046, with DATA-fallback
+priority, the shared memory reserve and Process-Swap admission closure. The 192-byte
 charge used by the replay is a comparison model, not a fixed production entry
 size or cache limit. SIEVE remains available only as a replay challenger.

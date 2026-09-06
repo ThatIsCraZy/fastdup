@@ -73,7 +73,7 @@ fn shared_backing_is_charged_until_its_last_cache_view_is_evicted() {
         {
             let mut admission = cache.admission.lock().unwrap();
             let mut steps = 1;
-            cache.reclaim_locked(&mut admission, &mut steps, 0, &protected);
+            cache.reclaim_locked(&mut admission, &mut steps, 0, Some(&protected));
             assert_eq!(steps, 0);
         }
         assert_accounting(&cache);

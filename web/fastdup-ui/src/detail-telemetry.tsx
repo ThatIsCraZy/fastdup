@@ -8,6 +8,10 @@ export interface DetailTelemetry {
   latency?: { read: OperationLatency; write: OperationLatency } | null;
   runtime?: {
     runtimeId: string;
+    cacheBudget?: {
+      maximumMemoryUsedBasisPoints: number; effectiveLimitBytes: number; availableBytes: number; budgetBytes: number;
+      pools: { id: string; fallbackTier: string; residentBytes: number; targetBytes: number; leasedBytes: number; hits: number; misses: number; evictions: number }[];
+    } | null;
     ioUring: { ringEntries: number; inflightBytes: number; maxInflightBytes: number; peakInflightBytes: number; submitted: number; completed: number };
     caches: { id: string; hits: number; misses: number; evictions: number; residentBytes?: number | null; residentPages?: number | null }[];
     reduction: { enabled: boolean; queries: number; candidates: number; acceptedPrefixes: number; acceptedSparseXor: number; savedPayloadBytes: number; fallbacks: number; errors: number };
@@ -17,7 +21,7 @@ export interface DetailTelemetry {
 }
 
 const tabs = ["Latenzen", "io_uring", "Caches", "GC & Reduction", "Checkpoint-Phasen"];
-const cacheLabels: Record<string, string> = { verifiedRead: "Verified Read", exactIndex: "Exact Index", similarityIndex: "Similarity Index", containerDescriptors: "Container Descriptors" };
+const cacheLabels: Record<string, string> = { verifiedRead: "Verified Read", exactIndex: "Exact Index", similarityIndex: "Similarity Index", containerDescriptors: "Container Descriptors", historicalProofs: "Historical Proofs" };
 const phaseLabels: Record<string, string> = { freeze: "Freeze", cdc: "CDC", hashFill: "Hash / FILL", exactLookup: "Exact Lookup", encode: "Encoding", containerPublish: "Container Publish", indexPublish: "Index Publish", metadataCommit: "Metadata Commit" };
 
 export function DetailTelemetryPanel({ sample, historical, loading }: { sample?: TelemetrySnapshot; historical: boolean; loading: boolean }) {
@@ -33,6 +37,7 @@ export function DetailTelemetryPanel({ sample, historical, loading }: { sample?:
   const checkpoint = runtime?.checkpoint;
   const gc = runtime?.gc;
   const reduction = runtime?.reduction;
+  const budget = runtime?.cacheBudget;
   return <section className="detail-telemetry" aria-label={t("Detailtelemetrie")}>
     <div className="detail-telemetry-heading"><h2>{t("Detailtelemetrie")}</h2><span>{sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</span></div>
     <div className="detail-tabs" role="tablist" aria-label={t("Detailtelemetrie")}>
@@ -57,8 +62,18 @@ export function DetailTelemetryPanel({ sample, historical, loading }: { sample?:
           <progress aria-label={t("In-Flight Belegung")} value={runtime.ioUring.inflightBytes} max={Math.max(1, runtime.ioUring.maxInflightBytes)} />
         </> : empty)}
         {tab === 2 && (runtime ? <>
+          {budget && <>
+            <p className="detail-note">{t("Gemeinsames RAM-Budget: Die Verteilung folgt dem gemessenen Nutzen. Caches, die DATA-Zugriffe vermeiden, erhalten Vorrang.")}</p>
+            {rows([["RAM-Obergrenze", `${number(budget.maximumMemoryUsedBasisPoints / 100)} %`], ["Effektives RAM", bytes(budget.effectiveLimitBytes)], ["Verfügbares RAM", bytes(budget.availableBytes)], ["Gemeinsames Cache-Budget", bytes(budget.budgetBytes)], ["Cache-Belegung", bytes(budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0))]])}
+            <progress aria-label={t("Cache-Budget Belegung")} value={budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0)} max={Math.max(1, budget.budgetBytes)} />
+          </>}
           <p className="detail-note">{t("Cache Hit Rates seit dem Mount. Ohne Zugriffe wird keine Rate angezeigt.")}</p>
-          <div className="telemetry-table-scroll"><table><thead><tr>{["Cache", "Hit Rate", "Hits", "Misses", "Evictions", "Belegung"].map(label => <th key={label}>{t(label)}</th>)}</tr></thead><tbody>{runtime.caches.map(cache => <tr key={cache.id}><th>{cacheLabels[cache.id] ?? cache.id}</th><td>{cache.hits + cache.misses ? `${number(cache.hits * 100 / (cache.hits + cache.misses))} %` : "—"}</td><td>{number(cache.hits)}</td><td>{number(cache.misses)}</td><td>{number(cache.evictions)}</td><td>{cache.residentBytes != null ? bytes(cache.residentBytes) : `${number(cache.residentPages)} ${t("Seiten")}`}</td></tr>)}</tbody></table></div>
+          <div className="telemetry-table-scroll"><table><thead><tr>{["Cache", ...(budget ? ["Rückfall auf"] : []), "Hit Rate", "Hits", "Misses", "Evictions", "Belegung", ...(budget ? ["Zielbudget", "Reserviert"] : [])].map(label => <th key={label}>{t(label)}</th>)}</tr></thead><tbody>{(budget?.pools ?? runtime.caches).map(cache => {
+            const pool = budget?.pools.find(item => item.id === cache.id);
+            return <tr key={cache.id}><th>{cacheLabels[cache.id] ?? cache.id}</th>{budget && <td>{pool?.fallbackTier === "data" ? "DATA" : pool?.fallbackTier === "metadata" ? "Metadata" : "—"}</td>}<td>{cache.hits + cache.misses ? `${number(cache.hits * 100 / (cache.hits + cache.misses))} %` : "—"}</td><td>{number(cache.hits)}</td><td>{number(cache.misses)}</td><td>{number(cache.evictions)}</td><td>{cache.residentBytes != null ? bytes(cache.residentBytes) : "residentPages" in cache && cache.residentPages != null ? `${number(cache.residentPages)} ${t("Seiten")}` : "—"}</td>{budget && <><td>{bytes(pool?.targetBytes)}</td><td>{bytes(pool?.leasedBytes)}</td></>}</tr>;
+          })}</tbody></table></div>
+          {budget && <p className="detail-note">{t("Zielbudget wird laufend angepasst. Reservierter Speicher wird erst nach der Verdrängung für andere Caches freigegeben. Die Belegung enthält Cache-Verwaltungsdaten.")}</p>}
+
         </> : empty)}
         {tab === 3 && (runtime ? <div className="detail-columns"><div><h3>{t("Letzter GC-Lauf")}</h3>{gc ? <><p className="detail-note">{timestamp(gc.observedAt)} · {t(({running:"Läuft",failed:"Fehlgeschlagen",noCandidates:"Keine Kandidaten",noProfitableCandidates:"Keine profitablen Kandidaten",catalogRebuilt:"Katalog erneuert",collected:"Abgeschlossen"} as Record<string,string>)[gc.state] ?? gc.state)}</p>{rows([["Dauer", gc.totalMs == null ? "—" : `${number(gc.totalMs)} ms`], ["Kandidaten", number(gc.candidates)], ["Geprüfte Victims", number(gc.victims)], ["Abgebrochene Kandidaten", number(gc.abortedCandidates)], ["Relocation Read", bytes(gc.readBytes)], ["Relocation Write", bytes(gc.writeBytes)], ["Unlinked", bytes(gc.unlinkedBytes)]])}</> : <p>{t("Seit dem Mount wurde noch kein GC-Lauf gestartet.")}</p>}</div>
           <div><h3>Advanced Reduction</h3><p className="detail-note">{t(reduction?.enabled ? "Aktiv · seit dem Mount" : "Deaktiviert · seit dem Mount")}</p>{reduction && rows([["Queries", number(reduction.queries)], ["Kandidaten", number(reduction.candidates)], ["Accepted Prefix", number(reduction.acceptedPrefixes)], ["Accepted Sparse-XOR", number(reduction.acceptedSparseXor)], ["Eingesparte Payload", bytes(reduction.savedPayloadBytes)], ["Independent Fallbacks", number(reduction.fallbacks)], ["Fehler", number(reduction.errors)]])}</div></div> : empty)}

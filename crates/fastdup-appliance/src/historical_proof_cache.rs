@@ -8,7 +8,9 @@ use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use fastdup_format::{ChunkId, ExactIndexEntry, ExactLocationTransition};
-use fastdup_store::{MemoryPressureSnapshot, shared_cache_reserve_bytes};
+use fastdup_store::{
+    CacheFallback, CacheObservation, CachePool, MemoryPressureSnapshot, shared_cache_reserve_bytes,
+};
 use hashbrown::HashTable;
 
 use crate::proof_cache_trace::ProofKey;
@@ -17,7 +19,6 @@ const ACCOUNTED_ENTRY_BYTES: usize = 224;
 const MAXIMUM_EVICTION_STEPS: usize = 256;
 const DEFAULT_SHARDS: usize = 256;
 const EFFECTIVE_RAM_DIVISOR: u64 = 50;
-const MAXIMUM_HARD_LIMIT_BYTES: u64 = 2 * 1_024 * 1_024 * 1_024;
 const REFRESH_MILLIS: u64 = 250;
 const NONE: u32 = u32::MAX;
 
@@ -41,14 +42,14 @@ pub(crate) struct HistoricalProofCacheConfig {
 impl HistoricalProofCacheConfig {
     /// Derives the production policy from one conservative memory snapshot.
     ///
-    /// The cache may grow to at most five percent of effective RAM and 2 GiB.
-    /// Its live target is stricter and normally uses at most two percent.
+    /// The shared adaptive broker assigns resident bytes. Geometry permits
+    /// the complete effective cache budget without reserving it up front.
     #[must_use]
-    fn conservative(snapshot: MemoryPressureSnapshot) -> Self {
+    pub(crate) fn conservative(snapshot: MemoryPressureSnapshot) -> Self {
         let effective = snapshot.effective_limit_bytes().max(1);
         let metadata = DEFAULT_SHARDS * size_of::<CacheShard>();
         let minimum = metadata + DEFAULT_SHARDS * ACCOUNTED_ENTRY_BYTES;
-        let hard = usize::try_from((effective / 20).min(MAXIMUM_HARD_LIMIT_BYTES))
+        let hard = usize::try_from(effective.saturating_sub(shared_cache_reserve_bytes(effective)))
             .unwrap_or(usize::MAX)
             .max(minimum);
         Self {
@@ -200,6 +201,7 @@ struct ShardState {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct HistoricalShardCounters {
+    hit_bytes: u64,
     hits: u64,
     misses: u64,
     admissions: u64,
@@ -212,6 +214,7 @@ struct HistoricalShardCounters {
 
 impl HistoricalShardCounters {
     fn add_assign(&mut self, other: Self) {
+        self.hit_bytes = self.hit_bytes.saturating_add(other.hit_bytes);
         self.hits = self.hits.saturating_add(other.hits);
         self.misses = self.misses.saturating_add(other.misses);
         self.admissions = self.admissions.saturating_add(other.admissions);
@@ -271,6 +274,7 @@ pub(crate) struct HistoricalProofCache {
     automatic_pressure: bool,
     started: Instant,
     last_refresh_millis: AtomicU64,
+    budget_pool: Option<CachePool>,
 }
 
 impl fmt::Debug for HistoricalProofCache {
@@ -306,7 +310,7 @@ impl HistoricalProofCache {
     ///
     /// Returns an allocation failure for the fixed shard directory.
     #[cfg(test)]
-    fn new_with_snapshot(
+    pub(crate) fn new_with_snapshot(
         config: HistoricalProofCacheConfig,
         snapshot: MemoryPressureSnapshot,
     ) -> Result<Self, HistoricalProofCacheError> {
@@ -337,6 +341,14 @@ impl HistoricalProofCache {
             automatic_pressure,
             started: Instant::now(),
             last_refresh_millis: AtomicU64::new(0),
+            budget_pool: automatic_pressure.then(|| {
+                CachePool::system(
+                    "historicalProofs",
+                    CacheFallback::Data,
+                    (config.shard_count.get() * size_of::<CacheShard>()) as u64,
+                    config.hard_limit_bytes as u64,
+                )
+            }),
         };
         cache.apply_memory_pressure(snapshot);
         Ok(cache)
@@ -370,6 +382,10 @@ impl HistoricalProofCache {
             .expect("ASSERT: Historical Proof Cache index points to an occupied slot");
         assert_entry_key(entry, key);
         slot.frequency = slot.frequency.saturating_add(1).min(3);
+        state.counters.hit_bytes = state
+            .counters
+            .hit_bytes
+            .saturating_add(u64::from(logical_length));
         state.counters.hits = state.counters.hits.saturating_add(1);
         Some(entry)
     }
@@ -532,7 +548,22 @@ impl HistoricalProofCache {
             .available_bytes()
             .min(snapshot.effective_limit_bytes());
         let headroom = available.saturating_sub(self.config.reserve_bytes);
-        let budget = if snapshot.swap_used_bytes() == 0 {
+        let metadata = self.shards.len().saturating_mul(size_of::<CacheShard>());
+        let budget = if let Some(pool) = &self.budget_pool {
+            let counters = self.counters();
+            pool.target(
+                snapshot,
+                CacheObservation {
+                    hits: counters.hits,
+                    misses: counters.misses,
+                    evictions: counters.evictions,
+                    hit_bytes: counters.hit_bytes,
+                    resident_bytes: (self.entry_count.load(Ordering::Acquire)
+                        * ACCOUNTED_ENTRY_BYTES
+                        + metadata) as u64,
+                },
+            )
+        } else if snapshot.swap_used_bytes() == 0 {
             headroom
                 .checked_div(4)
                 .unwrap_or(0)
@@ -541,7 +572,6 @@ impl HistoricalProofCache {
         } else {
             0
         };
-        let metadata = self.shards.len().saturating_mul(size_of::<CacheShard>());
         let target = usize::try_from(budget)
             .unwrap_or(usize::MAX)
             .saturating_sub(metadata)
@@ -553,31 +583,53 @@ impl HistoricalProofCache {
         self.swap_used_bytes
             .store(snapshot.swap_used_bytes(), Ordering::Release);
         let previous_target = self.target_entries.swap(target, Ordering::AcqRel);
-        if self.entry_count.load(Ordering::Acquire) > target
-            || target < previous_target && self.entry_count.load(Ordering::Acquire) != 0
-        {
-            self.clear_locked();
+        if target < previous_target {
+            self.trim_locked(target);
+        }
+        if let Some(pool) = &self.budget_pool {
+            pool.applied(
+                budget,
+                (self.entry_count.load(Ordering::Acquire) * ACCOUNTED_ENTRY_BYTES + metadata)
+                    as u64,
+            );
         }
     }
 
-    fn clear_locked(&self) {
+    fn trim_locked(&self, target: usize) {
         let mut removed = 0_usize;
-        for shard in &self.shards {
+        for (ordinal, shard) in self.shards.iter().enumerate() {
             let mut state = shard
                 .state
                 .lock()
                 .expect("ASSERT: Historical Proof Cache shard lock poisoned");
-            removed = removed
-                .checked_add(state.entries)
-                .expect("ASSERT: Historical Proof Cache entry count cannot overflow");
-            let counters = state.counters;
-            *state = ShardState::default();
-            state.counters = counters;
+            let quota = target_for_shard(target, ordinal, self.shards.len());
+            let before = state.entries;
+            if before <= quota {
+                continue;
+            }
+            while state.entries > quota {
+                let mut steps = 0;
+                let mut evictions = 0;
+                // The cold pressure path may scan the queue repeatedly; the
+                // bounded admission path retains its per-request step limit.
+                let _ = evict_one(&mut state, quota, &mut steps, &mut evictions);
+            }
+            // Vacant arena slots still own memory. Compact survivors before
+            // returning this donor's lease, retaining FIFO order and frequency.
+            if !compact_shard(&mut state) {
+                let counters = state.counters;
+                *state = ShardState::default();
+                state.counters = counters;
+                state.counters.allocation_rejections += 1;
+            }
+            let victims = before - state.entries;
+            state.counters.evictions = state.counters.evictions.saturating_add(victims as u64);
+            removed += victims;
         }
-        let accounted = self.entry_count.swap(0, Ordering::AcqRel);
-        assert_eq!(
-            accounted, removed,
-            "ASSERT: Historical Proof Cache global and sharded counts agree"
+        let accounted = self.entry_count.fetch_sub(removed, Ordering::AcqRel);
+        assert!(
+            accounted >= removed,
+            "ASSERT: historical cache victims were charged"
         );
     }
 
@@ -593,6 +645,38 @@ impl HistoricalProofCache {
                 total
             })
     }
+}
+
+// Rebuild one shard at a time; temporary memory is bounded by one shard's
+// survivors. Failure discards only that optional shard, never a DATA proof.
+fn compact_shard(state: &mut ShardState) -> bool {
+    let mut next = ShardState::default();
+    if next.slots.try_reserve_exact(state.entries).is_err()
+        || next.free.try_reserve_exact(state.entries).is_err()
+        || next.index.try_reserve(state.entries, |_| 0).is_err()
+    {
+        return false;
+    }
+    for head in [state.small.head, state.main.head] {
+        let mut index = head;
+        while index != NONE {
+            let slot = &state.slots[index as usize];
+            let entry = slot.entry.expect("ASSERT: FIFO survivor is occupied");
+            let key = ProofKey::new(entry.chunk_id(), entry.logical_length());
+            let new_index = next.slots.len();
+            insert_entry(&mut next, entry, key, proof_hash(key), slot.queue)
+                .expect("ASSERT: compacted shard capacity was reserved");
+            next.slots[new_index].frequency = slot.frequency;
+            index = slot.next;
+        }
+    }
+    assert_eq!(
+        next.entries, state.entries,
+        "ASSERT: compaction retains all survivors"
+    );
+    next.counters = state.counters;
+    *state = next;
+    true
 }
 
 fn reserve_admission(state: &mut ShardState) -> bool {
@@ -909,6 +993,40 @@ mod tests {
         assert!(status.evictions() > 0);
         assert!(status.entry_count() <= status.target_entries());
         assert!(status.maximum_eviction_steps() <= MAXIMUM_EVICTION_STEPS);
+    }
+
+    #[test]
+    fn shrinking_preserves_hot_proofs_and_releases_vacant_arenas() {
+        let cache = cache();
+        let capacity = cache.status().target_entries();
+        let hot = entry(1);
+        cache.admit(hot, HistoricalProofAdmission::ExactReuse);
+        for _ in 0..3 {
+            assert_eq!(
+                cache.get(hot.chunk_id(), u64::from(hot.logical_length())),
+                Some(hot)
+            );
+        }
+        for ordinal in 2..=capacity as u64 {
+            cache.admit(entry(ordinal), HistoricalProofAdmission::Published);
+        }
+        let target = capacity / 2;
+        let budget = size_of::<CacheShard>() + target * ACCOUNTED_ENTRY_BYTES;
+        cache.update_memory_pressure(MemoryPressureSnapshot::new(1 << 30, (budget * 4) as u64, 0));
+        assert_eq!(cache.status().entry_count(), target);
+        assert_eq!(
+            cache.get(hot.chunk_id(), u64::from(hot.logical_length())),
+            Some(hot)
+        );
+        let state = cache.shards[0].state.lock().unwrap();
+        assert_eq!(state.slots.len(), target);
+        assert_eq!(state.slots.capacity(), target);
+        assert!(state.free.is_empty());
+        drop(state);
+        for ordinal in 1000..1100 {
+            cache.admit(entry(ordinal), HistoricalProofAdmission::Published);
+        }
+        assert_eq!(cache.status().entry_count(), target);
     }
 
     #[test]

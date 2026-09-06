@@ -7737,7 +7737,15 @@ mod tests {
                 })
             }
         }
-        let proofs = Arc::new(OnlineDependencyProofs::new().unwrap());
+        // This test requires a historical hit; supply deterministic capacity
+        // instead of competing with concurrently running system-cache tests.
+        let snapshot = fastdup_store::MemoryPressureSnapshot::new(1 << 30, 1 << 30, 0);
+        let mut owned = OnlineDependencyProofs::new().unwrap();
+        owned.historical = HistoricalProofCache::new_with_snapshot(
+            crate::historical_proof_cache::HistoricalProofCacheConfig::conservative(snapshot),
+            snapshot,
+        ).unwrap();
+        let proofs = Arc::new(owned);
         for ordinal in 0..MAX_ONLINE_DEPENDENCY_PROOFS_V1 / 2 {
             proofs.remember_active(budget_entry(ordinal), OnlineProofAdmission::Published);
         }

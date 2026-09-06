@@ -82,7 +82,25 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
     let similarity = appliance.similarity_index_page_cache_status();
     let descriptors = appliance.container_descriptor_cache_status();
     let reduction = appliance.advanced_reduction_status();
+    let history = appliance.historical_proof_cache_status();
+    let budget = fastdup_store::cache_budget_status();
+    let pools: Vec<_> = budget
+        .pools
+        .iter()
+        .map(|pool| {
+            json!({"id":pool.name, "fallbackTier":match pool.fallback {
+            fastdup_store::CacheFallback::Data => "data",
+            fastdup_store::CacheFallback::Metadata => "metadata",
+        }, "residentBytes":pool.resident_bytes, "targetBytes":pool.target_bytes,
+            "leasedBytes":pool.leased_bytes, "hits":pool.hits, "misses":pool.misses,
+            "evictions":pool.evictions})
+        })
+        .collect();
     json!({
+        "cacheBudget": {"maximumMemoryUsedBasisPoints":9200,
+            "effectiveLimitBytes":budget.effective_limit_bytes,
+            "availableBytes":budget.available_bytes,
+            "budgetBytes":budget.budget_bytes, "pools":pools},
         "runtimeId": format!("{}", std::process::id()),
         "ioUring": {"ringEntries":io.ring_entries(), "inflightBytes":io.inflight_bytes(),
             "maxInflightBytes":io.max_inflight_bytes(), "peakInflightBytes":io.peak_inflight_bytes(),
@@ -91,7 +109,8 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
             {"id":"verifiedRead", "hits":read.hits(), "misses":read.misses(), "evictions":read.evictions(), "residentBytes":read.resident_bytes()},
             {"id":"exactIndex", "hits":exact.hits(), "misses":exact.misses(), "evictions":exact.evictions(), "residentPages":exact.resident_pages()},
             {"id":"similarityIndex", "hits":similarity.hits(), "misses":similarity.misses(), "evictions":similarity.evictions(), "residentPages":similarity.resident_pages()},
-            {"id":"containerDescriptors", "hits":descriptors.hits(), "misses":descriptors.misses(), "evictions":descriptors.evictions(), "residentBytes":descriptors.resident_bytes()}
+            {"id":"containerDescriptors", "hits":descriptors.hits(), "misses":descriptors.misses(), "evictions":descriptors.evictions(), "residentBytes":descriptors.resident_bytes()},
+            {"id":"historicalProofs", "hits":history.hits(), "misses":history.misses(), "evictions":history.evictions(), "residentBytes":history.resident_bytes()}
         ],
         "reduction": {"enabled":reduction.enabled(), "queries":reduction.queries(), "candidates":reduction.candidates(),
             "acceptedPrefixes":reduction.accepted_prefixes(), "acceptedSparseXor":reduction.accepted_sparse_xor(),

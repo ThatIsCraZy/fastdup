@@ -1,3 +1,4 @@
+use crate::{CacheFallback, CacheObservation, CachePool};
 use fastdup_format::ChunkId;
 pub(crate) use fastdup_format::VerifiedChunkPayload;
 use std::array;
@@ -14,8 +15,6 @@ pub(crate) use crate::memory_budget::{MemoryPressureSnapshot, SYSTEM_REFRESH_INT
 const CACHE_WAYS: usize = 4;
 const CACHE_SLOT_TARGET_BYTES: usize = 16 * 1_024;
 const MAX_RECLAIM_STEPS_PER_GROUP: usize = 256;
-const MINIMUM_SYSTEM_RESERVE_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
-const MAXIMUM_DEFAULT_CACHE_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
 
 /// Hard geometry and memory reserve for the shared verified read cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,8 +51,8 @@ impl VerifiedReadCacheConfig {
 
     /// Derives a conservative default from a complete system snapshot.
     ///
-    /// One quarter of effective RAM (at least 4 GiB) remains outside the cache.
-    /// Cache RAM itself is capped at one eighth of effective RAM and 8 GiB.
+    /// Geometry permits the full shared budget; the adaptive broker assigns
+    /// actual bytes according to observed reuse while preserving 8% headroom.
     ///
     /// # Panics
     ///
@@ -64,7 +63,7 @@ impl VerifiedReadCacheConfig {
     pub fn conservative(snapshot: MemoryPressureSnapshot) -> Self {
         let effective = snapshot.effective_limit_bytes().max(1);
         let reserve = shared_cache_reserve_bytes(effective);
-        let hard = (effective / 8).clamp(64 * 1_024, MAXIMUM_DEFAULT_CACHE_BYTES);
+        let hard = effective.saturating_sub(reserve).max(64 * 1_024);
         let workers = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
         let shards = workers.next_power_of_two().min(64);
         Self {
@@ -97,7 +96,7 @@ impl VerifiedReadCacheConfig {
 /// the memory needed by Dirty DATA, reduction workers, XFS, and device queues.
 #[must_use]
 pub fn shared_cache_reserve_bytes(effective_limit_bytes: u64) -> u64 {
-    (effective_limit_bytes / 4).max(MINIMUM_SYSTEM_RESERVE_BYTES)
+    crate::cache_memory_reserve(effective_limit_bytes)
 }
 
 #[derive(Debug)]
@@ -318,6 +317,7 @@ struct CacheShardState {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CacheShardCounters {
+    hit_bytes: u64,
     hits: u64,
     misses: u64,
     admissions: u64,
@@ -326,6 +326,7 @@ struct CacheShardCounters {
 
 impl CacheShardCounters {
     fn add_assign(&mut self, other: Self) {
+        self.hit_bytes = self.hit_bytes.saturating_add(other.hit_bytes);
         self.hits = self.hits.saturating_add(other.hits);
         self.misses = self.misses.saturating_add(other.misses);
         self.admissions = self.admissions.saturating_add(other.admissions);
@@ -367,6 +368,7 @@ pub struct VerifiedReadCache {
     automatic_pressure: bool,
     started: Instant,
     last_refresh_millis: AtomicU64,
+    budget_pool: Option<CachePool>,
 }
 
 impl fmt::Debug for VerifiedReadCache {
@@ -471,6 +473,14 @@ impl VerifiedReadCache {
             automatic_pressure,
             started: Instant::now(),
             last_refresh_millis: AtomicU64::new(0),
+            budget_pool: automatic_pressure.then(|| {
+                CachePool::system(
+                    "verifiedRead",
+                    CacheFallback::Data,
+                    metadata_bytes as u64,
+                    config.hard_limit_bytes as u64,
+                )
+            }),
         };
         cache.apply_memory_pressure(snapshot);
         Ok(cache)
@@ -493,11 +503,25 @@ impl VerifiedReadCache {
     }
 
     fn apply_memory_pressure(&self, snapshot: MemoryPressureSnapshot) {
-        let _admission = self
+        let mut admission = self
             .admission
             .lock()
             .expect("ASSERT: verified read-cache admission lock poisoned");
-        let total_target = if snapshot.swap_used_bytes() != 0 {
+        let total_target = if let Some(pool) = &self.budget_pool {
+            let counters = self.counters();
+            usize::try_from(pool.target(
+                snapshot,
+                CacheObservation {
+                    hits: counters.hits,
+                    misses: counters.misses,
+                    evictions: counters.evictions,
+                    hit_bytes: counters.hit_bytes,
+                    resident_bytes: (self.resident_bytes.load(Ordering::Acquire)
+                        + self.metadata_bytes) as u64,
+                },
+            ))
+            .unwrap_or(usize::MAX)
+        } else if snapshot.swap_used_bytes() != 0 {
             0
         } else {
             let available = snapshot
@@ -517,12 +541,36 @@ impl VerifiedReadCache {
             .store(snapshot.swap_used_bytes(), Ordering::Release);
         self.target_bytes.store(payload_target, Ordering::Release);
         if self.resident_bytes.load(Ordering::Acquire) > payload_target {
-            self.clear_locked();
+            if self.budget_pool.is_some() && payload_target != 0 {
+                let mut steps = self
+                    .shards
+                    .iter()
+                    .map(|shard| {
+                        shard
+                            .state
+                            .lock()
+                            .expect("ASSERT: cache shard lock poisoned")
+                            .sets
+                            .len()
+                            * CACHE_WAYS
+                    })
+                    .sum();
+                self.reclaim_locked(&mut admission, &mut steps, payload_target, None);
+            } else {
+                self.clear_locked();
+            }
+        }
+        if let Some(pool) = &self.budget_pool {
+            pool.applied(
+                total_target as u64,
+                (self.resident_bytes.load(Ordering::Acquire) + self.metadata_bytes) as u64,
+            );
         }
     }
 
     #[must_use]
     pub fn status(&self) -> VerifiedReadCacheStatus {
+        self.maybe_refresh_pressure();
         let counters = self.counters();
         VerifiedReadCacheStatus {
             hits: counters.hits,
@@ -572,6 +620,7 @@ impl VerifiedReadCache {
                 Some(logical_length),
                 "ASSERT: verified cache entry length changed after admission"
             );
+            state.counters.hit_bytes = state.counters.hit_bytes.saturating_add(logical_length);
             state.counters.hits = state.counters.hits.saturating_add(1);
             return Some(payload);
         }
@@ -686,7 +735,7 @@ impl VerifiedReadCache {
                             &mut admission,
                             &mut reclaim_steps,
                             target.saturating_sub(added_bytes),
-                            &backing_charge,
+                            Some(&backing_charge),
                         );
                         continue;
                     }
@@ -728,7 +777,7 @@ impl VerifiedReadCache {
         admission: &mut CacheAdmission,
         remaining_steps: &mut usize,
         resident_target: usize,
-        protected: &Arc<CacheBackingCharge>,
+        protected: Option<&Arc<CacheBackingCharge>>,
     ) {
         while *remaining_steps != 0 && self.resident_bytes.load(Ordering::Acquire) > resident_target
         {
@@ -745,10 +794,9 @@ impl VerifiedReadCache {
             let slots = self.shards.len() * state.sets.len() * CACHE_WAYS;
             admission.reclaim_cursor = (cursor + 1) % slots;
             let slot = &mut state.sets[set_index].ways[way];
-            if slot
-                .as_ref()
-                .is_none_or(|entry| Arc::ptr_eq(&entry.backing_charge, protected))
-            {
+            if slot.as_ref().is_none_or(|entry| {
+                protected.is_some_and(|protected| Arc::ptr_eq(&entry.backing_charge, protected))
+            }) {
                 continue;
             }
             let entry = slot
@@ -1111,5 +1159,29 @@ mod tests {
 
         assert!(cache.status().target_bytes() > 0);
         assert_eq!(cache.status().swap_used_bytes(), 0);
+    }
+    #[test]
+    #[ignore = "manual release-mode verified DATA hit-path A/B"]
+    fn adaptive_budget_hit_path_benchmark() {
+        let cache = VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(1024 * 1024, 0, NonZeroUsize::MIN).unwrap(),
+            MemoryPressureSnapshot::new(8 * 1024 * 1024, 8 * 1024 * 1024, 0),
+        )
+        .unwrap();
+        let payload = verified_payload(b"cache hit payload");
+        let id = payload.chunk_id();
+        let length = payload.len() as u64;
+        cache.admit_decoded_group(vec![payload]);
+        assert!(cache.get(id, length).is_some());
+        for round in 0..7 {
+            let start = Instant::now();
+            for _ in 0..500_000 {
+                std::hint::black_box(cache.get(id, length).unwrap());
+            }
+            println!(
+                "verified_hit round={round} queries=500000 elapsed_ns={}",
+                start.elapsed().as_nanos()
+            );
+        }
     }
 }

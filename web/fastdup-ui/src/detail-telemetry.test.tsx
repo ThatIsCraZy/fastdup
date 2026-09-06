@@ -22,3 +22,21 @@ it("never substitutes live details for an empty historical interval", () => {
  expect(screen.getByText('Keine Messwerte im gewählten Zeitraum.')).toBeVisible();
  expect(screen.queryByRole('table')).not.toBeInTheDocument();
 });
+
+it("shows the shared budget, DATA priority tier and pending donor reservation in historical samples", () => {
+ const runtime = details.runtime!;
+ const cached = {...details, runtime:{...runtime,cacheBudget:{maximumMemoryUsedBasisPoints:9200,effectiveLimitBytes:20000000000,availableBytes:2000000000,budgetBytes:16000000000,pools:[
+  {id:"verifiedRead",fallbackTier:"data",hits:90,misses:10,evictions:5,residentBytes:6000000000,targetBytes:4000000000,leasedBytes:6000000000},
+  {id:"historicalProofs",fallbackTier:"data",hits:0,misses:0,evictions:0,residentBytes:0,targetBytes:1000000000,leasedBytes:1000000000},
+  {id:"exactIndex",fallbackTier:"metadata",hits:25,misses:75,evictions:2,residentBytes:500000000,targetBytes:500000000,leasedBytes:500000000}
+ ]}}};
+ render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:cached}} historical={true} loading={false}/></I18nProvider>);
+ fireEvent.click(screen.getByRole('tab',{name:'Caches'}));
+ expect(screen.getByText('92 %')).toBeVisible();expect(screen.getByText('16 GB')).toBeVisible();
+ const data = within(screen.getByRole('row',{name:/Verified Read/}));
+ expect(data.getByText('DATA')).toBeVisible();expect(data.getByText('90 %')).toBeVisible();
+ expect(data.getByText('4 GB')).toBeVisible();expect(data.getAllByText('6 GB')).toHaveLength(2);
+ expect(within(screen.getByRole('row',{name:/Exact Index/})).getByText('Metadata')).toBeVisible();
+ expect(within(screen.getByRole('row',{name:/Historical Proofs/})).getByText('—')).toBeVisible();
+ expect(screen.getByRole('progressbar',{name:'Cache-Budget Belegung'})).toHaveAttribute('value','6500000000');
+});

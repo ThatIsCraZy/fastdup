@@ -1,6 +1,7 @@
 use crate::read_cache::{
     MemoryPressureSnapshot, SYSTEM_REFRESH_INTERVAL, shared_cache_reserve_bytes,
 };
+use crate::{CacheFallback, CacheObservation, CachePool};
 use fastdup_format::{ContainerId, SealedContainerDescriptor};
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -68,6 +69,7 @@ pub(crate) struct ContainerDescriptorCache {
     automatic_pressure: bool,
     started: Instant,
     last_refresh_millis: AtomicU64,
+    budget_pool: Option<CachePool>,
 }
 
 /// Process-local telemetry for verified Container-envelope reuse.
@@ -219,6 +221,15 @@ impl ContainerDescriptorCache {
             automatic_pressure,
             started: Instant::now(),
             last_refresh_millis: AtomicU64::new(0),
+            budget_pool: automatic_pressure.then(|| {
+                CachePool::system(
+                    "containerDescriptors",
+                    CacheFallback::Data,
+                    (SHARD_COUNT * size_of::<DescriptorShard>()) as u64,
+                    (HARD_CAPACITY_ENTRIES * ACCOUNTED_ENTRY_BYTES
+                        + SHARD_COUNT * size_of::<DescriptorShard>()) as u64,
+                )
+            }),
         };
         cache.apply_memory_pressure(snapshot);
         cache
@@ -371,7 +382,23 @@ impl ContainerDescriptorCache {
         let reserve = shared_cache_reserve_bytes(snapshot.effective_limit_bytes());
         let headroom = snapshot.available_bytes().saturating_sub(reserve);
         let fraction_budget = snapshot.effective_limit_bytes() / EFFECTIVE_RAM_DIVISOR;
-        let budget = if snapshot.swap_used_bytes() == 0 {
+        let metadata = self.shards.len() * size_of::<DescriptorShard>();
+        let budget = if let Some(pool) = &self.budget_pool {
+            let counters = self.counters();
+            pool.target(
+                snapshot,
+                CacheObservation {
+                    hits: counters.hits,
+                    misses: counters.misses,
+                    evictions: counters.evictions,
+                    hit_bytes: counters.hits.saturating_mul(8192),
+                    resident_bytes: (self.entry_count.load(Ordering::Acquire)
+                        * ACCOUNTED_ENTRY_BYTES
+                        + metadata) as u64,
+                },
+            )
+            .saturating_sub(metadata as u64)
+        } else if snapshot.swap_used_bytes() == 0 {
             headroom.min(fraction_budget)
         } else {
             0
@@ -385,33 +412,51 @@ impl ContainerDescriptorCache {
             .store(snapshot.available_bytes(), Ordering::Release);
         self.swap_used_bytes
             .store(snapshot.swap_used_bytes(), Ordering::Release);
-        self.target_entries.store(target, Ordering::Release);
-        if self.entry_count.load(Ordering::Acquire) > target {
-            self.clear_locked();
+        let previous = self.target_entries.swap(target, Ordering::AcqRel);
+        if target < previous {
+            self.trim_locked(target);
+        }
+        if let Some(pool) = &self.budget_pool {
+            pool.applied(
+                budget + metadata as u64,
+                (self.entry_count.load(Ordering::Acquire) * ACCOUNTED_ENTRY_BYTES + metadata)
+                    as u64,
+            );
         }
     }
 
-    fn clear_locked(&self) {
+    fn trim_locked(&self, target: usize) {
         let mut removed = 0_usize;
-        for shard in &self.shards {
+        for (ordinal, shard) in self.shards.iter().enumerate() {
             let mut state = shard
                 .state
                 .lock()
                 .expect("ASSERT: Container descriptor cache shard lock poisoned");
-            let shard_removed = state.entries.len();
+            let quota = target_for_shard(target, ordinal);
+            let mut keep = quota;
+            let before = state.entries.len();
+            state.entries.retain(|_, _| {
+                if keep == 0 {
+                    false
+                } else {
+                    keep -= 1;
+                    true
+                }
+            });
+            let shard_removed = before - state.entries.len();
             removed = removed
                 .checked_add(shard_removed)
                 .expect("ASSERT: descriptor cache entry count cannot overflow");
-            state.entries = HashMap::new();
+            state.entries.shrink_to_fit();
             state.counters.evictions = state.counters.evictions.saturating_add(
                 u64::try_from(shard_removed)
                     .expect("ASSERT: descriptor shard entry count fits u64"),
             );
         }
-        let accounted = self.entry_count.swap(0, Ordering::AcqRel);
-        assert_eq!(
-            removed, accounted,
-            "ASSERT: descriptor cache entry accounting disagreed with its shards"
+        let accounted = self.entry_count.fetch_sub(removed, Ordering::AcqRel);
+        assert!(
+            accounted >= removed,
+            "ASSERT: descriptor cache victims were charged"
         );
     }
 

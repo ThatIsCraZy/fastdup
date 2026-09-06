@@ -1,8 +1,9 @@
+use crate::page_cache::{ACCOUNTED_PAGE_BYTES, LazyPageCache};
+use crate::{CacheFallback, CacheObservation, CachePool};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 use std::io;
-use std::mem::size_of;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
@@ -2723,37 +2724,15 @@ fn write_streamed_page<I: StorageIo>(
     Ok(())
 }
 
-const _: () = assert!(std::mem::align_of::<ExactIndexPageCacheSlot>() == 64);
-
-#[derive(Clone, Debug)]
-struct CachedExactIndexPage {
-    run_hash: [u8; 32],
-    page_ordinal: usize,
-    page: Arc<ExactIndexPage>,
-}
-
-#[repr(align(64))]
-#[derive(Debug)]
-struct ExactIndexPageCacheSlot {
-    page: Mutex<Option<CachedExactIndexPage>>,
-}
-
-impl Default for ExactIndexPageCacheSlot {
-    fn default() -> Self {
-        Self {
-            page: Mutex::new(None),
-        }
-    }
-}
-
 /// Repository-wide, pressure-bounded cache of independently verified 4-KiB
 /// Exact-Index pages.
 ///
-/// Direct mapping keeps lookup allocation-free and bounds both pointer chasing
-/// and replacement work. A collision merely evicts another acceleration entry;
+/// Lazy sharded maps keep lookup allocation-free and admit only the shared
+/// budget granted to this pool. FIFO replacement discards acceleration only;
 /// it cannot affect Exact-Index or DATA correctness.
 struct ExactIndexPageCache {
-    slots: Box<[ExactIndexPageCacheSlot]>,
+    pages: LazyPageCache<ExactIndexPage>,
+    capacity_pages: u64,
     admission: Mutex<()>,
     target_pages: AtomicU64,
     hits: AtomicU64,
@@ -2767,6 +2746,7 @@ struct ExactIndexPageCache {
     automatic_pressure: bool,
     started: Instant,
     last_refresh_millis: AtomicU64,
+    budget_pool: Option<CachePool>,
 }
 
 impl fmt::Debug for ExactIndexPageCache {
@@ -2780,22 +2760,25 @@ impl fmt::Debug for ExactIndexPageCache {
 
 impl ExactIndexPageCache {
     fn build(snapshot: MemoryPressureSnapshot, automatic_pressure: bool) -> Self {
-        let slot_count = exact_page_cache_capacity(snapshot);
-        let slots = std::iter::repeat_with(ExactIndexPageCacheSlot::default)
-            .take(slot_count)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        assert_eq!(
-            slots.len(),
-            slot_count,
-            "ASSERT: Exact Index page cache construction is complete"
-        );
-        assert!(
-            slots.len().is_power_of_two(),
-            "ASSERT: Exact Index page-cache geometry is direct-map compatible"
-        );
+        let pages = LazyPageCache::new();
+        let metadata = pages.metadata_bytes();
+        let capacity_pages = if automatic_pressure {
+            snapshot.effective_limit_bytes() / ACCOUNTED_PAGE_BYTES
+        } else {
+            exact_page_cache_capacity(snapshot) as u64
+        };
+        let budget_pool = automatic_pressure.then(|| {
+            CachePool::system(
+                "exactIndex",
+                CacheFallback::Metadata,
+                metadata,
+                snapshot.effective_limit_bytes(),
+            )
+        });
         let cache = Self {
-            slots,
+            pages,
+            capacity_pages,
+            budget_pool,
             admission: Mutex::new(()),
             target_pages: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -2816,15 +2799,7 @@ impl ExactIndexPageCache {
 
     fn get(&self, run_hash: [u8; 32], page_ordinal: usize) -> Option<Arc<ExactIndexPage>> {
         self.refresh_pressure_if_due();
-        let slot = &self.slots[exact_page_cache_slot(run_hash, page_ordinal, self.slots.len())];
-        let cached = slot
-            .page
-            .lock()
-            .expect("ASSERT: Exact Index page-cache slot lock poisoned");
-        let found = cached
-            .as_ref()
-            .filter(|cached| cached.run_hash == run_hash && cached.page_ordinal == page_ordinal)
-            .map(|cached| Arc::clone(&cached.page));
+        let found = self.pages.get(run_hash, page_ordinal);
         if found.is_some() {
             self.hits.fetch_add(1, AtomicOrdering::Relaxed);
         } else {
@@ -2850,32 +2825,17 @@ impl ExactIndexPageCache {
                 .fetch_add(1, AtomicOrdering::Relaxed);
             return;
         }
-        let slot = &self.slots[exact_page_cache_slot(run_hash, page_ordinal, self.slots.len())];
-        let mut cached = slot
-            .page
-            .lock()
-            .expect("ASSERT: Exact Index page-cache slot lock poisoned");
-        match cached.as_ref() {
-            None => {
-                if self.resident_pages.load(AtomicOrdering::Acquire) >= target {
-                    self.pressure_rejections
-                        .fetch_add(1, AtomicOrdering::Relaxed);
-                    return;
-                }
-                self.resident_pages.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            Some(previous)
-                if previous.run_hash != run_hash || previous.page_ordinal != page_ordinal =>
-            {
-                self.evictions.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            Some(_) => {}
+        if let Some((delta, evictions)) = self.pages.insert(run_hash, page_ordinal, page, target) {
+            self.resident_pages
+                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
+                    value.checked_add_signed(delta)
+                })
+                .expect("ASSERT: page accounting stays in range");
+            self.evictions.fetch_add(evictions, AtomicOrdering::Relaxed);
+        } else {
+            self.pressure_rejections
+                .fetch_add(1, AtomicOrdering::Relaxed);
         }
-        *cached = Some(CachedExactIndexPage {
-            run_hash,
-            page_ordinal,
-            page,
-        });
     }
 
     fn status(&self) -> ExactIndexPageCacheStatus {
@@ -2888,8 +2848,7 @@ impl ExactIndexPageCache {
             evictions: self.evictions.load(AtomicOrdering::Relaxed),
             pressure_rejections: self.pressure_rejections.load(AtomicOrdering::Relaxed),
             target_pages: self.target_pages.load(AtomicOrdering::Relaxed),
-            capacity_pages: u64::try_from(self.slots.len())
-                .expect("ASSERT: Exact Index page-cache capacity fits u64"),
+            capacity_pages: self.capacity_pages,
             reserve_bytes: shared_cache_reserve_bytes(effective_limit_bytes),
             effective_limit_bytes,
             available_bytes: self.available_bytes.load(AtomicOrdering::Relaxed),
@@ -2924,53 +2883,55 @@ impl ExactIndexPageCache {
     }
 
     fn apply_pressure_snapshot(&self, snapshot: MemoryPressureSnapshot) {
+        let _admission = self
+            .admission
+            .lock()
+            .expect("ASSERT: Exact page admission lock poisoned");
         let reserve = shared_cache_reserve_bytes(snapshot.effective_limit_bytes());
         let available_for_cache = snapshot.available_bytes().saturating_sub(reserve);
-        let page_bytes = exact_page_cache_accounted_page_bytes();
-        let capacity = u64::try_from(self.slots.len())
-            .expect("ASSERT: Exact Index page-cache capacity fits u64");
-        let target = if snapshot.swap_used_bytes() == 0 {
-            (available_for_cache / page_bytes).min(capacity)
+        let page_bytes = ACCOUNTED_PAGE_BYTES;
+        let metadata = self.pages.metadata_bytes();
+        let budget = if let Some(pool) = &self.budget_pool {
+            pool.target(
+                snapshot,
+                CacheObservation {
+                    hits: self.hits.load(AtomicOrdering::Relaxed),
+                    misses: self.misses.load(AtomicOrdering::Relaxed),
+                    evictions: self.evictions.load(AtomicOrdering::Relaxed),
+                    hit_bytes: self
+                        .hits
+                        .load(AtomicOrdering::Relaxed)
+                        .saturating_mul(EXACT_INDEX_PAGE_BYTES as u64),
+                    resident_bytes: self.resident_pages.load(AtomicOrdering::Acquire) * page_bytes
+                        + metadata,
+                },
+            )
+            .saturating_sub(metadata)
+        } else if snapshot.swap_used_bytes() == 0 {
+            available_for_cache
         } else {
             0
         };
+        let target = (budget / page_bytes).min(self.capacity_pages);
         self.effective_limit_bytes
             .store(snapshot.effective_limit_bytes(), AtomicOrdering::Relaxed);
         self.available_bytes
             .store(snapshot.available_bytes(), AtomicOrdering::Relaxed);
         self.swap_used_bytes
             .store(snapshot.swap_used_bytes(), AtomicOrdering::Relaxed);
-        self.target_pages.store(target, AtomicOrdering::Release);
-        if self.resident_pages.load(AtomicOrdering::Acquire) > target {
-            self.purge();
+        let previous = self.target_pages.swap(target, AtomicOrdering::AcqRel);
+        if target < previous {
+            let removed = self.pages.trim(target);
+            self.resident_pages
+                .fetch_sub(removed, AtomicOrdering::AcqRel);
+            self.evictions.fetch_add(removed, AtomicOrdering::Relaxed);
         }
-    }
-
-    fn purge(&self) {
-        let _admission = self
-            .admission
-            .lock()
-            .expect("ASSERT: Exact Index page-cache admission lock poisoned");
-        let mut removed = 0_u64;
-        for slot in &self.slots {
-            if slot
-                .page
-                .lock()
-                .expect("ASSERT: Exact Index page-cache slot lock poisoned")
-                .take()
-                .is_some()
-            {
-                removed = removed
-                    .checked_add(1)
-                    .expect("ASSERT: Exact Index cached-page count cannot overflow");
-            }
+        if let Some(pool) = &self.budget_pool {
+            pool.applied(
+                budget + metadata,
+                self.resident_pages.load(AtomicOrdering::Acquire) * page_bytes + metadata,
+            );
         }
-        let previous = self.resident_pages.swap(0, AtomicOrdering::AcqRel);
-        assert_eq!(
-            removed, previous,
-            "ASSERT: Exact Index page-cache resident accounting matches its slots"
-        );
-        self.evictions.fetch_add(removed, AtomicOrdering::Relaxed);
     }
 }
 
@@ -3003,8 +2964,7 @@ fn exact_page_cache_capacity(snapshot: MemoryPressureSnapshot) -> usize {
 }
 
 fn exact_page_cache_accounted_page_bytes() -> u64 {
-    u64::try_from(EXACT_INDEX_PAGE_BYTES + size_of::<ExactIndexPageCacheSlot>())
-        .expect("ASSERT: Exact Index accounted page bytes fit u64")
+    ACCOUNTED_PAGE_BYTES
 }
 
 fn floor_power_of_two(value: usize) -> usize {
@@ -3012,22 +2972,6 @@ fn floor_power_of_two(value: usize) -> usize {
         .checked_next_power_of_two()
         .unwrap_or(usize::MAX / 2 + 1);
     if next == value { value } else { next / 2 }
-}
-
-fn exact_page_cache_slot(run_hash: [u8; 32], page_ordinal: usize, slot_count: usize) -> usize {
-    assert!(
-        slot_count.is_power_of_two(),
-        "ASSERT: Exact Index page-cache slot count is a power of two"
-    );
-    let mut lane = [0_u8; 8];
-    lane.copy_from_slice(&run_hash[..8]);
-    let page = u64::try_from(page_ordinal)
-        .expect("ASSERT: an Exact Index page ordinal fits the cache hash domain");
-    let mixed =
-        u64::from_le_bytes(lane) ^ page.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ page.rotate_left(29);
-    let mask =
-        u64::try_from(slot_count - 1).expect("ASSERT: the Exact Index page-cache mask fits u64");
-    usize::try_from(mixed & mask).expect("ASSERT: a masked Exact Index page-cache slot fits usize")
 }
 
 /// Open immutable Run handle backed by bounded reads or an audited active mapping.
@@ -3790,13 +3734,20 @@ mod tests {
         let cache = ExactIndexPageCache::build(healthy, false);
         let status = cache.status();
 
-        assert_eq!(std::mem::align_of::<ExactIndexPageCacheSlot>(), 64);
+        assert!(ACCOUNTED_PAGE_BYTES > EXACT_INDEX_PAGE_BYTES as u64);
         assert!(status.capacity_pages().is_power_of_two());
         assert!(status.capacity_pages() > 256);
         assert_eq!(status.target_pages(), status.capacity_pages());
-        assert_eq!(status.reserve_bytes(), 32 * gib);
+        assert_eq!(
+            status.reserve_bytes(),
+            shared_cache_reserve_bytes(128 * gib)
+        );
 
-        cache.apply_pressure_snapshot(MemoryPressureSnapshot::new(128 * gib, 32 * gib, 0));
+        cache.apply_pressure_snapshot(MemoryPressureSnapshot::new(
+            128 * gib,
+            shared_cache_reserve_bytes(128 * gib),
+            0,
+        ));
         assert_eq!(cache.status().target_pages(), 0);
 
         cache.apply_pressure_snapshot(MemoryPressureSnapshot::new(128 * gib, 96 * gib, 1));
@@ -3814,9 +3765,13 @@ mod tests {
             512 * 1_024 * 1_024
         );
         assert_eq!(
-            exact_run_membership_budget(MemoryPressureSnapshot::new(16 * gib, 4 * gib, 0)),
+            exact_run_membership_budget(MemoryPressureSnapshot::new(
+                16 * gib,
+                shared_cache_reserve_bytes(16 * gib),
+                0
+            )),
             0,
-            "the shared 4-GiB reserve wins over optional membership hints"
+            "the shared 8-percent reserve wins over optional membership hints"
         );
         assert_eq!(
             exact_run_membership_budget(MemoryPressureSnapshot::new(16 * gib, 12 * gib, 1)),

@@ -28,12 +28,36 @@ pub struct OperationLatency {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeDetails {
+    pub cache_budget: Option<CacheBudgetTelemetry>,
     pub runtime_id: String,
     pub io_uring: IoUringTelemetry,
     pub caches: Vec<CacheTelemetry>,
     pub reduction: ReductionTelemetry,
     pub checkpoint: Option<CheckpointTelemetry>,
     pub gc: Option<GcTelemetry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheBudgetTelemetry {
+    pub maximum_memory_used_basis_points: u64,
+    pub effective_limit_bytes: u64,
+    pub available_bytes: u64,
+    pub budget_bytes: u64,
+    pub pools: Vec<CachePoolTelemetry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePoolTelemetry {
+    pub id: String,
+    pub fallback_tier: String,
+    pub resident_bytes: u64,
+    pub target_bytes: u64,
+    pub leased_bytes: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -155,5 +179,40 @@ mod tests {
         assert_eq!(latency.read.p99_micros, 250);
         assert_eq!(latency.write.operations, 0);
         assert!(details.runtime.is_none());
+    }
+    #[test]
+    fn shared_cache_budget_survives_runtime_parse_and_history_serialization() {
+        let mut frontend = serde_json::json!({"details":{
+            "runtimeId":"test", "ioUring":{"ringEntries":64,"inflightBytes":0,"maxInflightBytes":1,"peakInflightBytes":0,"submitted":0,"completed":0},
+            "caches":[], "reduction":{"enabled":true,"queries":0,"candidates":0,"acceptedPrefixes":0,"acceptedSparseXor":0,"savedPayloadBytes":0,"fallbacks":0,"errors":0},
+            "cacheBudget":{"maximumMemoryUsedBasisPoints":9200,"effectiveLimitBytes":1000,"availableBytes":80,"budgetBytes":900,"pools":[
+                {"id":"verifiedRead","fallbackTier":"data","residentBytes":600,"targetBytes":400,"leasedBytes":600,"hits":9,"misses":1,"evictions":2}
+            ]}
+        }});
+        let details = parse_details(&frontend);
+        let budget = details
+            .runtime
+            .as_ref()
+            .unwrap()
+            .cache_budget
+            .as_ref()
+            .unwrap();
+        assert_eq!(budget.maximum_memory_used_basis_points, 9200);
+        assert_eq!(budget.pools[0].leased_bytes, 600);
+        assert_eq!(budget.pools[0].target_bytes, 400);
+        let saved = serde_json::to_value(&details).unwrap();
+        assert_eq!(
+            saved["runtime"]["cacheBudget"],
+            frontend["details"]["cacheBudget"]
+        );
+        frontend["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cacheBudget");
+        let legacy = parse_details(&frontend).runtime.unwrap();
+        assert!(
+            legacy.cache_budget.is_none(),
+            "old runtime samples remain readable"
+        );
     }
 }

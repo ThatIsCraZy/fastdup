@@ -23,10 +23,10 @@ independently verified immutable Exact Index pages. This cache retains only a
 hot subset of the persistent index, never the complete Chunk map. A hit removes
 Metadata-Tier page I/O but still yields only unverified Location candidates;
 the selected immutable Container record and Chunk identity must be verified
-before reuse. Exact pages use direct-mapped cache-line-separated slots rather
-than a global LRU.
+before reuse. Exact pages use lazy cache-line-separated shards with local FIFO
+replacement rather than a global LRU.
 
-The cache is four-way set associative and sharded on cache-line-separated
+The verified DATA cache is four-way set associative and sharded on cache-line-separated
 locks. There is no process-global pointer-heavy LRU. A hit touches one shard
 and at most four entries. A miss performs ordinary verified Container I/O
 without holding a cache lock; only the final immutable admission and exact byte
@@ -53,22 +53,58 @@ process-Swap purges still take precedence. Workload-transition regression tests
 must cover a full byte budget with free set ways, multi-view allocation
 accounting, cursor progress, and concurrent reads/admissions/pressure updates.
 
-The default hard cache limit is the smaller of one eighth of effective RAM and
-8 GiB. At least the greater of one quarter of effective RAM and 4 GiB remains
-outside the cache for Dirty DATA, Ingest Lanes, codec workers, metadata/index
-caches, XFS clean pages, writeback, and device queues. The effective limit and
-available headroom are the conservative minima of `/proc/meminfo` and finite
-cgroup-v2 `memory.high`/`memory.max` limits. One process-wide
-`MemoryBudgetGovernor` owns Linux sampling and publishes one fail-closed
-snapshot to every rebuildable cache. Sampling occurs at most every 250 ms on
-cache access, not in FastCDC, Bloom probes, or encoding loops.
+## Shared adaptive budget (2026-09-07)
 
-The Exact Index page cache has an independent smaller hard budget: one 128th of
-effective RAM, clamped between 1 MiB and 256 MiB. Its resident target grows up
-to that preallocated geometry only while `MemAvailable` exceeds the shared
-reserve. Falling below the reserve purges resident pages; Swap charged to the
-fastdup process sets its target to zero. Fixed slot metadata is cache-line aligned, and page
-admission never allocates an unbounded lookup table.
+System-configured caches share one broker instead of independent fixed RAM
+fractions. The operating ceiling is 92% of effective host/cgroup memory: 8%
+remains available for concurrent working-memory and kernel demand. The sampled
+cache budget is current conservatively charged cache residency plus available
+memory minus that reserve, capped at 92% of the effective limit. Already
+resident cache bytes are included so a full useful cache does not mistakenly
+shrink itself just because its allocation lowered `MemAvailable`. Dirty DATA,
+Ingest Lanes, codec workers, pinned Generation Proof Sets and active immutable
+Run views consume working memory outside these reclaimable leases and reduce
+available headroom. This is an operating target sampled every 250 ms, not a
+kernel guarantee against an external allocation between samples.
+
+One broker accounts nonoverlapping byte leases for verified DATA payloads,
+historical DATA proofs, Container descriptors, Exact pages and Similarity
+pages. A cache reports cumulative hits, avoided logical read bytes, misses,
+evictions and resident bytes on its existing cold refresh path. Recent avoided
+read bytes per resident byte determine benefit; an exponentially decayed window
+adapts when a workload changes. DATA-fallback benefit receives a 16x weight
+relative to Metadata-fallback benefit. This is an explicit priority multiplier,
+not a per-cache byte reservation. Payload/proof hits count actual logical
+length; descriptor hits represent the two envelope pages and index hits one
+4-KiB page. These values estimate avoided fallback work and do not claim measured
+physical I/O on every miss.
+
+A bounded exploration share (1/16 of the current distributable budget across
+pools) lets a cold or previously displaced cache demonstrate reuse. Misses and
+replacement demand permit gradual growth; a pool already serving its working
+set cannot reserve unlimited unused space. Weighted allocation redistributes
+unclaimed capacity after each pool's current demand is satisfied. Activity
+ages out, so an idle pool loses priority. Counter snapshots and broker locks
+stay off the normal cache-hit path; hits retain their existing local locks.
+
+Shrinking sets a desired target first. The old lease remains charged until
+the donor has stopped admission and completed local eviction under its own
+admission lock. Partial shrink retains useful entries; historical proof arenas
+compact survivors so vacant slots do not retain a returned lease. Only then can
+another pool borrow those bytes. Outstanding
+immutable reader views remain valid and any memory they still own remains part
+of sampled process working memory. Failed pressure samples or Process Swap
+revoke payload admission; fixed lookup metadata stays conservatively charged.
+A pool's addressable geometry limits indexing, not its desired RAM allocation.
+Explicit externally governed/test constructors retain deterministic policies;
+production constructors all register with the shared broker.
+
+Exact and Similarity pages use lazy cache-line-separated sharded maps and FIFO
+replacement. Their former 256-MiB and 512-page limits do not constrain system
+allocations. Maps grow only on actual admission, are conservatively charged
+alongside decoded pages, and release excess capacity when a target shrinks.
+The page budget includes Similarity bucket-fence entries. A hit remains a
+verified immutable page lookup and never authorizes DATA reuse by itself.
 
 Active immutable Exact Runs additionally use rebuildable membership filters.
 They reuse the same cache-line-aligned blocked Bloom implementation as the
@@ -84,15 +120,13 @@ A missing filter changes only performance:
 lookup falls through to verified Exact pages. The immutable filters are rebuilt
 during Run activation audit, never persisted, and never authorize a Location.
 
-The fixed set metadata plus resident payload can never exceed the hard limit.
-When available memory cannot cover the reserve, the payload target shrinks. If
-resident payload exceeds the new target, all payload entries are discarded
-rather than gradually chasing pressure. Nonzero Process Swap sets the payload
-target to zero, purges all entries, and refuses new admission until that charge
-returns to zero. Host and current-cgroup Swap remain separate telemetry because
-either may belong to another workload when the process is not yet running in
-its dedicated production cgroup. Durable reads continue through the verified
-XFS path.
+Fixed lookup metadata and payload together remain inside a granted cache
+lease. Verified DATA reclamation preserves the bounded admission scan and
+uses a complete cold-path scan when a donor must reach a lower target.
+Process Swap revokes payload leases and clears entries; host/cgroup Swap from
+other workloads remains separate telemetry. Reads continue through normal
+verification after every miss. Independently held verified reader allocations
+are not cache entries and are accounted through available process memory.
 
 This process policy prevents the fastdup caches from intentionally consuming
 the I/O reserve, but an application budget cannot overrule kernel reclaim. A
@@ -125,13 +159,11 @@ HashMap storage only for descriptors actually admitted; constructing it does
 not reserve the multi-gigabyte hard capacity. Lookup takes one shard lock and
 there is no process-global LRU lock.
 
-The resident target is the smaller of hard capacity, two percent of effective
-RAM using a conservative 160 bytes per entry, and available bytes above the
-shared cache reserve. A healthy 128-GiB appliance can therefore reach the full
-512-TiB addressable set. Lower-memory or pressured systems retain less. Any
-Swap charged to the fastdup process sets the target to zero, releases all
-allocated shard maps, and rejects admission until pressure clears. Allocation failure
-rejects only the cache entry and never the verified read.
+The resident descriptor target follows its DATA-priority shared lease, up to
+the existing addressable Container-count limit. Shards allocate on demand;
+allocation failure rejects only cache admission. Its fixed shard directory and
+conservative per-entry charges participate in the same broker as payloads and
+index pages.
 
 A hit removes `object_len` plus Header/Footer reads, but the selected Record is
 still range-read and must pass coordinate, CRC, decoded-length, and Chunk-ID

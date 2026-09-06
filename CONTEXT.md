@@ -340,10 +340,16 @@ Run view and never authorizes Chunk reuse or replaces DATA Location verification
 _Avoid_: In-memory Exact Index, hash table
 
 **Cache memory reserve**:
-Host/cgroup headroom that DATA and Exact Index caches are forbidden to consume.
+Host/cgroup headroom that rebuildable caches are forbidden to consume.
 It protects Dirty DATA, reduction workers, XFS clean/writeback pages, and device
 queues; pressure shrinks or disables cache admission rather than borrowing it.
 _Avoid_: Cache capacity, free RAM, metadata reserve
+
+**Shared cache budget**:
+The reclaimable RAM that cache consumers compete for according to observed
+reuse and the storage work their hits avoid. Returning a budget requires
+releasing its cache ownership first; it never releases pinned durable state.
+_Avoid_: Physical Pool, per-cache RAM reservation, storage capacity
 
 **Process Swap**:
 Swap currently attributable to the running fastdup process. It closes

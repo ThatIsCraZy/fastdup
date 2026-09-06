@@ -18,10 +18,16 @@ mod manifest_reader;
 mod manifest_tree;
 mod metadata_mark_catalog;
 pub use manifest_tree::{ManifestRangeExtent, ManifestTreeSummary};
+mod cache_budget;
 mod long_lived_arena;
 mod maintenance;
 mod maintenance_ioprio;
 mod memory_budget;
+mod page_cache;
+pub use cache_budget::{
+    CacheBudgetStatus, CacheFallback, CacheObservation, CachePool, CachePoolStatus,
+    cache_budget_status, cache_memory_reserve,
+};
 mod online_similarity;
 mod persistent_reduction;
 mod prefix_context;
