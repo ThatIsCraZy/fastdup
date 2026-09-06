@@ -9,8 +9,9 @@ use fastdup_copy_metrics::{CopyClass, record_copy};
 use fuse3::notify::Notify;
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, FileAttr as FuseFileAttr, ReplyAttr, ReplyCopyFileRange,
-    ReplyCreated, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyIoctl,
-    ReplyLSeek, ReplyLock as FuseReplyLock, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr,
+    ReplyCreated, ReplyData, ReplyDataVectored, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry,
+    ReplyInit, ReplyIoctl, ReplyLSeek, ReplyLock as FuseReplyLock, ReplyOpen, ReplyStatFs,
+    ReplyWrite, ReplyXAttr,
 };
 use fuse3::raw::{Filesystem, OwnedRequestPayload, Request};
 use fuse3::{Errno, FileType, MountOptions, SetAttr, Timestamp};
@@ -911,6 +912,21 @@ impl Filesystem for FuseFilesystem {
         offset: u64,
         size: u32,
     ) -> fuse3::Result<ReplyData> {
+        let reply = self
+            .read_vectored(request, inode, handle, offset, size)
+            .await?;
+        let data = crate::versioned_file::join_read_segments(reply.data).map_err(errno)?;
+        Ok(ReplyData { data })
+    }
+
+    async fn read_vectored(
+        &self,
+        request: Request,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+        size: u32,
+    ) -> fuse3::Result<ReplyDataVectored> {
         let started = Instant::now();
         let namespace = Arc::clone(&self.namespace);
         let request = context(request);
@@ -920,7 +936,7 @@ impl Filesystem for FuseFilesystem {
             .run_blocking(move || {
                 namespace.dispatch(
                     request,
-                    Operation::ReadShared {
+                    Operation::ReadSegments {
                         inode,
                         handle,
                         offset,
@@ -936,12 +952,12 @@ impl Filesystem for FuseFilesystem {
                 return Err(errno(error));
             }
         };
-        let Reply::SharedData(data) = reply else {
+        let Reply::SegmentedData(data) = reply else {
             unreachable!("ASSERT: a shared read returns shared DATA");
         };
         self.frontend_telemetry
-            .record_read(Some(data.len()), started);
-        Ok(ReplyData { data })
+            .record_read(Some(data.iter().map(Bytes::len).sum()), started);
+        Ok(ReplyDataVectored { data })
     }
 
     async fn write(

@@ -4,6 +4,13 @@ status: accepted
 
 # Build Exact and Similarity indexes from one verified pool scan
 
+Current-state note (2026-09-05): the one-scan offline rebuild remains implemented.
+ADR 0089 adds online immutable replacement-bucket runs and Reduction Head
+activation; the strict family-to-active-Exact pairing below describes the
+offline paired-reader seam, not every online query. Online families may be
+unbound and queries resolve hints through current Exact. Dependent encoding
+is now implemented under ADRs 0063 and 0088.
+
 The advanced-reduction rebuild decodes each immutable Container once and feeds
 the verified record stream to two bounded builders. Verified Locations produce
 hidden Exact Runs; decoded logical bytes produce externally sorted Similarity

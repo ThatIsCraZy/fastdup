@@ -7,7 +7,9 @@ status: accepted
 Current-state note (2026-08-27): the successor-proof decision remains current.
 ADR 0054 replaced FastCDC with SeqCDC, ADR 0051 replaced the historical LRU
 with S3-FIFO, and ADR 0069 implemented the Appliance Lease described below as
-deferred.
+deferred. Updated 2026-09-05: ADR 0059 also supersedes the mandatory writer
+reread described below with writer-owned publication evidence; independent
+read, recovery, and scrub verification remain required.
 
 Normal in-process commits form a Successor Graph Proof: unchanged Manifest
 extents retain the complete DATA proof of the immediately preceding verified

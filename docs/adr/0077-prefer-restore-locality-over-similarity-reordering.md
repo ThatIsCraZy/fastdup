@@ -48,3 +48,21 @@ sorting can matter on the intended HDD tier; the sequential fixture cannot
 prove seek savings. Physical-HDD fragmented-file evidence is required before
 adding a 2x activation threshold, speculative read-ahead, or parallel I/O. See
 [`verified-restore-coalescing-2026-08-27.md`](../benchmarks/verified-restore-coalescing-2026-08-27.md).
+
+## Visible live intervals and segmented replies (2026-09-05)
+
+The POSIX Read Plan resolves visible intervals from the newest Dirty Epoch back
+to Committed before touching DATA. It retains immutable resident owners and
+external source coordinates under the inode lock, then executes required reads
+after releasing that lock. Truncation, holes, Frozen epochs and later writes
+cannot change the captured view; completely hidden sources perform no I/O.
+Adjacent views of one live publication share a bounded Store read and Record
+verification even before Exact activation.
+
+A verified reply may retain several immutable byte segments through POSIX and
+FUSE. Contiguous views of one decoded Record still merge into one view. FUSE
+sends header and body segments in one vectored response, keeps their owners alive
+through completion, caps the body at the requested size, and falls back to one
+joined buffer above 128 segments. A short device write is a failed message and
+is never retried as a suffix. Existing contiguous Bytes/Vec read APIs remain
+available. This avoids userspace concatenation; it does not claim kernel zero-copy.

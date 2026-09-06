@@ -1,5 +1,6 @@
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
@@ -37,9 +38,11 @@ impl WorkerPermits {
         }
         let length = inputs.len();
         let queue = Mutex::new(inputs.into_iter().enumerate().collect::<VecDeque<_>>());
-        let completed = (0..lease.workers().get().min(length))
+        let completed = lease
+            .split()
             .into_par_iter()
-            .map(|_| {
+            .map(|worker| {
+                let _worker = worker;
                 let mut completed = Vec::new();
                 loop {
                     let job = queue
@@ -103,6 +106,7 @@ impl WorkerPermits {
         *available -= acquired.get();
         Some(WorkerPermitLease {
             pool: self,
+            remaining: AtomicUsize::new(acquired.get()),
             acquired,
             requested: desired,
             wait_ns: 0,
@@ -141,6 +145,7 @@ impl WorkerPermits {
         *available -= acquired;
         WorkerPermitLease {
             pool: self,
+            remaining: AtomicUsize::new(acquired),
             acquired: NonZeroUsize::new(acquired)
                 .expect("ASSERT: a granted worker lease is nonempty"),
             requested: desired,
@@ -155,12 +160,62 @@ impl WorkerPermits {
 pub struct WorkerPermitLease<'a> {
     pool: &'a WorkerPermits,
     acquired: NonZeroUsize,
+    remaining: AtomicUsize,
     requested: NonZeroUsize,
     wait_ns: u64,
     blocked: bool,
 }
 
-impl WorkerPermitLease<'_> {
+impl<'a> WorkerPermitLease<'a> {
+    /// Retires one finished worker while retaining at least one permit for
+    /// serial assembly. Call once per worker other than worker zero.
+    ///
+    /// # Panics
+    /// Panics if a caller retires more workers than it acquired.
+    pub fn retire_worker(&self) {
+        let previous = self
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1).filter(|n| *n >= 1)
+            })
+            .expect("ASSERT: worker retirement retains the assembly permit");
+        assert!(previous > 1);
+        self.release(1);
+    }
+
+    fn split(self) -> Vec<WorkerPermitLease<'a>> {
+        let count = self.remaining.swap(0, Ordering::AcqRel);
+        (0..count)
+            .map(|_| WorkerPermitLease {
+                pool: self.pool,
+                acquired: NonZeroUsize::MIN,
+                remaining: AtomicUsize::new(1),
+                requested: NonZeroUsize::MIN,
+                wait_ns: 0,
+                blocked: false,
+            })
+            .collect()
+    }
+
+    fn release(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut available = self
+            .pool
+            .available
+            .lock()
+            .expect("ASSERT: CPU permit lock poisoned during retirement");
+        *available = available
+            .checked_add(count)
+            .expect("ASSERT: CPU permit accounting cannot overflow");
+        assert!(
+            *available <= self.pool.total.get(),
+            "ASSERT: CPU permit retirement exceeded budget"
+        );
+        self.pool.changed.notify_all();
+    }
+
     #[must_use]
     pub const fn workers(&self) -> NonZeroUsize {
         self.acquired
@@ -184,25 +239,66 @@ impl WorkerPermitLease<'_> {
 
 impl Drop for WorkerPermitLease<'_> {
     fn drop(&mut self) {
-        let mut available = self
-            .pool
-            .available
-            .lock()
-            .expect("ASSERT: encode worker permit lock poisoned during retirement");
-        *available = available
-            .checked_add(self.acquired.get())
-            .expect("ASSERT: encode worker permit accounting cannot overflow");
-        assert!(
-            *available <= self.pool.total.get(),
-            "ASSERT: encode worker retirement exceeded the write-through worker budget"
-        );
-        self.pool.changed.notify_all();
+        self.release(self.remaining.swap(0, Ordering::AcqRel));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_workers_release_permits_before_a_slow_batch_finishes() {
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::Duration;
+        let permits = Arc::new(WorkerPermits::new(NonZeroUsize::new(4).unwrap()));
+        let started = Arc::new(Barrier::new(5));
+        let (release, blocked) = mpsc::channel();
+        let blocked = Mutex::new(blocked);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(4)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        permits.map((0..4).collect(), NonZeroUsize::new(4).unwrap(), |ordinal| {
+                            started.wait();
+                            if ordinal == 0 {
+                                blocked.lock().unwrap().recv().unwrap();
+                            }
+                            ordinal * 2
+                        })
+                    })
+            });
+            started.wait();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while permits.available() != 3 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let available = permits.available();
+            release.send(()).unwrap();
+            assert_eq!(worker.join().unwrap(), [0, 2, 4, 6]);
+            assert_eq!(available, 3, "only the blocked worker retains its permit");
+        });
+        assert_eq!(permits.available(), 4);
+    }
+
+    #[test]
+    fn failed_worker_unwinds_all_permits() {
+        let permits = WorkerPermits::new(NonZeroUsize::new(4).unwrap());
+        let result = std::panic::catch_unwind(|| {
+            permits.map(
+                (0..16).collect(),
+                NonZeroUsize::new(4).unwrap(),
+                |ordinal| {
+                    assert_ne!(ordinal, 3, "injected worker failure");
+                },
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(permits.available(), 4);
+    }
 
     #[test]
     #[ignore = "manual release-mode competing CPU admission A/B"]

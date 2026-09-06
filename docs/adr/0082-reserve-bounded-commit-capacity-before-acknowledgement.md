@@ -58,9 +58,11 @@ the same sequential stream admission-equivalent without weakening the
 per-mutation bound for random writes.
 
 A write independently claims twice the larger of its payload and the 256-KiB
-v1 maximum Chunk, plus 4 KiB of DATA. This covers write-through bytes, one
-bounded boundary rechunk, raw fallback, record framing, alignment, and
-sealed-Container publication.
+v1 maximum Chunk, plus 4 KiB of physical Container capacity. This covers
+write-through bytes, one bounded boundary rechunk, raw fallback, record framing, alignment, and
+sealed-Container publication. For DATA placement it is charged to DATA; for
+Small-File placement the same physical bound is charged to both Metadata
+headroom and the separate Small-File quota bucket, with no DATA claim.
 Metadata-only clone and sparse allocation claim no DATA. Removal operations
 use the protected floor rather than consuming ordinary admission headroom.
 

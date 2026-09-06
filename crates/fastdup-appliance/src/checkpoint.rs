@@ -36,6 +36,7 @@ use fastdup_store::{
     VerifiedReadCacheError, VerifiedReadCacheStatus, seqcdc_cut, seqcdc_cut_scalar,
     seqcdc_cut_segmented, seqcdc_cut_segmented_scalar,
 };
+use hashbrown::HashTable;
 use rayon::prelude::*;
 
 use crate::historical_proof_cache::{HistoricalProofAdmission, HistoricalProofCache};
@@ -74,7 +75,6 @@ const EXACT_PUBLICATION_QUEUE_BATCHES: usize = 8;
 const MAX_RECENT_EXACT_LOCATIONS: usize = 8_192;
 // Combined Active and Frozen 512-MiB generations at SeqCDC-v1's 16-KiB minimum.
 const MAX_ONLINE_DEPENDENCY_PROOFS_V1: usize = 65_536;
-const ACCOUNTED_GENERATION_PROOF_BYTES: usize = 256;
 const WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1: usize = 400 * 1_024 * 1_024;
 const WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1: usize = 32 * 1_024 * 1_024;
 const MULTI_STREAM_QUEUE_BUDGET_BYTES_V1: usize = 16 * 1_024 * 1_024;
@@ -633,6 +633,88 @@ struct GenerationProof {
     admission: HistoricalProofAdmission,
 }
 
+/// Full identities live once in the arena; table buckets carry only ordinals.
+/// Entries never move independently or disappear while the table is queryable.
+#[derive(Debug, Default)]
+struct GenerationProofMap {
+    index: HashTable<u32>,
+    entries: Vec<GenerationProof>,
+}
+
+impl GenerationProofMap {
+    fn key(proof: &GenerationProof) -> (ChunkId, u32) {
+        (proof.entry.chunk_id(), proof.entry.logical_length())
+    }
+
+    fn hash(key: (ChunkId, u32)) -> u64 {
+        let bytes = key.0.bytes();
+        u64::from_le_bytes(bytes[..8].try_into().expect("fixed Chunk ID prefix"))
+            ^ u64::from_le_bytes(bytes[24..].try_into().expect("fixed Chunk ID suffix"))
+                .rotate_left(23)
+            ^ u64::from(key.1).wrapping_mul(0x9E37_79B1_85EB_CA87)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&self, key: &(ChunkId, u32)) -> Option<&GenerationProof> {
+        let &ordinal = self.index.find(Self::hash(*key), |&ordinal| {
+            Self::key(&self.entries[ordinal as usize]) == *key
+        })?;
+        Some(&self.entries[ordinal as usize])
+    }
+
+    fn get_mut(&mut self, key: &(ChunkId, u32)) -> Option<&mut GenerationProof> {
+        let &ordinal = self.index.find(Self::hash(*key), |&ordinal| {
+            Self::key(&self.entries[ordinal as usize]) == *key
+        })?;
+        Some(&mut self.entries[ordinal as usize])
+    }
+
+    fn insert(
+        &mut self,
+        key: (ChunkId, u32),
+        mut proof: GenerationProof,
+    ) -> Option<GenerationProof> {
+        assert_eq!(
+            key,
+            Self::key(&proof),
+            "ASSERT: arena key matches proof identity"
+        );
+        if let Some(previous) = self.get_mut(&key) {
+            if previous.admission == HistoricalProofAdmission::ExactReuse {
+                proof.admission = previous.admission;
+            }
+            return Some(std::mem::replace(previous, proof));
+        }
+        assert!(
+            self.len() < MAX_ONLINE_DEPENDENCY_PROOFS_V1,
+            "ASSERT: proof arena is bounded"
+        );
+        let ordinal = u32::try_from(self.len()).expect("ASSERT: bounded proof ordinal fits u32");
+        self.entries.push(proof);
+        self.index
+            .insert_unique(Self::hash(key), ordinal, |&ordinal| {
+                Self::hash(Self::key(&self.entries[ordinal as usize]))
+            });
+        None
+    }
+
+    fn into_sorted_values(self) -> impl Iterator<Item = GenerationProof> {
+        let Self { index, mut entries } = self;
+        drop(index);
+        // Historical admission order must remain identical to the old BTree.
+        entries.sort_unstable_by_key(Self::key);
+        entries.into_iter()
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<GenerationProof>()
+            + self.index.allocation_size()
+    }
+}
+
 /// Bounded, non-evictable proof ownership for the two live commit generations.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GenerationProofSetStatus {
@@ -660,8 +742,8 @@ impl GenerationProofSetStatus {
 
 #[derive(Debug, Default)]
 struct GenerationProofState {
-    active: BTreeMap<(ChunkId, u32), GenerationProof>,
-    frozen: Option<BTreeMap<(ChunkId, u32), GenerationProof>>,
+    active: GenerationProofMap,
+    frozen: Option<GenerationProofMap>,
     publishing: BTreeSet<(ChunkId, u32)>,
 }
 
@@ -729,32 +811,15 @@ impl OnlineDependencyProofs {
                 HistoricalProofAdmission::ExactReuse
             }
         };
-        if let Some(previous) = target.insert(
+        target.insert(
             key,
             GenerationProof {
                 entry,
                 admission: historical_admission,
             },
-        ) {
-            assert_eq!(
-                previous.entry.chunk_id(),
-                entry.chunk_id(),
-                "ASSERT: online dependency proof key must match its verified Location"
-            );
-            assert_eq!(
-                previous.entry.logical_length(),
-                entry.logical_length(),
-                "ASSERT: one Chunk ID cannot acquire another logical length"
-            );
-            if previous.admission == HistoricalProofAdmission::ExactReuse {
-                target
-                    .get_mut(&key)
-                    .expect("ASSERT: replaced Generation Proof remains present")
-                    .admission = HistoricalProofAdmission::ExactReuse;
-            }
-        }
+        );
         let active_proofs = state.active.len();
-        let frozen_proofs = state.frozen.as_ref().map_or(0, BTreeMap::len);
+        let frozen_proofs = state.frozen.as_ref().map_or(0, GenerationProofMap::len);
         assert!(
             active_proofs
                 .checked_add(frozen_proofs)
@@ -799,8 +864,11 @@ impl OnlineDependencyProofs {
             .frozen
             .take()
             .expect("ASSERT: a new proof freeze must still own Frozen state");
-        for (key, proof) in frozen {
-            state.active.entry(key).or_insert(proof);
+        for proof in frozen.into_sorted_values() {
+            let key = GenerationProofMap::key(&proof);
+            if state.active.get(&key).is_none() {
+                state.active.insert(key, proof);
+            }
         }
         assert!(
             state.active.len() <= MAX_ONLINE_DEPENDENCY_PROOFS_V1,
@@ -816,7 +884,7 @@ impl OnlineDependencyProofs {
             .frozen
             .take()
             .expect("ASSERT: a successful commit owns one Frozen Generation Proof Set");
-        for proof in frozen.into_values() {
+        for proof in frozen.into_sorted_values() {
             self.historical.admit(proof.entry, proof.admission);
         }
     }
@@ -876,6 +944,67 @@ impl OnlineDependencyProofs {
             chunk_id,
             logical_length,
         )));
+        entry
+    }
+
+    /// Finds and promotes a proof for ingest under one Generation lock. A
+    /// Frozen/history hit must enter Active before the new extent uses it.
+    fn verified_entry_for_active(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u64,
+    ) -> Option<ExactIndexEntry> {
+        let logical_length = u32::try_from(logical_length).ok()?;
+        let key = (chunk_id, logical_length);
+        let generation_entry = {
+            let mut state = self
+                .generation
+                .lock()
+                .expect("ASSERT: Generation Proof Set lock poisoned");
+            let GenerationProofState { active, frozen, .. } = &mut *state;
+            let entry = if let Some(proof) = active.get_mut(&key) {
+                proof.admission = HistoricalProofAdmission::ExactReuse;
+                Some(proof.entry)
+            } else {
+                frozen
+                    .as_ref()
+                    .and_then(|proofs| proofs.get(&key))
+                    .map(|proof| {
+                        let entry = proof.entry;
+                        active.insert(
+                            key,
+                            GenerationProof {
+                                entry,
+                                admission: HistoricalProofAdmission::ExactReuse,
+                            },
+                        );
+                        entry
+                    })
+            };
+            assert!(
+                state.active.len() + state.frozen.as_ref().map_or(0, GenerationProofMap::len)
+                    <= MAX_ONLINE_DEPENDENCY_PROOFS_V1,
+                "ASSERT: combined Generation Proof Sets exceeded their budget"
+            );
+            entry
+        };
+        let entry =
+            generation_entry.or_else(|| self.historical.get(chunk_id, u64::from(logical_length)));
+        self.trace.record(ProofCacheEvent::lookup(ProofKey::new(
+            chunk_id,
+            logical_length,
+        )));
+        if let Some(entry) = entry {
+            assert_entry_matches(entry, chunk_id, logical_length);
+            if generation_entry.is_some() {
+                self.trace.record(ProofCacheEvent::admit_exact_reuse(
+                    ProofKey::new(chunk_id, logical_length),
+                    entry.location().record_length(),
+                ));
+            } else {
+                self.remember_active(entry, OnlineProofAdmission::Touch);
+            }
+        }
         entry
     }
 
@@ -958,7 +1087,7 @@ impl OnlineDependencyProofs {
                 "ASSERT: completed publication must release its Chunk claim"
             );
         }
-        let frozen_proofs = state.frozen.as_ref().map_or(0, BTreeMap::len);
+        let frozen_proofs = state.frozen.as_ref().map_or(0, GenerationProofMap::len);
         assert!(
             state
                 .active
@@ -1002,11 +1131,17 @@ impl OnlineDependencyProofs {
             .lock()
             .expect("ASSERT: Generation Proof Set lock poisoned");
         let active_proofs = state.active.len();
-        let frozen_proofs = state.frozen.as_ref().map_or(0, BTreeMap::len);
-        let accounted_bytes = active_proofs
-            .checked_add(frozen_proofs)
-            .and_then(|proofs| proofs.checked_mul(ACCOUNTED_GENERATION_PROOF_BYTES))
-            .expect("ASSERT: bounded Generation Proof accounting cannot overflow");
+        let frozen_proofs = state.frozen.as_ref().map_or(0, GenerationProofMap::len);
+        let accounted_bytes = state
+            .active
+            .allocated_bytes()
+            .checked_add(
+                state
+                    .frozen
+                    .as_ref()
+                    .map_or(0, GenerationProofMap::allocated_bytes),
+            )
+            .expect("ASSERT: bounded Generation Proof allocation accounting cannot overflow");
         GenerationProofSetStatus {
             active_proofs,
             frozen_proofs,
@@ -1103,12 +1238,13 @@ struct InstalledManifest {
     summary: ManifestTreeSummary,
 }
 
-struct VerifiedLocationFile<C> {
-    containers: ContainerRepository<C>,
+struct VerifiedLocationFile {
+    source: Arc<dyn CommittedFile>,
+    source_offset: u64,
     entry: ExactIndexEntry,
 }
 
-impl<C> fmt::Debug for VerifiedLocationFile<C> {
+impl fmt::Debug for VerifiedLocationFile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("VerifiedLocationFile")
@@ -1119,10 +1255,7 @@ impl<C> fmt::Debug for VerifiedLocationFile<C> {
     }
 }
 
-impl<C> CommittedFile for VerifiedLocationFile<C>
-where
-    C: Send + Sync + StorageIo,
-{
+impl CommittedFile for VerifiedLocationFile {
     fn logical_size(&self) -> u64 {
         u64::from(self.entry.logical_length())
     }
@@ -1139,29 +1272,19 @@ where
     }
 
     fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
-        let logical_size = self.logical_size();
-        let start = offset.min(logical_size);
-        let end = offset.saturating_add(u64::from(length)).min(logical_size);
-        if start == end {
-            return Ok(Vec::new());
-        }
-        let bytes = self
-            .containers
-            .read_verified_location(self.entry)
+        self.read_shared_at(offset, length).map(Vec::from)
+    }
+
+    fn read_shared_at(&self, offset: u64, length: u32) -> Result<bytes::Bytes, PosixError> {
+        let start = offset.min(self.logical_size());
+        let length = u32::try_from(u64::from(length).min(self.logical_size() - start))
             .map_err(|_| PosixError::Io)?;
-        if bytes.len()
-            != usize::try_from(logical_size).expect("ASSERT: Exact Index length fits usize")
-        {
-            return Err(PosixError::Io);
-        }
-        let slice_start = usize::try_from(start).expect("ASSERT: Chunk offset fits usize");
-        let slice_end = usize::try_from(end).expect("ASSERT: Chunk end fits usize");
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(slice_end - slice_start)
-            .map_err(|_| PosixError::OutOfMemory)?;
-        output.extend_from_slice(&bytes[slice_start..slice_end]);
-        Ok(output)
+        self.source
+            .read_shared_at(self.source_offset + start, length)
+    }
+
+    fn shared_read_source(&self) -> Option<(Arc<dyn CommittedFile>, u64)> {
+        Some((Arc::clone(&self.source), self.source_offset))
     }
 
     fn matches_complete_bytes(&self, candidate: &[u8]) -> Result<bool, PosixError> {
@@ -1329,9 +1452,19 @@ impl ChunkFragments {
 
     fn is_fill(&self) -> bool {
         let first = self.first_byte();
-        self.parts
-            .iter()
-            .all(|part| part.as_bytes().iter().all(|byte| *byte == first))
+        let repeated = [first; 32];
+        self.parts.iter().all(|part| {
+            let bytes = part.as_bytes();
+            // Keep immediate rejection cheap; fixed-size comparisons let the
+            // compiler vectorize long FILL scans without alignment or Unsafe.
+            let head = bytes.len().min(8);
+            if !bytes[..head].iter().all(|&byte| byte == first) {
+                return false;
+            }
+            let mut blocks = bytes[head..].chunks_exact(repeated.len());
+            blocks.all(|block| block == repeated)
+                && blocks.remainder().iter().all(|&byte| byte == first)
+        })
     }
 
     fn chunk_id(&self) -> ChunkId {
@@ -1468,8 +1601,20 @@ fn prepare_compression_regions<'a>(
             .order
             .push(CompressionRegionOrder::Materialized(ordinal));
     }
+    let materializing_bytes = materializing.iter().try_fold(0_usize, |sum, plan| {
+        sum.checked_add(plan.decoded_length)
+            .ok_or(DurableNamespaceError::OutOfMemory)
+    })?;
+    // Copies need substantially more bytes per worker than fingerprint/codec
+    // jobs. Small batches still own one permit; large batches keep parallelism.
+    let copy_workers = NonZeroUsize::new(
+        workers
+            .get()
+            .min((materializing_bytes / (512 * 1024)).max(1)),
+    )
+    .expect("ASSERT: materialization requests at least one worker");
     prepared.materialized = admission
-        .map(materializing, workers, materialize_compression_region)
+        .map(materializing, copy_workers, materialize_compression_region)
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1775,72 +1920,166 @@ fn take_stable_chunk_batch(
     Ok(batch)
 }
 
+/// A serial FILL pass carries its result into hashing without repeating FILL classification.
 fn classify_stable_chunk_batch(
     batch: &[StableChunk],
-    workers: NonZeroUsize,
-) -> Result<Vec<Option<ChunkId>>, DurableNamespaceError> {
+    budget: NonZeroUsize,
+    permits: &WorkerPermits,
+    telemetry: &CpuPhaseTelemetry,
+) -> Result<(Vec<Option<ChunkId>>, usize), DurableNamespaceError> {
     assert!(
-        !batch.is_empty() && workers.get() <= batch.len(),
-        "ASSERT: stable Chunk hash workers are nonempty and bounded by the batch"
+        !batch.is_empty(),
+        "ASSERT: classification batch is nonempty"
     );
-    if workers.get() == 1 {
-        return classify_stable_chunk_shard(batch);
-    }
-    let next = AtomicUsize::new(0);
-    let worker_results = (0..workers.get())
-        .into_par_iter()
-        .map(|_| {
-            let mut completed = Vec::new();
-            loop {
-                let start = next.fetch_add(4, Ordering::Relaxed);
-                if start >= batch.len() {
-                    break;
-                }
-                for (relative, chunk) in batch[start..(start + 4).min(batch.len())]
-                    .iter()
-                    .enumerate()
-                {
-                    completed.push((
-                        start + relative,
-                        (!chunk.bytes.is_fill()).then(|| chunk.bytes.chunk_id()),
-                    ));
-                }
-            }
-            completed
-        })
-        .collect::<Vec<_>>();
+    let mut lease = permits.acquire(NonZeroUsize::MIN);
+    telemetry.record_permit(&lease);
+    let mut phase = telemetry.begin();
+    let mut ordinals = Vec::new();
+    ordinals
+        .try_reserve_exact(batch.len())
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
     let mut classified = Vec::new();
     classified
         .try_reserve_exact(batch.len())
         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
     classified.resize(batch.len(), None);
-    let mut completed_count = 0;
-    for completed in worker_results {
-        for (ordinal, id) in completed {
-            classified[ordinal] = id;
-            completed_count += 1;
+    let mut hash_bytes = 0_usize;
+    for (ordinal, chunk) in batch.iter().enumerate() {
+        assert!(!chunk.bytes.is_empty(), "ASSERT: SeqCDC Chunk is nonempty");
+        if !chunk.bytes.is_fill() {
+            ordinals.push(ordinal);
+            hash_bytes = hash_bytes
+                .checked_add(chunk.bytes.len())
+                .ok_or(DurableNamespaceError::OutOfMemory)?;
         }
     }
-    assert_eq!(
-        completed_count,
-        batch.len(),
-        "ASSERT: every stable Chunk has one hash worker owner"
-    );
-    Ok(classified)
+    let desired = stable_hash_workers(hash_bytes, ordinals.len(), budget);
+    if desired.get() > 1 {
+        // Never wait for another admission while holding the serial-pass permit.
+        drop(phase);
+        drop(lease);
+        lease = permits.acquire(desired);
+        telemetry.record_permit(&lease);
+        phase = telemetry.begin();
+    }
+    let workers = lease.workers().get();
+    if workers == 1 {
+        for ordinal in ordinals {
+            classified[ordinal] = Some(batch[ordinal].bytes.chunk_id());
+        }
+    } else {
+        let next = AtomicUsize::new(0);
+        let results = (0..workers)
+            .into_par_iter()
+            .map(|worker| {
+                struct Retire<'a, 'b>(&'a WorkerPermitLease<'b>, usize);
+                impl Drop for Retire<'_, '_> {
+                    fn drop(&mut self) {
+                        if self.1 != 0 {
+                            self.0.retire_worker();
+                        }
+                    }
+                }
+                let _worker = Retire(&lease, worker);
+                let mut completed = Vec::new();
+                loop {
+                    let start = next.fetch_add(4, Ordering::Relaxed);
+                    if start >= ordinals.len() {
+                        break;
+                    }
+                    for &ordinal in &ordinals[start..(start + 4).min(ordinals.len())] {
+                        completed.push((ordinal, batch[ordinal].bytes.chunk_id()));
+                    }
+                }
+                completed
+            })
+            .collect::<Vec<_>>();
+        let mut completed_count = 0;
+        for (ordinal, id) in results.into_iter().flatten() {
+            classified[ordinal] = Some(id);
+            completed_count += 1;
+        }
+        assert_eq!(
+            completed_count,
+            ordinals.len(),
+            "ASSERT: every non-FILL Chunk has one hash owner"
+        );
+    }
+    drop(phase);
+    drop(lease);
+    Ok((classified, workers))
 }
 
-fn classify_stable_chunk_shard(
-    batch: &[StableChunk],
-) -> Result<Vec<Option<ChunkId>>, DurableNamespaceError> {
-    let mut classified = Vec::new();
-    classified
-        .try_reserve_exact(batch.len())
-        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-    for chunk in batch {
-        assert!(!chunk.bytes.is_empty(), "ASSERT: SeqCDC Chunk is nonempty");
-        classified.push((!chunk.bytes.is_fill()).then(|| chunk.bytes.chunk_id()));
+fn stable_hash_workers(bytes: usize, chunks: usize, budget: NonZeroUsize) -> NonZeroUsize {
+    // Measured crossover: 1 MiB -> 2 workers, 4 MiB -> 4; large batches may
+    // use the entire pool. Balance coordination growing with worker count
+    // against hash time decreasing with it, rather than imposing a CPU cap.
+    let by_bytes = bytes.div_ceil(256 * 1024).isqrt().max(1);
+    NonZeroUsize::new(budget.get().min(chunks.div_ceil(4).max(1)).min(by_bytes))
+        .expect("ASSERT: hash classification always has one worker")
+}
+
+/// Append-only staging until the whole owner is detached or discarded.
+/// Each append proves its new range and preserves the cached byte sum.
+#[derive(Debug, Default)]
+struct PendingWriteThrough {
+    chunks: Vec<PendingWriteThroughChunk>,
+    bytes: usize,
+}
+
+impl PendingWriteThrough {
+    fn validate_append(previous_end: Option<u64>, chunk: &PendingWriteThroughChunk) -> u64 {
+        assert!(
+            !chunk.bytes.is_empty() && chunk.bytes.len() <= CDC_MAXIMUM_BYTES,
+            "ASSERT: pending write-through Chunk violates SeqCDC length bounds"
+        );
+        assert!(
+            previous_end.is_none_or(|end| end <= chunk.offset),
+            "ASSERT: pending write-through Chunks must be ordered and disjoint"
+        );
+        chunk
+            .offset
+            .checked_add(u64::try_from(chunk.bytes.len()).expect("bounded Chunk fits u64"))
+            .expect("ASSERT: pending write-through Chunk range cannot overflow")
     }
-    Ok(classified)
+
+    fn push(&mut self, chunk: PendingWriteThroughChunk) -> Result<(), DurableNamespaceError> {
+        let previous_end = self.chunks.last().map(|previous| {
+            previous.offset + u64::try_from(previous.bytes.len()).expect("bounded Chunk fits u64")
+        });
+        Self::validate_append(previous_end, &chunk);
+        let bytes = self
+            .bytes
+            .checked_add(chunk.bytes.len())
+            .ok_or(DurableNamespaceError::OutOfMemory)?;
+        assert!(
+            bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
+            "ASSERT: pending write-through payload exceeds its Container bound"
+        );
+        self.chunks
+            .try_reserve(1)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        self.chunks.push(chunk);
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.bytes = 0;
+    }
+
+    fn assert_bounded(&self) {
+        assert_eq!(
+            self.chunks.is_empty(),
+            self.bytes == 0,
+            "ASSERT: pending write-through count and bytes must agree"
+        );
+        assert!(
+            self.bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
+            "ASSERT: pending write-through payload exceeds its Container bound"
+        );
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1852,8 +2091,7 @@ struct WriteThroughStream {
     next_offset: u64,
     tail_offset: u64,
     tail: SegmentedIngestTail,
-    pending_chunks: Vec<PendingWriteThroughChunk>,
-    pending_bytes: usize,
+    pending: PendingWriteThrough,
 }
 
 #[derive(Debug, Default)]
@@ -2083,6 +2321,8 @@ struct IngestQueue {
 #[derive(Debug)]
 struct DetachedContainerWork {
     inode: InodeId,
+    first_chunk_sequence: u64,
+    completion: Option<std::sync::mpsc::SyncSender<Result<(), DurableNamespaceError>>>,
     through_sequence: u64,
     publication_ordinal: u64,
     chunks: Vec<PendingWriteThroughChunk>,
@@ -2096,14 +2336,10 @@ impl DetachedContainerWork {
         chunks: Vec<PendingWriteThroughChunk>,
         payload_bytes: usize,
     ) -> Self {
-        let actual = chunks.iter().fold(0_usize, |total, chunk| {
-            total
-                .checked_add(chunk.bytes.len())
-                .expect("ASSERT: detached Container byte sum cannot overflow")
-        });
+        let (actual, first_chunk_sequence) = validate_pending_chunks(&chunks);
         assert_eq!(
             actual, payload_bytes,
-            "ASSERT: detached Container byte accounting must be exact"
+            "ASSERT: pending write-through byte accounting must be exact"
         );
         assert!(
             !chunks.is_empty() && payload_bytes != 0,
@@ -2117,6 +2353,9 @@ impl DetachedContainerWork {
             inode,
             through_sequence,
             publication_ordinal: 0,
+            first_chunk_sequence: first_chunk_sequence
+                .expect("ASSERT: detached work contains Chunks"),
+            completion: None,
             chunks,
             payload_bytes,
         }
@@ -2224,7 +2463,7 @@ impl PublicationQueue {
                 assert!(
                     inode_queue
                         .in_flight
-                        .insert(work.publication_ordinal, work.through_sequence)
+                        .insert(work.publication_ordinal, work.first_chunk_sequence)
                         .is_none(),
                     "ASSERT: detached publication ordinal is unique per inode"
                 );
@@ -2277,7 +2516,7 @@ impl PublicationQueue {
             .expect("ASSERT: completed publication inode must retain queue state");
         assert_eq!(
             inode_queue.in_flight.remove(&work.publication_ordinal),
-            Some(work.through_sequence),
+            Some(work.first_chunk_sequence),
             "ASSERT: completed publication must match the active inode sequence"
         );
         assert_eq!(
@@ -2296,27 +2535,58 @@ impl PublicationQueue {
     }
 
     fn wait_through(&self, inode: InodeId, through_sequence: u64) {
+        let target = {
+            let state = self
+                .state
+                .lock()
+                .expect("ASSERT: publication queue lock poisoned");
+            state
+                .inodes
+                .get(&inode)
+                .and_then(|queue| {
+                    // A later-ending batch may contain complete pre-cut Chunks.
+                    // Snapshot the required ordinal once: later arrivals cannot
+                    // extend a Sync/Release/checkpoint fence indefinitely.
+                    queue
+                        .in_flight
+                        .iter()
+                        .filter_map(|(&ordinal, &first)| {
+                            (first <= through_sequence).then_some(ordinal)
+                        })
+                        .chain(queue.pending.iter().filter_map(|work| {
+                            (work.first_chunk_sequence <= through_sequence)
+                                .then_some(work.publication_ordinal)
+                        }))
+                        .max()
+                })
+                .map_or(0, |ordinal| ordinal + 1)
+        };
+        self.wait_for_retirement(inode, target);
+    }
+
+    fn retirement_target(&self, inode: InodeId) -> u64 {
+        self.state
+            .lock()
+            .expect("ASSERT: publication queue lock poisoned")
+            .inodes
+            .get(&inode)
+            .map_or(0, |queue| queue.next_publication_ordinal)
+    }
+
+    fn wait_for_retirement(&self, inode: InodeId, target: u64) {
         let mut state = self
             .state
             .lock()
-            .expect("ASSERT: detached publication queue lock poisoned");
-        loop {
-            let complete = state.inodes.get(&inode).is_none_or(|queue| {
-                queue
-                    .in_flight
-                    .values()
-                    .all(|sequence| *sequence > through_sequence)
-                    && queue
-                        .pending
-                        .front()
-                        .is_none_or(|work| work.through_sequence > through_sequence)
-            });
-            if complete {
-                return;
-            }
-            state = self.completed.wait(state).expect(
-                "ASSERT: detached publication queue lock poisoned while waiting for sequence fence",
-            );
+            .expect("ASSERT: publication queue lock poisoned");
+        while state
+            .inodes
+            .get(&inode)
+            .is_some_and(|queue| queue.next_retirement_ordinal < target)
+        {
+            state = self
+                .completed
+                .wait(state)
+                .expect("ASSERT: publication queue lock poisoned while waiting for retirement");
         }
     }
 
@@ -2996,52 +3266,23 @@ impl Drop for ActiveWriteThrough<'_> {
     }
 }
 
-fn workers_per_ingest_job(worker_budget: NonZeroUsize, active_jobs: usize) -> NonZeroUsize {
-    assert!(
-        active_jobs != 0,
-        "ASSERT: worker sharing requires one active write-through job"
-    );
-    let jobs = active_jobs;
-    NonZeroUsize::new((worker_budget.get() / jobs).max(1))
-        .expect("ASSERT: clamped worker share is nonzero")
-}
-
-fn assert_pending_write_through_state(state: &WriteThroughStream) {
+fn validate_pending_chunks(chunks: &[PendingWriteThroughChunk]) -> (usize, Option<u64>) {
     let mut summed_bytes = 0_usize;
     let mut previous_end = None;
-    for pending in &state.pending_chunks {
-        assert!(
-            !pending.bytes.is_empty() && pending.bytes.len() <= CDC_MAXIMUM_BYTES,
-            "ASSERT: pending write-through Chunk violates SeqCDC length bounds"
-        );
-        let end = pending
-            .offset
-            .checked_add(
-                u64::try_from(pending.bytes.len()).expect("ASSERT: pending Chunk length fits u64"),
-            )
-            .expect("ASSERT: pending write-through Chunk range cannot overflow");
-        assert!(
-            previous_end.is_none_or(|previous| previous <= pending.offset),
-            "ASSERT: pending write-through Chunks must be ordered and disjoint"
-        );
-        previous_end = Some(end);
+    let mut first_sequence: Option<u64> = None;
+    for pending in chunks {
+        previous_end = Some(PendingWriteThrough::validate_append(previous_end, pending));
         summed_bytes = summed_bytes
             .checked_add(pending.bytes.len())
             .expect("ASSERT: bounded pending write-through bytes cannot overflow");
+        let sequence = pending.bytes.through_sequence();
+        first_sequence = Some(first_sequence.map_or(sequence, |previous| previous.min(sequence)));
     }
-    assert_eq!(
-        summed_bytes, state.pending_bytes,
-        "ASSERT: pending write-through byte accounting must be exact"
-    );
-    assert_eq!(
-        state.pending_chunks.is_empty(),
-        state.pending_bytes == 0,
-        "ASSERT: pending write-through count and bytes must agree"
-    );
-    assert!(
-        state.pending_bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
-        "ASSERT: pending write-through payload exceeds its Container bound"
-    );
+    (summed_bytes, first_sequence)
+}
+
+fn assert_pending_write_through_state(state: &WriteThroughStream) {
+    state.pending.assert_bounded();
 }
 
 fn assert_bounded_write_through_lane(state: &WriteThroughStream) {
@@ -3049,13 +3290,13 @@ fn assert_bounded_write_through_lane(state: &WriteThroughStream) {
     let buffered = state
         .tail
         .len()
-        .checked_add(state.pending_bytes)
+        .checked_add(state.pending.bytes)
         .expect("ASSERT: bounded Ingest Lane bytes cannot overflow");
     assert!(
         buffered <= CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES,
         "ASSERT: one Ingest Lane exceeded one Container plus CDC suffix: tail={} pending={} buffered={} bound={}",
         state.tail.len(),
-        state.pending_bytes,
+        state.pending.bytes,
         buffered,
         CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES,
     );
@@ -3074,7 +3315,7 @@ impl<C> fmt::Debug for WriteThroughIngest<C> {
                 .expect("ASSERT: write-through lane lock poisoned");
             total
                 .checked_add(lane.tail.len())
-                .and_then(|sum| sum.checked_add(lane.pending_bytes))
+                .and_then(|sum| sum.checked_add(lane.pending.bytes))
                 .expect("ASSERT: bounded write-through lane bytes cannot overflow")
         });
         let overflow = snapshot
@@ -3084,7 +3325,7 @@ impl<C> fmt::Debug for WriteThroughIngest<C> {
         let ingest = self.queue.status();
         let buffered_bytes = buffered_bytes
             .checked_add(overflow.tail.len())
-            .and_then(|sum| sum.checked_add(overflow.pending_bytes))
+            .and_then(|sum| sum.checked_add(overflow.pending.bytes))
             .and_then(|sum| sum.checked_add(ingest.buffered_bytes))
             .and_then(|sum| sum.checked_add(self.publication_queue.buffered_bytes()))
             .expect("ASSERT: bounded write-through bytes cannot overflow");
@@ -3156,14 +3397,20 @@ where
                 .name(format!("fastdup-publish-{ordinal}"))
                 .spawn(move || {
                     while let Some(work) = queue.next_work() {
-                        if let Some(owner) = owner.upgrade() {
+                        let result = if let Some(owner) = owner.upgrade() {
                             let result = owner.publish_detached_container(&work);
                             queue.wait_for_retirement_turn(&work);
-                            owner.retire_detached_container(&work, result);
+                            owner.retire_detached_container(&work, result)
                         } else {
                             queue.wait_for_retirement_turn(&work);
-                        }
+                            Err(DurableNamespaceError::FrozenViewMismatch)
+                        };
                         queue.finish(&work);
+                        if let Some(completion) = &work.completion {
+                            // One bounded reply; a canceled checkpoint may have
+                            // dropped its receiver, but retirement still finishes.
+                            let _ = completion.send(result);
+                        }
                     }
                 })
                 .expect("ASSERT: bounded permanent publication worker creation succeeds");
@@ -3238,7 +3485,7 @@ where
         &self,
         work: &DetachedContainerWork,
         result: Result<(Vec<ExternalizedExtent>, bool), DurableNamespaceError>,
-    ) {
+    ) -> Result<(), DurableNamespaceError> {
         match result {
             Ok((externalized, sealed)) => {
                 if let Some(namespace) = self.namespace.get().and_then(Weak::upgrade) {
@@ -3251,8 +3498,17 @@ where
                         .expect("ASSERT: write-through registry lock poisoned");
                     registry.sealed.push_back(Instant::now());
                 }
+                Ok(())
             }
-            Err(error) => self.degrade_inode(work.inode, work.through_sequence, &error),
+            Err(error) => {
+                // Partial drains return the error to their checkpoint, which
+                // retains the Frozen view for retry. Only unobserved background
+                // failures use ordinary lane degradation.
+                if work.completion.is_none() {
+                    self.degrade_inode(work.inode, work.through_sequence, &error);
+                }
+                Err(error)
+            }
         }
     }
 
@@ -3327,7 +3583,7 @@ where
                 .expect("ASSERT: write-through lane lock poisoned");
             total
                 .checked_add(lane.tail.len())
-                .and_then(|sum| sum.checked_add(lane.pending_bytes))
+                .and_then(|sum| sum.checked_add(lane.pending.bytes))
                 .expect("ASSERT: bounded write-through lane bytes cannot overflow")
         });
         let overflow = snapshot
@@ -3336,7 +3592,7 @@ where
             .expect("ASSERT: write-through overflow lane lock poisoned");
         let buffered = buffered
             .checked_add(overflow.tail.len())
-            .and_then(|sum| sum.checked_add(overflow.pending_bytes))
+            .and_then(|sum| sum.checked_add(overflow.pending.bytes))
             .expect("ASSERT: bounded write-through bytes cannot overflow");
         let ingest = self.queue.status();
         let queued_bytes = ingest
@@ -3448,8 +3704,7 @@ where
                 lane.placement = Some(fragment.placement);
                 lane.tail_offset = fragment.offset;
                 lane.tail.clear();
-                lane.pending_chunks.clear();
-                lane.pending_bytes = 0;
+                lane.pending.clear();
             }
             assert_bounded_write_through_lane(&lane);
             lane.last_mutation_sequence = Some(fragment.mutation_sequence);
@@ -3466,18 +3721,19 @@ where
                     fragment.mutation_sequence,
                     StableExtraction::FillContainer,
                 )?);
-                if lane.pending_bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
+                if lane.pending.bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
                     break;
                 }
                 assert!(
-                    lane.pending_bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
+                    lane.pending.bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
                     "ASSERT: write-through payload exceeded its pre-format Container bound"
                 );
+                let pending = std::mem::take(&mut lane.pending);
                 let work = DetachedContainerWork::new(
                     inode,
                     fragment.mutation_sequence,
-                    std::mem::take(&mut lane.pending_chunks),
-                    std::mem::take(&mut lane.pending_bytes),
+                    pending.chunks,
+                    pending.bytes,
                 );
                 assert_pending_write_through_state(&lane);
                 self.publication_queue.enqueue(work);
@@ -3506,7 +3762,6 @@ where
             lanes
         };
         let mut externalized = Vec::new();
-        let mut sealed = 0_usize;
         for lane in lanes {
             let mut lane = lane
                 .lock()
@@ -3516,6 +3771,7 @@ where
                 assert_pending_write_through_state(&lane);
                 continue;
             };
+            let mut completions = Vec::new();
             loop {
                 let previous_tail = lane.tail.len();
                 let extracted = self.extract_stable_chunks(
@@ -3528,45 +3784,46 @@ where
                     .try_reserve(extracted.len())
                     .map_err(|_| DurableNamespaceError::OutOfMemory)?;
                 externalized.extend(extracted);
-                let had_pending = !lane.pending_chunks.is_empty();
+                let had_pending = !lane.pending.chunks.is_empty();
                 if had_pending {
-                    let (published, did_seal) =
-                        self.publish_pending(&mut lane, inode, through_sequence)?;
-                    externalized
-                        .try_reserve(published.len())
+                    completions
+                        .try_reserve(1)
                         .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-                    externalized.extend(published);
-                    if did_seal {
-                        sealed = sealed
-                            .checked_add(1)
-                            .expect("ASSERT: bounded lane flush count cannot overflow usize");
-                    }
+                    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                    let pending = std::mem::take(&mut lane.pending);
+                    let mut work = DetachedContainerWork::new(
+                        inode,
+                        through_sequence,
+                        pending.chunks,
+                        pending.bytes,
+                    );
+                    work.completion = Some(sender);
+                    // The same 64-MiB queue charges full and partial Containers.
+                    // Only bounded queue backpressure may retain this lane lock.
+                    self.publication_queue.enqueue(work);
+                    completions.push(receiver);
                 }
                 if lane.tail.len() == previous_tail || !had_pending {
                     break;
                 }
             }
             assert!(
-                lane.pending_chunks.is_empty() && lane.pending_bytes == 0,
-                "ASSERT: commit-cut drain must publish every complete staged Chunk"
+                lane.pending.chunks.is_empty() && lane.pending.bytes == 0,
+                "ASSERT: commit-cut drain detaches every complete staged Chunk"
             );
             assert!(
                 lane.tail.len() <= CDC_MAXIMUM_BYTES * 2,
-                "ASSERT: commit-cut drain may retain only one boundary Chunk plus the incomplete CDC suffix"
+                "ASSERT: commit-cut drain retains only a boundary Chunk and CDC suffix"
             );
             assert_bounded_write_through_lane(&lane);
-        }
-        if sealed != 0 {
-            let mut registry = self
-                .registry
-                .lock()
-                .expect("ASSERT: write-through registry lock poisoned");
-            registry
-                .sealed
-                .try_reserve(sealed)
-                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-            for _ in 0..sealed {
-                registry.sealed.push_back(Instant::now());
+            // Pin the finite publication prefix while this lane is stable.
+            let target = self.publication_queue.retirement_target(inode);
+            drop(lane);
+            self.publication_queue.wait_for_retirement(inode, target);
+            for completion in completions {
+                completion
+                    .recv()
+                    .map_err(|_| DurableNamespaceError::FrozenViewMismatch)??;
             }
         }
         Ok(externalized)
@@ -3591,38 +3848,32 @@ where
         assert_pending_write_through_state(state);
         let stable_before = state.tail.len().saturating_sub(CDC_MAXIMUM_BYTES);
         let stable_required = CONTAINER_PAYLOAD_FLUSH_BYTES
-            .checked_sub(state.pending_bytes)
+            .checked_sub(state.pending.bytes)
             .expect("ASSERT: pending bytes remain below the flush threshold");
         if extraction == StableExtraction::FillContainer && stable_before < stable_required {
             return Ok(Vec::new());
         }
         let mut externalized = Vec::new();
-        while state.pending_bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
+        while state.pending.bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
             let maximum_batch_bytes = CONTAINER_PAYLOAD_FLUSH_BYTES
-                .checked_sub(state.pending_bytes)
+                .checked_sub(state.pending.bytes)
                 .expect("ASSERT: pending bytes remain below the flush threshold");
             let batch = take_stable_chunk_batch(state, maximum_batch_bytes)?;
             if batch.is_empty() {
                 break;
             }
-            let desired_workers = workers_per_ingest_job(
+            let (chunk_ids, workers) = classify_stable_chunk_batch(
+                &batch,
                 self.worker_budget,
-                self.active_writers.load(Ordering::Acquire),
-            );
-            let worker_lease = self.worker_permits.acquire(desired_workers);
-            self.hash_cpu.record_permit(&worker_lease);
-            let cpu_phase = self.hash_cpu.begin();
-            let workers = NonZeroUsize::new(worker_lease.workers().get().min(batch.len()))
-                .expect("ASSERT: a nonempty Chunk batch has one hash worker");
-            let chunk_ids = classify_stable_chunk_batch(&batch, workers)?;
-            drop(cpu_phase);
-            drop(worker_lease);
+                &self.worker_permits,
+                &self.hash_cpu,
+            )?;
             self.hash_batches
                 .fetch_add(1, Ordering::Relaxed)
                 .checked_add(1)
                 .expect("ASSERT: hash-batch telemetry cannot overflow");
             self.maximum_hash_workers
-                .fetch_max(workers.get(), Ordering::Relaxed);
+                .fetch_max(workers, Ordering::Relaxed);
             assert_eq!(
                 batch.len(),
                 chunk_ids.len(),
@@ -3650,14 +3901,13 @@ where
                 };
                 if let Some(entry) = self
                     .online_dependency_proofs
-                    .verified_entry(chunk_id, logical_length)
+                    .verified_entry_for_active(chunk_id, logical_length)
                 {
-                    externalized.push(self.externalized_location(
+                    externalized.push(self.externalized_proven_location(
                         inode,
                         chunk.offset,
                         chunk_through_sequence,
                         entry,
-                        OnlineProofAdmission::Touch,
                     )?);
                     continue;
                 }
@@ -3674,38 +3924,16 @@ where
                     )?);
                     continue;
                 }
-                state.pending_bytes = state
-                    .pending_bytes
-                    .checked_add(chunk.bytes.len())
-                    .ok_or(DurableNamespaceError::OutOfMemory)?;
-                state.pending_chunks.push(PendingWriteThroughChunk {
+                state.pending.push(PendingWriteThroughChunk {
                     offset: chunk.offset,
                     chunk_id,
                     bytes: chunk.bytes,
                     placement: state
                         .placement
                         .expect("ASSERT: active Write-Through stream has a placement"),
-                });
+                })?;
             }
         }
-        assert_pending_write_through_state(state);
-        Ok(externalized)
-    }
-
-    fn publish_pending(
-        &self,
-        state: &mut WriteThroughStream,
-        inode: InodeId,
-        through_sequence: u64,
-    ) -> Result<(Vec<ExternalizedExtent>, bool), DurableNamespaceError> {
-        assert_pending_write_through_state(state);
-        if state.pending_chunks.is_empty() {
-            state.pending_bytes = 0;
-            return Ok((Vec::new(), false));
-        }
-        let externalized = self.publish_chunks(&state.pending_chunks, inode, through_sequence)?;
-        state.pending_chunks.clear();
-        state.pending_bytes = 0;
         assert_pending_write_through_state(state);
         Ok(externalized)
     }
@@ -3829,8 +4057,7 @@ where
                 .all(|chunk| chunk.placement == new_chunks[0].placement),
             "ASSERT: one Container cannot cross physical placement tiers"
         );
-        let active_writers = self.active_writers.load(Ordering::Acquire);
-        let desired_workers = workers_per_ingest_job(self.worker_budget, active_writers);
+        let desired_workers = self.worker_budget;
         let materialization_started = Instant::now();
         let prepared_regions =
             prepare_compression_regions(new_chunks, desired_workers, &self.worker_permits);
@@ -3912,6 +4139,9 @@ where
             .iter()
             .map(|target| target.chunk_id())
             .collect::<Vec<_>>();
+        let desired_workers =
+            NonZeroUsize::new(desired_workers.get().min(ordinary_regions.len().max(1)))
+                .expect("ASSERT: serial assembly needs one worker");
         let worker_lease = self.worker_permits.acquire(desired_workers);
         let workers = worker_lease.workers();
         self.encode_cpu.record_permit(&worker_lease);
@@ -3920,15 +4150,21 @@ where
             workers.get() <= self.worker_budget.get(),
             "ASSERT: one encode job cannot exceed the write-through worker budget"
         );
-        let prepared = ContainerRepository::<C>::prepare_mixed_prehashed_reduction_parallel(
-            random_container_id()?,
-            generation,
-            &ordinary_regions,
-            independent,
-            dependents,
-            workers,
-            Some(&chunk_order),
-        )?;
+        let prepared =
+            ContainerRepository::<C>::prepare_mixed_prehashed_reduction_with_worker_retirement(
+                random_container_id()?,
+                generation,
+                &ordinary_regions,
+                independent,
+                dependents,
+                workers,
+                Some(&chunk_order),
+                &|worker| {
+                    if worker != 0 {
+                        worker_lease.retire_worker();
+                    }
+                },
+            )?;
         drop(cpu_phase);
         drop(worker_lease);
         let (verified, _) = self
@@ -3956,6 +4192,7 @@ where
         externalized
             .try_reserve(chunks.len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        let mut entries = Vec::with_capacity(chunks.len());
         for pending in chunks {
             let chunk_id = pending.chunk_id;
             let entry = locations
@@ -3973,12 +4210,30 @@ where
                     second_length: u64::from(expected_length),
                 });
             }
-            externalized.push(self.externalized_proven_location(
+            entries.push(entry);
+        }
+        // One shared virtual file per bounded publication lets live reads
+        // batch adjacent chunk views, including before Exact activation.
+        let source: Arc<dyn CommittedFile> = Arc::new(crate::ManifestCommittedFile::from_verified(
+            self.index
+                .prepare(VerifiedManifestFile::from_published_locations(
+                    &entries,
+                    self.containers.clone(),
+                )?),
+        ));
+        let mut source_offset = 0;
+        for (pending, entry) in chunks.iter().zip(entries) {
+            externalized.push(ExternalizedExtent::new(
                 inode,
                 pending.offset,
                 pending.bytes.through_sequence(),
-                entry,
+                Arc::new(VerifiedLocationFile {
+                    source: Arc::clone(&source),
+                    source_offset,
+                    entry,
+                }),
             )?);
+            source_offset += u64::from(entry.logical_length());
         }
         Ok(externalized)
     }
@@ -4008,7 +4263,14 @@ where
             offset,
             through_sequence,
             Arc::new(VerifiedLocationFile {
-                containers: self.containers.clone(),
+                source: Arc::new(crate::ManifestCommittedFile::from_verified(
+                    self.index
+                        .prepare(VerifiedManifestFile::from_published_locations(
+                            &[entry],
+                            self.containers.clone(),
+                        )?),
+                )),
+                source_offset: 0,
                 entry,
             }),
         )
@@ -7132,6 +7394,245 @@ impl From<MountError> for DurableNamespaceError {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn block_fill_scan_matches_scalar_across_fragment_and_lane_edges() {
+        for length in 1..=512 {
+            for value in [0, 31, 255] {
+                for split in [1, 31, 32, 33, length] {
+                    let mut bytes = vec![value; length];
+                    for bad in [None, Some(0), Some(length / 2), Some(length - 1)] {
+                        if let Some(index) = bad {
+                            bytes[index] ^= 1;
+                        }
+                        let parts = bytes
+                            .chunks(split)
+                            .map(|part| MutationPayload::from_owned_bytes(part.to_vec()))
+                            .collect();
+                        let input = ChunkFragments::new(parts, length);
+                        assert_eq!(input.is_fill(), bytes.iter().all(|byte| *byte == bytes[0]));
+                        if let Some(index) = bad {
+                            bytes[index] ^= 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn publication_fixture(first_sequence: u64, through_sequence: u64) -> DetachedContainerWork {
+        let bytes = vec![17; 16_384];
+        DetachedContainerWork::new(
+            InodeId::new(2).unwrap(),
+            through_sequence,
+            vec![PendingWriteThroughChunk {
+                offset: 0,
+                chunk_id: ChunkId::of(&bytes),
+                bytes: ChunkFragments::new_through(
+                    vec![MutationPayload::from_owned_bytes(bytes)],
+                    16_384,
+                    first_sequence,
+                ),
+                placement: ContainerPlacement::Data,
+            }],
+            16_384,
+        )
+    }
+
+    #[test]
+    fn publication_fence_waits_for_pre_cut_chunks_in_a_later_ending_batch() {
+        let queue = Arc::new(PublicationQueue::new());
+        let inode = InodeId::new(2).unwrap();
+        queue.enqueue(publication_fixture(7, 36));
+        let work = queue.next_work().unwrap();
+        let waiter = Arc::clone(&queue);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            waiter.wait_through(inode, 13);
+            sender.send(()).unwrap();
+        });
+        let escaped = receiver.recv_timeout(Duration::from_millis(100)).is_ok();
+        queue.finish(&work);
+        thread.join().unwrap();
+        assert!(
+            !escaped,
+            "the pre-cut Chunk recipe is not attached before retirement"
+        );
+        receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn fixed_publication_fence_does_not_wait_for_later_arrivals() {
+        let queue = PublicationQueue::new();
+        let inode = InodeId::new(2).unwrap();
+        queue.enqueue(publication_fixture(7, 36));
+        let first = queue.next_work().unwrap();
+        let target = queue.retirement_target(inode);
+        queue.enqueue(publication_fixture(8, 37));
+        let later = queue.next_work().unwrap();
+        queue.finish(&first);
+        queue.wait_for_retirement(inode, target);
+        assert_eq!(queue.buffered_bytes(), 16_384);
+        queue.finish(&later);
+    }
+
+    #[test]
+    fn active_proof_lookup_promotes_frozen_and_preserves_reuse_admission() {
+        let proofs = OnlineDependencyProofs::new().unwrap();
+        let location =
+            ExactIndexLocation::raw(ContainerId::new([29; 16]).unwrap(), 1, 4096, 256, 0).unwrap();
+        let id = ChunkId::of(b"proof");
+        let entry = ExactIndexEntry::active(id, 5, location).unwrap();
+        proofs.remember_active(entry, OnlineProofAdmission::Published);
+        assert_eq!(proofs.verified_entry_for_active(id, 5), Some(entry));
+        assert!(proofs.freeze_for_commit());
+        assert_eq!(proofs.verified_entry_for_active(id, 5), Some(entry));
+        proofs.remember_active(entry, OnlineProofAdmission::Published);
+        let state = proofs.generation.lock().unwrap();
+        assert_eq!(state.active.len(), 1);
+        assert_eq!(state.frozen.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            state.active.get(&(id, 5)).unwrap().admission,
+            HistoricalProofAdmission::ExactReuse
+        );
+        drop(state);
+        assert_eq!(proofs.verified_entry_for_active(id, 6), None);
+    }
+
+    #[test]
+    fn generation_arena_checks_full_keys_and_survives_cancelled_freeze() {
+        let proofs = OnlineDependencyProofs::new().unwrap();
+        let location =
+            ExactIndexLocation::raw(ContainerId::new([29; 16]).unwrap(), 1, 4096, 256, 0).unwrap();
+        let mut first = [3_u8; 32];
+        first[8] = 7;
+        let mut second = first;
+        second[8] = 8;
+        let a = ExactIndexEntry::active(ChunkId::from_bytes(first), 32, location).unwrap();
+        let b = ExactIndexEntry::active(ChunkId::from_bytes(second), 32, location).unwrap();
+        assert_eq!(
+            GenerationProofMap::hash((a.chunk_id(), 32)),
+            GenerationProofMap::hash((b.chunk_id(), 32))
+        );
+        proofs.remember_active(a, OnlineProofAdmission::Published);
+        proofs.remember_active(b, OnlineProofAdmission::Published);
+        assert!(proofs.freeze_for_commit());
+        assert_eq!(proofs.verified_entry_for_active(b.chunk_id(), 32), Some(b));
+        proofs.cancel_new_freeze(true);
+        let state = proofs.generation.lock().unwrap();
+        assert!(state.frozen.is_none());
+        assert_eq!(state.active.len(), 2);
+        assert_eq!(state.active.get(&(a.chunk_id(), 32)).unwrap().entry, a);
+        assert_eq!(
+            state.active.get(&(b.chunk_id(), 32)).unwrap().admission,
+            HistoricalProofAdmission::ExactReuse
+        );
+        assert!(state.active.get(&(a.chunk_id(), 33)).is_none());
+        drop(state);
+        assert!(proofs.freeze_for_commit());
+        let frozen = proofs.generation.lock().unwrap().frozen.take().unwrap();
+        let ordered: Vec<_> = frozen
+            .into_sorted_values()
+            .map(|p| p.entry.chunk_id())
+            .collect();
+        assert_eq!(ordered, vec![a.chunk_id(), b.chunk_id()]);
+        assert_eq!(proofs.generation_status().accounted_bytes(), 0);
+    }
+
+    #[test]
+    fn hash_granularity_preserves_fragmented_mixed_batches_and_partial_permits() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(10)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let permits = WorkerPermits::new(NonZeroUsize::new(10).unwrap());
+            let mut batch = Vec::new();
+            for ordinal in 0..128 {
+                let mut bytes = vec![19; CDC_MAXIMUM_BYTES];
+                if ordinal % 3 != 0 {
+                    let middle = bytes.len() / 2;
+                    bytes[middle] = 27;
+                }
+                let parts = bytes
+                    .chunks(17003)
+                    .map(|part| MutationPayload::from_owned_bytes(part.to_vec()))
+                    .collect();
+                batch.push(StableChunk {
+                    offset: (ordinal * CDC_MAXIMUM_BYTES) as u64,
+                    bytes: ChunkFragments::new(parts, bytes.len()),
+                });
+            }
+            let expected: Vec<_> = batch
+                .iter()
+                .map(|c| (!c.bytes.is_fill()).then(|| c.bytes.chunk_id()))
+                .collect();
+            let held = permits.acquire(NonZeroUsize::new(8).unwrap());
+            let (actual, workers) = classify_stable_chunk_batch(
+                &batch,
+                NonZeroUsize::new(10).unwrap(),
+                &permits,
+                &CpuPhaseTelemetry::default(),
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(workers, 2);
+            assert_eq!(permits.available(), 2);
+            drop(held);
+            let fill: Vec<_> = batch.into_iter().step_by(3).collect();
+            let (actual, workers) = classify_stable_chunk_batch(
+                &fill,
+                NonZeroUsize::new(10).unwrap(),
+                &permits,
+                &CpuPhaseTelemetry::default(),
+            )
+            .unwrap();
+            assert!(actual.iter().all(Option::is_none));
+            assert_eq!(workers, 1);
+            assert_eq!(permits.available(), 10);
+            assert_eq!(
+                stable_hash_workers(32 * 1024 * 1024, 128, NonZeroUsize::new(10).unwrap()).get(),
+                10
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "ordered and disjoint")]
+    fn pending_append_rejects_overlap_before_staging() {
+        let mut pending = PendingWriteThrough::default();
+        for offset in [10, 12] {
+            pending
+                .push(PendingWriteThroughChunk {
+                    offset,
+                    chunk_id: ChunkId::of(b"abc"),
+                    bytes: ChunkFragments::new(
+                        vec![MutationPayload::from_owned_bytes(b"abc".to_vec())],
+                        3,
+                    ),
+                    placement: ContainerPlacement::Data,
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ordered and disjoint")]
+    fn detach_independently_rejects_reordered_chunks() {
+        let chunks = [10, 5]
+            .into_iter()
+            .map(|offset| PendingWriteThroughChunk {
+                offset,
+                chunk_id: ChunkId::of(b"abc"),
+                bytes: ChunkFragments::new(
+                    vec![MutationPayload::from_owned_bytes(b"abc".to_vec())],
+                    3,
+                ),
+                placement: ContainerPlacement::Data,
+            })
+            .collect();
+        DetachedContainerWork::new(InodeId::new(2).unwrap(), 1, chunks, 6);
+    }
     use super::*;
     use fastdup_format::ExactIndexLocation;
     use fastdup_testkit::MemoryStorageIo;
@@ -7219,7 +7720,7 @@ mod tests {
                 .generation
                 .lock()
                 .expect("fixture Generation Proof Set lock remains healthy");
-            if !state.active.is_empty() && !state.publishing.is_empty() {
+            if state.active.len() != 0 && !state.publishing.is_empty() {
                 observed_partial_batch = true;
                 drop(state);
                 assert!(proofs.freeze_for_commit());
@@ -7302,7 +7803,13 @@ mod tests {
             .read_verified_location(entry)
             .expect("perform the one physical candidate verification");
         let after_verification = storage.operation_count();
-        let external = VerifiedLocationFile { containers, entry };
+        let external = VerifiedLocationFile {
+            source: Arc::new(crate::ManifestCommittedFile::from_verified(
+                VerifiedManifestFile::from_published_locations(&[entry], containers).unwrap(),
+            )),
+            source_offset: 0,
+            entry,
+        };
 
         assert!(
             external
@@ -7314,6 +7821,57 @@ mod tests {
             storage.operation_count(),
             after_verification,
             "frontend externalization must not repeat Container envelope or Record I/O"
+        );
+    }
+
+    #[test]
+    fn live_prefix_location_reads_before_target_index_activation() {
+        let storage = MemoryStorageIo::new();
+        let containers = ContainerRepository::new(storage.clone());
+        let base = (0_u32..16384)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect::<Vec<_>>();
+        let mut target = base.clone();
+        target[17] ^= 0x5b;
+        let base_id = ContainerId::new([0xe1; 16]).unwrap();
+        containers.publish_raw(base_id, 1, &[&base]).unwrap();
+        let base_entry =
+            ExactIndexEntry::from_verified(containers.read(base_id).unwrap().locations()[0])
+                .unwrap();
+        let indexes = ExactIndexRunRepository::new(storage.clone());
+        indexes
+            .append_level_zero(
+                ExactIndexProfileId::new([0xe3; 32]).unwrap(),
+                vec![base_entry],
+            )
+            .unwrap();
+        let active = indexes.pin_active_generation().unwrap();
+        let publication = containers
+            .publish_zstd_prefix_pairs_verified(
+                ContainerId::new([0xe2; 16]).unwrap(),
+                2,
+                &[(&base, &target)],
+            )
+            .unwrap();
+        let entry = ExactIndexEntry::from_verified(publication.locations()[0]).unwrap();
+        let before = storage.operation_count();
+        let reader = VerifiedManifestFile::from_published_locations(&[entry], containers)
+            .unwrap()
+            .with_active_index(&active);
+        let external = VerifiedLocationFile {
+            source: Arc::new(ManifestCommittedFile::from_verified(reader)),
+            source_offset: 0,
+            entry,
+        };
+        assert_eq!(
+            storage.operation_count(),
+            before,
+            "live recipe construction cannot reread DATA"
+        );
+        assert_eq!(external.read_at(0, 16384).unwrap(), target);
+        assert_eq!(
+            external.read_shared_at(9, 53).unwrap().as_ref(),
+            &target[9..62]
         );
     }
 
@@ -7639,15 +8197,16 @@ mod tests {
     }
 
     #[test]
-    fn active_ingest_jobs_share_one_global_worker_budget() {
-        let budget = NonZeroUsize::new(10).expect("fixture budget is nonzero");
-        assert_eq!(workers_per_ingest_job(budget, 1).get(), 10);
-        assert_eq!(workers_per_ingest_job(budget, 2).get(), 5);
-        assert_eq!(workers_per_ingest_job(budget, 10).get(), 1);
-        assert_eq!(workers_per_ingest_job(budget, 64).get(), 1);
-        for active in 1..=10 {
-            assert!(workers_per_ingest_job(budget, active).get() * active <= budget.get());
-        }
+    fn cpu_admission_uses_available_workers_during_ingest_io() {
+        let budget = NonZeroUsize::new(10).unwrap();
+        let permits = WorkerPermits::new(budget);
+        let active = AtomicUsize::new(0);
+        let _io_job = ActiveWriteThrough::enter(&active);
+        let cpu = permits.acquire(budget);
+        assert_eq!(cpu.workers(), budget);
+        assert_eq!(permits.available(), 0);
+        drop(cpu);
+        assert_eq!(permits.available(), 10);
     }
 
     #[test]
@@ -7768,23 +8327,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "pending write-through byte accounting must be exact")]
     fn pending_write_through_accounting_asserts_at_the_planner_boundary() {
-        let state = WriteThroughStream {
-            pending_chunks: vec![PendingWriteThroughChunk {
-                offset: 0,
-                chunk_id: ChunkId::of(&[1, 2, 3]),
-                bytes: ChunkFragments::new(
-                    vec![
-                        MutationPayload::try_copy_from_slice(&[1, 2, 3])
-                            .expect("allocate fixture payload"),
-                    ],
-                    3,
-                ),
-                placement: ContainerPlacement::Data,
-            }],
-            pending_bytes: 2,
-            ..WriteThroughStream::default()
-        };
-        assert_pending_write_through_state(&state);
+        let chunks = vec![PendingWriteThroughChunk {
+            offset: 0,
+            chunk_id: ChunkId::of(&[1, 2, 3]),
+            bytes: ChunkFragments::new(vec![MutationPayload::from_owned_bytes(vec![1, 2, 3])], 3),
+            placement: ContainerPlacement::Data,
+        }];
+        DetachedContainerWork::new(InodeId::new(2).unwrap(), 1, chunks, 2);
     }
 
     #[test]

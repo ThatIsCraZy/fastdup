@@ -48,3 +48,29 @@ only at candidate pages.
   page-bound bytes.
 - The repeatable benchmark and results are recorded in
   `docs/benchmarks/exact-lookup-mmap-2026-08-27.md`.
+
+## Reuse during an in-process L0 append (2026-09-06)
+
+The serialized L0 append reads and validates the durable Activation Record and
+its stored Run Set before matching the installed generation. It may reuse that
+generation's already audited Mapping owners and Page Bounds only while their
+immutable-file leases remain alive. Each successor Run reference must match
+the owner's profile, generation, complete Run hash and length. New or unknown
+Runs receive a complete audit. The final Activation-Log sync and generation
+retirement fences are unchanged.
+
+This avoids auditing every unchanged Run once to reload the predecessor and
+again to activate its successor. Positional adapters, changed selectors and
+process restart retain complete verification. Public activation, recovery and
+offline scrub independently audit; the append optimization does not change
+their corruption-detection boundary. The stored Run Set is still reread even
+when its Runs can be shared. New membership admission resamples memory
+pressure: a reused Bloom hint is dropped from the successor if it exceeds the
+remaining budget, including when Swap disables admission. The Mapping may
+still be reused without that optional hint.
+
+Tests pair shared Mapping identity with independent recovery, reject a
+different Run hash and stale installed selector, and verify pressure-driven
+hint removal. Existing positional, activation fault, immutable-file mutation
+and generation-drain tests remain required. The source audit and measurement
+basis are in `docs/research/hotpath-audit6-2026-09-06.md`.

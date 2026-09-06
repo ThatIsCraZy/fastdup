@@ -18,12 +18,10 @@ subtree allocation, level, and child identity are verified together.
 
 ## Compatibility and pairing
 
-Readers continue to accept Manifest Inner Node v1. A v1 child has no trusted
-allocation summary, so an operation that requires one may perform a complete
-verified scan or refuse the optimized path; it must not invent a total. New
-trees and every rewritten ancestor use v2. An untouched v1 subtree can be
-referenced by a v2 parent only after its allocation total has been completely
-verified.
+Writers emit and readers accept only Manifest Inner Node v2. ADR 0074
+removed the earlier pre-production v1 compatibility path: there is no mixed
+v1/v2 tree or fallback scan for a v1 child. Unsupported versions fail closed
+at decode, including recovery and offline scrub.
 
 The writer computes leaf totals from canonical extents and parent totals with
 checked addition. Recovery and offline scrub traverse the complete selected

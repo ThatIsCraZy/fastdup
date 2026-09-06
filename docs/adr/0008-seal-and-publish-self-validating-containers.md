@@ -21,5 +21,7 @@ The total container size is capped at 64 MiB and an individual encoded record at
 decoded logical chunks, and BLAKE3-256 binds the sealed container structure. Recovery
 ignores building files, invalid footers, unknown required flags, and nonzero
 reserved fields. A random 128-bit container ID identifies the immutable object;
-a separate monotonic 64-bit container generation records creation order and can
-resume above the maximum generation found during rebuild.
+a separate monotonic 64-bit Container generation records creation order. Writable
+allocator recovery uses the paired durable high-water reservations in ADR 0072;
+scanning the maximum published generation alone cannot prevent reuse after a
+crash. ADR 0088 advances the Container envelope and intrinsic summary to v3.

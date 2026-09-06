@@ -1,5 +1,59 @@
 use super::*;
 
+#[test]
+fn consuming_read_view_preserves_nonzero_backing_offset_and_checked_bounds() {
+    let mut payload =
+        VerifiedChunkPayload::from_owned(ChunkId::of(b"0123456789"), b"0123456789".to_vec());
+    payload.offset = 3;
+    payload.length = 4;
+    let pointer = payload.as_slice()[1..].as_ptr();
+    let view = payload.clone().into_read_view(1..4).unwrap();
+    assert_eq!(view.as_ref(), b"456");
+    assert_eq!(view.as_ref().as_ptr(), pointer);
+    assert!(
+        payload
+            .clone()
+            .into_read_view(4..4)
+            .unwrap()
+            .as_ref()
+            .is_empty()
+    );
+    assert!(
+        payload
+            .clone()
+            .into_read_view(std::ops::Range { start: 2, end: 1 })
+            .is_none()
+    );
+    assert!(payload.clone().into_read_view(0..5).is_none());
+    drop(payload);
+    assert_eq!(view.as_ref(), b"456");
+}
+
+#[test]
+fn prefix_vec_output_checks_actual_decoded_length_in_both_directions() {
+    let base = vec![19; 64 * 1024];
+    let mut target = base.clone();
+    target[123] = 7;
+    let encoded = ZstdPrefixRecord::encode(&base, &target).unwrap();
+    let verified = VerifiedChunkPayload::from_owned(ChunkId::of(&base), base.clone());
+    assert_eq!(
+        ZstdPrefixRecord::decode_with_verified_base(&encoded, &verified)
+            .unwrap()
+            .payload(),
+        target
+    );
+    for declared_length in [65535, 65537] {
+        let mut corrupt = encoded.clone();
+        put_u32(&mut corrupt, 36, declared_length);
+        // Exercise the output boundary independently of earlier CRC/shape
+        // rejection: successful Zstd output must still match the exact length.
+        assert!(ZstdPrefixRecord::decode_after_base_verification(&corrupt, &base).is_err());
+    }
+    let mut corrupt = encoded;
+    corrupt[RECORD_HEADER_BYTES + CHUNK_TABLE_ENTRY_BYTES] ^= 3;
+    assert!(ZstdPrefixRecord::decode_with_verified_base(&corrupt, &verified).is_err());
+}
+
 fn fixture(length: usize) -> Vec<u8> {
     let mut state = 0x1234_5678_9012_abcd_u64;
     (0..length)

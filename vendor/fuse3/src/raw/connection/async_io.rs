@@ -165,6 +165,22 @@ impl FuseConnection {
         }
     }
 
+    pub async fn write_segments(
+        &self,
+        header: &[u8],
+        data: &[bytes::Bytes],
+    ) -> std::io::Result<usize> {
+        match &self.mode {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            ConnectionMode::Block(connection) => connection.write_segments(header, data).await,
+            #[cfg(any(
+                all(target_os = "linux", feature = "unprivileged"),
+                target_os = "freebsd"
+            ))]
+            ConnectionMode::NonBlock(connection) => connection.write_segments(header, data).await,
+        }
+    }
+
     pub async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
         &self,
         data: T,
@@ -357,6 +373,14 @@ impl BlockFuseConnection {
         ((header_buf, data_buf), res)
     }
 
+    async fn write_segments(&self, header: &[u8], data: &[bytes::Bytes]) -> std::io::Result<usize> {
+        let _guard = self.write.lock().await;
+        let mut slices = Vec::with_capacity(data.len() + 1);
+        slices.push(IoSlice::new(header));
+        slices.extend(data.iter().map(|bytes| IoSlice::new(bytes)));
+        (&self.file).write_vectored(&slices)
+    }
+
     async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(
         &self,
         data: T,
@@ -515,6 +539,14 @@ impl NonBlockFuseConnection {
             .await;
 
         ((header_buf, data_buf), res)
+    }
+
+    async fn write_segments(&self, header: &[u8], data: &[bytes::Bytes]) -> std::io::Result<usize> {
+        let _guard = self.write.lock().await;
+        let mut slices = Vec::with_capacity(data.len() + 1);
+        slices.push(IoSlice::new(header));
+        slices.extend(data.iter().map(|bytes| IoSlice::new(bytes)));
+        uio::writev(&self.fd, &slices).map_err(Into::into)
     }
 
     async fn write_vectored<T: Deref<Target = [u8]> + Send, U: Deref<Target = [u8]> + Send>(

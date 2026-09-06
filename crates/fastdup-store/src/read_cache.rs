@@ -192,9 +192,15 @@ struct CacheKey {
 
 #[derive(Clone, Debug)]
 struct CacheEntry {
-    key: CacheKey,
     payload: VerifiedChunkPayload,
     backing_charge: Arc<CacheBackingCharge>,
+}
+
+impl CacheEntry {
+    fn matches(&self, key: CacheKey) -> bool {
+        self.payload.chunk_id() == key.chunk_id
+            && u64::try_from(self.payload.len()).ok() == Some(key.logical_length)
+    }
 }
 
 #[derive(Debug)]
@@ -552,7 +558,7 @@ impl VerifiedReadCache {
             .ways
             .iter()
             .flatten()
-            .find(|entry| entry.key == key)
+            .find(|entry| entry.matches(key))
             .map(|entry| entry.payload.clone());
         if let Some(payload) = payload {
             assert_eq!(
@@ -654,7 +660,7 @@ impl VerifiedReadCache {
                 .expect("ASSERT: verified read-cache shard lock poisoned");
             let set_index = (hash / self.shards.len()) % state.sets.len();
             let set = &mut state.sets[set_index];
-            if set.ways.iter().flatten().any(|entry| entry.key == key) {
+            if set.ways.iter().flatten().any(|entry| entry.matches(key)) {
                 continue;
             }
             let victim = set
@@ -690,7 +696,6 @@ impl VerifiedReadCache {
                 continue;
             }
             let replaced = set.ways[victim].replace(CacheEntry {
-                key,
                 payload,
                 backing_charge: Arc::clone(&backing_charge),
             });

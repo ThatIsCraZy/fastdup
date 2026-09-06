@@ -4,6 +4,10 @@ status: accepted
 
 # Prepublish streaming Containers and coalesce generation commits
 
+Current-state note (2026-09-05): the streaming and coalescing decision remains
+current. Read the historical FastCDC names below as SeqCDC-v1 under ADR 0054;
+production DATA publication uses the io_uring adapter under ADR 0058.
+
 Long sequential writes pass through bounded process-local FastCDC Ingest Lanes
 before the Namespace generation is frozen. Each registered lane retains at most
 one adaptive Container target plus its bounded CDC suffix. Complete Chunks are

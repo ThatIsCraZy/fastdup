@@ -22,7 +22,7 @@ configuration is not an accepted substitute.
 
 ## Manifest Chunk slices
 
-Veeam aligns clone ranges to 4 KiB or 64 KiB, while FastCDC boundaries are
+Veeam aligns clone ranges to 4 KiB or 64 KiB, while SeqCDC boundaries are
 content-defined. Manifest Leaf v2 therefore adds DATA_SLICE extent kind `4`.
 It retains the existing 64-byte extent record and stores the full immutable
 Chunk identity and length plus a checked byte offset. The logical slice must be
@@ -34,9 +34,9 @@ full `chunk_length`; allocation accounting uses the slice's `logical_length`.
 Slicing an existing DATA or DATA_SLICE extent changes only Manifest metadata
 and never creates a new logical Chunk identity or physical Location.
 
-Manifest Leaf v1 remains readable. A leaf containing no DATA_SLICE continues
-to encode as v1 for stable bytes; a leaf containing at least one slice encodes
-as v2. Unknown versions and kind/version mismatches fail closed.
+Manifest writers emit and readers accept only Leaf v2, including leaves
+without DATA_SLICE. ADR 0074 removed the earlier v1 compatibility path.
+Unknown versions and invalid extent kinds fail closed.
 
 ## Admission and edge semantics
 

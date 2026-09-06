@@ -593,6 +593,12 @@ pub enum Operation<'a> {
         offset: u64,
         length: u32,
     },
+    ReadSegments {
+        inode: InodeId,
+        handle: HandleId,
+        offset: u64,
+        length: u32,
+    },
     Write {
         inode: InodeId,
         handle: HandleId,
@@ -777,6 +783,7 @@ pub enum Reply {
     Opened(HandleId),
     Data(Vec<u8>),
     SharedData(Bytes),
+    SegmentedData(Vec<Bytes>),
     LinkTarget(Vec<u8>),
     Xattr(Vec<u8>),
     FileFlags(u32),
@@ -2415,14 +2422,6 @@ fn plan_overlap(
     Ok(())
 }
 
-fn copy_bytes(source: &[u8]) -> Result<Vec<u8>, PosixError> {
-    let mut copy = Vec::new();
-    copy.try_reserve_exact(source.len())
-        .map_err(|_| PosixError::OutOfMemory)?;
-    copy.extend_from_slice(source);
-    Ok(copy)
-}
-
 #[derive(Debug)]
 #[repr(align(64))]
 struct Inode {
@@ -3839,13 +3838,19 @@ impl Namespace {
                 handle,
                 offset,
                 length,
-            } => self.read(inode, handle, offset, length, false),
+            } => self.read(inode, handle, offset, length, 0),
             Operation::ReadShared {
                 inode,
                 handle,
                 offset,
                 length,
-            } => self.read(inode, handle, offset, length, true),
+            } => self.read(inode, handle, offset, length, 1),
+            Operation::ReadSegments {
+                inode,
+                handle,
+                offset,
+                length,
+            } => self.read(inode, handle, offset, length, 2),
             Operation::Write {
                 inode,
                 handle,
@@ -4711,7 +4716,7 @@ impl Namespace {
         handle: HandleId,
         offset: u64,
         length: u32,
-        shared: bool,
+        representation: u8,
     ) -> Result<Reply, PosixError> {
         let (object, open) = self.resolve_open_file(inode, handle)?;
         if open.options.access == AccessMode::WriteOnly {
@@ -4725,13 +4730,13 @@ impl Namespace {
         );
         let plan = state.data.plan_read(offset, length)?;
         drop(state);
-        let bytes = plan.execute_shared()?;
+        let reply = match representation {
+            0 => Reply::Data(plan.execute()?),
+            1 => Reply::SharedData(plan.execute_shared()?),
+            _ => Reply::SegmentedData(plan.execute_segments()?),
+        };
         self.update_relatime(inode, &object);
-        Ok(if shared {
-            Reply::SharedData(bytes)
-        } else {
-            Reply::Data(Vec::from(bytes))
-        })
+        Ok(reply)
     }
 
     fn write(

@@ -308,19 +308,22 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             }
         }
         let mut trials = trials.into_iter();
+        let mut wave = Vec::new();
         loop {
             // At most eight independently verified Base owners survive a CPU
             // boundary. No speculative candidates beyond the original trial
             // budget are read. The coherent Exact pin lives through all waves.
-            let mut wave = trials.by_ref().take(8).collect::<Vec<_>>();
+            wave.extend(trials.by_ref().take(8 - wave.len()));
             if wave.is_empty() {
                 break;
             }
-            while !wave.is_empty() {
+            {
+                let mut bases = std::collections::BTreeMap::new();
                 let mut ready = Vec::new();
-                for (ordinal, mut trial, hint) in wave {
-                    if let Some((candidate, base)) =
-                        self.read_next_trial_base(&mut trial, containers, cache, &snapshot)
+                let mut pending = std::collections::VecDeque::from(wave);
+                while let Some((ordinal, mut trial, hint)) = pending.pop_front() {
+                    if let Some((candidate, base)) = self
+                        .read_next_trial_base(&mut trial, containers, cache, &snapshot, &mut bases)
                     {
                         ready.push((ordinal, trial, hint, candidate, base));
                     } else {
@@ -328,8 +331,13 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
                         let hint =
                             (!matches!(plan, PersistentChunkPlan::Dependent(_))).then_some(hint);
                         ordered[ordinal] = Some((plan, hint));
+                        if let Some(next) = trials.next() {
+                            pending.push_back(next);
+                        }
                     }
                 }
+                // Only ready Base owners (at most eight) cross into CPU work.
+                drop(bases);
                 let completed = map_admitted(
                     ready,
                     workers,
@@ -523,9 +531,13 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         match self.prepare_trial(target_id, target, fingerprint, counters, snapshot)? {
             PreparedChunkTrial::Ready(plan) => Ok(plan),
             PreparedChunkTrial::Trials(mut trial) => {
-                while let Some((candidate, base)) =
-                    self.read_next_trial_base(&mut trial, containers, cache, snapshot)
-                {
+                while let Some((candidate, base)) = self.read_next_trial_base(
+                    &mut trial,
+                    containers,
+                    cache,
+                    snapshot,
+                    &mut std::collections::BTreeMap::new(),
+                ) {
                     trial.run_base(candidate, base.as_slice(), counters)?;
                 }
                 Ok(trial.finish(counters))
@@ -610,6 +622,10 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         containers: &ContainerRepository<C>,
         cache: Option<&VerifiedReadCache>,
         snapshot: &ReductionBatchSnapshot<I>,
+        bases: &mut std::collections::BTreeMap<
+            (ChunkId, u32),
+            fastdup_format::VerifiedChunkPayload,
+        >,
     ) -> Option<(
         SimilarityBaseCandidate,
         fastdup_format::VerifiedChunkPayload,
@@ -622,12 +638,13 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         let _base_phase = ReductionTimer::new(&counters.base_read_ns);
         for candidate in trial.candidates.by_ref() {
             counters.base_reads.fetch_add(1, Ordering::Relaxed);
-            if let Some(base) = containers.find_verified_independent_base_payload_with_index(
-                exact,
-                candidate.chunk_id(),
-                candidate.logical_length(),
-                cache,
-            ) {
+            let key = (candidate.chunk_id(), candidate.logical_length());
+            let base = bases.get(&key).cloned().or_else(|| {
+                containers
+                    .find_verified_independent_base_payload_with_index(exact, key.0, key.1, cache)
+            });
+            if let Some(base) = base {
+                bases.entry(key).or_insert_with(|| base.clone());
                 counters.base_read_bytes.fetch_add(
                     u64::try_from(base.len()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
@@ -935,6 +952,101 @@ mod tests {
     use std::mem::{align_of, size_of};
 
     use super::*;
+
+    #[test]
+    fn refilled_base_waves_match_serial_codec_decisions_and_order() {
+        use crate::{
+            ContainerRepository, ExactIndexRunRepository, FsStorageIo, SimilarityIndexRepository,
+        };
+        use fastdup_format::{ContainerId, ExactIndexEntry, ExactIndexProfileId};
+        let root = std::env::temp_dir().join(format!(
+            "fastdup-base-waves-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = FsStorageIo::open(&root).unwrap();
+        let containers = ContainerRepository::new(storage.clone());
+        let mut seed = 71_u64;
+        let base = (0..65536)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                u8::try_from(seed & 0xff).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let container_id = ContainerId::new([0xe9; 16]).unwrap();
+        containers.publish_raw(container_id, 1, &[&base]).unwrap();
+        let entry =
+            ExactIndexEntry::from_verified(containers.read(container_id).unwrap().locations()[0])
+                .unwrap();
+        let exact = ExactIndexRunRepository::new(storage.clone());
+        exact
+            .append_level_zero(ExactIndexProfileId::new([0xe8; 32]).unwrap(), vec![entry])
+            .unwrap();
+        let active = exact.pin_active_generation().unwrap();
+        let similarities = SimilarityIndexRepository::new(storage);
+        let mut stager = similarities.entry_stager(1);
+        stager
+            .push(crate::similarity_index_entry_v1(&base).unwrap())
+            .unwrap();
+        let publication = similarities
+            .finish_staged_entries(1, stager, active.run_set().id().unwrap())
+            .unwrap();
+        similarities.activate_staged_family(publication).unwrap();
+        let planner = PersistentReductionIndex::new(
+            &active,
+            Arc::new(similarities.recover_latest().unwrap().unwrap()),
+        )
+        .unwrap();
+        let targets = (0_usize..25)
+            .map(|ordinal| {
+                if ordinal % 7 == 0 {
+                    return vec![0x51; 65536];
+                }
+                let mut target = base.clone();
+                target[ordinal * 91] ^= 0x5a;
+                target
+            })
+            .collect::<Vec<_>>();
+        let chunks = targets
+            .iter()
+            .map(|bytes| PrehashedChunk::new(ChunkId::of(bytes), bytes))
+            .collect::<Vec<_>>();
+        for workers in [1, 4] {
+            let workers = NonZeroUsize::new(workers).unwrap();
+            let permits = crate::WorkerPermits::new(workers);
+            let batch = planner.plan_batch_for_publication_cached(
+                &containers,
+                &chunks,
+                None,
+                workers,
+                &permits,
+            );
+            assert_eq!(permits.available(), workers.get());
+            for ((observed, observed_hint), chunk) in batch.into_iter().zip(&chunks) {
+                let (expected, expected_hint) = planner
+                    .plan_chunk_for_publication(&containers, chunk.chunk_id(), chunk.bytes())
+                    .unwrap();
+                assert_eq!(observed_hint, expected_hint);
+                match (observed, expected) {
+                    (PersistentChunkPlan::NoCandidates, PersistentChunkPlan::NoCandidates) => {}
+                    (PersistentChunkPlan::Independent(a), PersistentChunkPlan::Independent(b)) => {
+                        assert_eq!(a, b);
+                    }
+                    (PersistentChunkPlan::Dependent(a), PersistentChunkPlan::Dependent(b)) => {
+                        assert_eq!(a, b);
+                    }
+                    _ => panic!("batch changed serial codec selection"),
+                }
+            }
+        }
+        assert!(planner.status().accepted_sparse_xor() > 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn small_cpu_batches_leave_unused_permits_for_concurrent_stages() {

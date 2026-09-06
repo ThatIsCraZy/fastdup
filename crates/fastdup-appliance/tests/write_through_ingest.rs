@@ -1982,3 +1982,190 @@ fn write_salted_fixture_in_lockstep(
     block[0] = 4_u8.wrapping_add(salt);
     block[..4_096].to_vec()
 }
+
+#[test]
+fn partial_commit_drain_allows_same_inode_progress_and_recovers_only_the_cut() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let paused =
+        PausedStorageIo::disarmed_before_name_prefix(data.clone(), StorageOperation::SyncFile, ".");
+    let appliance = Arc::new(
+        DurableNamespace::open_with_index(
+            NamespaceConfig::default(),
+            GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
+            ContainerRepository::new(paused.clone()),
+            &ExactIndexRunRepository::new(MemoryStorageIo::new()),
+            32,
+        )
+        .unwrap(),
+    );
+    paused.arm();
+    let (inode, handle) = create_file(&appliance, b"partial-cut-overlap");
+    let mut block = fixture_block();
+    let mut prefix = Vec::new();
+    for ordinal in 0..16 {
+        for byte in &mut block {
+            *byte = byte.wrapping_add(1);
+        }
+        prefix.extend_from_slice(&block);
+        write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
+    }
+    fence_ingest(&appliance, inode, handle);
+    let checkpointer = Arc::clone(&appliance);
+    let checkpoint =
+        std::thread::spawn(move || checkpointer.checkpoint_profiled().unwrap().unwrap());
+    assert!(paused.wait_until_reached(STORAGE_REACH_TIMEOUT));
+    let writer_appliance = Arc::clone(&appliance);
+    let (sender, receiver) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        for ordinal in 16..56 {
+            for byte in &mut block {
+                *byte = byte.wrapping_add(1);
+            }
+            write_one_mebibyte(&writer_appliance, inode, handle, ordinal, &block);
+        }
+        sender.send(()).unwrap();
+    });
+    let progressed = receiver.recv_timeout(Duration::from_secs(5)).is_ok();
+    let second_publication = paused.wait_until_reached_count(2, Duration::from_secs(5));
+    paused.resume();
+    writer.join().unwrap();
+    let committed = checkpoint.join().unwrap();
+    fence_ingest(&appliance, inode, handle);
+    assert!(
+        progressed,
+        "partial Container durability must release its Lane before admission fills"
+    );
+    assert!(
+        second_publication,
+        "the same inode must prepare and publish its next Container concurrently"
+    );
+    assert!(committed.metrics().checkpoint_rechunk_bytes() <= 1024 * 1024);
+    drop(appliance);
+    metadata.crash();
+    data.crash();
+    assert_recovered_prefix(metadata, data, inode, &prefix);
+}
+
+fn assert_recovered_prefix(
+    metadata: MemoryStorageIo,
+    data: MemoryStorageIo,
+    inode: InodeId,
+    prefix: &[u8],
+) {
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, checkpoint_policy_set()),
+        &ContainerRepository::new(data),
+    )
+    .unwrap()
+    .unwrap();
+    let Reply::Opened(reader) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("expected recovered handle");
+    };
+    for (ordinal, expected) in prefix.chunks(1024 * 1024).enumerate() {
+        let Reply::Data(bytes) = recovered
+            .dispatch(
+                CALLER,
+                Operation::Read {
+                    inode,
+                    handle: reader,
+                    offset: u64::try_from(ordinal).unwrap() * 1024 * 1024,
+                    length: 1024 * 1024,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected recovered bytes");
+        };
+        assert_eq!(bytes, expected);
+    }
+    let Reply::Data(eof) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Read {
+                inode,
+                handle: reader,
+                offset: u64::try_from(prefix.len()).unwrap(),
+                length: 4096,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("expected EOF");
+    };
+    assert!(
+        eof.is_empty(),
+        "later Active bytes must not enter the recovered cut"
+    );
+}
+
+#[test]
+fn partial_publication_failure_preserves_the_frozen_token_and_retry_bytes() {
+    let block = fixture_block();
+    let baseline_data = MemoryStorageIo::new();
+    let baseline = open_appliance_on(
+        MemoryStorageIo::new(),
+        baseline_data.clone(),
+        MemoryStorageIo::new(),
+    );
+    let (inode, handle) = create_file(&baseline, b"partial-failure");
+    for ordinal in 0..16 {
+        write_one_mebibyte(&baseline, inode, handle, ordinal, &block);
+    }
+    fence_ingest(&baseline, inode, handle);
+    let before = baseline_data.operation_count();
+    baseline.checkpoint().unwrap().unwrap();
+    let failed_operation = baseline_data
+        .operations()
+        .iter()
+        .enumerate()
+        .skip(before)
+        .find_map(|(ordinal, operation)| {
+            (*operation == StorageOperation::SyncFile).then_some(ordinal)
+        })
+        .unwrap();
+    drop(baseline);
+
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::with_fail_before(failed_operation);
+    let appliance = open_appliance_on(metadata.clone(), data.clone(), MemoryStorageIo::new());
+    let (inode, handle) = create_file(&appliance, b"partial-failure");
+    for ordinal in 0..16 {
+        write_one_mebibyte(&appliance, inode, handle, ordinal, &block);
+    }
+    fence_ingest(&appliance, inode, handle);
+    let cut = appliance.namespace().begin_commit().unwrap().unwrap();
+    assert!(
+        appliance.checkpoint().is_err(),
+        "the partial publication error must reach the checkpoint caller"
+    );
+    assert_eq!(
+        appliance
+            .namespace()
+            .begin_commit()
+            .unwrap()
+            .unwrap()
+            .token(),
+        cut.token()
+    );
+    assert!(
+        !appliance.write_through_status().degraded(),
+        "an observed checkpoint error retains its ordinary retry path"
+    );
+    appliance.checkpoint().unwrap().unwrap();
+    drop(appliance);
+    metadata.crash();
+    data.crash();
+    assert_recovered_prefix(metadata, data, inode, &block.repeat(16));
+}

@@ -242,6 +242,23 @@ pub trait Filesystem {
         Err(libc::ENOSYS.into())
     }
 
+    /// Reads immutable segments. Existing filesystems retain their read API.
+    fn read_vectored(
+        &self,
+        req: Request,
+        inode: Inode,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> impl std::future::Future<Output = Result<ReplyDataVectored>> + Send {
+        let read = self.read(req, inode, fh, offset, size);
+        async move {
+            read.await.map(|reply| ReplyDataVectored {
+                data: vec![reply.data],
+            })
+        }
+    }
+
     /// write data. Write should return exactly the number of bytes requested except on error. An
     /// exception to this is when the file has been opened in `direct_io` mode, in which case the
     /// return value of the write system call will reflect the return value of this operation. `fh`

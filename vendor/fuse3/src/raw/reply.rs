@@ -144,6 +144,12 @@ pub struct ReplyData {
     pub data: Bytes,
 }
 
+/// Immutable buffers retained until one vectored FUSE response completes.
+#[derive(Debug)]
+pub struct ReplyDataVectored {
+    pub data: Vec<Bytes>,
+}
+
 impl From<Bytes> for ReplyData {
     fn from(data: Bytes) -> Self {
         Self { data }

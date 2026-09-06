@@ -454,6 +454,12 @@ where
             .map_err(|_| PosixError::Io)
     }
 
+    fn read_segments_at(&self, offset: u64, length: u32) -> Result<Vec<bytes::Bytes>, PosixError> {
+        self.file
+            .read_segments_at(offset, length)
+            .map_err(|_| PosixError::Io)
+    }
+
     fn prepared_clone_extents(
         &self,
         offset: u64,

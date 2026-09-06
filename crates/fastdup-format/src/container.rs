@@ -1715,6 +1715,7 @@ impl SealedContainer {
             workers,
             gate,
             None,
+            &|_| {},
         )
     }
 
@@ -1749,6 +1750,7 @@ impl SealedContainer {
             workers,
             gate,
             None,
+            &|_| {},
         )
     }
 
@@ -1790,6 +1792,7 @@ impl SealedContainer {
             workers,
             gate,
             None,
+            &|_| {},
         )
     }
 
@@ -1827,6 +1830,7 @@ impl SealedContainer {
             workers,
             gate,
             None,
+            &|_| {},
         )
     }
 
@@ -1880,6 +1884,36 @@ impl SealedContainer {
         gate: IncompressibilityGatePolicy,
         chunk_order: Option<&[ChunkId]>,
     ) -> Result<AdaptiveContainerEncoding, FormatError> {
+        Self::encode_mixed_prehashed_reduction_with_worker_retirement(
+            container_id,
+            container_generation,
+            regions,
+            independent,
+            dependents,
+            workers,
+            gate,
+            chunk_order,
+            &|_| {},
+        )
+    }
+
+    /// Encodes regions and retires each worker at its CPU boundary, before
+    /// serial Container assembly. The callback also runs on worker failure.
+    ///
+    /// # Errors
+    /// Returns the same format and allocation failures as the ordinary encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_mixed_prehashed_reduction_with_worker_retirement(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[PrehashedAdaptiveRegion<'_>],
+        independent: Vec<PreparedIndependentRecord>,
+        dependents: Vec<PreparedDependentRecord>,
+        workers: NonZeroUsize,
+        gate: IncompressibilityGatePolicy,
+        chunk_order: Option<&[ChunkId]>,
+        retire: &(dyn Fn(usize) + Sync),
+    ) -> Result<AdaptiveContainerEncoding, FormatError> {
         let inputs = regions
             .iter()
             .map(|region| match *region {
@@ -1903,6 +1937,7 @@ impl SealedContainer {
             workers,
             gate,
             chunk_order,
+            retire,
         )
     }
 
@@ -1917,6 +1952,7 @@ impl SealedContainer {
         workers: NonZeroUsize,
         gate: IncompressibilityGatePolicy,
         chunk_order: Option<&[ChunkId]>,
+        retire: &(dyn Fn(usize) + Sync),
     ) -> Result<AdaptiveContainerEncoding, FormatError> {
         if regions.is_empty()
             && transplanted.is_empty()
@@ -1929,7 +1965,14 @@ impl SealedContainer {
         let next_region = AtomicUsize::new(0);
         let encoded_by_region = (0..worker_count)
             .into_par_iter()
-            .map(|_| {
+            .map(|worker| {
+                struct Retire<'a>(&'a (dyn Fn(usize) + Sync), usize);
+                impl Drop for Retire<'_> {
+                    fn drop(&mut self) {
+                        (self.0)(self.1);
+                    }
+                }
+                let _retire = Retire(retire, worker);
                 let mut completed = Vec::new();
                 loop {
                     // Exactly worker_count jobs own permits; work stealing
@@ -3783,19 +3826,15 @@ impl AdaptiveEncoderV1 {
         output
             .try_reserve_exact(payload_cap)
             .map_err(|_| FormatError::ArithmeticOverflow)?;
-        output.resize(payload_cap, 0);
-        match self
-            .zstd
-            .context_mut()
-            .compress2(output.as_mut_slice(), decoded)
-        {
+        match self.zstd.context_mut().compress2(&mut output, decoded) {
             Ok(written) => {
-                assert!(
-                    written <= payload_cap,
-                    "ASSERT: bounded Zstd cannot exceed its owned destination"
-                );
-                output.truncate(written);
-                Ok(Some(output))
+                // Vec's allocator may grant more capacity than requested. The
+                // reduction policy cap still applies to the actual encoding.
+                if written > payload_cap {
+                    Ok(None)
+                } else {
+                    Ok(Some(output))
+                }
             }
             Err(error)
                 if zstd::zstd_safe::get_error_name(error) == "Destination buffer is too small" =>
@@ -4498,13 +4537,12 @@ impl ZstdPrefixRecord {
         decoded
             .try_reserve_exact(decoded_length)
             .map_err(|_| FormatError::ArithmeticOverflow)?;
-        decoded.resize(decoded_length, 0);
         let mut context = zstd::zstd_safe::DCtx::try_create().ok_or(FormatError::ZstdFailure)?;
         context
             .ref_prefix(base)
             .map_err(|_| FormatError::ZstdFailure)?;
         let written = context
-            .decompress(decoded.as_mut_slice(), &bytes[payload_offset..payload_end])
+            .decompress(&mut decoded, &bytes[payload_offset..payload_end])
             .map_err(|_| FormatError::ZstdFailure)?;
         if written != decoded_length {
             return Err(FormatError::InvalidZstdPrefixRecord);
@@ -5270,6 +5308,16 @@ impl AsRef<[u8]> for VerifiedChunkPayload {
 }
 
 impl VerifiedChunkPayload {
+    /// Consumes this verified payload into a checked response owner, moving
+    /// the backing reference without retaining identity or Location metadata.
+    #[must_use]
+    pub fn into_read_view(self, range: std::ops::Range<usize>) -> Option<VerifiedReadView> {
+        (range.start <= range.end && range.end <= self.length).then(|| VerifiedReadView {
+            backing: self.backing,
+            range: self.offset + range.start..self.offset + range.end,
+        })
+    }
+
     /// Returns a checked response owner for part of this verified Chunk.
     #[must_use]
     pub fn read_view(&self, range: std::ops::Range<usize>) -> Option<VerifiedReadView> {

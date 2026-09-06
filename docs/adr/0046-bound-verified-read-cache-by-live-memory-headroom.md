@@ -289,3 +289,13 @@ shrink only if RSS and tail-latency measurements justify the extra state.
 Container fan-out is its intended workload. The original owned adapter met its
 memory and correctness gates but did not beat the synchronous baseline. ADR
 0058 replaces its batch worker and makes ring capability a startup requirement.
+
+
+## Compact resident keys (2026-09-06)
+
+A resident entry compares its verified payload's full Chunk ID and logical length
+directly, rather than storing the same key a second time. Backing ownership,
+shared allocation charging, sharding and replacement remain unchanged. Fixed
+geometry continues to derive from the actual CacheSet size. On the measured
+x86-64 build a set shrinks from 904 to 744 bytes; this is a metadata saving,
+not an equivalent reduction in total process RSS.

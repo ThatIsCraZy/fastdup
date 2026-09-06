@@ -15,9 +15,14 @@ domains.
 for single-disk development and CI. The default and the only production value
 is `required`; malformed policy fails before either storage root is opened.
 
-The current Metadata filesystem contains only commit-critical state. Before
-ADR 0084 enables Small-File placement, that feature must add an independent XFS
-project quota or filesystem so it cannot borrow the Metadata reserve. The same
-rule applies to any future disk-backed cache. Production qualification fills
-each noncritical quota and proves that one bounded Metadata commit and cleanup
-remain possible.
+The Metadata filesystem also contains the Small-File Container directory from
+ADR 0084. Startup assigns it an inheriting XFS project and installs a hard
+quota through `SmallFileTierIsolation::prepare`; configuration that would
+consume the protected Metadata floor is rejected. The lab policy reports quota
+enforcement as bypassed. Any future disk-backed cache needs the same independent
+capacity boundary.
+
+The [XFS/FUSE exhaustion qualification](../testing/full-tier-enospc.md), last
+exercised on 2026-09-01, fills DATA and the Small-File quota and checks rejected
+write invisibility, reads, cleanup, scrub, and remount. Its loop-device evidence
+does not establish power-loss or hardware-cache behavior.

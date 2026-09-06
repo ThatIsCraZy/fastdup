@@ -4,6 +4,12 @@ status: accepted
 
 # Resolve Bases through bounded Recovery Index reads
 
+Current-state note (2026-09-05): the bounded resolver remains current for both
+ZSTD_PREFIX and Sparse-XOR. The v2/no-v3 discussion below records why the
+proposed Header/Footer lookup accelerator was rejected at the time. ADR 0088
+later advances the actual envelope and intrinsic summary to Container v3 for
+Sparse-XOR; it does not add that rejected filter or physical Base pointers.
+
 Index-free Prefix decoding owns one pass-local Base resolver. It enumerates the
 published namespace at most once, reads only each Container's paired envelope
 and compact Recovery Index, and retains every successfully verified Base for

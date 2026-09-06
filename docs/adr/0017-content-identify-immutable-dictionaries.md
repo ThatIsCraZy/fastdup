@@ -4,6 +4,11 @@ status: accepted
 
 # Content-identify immutable dictionaries
 
+Current-state note (2026-09-05): this is an accepted dependency contract for a
+future durable Dictionary path. Current Dictionary training and encoding are
+experimental under ADR 0047; production Container readers/writers implement
+RAW, Zstd, ZSTD_PREFIX, and Sparse-XOR, with no durable Dictionary activation.
+
 Zstd dictionary records reference an immutable Dictionary Object identified by
 BLAKE3-256 of its exact bytes. Retraining always creates a new ID and old records
 retain their original dependency. A missing or corrupt dictionary makes that

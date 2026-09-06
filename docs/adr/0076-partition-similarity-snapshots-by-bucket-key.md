@@ -4,6 +4,12 @@ status: accepted
 
 # Partition Similarity snapshots by complete BucketKey ranges
 
+Current-state note (2026-09-05): the partition and family validation rules remain.
+Under ADR 0089 an online serving generation selects multiple chronological
+families through a Reduction Head. Bucket ranges are disjoint within a family,
+but may overlap across families; queries use only the newest complete value
+for each bucket. Publishing a family alone does not activate the online view.
+
 This record was originally committed under the already occupied number 0046.
 It was renumbered to 0076 during the 2026-08-27 ADR audit; the decision and its
 chronology are unchanged.

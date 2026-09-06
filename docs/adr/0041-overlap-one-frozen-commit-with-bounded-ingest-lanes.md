@@ -4,6 +4,9 @@ status: accepted
 
 # Overlap one frozen commit with bounded Ingest Lanes
 
+Current-state note (2026-09-05): ADR 0054 replaces the historical FastCDC names
+below with SeqCDC-v1. The Active/Frozen ownership and admission rules remain.
+
 fastdup maintains exactly one Active Dirty Epoch and at most one Frozen Commit
 Cut. Freezing a cut does not close mutation admission: later accepted mutations
 receive their normal per-inode sequence and remain immediately readable in the
@@ -157,3 +160,28 @@ metadata/index caches. The overflow lane may reduce dedup/compression quality
 for workloads with more than eight simultaneously hot files; increasing that
 bound is a benchmark and RSS decision rather than a correctness or format
 change.
+
+
+## Partial publication and cut fences (2026-09-06)
+
+Detached work carries both its final admission sequence and the minimum of its
+Chunks' carried sequences. A Sync/Release/Commit fence snapshots the greatest
+already-enqueued publication ordinal containing a complete Chunk at or before
+the requested sequence. It waits through ordered retirement of that fixed
+prefix; later arrivals cannot extend the fence. A Container ending after a cut
+may still contain required pre-cut recipes.
+
+A partial commit drain detaches through the same 64-MiB publication queue as a
+full Container. It captures a finite per-inode retirement target while holding
+the Lane lock, then releases that lock before waiting for encode, DATA durability
+and Namespace externalization. A bounded completion reply propagates a failed
+partial publication to the checkpoint; resident DATA and the Frozen token remain
+available for retry. Queue pressure may still block a producer with its Lane
+held; no uncharged detached payload is introduced.
+
+A failed partial-publication test requires the same Frozen token and byte-exact
+crash recovery after retry. Queue tests cover crossing sequences and fixed
+retirement targets. A blocked
+partial-publication integration test requires same-inode forward progress and
+a second concurrent publication, then crash-recovers only the original Frozen
+prefix byte-exactly.

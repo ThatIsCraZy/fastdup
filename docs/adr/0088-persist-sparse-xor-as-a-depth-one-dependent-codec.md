@@ -19,8 +19,12 @@ neither dependent target may become a Base, so dependency depth remains one.
 
 ## Consequences
 
-The Container envelope and intrinsic summary advance together instead of
-preserving compatibility with pre-production images. Sparse-XOR is selected for
+The Container envelope and intrinsic summary advance together to version 3
+instead of preserving compatibility with pre-production images. Record-local
+formats retain their own version fields; envelope version 3 does not mean
+every nested structure is version 3. The structural-commitment algorithm
+remains identifier 2 under ADR 0060. Writers and readers accept only the
+current envelope, so the earlier Container-v2 wording in ADR 0075 is historical. Sparse-XOR is selected for
 sparse in-place changes while ZSTD_PREFIX remains available for shifts or dense
 changes. Unknown codecs, malformed runs, missing or incorrect Bases, truncated
 payloads, and target-identity mismatches fail closed before bytes reach a

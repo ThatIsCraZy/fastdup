@@ -4,6 +4,17 @@ status: accepted
 
 # Pin a coherent reduction snapshot for write-through
 
+Current-state note (2026-09-05): ADR 0089 replaces the mount-lifetime Exact/Similarity
+pair described below in the online writer. Each planning batch retains an
+immutable Similarity view and then pins current Exact for candidate resolution;
+the Reduction Head records Exact provenance, not a historical Exact lease.
+A dependent-publication guard protects Bases through target Exact activation.
+ADR 0088 adds Sparse-XOR beside Prefix within the same four-trial budget.
+Fragmented targets are materialized once and can use both dependent codecs.
+The original frozen-pair seam remains available for offline/experimental use;
+missing acceleration still falls back to independent encoding. ADR 0089 is
+implemented but remains proposed pending its stated performance gates.
+
 Advanced write-through pins one immutable Similarity family together with the
 exact Exact Run Set named by that family. Later Exact L0 activations do not
 replace this pair during the mount: the candidate universe remains the

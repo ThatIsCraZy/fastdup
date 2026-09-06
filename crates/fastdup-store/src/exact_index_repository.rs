@@ -794,11 +794,19 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         &self,
         run_set: &ExactIndexRunSet,
     ) -> Result<ActivatedExactIndex<I>, ExactIndexStoreError> {
+        self.activate_with_readers(run_set, &[])
+    }
+
+    fn activate_with_readers(
+        &self,
+        run_set: &ExactIndexRunSet,
+        reusable: &[ExactIndexRunReader<I>],
+    ) -> Result<ActivatedExactIndex<I>, ExactIndexStoreError> {
         let _guard = self
             .publish_lock
             .lock()
             .expect("ASSERT: Exact Index activation lock poisoned");
-        let readers = self.verify_run_set_dependencies(run_set)?;
+        let readers = self.verify_run_set_dependencies_with_readers(run_set, reusable)?;
         let encoded = run_set.encode()?;
         let run_set_id = ExactIndexRunSetId::from_encoded(&encoded)?;
         self.publish_run_set(run_set_id, &encoded)?;
@@ -988,7 +996,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .generation_publish_lock
             .lock()
             .expect("ASSERT: Exact generation publication lock poisoned");
-        let previous = self.recover_active()?;
+        let previous = self.recover_for_append()?;
         self.append_level_zero_from(profile, entries, previous.as_ref())
     }
 
@@ -1017,7 +1025,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .generation_publish_lock
             .lock()
             .expect("ASSERT: Exact generation publication lock poisoned");
-        let previous = self.recover_active()?;
+        let previous = self.recover_for_append()?;
         if previous.as_ref().map(ActivatedExactIndex::record) != Some(expected) {
             return Err(ExactIndexStoreError::ActivationChanged);
         }
@@ -1074,8 +1082,31 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)
         })?;
         let run_set = ExactIndexRunSet::new(profile, run_set_generation, run_refs)?;
-        let active = self.activate(&run_set)?;
+        let active = self.activate_with_readers(
+            &run_set,
+            previous.map_or(&[], |active| active.readers.as_slice()),
+        )?;
         Ok(self.install_active_generation(active))
+    }
+
+    /// Match the durable selector before borrowing in-process audit evidence.
+    /// A fresh process, changed selector or positional adapter uses recovery.
+    fn recover_for_append(&self) -> Result<Option<ActivatedExactIndex<I>>, ExactIndexStoreError> {
+        let log = ExactActivationLog::new(&self.storage);
+        let Some(snapshot) = log.load_for_recovery().map_err(map_activation_log_error)? else {
+            return Ok(None);
+        };
+        let Some(record) = snapshot.last_record() else {
+            return Ok(None);
+        };
+        let run_set = self.read_activated_run_set(record)?;
+        if let Some(pin) = self.pin_matching_generation(record)
+            && pin.readers.iter().all(|reader| reader.mapping.is_some())
+        {
+            return ActivatedExactIndex::new(record, run_set, pin.readers.clone()).map(Some);
+        }
+        let readers = self.verify_run_set_dependencies(&run_set)?;
+        ActivatedExactIndex::new(record, run_set, readers).map(Some)
     }
 
     fn pin_matching_generation(
@@ -1287,10 +1318,10 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         Ok(high_water)
     }
 
-    fn open_activated_record(
+    fn read_activated_run_set(
         &self,
         record: ExactIndexActivationRecord,
-    ) -> Result<ActivatedExactIndex<I>, ExactIndexStoreError> {
+    ) -> Result<ExactIndexRunSet, ExactIndexStoreError> {
         let run_set = self.read_run_set(record.run_set_id())?;
         if run_set.profile() != record.profile()
             || run_set.generation() != record.run_set_generation()
@@ -1298,6 +1329,14 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         {
             return Err(ExactIndexStoreError::DependencyMismatch);
         }
+        Ok(run_set)
+    }
+
+    fn open_activated_record(
+        &self,
+        record: ExactIndexActivationRecord,
+    ) -> Result<ActivatedExactIndex<I>, ExactIndexStoreError> {
+        let run_set = self.read_activated_run_set(record)?;
         let readers = self.verify_run_set_dependencies(&run_set)?;
         ActivatedExactIndex::new(record, run_set, readers)
     }
@@ -1750,6 +1789,14 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         &self,
         run_set: &ExactIndexRunSet,
     ) -> Result<Vec<ExactIndexRunReader<I>>, ExactIndexStoreError> {
+        self.verify_run_set_dependencies_with_readers(run_set, &[])
+    }
+
+    fn verify_run_set_dependencies_with_readers(
+        &self,
+        run_set: &ExactIndexRunSet,
+        reusable: &[ExactIndexRunReader<I>],
+    ) -> Result<Vec<ExactIndexRunReader<I>>, ExactIndexStoreError> {
         if run_set.family_count() > MAX_ACTIVE_EXACT_INDEX_FAMILIES {
             return Err(ExactIndexStoreError::TooManyActiveRuns);
         }
@@ -1759,9 +1806,34 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
         let mut membership_bytes_remaining = self.membership_budget_bytes_now();
         let mut mapped_mode = None;
+        let reusable: BTreeMap<_, _> = reusable
+            .iter()
+            .filter(|reader| reader.mapping.is_some())
+            .map(|reader| (reader.name.as_str(), reader))
+            .collect();
         for run_ref in run_set.runs().iter().copied() {
             let name = published_name(run_ref.profile(), run_ref.generation());
-            let audited = self.audit_named_with_membership(&name, membership_bytes_remaining)?;
+            let audited = if let Some(reader) = reusable.get(name.as_str()) {
+                // The Arc retains the same audited file and immutable lease.
+                // Match all Run identity fields before making it selectable.
+                verify_requested_identity(
+                    run_ref.profile(),
+                    run_ref.generation(),
+                    reader.descriptor,
+                )?;
+                verify_run_reference(run_ref, reader.descriptor)?;
+                AuditedExactRun {
+                    descriptor: reader.descriptor,
+                    mapping: reader.mapping.clone(),
+                    membership: reader
+                        .membership
+                        .as_ref()
+                        .filter(|filter| filter.allocated_bytes() <= membership_bytes_remaining)
+                        .map(Arc::clone),
+                }
+            } else {
+                self.audit_named_with_membership(&name, membership_bytes_remaining)?
+            };
             let descriptor = audited.descriptor;
             let membership = audited.membership;
             let mapping = audited.mapping;
@@ -3427,6 +3499,289 @@ fn encode_hex<const N: usize>(bytes: [u8; N]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reuse_fixture(ordinal: u64) -> ExactIndexEntry {
+        let location = fastdup_format::ExactIndexLocation::raw(
+            ContainerId::new([71; 16]).unwrap(),
+            1,
+            4096,
+            256,
+            0,
+        )
+        .unwrap();
+        ExactIndexEntry::active(ChunkId::of(&ordinal.to_le_bytes()), 32, location).unwrap()
+    }
+
+    fn reuse_repository(label: &str) -> ExactIndexRunRepository<crate::FsStorageIo> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/tests")
+            .join(format!("exact-reuse-{label}-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        ExactIndexRunRepository::new_with_memory_snapshot(
+            crate::FsStorageIo::open(&root).unwrap(),
+            MemoryPressureSnapshot::new(8 << 30, 6 << 30, 0),
+        )
+    }
+
+    #[test]
+    fn append_shares_audited_runs_but_recovery_reaudits_and_pressure_drops_hints() {
+        let mut repository = reuse_repository("mapped");
+        let profile = ExactIndexProfileId::new([61; 32]).unwrap();
+        repository
+            .append_level_zero(profile, (0..1024).map(reuse_fixture).collect())
+            .unwrap();
+        let old = repository.pin_active_generation().unwrap();
+        let old_reader = &old.readers[0];
+        assert!(old_reader.membership.is_some());
+        repository
+            .append_level_zero(profile, vec![reuse_fixture(2000)])
+            .unwrap();
+        let current = repository.pin_active_generation().unwrap();
+        let shared = current
+            .readers
+            .iter()
+            .find(|reader| reader.name == old_reader.name)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            shared.mapping.as_ref().unwrap(),
+            old_reader.mapping.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            shared.membership.as_ref().unwrap(),
+            old_reader.membership.as_ref().unwrap()
+        ));
+        let recovered = repository.recover_active().unwrap().unwrap();
+        let independent = recovered
+            .readers
+            .iter()
+            .find(|reader| reader.name == old_reader.name)
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            independent.mapping.as_ref().unwrap(),
+            old_reader.mapping.as_ref().unwrap()
+        ));
+        // Swap disables new membership admission, including reused hints.
+        repository.fixed_membership_snapshot =
+            Some(MemoryPressureSnapshot::new(8 << 30, 6 << 30, 1));
+        repository
+            .append_level_zero(profile, vec![reuse_fixture(2001)])
+            .unwrap();
+        let pressured = repository.pin_active_generation().unwrap();
+        assert!(
+            pressured
+                .readers
+                .iter()
+                .all(|reader| reader.membership.is_none())
+        );
+        let shared = pressured
+            .readers
+            .iter()
+            .find(|reader| reader.name == old_reader.name)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            shared.mapping.as_ref().unwrap(),
+            old_reader.mapping.as_ref().unwrap()
+        ));
+        assert!(
+            !pressured
+                .lookup_transitions(reuse_fixture(17).chunk_id(), 32)
+                .unwrap()
+                .candidates()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn append_matches_durable_activation_before_reusing_cached_generation() {
+        let repository = reuse_repository("changed-selector");
+        let profile = ExactIndexProfileId::new([62; 32]).unwrap();
+        repository
+            .append_level_zero(profile, vec![reuse_fixture(1)])
+            .unwrap();
+        // Public activation deliberately does not install the process snapshot.
+        repository
+            .activate(&ExactIndexRunSet::new(profile, 2, vec![]).unwrap())
+            .unwrap();
+        repository
+            .append_level_zero(profile, vec![reuse_fixture(2)])
+            .unwrap();
+        let current = repository.pin_active_generation().unwrap();
+        assert!(
+            current
+                .lookup_transitions(reuse_fixture(1).chunk_id(), 32)
+                .unwrap()
+                .candidates()
+                .is_empty()
+        );
+        assert!(
+            !current
+                .lookup_transitions(reuse_fixture(2).chunk_id(), 32)
+                .unwrap()
+                .candidates()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reusable_mapping_does_not_authorize_a_different_run_hash() {
+        let repository = reuse_repository("wrong-hash");
+        let profile = ExactIndexProfileId::new([63; 32]).unwrap();
+        repository
+            .append_level_zero(profile, vec![reuse_fixture(1)])
+            .unwrap();
+        let old = repository.pin_active_generation().unwrap();
+        let different = ExactIndexRun::new(profile, 1, vec![reuse_fixture(2)])
+            .unwrap()
+            .encode()
+            .unwrap();
+        let descriptor = descriptor_from_complete_bytes(&different).unwrap();
+        let run_set = ExactIndexRunSet::new(
+            profile,
+            2,
+            vec![ExactIndexRunRef::new(0, descriptor).unwrap()],
+        )
+        .unwrap();
+        assert!(
+            repository
+                .activate_with_readers(&run_set, &old.readers)
+                .is_err()
+        );
+        assert_eq!(
+            repository.recover_active().unwrap().unwrap().record(),
+            old.record()
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct ReuseFaultStorage {
+        inner: crate::FsStorageIo,
+        fault: Arc<AtomicUsize>,
+    }
+
+    impl StorageIo for ReuseFaultStorage {
+        fn create_new(&self, name: &str) -> io::Result<()> {
+            self.inner.create_new(name)
+        }
+        fn exists(&self, name: &str) -> io::Result<bool> {
+            self.inner.exists(name)
+        }
+        fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+            self.inner.read(name)
+        }
+        fn object_len(&self, name: &str) -> io::Result<u64> {
+            self.inner.object_len(name)
+        }
+        fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+            self.inner.read_exact_at(name, offset, length)
+        }
+        fn list_names(&self) -> io::Result<Vec<String>> {
+            self.inner.list_names()
+        }
+        fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
+            self.inner.set_len(name, length)
+        }
+        fn publish_noreplace(&self, temporary: &str, published: &str) -> io::Result<()> {
+            self.inner.publish_noreplace(temporary, published)
+        }
+        fn remove_file(&self, name: &str) -> io::Result<()> {
+            self.inner.remove_file(name)
+        }
+        fn sync_root(&self) -> io::Result<()> {
+            self.inner.sync_root()
+        }
+        fn lease_immutable_file(
+            &self,
+            name: &str,
+            expected_length: u64,
+        ) -> io::Result<Option<crate::ImmutableFileLease>> {
+            self.inner.lease_immutable_file(name, expected_length)
+        }
+        fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
+            if matches!(
+                name,
+                "exact-index.activation.wal" | "exact-index.activation.1.wal"
+            ) && self
+                .fault
+                .compare_exchange(1, 0, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+                .is_ok()
+            {
+                return Err(io::Error::other("injected before activation write"));
+            }
+            self.inner.write_at(name, offset, bytes)
+        }
+        fn sync_file(&self, name: &str) -> io::Result<()> {
+            self.inner.sync_file(name)?;
+            if matches!(
+                name,
+                "exact-index.activation.wal" | "exact-index.activation.1.wal"
+            ) && self
+                .fault
+                .compare_exchange(2, 0, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+                .is_ok()
+            {
+                return Err(io::Error::other("injected after activation sync"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reused_mapping_append_recovers_and_retries_before_write_and_after_sync_faults() {
+        for mode in [1, 2] {
+            let initial = reuse_repository(&format!("fault-{mode}"));
+            let storage = ReuseFaultStorage {
+                inner: initial.storage,
+                fault: Arc::new(AtomicUsize::new(0)),
+            };
+            let repository = ExactIndexRunRepository::new(storage.clone());
+            let profile = ExactIndexProfileId::new([64; 32]).unwrap();
+            repository
+                .append_level_zero(profile, vec![reuse_fixture(1)])
+                .unwrap();
+            let old = repository.pin_active_generation().unwrap();
+            assert!(old.readers[0].mapping.is_some());
+            storage.fault.store(mode, AtomicOrdering::Relaxed);
+            assert!(
+                repository
+                    .append_level_zero(profile, vec![reuse_fixture(2)])
+                    .is_err()
+            );
+            assert_eq!(storage.fault.load(AtomicOrdering::Relaxed), 0);
+            assert_eq!(
+                repository.pin_active_generation().unwrap().record(),
+                old.record()
+            );
+            let recovered = repository.recover_active().unwrap().unwrap();
+            assert_eq!(recovered.run_set().generation(), mode as u64);
+            assert_eq!(
+                repository.audit_activation_log().unwrap(),
+                Some(recovered.record())
+            );
+            repository
+                .append_level_zero(profile, vec![reuse_fixture(3)])
+                .unwrap();
+            let current = repository.pin_active_generation().unwrap();
+            for ordinal in [1, 3] {
+                assert!(
+                    !current
+                        .lookup_transitions(reuse_fixture(ordinal).chunk_id(), 32)
+                        .unwrap()
+                        .candidates()
+                        .is_empty()
+                );
+            }
+            assert_eq!(
+                current
+                    .lookup_transitions(reuse_fixture(2).chunk_id(), 32)
+                    .unwrap()
+                    .candidates()
+                    .is_empty(),
+                mode == 1
+            );
+        }
+    }
 
     #[test]
     fn exact_page_cache_capacity_and_target_follow_live_headroom() {

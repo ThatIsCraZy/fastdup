@@ -3,7 +3,7 @@ use crate::manifest_tree::{
     allocated_bytes_in_manifest_tree_range, read_manifest_tree_range,
 };
 use crate::{
-    ActivatedExactIndex, ContainerRepository, ExactIndexGenerationPin,
+    ActivatedExactIndex, ContainerRepository, ExactIndexEntry, ExactIndexGenerationPin,
     ExactIndexGenerationSnapshot, StorageIo, StoreError, VerifiedReadCache,
     generation::MetadataRootPin,
     read_cache::{VerifiedChunkPayload, VerifiedChunkRead},
@@ -30,6 +30,7 @@ pub struct VerifiedManifestFile<I> {
     containers: ContainerRepository<I>,
     indexed_reader: Option<Arc<dyn VerifiedChunkReader>>,
     read_cache: Option<Arc<VerifiedReadCache>>,
+    locations: Arc<[ExactIndexEntry]>,
 }
 
 trait ManifestRecipe: fmt::Debug + Send + Sync {
@@ -48,43 +49,97 @@ trait ManifestRecipe: fmt::Debug + Send + Sync {
 struct FlatManifestRecipe {
     manifest: ManifestLeaf,
     allocated_bytes: u64,
+    // Rebuildable process-local positions, shared by every view of this recipe.
+    // Empty and single-extent recipes need no additional allocation.
+    extent_ends: Vec<u64>,
+}
+
+impl FlatManifestRecipe {
+    fn new(manifest: ManifestLeaf) -> Result<Self, ManifestReadError> {
+        let mut extent_ends = Vec::new();
+        let indexed = manifest.extents().len() > 1;
+        if indexed {
+            extent_ends
+                .try_reserve_exact(manifest.extents().len())
+                .map_err(|_| ManifestReadError::OutOfMemory)?;
+        }
+        let mut end = 0_u64;
+        let mut allocated_bytes = 0_u64;
+        for extent in manifest.extents() {
+            let length = extent_logical_length(extent);
+            end = end
+                .checked_add(length)
+                .ok_or(ManifestReadError::ArithmeticOverflow)?;
+            if indexed {
+                extent_ends.push(end);
+            }
+            if !matches!(extent, ManifestExtent::Hole { .. }) {
+                allocated_bytes = allocated_bytes
+                    .checked_add(length)
+                    .ok_or(ManifestReadError::ArithmeticOverflow)?;
+            }
+        }
+        assert_eq!(
+            end,
+            manifest.file_length(),
+            "ASSERT: validated flat recipe partitions EOF"
+        );
+        Ok(Self {
+            manifest,
+            allocated_bytes,
+            extent_ends,
+        })
+    }
+
+    fn intersecting(&self, offset: u64, length: u64) -> (&[ManifestExtent], u64) {
+        let end = offset
+            .saturating_add(length)
+            .min(self.manifest.file_length());
+        if offset >= end {
+            return (&[], 0);
+        }
+        if self.extent_ends.is_empty() {
+            return (self.manifest.extents(), 0);
+        }
+        let first = self
+            .extent_ends
+            .partition_point(|&position| position <= offset);
+        let last = self.extent_ends.partition_point(|&position| position < end) + 1;
+        let start = first
+            .checked_sub(1)
+            .map_or(0, |ordinal| self.extent_ends[ordinal]);
+        (&self.manifest.extents()[first..last], start)
+    }
 }
 
 impl ManifestRecipe for FlatManifestRecipe {
     fn root(&self) -> Option<MetadataObjectId> {
         None
     }
-
     fn logical_size(&self) -> u64 {
         self.manifest.file_length()
     }
-
     fn allocated_bytes(&self) -> u64 {
         self.allocated_bytes
     }
 
     fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, ManifestReadError> {
         let end = offset.saturating_add(length).min(self.logical_size());
-        let mut extent_offset = 0_u64;
-        self.manifest
-            .extents()
-            .iter()
-            .try_fold(0_u64, |total, extent| {
-                let extent_end = extent_offset
-                    .checked_add(extent_logical_length(extent))
-                    .ok_or(ManifestReadError::ArithmeticOverflow)?;
-                let overlap = extent_end
-                    .min(end)
-                    .saturating_sub(extent_offset.max(offset));
-                extent_offset = extent_end;
-                if matches!(extent, ManifestExtent::Hole { .. }) {
-                    Ok(total)
-                } else {
-                    total
-                        .checked_add(overlap)
-                        .ok_or(ManifestReadError::ArithmeticOverflow)
-                }
-            })
+        let (extents, mut start) = self.intersecting(offset, length);
+        extents.iter().try_fold(0_u64, |total, extent| {
+            let extent_end = start
+                .checked_add(extent_logical_length(extent))
+                .ok_or(ManifestReadError::ArithmeticOverflow)?;
+            let overlap = extent_end.min(end).saturating_sub(start.max(offset));
+            start = extent_end;
+            if matches!(extent, ManifestExtent::Hole { .. }) {
+                Ok(total)
+            } else {
+                total
+                    .checked_add(overlap)
+                    .ok_or(ManifestReadError::ArithmeticOverflow)
+            }
+        })
     }
 
     fn read_range(
@@ -92,20 +147,16 @@ impl ManifestRecipe for FlatManifestRecipe {
         offset: u64,
         length: u64,
     ) -> Result<Vec<ManifestRangeExtent>, ManifestReadError> {
-        let end = offset.saturating_add(length).min(self.logical_size());
+        let (extents, mut start) = self.intersecting(offset, length);
         let mut located = Vec::new();
-        let mut extent_offset = 0_u64;
-        for extent in self.manifest.extents() {
-            let extent_end = extent_offset
+        located
+            .try_reserve_exact(extents.len())
+            .map_err(|_| ManifestReadError::OutOfMemory)?;
+        for extent in extents {
+            located.push(ManifestRangeExtent::new(start, extent.clone()));
+            start = start
                 .checked_add(extent_logical_length(extent))
                 .ok_or(ManifestReadError::ArithmeticOverflow)?;
-            if extent_end > offset && extent_offset < end {
-                located
-                    .try_reserve(1)
-                    .map_err(|_| ManifestReadError::OutOfMemory)?;
-                located.push(ManifestRangeExtent::new(extent_offset, extent.clone()));
-            }
-            extent_offset = extent_end;
         }
         Ok(located)
     }
@@ -179,6 +230,13 @@ trait VerifiedChunkReader: fmt::Debug + Send + Sync {
         cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError>;
 
+    fn read_locations(
+        &self,
+        locations: &[ExactIndexEntry],
+        requests: &[(ChunkId, u64)],
+        cache: Option<&VerifiedReadCache>,
+    ) -> Result<VerifiedChunkRead, StoreError>;
+
     fn read_verified_chunks(
         &self,
         requests: &[(ChunkId, u64)],
@@ -221,6 +279,21 @@ where
         };
         self.containers
             .read_verified_chunk_payload_cached(&index, chunk_id, logical_length, cache)
+    }
+
+    fn read_locations(
+        &self,
+        locations: &[ExactIndexEntry],
+        requests: &[(ChunkId, u64)],
+        cache: Option<&VerifiedReadCache>,
+    ) -> Result<VerifiedChunkRead, StoreError> {
+        let pin = self.index.try_pin();
+        self.containers.read_verified_chunks_with_locations(
+            pin.as_deref(),
+            locations,
+            requests,
+            cache,
+        )
     }
 
     fn read_verified_chunks(
@@ -275,23 +348,49 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             }
         }
         containers.verify_required_chunks(&required)?;
-        let allocated_bytes = manifest.extents().iter().try_fold(0_u64, |total, extent| {
-            let length = if matches!(extent, ManifestExtent::Hole { .. }) {
-                0
-            } else {
-                extent_logical_length(extent)
-            };
-            total.checked_add(length)
-        });
-        let allocated_bytes = allocated_bytes.ok_or(ManifestReadError::ArithmeticOverflow)?;
         Ok(Self {
-            recipe: Arc::new(FlatManifestRecipe {
-                manifest,
-                allocated_bytes,
-            }),
+            recipe: Arc::new(FlatManifestRecipe::new(manifest)?),
             containers,
             indexed_reader: None,
             read_cache: None,
+            locations: Arc::from([]),
+        })
+    }
+
+    /// Builds a live read recipe from published writer-carried Locations.
+    /// Construction is metadata-only; every read independently verifies DATA
+    /// and resolves dependent Bases through the configured reader policy.
+    /// Locations may precede Exact Index activation and remain mere candidates.
+    ///
+    /// # Errors
+    /// Rejects an invalid or oversized flat recipe.
+    pub fn from_published_locations(
+        entries: &[ExactIndexEntry],
+        containers: ContainerRepository<I>,
+    ) -> Result<Self, ManifestReadError> {
+        let length = entries
+            .iter()
+            .try_fold(0_u64, |sum, entry| {
+                sum.checked_add(u64::from(entry.logical_length()))
+            })
+            .ok_or(ManifestReadError::ArithmeticOverflow)?;
+        let extents = entries
+            .iter()
+            .map(|entry| ManifestExtent::Data {
+                logical_length: u64::from(entry.logical_length()),
+                chunk_id: entry.chunk_id(),
+            })
+            .collect();
+        let manifest = ManifestLeaf::new(length, extents).map_err(ManifestTreeError::from)?;
+        let mut locations = entries.to_vec();
+        locations.sort_unstable_by_key(ExactIndexEntry::chunk_id);
+        locations.dedup_by_key(|entry| entry.chunk_id());
+        Ok(Self {
+            recipe: Arc::new(FlatManifestRecipe::new(manifest)?),
+            containers,
+            indexed_reader: None,
+            read_cache: None,
+            locations: locations.into(),
         })
     }
 
@@ -313,6 +412,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             containers,
             indexed_reader: None,
             read_cache: None,
+            locations: Arc::from([]),
         }
     }
 
@@ -421,6 +521,32 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
     /// # Errors
     /// Returns the same integrity and range failures as `read_at`.
     pub fn read_shared_at(&self, offset: u64, length: u32) -> Result<Bytes, ManifestReadError> {
+        join_manifest_segments(self.read_segments_at(offset, length)?)
+    }
+
+    /// Reads a bounded range as immutable segments suitable for vectored I/O.
+    ///
+    /// # Errors
+    /// Returns the same integrity and range failures as `read_at`.
+    pub fn read_segments_at(
+        &self,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<Bytes>, ManifestReadError> {
+        if !self.locations.is_empty() {
+            let read = |requests: &[(ChunkId, u64)]| match &self.indexed_reader {
+                Some(reader) => {
+                    reader.read_locations(&self.locations, requests, self.read_cache.as_deref())
+                }
+                None => self.containers.read_verified_chunks_with_locations::<I>(
+                    None,
+                    &self.locations,
+                    requests,
+                    self.read_cache.as_deref(),
+                ),
+            };
+            return self.read_at_using(offset, length, |id, length| read(&[(id, length)]), read);
+        }
         if let Some(reader) = &self.indexed_reader {
             self.read_at_using(
                 offset,
@@ -486,6 +612,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
                 )
             },
         )
+        .and_then(join_manifest_segments)
         .map(Vec::from)
     }
 
@@ -583,7 +710,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         length: u32,
         mut read_chunk: F,
         read_chunks: G,
-    ) -> Result<Bytes, ManifestReadError>
+    ) -> Result<Vec<Bytes>, ManifestReadError>
     where
         F: FnMut(ChunkId, u64) -> Result<VerifiedChunkRead, StoreError>,
         G: FnOnce(&[(ChunkId, u64)]) -> Result<VerifiedChunkRead, StoreError>,
@@ -592,7 +719,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             return Err(ManifestReadError::RequestTooLarge(length));
         }
         if length == 0 || offset >= self.logical_size() {
-            return Ok(Bytes::new());
+            return Ok(Vec::new());
         }
         let read_end = offset
             .saturating_add(u64::from(length))
@@ -702,7 +829,7 @@ fn assemble_manifest_read<F>(
     read_end: u64,
     extents: &[ManifestRangeExtent],
     mut read_chunk: F,
-) -> Result<Bytes, ManifestReadError>
+) -> Result<Vec<Bytes>, ManifestReadError>
 where
     F: FnMut(ChunkId, u64) -> Result<VerifiedChunkPayload, StoreError>,
 {
@@ -735,7 +862,10 @@ where
             if end > payload.len() {
                 return Err(ManifestReadError::ArithmeticOverflow);
             }
-            return Ok(Bytes::from_owner(payload).slice(start..end));
+            let view = payload
+                .into_read_view(start..end)
+                .expect("ASSERT: resolved single-Chunk read range is within its verified payload");
+            return Ok(vec![Bytes::from_owner(view)]);
         }
     }
     let mut output = ManifestReadOutput::new(output_length);
@@ -806,37 +936,31 @@ where
     Ok(output.finish())
 }
 
-/// Keeps a shared verified range until a sparse extent, physical gap or new
-/// allocation actually requires assembly. Each Chunk is fetched only once.
+/// Joins adjacent ranges of the same verified allocation, retaining other
+/// owners separately until a caller explicitly needs a contiguous buffer.
 struct ManifestReadOutput {
     length: usize,
     view: Option<fastdup_format::VerifiedReadView>,
-    bytes: Vec<u8>,
+    segments: Vec<Bytes>,
 }
 
 impl ManifestReadOutput {
-    fn new(length: usize) -> Self {
+    fn new(_length: usize) -> Self {
         Self {
-            length,
+            length: 0,
             view: None,
-            bytes: Vec::new(),
+            segments: Vec::new(),
         }
     }
 
     fn len(&self) -> usize {
-        self.view
-            .as_ref()
-            .map_or(self.bytes.len(), |view| view.as_ref().len())
+        self.length
     }
 
-    fn owned(&mut self) -> Result<&mut Vec<u8>, ManifestReadError> {
-        self.bytes
-            .try_reserve_exact(self.length - self.bytes.len())
-            .map_err(|_| ManifestReadError::OutOfMemory)?;
+    fn flush(&mut self) {
         if let Some(view) = self.view.take() {
-            self.bytes.extend_from_slice(view.as_ref());
+            self.segments.push(Bytes::from_owner(view));
         }
-        Ok(&mut self.bytes)
     }
 
     fn append_payload(
@@ -844,31 +968,57 @@ impl ManifestReadOutput {
         payload: &VerifiedChunkPayload,
         range: std::ops::Range<usize>,
     ) -> Result<(), ManifestReadError> {
-        let bytes = payload
-            .as_slice()
-            .get(range.clone())
-            .ok_or(ManifestReadError::ArithmeticOverflow)?;
-        if let Some(view) = &mut self.view {
-            if view.try_append(payload, range) {
-                return Ok(());
-            }
-        } else if self.bytes.is_empty() {
-            self.view = payload.read_view(range);
+        let length = range.len();
+        if let Some(view) = &mut self.view
+            && view.try_append(payload, range.clone())
+        {
+            self.length += length;
             return Ok(());
         }
-        self.owned()?.extend_from_slice(bytes);
+        self.flush();
+        self.view = Some(
+            payload
+                .read_view(range)
+                .ok_or(ManifestReadError::ArithmeticOverflow)?,
+        );
+        self.length += length;
         Ok(())
     }
 
     fn resize(&mut self, length: usize, value: u8) -> Result<(), ManifestReadError> {
-        self.owned()?.resize(length, value);
+        self.flush();
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length - self.length)
+            .map_err(|_| ManifestReadError::OutOfMemory)?;
+        bytes.resize(length - self.length, value);
+        self.segments.push(Bytes::from(bytes));
+        self.length = length;
         Ok(())
     }
 
-    fn finish(self) -> Bytes {
-        self.view
-            .map_or_else(|| Bytes::from(self.bytes), Bytes::from_owner)
+    fn finish(mut self) -> Vec<Bytes> {
+        self.flush();
+        self.segments
     }
+}
+
+fn join_manifest_segments(mut segments: Vec<Bytes>) -> Result<Bytes, ManifestReadError> {
+    if segments.len() == 1 {
+        return Ok(segments.pop().expect("ASSERT: one segment"));
+    }
+    let length = segments.iter().try_fold(0_usize, |sum, bytes| {
+        sum.checked_add(bytes.len())
+            .ok_or(ManifestReadError::ArithmeticOverflow)
+    })?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|_| ManifestReadError::OutOfMemory)?;
+    for bytes in segments {
+        output.extend_from_slice(&bytes);
+    }
+    Ok(Bytes::from(output))
 }
 
 #[derive(Debug)]
@@ -952,5 +1102,64 @@ const fn extent_logical_length(extent: &ManifestExtent) -> u64 {
         | ManifestExtent::DataSlice { logical_length, .. }
         | ManifestExtent::Hole { logical_length }
         | ManifestExtent::Fill { logical_length, .. } => logical_length,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flat_recipe_index_matches_linear_mixed_extent_ranges() {
+        for count in [0_u64, 1, 2, 32, 512] {
+            let extents = (0..count)
+                .map(|ordinal| {
+                    let logical_length = ordinal % 31 + 1;
+                    match ordinal % 4 {
+                        0 => ManifestExtent::Hole { logical_length },
+                        1 => ManifestExtent::Fill {
+                            logical_length,
+                            value: 23,
+                        },
+                        2 => ManifestExtent::Data {
+                            logical_length,
+                            chunk_id: ChunkId::of(&ordinal.to_le_bytes()),
+                        },
+                        _ => ManifestExtent::DataSlice {
+                            logical_length,
+                            chunk_id: ChunkId::of(&ordinal.to_le_bytes()),
+                            chunk_length: 64,
+                            chunk_offset: 3,
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            let size = extents.iter().map(extent_logical_length).sum();
+            let recipe =
+                FlatManifestRecipe::new(ManifestLeaf::new(size, extents.clone()).unwrap()).unwrap();
+            for offset in (0..size + 2).step_by(17).chain([size, size + 1, u64::MAX]) {
+                for length in [0, 1, 31, 99, 1000, u64::MAX] {
+                    let end = offset.saturating_add(length).min(size);
+                    let mut start = 0;
+                    let mut expected = Vec::new();
+                    let mut allocated = 0;
+                    for extent in &extents {
+                        let next = start + extent_logical_length(extent);
+                        if offset < end && start < end && next > offset {
+                            expected.push(ManifestRangeExtent::new(start, extent.clone()));
+                            if !matches!(extent, ManifestExtent::Hole { .. }) {
+                                allocated += next.min(end) - start.max(offset);
+                            }
+                        }
+                        start = next;
+                    }
+                    assert_eq!(recipe.read_range(offset, length).unwrap(), expected);
+                    assert_eq!(
+                        recipe.allocated_bytes_in_range(offset, length).unwrap(),
+                        allocated
+                    );
+                }
+            }
+        }
     }
 }

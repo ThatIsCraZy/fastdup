@@ -1,6 +1,6 @@
 use crate::{
     CommitRange, ExternalDirtyData, MutationPayload, PosixError, PreparedCommitExtent,
-    PreparedDataRecipe, SparseData, copy_bytes,
+    PreparedDataRecipe, SparseData,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -39,6 +39,20 @@ pub trait CommittedFile: fmt::Debug + Send + Sync {
     /// Returns the same failures as `read_at`.
     fn read_shared_at(&self, offset: u64, length: u32) -> Result<Bytes, PosixError> {
         self.read_at(offset, length).map(Bytes::from)
+    }
+
+    /// Reads immutable segments in logical order without concatenating owners.
+    ///
+    /// # Errors
+    /// Returns the same failures as `read_at`.
+    fn read_segments_at(&self, offset: u64, length: u32) -> Result<Vec<Bytes>, PosixError> {
+        self.read_shared_at(offset, length).map(|bytes| vec![bytes])
+    }
+
+    /// Canonical shared source for a range-local immutable view. Metadata only.
+    /// The returned offset denotes this view's byte zero in the shared source.
+    fn shared_read_source(&self) -> Option<(Arc<dyn CommittedFile>, u64)> {
+        None
     }
 
     /// Verifies that one complete candidate payload is exactly this source.
@@ -960,7 +974,7 @@ impl FrozenCommit {
 
     fn plan_read(&self, offset: u64, length: u32) -> Result<ReadPlan, PosixError> {
         ReadPlan::new(
-            Arc::clone(&self.committed),
+            &self.committed,
             &[&self.epoch.dirty],
             self.epoch.dirty.result_size,
             offset,
@@ -993,6 +1007,9 @@ impl CommittedFile for FrozenCommit {
     }
     fn read_shared_at(&self, offset: u64, length: u32) -> Result<Bytes, PosixError> {
         self.plan_read(offset, length)?.execute_shared()
+    }
+    fn read_segments_at(&self, offset: u64, length: u32) -> Result<Vec<Bytes>, PosixError> {
+        self.plan_read(offset, length)?.execute_segments()
     }
 }
 
@@ -1054,35 +1071,63 @@ impl VersionedFile {
         }
         let mut accepted = false;
         let mut first_error = None;
+        let mut active = Vec::new();
+        let mut previous_end = 0;
         for (offset, through_sequence, source) in candidates {
+            // Preserve input-order semantics for overlapping/stale candidates.
+            // Ordinary disjoint publication ranges retire resident backing once.
+            if offset < previous_end && !active.is_empty() {
+                match self
+                    .active
+                    .data
+                    .externalize_many(std::mem::take(&mut active))
+                {
+                    Ok(()) => accepted = true,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
             let active_result = (|| {
                 if through_sequence <= self.active.base_sequence
                     || through_sequence > self.active.through_sequence
                 {
                     return Err(PosixError::Again);
                 }
-                let end = offset
-                    .checked_add(source.logical_size())
-                    .ok_or(PosixError::Io)?;
+                let length = source.logical_size();
+                let end = offset.checked_add(length).ok_or(PosixError::Io)?;
                 if !self.active.holes.overlapping_starts(offset, end).is_empty() {
                     return Err(PosixError::Again);
                 }
-                self.active.data.externalize_many(vec![(
-                    offset,
-                    through_sequence,
-                    Arc::clone(&source),
-                )])
+                if length == 0
+                    || end > self.active.data.logical_size
+                    || source.allocated_bytes() != length
+                    || !self
+                        .active
+                        .data
+                        .range_unchanged_through(offset, end, through_sequence)
+                {
+                    return Err(PosixError::Io);
+                }
+                active.push((offset, through_sequence, Arc::clone(&source)));
+                previous_end = end;
+                Ok(())
             })();
             let frozen_result = self.prepare_inflight(offset, through_sequence, &source);
-            if active_result.is_ok() || frozen_result.is_ok() {
+            if frozen_result.is_ok() {
                 accepted = true;
-            } else {
-                first_error.get_or_insert_with(|| {
-                    active_result
-                        .expect_err("ASSERT: rejected active externalization has one error")
-                });
+            } else if let Err(error) = active_result {
+                first_error.get_or_insert(error);
                 if !matches!(frozen_result, Err(PosixError::Again)) {
                     first_error = frozen_result.err();
+                }
+            }
+        }
+        if !active.is_empty() {
+            match self.active.data.externalize_many(active) {
+                Ok(()) => accepted = true,
+                Err(error) => {
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -1477,7 +1522,7 @@ impl VersionedFile {
         }
         layers.push(&self.active);
         ReadPlan::new(
-            Arc::clone(&self.committed),
+            &self.committed,
             &layers,
             self.active.result_size,
             offset,
@@ -1839,126 +1884,182 @@ fn allocated_bytes_through(
 }
 
 #[derive(Debug)]
-struct PlannedData {
-    start: u64,
-    bytes: Vec<u8>,
+enum ReadSource {
+    Resident(Bytes),
+    External {
+        file: Arc<dyn CommittedFile>,
+        offset: u64,
+    },
+    Zero,
 }
 
 #[derive(Debug)]
-struct PlannedEpoch {
-    result_size: u64,
-    data: Vec<PlannedData>,
-    holes: Vec<(u64, u64)>,
+struct ReadSpan {
+    start: u64,
+    end: u64,
+    source: ReadSource,
 }
 
-impl PlannedEpoch {
-    fn new(epoch: &DirtyEpoch, read_start: u64, read_end: u64) -> Result<Self, PosixError> {
-        if read_start >= read_end {
-            return Ok(Self {
-                result_size: epoch.result_size,
-                data: Vec::new(),
-                holes: Vec::new(),
-            });
-        }
-        let mut data = Vec::new();
-        if let Some((&extent_start, bytes)) = epoch.data.extents.range(..=read_start).next_back() {
-            plan_data(
-                &mut data,
-                read_start,
-                read_end,
-                extent_start,
-                bytes.as_bytes(),
-            )?;
-        }
-        for (&extent_start, bytes) in epoch
-            .data
-            .extents
-            .range((Excluded(read_start), Excluded(read_end)))
-        {
-            plan_data(
-                &mut data,
-                read_start,
-                read_end,
-                extent_start,
-                bytes.as_bytes(),
-            )?;
-        }
-        if let Some((&extent_start, external)) =
-            epoch.data.external_extents.range(..=read_start).next_back()
-        {
-            plan_external(&mut data, read_start, read_end, extent_start, external)?;
-        }
-        for (&extent_start, external) in epoch
-            .data
-            .external_extents
-            .range((Excluded(read_start), Excluded(read_end)))
-        {
-            plan_external(&mut data, read_start, read_end, extent_start, external)?;
-        }
-        let holes = epoch
-            .holes
-            .overlapping_starts(read_start, read_end)
-            .into_iter()
-            .map(|start| {
-                (
-                    start.max(read_start),
-                    epoch.holes.ranges[&start].min(read_end),
-                )
-            })
-            .collect();
-        Ok(Self {
-            result_size: epoch.result_size,
-            data,
-            holes,
-        })
-    }
-
-    fn apply(&self, output: &mut [u8], read_start: u64, read_end: u64) {
-        if self.result_size < read_end {
-            zero_range(
-                output,
-                read_start,
-                read_end,
-                self.result_size.max(read_start),
-                read_end,
-            );
-        }
-        for &(hole_start, hole_end) in &self.holes {
-            zero_range(output, read_start, read_end, hole_start, hole_end);
-        }
-        for extent in &self.data {
-            overlay_bytes(output, read_start, read_end, extent.start, &extent.bytes);
-        }
-    }
-}
-
+/// A snapshot of only the visible intervals. Planning never performs DATA I/O.
 #[derive(Debug)]
 pub(super) struct ReadPlan {
-    committed: Arc<dyn CommittedFile>,
-    read_start: u64,
-    read_end: u64,
-    epochs: Vec<PlannedEpoch>,
+    spans: Vec<ReadSpan>,
 }
 
 impl ReadPlan {
     fn new(
-        committed: Arc<dyn CommittedFile>,
+        committed: &Arc<dyn CommittedFile>,
         epochs: &[&DirtyEpoch],
         logical_size: u64,
         offset: u64,
         length: u32,
     ) -> Result<Self, PosixError> {
-        let read_end = offset.saturating_add(u64::from(length)).min(logical_size);
-        let epochs = epochs
-            .iter()
-            .map(|epoch| PlannedEpoch::new(epoch, offset, read_end))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            committed,
-            read_start: offset,
-            read_end,
-            epochs,
-        })
+        let end = offset.saturating_add(u64::from(length)).min(logical_size);
+        let mut plan = Self { spans: Vec::new() };
+        if offset >= end {
+            return Ok(plan);
+        }
+        plan.spans
+            .try_reserve(epochs.len() + 1)
+            .map_err(|_| PosixError::OutOfMemory)?;
+        let mut uncovered = Vec::new();
+        uncovered
+            .try_reserve(1)
+            .map_err(|_| PosixError::OutOfMemory)?;
+        uncovered.push((offset, end));
+        for epoch in epochs.iter().rev() {
+            // A truncate followed by growth must hide older bytes past EOF.
+            plan.cover(&mut uncovered, epoch.result_size, end, |_| ReadSource::Zero);
+            for start in epoch.holes.overlapping_starts(offset, end) {
+                plan.cover(&mut uncovered, start, epoch.holes.ranges[&start], |_| {
+                    ReadSource::Zero
+                });
+            }
+            let first = epoch.data.extents.range(..=offset).next_back();
+            for (&start, data) in first
+                .into_iter()
+                .chain(epoch.data.extents.range((Excluded(offset), Excluded(end))))
+            {
+                plan.cover(&mut uncovered, start, start + data.len() as u64, |range| {
+                    ReadSource::Resident(
+                        data.bytes.bytes.slice(
+                            usize::try_from(range.0 - start)
+                                .expect("ASSERT: resident offset fits usize")
+                                ..usize::try_from(range.1 - start)
+                                    .expect("ASSERT: resident end fits usize"),
+                        ),
+                    )
+                });
+            }
+            let first = epoch.data.external_extents.range(..=offset).next_back();
+            for (&start, external) in first.into_iter().chain(
+                epoch
+                    .data
+                    .external_extents
+                    .range((Excluded(offset), Excluded(end))),
+            ) {
+                plan.cover(&mut uncovered, start, start + external.length, |range| {
+                    Self::external(&external.source, external.source_offset + range.0 - start)
+                });
+            }
+            if uncovered.is_empty() {
+                break;
+            }
+        }
+        plan.cover(&mut uncovered, 0, committed.logical_size(), |range| {
+            Self::external(committed, range.0)
+        });
+        plan.cover(&mut uncovered, offset, end, |_| ReadSource::Zero);
+        plan.spans.sort_unstable_by_key(|span| span.start);
+        Ok(plan)
+    }
+
+    fn external(file: &Arc<dyn CommittedFile>, offset: u64) -> ReadSource {
+        match file.shared_read_source() {
+            Some((file, base)) => ReadSource::External {
+                file,
+                offset: base + offset,
+            },
+            None => ReadSource::External {
+                file: Arc::clone(file),
+                offset,
+            },
+        }
+    }
+
+    fn cover(
+        &mut self,
+        uncovered: &mut Vec<(u64, u64)>,
+        start: u64,
+        end: u64,
+        mut source: impl FnMut((u64, u64)) -> ReadSource,
+    ) {
+        if uncovered.len() > 16 {
+            self.cover_many(uncovered, start, end, source);
+            return;
+        }
+        let mut ordinal = 0;
+        while ordinal < uncovered.len() {
+            let (left, right) = uncovered[ordinal];
+            let overlap = (left.max(start), right.min(end));
+            if overlap.0 >= overlap.1 {
+                ordinal += 1;
+                continue;
+            }
+            self.spans.push(ReadSpan {
+                start: overlap.0,
+                end: overlap.1,
+                source: source(overlap),
+            });
+            match (left < overlap.0, overlap.1 < right) {
+                (true, true) => {
+                    uncovered[ordinal] = (left, overlap.0);
+                    uncovered.insert(ordinal + 1, (overlap.1, right));
+                    ordinal += 2;
+                }
+                (true, false) => {
+                    uncovered[ordinal].1 = overlap.0;
+                    ordinal += 1;
+                }
+                (false, true) => {
+                    uncovered[ordinal].0 = overlap.1;
+                    ordinal += 1;
+                }
+                (false, false) => {
+                    uncovered.remove(ordinal);
+                }
+            }
+        }
+    }
+
+    fn cover_many(
+        &mut self,
+        uncovered: &mut Vec<(u64, u64)>,
+        start: u64,
+        end: u64,
+        mut source: impl FnMut((u64, u64)) -> ReadSource,
+    ) {
+        if start >= end {
+            return;
+        }
+        // Uncovered intervals stay ordered and disjoint. Replace the whole
+        // overlap once instead of repeatedly scanning and shifting its prefix.
+        let first = uncovered.partition_point(|&(_, right)| right <= start);
+        let last = uncovered.partition_point(|&(left, _)| left < end);
+        if first >= last {
+            return;
+        }
+        let left = (uncovered[first].0 < start).then_some((uncovered[first].0, start));
+        let right = (uncovered[last - 1].1 > end).then_some((end, uncovered[last - 1].1));
+        for &(left, right) in &uncovered[first..last] {
+            let overlap = (left.max(start), right.min(end));
+            self.spans.push(ReadSpan {
+                start: overlap.0,
+                end: overlap.1,
+                source: source(overlap),
+            });
+        }
+        uncovered.splice(first..last, [left, right].into_iter().flatten());
     }
 
     pub(super) fn execute(self) -> Result<Vec<u8>, PosixError> {
@@ -1966,114 +2067,86 @@ impl ReadPlan {
     }
 
     pub(super) fn execute_shared(self) -> Result<Bytes, PosixError> {
-        if self.read_start >= self.read_end {
-            return Ok(Bytes::new());
-        }
-        if self.read_end <= self.committed.logical_size()
-            && self
-                .epochs
-                .iter()
-                .all(|epoch| !epoch.affects(self.read_end))
-        {
-            let length = u32::try_from(self.read_end - self.read_start)
-                .expect("ASSERT: a planned read length originated from u32");
-            let bytes = self.committed.read_shared_at(self.read_start, length)?;
-            if bytes.len() != usize::try_from(length).expect("ASSERT: u32 read length fits usize") {
-                return Err(PosixError::Io);
-            }
-            return Ok(bytes);
-        }
-        let output_length = usize::try_from(self.read_end - self.read_start)
-            .map_err(|_| PosixError::FileTooLarge)?;
+        join_read_segments(self.execute_segments()?)
+    }
+
+    pub(super) fn execute_segments(self) -> Result<Vec<Bytes>, PosixError> {
         let mut output = Vec::new();
-        output
-            .try_reserve_exact(output_length)
-            .map_err(|_| PosixError::OutOfMemory)?;
-        output.resize(output_length, 0);
-
-        let committed_end = self.read_end.min(self.committed.logical_size());
-        if self.read_start < committed_end {
-            let committed_length = u32::try_from(committed_end - self.read_start)
-                .expect("ASSERT: a planned read length originated from u32");
-            let committed = self.committed.read_at(self.read_start, committed_length)?;
-            if committed.len()
-                != usize::try_from(committed_length)
-                    .expect("ASSERT: u32 read length must fit usize")
-            {
-                return Err(PosixError::Io);
+        let mut spans = self.spans.into_iter().peekable();
+        while let Some(span) = spans.next() {
+            let mut length = span.end - span.start;
+            match span.source {
+                ReadSource::Resident(bytes) => output.push(bytes),
+                ReadSource::Zero => {
+                    let mut bytes = Vec::new();
+                    bytes
+                        .try_reserve_exact(
+                            usize::try_from(length)
+                                .expect("ASSERT: bounded read length fits usize"),
+                        )
+                        .map_err(|_| PosixError::OutOfMemory)?;
+                    bytes.resize(
+                        usize::try_from(length).expect("ASSERT: bounded read length fits usize"),
+                        0,
+                    );
+                    output.push(Bytes::from(bytes));
+                }
+                ReadSource::External { file, offset } => {
+                    // Adjacent live views of one publication use one Store batch.
+                    while let Some(next) = spans.peek() {
+                        if let ReadSource::External {
+                            file: next_file,
+                            offset: next_offset,
+                        } = &next.source
+                            && Arc::ptr_eq(&file, next_file)
+                            && *next_offset == offset + length
+                            && length + next.end - next.start <= 1024 * 1024
+                        {
+                            length += next.end - next.start;
+                            spans.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    let bytes = file.read_segments_at(
+                        offset,
+                        u32::try_from(length).map_err(|_| PosixError::FileTooLarge)?,
+                    )?;
+                    if bytes.iter().map(Bytes::len).sum::<usize>()
+                        != usize::try_from(length).expect("ASSERT: bounded read length fits usize")
+                    {
+                        return Err(PosixError::Io);
+                    }
+                    output.extend(bytes);
+                }
             }
-            output[..committed.len()].copy_from_slice(&committed);
         }
-        for epoch in &self.epochs {
-            epoch.apply(&mut output, self.read_start, self.read_end);
+        // Bound the number of owners passed through transports with finite IOV_MAX.
+        if output.len() > 128 {
+            return join_read_segments(output).map(|bytes| vec![bytes]);
         }
-        Ok(Bytes::from(output))
+        Ok(output)
     }
 }
 
-impl PlannedEpoch {
-    fn affects(&self, read_end: u64) -> bool {
-        self.result_size < read_end || !self.data.is_empty() || !self.holes.is_empty()
+pub(crate) fn join_read_segments(mut segments: Vec<Bytes>) -> Result<Bytes, PosixError> {
+    if segments.len() == 1 {
+        return Ok(segments.pop().expect("ASSERT: one segment"));
     }
+    let length = segments.iter().try_fold(0_usize, |sum, bytes| {
+        sum.checked_add(bytes.len()).ok_or(PosixError::FileTooLarge)
+    })?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|_| PosixError::OutOfMemory)?;
+    for bytes in segments {
+        output.extend_from_slice(&bytes);
+    }
+    Ok(Bytes::from(output))
 }
 
-fn plan_data(
-    planned: &mut Vec<PlannedData>,
-    read_start: u64,
-    read_end: u64,
-    extent_start: u64,
-    bytes: &[u8],
-) -> Result<(), PosixError> {
-    let extent_end = extent_start
-        .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64"))
-        .expect("ASSERT: validated DATA extent must not overflow");
-    let copy_start = extent_start.max(read_start);
-    let copy_end = extent_end.min(read_end);
-    if copy_start >= copy_end {
-        return Ok(());
-    }
-    let source_start =
-        usize::try_from(copy_start - extent_start).expect("ASSERT: source offset must fit usize");
-    let source_end =
-        usize::try_from(copy_end - extent_start).expect("ASSERT: source end must fit usize");
-    planned.push(PlannedData {
-        start: copy_start,
-        bytes: copy_bytes(&bytes[source_start..source_end])?,
-    });
-    Ok(())
-}
-
-fn plan_external(
-    planned: &mut Vec<PlannedData>,
-    read_start: u64,
-    read_end: u64,
-    extent_start: u64,
-    external: &ExternalDirtyData,
-) -> Result<(), PosixError> {
-    let extent_end = extent_start
-        .checked_add(external.length)
-        .ok_or(PosixError::Io)?;
-    let copy_start = extent_start.max(read_start);
-    let copy_end = extent_end.min(read_end);
-    if copy_start >= copy_end {
-        return Ok(());
-    }
-    let source_offset = external
-        .source_offset
-        .checked_add(copy_start - extent_start)
-        .ok_or(PosixError::Io)?;
-    let length = u32::try_from(copy_end - copy_start).map_err(|_| PosixError::FileTooLarge)?;
-    let bytes = external.source.read_at(source_offset, length)?;
-    if bytes.len() != usize::try_from(length).expect("ASSERT: u32 fits usize") {
-        return Err(PosixError::Io);
-    }
-    planned.push(PlannedData {
-        start: copy_start,
-        bytes,
-    });
-    Ok(())
-}
-
+#[cfg(test)]
 fn overlay_bytes(
     output: &mut [u8],
     read_start: u64,
@@ -2100,21 +2173,64 @@ fn overlay_bytes(
     output[target_start..target_end].copy_from_slice(&bytes[source_start..source_end]);
 }
 
-fn zero_range(output: &mut [u8], read_start: u64, read_end: u64, zero_start: u64, zero_end: u64) {
-    let start = zero_start.max(read_start);
-    let end = zero_end.min(read_end);
-    if start >= end {
-        return;
-    }
-    let target_start =
-        usize::try_from(start - read_start).expect("ASSERT: target offset must fit usize");
-    let target_end = usize::try_from(end - read_start).expect("ASSERT: target end must fit usize");
-    output[target_start..target_end].fill(0);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragmented_reads_preserve_frozen_external_hole_and_truncate_layers() {
+        let mut expected = vec![3; 65_536];
+        let mut file = VersionedFile::from_committed(bytes_reader(expected.clone()), 0);
+        let mut sequence = 0;
+        for start in (0..expected.len()).step_by(256) {
+            sequence += 1;
+            file.write(u64::try_from(start).unwrap(), &[5; 64], sequence)
+                .unwrap();
+            expected[start..start + 64].fill(5);
+        }
+        let frozen_bytes = expected.clone();
+        let frozen = file.freeze_active(CommitToken::new(1).unwrap()).unwrap();
+        for start in (0..expected.len()).step_by(512) {
+            sequence += 1;
+            file.punch_hole(
+                u64::try_from(start + 32).unwrap(),
+                u64::try_from(start + 96).unwrap(),
+                sequence,
+            )
+            .unwrap();
+            expected[start + 32..start + 96].fill(0);
+            sequence += 1;
+            file.write(u64::try_from(start + 128).unwrap(), &[9; 32], sequence)
+                .unwrap();
+            file.externalize_many(vec![(
+                u64::try_from(start + 128).unwrap(),
+                sequence,
+                bytes_reader(vec![9; 32]),
+            )])
+            .unwrap();
+            expected[start + 128..start + 160].fill(9);
+        }
+        sequence += 1;
+        file.truncate(65_000, sequence).unwrap();
+        sequence += 1;
+        file.truncate(65_536, sequence).unwrap();
+        expected[65_000..].fill(0);
+        assert_eq!(frozen.read_at(0, 65_536).unwrap(), frozen_bytes);
+        for offset in [0_u64, 1, 255, 1024, 65_500, 65_536] {
+            for length in [0_u32, 1, 32, 2048, 65_536] {
+                let start = usize::try_from(offset).unwrap().min(expected.len());
+                let end = (start + usize::try_from(length).unwrap()).min(expected.len());
+                assert_eq!(
+                    file.plan_read(offset, length).unwrap().execute().unwrap(),
+                    expected[start..end]
+                );
+            }
+        }
+        let pinned = file.plan_read(0, 65_536).unwrap();
+        file.write(0, &[17; 1024], sequence + 1).unwrap();
+        assert_eq!(pinned.execute().unwrap(), expected);
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2566,6 +2682,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct CountingReader {
+        reads: Arc<Mutex<Vec<(u64, u32)>>>,
+        bytes: Bytes,
+    }
+
+    impl CommittedFile for CountingReader {
+        fn logical_size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+        fn allocated_bytes(&self) -> u64 {
+            self.logical_size()
+        }
+        fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, PosixError> {
+            Ok(offset.saturating_add(length).min(self.logical_size())
+                - offset.min(self.logical_size()))
+        }
+        fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+            self.read_shared_at(offset, length).map(Vec::from)
+        }
+        fn read_shared_at(&self, offset: u64, length: u32) -> Result<Bytes, PosixError> {
+            self.reads.lock().unwrap().push((offset, length));
+            Ok(self.bytes.slice(
+                usize::try_from(offset).unwrap()
+                    ..usize::try_from(offset).unwrap() + length as usize,
+            ))
+        }
+    }
+
+    #[test]
+    fn read_snapshot_retains_dirty_owner_and_skips_hidden_storage() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut file = VersionedFile::from_committed(
+            Arc::new(CountingReader {
+                reads: Arc::clone(&reads),
+                bytes: Bytes::from_static(b"old-data"),
+            }),
+            0,
+        );
+        let bytes = Bytes::from_static(b"new-data");
+        let pointer = bytes.as_ptr();
+        file.write_payload(0, MutationPayload::from_shared_bytes(bytes, 8), 1)
+            .unwrap();
+        let plan = file.plan_read(0, 8).unwrap();
+        file.write(0, b"changed!", 2).unwrap();
+        let reply = plan.execute_shared().unwrap();
+        assert_eq!(reply.as_ref(), b"new-data");
+        assert_eq!(reply.as_ptr(), pointer);
+        assert!(reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn partial_read_fetches_only_visible_committed_intervals() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut file = VersionedFile::from_committed(
+            Arc::new(CountingReader {
+                reads: Arc::clone(&reads),
+                bytes: Bytes::from_static(b"abcdefgh"),
+            }),
+            0,
+        );
+        file.write(2, b"WXYZ", 1).unwrap();
+        let plan = file.plan_read(0, 8).unwrap();
+        assert!(reads.lock().unwrap().is_empty());
+        let segments = plan.execute_segments().unwrap();
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments.concat(), b"abWXYZgh");
+        assert_eq!(*reads.lock().unwrap(), [(0, 2), (6, 2)]);
+    }
+
+    #[test]
+    fn external_read_is_deferred_and_hidden_frozen_source_is_not_read() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut file = VersionedFile::new_empty();
+        file.write(0, b"external", 1).unwrap();
+        file.externalize_many(vec![(
+            0,
+            1,
+            Arc::new(CountingReader {
+                reads: Arc::clone(&reads),
+                bytes: Bytes::from_static(b"external"),
+            }),
+        )])
+        .unwrap();
+        let snapshot = file.plan_read(0, 8).unwrap();
+        assert!(reads.lock().unwrap().is_empty());
+        let _frozen = file.freeze_active(CommitToken::new(1).unwrap()).unwrap();
+        file.write(0, b"replaced", 2).unwrap();
+        assert_eq!(
+            file.plan_read(0, 8).unwrap().execute().unwrap(),
+            b"replaced"
+        );
+        assert!(reads.lock().unwrap().is_empty());
+        assert_eq!(snapshot.execute().unwrap(), b"external");
+        assert_eq!(*reads.lock().unwrap(), [(0, 8)]);
     }
 
     #[test]

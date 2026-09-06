@@ -57,6 +57,26 @@ only a single large Container may consume the full pool internally. This keeps
 thread count fixed and prevents nested jobs from claiming more CPU than their
 admission budget.
 
+Hash admission first classifies FILL under one CPU permit and carries the
+non-FILL ordinals forward, so no FILL scan is repeated. The hash request uses
+both non-FILL byte count and runnable four-Chunk groups. The measured policy
+requests at most `floor(sqrt(ceil(hash_bytes / 256 KiB)))` workers, with a
+minimum of one and the configured CPU budget as the upper bound. This gives
+two workers for 1 MiB, four for 4 MiB and permits a 32-MiB batch to use all ten
+workers on the measured host. It places no fixed process-wide CPU cap. The
+serial-pass permit is released before requesting parallel admission; partial
+grants preserve the same Chunk identities and order. All-FILL batches retain
+one worker. The crossover evidence is in the sixth hotpath audit.
+
+Pending staging validates each new Chunk's length, checked range end and
+ordering against its predecessor, and updates its byte sum in the same append
+operation. Ordinary lane-bound checks use that preserved sum. Detach transfers
+the chunks and accounting together and independently validates all lengths,
+range ordering, the full byte sum and the Container bound. This same pass
+derives the minimum included mutation sequence for the publication fence.
+Thus growing a Pending Container does not repeatedly rescan its already
+checked prefix; malformed detach accounting and reordered chunks still fail.
+
 The identity computed for a stable SeqCDC Chunk is carried through the
 Container writer together with the immutable Chunk bytes. Under ADR 0059, the
 encoder also returns publication Locations from the layout it serialized.
@@ -162,3 +182,29 @@ are collected in region order before any planning borrows them. Empty batches
 take no permits; every batch caps its requested permits by its actual job count
 before admission, including small Base-trial waves. Preparation wall telemetry
 includes admission waiting and is reported separately from encoding.
+
+## Runnable work and worker retirement (2026-09-05)
+
+CPU requests are capped before acquisition by the actual hash shards or ordinary
+Compression Regions. Ingest jobs waiting for storage do not divide the CPU share;
+the common permit pool accounts for runnable CPU work. Finished map workers
+retire their own permits. Hash and encode workers retire at their worker boundary,
+including errors; one permit remains through serial result/Container assembly.
+The complete lease still releases on every failure path.
+
+Advanced Base waves refill a finished target slot before the next CPU phase,
+retain at most eight independently verified Base owners, and share identical
+Bases within the wave. They retain candidate order, codec-trial budgets, savings
+thresholds and logical result order. There is no speculative next-candidate read
+or parallel HDD I/O. Differential tests compare 25 mixed targets with serial
+planning at one and four workers; prepared records must be byte-identical.
+
+
+## Copy work granularity (2026-09-06)
+
+Compression Region materialization requests at most one worker per 512 KiB of
+aggregate copied input, rounded down with a one-worker minimum. The ordinary
+job-count cap still applies. Small batches retain CPU admission while avoiding
+Rayon/queue/result-assembly costs that exceed their copy work. Fingerprint and
+codec stages keep their separate worker policies. Large materialization batches
+retain parallelism; no durable chunk or compression boundary changes.

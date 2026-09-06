@@ -4,8 +4,8 @@ status: proposed
 
 # Maintain Similarity as an online immutable-run index
 
-ADR 0063 deliberately pins one immutable Exact/Similarity pair for an entire
-mount. Independently encoded Chunks written after that mount therefore cannot
+The original ADR 0063 design pinned one immutable Exact/Similarity pair for an
+entire mount. Independently encoded Chunks written after that mount could not
 become Similarity Candidates until an offline full-pool rebuild and remount.
 That makes Advanced Reduction progressively less useful on a long-lived
 appliance.
@@ -135,11 +135,12 @@ pruned during compaction. It is not a full index rebuild.
 
 ## Process interface
 
-The appliance should depend on a small dynamic Reduction repository rather
-than storing the mount-time `Arc<PersistentReductionIndex<_>>`. Its interface
-needs only to pin the current coherent generation, publish one verified batch,
-and report status. Run layout, compaction selection, activation, recovery, and
-lease retirement stay hidden behind that boundary.
+The appliance uses `OnlineSimilarityRepository` behind `PersistentReductionIndex`
+for the live writer. Planning pins the immutable Similarity view and current
+Exact for one batch; verified hint publication runs through the bounded
+background queue. The repository exposes pinning, publication, and status.
+Run layout, compaction selection, activation, recovery, and lease retirement
+stay hidden behind that boundary.
 
 There is no separately queried RAM-only overlay. A bounded publication queue
 may batch verified mutations until an immutable L0 can be committed, as the

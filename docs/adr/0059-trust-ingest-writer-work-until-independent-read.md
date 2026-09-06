@@ -73,3 +73,45 @@ Record CRC verification, Recovery Index comparison, or a second negative
 Exact lookup. Publication now proves ordered durable placement of the writer's
 image, not independent correctness of every byte in that image. Independent
 read and scrub verification retain end-to-end stored-data checking.
+
+## Live published sources (2026-09-05)
+
+A bounded publication may construct one shared virtual read recipe directly from
+its writer-carried Locations. Range-local external extents retain the matching
+Chunk recipe and view coordinates. Construction performs no DATA verification.
+The first independent live read uses the same verified Record plan, cache and
+Base resolver as a committed Manifest read, including Prefix/Sparse-XOR Targets
+whose Exact Location has not yet reached asynchronous index activation. The
+independent-only Location API is not a valid reader for those dependent Targets.
+Retired index snapshots retain the verified scan fallback; dormant sources do
+not hold long-lived Exact generation operation pins.
+
+Externalization validates each candidate's coverage and mutation sequence before
+retiring disjoint resident ranges as a batch. Overlapping candidates preserve
+input-order semantics, stale candidates remain rejectable, and valid Frozen
+recipes may still be attached independently of Active acceptance. No additional
+hash or immediate DATA reread is introduced at this writer boundary.
+
+
+## One lookup and promotion for online reuse (2026-09-06)
+
+An ingest proof hit finds and marks an Active proof in one Generation critical
+section. A Frozen hit is copied into Active under that same lock before reuse;
+a Historical hit retains ordinary Active admission. Full identity and length,
+combined proof bounds, reuse-origin precedence and lookup/admission trace events
+remain paired. Checkpoint-only lookup retains its separate Frozen semantics.
+The resulting external view does not repeat Active admission. Neither this
+promotion nor the cache layout can bypass independent demand/recovery/scrub
+verification.
+
+### Compact Generation Proof storage (2026-09-06)
+
+Active and Frozen Proofs store each full identity and Exact Location once in a
+contiguous arena. Hash buckets hold only bounded ordinals and compare the
+complete Chunk ID and logical length before returning a proof. Freeze moves
+the whole owner. Successful completion consumes and sorts the arena by the
+former BTree key before Historical admission, preserving its policy order;
+cancelled Freeze retains an already newer Active entry and its reuse origin.
+The combined 65,536-Proof bound and publication claims remain unchanged.
+Reported heap usage includes actual arena and hash-table capacities for both
+generations, including reserved slots, rather than a fixed per-entry estimate.

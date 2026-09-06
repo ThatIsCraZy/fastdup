@@ -133,6 +133,24 @@ impl ResponseSender {
         }
     }
 
+    async fn send_segments(&self, header: &fuse_out_header, data: &[bytes::Bytes]) {
+        // A FUSE reply is one message: never retry a short write as a suffix.
+        match self
+            .connection
+            .write_segments(header.as_bytes(), data)
+            .await
+        {
+            Ok(length) if length == header.len as usize => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                warn!("vectored FUSE reply interrupted: {}", error);
+            }
+            result => {
+                error!("vectored FUSE reply failed: {:?}", result);
+                self.send_failed.notify();
+            }
+        }
+    }
+
     /// send response with header and data
     pub(crate) async fn send2(&self, header: &fuse_out_header, data: &[u8]) {
         if let Err(err) = self
@@ -2182,7 +2200,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             );
 
             let mut reply_data = match fs
-                .read(
+                .read_vectored(
                     request,
                     in_header.nodeid,
                     read_in.fh,
@@ -2199,17 +2217,27 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 Ok(reply_data) => reply_data.data,
             };
 
-            if reply_data.len() > read_in.size as _ {
-                reply_data.truncate(read_in.size as _);
+            let mut remaining = read_in.size as usize;
+            reply_data.retain_mut(|bytes| {
+                bytes.truncate(remaining.min(bytes.len()));
+                remaining -= bytes.len();
+                !bytes.is_empty()
+            });
+            let length = read_in.size as usize - remaining;
+            // Keep the transport below IOV_MAX even for fragmented readers.
+            if reply_data.len() > 128 {
+                let mut joined = Vec::with_capacity(length);
+                for bytes in reply_data {
+                    joined.extend_from_slice(&bytes);
+                }
+                reply_data = vec![bytes::Bytes::from(joined)];
             }
-
             let out_header = fuse_out_header {
-                len: (FUSE_OUT_HEADER_SIZE + reply_data.len()) as u32,
+                len: (FUSE_OUT_HEADER_SIZE + length) as u32,
                 error: 0,
                 unique: request.unique,
             };
-
-            resp_sender.send2(&out_header, &reply_data).await;
+            resp_sender.send_segments(&out_header, &reply_data).await;
         });
     }
 

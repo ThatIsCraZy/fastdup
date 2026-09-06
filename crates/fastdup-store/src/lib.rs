@@ -1838,19 +1838,46 @@ impl<I: StorageIo> ContainerRepository<I> {
         workers: NonZeroUsize,
         chunk_order: Option<&[fastdup_format::ChunkId]>,
     ) -> Result<PreparedAdaptiveContainer, StoreError> {
+        Self::prepare_mixed_prehashed_reduction_with_worker_retirement(
+            container_id,
+            container_generation,
+            regions,
+            independent,
+            dependents,
+            workers,
+            chunk_order,
+            &|_| {},
+        )
+    }
+
+    /// Encodes with per-worker retirement before serial image assembly.
+    ///
+    /// # Errors
+    /// Returns the same format, codec and allocation failures as the ordinary encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_mixed_prehashed_reduction_with_worker_retirement(
+        container_id: ContainerId,
+        container_generation: u64,
+        regions: &[PrehashedAdaptiveRegion<'_>],
+        independent: Vec<fastdup_format::PreparedIndependentRecord>,
+        dependents: Vec<fastdup_format::PreparedDependentRecord>,
+        workers: NonZeroUsize,
+        chunk_order: Option<&[fastdup_format::ChunkId]>,
+        retire: &(dyn Fn(usize) + Sync),
+    ) -> Result<PreparedAdaptiveContainer, StoreError> {
         let encode_wall_started = Instant::now();
         let encode_cpu_started = process_cpu_time();
-        let encoded =
-            SealedContainer::encode_mixed_prehashed_reduction_parallel_profiled_with_gate(
-                container_id,
-                container_generation,
-                regions,
-                independent,
-                dependents,
-                workers,
-                IncompressibilityGatePolicy::Off,
-                chunk_order,
-            )?;
+        let encoded = SealedContainer::encode_mixed_prehashed_reduction_with_worker_retirement(
+            container_id,
+            container_generation,
+            regions,
+            independent,
+            dependents,
+            workers,
+            IncompressibilityGatePolicy::Off,
+            chunk_order,
+            retire,
+        )?;
         let encode_wall = encode_wall_started.elapsed();
         let encode_process_cpu = process_cpu_elapsed(encode_cpu_started);
         let incompressibility_gate = encoded.metrics();
@@ -2342,7 +2369,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         })
     }
 
-    /// Resolves one Exact Index candidate by its canonical Container name and
+    /// Resolves one independent RAW/Zstd Exact Index candidate by its canonical Container name and
     /// returns bytes only after pairing the sealed Header/Footer envelope and
     /// every physical coordinate, then verifying the complete selected Record
     /// CRC and decoded Chunk ID.
@@ -2855,9 +2882,27 @@ impl<I: StorageIo> ContainerRepository<I> {
         requests: &[(fastdup_format::ChunkId, u64)],
         cache: Option<&VerifiedReadCache>,
     ) -> Result<VerifiedChunkRead, StoreError> {
-        if requests.len() == 1 {
+        self.read_verified_chunks_with_locations(Some(index), &[], requests, cache)
+    }
+
+    // Writer-carried Locations are candidates, never verification proofs for a
+    // read. Every selected Record/Chunk follows the same verification boundary.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn read_verified_chunks_with_locations<J: StorageIo>(
+        &self,
+        index: Option<&ActivatedExactIndex<J>>,
+        locations: &[ExactIndexEntry],
+        requests: &[(fastdup_format::ChunkId, u64)],
+        cache: Option<&VerifiedReadCache>,
+    ) -> Result<VerifiedChunkRead, StoreError> {
+        if requests.len() == 1 && locations.is_empty() {
             let (chunk_id, logical_length) = requests[0];
-            return self.read_verified_chunk_payload_cached(index, chunk_id, logical_length, cache);
+            return match index {
+                Some(index) => {
+                    self.read_verified_chunk_payload_cached(index, chunk_id, logical_length, cache)
+                }
+                None => self.read_verified_chunk_payload(chunk_id, logical_length),
+            };
         }
         let mut resolved = Vec::new();
         resolved
@@ -2898,11 +2943,25 @@ impl<I: StorageIo> ContainerRepository<I> {
                 active_candidates[request_ordinal] = previous_candidates;
                 continue;
             }
-            if index
-                .lookup_transitions_into(chunk_id, index_length, &mut lookup_scratch)
-                .is_err()
+            lookup_scratch.clear();
+            if let Ok(ordinal) =
+                locations.binary_search_by_key(&chunk_id, ExactIndexEntry::chunk_id)
             {
-                continue;
+                let entry = locations[ordinal];
+                if entry.logical_length() == index_length {
+                    lookup_scratch.push(entry);
+                }
+            }
+            if lookup_scratch.is_empty() {
+                let Some(index) = index else {
+                    continue;
+                };
+                if index
+                    .lookup_transitions_into(chunk_id, index_length, &mut lookup_scratch)
+                    .is_err()
+                {
+                    continue;
+                }
             }
             let mut seen_locations: [Option<ExactIndexLocation>; MAX_EXACT_LOOKUP_CANDIDATES] =
                 [None; MAX_EXACT_LOOKUP_CANDIDATES];
@@ -3248,13 +3307,15 @@ impl<I: StorageIo> ContainerRepository<I> {
                 if let std::collections::btree_map::Entry::Vacant(entry) =
                     verified_bases.entry(base_key)
                 {
-                    let base = self
-                        .find_verified_independent_base_read_with_index(
-                            index,
-                            base_id,
-                            index_length,
-                            cache,
-                        )
+                    let base = index
+                        .and_then(|index| {
+                            self.find_verified_independent_base_read_with_index(
+                                index,
+                                base_id,
+                                index_length,
+                                cache,
+                            )
+                        })
                         .and_then(|read| {
                             let (mut requested, groups) = read.into_parts();
                             let payload = requested.pop()?;
@@ -3283,9 +3344,16 @@ impl<I: StorageIo> ContainerRepository<I> {
 
         for (request_ordinal, &(chunk_id, logical_length)) in requests.iter().enumerate() {
             if resolved[request_ordinal].is_none() {
-                let (mut requested, groups) = self
-                    .read_verified_chunk_payload_cached(index, chunk_id, logical_length, cache)?
-                    .into_parts();
+                let read = match index {
+                    Some(index) => self.read_verified_chunk_payload_cached(
+                        index,
+                        chunk_id,
+                        logical_length,
+                        cache,
+                    ),
+                    None => self.read_verified_chunk_payload(chunk_id, logical_length),
+                }?;
+                let (mut requested, groups) = read.into_parts();
                 resolved[request_ordinal] = requested.pop();
                 admission_groups.extend(groups);
             }

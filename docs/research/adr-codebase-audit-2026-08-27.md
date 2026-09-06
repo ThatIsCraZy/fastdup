@@ -1,5 +1,8 @@
 # ADR-to-code audit, 2026-08-27
 
+Historical snapshot. See the [2026-09-05 alignment update](adr-codebase-audit-2026-09-05.md)
+for subsequent implementation and corrected open-work status.
+
 This audit compares every accepted, proposed, or superseded record in
 `docs/adr/` with the current workspace. “Current” means that the implemented
 scope agrees with the decision; it does not claim that every production or

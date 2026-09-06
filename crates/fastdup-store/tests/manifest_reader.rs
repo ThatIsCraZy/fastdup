@@ -889,3 +889,56 @@ fn shared_extent_reply_microbenchmark() {
         );
     }
 }
+
+#[test]
+fn live_publication_batches_one_record_without_exact_activation() {
+    let root = unique_test_root("live-publication-batch");
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let chunks = (0_u32..32)
+        .map(|chunk| {
+            (0_u32..16384)
+                .map(|offset| u8::try_from((offset % 251 + chunk * 3) % 256).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let slices = chunks.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let id = ContainerId::new([0xe7; 16]).unwrap();
+    let publication = containers
+        .publish_adaptive_regions_verified(id, 1, &[&slices])
+        .unwrap();
+    let entries = publication
+        .locations()
+        .iter()
+        .copied()
+        .map(|entry| ExactIndexEntry::from_verified(entry).unwrap())
+        .collect::<Vec<_>>();
+    containers.read_verified_location(entries[0]).unwrap();
+    storage.clear_range_reads();
+    let file =
+        VerifiedManifestFile::from_published_locations(&entries[..8], containers.clone()).unwrap();
+    assert!(
+        storage.data_range_reads().is_empty(),
+        "construction must not verify DATA again"
+    );
+    let segments = file.read_segments_at(0, 8 * 16384).unwrap();
+    assert_eq!(segments.concat(), chunks[..8].concat());
+    assert_eq!(
+        segments.len(),
+        1,
+        "contiguous ranges keep the decoded record owner"
+    );
+    assert_eq!(
+        storage.data_range_reads().len(),
+        1,
+        "eight live Chunks decode one physical record"
+    );
+    storage.clear_range_reads();
+    let name = format!("{}.fdc", "e7".repeat(16));
+    let offset = entries[0].location().record_offset();
+    storage.write_at(&name, offset + 32, &[0xff]).unwrap();
+    assert!(
+        file.read_at(0, 16384).is_err(),
+        "writer-carried Locations cannot authorize corrupt reads"
+    );
+}
