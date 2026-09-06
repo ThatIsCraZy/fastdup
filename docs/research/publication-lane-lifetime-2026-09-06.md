@@ -56,3 +56,39 @@ Local raw evidence is under `.artifacts/publication-lane/`: `before.log`,
 `after.log`, `tests.log`, and `clippy.log`. The source test, rather than a
 production scheduling hook, controls checkpoint overlap through its captured
 lane ownership.
+
+## Installed RPM and SMB verification
+
+RPM `fastdup-0.6.4-7.el10.x86_64` was installed on `10.1.1.161`.
+The prior runtime was stopped and its disconnected FUSE mount detached before
+installation. Startup recovery completed, and the repository, control plane,
+agent, and Samba were active. `rpm -V` reported only the existing repository
+and generated Samba configuration modifications.
+
+An encrypted SMB 3.1.1 test ran entirely on the VM through loopback; the VPN
+carried only SSH orchestration. It wrote 10 GiB of random, repeated, locally
+modified, and zero-containing content through irregular SMB request fragments.
+After the first 2 GiB, a second connection repeatedly opened a file with
+`FILE_OVERWRITE_IF`, alternated 8-MiB and 36-MiB random replacements, flushed,
+read-verified each complete replacement by SHA-256, and closed the handle.
+All 40 replacement cycles completed (880 MiB of additional writes and reads).
+
+- Main write: 271.839 seconds, 37.669 MiB/s, including concurrent replacements.
+- One-MiB write-series latency: p99 33.557 ms; maximum 50 ms. Each series
+  contains several SMB requests; these are not individual request latencies.
+- Complete main-file readback: 183.447 seconds, matching SHA-256
+  `b42c23b5fc56ec4ff94da711aae80d39545f730ba451bcf5b8f3660113cd3fcb`.
+- 483 checkpoint records across verification and cleanup, maximum total wall
+  time 0.287136621 seconds; no runtime panic, critical error, or degradation.
+- Runtime PID 33861 remained unchanged with zero service restarts. Temporary
+  test files, share, and account were removed; only `veeam-test` remained.
+
+The workload showed no throughput collapse. Its concurrent truncate workload
+differs from the -6 handle-churn measurement, so it is not a controlled A/B
+speedup claim. A complete Veeam backup still requires a client run.
+
+Evidence: `.artifacts/publication-lane/smb-truncate.log`, `live-runtime.log`,
+`verification.json`, and `verify-smb-truncate.py`. Release artifacts are under
+`.artifacts/releases/v0.6.4-7/` and published on the existing v0.6.4 release.
+Binary RPM SHA-256:
+`697fd8e394696b65e98aa1d57352a81257efeee91fa7f55fd22265a904be5a3a`.
