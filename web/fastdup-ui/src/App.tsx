@@ -1,3 +1,4 @@
+import { StorageOverview } from "./storage-overview";
 import { SambaUsersSettings, WebUsersSettings, CertificateSettings } from "./settings-access";
 import { RecentJobs } from "./recent-jobs";
 import { DetailTelemetryPanel } from "./detail-telemetry";
@@ -901,6 +902,7 @@ function DrivesPage({
   );
   const revision =
     selectedMeta?.inventoryRevision || selectedData?.inventoryRevision || "";
+  if (snapshot.repository) return <StorageOverview snapshot={snapshot}/>;
   return (
     <>
       <div className="page-title">

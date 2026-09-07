@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/fastdup-0.6.4-1.el10.x86_64.rpm">Download the RPM</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm">Download the RPM</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Product page</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6.4">Release notes</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7">Release notes</a>
 </p>
 
 fastdup is an experimental, software-defined single-node storage appliance for
@@ -29,6 +29,18 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > [!WARNING]
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
+
+## New in v0.7 · 7 September 2026
+
+- Initialized repositories show logical versus physical usage, Metadata/DATA
+  assignments and current device I/O under **Drives**.
+- Switch cache hit rates between **Last 5 minutes** and **Total since mount**.
+  Historical samples preserve their corresponding counter window.
+- Fast mounts from committed metadata, with DATA verification in the background.
+- Interrupted scrubs resume durable completed checks after reconciling current
+  containers and independent bases, instead of rereading every checked payload.
+
+[Release notes v0.7](docs/releases/v0.7.md) · RPM version **0.7.0-1**.
 
 ## New in v0.6.4 · 6 September 2026
 
@@ -148,11 +160,11 @@ You need:
 Download and install the current binary package:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/fastdup-0.6.4-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.6.4-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.7.0-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 
@@ -191,11 +203,13 @@ single browser interface, an administrator can:
 
 <p align="center"><em>WebUI preview with sample data: repository health, throughput, reduction, capacity, and disk I/O.</em></p>
 
-| Safe device selection and provisioning | SMB shares and logical quotas |
+| Logical/physical usage and drive roles | SMB shares and logical quotas |
 | --- | --- |
-| ![Drive provisioning in the fastdup WebUI](docs/assets/webui-drives.png) | ![SMB share management in the fastdup WebUI](docs/assets/webui-shares.png) |
+| ![Repository storage usage in the fastdup WebUI](docs/assets/webui-drives.png) | ![SMB share management in the fastdup WebUI](docs/assets/webui-shares.png) |
 
 <p align="center"><em>These screenshots are generated from the real React WebUI using its bundled preview dataset.</em></p>
+
+![Five-minute cache hit rates with sample data](docs/assets/webui-cache.png)
 
 ## First-time setup
 

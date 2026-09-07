@@ -31,7 +31,7 @@
       content="https://thatiscrazy.github.io/fastdup/assets/webui-overview.png"
     />
     <meta name="twitter:card" content="summary_large_image" />
-    <link rel="stylesheet" href="site.css?v=20260905-2" />
+    <link rel="stylesheet" href="site.css?v=20260907-v07" />
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
@@ -39,9 +39,9 @@
         "name": "fastdup",
         "applicationCategory": "StorageApplication",
         "operatingSystem": "Rocky Linux 10 x86-64",
-        "softwareVersion": "0.6.1",
+        "softwareVersion": "0.7.0",
         "license": "https://www.apache.org/licenses/LICENSE-2.0",
-        "downloadUrl": "https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm",
+        "downloadUrl": "https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm",
         "codeRepository": "https://github.com/ThatIsCraZy/fastdup"
       }
     </script>
@@ -109,12 +109,12 @@
           <div class="hero-actions">
             <a
               class="button primary lang-de"
-              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm"
+              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm"
               >RPM herunterladen <span>↓</span></a
             >
             <a
               class="button primary lang-en"
-              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm"
+              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm"
               >Download RPM <span>↓</span></a
             >
             <a class="button secondary lang-de" href="#installation"
@@ -133,7 +133,7 @@
             data.
           </p>
           <div class="compatibility">
-            <span>RPM v0.6.1</span><span>Rocky Linux 10</span><span>x86-64</span
+            <span>RPM v0.7</span><span>Rocky Linux 10</span><span>x86-64</span
             ><span>Rust</span>
           </div>
         </div>
@@ -156,16 +156,16 @@
 
       <div class="section-shell release-note">
         <p lang="de" class="lang-de">
-          <b>Neu in v0.6.1 · 06.09.2026:</b> Optimierte Ingest- und Read-Pfade,
-          zuverlässiger Shutdown und korrigierte Metadata-I/O-Fehlerbehandlung. Download: RPM 0.6.1 für Rocky
-          Linux 10. Die Messungen dokumentieren die Entwicklungsbuilds auf dem
-          Weg zu diesem Release.
+          <b>Neu in v0.7 · 07.09.2026:</b> Logische und physische Belegung mit
+          Laufwerkszuordnung, Cache-Trefferraten für die letzten fünf Minuten,
+          schneller Mount und dauerhaft fortsetzbare Hintergrundprüfung.
+          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7">Release-Details ↗</a>
         </p>
         <p lang="en" class="lang-en">
-          <b>New in v0.6.1 · 6 September 2026:</b> Improved ingest and read paths,
-          reliable shutdown, and corrected Metadata-I/O failure handling. Download: RPM 0.6.1 for
-          Rocky Linux 10. Measurements document the development builds leading
-          to this release.
+          <b>New in v0.7 · 7 September 2026:</b> Logical and physical usage with
+          drive assignments, five-minute cache hit rates, fast mounts and durable
+          background scrub resume.
+          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7">Release details ↗</a>
         </p>
       </div>
       <section class="trust-strip" aria-label="Produktmerkmale">
@@ -884,20 +884,20 @@
         <figure class="screen-card">
           <div>
             <span class="number">01</span>
-            <h3 class="lang-de">Sichere Laufwerksauswahl</h3>
-            <h3 class="lang-en">Safe drive selection</h3>
+            <h3 class="lang-de">Belegung und Laufwerksrollen</h3>
+            <h3 class="lang-en">Storage usage and drive roles</h3>
             <p class="lang-de">
-              Gerätemodell, Seriennummer, WWN, Kapazität und HBA-Pfad vor der
-              Provisionierung kontrollieren.
+              Logische und physische Belegung vergleichen und sehen, welche
+              Laufwerke Metadaten und Nutzdaten speichern.
             </p>
             <p class="lang-en">
-              Verify model, serial, WWN, capacity, and HBA path before
-              provisioning.
+              Compare logical and physical usage and see which drives hold
+              metadata and file data.
             </p>
           </div>
           <img
             src="assets/webui-drives.png"
-            alt="fastdup Laufwerksauswahl"
+            alt="fastdup logische und physische Belegung mit Beispieldaten"
             width="1600"
             height="1000"
             loading="lazy"
@@ -1215,10 +1215,10 @@
             </div>
             <pre
               id="install"
-            ><code>curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm &amp;&amp;
-curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/SHA256SUMS &amp;&amp;
+            ><code>curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm &amp;&amp;
+curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/SHA256SUMS &amp;&amp;
 sha256sum --check --ignore-missing SHA256SUMS &amp;&amp;
-sudo dnf install ./fastdup-0.6.1-1.el10.x86_64.rpm &amp;&amp;
+sudo dnf install ./fastdup-0.7.0-1.el10.x86_64.rpm &amp;&amp;
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code></pre>
             <p id="copy-status" role="status" aria-live="polite"></p>
             <div class="terminal-result">
@@ -1518,22 +1518,22 @@ sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code>
             See the WebUI. Install the RPM. Evaluate fastdup.
           </h2>
           <p class="lang-de">
-            Release 0.6.1 für Rocky Linux 10 auf x86-64. Forschungsprototyp —
+            Release 0.7 für Rocky Linux 10 auf x86-64. Forschungsprototyp —
             bitte nicht als einzige Kopie wichtiger Daten einsetzen.
           </p>
           <p class="lang-en">
-            Release 0.6.1 for Rocky Linux 10 on x86-64. Research prototype —
+            Release 0.7 for Rocky Linux 10 on x86-64. Research prototype —
             please do not use it as the only copy of important data.
           </p>
         </div>
         <div>
           <a
             class="button primary lang-de"
-            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm"
+            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm"
             >RPM herunterladen <span>↓</span></a
           ><a
             class="button primary lang-en"
-            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.1/fastdup-0.6.1-1.el10.x86_64.rpm"
+            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm"
             >Download RPM <span>↓</span></a
           ><a
             class="button secondary"

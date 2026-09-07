@@ -17,7 +17,9 @@ vi.mock("echarts-for-react", () => ({
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe("FastDup Control Plane UI", () => {
+  let liveSnapshot = previewSnapshot;
   beforeEach(() => {
+    liveSnapshot = previewSnapshot;
     vi.stubGlobal(
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
@@ -31,7 +33,7 @@ describe("FastDup Control Plane UI", () => {
             }
           : url.endsWith("/api/v1/samba/principals")
             ? { users: ["backup"], groups: ["storage-admins"] }
-            : previewSnapshot;
+            : liveSnapshot;
         return Promise.resolve(
           new Response(JSON.stringify(body), {
             status: 200,
@@ -126,7 +128,7 @@ describe("FastDup Control Plane UI", () => {
     for (const [navigation, heading] of [
       ["Übersicht", "Production Repository"],
       ["Repository", "Production Repository"],
-      ["Laufwerke", "Laufwerke & Provisionierung"],
+      ["Laufwerke", "Laufwerke & Belegung"],
       ["SMB-Freigaben", "SMB-Freigaben"],
       ["Telemetrie", "Tiefentelemetrie"],
       ["Ereignisse", "Ereignisse"],
@@ -445,6 +447,7 @@ describe("FastDup Control Plane UI", () => {
   });
 
   it("provisioniert nur über erkannte Target-Karten ohne Gerätepfad-Freitext", async () => {
+    liveSnapshot = {...previewSnapshot, repository: undefined};
     render(<App />);
     await screen.findByRole("button", { name: /admin administrator/i });
     fireEvent.click(screen.getByRole("button", { name: /laufwerke/i }));
@@ -584,9 +587,8 @@ describe("FastDup Control Plane UI", () => {
     render(<App />);
     await screen.findByRole("button", { name: /admin administrator/i });
     fireEvent.click(screen.getByRole("button", { name: /laufwerke/i }));
-    expect(
-      screen.getByRole("button", { name: /neues repository initialisieren/i }),
-    ).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /neues repository initialisieren/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Laufwerke & Belegung" })).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: /^repository$/i }));
     expect(screen.getAllByRole("button", { name: /offline-scrub/i })[0]).toBeEnabled();
@@ -595,6 +597,7 @@ describe("FastDup Control Plane UI", () => {
 
   it("sortiert nicht auswählbare Targets stabil unter auswählbare Targets", async () => {
     const unordered = structuredClone(previewSnapshot);
+    delete unordered.repository;
     unordered.targets = [
       unordered.targets[2],
       unordered.targets[0],
@@ -692,7 +695,7 @@ it("loads inventory after interactive login without a browser reload", async () 
     if (url.endsWith("/session") && !loggedIn) return Promise.resolve(new Response("{}", { status: 401 }));
     if (url.endsWith("/session/login")) loggedIn = true;
     const body = url.endsWith("/session/login") ? { username: "admin", csrfToken: "csrf", mustChangePassword: false }
-      : url.endsWith("/principals") ? { users: [], groups: [] } : previewSnapshot;
+      : url.endsWith("/principals") ? { users: [], groups: [] } : {...previewSnapshot, repository: undefined};
     return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
   });
   vi.stubGlobal("fetch", fetch);

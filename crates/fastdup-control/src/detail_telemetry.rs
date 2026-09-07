@@ -28,6 +28,8 @@ pub struct OperationLatency {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_window: Option<CacheWindowTelemetry>,
     pub cache_budget: Option<CacheBudgetTelemetry>,
     pub scrub: Option<ScrubTelemetry>,
     pub runtime_id: String,
@@ -252,4 +254,19 @@ pub struct ScrubTelemetry {
     pub read_bytes: u64,
     pub current_container: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheWindowTelemetry {
+    pub seconds: u64,
+    pub pools: Vec<CacheWindowCounters>,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheWindowCounters {
+    pub id: String,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
 }

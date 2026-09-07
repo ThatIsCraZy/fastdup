@@ -490,3 +490,17 @@ fn deterministic_sparse_operations_match_a_byte_and_allocation_oracle() {
         }
     }
 }
+
+#[test]
+fn logical_usage_telemetry_tracks_allocated_ranges_without_counting_sparse_holes() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let (inode, handle) = create(&namespace,b"usage");
+    write(&namespace,inode,handle,1_000_000,&[42;4096]);
+    assert_eq!(namespace.sample_logical_usage().unwrap().0,4096);
+    namespace.dispatch(CALLER, Operation::Link {inode,new_parent:ROOT_INODE,new_name:b"usage-link"}).unwrap();
+    assert_eq!(namespace.sample_logical_usage().unwrap().0,4096);
+    write(&namespace,inode,handle,1_000_000,&[17;4096]);
+    assert_eq!(namespace.sample_logical_usage().unwrap().0,4096);
+    fallocate(&namespace,inode,handle,1_000_000,4096,FallocateMode::PunchHole);
+    assert_eq!(namespace.sample_logical_usage().unwrap().0,0);
+}

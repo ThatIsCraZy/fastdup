@@ -253,6 +253,8 @@ impl From<fastdup_posix::SmallFilePolicySnapshot> for ManagementSmallFilePolicy 
 
 #[derive(Debug, Serialize)]
 struct ManagementFrontendTelemetry {
+    logical_allocated_bytes: Option<u64>,
+    logical_allocated_observed_at: Option<u64>,
     read_bytes: u64,
     write_bytes: u64,
     read_operations: u64,
@@ -969,11 +971,14 @@ fn apply_management_operation(
     match operation {
         ManagementOperation::Inspect => {
             let snapshot = telemetry.snapshot();
+            let logical_usage = namespace.sample_logical_usage();
             ManagementResponse {
                 version: MANAGEMENT_PROTOCOL_VERSION,
                 ok: true,
                 error: None,
                 frontend: Some(ManagementFrontendTelemetry {
+                    logical_allocated_bytes: logical_usage.map(|value| value.0),
+                    logical_allocated_observed_at: logical_usage.map(|value| value.1),
                     details: None,
                     read_bytes: snapshot.read_bytes,
                     write_bytes: snapshot.write_bytes,

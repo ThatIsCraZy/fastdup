@@ -8,6 +8,7 @@ export interface DetailTelemetry {
   latency?: { read: OperationLatency; write: OperationLatency } | null;
   runtime?: {
     runtimeId: string;
+    cacheWindow?: {seconds: number; pools: {id: string; hits: number; misses: number; evictions: number}[]} | null;
     scrub?: {state: string; totalContainers: number; verifiedContainers: number; resumedContainers?: number; newlyVerifiedContainers?: number; remainingContainers?: number; verifiedBytes: number; readBytes: number; currentContainer?: string | null; error?: string | null} | null;
     cacheBudget?: {
       maximumMemoryUsedBasisPoints: number; effectiveLimitBytes: number; availableBytes: number; budgetBytes: number;
@@ -28,6 +29,7 @@ const phaseLabels: Record<string, string> = { freeze: "Freeze", cdc: "CDC", hash
 export function DetailTelemetryPanel({ sample, historical, loading }: { sample?: TelemetrySnapshot; historical: boolean; loading: boolean }) {
   const { t, locale } = useI18n();
   const [tab, setTab] = useState(0);
+  const [cacheRange, setCacheRange] = useState<"total" | "5m">("total");
   const details = sample?.details;
   const runtime = details?.runtime;
   const number = (value?: number | null) => value == null ? "—" : value.toLocaleString(locale, { maximumFractionDigits: 2 });
@@ -76,10 +78,13 @@ export function DetailTelemetryPanel({ sample, historical, loading }: { sample?:
             {rows([["RAM-Obergrenze", `${number(budget.maximumMemoryUsedBasisPoints / 100)} %`], ["Effektives RAM", bytes(budget.effectiveLimitBytes)], ["Verfügbares RAM", bytes(budget.availableBytes)], ["Gemeinsames Cache-Budget", bytes(budget.budgetBytes)], ["Cache-Belegung", bytes(budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0))]])}
             <progress aria-label={t("Cache-Budget Belegung")} value={budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0)} max={Math.max(1, budget.budgetBytes)} />
           </>}
-          <p className="detail-note">{t("Cache Hit Rates seit dem Mount. Ohne Zugriffe wird keine Rate angezeigt.")}</p>
+          <div className="cache-range" role="group" aria-label={t("Cache-Zeitraum")}><button aria-pressed={cacheRange === "5m"} onClick={() => setCacheRange("5m")}>{t("Letzte 5 Minuten")}</button><button aria-pressed={cacheRange === "total"} onClick={() => setCacheRange("total")}>{t("Gesamt seit Mount")}</button></div>
+          <p className="detail-note">{t(cacheRange === "total" ? "Cache Hit Rates seit dem Mount. Ohne Zugriffe wird keine Rate angezeigt." : "Trefferrate und Zählerdifferenzen der letzten 5 Minuten vor diesem Messpunkt. RAM-Belegung und Budgets gelten zum Messpunkt.")}</p>
+          {cacheRange === "5m" && <p className="detail-note">{runtime.cacheWindow?.seconds ? `${t("Erfasster Zeitraum")}: ${number(runtime.cacheWindow.seconds)} s` : t("Für dieses Zeitfenster sind noch keine Messdaten verfügbar.")}</p>}
           <div className="telemetry-table-scroll"><table><thead><tr>{["Cache", ...(budget ? ["Rückfall auf"] : []), "Hit Rate", "Hits", "Misses", "Evictions", "Belegung", ...(budget ? ["Zielbudget", "Reserviert"] : [])].map(label => <th key={label}>{t(label)}</th>)}</tr></thead><tbody>{(budget?.pools ?? runtime.caches).map(cache => {
             const pool = budget?.pools.find(item => item.id === cache.id);
-            return <tr key={cache.id}><th>{cacheLabels[cache.id] ?? cache.id}</th>{budget && <td>{pool?.fallbackTier === "data" ? "DATA" : pool?.fallbackTier === "metadata" ? "Metadata" : "—"}</td>}<td>{cache.hits + cache.misses ? `${number(cache.hits * 100 / (cache.hits + cache.misses))} %` : "—"}</td><td>{number(cache.hits)}</td><td>{number(cache.misses)}</td><td>{number(cache.evictions)}</td><td>{cache.residentBytes != null ? bytes(cache.residentBytes) : "residentPages" in cache && cache.residentPages != null ? `${number(cache.residentPages)} ${t("Seiten")}` : "—"}</td>{budget && <><td>{bytes(pool?.targetBytes)}</td><td>{bytes(pool?.leasedBytes)}</td></>}</tr>;
+            const counts = cacheRange === "total" ? cache : runtime.cacheWindow?.seconds ? runtime.cacheWindow.pools.find(pool => pool.id === cache.id) : undefined;
+            return <tr key={cache.id}><th>{cacheLabels[cache.id] ?? cache.id}</th>{budget && <td>{pool?.fallbackTier === "data" ? "DATA" : pool?.fallbackTier === "metadata" ? "Metadata" : "—"}</td>}<td>{counts && counts.hits + counts.misses ? `${number(counts.hits * 100 / (counts.hits + counts.misses))} %` : "—"}</td><td>{number(counts?.hits)}</td><td>{number(counts?.misses)}</td><td>{number(counts?.evictions)}</td><td>{cache.residentBytes != null ? bytes(cache.residentBytes) : "residentPages" in cache && cache.residentPages != null ? `${number(cache.residentPages)} ${t("Seiten")}` : "—"}</td>{budget && <><td>{bytes(pool?.targetBytes)}</td><td>{bytes(pool?.leasedBytes)}</td></>}</tr>;
           })}</tbody></table></div>
           {budget && <p className="detail-note">{t("Zielbudget wird laufend angepasst. Reservierter Speicher wird erst nach der Verdrängung für andere Caches freigegeben. Die Belegung enthält Cache-Verwaltungsdaten.")}</p>}
 

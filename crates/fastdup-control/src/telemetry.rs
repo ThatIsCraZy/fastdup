@@ -188,6 +188,7 @@ impl SystemSampler {
             .unwrap_or((0, 0));
         TelemetrySnapshot {
             small_file_quota: None,
+            storage_usage: None,
             details: None,
             sequence: self.sequence,
             observed_at,
@@ -351,11 +352,11 @@ fn read_trimmed(path: &Path) -> Option<String> {
         .map(|value| value.trim().to_owned())
 }
 
-fn filesystem_usage(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn filesystem_usage(path: &Path) -> Option<(u64, u64)> {
     let statistics = rustix::fs::statvfs(path).ok()?;
     let fragment = statistics.f_frsize.max(1);
     let capacity = statistics.f_blocks.checked_mul(fragment)?;
-    let available = statistics.f_bavail.checked_mul(fragment)?;
+    let available = statistics.f_bfree.checked_mul(fragment)?;
     Some((capacity.saturating_sub(available), capacity))
 }
 

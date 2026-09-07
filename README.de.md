@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/fastdup-0.6.4-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Produktseite</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.6.4">Release-Informationen</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7">Release-Informationen</a>
 </p>
 
 fastdup ist eine experimentelle, softwaredefinierte Single-Node-
@@ -31,6 +31,18 @@ HTTPS-WebUI hält die Administration einfach.
 > fastdup ist ein Forschungsprototyp und kein produktionsreifes Backup-Produkt.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
+
+## Neu in v0.7 · 7. September 2026
+
+- Initialisierte Repositories zeigen unter **Laufwerke** logische und physische
+  Belegung sowie Metadata-/DATA-Zuordnung und aktuelle Datenträger-I/O.
+- Cache-Trefferraten lassen sich zwischen **Letzte 5 Minuten** und **Gesamt seit
+  Mount** umschalten. Historische Messpunkte behalten das jeweilige Zeitfenster.
+- Schneller Mount aus committed Metadaten; die DATA-Prüfung läuft im Hintergrund.
+- Unterbrochene Scrubs übernehmen dauerhaft gespeicherte vollständige Prüfungen,
+  prüfen aktuelle Container und Basisabhängigkeiten und setzen den Durchlauf fort.
+
+[Release-Notes v0.7](docs/releases/v0.7.md) · RPM-Version **0.7.0-1**.
 
 ## Neu in v0.6.4 · 6. September 2026
 
@@ -156,11 +168,11 @@ Benötigt werden:
 Aktuelles Binärpaket herunterladen und installieren:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/fastdup-0.6.4-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.6.4/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.6.4-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.7.0-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 
@@ -200,11 +212,13 @@ ausgeliefert. Über eine einzige Browseroberfläche kann ein Administrator:
 
 <p align="center"><em>WebUI-Vorschau mit Beispieldaten: Repository-Zustand, Durchsatz, Datenreduktion, Kapazität und Disk-I/O.</em></p>
 
-| Sichere Geräteauswahl und Provisionierung | SMB-Freigaben und logische Quotas |
+| Logische/physische Belegung und Laufwerksrollen | SMB-Freigaben und logische Quotas |
 | --- | --- |
-| ![Laufwerksprovisionierung in der fastdup-WebUI](docs/assets/webui-drives.png) | ![Verwaltung von SMB-Freigaben in der fastdup-WebUI](docs/assets/webui-shares.png) |
+| ![Repository-Belegung in der fastdup-WebUI](docs/assets/webui-drives.png) | ![Verwaltung von SMB-Freigaben in der fastdup-WebUI](docs/assets/webui-shares.png) |
 
 <p align="center"><em>Die Screenshots stammen automatisiert aus der echten React-WebUI und verwenden deren mitgelieferte Preview-Daten.</em></p>
+
+![Cache-Trefferraten der letzten fünf Minuten mit Beispieldaten](docs/assets/webui-cache.png)
 
 ## Ersteinrichtung
 

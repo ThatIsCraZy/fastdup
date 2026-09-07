@@ -31,6 +31,7 @@ export interface SeriesPoint {
 }
 
 export interface TelemetrySnapshot {
+  storageUsage?: {logicalAllocatedBytes?: number | null; logicalObservedAt?: number | null; metadataUsedBytes?: number | null; metadataCapacityBytes?: number | null; dataUsedBytes?: number | null; dataCapacityBytes?: number | null};
   smallFileQuota?: { requestedBytes: number; effectiveBytes: number };
   details?: import("./detail-telemetry").DetailTelemetry | null;
   sequence: number;

@@ -60,3 +60,23 @@ it("distinguishes carried-forward checks, new verification and remaining work", 
  expect(screen.getByText(/60 aus vorheriger Prüfung übernommen.*15 neu geprüft.*25 noch ausstehend/)).toBeVisible();
  expect(screen.getByRole('progressbar',{name:'Hintergrundprüfung'})).toHaveAttribute('value','75');
 });
+
+it("switches cache counters to the five-minute window without changing RAM gauges",()=>{
+ const runtime={...details.runtime!,cacheWindow:{seconds:300,pools:[{id:"verifiedRead",hits:2,misses:8,evictions:1}]}};
+ render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={true} loading={false}/></I18nProvider>);
+ fireEvent.click(screen.getByRole('tab',{name:'Caches'}));
+ expect(screen.getByText('75 %')).toBeVisible();
+ fireEvent.click(screen.getByRole('button',{name:'Letzte 5 Minuten'}));
+ expect(screen.getByText('20 %')).toBeVisible();
+ expect(screen.getByText('1,02 KB')).toBeVisible();
+ expect(screen.getByText('Erfasster Zeitraum: 300 s')).toBeVisible();
+ fireEvent.click(screen.getByRole('button',{name:'Gesamt seit Mount'}));
+ expect(screen.getByText('75 %')).toBeVisible();
+});
+it("never substitutes lifetime counters for a missing recent window",()=>{
+ render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details}} historical={false} loading={false}/></I18nProvider>);
+ fireEvent.click(screen.getByRole('tab',{name:'Caches'}));
+ fireEvent.click(screen.getByRole('button',{name:'Letzte 5 Minuten'}));
+ expect(screen.queryByText('75 %')).not.toBeInTheDocument();
+ expect(screen.getByText('Für dieses Zeitfenster sind noch keine Messdaten verfügbar.')).toBeVisible();
+});

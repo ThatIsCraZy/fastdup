@@ -40,6 +40,8 @@ const REPOSITORY_START_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Debug)]
 struct RuntimeFrontendCounters {
+    logical_allocated_bytes: Option<u64>,
+    logical_observed_at: Option<u64>,
     details: crate::DetailTelemetry,
     read_bytes: u64,
     write_bytes: u64,
@@ -249,6 +251,7 @@ pub struct AgentRuntime {
     fingerprint: String,
     latest: RwLock<TelemetrySnapshot>,
     sampler: Mutex<SystemSampler>,
+    cache_window: Mutex<crate::cache_window::CacheWindow>,
     events: broadcast::Sender<ControlEvent>,
     shutdown: watch::Sender<bool>,
 }
@@ -271,6 +274,7 @@ impl AgentRuntime {
             fingerprint,
             latest: RwLock::new(TelemetrySnapshot::default()),
             sampler: Mutex::new(SystemSampler::default()),
+            cache_window: Mutex::default(),
             events,
             shutdown,
         })
@@ -410,6 +414,23 @@ impl AgentRuntime {
             std::fs::read("/run/fastdup/small-file-quota.json").ok().and_then(|bytes| serde_json::from_slice(&bytes).ok())
         } else { None };
         snapshot.details = frontend.as_ref().map(|frontend| Box::new(frontend.details.clone()));
+        if let Some(runtime) = snapshot.details.as_mut().and_then(|d| d.runtime.as_mut())
+            && let Ok(mut window) = self.cache_window.lock() {
+            window.observe(u64::try_from(unix_seconds()).unwrap_or_default(), runtime);
+        }
+        if binding.is_some() {
+            let metadata = mounted_pool_usage(METADATA_ROOT);
+            let data = mounted_pool_usage(DATA_ROOT);
+            snapshot.storage_usage = Some(Box::new(crate::StorageUsageTelemetry {
+                logical_allocated_bytes: frontend.as_ref().and_then(|f| f.logical_allocated_bytes),
+                logical_observed_at: frontend.as_ref().and_then(|f| f.logical_observed_at),
+                metadata_used_bytes: metadata.map(|value| value.0),
+                metadata_capacity_bytes: metadata.map(|value| value.1),
+                data_used_bytes: data.map(|value| value.0),
+                data_capacity_bytes: data.map(|value| value.1),
+            }));
+        }
+
         if let Some(checkpoint) = snapshot.details.as_ref().and_then(|d| d.runtime.as_ref()).and_then(|r| r.checkpoint.as_ref()) {
             snapshot.commit_generation = Some(checkpoint.generation);
             snapshot.last_checkpoint_seconds = Some(u64::try_from(unix_seconds()).unwrap_or_default().saturating_sub(checkpoint.completed_at));
@@ -1239,6 +1260,12 @@ fn write_runtime_environment(settings: &crate::RepositorySettings) -> Result<(),
         .map_err(problem("runtime_sync"))
 }
 
+fn mounted_pool_usage(root: &str) -> Option<(u64,u64)> {
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    if !mounts.lines().any(|line| line.split_whitespace().nth(4)==Some(root)) { return None; }
+    crate::telemetry::filesystem_usage(Path::new(root))
+}
+
 fn read_frontend_counters() -> Option<RuntimeFrontendCounters> {
     let mut stream = StdUnixStream::connect(MANAGEMENT_SOCKET).ok()?;
     stream
@@ -1256,6 +1283,8 @@ fn read_frontend_counters() -> Option<RuntimeFrontendCounters> {
     let response: serde_json::Value = serde_json::from_slice(&response).ok()?;
     if response.get("ok")?.as_bool()? {
         Some(RuntimeFrontendCounters {
+            logical_allocated_bytes: response.pointer("/frontend/logical_allocated_bytes").and_then(serde_json::Value::as_u64),
+            logical_observed_at: response.pointer("/frontend/logical_allocated_observed_at").and_then(serde_json::Value::as_u64),
             details: crate::detail_telemetry::parse_details(response.get("frontend")?),
             read_bytes: response.pointer("/frontend/read_bytes")?.as_u64()?,
             write_bytes: response.pointer("/frontend/write_bytes")?.as_u64()?,

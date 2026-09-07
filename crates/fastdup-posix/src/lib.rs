@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 mod fuse_adapter;
 mod inode_metadata;
 mod logical_quota;
+mod logical_usage;
 mod small_file_policy;
 mod versioned_file;
 
@@ -2607,6 +2608,7 @@ pub struct Namespace {
     mutation_observer: RwLock<Option<Arc<dyn MutationObserver>>>,
     commit_capacity_admission: OnceLock<Arc<dyn CommitCapacityAdmission>>,
     logical_quotas: LogicalQuotaTable,
+    logical_usage: Mutex<logical_usage::LogicalUsageSampler>,
     reduction_policy: RwLock<ShareReductionPolicy>,
     catalog: RwLock<Catalog>,
     locks: Mutex<LockTable>,
@@ -2671,6 +2673,7 @@ impl Namespace {
             mutation_observer: RwLock::new(None),
             commit_capacity_admission: OnceLock::new(),
             logical_quotas: LogicalQuotaTable::default(),
+            logical_usage: Mutex::default(),
             reduction_policy: RwLock::new(ShareReductionPolicy::default()),
             catalog: RwLock::new(Catalog {
                 next_inode: ROOT_INODE.get() + 1,
@@ -2937,6 +2940,7 @@ impl Namespace {
             mutation_observer: RwLock::new(None),
             commit_capacity_admission: OnceLock::new(),
             logical_quotas: LogicalQuotaTable::default(),
+            logical_usage: Mutex::default(),
             reduction_policy: RwLock::new(ShareReductionPolicy::default()),
             catalog: RwLock::new(Catalog {
                 next_inode: snapshot.next_inode,

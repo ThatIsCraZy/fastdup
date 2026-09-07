@@ -94,3 +94,19 @@ zero, and `cpu.stat` to show throttling above one CPU worth of sustained work.
 Killing or cgroup-OOMing `fastdup-control` and then `fastdup-agent` must not
 change the repository unit's active state, mount identity, or current Commit
 generation.
+
+## Storage usage and cache windows (v0.7)
+
+The initialized **Drives** page shows assigned Metadata/DATA devices and their
+roles, physical filesystem usage, and logical file allocation before reduction.
+Logical allocation is sampled from cached inode counters, at most 4096 per
+inspection; large or busy namespaces may have an older completed observation.
+Hard links count once, sparse holes do not count, and pinned unlinked files
+remain counted until retired. No DATA reads are introduced for this display.
+Physical usage uses allocated filesystem blocks (`blocks - bfree`), includes
+Small Files on Metadata, and is unavailable when the dedicated pool is not mounted.
+
+Cache detail offers lifetime or five-minute counter differences. The latter is
+computed by the agent and stored with historical samples, with the actual
+observed duration shown during warm-up or after resets. Memory gauges remain
+instantaneous. No lifetime rate is substituted when the recent window is absent.

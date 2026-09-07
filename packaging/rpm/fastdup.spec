@@ -1,8 +1,8 @@
 %global debug_package %{nil}
 
 Name:           fastdup
-Version:        0.6.4
-Release:        14%{?dist}
+Version:        0.7.0
+Release:        1%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,10 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Mon Sep 07 2026 fastdup maintainers - 0.7.0-1
+- Repository usage overview and five-minute cache counter windows.
+- Durable resume of incomplete background scrub rounds.
+
 * Mon Sep 07 2026 fastdup contributors <fastdup@localhost> - 0.6.4-14
 - Mount from the committed Metadata graph without scanning Container storage.
 - Detect missing committed Chunks during paced initial scrub before allowing GC.

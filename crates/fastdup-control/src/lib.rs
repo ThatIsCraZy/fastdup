@@ -13,6 +13,7 @@
 mod auth;
 mod control;
 mod detail_telemetry;
+mod cache_window;
 mod inventory;
 mod firewall;
 mod samba;
@@ -251,6 +252,8 @@ pub struct TelemetrySnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub small_file_quota: Option<SmallFileQuotaStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_usage: Option<Box<StorageUsageTelemetry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Box<DetailTelemetry>>,
     pub sequence: u64,
     pub observed_at: String,
@@ -271,6 +274,17 @@ pub struct TelemetrySnapshot {
     pub series: Vec<SeriesPoint>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageUsageTelemetry {
+    pub logical_allocated_bytes: Option<u64>,
+    pub logical_observed_at: Option<u64>,
+    pub metadata_used_bytes: Option<u64>,
+    pub metadata_capacity_bytes: Option<u64>,
+    pub data_used_bytes: Option<u64>,
+    pub data_capacity_bytes: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SmallFileQuotaStatus {
@@ -282,6 +296,7 @@ impl Default for TelemetrySnapshot {
     fn default() -> Self {
         Self {
             small_file_quota: None,
+            storage_usage: None,
             details: None,
             sequence: 0,
             observed_at: unix_seconds().to_string(),
