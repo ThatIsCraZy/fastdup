@@ -40,8 +40,8 @@ impl PendingDataVerification {
         Ok(())
     }
 
-    fn observe(&mut self, structure: &ContainerStructure) {
-        for chunk in structure.chunks() {
+    pub(crate) fn observe_chunks(&mut self, chunks: &[fastdup_format::StructuralChunk]) {
+        for chunk in chunks {
             if self.required.get(&chunk.chunk_id).copied() == Some(u64::from(chunk.logical_length))
             {
                 self.required.remove(&chunk.chunk_id);
@@ -62,7 +62,11 @@ impl<I: StorageIo> ContainerRepository<I> {
         id: ContainerId,
         index: Option<&crate::ActivatedExactIndex<X>>,
     ) -> Result<u64, StoreError> {
-        self.scrub_container_using(id, index, None)
+        Ok(self
+            .scrub_structure(id, index)?
+            .descriptor()
+            .layout()
+            .file_length)
     }
 
     /// Fully scrubs a Container and discharges matching startup requirements.
@@ -76,15 +80,18 @@ impl<I: StorageIo> ContainerRepository<I> {
         index: Option<&crate::ActivatedExactIndex<X>>,
         required: &mut PendingDataVerification,
     ) -> Result<u64, StoreError> {
-        self.scrub_container_using(id, index, Some(required))
+        let structure = self.scrub_structure(id, index)?;
+        if self.selectable_container(id) {
+            required.observe_chunks(structure.chunks());
+        }
+        Ok(structure.descriptor().layout().file_length)
     }
 
-    fn scrub_container_using<X: StorageIo>(
+    pub(crate) fn scrub_structure<X: StorageIo>(
         &self,
         id: ContainerId,
         index: Option<&crate::ActivatedExactIndex<X>>,
-        required: Option<&mut PendingDataVerification>,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<ContainerStructure, StoreError> {
         let bytes = self.storage.read(&crate::published_name(id))?;
         let mut fallback = crate::ContainerBaseResolver::new(self);
         let mut resolver_error = None;
@@ -113,8 +120,6 @@ impl<I: StorageIo> ContainerRepository<I> {
         if verified?.header().container_id() != id {
             return Err(StoreError::PublishVerificationMismatch);
         }
-        if let Some(required) = required
-            && self.selectable_container(id)
         {
             // All payloads and Bases have already verified. Extract identities
             // from that same immutable image, with no extra disk reads.
@@ -136,9 +141,8 @@ impl<I: StorageIo> ContainerRepository<I> {
                         .ok_or(fastdup_format::FormatError::InvalidContainerLayout)
                 },
             )?;
-            required.observe(&structure);
+            Ok(structure)
         }
-        Ok(bytes.len() as u64)
     }
 
     /// Validates all metadata of one immutable Container, without payload reads.

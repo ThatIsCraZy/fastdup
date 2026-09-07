@@ -50,8 +50,10 @@ reduced CPU priority, and issues reads in at most 256-KiB portions. Pauses adapt
 to measured read time and frontend storage activity: approximately 10% read duty
 under activity and at most 50% while idle. These are operating targets, not a
 block-scheduler latency guarantee. Cancellation is checked between portions and
-in short sleep slices. The initial pass restarts after another process exit;
-its progress is observational and never a durable skip certificate.
+in short sleep slices. ADR 0092 supersedes the original process-local progress policy: incomplete
+rounds durably retain full checks and resume after current-envelope and DATA
+coverage reconciliation. This remains historical work, never a current payload
+proof or deletion capability.
 
 Automatic and manually requested Online GC wait for successful completion of
 this initial pass. No Container deletion can race its snapshot. Completing the

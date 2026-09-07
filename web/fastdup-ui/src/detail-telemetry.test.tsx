@@ -53,3 +53,10 @@ it("keeps background verification progress visible across tabs and shows a write
  expect(screen.getByRole('alert')).toHaveTextContent('Neue Schreibzugriffe sind gesperrt');
  expect(screen.queryByRole('progressbar',{name:'Hintergrundprüfung'})).not.toBeInTheDocument();
 });
+
+it("distinguishes carried-forward checks, new verification and remaining work", () => {
+ const scrub = {state:"running",totalContainers:100,verifiedContainers:75,resumedContainers:60,newlyVerifiedContainers:15,remainingContainers:25,verifiedBytes:1000,readBytes:100};
+ render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:{...details,runtime:{...details.runtime!,scrub}}}} historical={true} loading={false}/></I18nProvider>);
+ expect(screen.getByText(/60 aus vorheriger Prüfung übernommen.*15 neu geprüft.*25 noch ausstehend/)).toBeVisible();
+ expect(screen.getByRole('progressbar',{name:'Hintergrundprüfung'})).toHaveAttribute('value','75');
+});

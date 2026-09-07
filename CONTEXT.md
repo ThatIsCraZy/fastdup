@@ -489,6 +489,11 @@ A mount from a structurally valid committed Metadata graph whose DATA availabili
 and integrity are checked on demand and by background scrub.
 _Avoid_: Verified repository, index-authoritative start
 
+**Scrub round progress**:
+Historical full checks of immutable Containers within one incomplete verification
+round, reusable only after reconciliation with present DATA and current graph requirements.
+_Avoid_: Healthy forever, current payload proof, GC deletion authority
+
 **Structural start**:
 A mount after complete structural validation but before every stored chunk has
 been rehashed. Every chunk is fully verified when read, while background scrub
@@ -645,7 +650,7 @@ The complete DATA-dependency proof for one new Commit Group formed by retaining
 unchanged dependencies from the immediately preceding verified generation and
 fully verifying every newly introduced dependency. It is valid only while that
 predecessor remains the installed generation and immutable storage stays under
-the same appliance process; recovery and scrub construct fresh complete proofs.
+the same appliance process; full recovery and offline scrub construct fresh complete proofs.
 _Avoid_: Exact-Index authority, cache hit, partial verification
 
 **Generation pin**:

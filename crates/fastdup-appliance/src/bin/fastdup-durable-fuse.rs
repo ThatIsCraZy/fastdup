@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -333,7 +334,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "WARNING: physical pool isolation bypassed for LAB; this configuration is not production-safe"
         );
     }
-    AppliancePoolBinding::initialize_or_open_filesystem(&metadata_pool, &data_pool)?;
+    let pool_binding =
+        AppliancePoolBinding::initialize_or_open_filesystem(&metadata_pool, &data_pool)?;
+    let mut scrub_binding_hash = blake3::Hasher::new();
+    scrub_binding_hash.update(&pool_binding.metadata().encode());
+    scrub_binding_hash.update(&pool_binding.data().encode());
+    // A restored/copied pool pair must not inherit old scrub observations merely
+    // because its durable pool IDs were copied along with the data.
+    for root in [metadata_pool.root(), data_pool.root()] {
+        let metadata = std::fs::metadata(root)?;
+        scrub_binding_hash.update(&metadata.dev().to_le_bytes());
+        scrub_binding_hash.update(&metadata.ino().to_le_bytes());
+    }
+    let scrub_binding = *scrub_binding_hash.finalize().as_bytes();
     let small_file_isolation =
         SmallFileTierIsolation::prepare(&metadata_root, pool_isolation_policy)?;
     emit_small_file_tier(&small_file_isolation);
@@ -403,6 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recovered.recovery_indexes.clone(),
         data_storage.clone(),
         Arc::clone(&namespace),
+        (metadata_pool.clone(), scrub_binding),
     )?;
     let gc_runtime = start_online_gc_runtime(
         recovered.online_maintenance,

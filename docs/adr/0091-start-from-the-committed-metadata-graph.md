@@ -46,6 +46,10 @@ startup graph's Containers cannot be deleted while foreground commits advance.
 Newly published Containers retain the existing writer proofs. The initial
 requirements consume RAM proportional to the selected graph's unique DATA
 identities, shrink as scrub advances and are discarded on completion or exit.
+ADR 0092 adds durable round progress: each start reconstructs these requirements
+from the current graph, then reconciles prior full checks with present Container
+envelopes and independent Base availability. The journal never replaces the
+selected Metadata graph or grants current payload/deletion evidence.
 
 Missing or damaged DATA may therefore be discovered after the mount becomes
 available. Demand reads always verify content and dependencies; scrub failure

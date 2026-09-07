@@ -8,7 +8,7 @@ export interface DetailTelemetry {
   latency?: { read: OperationLatency; write: OperationLatency } | null;
   runtime?: {
     runtimeId: string;
-    scrub?: {state: string; totalContainers: number; verifiedContainers: number; verifiedBytes: number; readBytes: number; currentContainer?: string | null; error?: string | null} | null;
+    scrub?: {state: string; totalContainers: number; verifiedContainers: number; resumedContainers?: number; newlyVerifiedContainers?: number; remainingContainers?: number; verifiedBytes: number; readBytes: number; currentContainer?: string | null; error?: string | null} | null;
     cacheBudget?: {
       maximumMemoryUsedBasisPoints: number; effectiveLimitBytes: number; availableBytes: number; budgetBytes: number;
       pools: { id: string; fallbackTier: string; residentBytes: number; targetBytes: number; leasedBytes: number; hits: number; misses: number; evictions: number }[];
@@ -45,6 +45,7 @@ export function DetailTelemetryPanel({ sample, historical, loading }: { sample?:
     {scrub && <div className="detail-scrub" role={scrub.state === "failed" ? "alert" : "status"}>
       <strong>{t("Hintergrundprüfung")}: {t(({running:"Läuft",complete:"Abgeschlossen",failed:"Fehlgeschlagen",cancelled:"Unterbrochen"} as Record<string,string>)[scrub.state] ?? scrub.state)}</strong>
       <span>{number(scrub.verifiedContainers)} / {number(scrub.totalContainers)} {t("Container geprüft")} · {bytes(scrub.readBytes)} {t("gelesen")}</span>
+      {scrub.resumedContainers !== undefined && <span>{number(scrub.resumedContainers)} {t("aus vorheriger Prüfung übernommen")} · {number(scrub.newlyVerifiedContainers ?? 0)} {t("neu geprüft")} · {number(scrub.remainingContainers ?? 0)} {t("noch ausstehend")}</span>}
       {scrub.state === "running" && <><progress aria-label={t("Hintergrundprüfung")} value={scrub.verifiedContainers} max={Math.max(1, scrub.totalContainers)} /><small>{t("Lesezugriffe werden vollständig geprüft. Die Hintergrundprüfung begrenzt ihre Last; automatische Speicherbereinigung wartet auf ihren Abschluss.")}</small></>}
       {scrub.state === "failed" && <small>{t("Datenprüfung fehlgeschlagen. Neue Schreibzugriffe sind gesperrt. Details stehen im Dienstprotokoll.")}</small>}
     </div>}

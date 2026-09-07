@@ -459,3 +459,6 @@ fn invalid_and_broken_chain_tails_preserve_the_valid_commit_prefix() {
         drop(pending);
     }
 }
+
+#[path = "structural_recovery/scrub_resume.rs"]
+mod scrub_resume;

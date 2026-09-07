@@ -215,6 +215,11 @@ mod tests {
         );
         let saved = serde_json::to_value(&details).unwrap();
         assert_eq!(saved["runtime"]["scrub"], frontend["details"]["scrub"]);
+        frontend["details"]["scrub"]["resumedContainers"] = serde_json::json!(2);
+        frontend["details"]["scrub"]["newlyVerifiedContainers"] = serde_json::json!(1);
+        frontend["details"]["scrub"]["remainingContainers"] = serde_json::json!(9);
+        let resumed = serde_json::to_value(parse_details(&frontend)).unwrap();
+        assert_eq!(resumed["runtime"]["scrub"], frontend["details"]["scrub"]);
         assert_eq!(
             saved["runtime"]["cacheBudget"],
             frontend["details"]["cacheBudget"]
@@ -237,6 +242,12 @@ pub struct ScrubTelemetry {
     pub state: String,
     pub total_containers: u64,
     pub verified_containers: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_containers: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newly_verified_containers: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_containers: Option<u64>,
     pub verified_bytes: u64,
     pub read_bytes: u64,
     pub current_container: Option<String>,

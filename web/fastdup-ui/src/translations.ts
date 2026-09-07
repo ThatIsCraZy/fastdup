@@ -331,5 +331,8 @@ export const english: Record<string, string> = {
   "{seconds} Sekunden": "{seconds} seconds",
   "{job} gestartet": "{job} started",
   "Freigabe „{name}“ löschen? Aktive Sessions werden getrennt.": "Delete share “{name}”? Active sessions will be disconnected.",
-  "{count} Audit-Einträge wurden als CSV bereitgestellt.": "{count} audit entries are available as CSV."
+  "{count} Audit-Einträge wurden als CSV bereitgestellt.": "{count} audit entries are available as CSV.",
+  "aus vorheriger Prüfung übernommen": "carried forward from the previous check",
+  "neu geprüft": "newly verified",
+  "noch ausstehend": "remaining"
 };
