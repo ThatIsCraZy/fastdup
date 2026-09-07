@@ -484,6 +484,11 @@ The generation-building recovery process that derives new online indexes from
 durable containers, a Recovery Checkpoint, and reachable object dependencies.
 _Avoid_: Scrub, normal startup
 
+**Committed start**:
+A mount from a structurally valid committed Metadata graph whose DATA availability
+and integrity are checked on demand and by background scrub.
+_Avoid_: Verified repository, index-authoritative start
+
 **Structural start**:
 A mount after complete structural validation but before every stored chunk has
 been rehashed. Every chunk is fully verified when read, while background scrub

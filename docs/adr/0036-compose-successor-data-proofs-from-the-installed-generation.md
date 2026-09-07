@@ -4,6 +4,10 @@ status: accepted
 
 # Compose successor DATA proofs from the installed generation
 
+Current normal-start policy: [ADR 0091](0091-start-from-the-committed-metadata-graph.md)
+defers Container structure and DATA availability checks to the initial scrub.
+The selected committed Metadata graph is still checked before mounting.
+
 Current policy (2026-09-07): [ADR 0090](0090-mount-after-structural-validation-and-scrub-in-background.md)
 implements structural normal startup followed by background content scrub.
 It supersedes mandatory startup rehashing and the runtime's repeated DATA proof

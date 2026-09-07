@@ -45,6 +45,7 @@ mod similarity_index_repository;
 mod similarity_mmap;
 mod similarity_simd;
 mod structural_recovery;
+pub use structural_recovery::PendingDataVerification;
 mod tiered_storage;
 pub use fastdup_format::{SimilarityIndexPartitionRef, SimilarityIndexRunFamily};
 pub use similarity_external_sort::SIMILARITY_PARTITION_TARGET_REFERENCES;

@@ -130,6 +130,29 @@ impl<'a, I: StorageIo> GenerationLog<'a, I> {
         Ok(())
     }
 
+    /// Drops only the invalid suffix after the exact already-validated head.
+    /// Truncation never rewrites the accepted prefix. A crash at any boundary
+    /// leaves that prefix recoverable, with either the old tail or no tail.
+    pub(crate) fn repair_tail(&self, expected: CommitRecord) -> Result<(), GenerationLogError> {
+        let snapshot = self
+            .load()?
+            .ok_or(GenerationLogError::EmptyAfterInitialization)?;
+        if snapshot.last_record() != Some(expected) {
+            return Err(GenerationLogError::PublishVerificationMismatch);
+        }
+        if snapshot.tail == LogTail::Clean {
+            return Ok(());
+        }
+        let name = SLOT_NAMES[snapshot.active_slot];
+        self.storage.set_len(name, snapshot.bytes.len() as u64)?;
+        let verified = decode_segment(snapshot.active_slot, self.storage.read(name)?)?;
+        if verified.tail != LogTail::Clean || verified.bytes != snapshot.bytes {
+            return Err(GenerationLogError::PublishVerificationMismatch);
+        }
+        self.storage.sync_file(name)?;
+        Ok(())
+    }
+
     fn ensure_slots_exist(&self) -> Result<(), GenerationLogError> {
         for name in SLOT_NAMES {
             if self.storage.exists(name)? {

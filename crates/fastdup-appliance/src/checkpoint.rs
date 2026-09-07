@@ -614,6 +614,7 @@ pub fn checkpoint_policy_set() -> PolicySetId {
 /// Commit Records.
 #[derive(Debug)]
 pub struct DurableNamespace<M, C> {
+    startup_data_verification: Option<fastdup_store::PendingDataVerification>,
     namespace: Arc<Namespace>,
     generations: GenerationRepository<M>,
     containers: ContainerRepository<C>,
@@ -625,6 +626,13 @@ pub struct DurableNamespace<M, C> {
     checkpoint_workers: NonZeroUsize,
     write_through: Arc<WriteThroughIngest<C>>,
     online_dependency_proofs: Arc<OnlineDependencyProofs>,
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryMode {
+    Full,
+    Structural,
+    Committed,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5121,7 +5129,7 @@ where
             containers,
             inode_reservation_span,
             Arc::new(ScanManifestReaders { read_cache }),
-            false,
+            RecoveryMode::Full,
         )
     }
 
@@ -5156,7 +5164,7 @@ where
             indexes,
             None,
             inode_reservation_span,
-            false,
+            RecoveryMode::Full,
         )
     }
 
@@ -5189,7 +5197,7 @@ where
             indexes,
             Some(similarities),
             inode_reservation_span,
-            false,
+            RecoveryMode::Full,
         )
     }
 
@@ -5217,8 +5225,44 @@ where
             indexes,
             Some(similarities),
             inode_reservation_span,
-            true,
+            RecoveryMode::Structural,
         )
+    }
+
+    /// Opens the committed Metadata graph without scanning Container storage.
+    /// The caller must pass `take_startup_data_verification()` to background
+    /// scrub and keep online deletion disabled until that check succeeds.
+    ///
+    /// # Errors
+    /// Returns Metadata recovery, reservation, or Namespace setup failures.
+    pub fn open_with_committed_recovery<X>(
+        config: NamespaceConfig,
+        generations: GenerationRepository<M>,
+        containers: ContainerRepository<C>,
+        indexes: &ExactIndexRunRepository<X>,
+        similarities: &SimilarityIndexRepository<X>,
+        inode_reservation_span: u64,
+    ) -> Result<Self, DurableNamespaceError>
+    where
+        X: Clone + Send + Sync + StorageIo + 'static,
+    {
+        Self::open_with_optional_reduction_index(
+            config,
+            generations,
+            containers,
+            indexes,
+            Some(similarities),
+            inode_reservation_span,
+            RecoveryMode::Committed,
+        )
+    }
+
+    /// Transfers the selected commit's outstanding DATA check to initial scrub.
+    #[must_use]
+    pub fn take_startup_data_verification(
+        &mut self,
+    ) -> Option<fastdup_store::PendingDataVerification> {
+        self.startup_data_verification.take()
     }
 
     fn open_with_optional_reduction_index<X>(
@@ -5228,7 +5272,7 @@ where
         indexes: &ExactIndexRunRepository<X>,
         similarities: Option<&SimilarityIndexRepository<X>>,
         inode_reservation_span: u64,
-        structural_recovery: bool,
+        recovery_mode: RecoveryMode,
     ) -> Result<Self, DurableNamespaceError>
     where
         X: Clone + Send + Sync + StorageIo + 'static,
@@ -5286,7 +5330,7 @@ where
             containers,
             inode_reservation_span,
             manifest_readers,
-            structural_recovery,
+            recovery_mode,
         )
     }
 
@@ -5300,24 +5344,35 @@ where
         containers: ContainerRepository<C>,
         inode_reservation_span: u64,
         manifest_readers: Arc<dyn ManifestReaderPolicy<C>>,
-        structural_recovery: bool,
+        recovery_mode: RecoveryMode,
     ) -> Result<Self, DurableNamespaceError> {
         if inode_reservation_span == 0 {
             return Err(DurableNamespaceError::InvalidReservationSpan);
         }
         let graph_verifier = manifest_readers.graph_verifier(containers.clone());
         let proof_started = Instant::now();
-        let phase = if structural_recovery {
-            "namespace_structure"
-        } else {
-            "namespace_data_proof"
+        let phase = match recovery_mode {
+            RecoveryMode::Full => "namespace_data_proof",
+            RecoveryMode::Structural => "namespace_structure",
+            RecoveryMode::Committed => "namespace_commit",
         };
         eprintln!("recovery_phase={phase} state=started");
-        let recovered = if structural_recovery {
-            generations.recover_latest_with_structural_files(&containers)?
-        } else {
-            generations
-                .recover_latest_with_verified_files_using(&containers, graph_verifier.as_ref())?
+        let (recovered, startup_data_verification) = match recovery_mode {
+            RecoveryMode::Committed => {
+                let (recovered, pending) = generations.recover_committed_for_mount(&containers)?;
+                (recovered, Some(pending))
+            }
+            RecoveryMode::Structural => (
+                generations.recover_latest_with_structural_files(&containers)?,
+                None,
+            ),
+            RecoveryMode::Full => (
+                generations.recover_latest_with_verified_files_using(
+                    &containers,
+                    graph_verifier.as_ref(),
+                )?,
+                None,
+            ),
         };
         eprintln!(
             "recovery_phase={phase} state=complete elapsed_ms={}",
@@ -5433,6 +5488,7 @@ where
             Arc::clone(&online_dependency_proofs),
         );
         Ok(Self {
+            startup_data_verification,
             namespace,
             generations,
             containers,

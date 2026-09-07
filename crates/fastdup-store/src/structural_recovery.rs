@@ -6,6 +6,50 @@ use fastdup_format::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Outstanding DATA identities from one selected committed Metadata graph.
+/// This is scrub work, never a content proof or deletion capability. Only a
+/// completely verified selectable Container can discharge an identity.
+#[derive(Debug)]
+#[must_use = "the initial scrub must check the selected commit's DATA requirements"]
+pub struct PendingDataVerification {
+    required: BTreeMap<ChunkId, u64>,
+}
+
+impl PendingDataVerification {
+    pub(crate) fn new(required: BTreeMap<ChunkId, u64>) -> Self {
+        Self { required }
+    }
+
+    #[must_use]
+    pub fn remaining_chunks(&self) -> usize {
+        self.required.len()
+    }
+
+    /// Confirms that the scrub found all required identities, including those
+    /// whose Container files are missing from the directory snapshot entirely.
+    ///
+    /// # Errors
+    /// Returns the first required Chunk not verified in a selectable Container.
+    pub fn finish(self) -> Result<(), StoreError> {
+        if let Some((&chunk_id, &logical_length)) = self.required.first_key_value() {
+            return Err(StoreError::MissingVerifiedChunk {
+                chunk_id,
+                logical_length,
+            });
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self, structure: &ContainerStructure) {
+        for chunk in structure.chunks() {
+            if self.required.get(&chunk.chunk_id).copied() == Some(u64::from(chunk.logical_length))
+            {
+                self.required.remove(&chunk.chunk_id);
+            }
+        }
+    }
+}
+
 impl<I: StorageIo> ContainerRepository<I> {
     /// Independently scrubs one complete Container without retaining its decoded
     /// corpus. Index hints accelerate Base lookup; unavailable hints fall back
@@ -17,6 +61,29 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         id: ContainerId,
         index: Option<&crate::ActivatedExactIndex<X>>,
+    ) -> Result<u64, StoreError> {
+        self.scrub_container_using(id, index, None)
+    }
+
+    /// Fully scrubs a Container and discharges matching startup requirements.
+    /// Dependent Bases must independently verify before any identity is counted.
+    ///
+    /// # Errors
+    /// Returns the same failures as `scrub_container`.
+    pub fn scrub_container_for_recovery<X: StorageIo>(
+        &self,
+        id: ContainerId,
+        index: Option<&crate::ActivatedExactIndex<X>>,
+        required: &mut PendingDataVerification,
+    ) -> Result<u64, StoreError> {
+        self.scrub_container_using(id, index, Some(required))
+    }
+
+    fn scrub_container_using<X: StorageIo>(
+        &self,
+        id: ContainerId,
+        index: Option<&crate::ActivatedExactIndex<X>>,
+        required: Option<&mut PendingDataVerification>,
     ) -> Result<u64, StoreError> {
         let bytes = self.storage.read(&crate::published_name(id))?;
         let mut fallback = crate::ContainerBaseResolver::new(self);
@@ -45,6 +112,31 @@ impl<I: StorageIo> ContainerRepository<I> {
         }
         if verified?.header().container_id() != id {
             return Err(StoreError::PublishVerificationMismatch);
+        }
+        if let Some(required) = required
+            && self.selectable_container(id)
+        {
+            // All payloads and Bases have already verified. Extract identities
+            // from that same immutable image, with no extra disk reads.
+            let footer_bytes = usize::try_from(FOOTER_BYTES)
+                .map_err(|_| fastdup_format::FormatError::ArithmeticOverflow)?;
+            let structure = ContainerStructure::read(
+                &bytes[..HEADER_BYTES],
+                &bytes[bytes.len() - footer_bytes..],
+                bytes.len() as u64,
+                |offset, length| {
+                    let start = usize::try_from(offset)
+                        .map_err(|_| fastdup_format::FormatError::ArithmeticOverflow)?;
+                    let end = start
+                        .checked_add(length)
+                        .ok_or(fastdup_format::FormatError::ArithmeticOverflow)?;
+                    bytes
+                        .get(start..end)
+                        .map(<[u8]>::to_vec)
+                        .ok_or(fastdup_format::FormatError::InvalidContainerLayout)
+                },
+            )?;
+            required.observe(&structure);
         }
         Ok(bytes.len() as u64)
     }

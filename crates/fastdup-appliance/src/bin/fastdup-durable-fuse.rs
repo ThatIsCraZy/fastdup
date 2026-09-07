@@ -83,6 +83,7 @@ type FsOnlineMaintenance =
 type FsGcCatalog = GcCandidateCatalogRepository<FsStorageIo>;
 
 struct RecoveredAppliance {
+    startup_data_verification: fastdup_store::PendingDataVerification,
     appliance: FsAppliance,
     online_gc_recovery: OnlineGcRecoveryReport,
     online_maintenance: FsOnlineMaintenance,
@@ -397,6 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = Session::new(volatile_mount_options());
     let mount = session.mount(filesystem, &mount_path).await?;
     let scrub_runtime = runtime_scrub::start(
+        recovered.startup_data_verification,
         recovered.recovery_containers.clone(),
         recovered.recovery_indexes.clone(),
         data_storage.clone(),
@@ -745,7 +747,7 @@ fn recover_appliance(
             );
         }
     }
-    let appliance = DurableNamespace::open_with_structural_recovery(
+    let mut appliance = DurableNamespace::open_with_committed_recovery(
         NamespaceConfig::default(),
         generations.clone(),
         containers.clone(),
@@ -758,7 +760,11 @@ fn recover_appliance(
     appliance
         .namespace_arc()
         .set_advanced_reduction_default(advanced_reduction == AdvancedReductionPolicy::DependentV1);
+    let startup_data_verification = appliance
+        .take_startup_data_verification()
+        .expect("committed startup supplies its DATA verification work");
     Ok(RecoveredAppliance {
+        startup_data_verification,
         appliance,
         online_gc_recovery,
         online_maintenance,

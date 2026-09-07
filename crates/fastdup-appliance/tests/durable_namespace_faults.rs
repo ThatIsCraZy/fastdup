@@ -1184,6 +1184,36 @@ fn crash_and_assert(
         ),
         RecoveryOracle::Complete => assert_complete(&namespace),
     }
+    let mut fast = DurableNamespace::open_with_committed_recovery(
+        NamespaceConfig::default(),
+        generations,
+        container_repository,
+        &fastdup_store::ExactIndexRunRepository::new(metadata.clone()),
+        &fastdup_store::SimilarityIndexRepository::new(metadata.clone()),
+        1024,
+    )
+    .expect("committed writable recovery preserves the crash oracle");
+    match oracle {
+        RecoveryOracle::Previous => assert_eq!(
+            fast.namespace().dispatch(
+                CALLER,
+                Operation::Lookup {
+                    parent: ROOT_INODE,
+                    name: NAME
+                }
+            ),
+            Err(PosixError::NoEntry)
+        ),
+        RecoveryOracle::Complete => assert_complete(fast.namespace()),
+    }
+    let mut pending = fast.take_startup_data_verification().unwrap();
+    let repository = ContainerRepository::new(containers.clone());
+    for id in repository.recovery_container_snapshot().unwrap() {
+        repository
+            .scrub_container_for_recovery::<MemoryStorageIo>(id, None, &mut pending)
+            .unwrap();
+    }
+    pending.finish().unwrap();
 }
 
 fn assert_complete(namespace: &Namespace) {

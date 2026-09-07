@@ -64,20 +64,18 @@ impl ScrubHandle {
 }
 
 pub fn start(
+    mut required: fastdup_store::PendingDataVerification,
     containers: ContainerRepository<MaintenanceContainerStorage>,
     indexes: ExactIndexRunRepository<FsStorageIo>,
     frontend: TelemetryStorageIo,
     namespace: Arc<Namespace>,
 ) -> io::Result<ScrubHandle> {
-    let names = containers
-        .recovery_container_snapshot()
-        .map_err(io::Error::other)?;
     let control = Arc::new(Control {
         cancelled: AtomicBool::new(false),
         complete: AtomicBool::new(false),
         read_bytes: AtomicU64::new(0),
         progress: Mutex::new(Progress {
-            total: names.len(),
+            total: 0,
             verified: 0,
             verified_bytes: 0,
             current: None,
@@ -97,6 +95,11 @@ pub fn start(
             let result = (|| {
                 fastdup_store::set_background_io_priority().map_err(io::Error::other)?;
                 rustix::process::nice(10).map_err(io::Error::from)?;
+                let names = containers
+                    .recovery_container_snapshot()
+                    .map_err(io::Error::other)?;
+                control.progress.lock().expect("scrub progress lock").total = names.len();
+                control.report("running", None);
                 let paced = PacedStorage {
                     inner: containers.storage().clone(),
                     control: Arc::clone(&control),
@@ -117,7 +120,7 @@ pub fn start(
                         },
                     ));
                     let bytes = repository
-                        .scrub_container(id, index.as_deref())
+                        .scrub_container_for_recovery(id, index.as_deref(), &mut required)
                         .map_err(io::Error::other)?;
                     let mut progress = control.progress.lock().expect("scrub progress lock");
                     progress.verified += 1;
@@ -125,6 +128,7 @@ pub fn start(
                     drop(progress);
                     control.report("running", None);
                 }
+                required.finish().map_err(io::Error::other)?;
                 Ok::<_, io::Error>(())
             })();
             control.finish(result, &namespace);

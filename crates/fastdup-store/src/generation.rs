@@ -2632,13 +2632,13 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         verifier: Option<&dyn RequiredChunkVerifier>,
     ) -> Result<Option<RecoveredGraph>, GenerationError> {
-        self.recover_latest_checked(&|required| {
+        self.recover_latest_checked(&mut |required| {
             if required.is_empty() {
                 return Ok(());
             }
             verifier
                 .ok_or(GenerationError::DataLocationsNotConnected)?
-                .verify_required_chunks(required)
+                .verify_required_chunks(&required)
                 .map_err(GenerationError::from)
         })
     }
@@ -2665,9 +2665,9 @@ impl<I: StorageIo> GenerationRepository<I> {
             .commit_lock
             .lock()
             .expect("generation commit lock poisoned");
-        let Some(graph) = self.recover_latest_checked(&|required| {
+        let Some(graph) = self.recover_latest_checked(&mut |required| {
             containers
-                .verify_required_chunk_structure(required)
+                .verify_required_chunk_structure(&required)
                 .map_err(GenerationError::from)
         })?
         else {
@@ -2683,9 +2683,64 @@ impl<I: StorageIo> GenerationRepository<I> {
         }))
     }
 
+    /// Selects the committed Metadata graph without visiting Container storage.
+    /// The returned requirements must be checked by the owning runtime's initial
+    /// scrub before it enables online deletion. Demand readers still verify DATA.
+    /// The newest committed graph must be valid; no silent rollback is permitted.
+    /// After validating that graph, an invalid WAL suffix is durably truncated
+    /// under the commit lock. The accepted prefix is never rewritten.
+    ///
+    /// # Errors
+    /// Returns Metadata, WAL, compatibility, allocation, or graph failures.
+    ///
+    /// # Panics
+    /// Panics if a previous invariant failure poisoned the commit lock.
+    pub fn recover_committed_for_mount<J>(
+        &self,
+        containers: &ContainerRepository<J>,
+    ) -> Result<
+        (
+            Option<RecoveredDataGeneration<J>>,
+            crate::PendingDataVerification,
+        ),
+        GenerationError,
+    >
+    where
+        I: Clone + Send + Sync + 'static,
+        J: Clone + StorageIo,
+    {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("generation commit lock poisoned");
+        let mut required = BTreeMap::new();
+        let graph = self.recover_latest_checked(&mut |chunks| {
+            required = chunks;
+            Ok(())
+        })?;
+        let recovered = if let Some(mut graph) = graph {
+            if graph.generation.rejected_newer_generations() != 0 {
+                return Err(GenerationError::NoRecoverableGeneration);
+            }
+            if graph.generation.wal_tail != WalTail::Clean {
+                GenerationLog::new(&self.storage)
+                    .repair_tail(graph.generation.record)
+                    .map_err(map_log_error)?;
+                graph.generation.wal_tail = WalTail::Clean;
+            }
+            Some(RecoveredDataGeneration {
+                generation: graph.generation,
+                files: verified_files(graph.manifests, self, containers)?,
+            })
+        } else {
+            None
+        };
+        Ok((recovered, crate::PendingDataVerification::new(required)))
+    }
+
     fn recover_latest_checked(
         &self,
-        verify: &impl Fn(&BTreeMap<fastdup_format::ChunkId, u64>) -> Result<(), GenerationError>,
+        verify: &mut impl FnMut(BTreeMap<fastdup_format::ChunkId, u64>) -> Result<(), GenerationError>,
     ) -> Result<Option<RecoveredGraph>, GenerationError> {
         let Some(snapshot) = GenerationLog::new(&self.storage)
             .load_for_recovery()
@@ -2798,7 +2853,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         structurally_valid_records: &[CommitRecord],
         oldest_online_generation: u64,
-        verify: &impl Fn(&BTreeMap<fastdup_format::ChunkId, u64>) -> Result<(), GenerationError>,
+        verify: &mut impl FnMut(BTreeMap<fastdup_format::ChunkId, u64>) -> Result<(), GenerationError>,
     ) -> Result<Option<SelectedGraph>, GenerationError> {
         for record in structurally_valid_records
             .iter()
@@ -2815,7 +2870,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             }
             let manifests = match self.scan_manifest_graph_with_required(&root).and_then(
                 |(manifests, required)| {
-                    verify(&required)?;
+                    verify(required)?;
                     Ok(manifests)
                 },
             ) {

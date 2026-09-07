@@ -4,6 +4,10 @@ status: accepted
 
 # Mount after structural validation and scrub in the background
 
+Current normal-start policy: [ADR 0091](0091-start-from-the-committed-metadata-graph.md)
+defers Container structure and DATA availability checks to the initial scrub.
+The selected committed Metadata graph is still checked before mounting.
+
 Normal startup uses the structural-start policy described in ADR 0023 instead
 of ADR 0036's mandatory complete DATA proof before mounting. The Commit WAL's
 causal durability ordering remains authoritative: Container bytes and directory
