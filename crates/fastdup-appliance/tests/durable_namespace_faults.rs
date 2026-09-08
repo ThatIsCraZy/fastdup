@@ -905,6 +905,92 @@ fn every_metadata_clone_fault_recovers_the_previous_or_complete_range() {
     }
 }
 
+#[test]
+fn veeam_8192_byte_clone_is_metadata_only_and_recovers_exact_offsets() {
+    const SOURCE_OFFSET: u64 = 1_617_920;
+    const TARGET_OFFSET: u64 = 1_609_728;
+    const LENGTH: u64 = 8_192;
+    let metadata = MemoryStorageIo::new();
+    let containers = MemoryStorageIo::new();
+    let appliance = open(metadata.clone(), containers.clone());
+    let (source_inode, source_handle, target_inode, target_handle, _) =
+        seed_clone_predecessor(&appliance);
+    let payload: Vec<u8> = (0..2 * 1024 * 1024_usize)
+        .map(|n| u8::try_from((n * 131 + n / 97) % 251).unwrap())
+        .collect();
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: source_inode,
+                handle: source_handle,
+                offset: 0,
+                data: &payload,
+            },
+        )
+        .unwrap();
+    appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::SetLength {
+                inode: target_inode,
+                handle: Some(target_handle),
+                length: 2 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+    appliance.checkpoint().unwrap().unwrap();
+    let before = containers.operation_count();
+    clone_fixture(
+        &appliance,
+        source_inode,
+        source_handle,
+        target_inode,
+        target_handle,
+        SOURCE_OFFSET,
+        TARGET_OFFSET,
+        LENGTH,
+    );
+    appliance.checkpoint().unwrap().unwrap();
+    assert_eq!(
+        containers.operation_count(),
+        before,
+        "the reported Veeam clone and its checkpoint must not read or write DATA"
+    );
+    drop(appliance);
+    metadata.crash();
+    containers.crash();
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, policy()),
+        &ContainerRepository::new(containers),
+    )
+    .unwrap()
+    .unwrap();
+    let Reply::Opened(handle) = recovered
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: target_inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("open clone target");
+    };
+    let mut expected = vec![0];
+    expected.extend_from_slice(&payload[1_617_920..1_626_112]);
+    expected.push(0);
+    assert_eq!(
+        read_range(&recovered, target_inode, handle, TARGET_OFFSET - 1, 8194),
+        expected
+    );
+}
+
 #[derive(Clone, Copy)]
 enum RecoveryOracle {
     Previous,

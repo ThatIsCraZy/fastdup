@@ -64,6 +64,18 @@ enum fastdup_contract_status fastdup_integrity_set_v1(const uint8_t *input,
 	return FASTDUP_CONTRACT_INVALID_PARAMETER;
 }
 
+enum fastdup_contract_status fastdup_integrity_effective_v1(
+    uint16_t stored, uint32_t cluster_size, uint16_t *effective)
+{
+	if (effective == NULL || stored > FASTDUP_CHECKSUM_CRC64 ||
+	    !is_power_of_two_u64(cluster_size) || cluster_size < 4096) {
+		return FASTDUP_CONTRACT_INVALID_PARAMETER;
+	}
+	*effective = stored == FASTDUP_CHECKSUM_NONE ? FASTDUP_CHECKSUM_NONE :
+		(cluster_size == 4096 ? FASTDUP_CHECKSUM_CRC32 : FASTDUP_CHECKSUM_CRC64);
+	return FASTDUP_CONTRACT_OK;
+}
+
 enum fastdup_contract_status fastdup_integrity_get_v1(uint8_t *output,
 						       size_t output_capacity,
 						       uint16_t algorithm,
@@ -77,6 +89,10 @@ enum fastdup_contract_status fastdup_integrity_get_v1(uint8_t *output,
 		return FASTDUP_CONTRACT_INVALID_PARAMETER;
 	}
 
+	if (fastdup_integrity_effective_v1(algorithm, cluster_size, &algorithm) !=
+	    FASTDUP_CONTRACT_OK) {
+		return FASTDUP_CONTRACT_INVALID_PARAMETER;
+	}
 	store_u16_le(output, algorithm);
 	store_u16_le(output + 2, 0);
 	store_u32_le(output + 4, 0);
@@ -115,7 +131,10 @@ enum fastdup_contract_status fastdup_integrity_resolve_v1(
 		algorithm = current;
 	} else if (algorithm != FASTDUP_CHECKSUM_NONE) {
 		/* ReFS v2 permits a filesystem-selected mechanism for either CRC request. */
-		algorithm = cluster_size == 4096 ? FASTDUP_CHECKSUM_CRC32 : FASTDUP_CHECKSUM_CRC64;
+		status = fastdup_integrity_effective_v1(algorithm, cluster_size, &algorithm);
+		if (status != FASTDUP_CONTRACT_OK) {
+			return status;
+		}
 	}
 	store_u16_le(stored, algorithm);
 	return FASTDUP_CONTRACT_OK;

@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm">Download the RPM</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.1/fastdup-0.7.1-1.el10.x86_64.rpm">Download the RPM</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Product page</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7">Release notes</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.1">Release notes</a>
 </p>
 
 fastdup is an experimental, software-defined single-node storage appliance for
@@ -29,6 +29,17 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > [!WARNING]
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
+
+## New in v0.7.1 · 9 September 2026
+
+- Fix Veeam 8 KiB block clones with consistent 4 KiB SMB alignment and
+  compatible interpretation of existing native-integrity-enabled files.
+- Avoid unprofitable cold Base reads using Similarity Sketches and learned
+  savings/read-cost feedback, with continued exploration and verified RAM reuse.
+- Expose skipped candidates, backend attempts, exploration and useful trials
+  in **GC & Reduction**.
+
+[Release notes v0.7.1](docs/releases/v0.7.1.md) · RPM version **0.7.1-1**.
 
 ## New in v0.7 · 7 September 2026
 
@@ -160,11 +171,11 @@ You need:
 Download and install the current binary package:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/fastdup-0.7.0-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.1/fastdup-0.7.1-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.1/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.7.0-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.7.1-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

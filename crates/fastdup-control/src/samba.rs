@@ -85,7 +85,7 @@ impl SambaConfig {
                     .expect("String write cannot fail");
             }
             rendered.push_str(
-                "\tforce user = fastdup-smb\n\tforce group = fastdup-smb\n\tvfs objects = fastdup\n\tfastdup:enabled = yes\n\tfastdup:clone alignment = 65536\n\tfastdup:maximum clone bytes = 1073741824\n",
+                "\tforce user = fastdup-smb\n\tforce group = fastdup-smb\n\tvfs objects = fastdup\n\tfastdup:enabled = yes\n\tfastdup:clone alignment = 4096\n\tfastdup:maximum clone bytes = 1073741824\n",
             );
         }
         // Includes preserve parser section state: restore global so the
@@ -324,7 +324,7 @@ mod tests {
         assert!(rendered.contains("browseable = no"));
         assert!(rendered.contains("smb encrypt = required"));
         assert!(rendered.contains("valid users = backup-operator @storage_admins"));
-        assert!(rendered.contains("fastdup:clone alignment = 65536"));
+        assert!(rendered.contains("fastdup:clone alignment = 4096"));
     }
 
     #[test]

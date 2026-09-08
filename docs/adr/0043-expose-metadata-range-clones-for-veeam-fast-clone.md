@@ -119,3 +119,31 @@ We do not claim Veeam compatibility until a real SMB 3.1.1 trace and Samba
 protocol test confirm the Integrity FSCTL state machine, alignment, error
 mapping, locks, rename/close ordering, and zero DATA-container I/O during a
 synthetic full.
+
+## 4 KiB clone admission and existing Integrity metadata (9 September 2026)
+
+The previous generated Samba configuration and VFS default required 64 KiB
+alignment although the FUSE volume uses 4 KiB geometry. Veeam's reported clone
+(source 1,617,920, target 1,609,728, length 8,192) is valid at 4 KiB and was
+rejected locally with `STATUS_INVALID_PARAMETER` before `copy_file_range`.
+The generated profile and VFS default now both use 4 KiB. Unaligned requests,
+EOF bounds, pre-sizing, non-overlap and the one-syscall cap remain enforced.
+
+Existing `0200` and `0100` xattrs both mean native integrity enabled; neither
+selects an actual CRC implementation inside fastdup. Interpret either valid
+legacy enabled representation as the current volume's filesystem-selected
+mechanism when reporting GET or comparing Clone source and target policies.
+This prevents a geometry correction from turning old enabled backups and new
+enabled targets into a false integrity mismatch. NONE remains distinct;
+unknown/truncated attributes still fail closed. UNCHANGED performs no metadata
+rewrite. No backup data or historical inode attributes are migrated.
+
+The portable contract regression uses the exact failing Veeam offsets and tests
+legacy/new enabled-policy interoperability. The appliance regression verifies
+that this range and its checkpoint issue no DATA operations and recover the
+correct bytes with intact neighboring bytes. The existing clone fault-injection
+oracle still checks atomic old-or-new recovery. These checks do not substitute
+for a complete Veeam synthetic-full qualification.
+
+Protocol references: [Block cloning restrictions](https://learn.microsoft.com/en-us/windows/win32/fileio/block-cloning),
+[Integrity information fields](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/72640484-66fb-4b8f-aec6-6ab56d63831b).

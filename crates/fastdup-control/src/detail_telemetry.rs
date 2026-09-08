@@ -88,6 +88,16 @@ pub struct CacheTelemetry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReductionTelemetry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_cold_candidates: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exploration_reads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_base_reads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_base_reuses: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successful_base_trials: Option<u64>,
     pub enabled: bool,
     pub queries: u64,
     pub candidates: u64,
@@ -226,6 +236,13 @@ mod tests {
             saved["runtime"]["cacheBudget"],
             frontend["details"]["cacheBudget"]
         );
+        assert!(saved["runtime"]["reduction"].get("backendBaseReads").is_none());
+        for (key, value) in [("backendBaseReads", 140), ("skippedColdCandidates", 931),
+            ("explorationReads", 32), ("warmBaseReuses", 710), ("successfulBaseTrials", 411)] {
+            frontend["details"]["reduction"][key] = serde_json::json!(value);
+        }
+        let with_gate = serde_json::to_value(parse_details(&frontend)).unwrap();
+        assert_eq!(with_gate["runtime"]["reduction"], frontend["details"]["reduction"]);
         frontend["details"]
             .as_object_mut()
             .unwrap()

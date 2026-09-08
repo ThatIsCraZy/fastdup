@@ -5,6 +5,7 @@
 //! chosen base is resolved and verified through the ordinary DATA read path.
 //! The frozen-pair constructor remains available for offline callers.
 
+use crate::candidate_read_gate::{CandidateReadGate, GateDecision, GateKey};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -37,6 +38,11 @@ const _: () = assert!(REDUCTION_COUNTER_STRIPES.is_power_of_two());
 struct ReductionCounterStripe {
     queries: AtomicU64,
     candidates: AtomicU64,
+    skipped_cold_candidates: AtomicU64,
+    exploration_reads: AtomicU64,
+    backend_base_reads: AtomicU64,
+    warm_base_reuses: AtomicU64,
+    successful_base_trials: AtomicU64,
     base_reads: AtomicU64,
     base_read_bytes: AtomicU64,
     prefix_trials: AtomicU64,
@@ -78,6 +84,11 @@ impl ReductionCounters {
                 total.add_assign(ReductionCounterValues {
                     queries: stripe.queries.load(Ordering::Relaxed),
                     candidates: stripe.candidates.load(Ordering::Relaxed),
+                    skipped_cold_candidates: stripe.skipped_cold_candidates.load(Ordering::Relaxed),
+                    exploration_reads: stripe.exploration_reads.load(Ordering::Relaxed),
+                    backend_base_reads: stripe.backend_base_reads.load(Ordering::Relaxed),
+                    warm_base_reuses: stripe.warm_base_reuses.load(Ordering::Relaxed),
+                    successful_base_trials: stripe.successful_base_trials.load(Ordering::Relaxed),
                     base_reads: stripe.base_reads.load(Ordering::Relaxed),
                     base_read_bytes: stripe.base_read_bytes.load(Ordering::Relaxed),
                     prefix_trials: stripe.prefix_trials.load(Ordering::Relaxed),
@@ -102,6 +113,11 @@ impl ReductionCounters {
 struct ReductionCounterValues {
     queries: u64,
     candidates: u64,
+    skipped_cold_candidates: u64,
+    exploration_reads: u64,
+    backend_base_reads: u64,
+    warm_base_reuses: u64,
+    successful_base_trials: u64,
     base_reads: u64,
     base_read_bytes: u64,
     prefix_trials: u64,
@@ -122,6 +138,19 @@ impl ReductionCounterValues {
     fn add_assign(&mut self, other: Self) {
         self.queries = self.queries.saturating_add(other.queries);
         self.candidates = self.candidates.saturating_add(other.candidates);
+        self.skipped_cold_candidates = self
+            .skipped_cold_candidates
+            .saturating_add(other.skipped_cold_candidates);
+        self.exploration_reads = self
+            .exploration_reads
+            .saturating_add(other.exploration_reads);
+        self.backend_base_reads = self
+            .backend_base_reads
+            .saturating_add(other.backend_base_reads);
+        self.warm_base_reuses = self.warm_base_reuses.saturating_add(other.warm_base_reuses);
+        self.successful_base_trials = self
+            .successful_base_trials
+            .saturating_add(other.successful_base_trials);
         self.base_reads = self.base_reads.saturating_add(other.base_reads);
         self.base_read_bytes = self.base_read_bytes.saturating_add(other.base_read_bytes);
         self.prefix_trials = self.prefix_trials.saturating_add(other.prefix_trials);
@@ -157,6 +186,7 @@ impl ReductionCounterValues {
 pub struct PersistentReductionIndex<I> {
     source: ReductionSource<I>,
     counters: ReductionCounters,
+    read_gate: CandidateReadGate,
 }
 
 enum ReductionSource<I> {
@@ -185,6 +215,7 @@ struct ChunkTrial<'a> {
     maximum_encoded_payload_bytes: usize,
     best: Option<(usize, PreparedDependentRecord)>,
     remaining_trials: usize,
+    cold_observation: Option<(GateKey, u64)>,
 }
 
 impl<I: Clone + StorageIo> fmt::Debug for PersistentReductionIndex<I> {
@@ -220,6 +251,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
                 similarity,
             },
             counters: ReductionCounters::new(),
+            read_gate: CandidateReadGate::default(),
         })
     }
 
@@ -228,6 +260,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         Self {
             source: ReductionSource::Online(repository),
             counters: ReductionCounters::new(),
+            read_gate: CandidateReadGate::default(),
         }
     }
 
@@ -346,7 +379,8 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
                     admission,
                     |(ordinal, mut trial, hint, candidate, base)| {
                         let counters = self.counters.for_chunk(trial.target_id);
-                        let result = trial.run_base(candidate, base.as_slice(), counters);
+                        let result =
+                            trial.run_base(candidate, base.as_slice(), counters, &self.read_gate);
                         if result.is_err() {
                             counters.errors.fetch_add(1, Ordering::Relaxed);
                         }
@@ -452,6 +486,11 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             enabled: true,
             queries: counters.queries,
             candidates: counters.candidates,
+            skipped_cold_candidates: counters.skipped_cold_candidates,
+            exploration_reads: counters.exploration_reads,
+            backend_base_reads: counters.backend_base_reads,
+            warm_base_reuses: counters.warm_base_reuses,
+            successful_base_trials: counters.successful_base_trials,
             base_reads: counters.base_reads,
             base_read_bytes: counters.base_read_bytes,
             prefix_trials: counters.prefix_trials,
@@ -540,7 +579,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
                     snapshot,
                     &mut std::collections::BTreeMap::new(),
                 ) {
-                    trial.run_base(candidate, base.as_slice(), counters)?;
+                    trial.run_base(candidate, base.as_slice(), counters, &self.read_gate)?;
                 }
                 Ok(trial.finish(counters))
             }
@@ -615,6 +654,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             maximum_encoded_payload_bytes,
             best: None,
             remaining_trials: MAXIMUM_DEPENDENT_TRIALS_V1,
+            cold_observation: None,
         }))
     }
 
@@ -641,10 +681,52 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         for candidate in trial.candidates.by_ref() {
             counters.base_reads.fetch_add(1, Ordering::Relaxed);
             let key = (candidate.chunk_id(), candidate.logical_length());
+            let gate_key = GateKey::new(
+                candidate.sketch_distance(),
+                key.1,
+                trial.independent.encoded_payload_bytes(),
+                trial.best.is_some(),
+            );
+            let started = std::time::Instant::now();
+            let mut decision = None;
+            let mut backend_reads = 0;
             let base = bases.get(&key).cloned().or_else(|| {
-                containers
-                    .find_verified_independent_base_payload_with_index(exact, key.0, key.1, cache)
+                let read = containers.find_verified_independent_base_read_gated(
+                    exact,
+                    key.0,
+                    key.1,
+                    cache,
+                    &mut || {
+                        let admit =
+                            *decision.get_or_insert_with(|| self.read_gate.decide(gate_key));
+                        if admit == GateDecision::Skip {
+                            return false;
+                        }
+                        backend_reads += 1;
+                        counters.backend_base_reads.fetch_add(1, Ordering::Relaxed);
+                        if admit == GateDecision::Explore {
+                            counters.exploration_reads.fetch_add(1, Ordering::Relaxed);
+                        }
+                        true
+                    },
+                )?;
+                let (mut requested, _) = read.into_parts();
+                requested.pop()
             });
+            let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            if backend_reads != 0 {
+                if base.is_some() {
+                    trial.cold_observation = Some((gate_key, elapsed));
+                } else {
+                    self.read_gate.observe(gate_key, 0, elapsed);
+                }
+            } else if base.is_some() {
+                counters.warm_base_reuses.fetch_add(1, Ordering::Relaxed);
+            } else if decision == Some(GateDecision::Skip) {
+                counters
+                    .skipped_cold_candidates
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(base) = base {
                 bases.entry(key).or_insert_with(|| base.clone());
                 counters.base_read_bytes.fetch_add(
@@ -664,7 +746,13 @@ impl ChunkTrial<'_> {
         candidate: SimilarityBaseCandidate,
         base_bytes: &[u8],
         counters: &ReductionCounterStripe,
+        read_gate: &CandidateReadGate,
     ) -> Result<(), PersistentReductionError> {
+        let started = std::time::Instant::now();
+        let before_bytes = self
+            .best
+            .as_ref()
+            .map_or(self.independent.encoded_payload_bytes(), |(n, _)| *n);
         let _trial_phase = ReductionTimer::new(&counters.codec_trial_ns);
         let Self {
             target_id,
@@ -736,6 +824,20 @@ impl ChunkTrial<'_> {
                     *best = Some((prefix_bytes, prepared));
                 }
             }
+        }
+        let saved = before_bytes.saturating_sub(best.as_ref().map_or(before_bytes, |(n, _)| *n));
+        if saved != 0 {
+            counters
+                .successful_base_trials
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some((key, read_ns)) = self.cold_observation.take() {
+            let trial_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            read_gate.observe(
+                key,
+                u64::try_from(saved).unwrap_or(u64::MAX),
+                read_ns.saturating_add(trial_ns),
+            );
         }
         Ok(())
     }
@@ -856,6 +958,11 @@ pub struct PersistentReductionStatus {
     enabled: bool,
     queries: u64,
     candidates: u64,
+    skipped_cold_candidates: u64,
+    exploration_reads: u64,
+    backend_base_reads: u64,
+    warm_base_reuses: u64,
+    successful_base_trials: u64,
     base_reads: u64,
     base_read_bytes: u64,
     prefix_trials: u64,
@@ -891,6 +998,11 @@ impl PersistentReductionStatus {
     reduction_status_getter!(enabled, enabled, bool);
     reduction_status_getter!(queries, queries, u64);
     reduction_status_getter!(candidates, candidates, u64);
+    reduction_status_getter!(skipped_cold_candidates, skipped_cold_candidates, u64);
+    reduction_status_getter!(exploration_reads, exploration_reads, u64);
+    reduction_status_getter!(backend_base_reads, backend_base_reads, u64);
+    reduction_status_getter!(warm_base_reuses, warm_base_reuses, u64);
+    reduction_status_getter!(successful_base_trials, successful_base_trials, u64);
     reduction_status_getter!(base_reads, base_reads, u64);
     reduction_status_getter!(base_read_bytes, base_read_bytes, u64);
     reduction_status_getter!(prefix_trials, prefix_trials, u64);
@@ -1150,3 +1262,7 @@ mod tests {
         assert_eq!(snapshot.errors, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "persistent_reduction_gate_tests.rs"]
+mod gate_tests;

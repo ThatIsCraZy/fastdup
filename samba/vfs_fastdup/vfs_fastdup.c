@@ -21,7 +21,7 @@
 #include <unistd.h>
 
 #define FASTDUP_MODULE "fastdup"
-#define FASTDUP_DEFAULT_ALIGNMENT ((uint64_t)65536)
+#define FASTDUP_DEFAULT_ALIGNMENT FASTDUP_CLONE_ALIGNMENT_V1
 #define FASTDUP_DEFAULT_MAX_CLONE ((uint64_t)1073741824)
 #define FASTDUP_LINUX_SINGLE_COPY_MAX ((uint64_t)0x7ffff000)
 #define FASTDUP_GET_INTEGRITY_BYTES ((uint32_t)16)
@@ -149,6 +149,7 @@ static NTSTATUS fastdup_get_integrity(struct vfs_handle_struct *handle,
 				     struct files_struct *fsp,
 				     uint16_t *algorithm)
 {
+	struct fastdup_config *config = NULL;
 	uint8_t stored[2];
 	ssize_t length = SMB_VFS_NEXT_FGETXATTR(handle, fsp,
 		FASTDUP_INTEGRITY_XATTR, stored, sizeof(stored));
@@ -161,6 +162,12 @@ static NTSTATUS fastdup_get_integrity(struct vfs_handle_struct *handle,
 	}
 	if (fastdup_integrity_decode_v1(stored, (size_t)length, algorithm) !=
 	    FASTDUP_CONTRACT_OK) {
+		return NT_STATUS_DATA_ERROR;
+	}
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct fastdup_config,
+				return NT_STATUS_INTERNAL_ERROR);
+	if (fastdup_integrity_effective_v1(*algorithm,
+		(uint32_t)config->alignment, algorithm) != FASTDUP_CONTRACT_OK) {
 		return NT_STATUS_DATA_ERROR;
 	}
 	return NT_STATUS_OK;
@@ -510,6 +517,13 @@ static struct tevent_req *fastdup_offload_write_send(
 	};
 	contract_status = fastdup_validate_clone_v1(&clone_request);
 	if (contract_status != FASTDUP_CONTRACT_OK) {
+		DBG_WARNING("fastdup clone rejected: contract=%d source_offset=%" PRIu64
+			" target_offset=%" PRIu64 " length=%" PRIu64
+			" alignment=%" PRIu64 " source_size=%" PRIu64
+			" target_size=%" PRIu64 "\n", contract_status,
+			clone_request.source_offset, clone_request.target_offset,
+			clone_request.length, clone_request.alignment,
+			clone_request.source_size, clone_request.target_size);
 		tevent_req_nterror(request,
 				   fastdup_contract_ntstatus(contract_status));
 		return tevent_req_post(request, event_context);

@@ -121,7 +121,7 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
             {"id":"containerDescriptors", "hits":descriptors.hits(), "misses":descriptors.misses(), "evictions":descriptors.evictions(), "residentBytes":descriptors.resident_bytes()},
             {"id":"historicalProofs", "hits":history.hits(), "misses":history.misses(), "evictions":history.evictions(), "residentBytes":history.resident_bytes()}
         ],
-        "reduction": {"enabled":reduction.enabled(), "queries":reduction.queries(), "candidates":reduction.candidates(),
+        "reduction": {"skippedColdCandidates":reduction.skipped_cold_candidates(), "explorationReads":reduction.exploration_reads(), "backendBaseReads":reduction.backend_base_reads(), "warmBaseReuses":reduction.warm_base_reuses(), "successfulBaseTrials":reduction.successful_base_trials(), "enabled":reduction.enabled(), "queries":reduction.queries(), "candidates":reduction.candidates(),
             "acceptedPrefixes":reduction.accepted_prefixes(), "acceptedSparseXor":reduction.accepted_sparse_xor(),
             "savedPayloadBytes":reduction.saved_payload_bytes(), "fallbacks":reduction.independent_fallbacks(), "errors":reduction.errors()},
         "checkpoint":CHECKPOINT.lock().ok().and_then(|last| last.clone()),

@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           fastdup
-Version:        0.7.0
+Version:        0.7.1
 Release:        1%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
@@ -108,6 +108,10 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Wed Sep 09 2026 fastdup contributors - 0.7.1-1
+- Accept Veeam 4 KiB-aligned clones and reconcile legacy native Integrity flags
+- Learn admission for speculative cold Base reads and expose decision counters
+
 * Mon Sep 07 2026 fastdup maintainers - 0.7.0-1
 - Repository usage overview and five-minute cache counter windows.
 - Durable resume of incomplete background scrub rounds.

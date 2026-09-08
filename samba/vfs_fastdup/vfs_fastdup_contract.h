@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define FASTDUP_CLONE_ALIGNMENT_V1 ((uint64_t)4096)
+
 #define FASTDUP_CHECKSUM_NONE ((uint16_t)0x0000)
 #define FASTDUP_CHECKSUM_CRC32 ((uint16_t)0x0001)
 #define FASTDUP_CHECKSUM_CRC64 ((uint16_t)0x0002)
@@ -40,6 +42,11 @@ struct fastdup_clone_request {
  */
 enum fastdup_contract_status fastdup_integrity_set_v1(const uint8_t *input,
 						       size_t input_length);
+
+/* Legacy CRC32/CRC64 xattrs both enable the native verifier. Present them
+ * using this volume's current geometry without rewriting the inode. */
+enum fastdup_contract_status fastdup_integrity_effective_v1(
+    uint16_t stored, uint32_t cluster_size, uint16_t *effective);
 
 enum fastdup_contract_status fastdup_integrity_get_v1(uint8_t *output,
 						       size_t output_capacity,

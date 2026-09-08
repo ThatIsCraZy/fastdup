@@ -176,6 +176,45 @@ static void duplicate_extents_is_one_bounded_presized_operation(void)
 	       FASTDUP_CONTRACT_INVALID_PARAMETER);
 }
 
+static void veeam_8192_byte_clone_and_legacy_integrity_are_compatible(void)
+{
+	struct fastdup_clone_request request = {
+		.source_size = 10753359872ULL, .target_size = 4194304,
+		.source_offset = 1617920, .target_offset = 1609728,
+		.length = 8192, .alignment = FASTDUP_CLONE_ALIGNMENT_V1,
+		.maximum_length = 1073741824, .same_file = false,
+	};
+	uint8_t old_policy[2] = {2, 0}, new_policy[2] = {1, 0};
+	uint8_t reply[16], unchanged[8] = {0xff, 0xff}, stored[2];
+	uint16_t old_algorithm, new_algorithm;
+	size_t length;
+	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_OK);
+	request.alignment = 65536;
+	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_MISALIGNED);
+	request.alignment = FASTDUP_CLONE_ALIGNMENT_V1;
+	request.target_offset++;
+	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_MISALIGNED);
+	request.target_offset--;
+	request.target_size = request.target_offset + request.length - 1;
+	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_TARGET_NOT_PRESIZED);
+
+	assert(fastdup_integrity_decode_v1(old_policy, 2, &old_algorithm) == FASTDUP_CONTRACT_OK);
+	assert(fastdup_integrity_decode_v1(new_policy, 2, &new_algorithm) == FASTDUP_CONTRACT_OK);
+	assert(fastdup_integrity_effective_v1(old_algorithm, 4096, &old_algorithm) == FASTDUP_CONTRACT_OK);
+	assert(fastdup_integrity_effective_v1(new_algorithm, 4096, &new_algorithm) == FASTDUP_CONTRACT_OK);
+	assert(old_algorithm == new_algorithm && old_algorithm == FASTDUP_CHECKSUM_CRC32);
+	assert(old_policy[0] == 2); /* Interpretation does not mutate stored metadata. */
+	assert(fastdup_integrity_get_v1(reply, 16, 2, 4096, &length) == FASTDUP_CONTRACT_OK);
+	assert(reply[0] == 1 && load_u32_le(reply + 8) == 4096 && load_u32_le(reply + 12) == 4096);
+	assert(fastdup_integrity_effective_v1(0, 4096, &new_algorithm) == FASTDUP_CONTRACT_OK);
+	assert(old_algorithm != new_algorithm); /* Enabled/NONE still cannot clone. */
+	assert(fastdup_integrity_resolve_v1(unchanged, 8, 2, 4096, stored) == FASTDUP_CONTRACT_OK);
+	assert(stored[0] == 2); /* UNCHANGED retains the stored representation. */
+	assert(fastdup_integrity_effective_v1(3, 4096, &new_algorithm) == FASTDUP_CONTRACT_INVALID_PARAMETER);
+	assert(fastdup_integrity_effective_v1(2, 6144, &new_algorithm) == FASTDUP_CONTRACT_INVALID_PARAMETER);
+	assert(fastdup_integrity_effective_v1(2, 4096, NULL) == FASTDUP_CONTRACT_INVALID_PARAMETER);
+}
+
 static void close_is_fenced_by_every_accepted_metadata_operation(void)
 {
 	struct fastdup_handle_fence fence = {0};
@@ -207,6 +246,7 @@ int main(void)
 	integrity_wire_validation_and_default_none_state();
 	integrity_enable_roundtrips_and_unchanged_preserves_state();
 	duplicate_extents_is_one_bounded_presized_operation();
+	veeam_8192_byte_clone_and_legacy_integrity_are_compatible();
 	close_is_fenced_by_every_accepted_metadata_operation();
 	return 0;
 }

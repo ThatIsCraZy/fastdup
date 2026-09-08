@@ -80,3 +80,14 @@ it("never substitutes lifetime counters for a missing recent window",()=>{
  expect(screen.queryByText('75 %')).not.toBeInTheDocument();
  expect(screen.getByText('Für dieses Zeitfenster sind noch keine Messdaten verfügbar.')).toBeVisible();
 });
+
+it("shows cold-read admission evidence and leaves old samples explicitly unavailable",()=>{
+ const runtime = {...details.runtime!,reduction:{...details.runtime!.reduction,skippedColdCandidates:931,explorationReads:32,backendBaseReads:140,warmBaseReuses:710,successfulBaseTrials:411}};
+ const view=render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={true} loading={false}/></I18nProvider>);
+ fireEvent.click(screen.getByRole('tab',{name:'GC & Reduction'}));
+ expect(within(screen.getByText('Kalte Kandidaten übersprungen').parentElement!).getByText('931')).toBeVisible();
+ expect(within(screen.getByText('Backend-Leseversuche (Basen)').parentElement!).getByText('140')).toBeVisible();
+ expect(within(screen.getByText('Basen aus RAM wiederverwendet').parentElement!).getByText('710')).toBeVisible();
+ view.rerender(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details}} historical={true} loading={false}/></I18nProvider>);
+ expect(within(screen.getByText('Kalte Kandidaten übersprungen').parentElement!).getByText('—')).toBeVisible();
+});

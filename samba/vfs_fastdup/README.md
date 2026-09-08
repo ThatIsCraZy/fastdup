@@ -27,11 +27,13 @@ The adapter is disabled by default. A development share enables it explicitly:
     path = /path/to/fastdup-fuse-mount
     vfs objects = fastdup
     fastdup:enabled = yes
-    fastdup:clone alignment = 65536
+    fastdup:clone alignment = 4096
     fastdup:maximum clone bytes = 1073741824
 ```
 
-The alignment must be a power of two of at least 4 KiB. The maximum must be a
+The default alignment is 4 KiB, matching the FUSE/SMB volume geometry and
+allowing Veeam's 8 KiB clones. Explicit alignment overrides must be a power of
+two of at least 4 KiB. The maximum must be a
 nonzero alignment multiple and no larger than `0x7ffff000`, keeping every clone
 inside one Linux `copy_file_range` syscall.
 
@@ -68,3 +70,11 @@ filesystem-selected mechanism convention. NONE never disables native corruption
 checks. Enforcement-off requests remain rejected. See
 [ADR 0043](../../docs/adr/0043-expose-metadata-range-clones-for-veeam-fast-clone.md)
 for the policy's representation and persistence boundaries.
+
+Existing generated share configurations with `clone alignment = 65536` must be
+regenerated with the updated control agent and reconnected; changing only the
+module's default does not override an explicit share setting. Deploy the module
+and control configuration together. Historical CRC64-enabled inode attributes
+remain intact and are interpreted as native-integrity enabled under the current
+volume geometry, so they can clone into newly CRC32-labelled 4 KiB files.
+NONE/enabled mismatches and malformed attributes still fail before mutation.

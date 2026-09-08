@@ -30,6 +30,7 @@ pub use cache_budget::{
 };
 mod online_similarity;
 mod persistent_reduction;
+mod candidate_read_gate;
 mod prefix_context;
 mod read_cache;
 mod recovery_checkpoint;
@@ -2775,6 +2776,21 @@ impl<I: StorageIo> ContainerRepository<I> {
         logical_length: u32,
         cache: Option<&VerifiedReadCache>,
     ) -> Option<VerifiedChunkRead> {
+        self.find_verified_independent_base_read_gated(
+            index, chunk_id, logical_length, cache, &mut || true,
+        )
+    }
+
+    // The optional writer gate runs only after current Exact authority and a
+    // matching verified cache entry have been checked. Ordinary reads always allow.
+    fn find_verified_independent_base_read_gated<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u32,
+        cache: Option<&VerifiedReadCache>,
+        before_backend_read: &mut dyn FnMut() -> bool,
+    ) -> Option<VerifiedChunkRead> {
         let lookup = index.lookup_transitions(chunk_id, logical_length).ok()?;
         let mut seen_locations: [Option<ExactIndexLocation>; MAX_EXACT_LOOKUP_CANDIDATES] =
             [None; MAX_EXACT_LOOKUP_CANDIDATES];
@@ -2815,6 +2831,9 @@ impl<I: StorageIo> ContainerRepository<I> {
                 .filter(|payload| payload.matches_independent_candidate(candidate))
             {
                 return Some(VerifiedChunkRead::single(payload, Vec::new()));
+            }
+            if !before_backend_read() {
+                continue;
             }
             if let Ok(read) = self.read_verified_location_payload(candidate) {
                 if let Some(cache) = cache {
