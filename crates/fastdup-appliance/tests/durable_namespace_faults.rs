@@ -799,20 +799,22 @@ fn apply_sparse_splice(
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn every_metadata_clone_fault_recovers_the_previous_or_complete_range() {
-    assert_metadata_clone_faults(96 * 1_024);
+    assert_metadata_clone_faults(4_096, 64 * 1_024, 96 * 1_024);
 }
 
 #[test]
 fn every_partial_cluster_clone_fault_recovers_the_previous_or_complete_range() {
-    assert_metadata_clone_faults(7_168);
+    assert_metadata_clone_faults(4_096, 64 * 1_024, 7_168);
+}
+
+#[test]
+fn every_unaligned_clone_fault_recovers_the_previous_or_complete_range() {
+    assert_metadata_clone_faults(4_097, 65_539, 5_120);
 }
 
 #[allow(clippy::too_many_lines)]
-fn assert_metadata_clone_faults(clone_length: u64) {
-    const SOURCE_OFFSET: u64 = 4_096;
-    const TARGET_OFFSET: u64 = 64 * 1_024;
+fn assert_metadata_clone_faults(source_offset: u64, target_offset: u64, clone_length: u64) {
     let probe_metadata = MemoryStorageIo::new();
     let probe_containers = MemoryStorageIo::new();
     let probe = open(probe_metadata.clone(), probe_containers.clone());
@@ -824,8 +826,8 @@ fn assert_metadata_clone_faults(clone_length: u64) {
         source_handle,
         target_inode,
         target_handle,
-        SOURCE_OFFSET,
-        TARGET_OFFSET,
+        source_offset,
+        target_offset,
         clone_length,
     );
     let metadata_baseline = probe_metadata.operation_count();
@@ -861,8 +863,8 @@ fn assert_metadata_clone_faults(clone_length: u64) {
                 source_handle,
                 target_inode,
                 target_handle,
-                SOURCE_OFFSET,
-                TARGET_OFFSET,
+                source_offset,
+                target_offset,
                 clone_length,
             );
             assert!(
@@ -896,12 +898,12 @@ fn assert_metadata_clone_faults(clone_length: u64) {
                 &recovered,
                 target_inode,
                 handle,
-                TARGET_OFFSET,
+                target_offset,
                 u32::try_from(clone_length).expect("clone length fits u32"),
             );
             let expected = if fail_after && relative == final_sync {
-                payload[usize::try_from(SOURCE_OFFSET).expect("source offset fits")
-                    ..usize::try_from(SOURCE_OFFSET + clone_length).expect("source end fits")]
+                payload[usize::try_from(source_offset).expect("source offset fits")
+                    ..usize::try_from(source_offset + clone_length).expect("source end fits")]
                     .to_vec()
             } else {
                 vec![0; usize::try_from(clone_length).expect("clone length fits usize")]
@@ -926,9 +928,25 @@ fn veeam_partial_cluster_clones_are_metadata_only_and_recover_exact_offsets() {
     }
 }
 
+#[test]
+fn consecutive_veeam_clones_recover_exact_bytes_without_data_io() {
+    assert_veeam_clone_sequence(&[
+        (1_617_920, 1_609_728, 7_168),
+        (1_625_088, 1_616_896, 5_120),
+        (1_630_208, 1_622_016, 1),
+        (1_630_209, 1_622_017, 8_193),
+        (1_638_402, 1_630_210, 65_536),
+        // Different byte residues and a range ending exactly at both EOFs.
+        (1_700_003, 1_800_007, 5_120),
+        (2 * 1024 * 1024 - 5_120, 2 * 1024 * 1024 - 5_120, 5_120),
+    ]);
+}
+
 fn assert_veeam_clone_recovers_exact_offsets(length: u64) {
-    const SOURCE_OFFSET: u64 = 1_617_920;
-    const TARGET_OFFSET: u64 = 1_609_728;
+    assert_veeam_clone_sequence(&[(1_617_920, 1_609_728, length)]);
+}
+
+fn assert_veeam_clone_sequence(ranges: &[(u64, u64, u64)]) {
     let metadata = MemoryStorageIo::new();
     let containers = MemoryStorageIo::new();
     let appliance = open(metadata.clone(), containers.clone());
@@ -962,16 +980,23 @@ fn assert_veeam_clone_recovers_exact_offsets(length: u64) {
         .unwrap();
     appliance.checkpoint().unwrap().unwrap();
     let before = containers.operation_count();
-    clone_fixture(
-        &appliance,
-        source_inode,
-        source_handle,
-        target_inode,
-        target_handle,
-        SOURCE_OFFSET,
-        TARGET_OFFSET,
-        length,
-    );
+    let mut expected = vec![0; payload.len()];
+    for &(source_offset, target_offset, length) in ranges {
+        clone_fixture(
+            &appliance,
+            source_inode,
+            source_handle,
+            target_inode,
+            target_handle,
+            source_offset,
+            target_offset,
+            length,
+        );
+        let source = usize::try_from(source_offset).unwrap();
+        let target = usize::try_from(target_offset).unwrap();
+        let length = usize::try_from(length).unwrap();
+        expected[target..target + length].copy_from_slice(&payload[source..source + length]);
+    }
     appliance.checkpoint().unwrap().unwrap();
     assert_eq!(
         containers.operation_count(),
@@ -1001,20 +1026,19 @@ fn assert_veeam_clone_recovers_exact_offsets(length: u64) {
     else {
         panic!("open clone target");
     };
-    let mut expected = vec![0];
-    expected
-        .extend_from_slice(&payload[1_617_920..usize::try_from(SOURCE_OFFSET + length).unwrap()]);
-    expected.push(0);
-    assert_eq!(
-        read_range(
-            &recovered,
-            target_inode,
-            handle,
-            TARGET_OFFSET - 1,
-            u32::try_from(length + 2).unwrap()
-        ),
-        expected
-    );
+    for (index, expected) in expected.chunks(65_536).enumerate() {
+        assert_eq!(
+            read_range(
+                &recovered,
+                target_inode,
+                handle,
+                u64::try_from(index * 65_536).unwrap(),
+                u32::try_from(expected.len()).unwrap()
+            ),
+            expected,
+            "recovered target block {index}"
+        );
+    }
 }
 
 #[derive(Clone, Copy)]

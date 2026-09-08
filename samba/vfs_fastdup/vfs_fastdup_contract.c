@@ -154,12 +154,8 @@ enum fastdup_contract_status fastdup_validate_clone_v1(
 	if (request->length > request->maximum_length) {
 		return FASTDUP_CONTRACT_CLONE_TOO_LARGE;
 	}
-	/* Veeam sends partial-cluster lengths (e.g. 7168). RangeClone is
-	 * byte-exact: retain aligned starts, but never round the requested end. */
-	if ((request->source_offset & (request->alignment - 1)) != 0 ||
-	    (request->target_offset & (request->alignment - 1)) != 0) {
-		return FASTDUP_CONTRACT_MISALIGNED;
-	}
+	/* Volume geometry is not a Manifest-slice constraint. Veeam continues
+	 * partial-cluster clones at byte offsets; preserve both exact ranges. */
 	if (request->source_offset > UINT64_MAX - request->length ||
 	    request->target_offset > UINT64_MAX - request->length) {
 		return FASTDUP_CONTRACT_INVALID_PARAMETER;

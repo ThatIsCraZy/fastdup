@@ -10,7 +10,7 @@ The module:
 - maps `FSCTL_DUPLICATE_EXTENTS_TO_FILE` to exactly one `copy_file_range` call
   on fastdup FUSE descriptors;
 - persists SMB Integrity Information policy as ordinary inode metadata;
-- rejects unsupported, offset-misaligned, oversized, overlapping, out-of-bounds, or
+- rejects unsupported, oversized, overlapping, out-of-bounds, or
   short clones without falling back to a buffered data copy; and
 - fences CLOSE behind all previously accepted operations on that Samba handle.
 
@@ -31,13 +31,14 @@ The adapter is disabled by default. A development share enables it explicitly:
     fastdup:maximum clone bytes = 1073741824
 ```
 
-The default source/target offset alignment is 4 KiB, matching the FUSE/SMB
-volume geometry. Lengths are byte-exact, including Veeam's 7168-byte partial
-cluster request; they are never rounded up. This is a compatibility extension
-to the strict Windows cluster-length rule, backed by native Manifest slices. Explicit alignment overrides must be a power of
-two of at least 4 KiB. The maximum must be a
-nonzero alignment multiple and no larger than `0x7ffff000`, keeping every clone
-inside one Linux `copy_file_range` syscall.
+Clone offsets and lengths are byte-exact, including consecutive Veeam requests
+that start inside a cluster. No range is rounded or copied through a buffered
+fallback. This extends the strict Windows cluster-boundary rule using native
+Manifest slices. The legacy `clone alignment` configuration key describes
+reported volume/Integrity geometry only; it no longer restricts byte ranges.
+It defaults to 4 KiB and must remain a power of two of at least 4 KiB. The
+configured maximum remains a nonzero geometry multiple no larger than
+`0x7ffff000`, keeping every clone inside one Linux `copy_file_range` syscall.
 
 ## Tests and Samba build
 
@@ -80,3 +81,10 @@ and control configuration together. Historical CRC64-enabled inode attributes
 remain intact and are interpreted as native-integrity enabled under the current
 volume geometry, so they can clone into newly CRC32-labelled 4 KiB files.
 NONE/enabled mismatches and malformed attributes still fail before mutation.
+
+`tests/clone_ranges_smb.py` replays consecutive partial-cluster operations through
+SMB 3.1.1. Supply `SMB_TEST_SERVER`, `SMB_TEST_SHARE`, `SMB_TEST_USER`,
+`SMB_TEST_PASSWORD` (or `SMB_TEST_NT_HASH`) and `SMB_TEST_SOURCE`. The source
+must be a stable file of at least 2 MiB and is opened read-only. The test owns
+and removes one unique destination, compares all its bytes, and checks
+flush/reopen persistence. Run only on a disposable test share.

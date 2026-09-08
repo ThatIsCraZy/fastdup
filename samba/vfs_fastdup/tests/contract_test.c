@@ -135,7 +135,7 @@ static void duplicate_extents_is_one_bounded_presized_operation(void)
 
 	request.source_offset++;
 	assert(fastdup_validate_clone_v1(&request) ==
-	       FASTDUP_CONTRACT_MISALIGNED);
+	       FASTDUP_CONTRACT_OK);
 	request.source_offset--;
 
 	request.length = request.maximum_length + request.alignment;
@@ -177,6 +177,31 @@ static void duplicate_extents_is_one_bounded_presized_operation(void)
 }
 
 /* Veeam also sends a partial final cluster inside a larger source file. */
+static void veeam_consecutive_byte_ranges_are_admitted(void)
+{
+	struct fastdup_clone_request request = {
+		.source_size = 19907710976ULL, .target_size = 4194304,
+		.source_offset = 1625088, .target_offset = 1616896,
+		.length = 5120, .alignment = FASTDUP_CLONE_ALIGNMENT_V1,
+		.maximum_length = 1073741824, .same_file = false,
+	};
+	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_OK);
+	/* Every starting byte residue, independently on both sides; exact EOF. */
+	for (uint64_t residue = 0; residue < 4096; residue++) {
+		request.source_offset = 1617920 + residue;
+		request.target_offset = 1609728 + (residue * 17 % 4096);
+		request.length = residue + 1;
+		request.source_size = request.source_offset + request.length;
+		request.target_size = request.target_offset + request.length;
+		assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_OK);
+		request.source_size--;
+		assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_SOURCE_OUT_OF_BOUNDS);
+		request.source_size++;
+		request.target_size--;
+		assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_TARGET_NOT_PRESIZED);
+	}
+}
+
 static void veeam_partial_cluster_lengths_preserve_exact_bounds(void)
 {
 	struct fastdup_clone_request request = {
@@ -208,7 +233,7 @@ static void veeam_partial_cluster_lengths_preserve_exact_bounds(void)
 	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_INVALID_PARAMETER);
 	request.source_offset = 1617920;
 	request.target_offset++;
-	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_MISALIGNED);
+	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_OK);
 	request.target_offset = request.source_offset + 4096;
 	request.same_file = true;
 	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_OVERLAP);
@@ -228,10 +253,10 @@ static void veeam_8192_byte_clone_and_legacy_integrity_are_compatible(void)
 	size_t length;
 	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_OK);
 	request.alignment = 65536;
-	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_MISALIGNED);
+	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_OK);
 	request.alignment = FASTDUP_CLONE_ALIGNMENT_V1;
 	request.target_offset++;
-	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_MISALIGNED);
+	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_OK);
 	request.target_offset--;
 	request.target_size = request.target_offset + request.length - 1;
 	assert(fastdup_validate_clone_v1(&request) == FASTDUP_CONTRACT_TARGET_NOT_PRESIZED);
@@ -286,6 +311,7 @@ int main(void)
 	duplicate_extents_is_one_bounded_presized_operation();
 	veeam_8192_byte_clone_and_legacy_integrity_are_compatible();
 	veeam_partial_cluster_lengths_preserve_exact_bounds();
+	veeam_consecutive_byte_ranges_are_admitted();
 	close_is_fenced_by_every_accepted_metadata_operation();
 	return 0;
 }

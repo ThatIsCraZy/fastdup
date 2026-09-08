@@ -175,3 +175,27 @@ through clone/checkpoint, and crash recovery. Fault injection covers both the
 prior aligned range and a 7,168-byte range at every metadata checkpoint operation;
 recovery must expose the complete old or new range. Existing Manifest reader
 and offline-scrub DATA_SLICE validation remains unchanged.
+
+## Consecutive byte-granular ranges (9 September 2026)
+
+The following request starts exactly where the previous 7,168-byte request
+ends: source 1,625,088, target 1,616,896, length 5,120. Retaining cluster-aligned
+starts while accepting partial-cluster lengths prevents consecutive clones.
+The earlier aligned-start condition is therefore superseded: admit arbitrary
+byte offsets and positive byte lengths, within all existing bounds and policy
+checks. The legacy `clone alignment` setting retains its reported volume and
+Integrity geometry meaning but imposes no alignment on Manifest slices.
+
+This deliberately extends the strict Windows offset rule as well as its length
+rule; it does not claim that Windows itself accepts these requests. There is
+no rounding, buffered copy, new DATA allocation or format change. The adapter
+still issues exactly one native CloneRange operation with the requested offsets
+and length. EOF/pre-sizing, overlap, overflow, integrity, permission and capacity
+admission remain enforced independently of geometry.
+
+Regressions must compose operations: test successive 7,168/5,120/1/8,193/65,536
+byte clones into one destination, differing source/target byte residues and
+exact EOF endings. Compare the entire target, including untouched bytes, after
+checkpoint and crash recovery. Add unaligned-offset fault injection and a real
+SMB sequence test. A single isolated failing request does not cover continuation
+at the end of a previously accepted partial-cluster operation.

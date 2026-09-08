@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.7.1
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,9 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Wed Sep 09 2026 fastdup contributors - 0.7.1-3
+- Accept consecutive byte-granular Veeam clones without cluster alignment limits
+
 * Wed Sep 09 2026 fastdup contributors - 0.7.1-2
 - Clone exact partial-cluster lengths from Veeam without DATA I/O or rounding
 

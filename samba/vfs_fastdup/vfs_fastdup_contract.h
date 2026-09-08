@@ -30,7 +30,7 @@ struct fastdup_clone_request {
 	uint64_t source_offset;
 	uint64_t target_offset;
 	uint64_t length;
-	uint64_t alignment;
+	uint64_t alignment; /* Legacy volume geometry; not a byte-range restriction. */
 	uint64_t maximum_length;
 	bool same_file;
 };
