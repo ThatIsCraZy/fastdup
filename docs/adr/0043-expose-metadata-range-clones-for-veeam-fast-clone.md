@@ -126,7 +126,7 @@ The previous generated Samba configuration and VFS default required 64 KiB
 alignment although the FUSE volume uses 4 KiB geometry. Veeam's reported clone
 (source 1,617,920, target 1,609,728, length 8,192) is valid at 4 KiB and was
 rejected locally with `STATUS_INVALID_PARAMETER` before `copy_file_range`.
-The generated profile and VFS default now both use 4 KiB. Unaligned requests,
+The generated profile and VFS default now both use 4 KiB. Unaligned starting offsets,
 EOF bounds, pre-sizing, non-overlap and the one-syscall cap remain enforced.
 
 Existing `0200` and `0100` xattrs both mean native integrity enabled; neither
@@ -147,3 +147,31 @@ for a complete Veeam synthetic-full qualification.
 
 Protocol references: [Block cloning restrictions](https://learn.microsoft.com/en-us/windows/win32/fileio/block-cloning),
 [Integrity information fields](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/72640484-66fb-4b8f-aec6-6ab56d63831b).
+
+## Byte-exact partial-cluster lengths (9 September 2026)
+
+The next real Veeam request used the same aligned source/target offsets but a
+7,168-byte length inside a 19,907,710,976-byte source. It is not a source-EOF
+exception. Requiring length to be a cluster multiple rejected it before FUSE.
+
+Accept any positive byte length within the existing per-request cap while
+retaining aligned starting offsets. Pass the exact length through the single
+`copy_file_range` call. Never round up, zero-pad, or split into a clone and a
+buffered tail: that could overwrite adjacent target bytes, change file size,
+introduce DATA I/O, or weaken atomicity. DATA_SLICE already represents this
+range without a format change. EOF, pre-sizing, permissions, integrity policy,
+overlap, capacity and overflow checks remain mandatory.
+
+This is an intentional compatibility extension: the strict
+[MS-FSA Duplicate Extents contract](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4623bf0a-ab5f-4ab6-9c03-b8372c7aa06b)
+requires cluster-multiple lengths. Do not describe partial-cluster acceptance
+as a Windows guarantee or change reported volume/checksum geometry to conceal
+it. Our backing storage can safely preserve exact ranges through Manifest
+slices, so rejecting the observed Veeam request has no storage-safety benefit.
+
+Regression coverage includes the exact reported SMB request, exhaustive small
+length/boundary admission, unchanged neighboring bytes, zero DATA operations
+through clone/checkpoint, and crash recovery. Fault injection covers both the
+prior aligned range and a 7,168-byte range at every metadata checkpoint operation;
+recovery must expose the complete old or new range. Existing Manifest reader
+and offline-scrub DATA_SLICE validation remains unchanged.

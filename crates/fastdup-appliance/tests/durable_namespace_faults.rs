@@ -801,9 +801,18 @@ fn apply_sparse_splice(
 #[test]
 #[allow(clippy::too_many_lines)]
 fn every_metadata_clone_fault_recovers_the_previous_or_complete_range() {
+    assert_metadata_clone_faults(96 * 1_024);
+}
+
+#[test]
+fn every_partial_cluster_clone_fault_recovers_the_previous_or_complete_range() {
+    assert_metadata_clone_faults(7_168);
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_metadata_clone_faults(clone_length: u64) {
     const SOURCE_OFFSET: u64 = 4_096;
     const TARGET_OFFSET: u64 = 64 * 1_024;
-    const CLONE_LENGTH: u64 = 96 * 1_024;
     let probe_metadata = MemoryStorageIo::new();
     let probe_containers = MemoryStorageIo::new();
     let probe = open(probe_metadata.clone(), probe_containers.clone());
@@ -817,7 +826,7 @@ fn every_metadata_clone_fault_recovers_the_previous_or_complete_range() {
         target_handle,
         SOURCE_OFFSET,
         TARGET_OFFSET,
-        CLONE_LENGTH,
+        clone_length,
     );
     let metadata_baseline = probe_metadata.operation_count();
     let container_baseline = probe_containers.operation_count();
@@ -854,7 +863,7 @@ fn every_metadata_clone_fault_recovers_the_previous_or_complete_range() {
                 target_handle,
                 SOURCE_OFFSET,
                 TARGET_OFFSET,
-                CLONE_LENGTH,
+                clone_length,
             );
             assert!(
                 appliance.checkpoint().is_err(),
@@ -888,14 +897,14 @@ fn every_metadata_clone_fault_recovers_the_previous_or_complete_range() {
                 target_inode,
                 handle,
                 TARGET_OFFSET,
-                u32::try_from(CLONE_LENGTH).expect("clone length fits u32"),
+                u32::try_from(clone_length).expect("clone length fits u32"),
             );
             let expected = if fail_after && relative == final_sync {
                 payload[usize::try_from(SOURCE_OFFSET).expect("source offset fits")
-                    ..usize::try_from(SOURCE_OFFSET + CLONE_LENGTH).expect("source end fits")]
+                    ..usize::try_from(SOURCE_OFFSET + clone_length).expect("source end fits")]
                     .to_vec()
             } else {
-                vec![0; usize::try_from(CLONE_LENGTH).expect("clone length fits usize")]
+                vec![0; usize::try_from(clone_length).expect("clone length fits usize")]
             };
             assert_eq!(
                 observed, expected,
@@ -907,9 +916,19 @@ fn every_metadata_clone_fault_recovers_the_previous_or_complete_range() {
 
 #[test]
 fn veeam_8192_byte_clone_is_metadata_only_and_recovers_exact_offsets() {
+    assert_veeam_clone_recovers_exact_offsets(8_192);
+}
+
+#[test]
+fn veeam_partial_cluster_clones_are_metadata_only_and_recover_exact_offsets() {
+    for length in [1, 1_024, 4_095, 4_096, 7_168, 8_193, 65_536] {
+        assert_veeam_clone_recovers_exact_offsets(length);
+    }
+}
+
+fn assert_veeam_clone_recovers_exact_offsets(length: u64) {
     const SOURCE_OFFSET: u64 = 1_617_920;
     const TARGET_OFFSET: u64 = 1_609_728;
-    const LENGTH: u64 = 8_192;
     let metadata = MemoryStorageIo::new();
     let containers = MemoryStorageIo::new();
     let appliance = open(metadata.clone(), containers.clone());
@@ -951,7 +970,7 @@ fn veeam_8192_byte_clone_is_metadata_only_and_recovers_exact_offsets() {
         target_handle,
         SOURCE_OFFSET,
         TARGET_OFFSET,
-        LENGTH,
+        length,
     );
     appliance.checkpoint().unwrap().unwrap();
     assert_eq!(
@@ -983,10 +1002,17 @@ fn veeam_8192_byte_clone_is_metadata_only_and_recovers_exact_offsets() {
         panic!("open clone target");
     };
     let mut expected = vec![0];
-    expected.extend_from_slice(&payload[1_617_920..1_626_112]);
+    expected
+        .extend_from_slice(&payload[1_617_920..usize::try_from(SOURCE_OFFSET + length).unwrap()]);
     expected.push(0);
     assert_eq!(
-        read_range(&recovered, target_inode, handle, TARGET_OFFSET - 1, 8194),
+        read_range(
+            &recovered,
+            target_inode,
+            handle,
+            TARGET_OFFSET - 1,
+            u32::try_from(length + 2).unwrap()
+        ),
         expected
     );
 }

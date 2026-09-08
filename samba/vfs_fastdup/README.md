@@ -10,7 +10,7 @@ The module:
 - maps `FSCTL_DUPLICATE_EXTENTS_TO_FILE` to exactly one `copy_file_range` call
   on fastdup FUSE descriptors;
 - persists SMB Integrity Information policy as ordinary inode metadata;
-- rejects unsupported, misaligned, oversized, overlapping, out-of-bounds, or
+- rejects unsupported, offset-misaligned, oversized, overlapping, out-of-bounds, or
   short clones without falling back to a buffered data copy; and
 - fences CLOSE behind all previously accepted operations on that Samba handle.
 
@@ -31,8 +31,10 @@ The adapter is disabled by default. A development share enables it explicitly:
     fastdup:maximum clone bytes = 1073741824
 ```
 
-The default alignment is 4 KiB, matching the FUSE/SMB volume geometry and
-allowing Veeam's 8 KiB clones. Explicit alignment overrides must be a power of
+The default source/target offset alignment is 4 KiB, matching the FUSE/SMB
+volume geometry. Lengths are byte-exact, including Veeam's 7168-byte partial
+cluster request; they are never rounded up. This is a compatibility extension
+to the strict Windows cluster-length rule, backed by native Manifest slices. Explicit alignment overrides must be a power of
 two of at least 4 KiB. The maximum must be a
 nonzero alignment multiple and no larger than `0x7ffff000`, keeping every clone
 inside one Linux `copy_file_range` syscall.
