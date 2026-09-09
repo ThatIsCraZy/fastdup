@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.1/fastdup-0.7.1-1.el10.x86_64.rpm">Download the RPM</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.2/fastdup-0.7.2-1.el10.x86_64.rpm">Download the RPM</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Product page</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.1">Release notes</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.2">Release notes</a>
 </p>
 
 fastdup is an experimental, software-defined single-node storage appliance for
@@ -30,7 +30,7 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
 
-## Next package · clone performance and occupancy reporting
+## New in v0.7.2 · 9 September 2026
 
 - Verified Manifest nodes share the adaptive RAM budget and avoid repeated
   metadata reads, CRC checks and decoding during clones and range reads.
@@ -46,8 +46,8 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
   checkpoint tabs expose detailed counters. Historical metrics and disks use
   the selected sample; missing observations stay unavailable.
 
-These changes are source updates; the published package links below still refer
-to v0.7.1. [Validation](docs/testing/clone-optimization-2026-09-09.md).
+[Release notes v0.7.2](docs/releases/v0.7.2.md) · RPM version **0.7.2-1**.
+[Validation](docs/testing/clone-optimization-2026-09-09.md).
 
 ## New in v0.7.1 · 9 September 2026
 
@@ -190,11 +190,11 @@ You need:
 Download and install the current binary package:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.1/fastdup-0.7.1-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.1/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.2/fastdup-0.7.2-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.2/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.7.1-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.7.2-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

@@ -1,8 +1,8 @@
 %global debug_package %{nil}
 
 Name:           fastdup
-Version:        0.7.1
-Release:        3%{?dist}
+Version:        0.7.2
+Release:        1%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,11 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Wed Sep 09 2026 fastdup contributors - 0.7.2-1
+- Cache verified Manifest nodes and dispatch independent Samba clones asynchronously
+- Include exact byte-granular Veeam clone continuation fixes
+- Correct physical reduction and reorganize cache/read-avoidance telemetry
+
 * Wed Sep 09 2026 fastdup contributors - 0.7.1-3
 - Accept consecutive byte-granular Veeam clones without cluster alignment limits
 
