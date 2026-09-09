@@ -49,6 +49,18 @@ describe("FastDup Control Plane UI", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /UI-Einstellungen|UI settings/ }));
   }
 
+  it("zeigt die Reduktionsbasis und fehlende Belegung ohne erfundenen Faktor", async () => {
+    const original = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => String(input).endsWith("/snapshot")
+      ? Promise.resolve(new Response(JSON.stringify({...previewSnapshot, telemetry: {...previewSnapshot.telemetry, reductionRatio: null}})))
+      : original(input, init)));
+    render(<App />);
+    await screen.findByText("Exact Dedup · seit Mount");
+    expect(screen.getByText("Gesamtreduktion nicht verfügbar")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", {name:"Telemetrie"}));
+    expect(screen.getByText("Gesamtreduktion · DATA + Metadata")).toBeVisible();
+  });
+
   it("speichert die UI-Sprache per Session und lädt sie nach erneutem Öffnen", async () => {
     let language = "de";
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -237,6 +249,29 @@ describe("FastDup Control Plane UI", () => {
       ),
     );
     expect(screen.getByText("Zeitraum · 24 h")).toBeVisible();
+  });
+
+  it("zeigt historische Kennzahlen und Laufwerke ohne aktuelle Werte beizumischen", async () => {
+    const original = globalThis.fetch;
+    const past = {...previewSnapshot.telemetry, observedAt:"2026-09-08T12:00:00Z", frontendReadMbps:12.3, frontendWriteMbps:45.6, reductionRatio:8.22, disks:[{...previewSnapshot.telemetry.disks[0],model:"Historisches Laufwerk"}]};
+    let resolveHistory: (response: Response) => void = () => {};
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => String(input).includes("/telemetry/history?")
+      ? new Promise<Response>(resolve => {resolveHistory=resolve;}) : original(input, init)));
+    const {container}=render(<App />);
+    await screen.findByText("Exact Dedup · seit Mount");
+    fireEvent.click(screen.getByRole("button", {name:"Telemetrie"}));
+    expect(screen.getByRole("tab", {name:"Caches"})).toHaveAttribute("aria-selected","true");
+    fireEvent.click(screen.getByRole("button", {name:"24 h"}));
+    expect(container.querySelector(".telemetry-metrics")).not.toHaveTextContent("842,6");
+    await act(async () => {resolveHistory(new Response(JSON.stringify([past])));});
+    expect(container.querySelector(".telemetry-metrics")).toHaveTextContent("12,3 MB/s");
+    expect(container.querySelector(".telemetry-metrics")).toHaveTextContent("8,22×");
+    expect(screen.getByText("Historisches Laufwerk")).toBeVisible();
+    expect(screen.queryByText("Micron 7450 MAX")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", {name:"7 d"}));
+    await act(async () => {resolveHistory(new Response("[]"));});
+    expect(container.querySelector(".telemetry-metrics")).not.toHaveTextContent("12,3");
+    expect(screen.queryByText("Historisches Laufwerk")).not.toBeInTheDocument();
   });
 
   it("exportiert den Audit-Verlauf und bestätigt den Download", async () => {
@@ -587,8 +622,8 @@ describe("FastDup Control Plane UI", () => {
     render(<App />);
     await screen.findByRole("button", { name: /admin administrator/i });
     fireEvent.click(screen.getByRole("button", { name: /laufwerke/i }));
+    expect(await screen.findByRole("heading", { name: "Laufwerke & Belegung" })).toBeVisible();
     expect(screen.queryByRole("button", { name: /neues repository initialisieren/i })).not.toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Laufwerke & Belegung" })).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: /^repository$/i }));
     expect(screen.getAllByRole("button", { name: /offline-scrub/i })[0]).toBeEnabled();

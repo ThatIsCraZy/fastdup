@@ -30,6 +30,25 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
 
+## Next package · clone performance and occupancy reporting
+
+- Verified Manifest nodes share the adaptive RAM budget and avoid repeated
+  metadata reads, CRC checks and decoding during clones and range reads.
+- Samba dispatches independent file clones asynchronously with bounded workers,
+  ordered conflicting clones and source/target CLOSE fences.
+- Physical total reduction uses **current logical allocation / occupied DATA +
+  Metadata bytes**. Exact Dedup remains an explicitly labeled since-mount hit rate.
+  Unavailable occupancy has no invented ratio; historical samples are corrected
+  from their recorded storage measurements.
+
+- Telemetry opens on cache effectiveness, including Manifest Nodes and a
+  five-minute/lifetime switch. Separate read-avoidance, GC/scrub, latency, I/O and
+  checkpoint tabs expose detailed counters. Historical metrics and disks use
+  the selected sample; missing observations stay unavailable.
+
+These changes are source updates; the published package links below still refer
+to v0.7.1. [Validation](docs/testing/clone-optimization-2026-09-09.md).
+
 ## New in v0.7.1 · 9 September 2026
 
 - Fix Veeam 8 KiB block clones with consistent 4 KiB SMB alignment and

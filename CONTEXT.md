@@ -320,6 +320,18 @@ A decoded chunk or region admitted to a shared read cache only after its complet
 stored encoding and logical content identity were verified.
 _Avoid_: Kernel-dirty page, cache location
 
+**Verified Manifest node cache**:
+Reusable, already verified immutable Manifest nodes. A cache hit can avoid
+another Metadata read and validation, but cannot establish reachability or
+replace a live Manifest root pin.
+_Avoid_: Metadata authority, recovery checkpoint, DATA cache
+
+**Physical total reduction**:
+Current allocated logical file bytes divided by occupied storage across both
+the Metadata and Data Pools. Includes filesystem overhead and storage awaiting
+reclamation; excludes Sparse Holes from the logical numerator.
+_Avoid_: Exact hit rate, processed bytes per newly written byte
+
 **Verified read plan**:
 A bounded demand-read plan that maps logical Manifest extents to verified
 physical Locations, shares one Encoding Record read and decode across its

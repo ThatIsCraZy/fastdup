@@ -88,6 +88,7 @@ pub struct GenerationRepository<I> {
     storage: I,
     supported_policy: PolicySetId,
     commit_lock: Arc<Mutex<()>>,
+    manifest_cache: Arc<crate::manifest_cache::ManifestNodeCache>,
     metadata_root_pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
     metadata_root_pin_handles: Arc<Mutex<Vec<Weak<MetadataRootPinInner>>>>,
     recovery_checkpoint_root_pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
@@ -322,6 +323,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             storage,
             supported_policy,
             commit_lock: Arc::new(Mutex::new(())),
+            manifest_cache: Arc::new(crate::manifest_cache::ManifestNodeCache::system()),
             metadata_root_pins: Arc::new(Mutex::new(BTreeMap::new())),
             metadata_root_pin_handles: Arc::new(Mutex::new(Vec::new())),
             recovery_checkpoint_root_pins: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3613,6 +3615,7 @@ where
                 generations.storage.clone(),
                 containers.clone(),
                 generations.pin_metadata_root(summary.root()),
+                Arc::clone(&generations.manifest_cache),
             ),
         });
     }

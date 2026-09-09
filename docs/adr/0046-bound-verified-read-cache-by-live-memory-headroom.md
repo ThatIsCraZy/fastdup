@@ -177,6 +177,40 @@ useful filter should remove substantially more Exact-page misses than its
 immutable RAM footprint; this remains a benchmark gate rather than a
 correctness assumption.
 
+## Verified Manifest nodes (9 September 2026)
+
+A repository-local decoded Manifest-node cache joins the shared broker as
+`manifestNodes`, with Metadata fallback priority. It has no fixed preferred RAM
+allocation. Its lazy sharded lookup storage, decoded nodes and replacement
+metadata are charged against the same leases and 92% operating ceiling. Normal
+hits touch one local shard; admission and pressure changes serialize separately.
+Concurrent misses perform verification without holding cache locks and converge
+to one charged entry. Eviction releases ownership and map/FIFO capacity before
+returning budget. Outstanding immutable Arc views remain working memory.
+
+Only installed Manifest readers use this cache. Each Generation Repository owns
+one distinct instance; clones share it and another repository/open gets a new
+instance. Admission verifies the expected Metadata Object ID, envelope CRC and
+complete node structure. Cache hits reuse that immutable decoded value while the
+reader retains its existing Metadata Root Pin. Every traversal still checks the
+parent's level, length and allocated-byte summaries. A cached node never pins a
+root, proves reachability, or authorizes DATA deletion or publication by itself.
+Recovery, writer/successor validation, GC and offline scrub retain independent
+storage verification and never consult this cache. Newly serialized target
+metadata still receives its own CRC and content identity.
+
+Clone preparation obtains its extents and tests for HOLEs in one verified range
+walk; a preliminary allocation walk would only repeat the same work. DATA and
+DATA_SLICE retain the original full Chunk identity without rereading or hashing
+payload merely to create a reference. The full-range partition, bounds and
+existing dependency proof requirements remain unchanged.
+
+Tests cover a tree with several leaves, repeated/adjacent range use, allocation
+queries, expected-root mismatch on a hit, invalid cold bytes, concurrent misses,
+isolation between cache instances, and owned views surviving a complete purge.
+The release-mode A/B runs the same tree traversal with admission disabled/enabled;
+see the [qualification record](../testing/clone-optimization-2026-09-09.md).
+
 ## XFS publication and io_uring
 
 ADR 0058 supersedes this section's worker-loop, verifier-pool, setup-fallback,

@@ -1,6 +1,6 @@
 use crate::manifest_tree::{
     ManifestRangeExtent, ManifestTreeError, ManifestTreeSummary,
-    allocated_bytes_in_manifest_tree_range, read_manifest_tree_range,
+    allocated_bytes_in_manifest_tree_range_decoded, read_manifest_tree_range_decoded,
 };
 use crate::{
     ActivatedExactIndex, ContainerRepository, ExactIndexEntry, ExactIndexGenerationPin,
@@ -166,6 +166,7 @@ struct TreeManifestRecipe<M> {
     summary: ManifestTreeSummary,
     metadata: M,
     _root_pin: MetadataRootPin,
+    cache: Arc<crate::manifest_cache::ManifestNodeCache>,
 }
 
 impl<M> fmt::Debug for TreeManifestRecipe<M> {
@@ -196,12 +197,12 @@ where
     }
 
     fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, ManifestReadError> {
-        allocated_bytes_in_manifest_tree_range(
+        allocated_bytes_in_manifest_tree_range_decoded(
             self.summary.root(),
             self.summary.logical_size(),
             offset,
             length,
-            |object_id| read_tree_metadata(&self.metadata, object_id),
+            |object_id| self.cache.read(object_id, || read_tree_metadata(&self.metadata, object_id)),
         )
         .map_err(Into::into)
     }
@@ -211,12 +212,12 @@ where
         offset: u64,
         length: u64,
     ) -> Result<Vec<ManifestRangeExtent>, ManifestReadError> {
-        read_manifest_tree_range(
+        read_manifest_tree_range_decoded(
             self.summary.root(),
             self.summary.logical_size(),
             offset,
             length,
-            |object_id| read_tree_metadata(&self.metadata, object_id),
+            |object_id| self.cache.read(object_id, || read_tree_metadata(&self.metadata, object_id)),
         )
         .map_err(Into::into)
     }
@@ -399,6 +400,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         metadata: M,
         containers: ContainerRepository<I>,
         root_pin: MetadataRootPin,
+        cache: Arc<crate::manifest_cache::ManifestNodeCache>,
     ) -> Self
     where
         M: Send + Sync + StorageIo + 'static,
@@ -408,6 +410,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
                 summary,
                 metadata,
                 _root_pin: root_pin,
+                cache,
             }),
             containers,
             indexed_reader: None,
@@ -1101,9 +1104,9 @@ fn read_tree_metadata<I: StorageIo>(
         return Err(ManifestTreeError::IdentityMismatch(object_id));
     }
     let bytes = storage.read(&name)?;
-    if u64::try_from(bytes.len()) != Ok(length)
-        || MetadataObjectId::from_encoded(&bytes)? != object_id
-    {
+    // The cache admission path verifies the content identity, CRC and node
+    // structure once before retaining the decoded immutable value.
+    if u64::try_from(bytes.len()) != Ok(length) {
         return Err(ManifestTreeError::IdentityMismatch(object_id));
     }
     Ok(bytes)

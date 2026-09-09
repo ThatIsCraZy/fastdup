@@ -469,9 +469,8 @@ where
         if length == 0 || end > self.logical_size {
             return Err(PosixError::InvalidArgument);
         }
-        if self.allocated_bytes_in_range(offset, length)? != length {
-            return Ok(None);
-        }
+        // The same verified range walk below detects HOLEs and validates the
+        // complete partition. A separate allocation traversal repeats metadata I/O.
         let located = self
             .file
             .manifest_extents_in_range(offset, length)

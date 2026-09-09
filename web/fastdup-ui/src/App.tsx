@@ -559,9 +559,9 @@ function Overview({
         />
         <MetricCard
           icon={Layers3}
-          label="Exact Dedup Rate"
+          label={t("Exact Dedup · seit Mount")}
           value={`${snapshot.dedupRate.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} %`}
-          detail={t("{ratio}× physische Gesamtreduktion", { ratio: snapshot.reductionRatio.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) })}
+          detail={snapshot.reductionRatio == null ? t("Gesamtreduktion nicht verfügbar") : t("{ratio}× Gesamtreduktion · DATA + Metadata", { ratio: snapshot.reductionRatio.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) })}
           tone="green"
         />
         <MetricCard
@@ -1478,21 +1478,14 @@ function TelemetryPage({
     "30 d": 30 * 24 * 60 * 60,
     "90 d": 90 * 24 * 60 * 60,
   };
-  const displayedSnapshot = useMemo(
-    () =>
-      history
-        ? {
-            ...snapshot,
-            series: history.map((sample) => ({
-              time: sample.observedAt,
-              read: sample.frontendReadMbps,
-              write: sample.frontendWriteMbps,
-            })),
-          }
-        : snapshot,
-    [history, snapshot],
-  );
-  const resourceSamples = history ?? liveResources;
+  const historical = range !== "Live";
+  const sample = historical ? history?.at(-1) : snapshot;
+  const displayedSnapshot = { ...snapshot, series: historical ? (history ?? []).map(item => ({time: item.observedAt, read: item.frontendReadMbps, write: item.frontendWriteMbps})) : snapshot.series };
+  const usage = sample?.storageUsage;
+  const physical = usage?.metadataUsedBytes != null && usage.dataUsedBytes != null ? usage.metadataUsedBytes + usage.dataUsedBytes : undefined;
+  const number = (value?: number | null, digits = 1) => value == null ? "—" : value.toLocaleString(locale, {minimumFractionDigits: digits, maximumFractionDigits: digits});
+  const rate = (value?: number) => value == null ? "—" : `${number(value)} MB/s`;
+  const resourceSamples = historical ? history ?? [] : liveResources;
   const historyRequest = useRef(0);
   const selectRange = (item: string) => {
     const request = ++historyRequest.current;
@@ -1502,6 +1495,7 @@ function TelemetryPage({
       setLoading(false);
       return;
     }
+    setHistory(null);
     setLoading(true);
     void loadHistory(rangeSeconds[item] ?? 900)
       .then(samples => { if (request === historyRequest.current) setHistory(samples); })
@@ -1514,7 +1508,7 @@ function TelemetryPage({
         <div>
           <span className="section-kicker">Observability</span>
           <h1>{t("Tiefentelemetrie")}</h1>
-          <p>{t("Synchronisierte Live-Daten aus POSIX-Rand, Host, Prozess und physischem Block-Layer.")}</p>
+          <p>{t("Durchsatz, Cache-Wirkung und Speicherbelegung. Details zeigen die Ursachen hinter den Messwerten.")}</p>
         </div>
         <div className="range-picker">
           {ranges.map((item) => (
@@ -1528,39 +1522,38 @@ function TelemetryPage({
           ))}
         </div>
       </div>
-      <section className="metric-grid telemetry-metrics">
+      <p className="telemetry-sample-note" role="status">{loading ? t("Lädt") : sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</p>
+      <section className="metric-grid telemetry-metrics" aria-busy={loading}>
         <MetricCard
           icon={Activity}
           label="Frontend Read"
-          value={`${snapshot.frontendReadMbps.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} MB/s`}
+          value={rate(sample?.frontendReadMbps)}
           detail={t("POSIX erfolgreich")}
         />
         <MetricCard
           icon={Activity}
           label="Frontend Write"
-          value={`${snapshot.frontendWriteMbps.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} MB/s`}
+          value={rate(sample?.frontendWriteMbps)}
           detail={t("POSIX erfolgreich")}
           tone="violet"
         />
         <MetricCard
           icon={CircleGauge}
-          label="Dedup Rate"
-          value={`${snapshot.dedupRate.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} %`}
+          label={t("Exact Dedup · seit Mount")}
+          value={sample ? `${number(sample.dedupRate)} %` : "—"}
           detail="exact / (exact + new)"
           tone="green"
         />
         <MetricCard
-          icon={Clock3}
-          label="Checkpoint"
-          value={
-            snapshot.lastCheckpointSeconds === undefined
-              ? "—"
-              : `${snapshot.lastCheckpointSeconds} s`
-          }
-          detail={t("Alter der aktiven Generation")}
+          icon={Layers3}
+          label={t("Gesamtreduktion · DATA + Metadata")}
+          value={sample?.reductionRatio == null ? "—" : `${number(sample.reductionRatio, 2)}×`}
+          detail={t("Logische / physische Belegung")}
           tone="amber"
         />
       </section>
+      <DetailTelemetryPanel sample={sample} historical={historical} loading={loading} initialTab={2} />
+      <div className="telemetry-section-title"><h2>{t("Verlauf & Speicherbelegung")}</h2><span>{range}</span></div>
       <Card className="telemetry-chart">
         <CardHeader>
           <div>
@@ -1590,8 +1583,8 @@ function TelemetryPage({
             </div>
           </CardHeader>
           <CardContent>
-            {history === null && resourceSamples.length < 2 && <p className="chart-note">{t("Live-Messwerte werden gesammelt…")}</p>}
-            {history?.length === 0 && <p className="chart-note">{t("Keine Messwerte im gewählten Zeitraum.")}</p>}
+            {!historical && resourceSamples.length < 2 && <p className="chart-note">{t("Live-Messwerte werden gesammelt…")}</p>}
+            {historical && !loading && resourceSamples.length === 0 && <p className="chart-note">{t("Keine Messwerte im gewählten Zeitraum.")}</p>}
             <ReactECharts option={resourceOption} style={{ height: 260 }} />
           </CardContent>
         </Card>
@@ -1602,37 +1595,21 @@ function TelemetryPage({
               <h2>{t("Dedup & physische Reduktion")}</h2>
             </div>
           </CardHeader>
-          <CardContent className="reduction-panel">
-            <div>
-              <span
-                style={
-                  {
-                    "--percent": `${snapshot.dedupRate * 3.6}deg`,
-                  } as React.CSSProperties
-                }
-              >
-                <strong>{snapshot.dedupRate.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%</strong>
-              </span>
-              <small>Exact Dedup</small>
-            </div>
-            <div>
-              <span
-                style={
-                  {
-                    "--percent": `${Math.min(100, snapshot.reductionRatio * 20) * 3.6}deg`,
-                  } as React.CSSProperties
-                }
-              >
-                <strong>{snapshot.reductionRatio.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}×</strong>
-              </span>
-              <small>{t("Gesamtreduktion")}</small>
-            </div>
-            <p>{t("FILL und Recipe-Reuse sind bewusst nicht in der Exact-Dedup-Rate enthalten.")}</p>
+          <CardContent className="telemetry-occupancy">
+            <dl className="telemetry-values">
+              <div><dt>{t("Logische Belegung")}</dt><dd>{usage?.logicalAllocatedBytes == null ? "—" : formatBytes(usage.logicalAllocatedBytes, locale)}</dd></div>
+              <div><dt>{t("Physische Belegung")}</dt><dd>{physical == null ? "—" : formatBytes(physical, locale)}</dd></div>
+              <div><dt>DATA</dt><dd>{usage?.dataUsedBytes == null ? "—" : formatBytes(usage.dataUsedBytes, locale)}</dd></div>
+              <div><dt>Metadata</dt><dd>{usage?.metadataUsedBytes == null ? "—" : formatBytes(usage.metadataUsedBytes, locale)}</dd></div>
+              <div><dt>{t("Checkpoint-Alter")}</dt><dd>{sample?.lastCheckpointSeconds == null ? "—" : `${number(sample.lastCheckpointSeconds, 0)} s`}</dd></div>
+              <div><dt>Generation</dt><dd>{number(sample?.commitGeneration, 0)}</dd></div>
+            </dl>
+            <p className="detail-note">{t("Exact Dedup zählt Treffer seit dem Mount, ohne FILL und Clone-Reuse. Gesamtreduktion = aktuelle logische Belegung / belegte Bytes auf DATA und Metadata, einschließlich Overhead und noch nicht freigegebenem Speicher.")}</p>
+            {usage?.logicalObservedAt != null && <p className="detail-note">{t("Logische Belegung erfasst")}: {new Date(usage.logicalObservedAt * 1000).toLocaleString(locale)}</p>}
           </CardContent>
         </Card>
       </div>
-      <DiskTelemetryTable disks={disks} />
-      <DetailTelemetryPanel sample={history === null ? snapshot : history.at(-1)} historical={history !== null} loading={loading} />
+      <DiskTelemetryTable disks={historical ? sample?.disks ?? [] : disks} />
     </>
   );
 }

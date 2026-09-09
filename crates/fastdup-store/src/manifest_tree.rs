@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::ops::Range;
+use std::sync::Arc;
 
 const LEAF_TARGET_LOGICAL_BYTES: u64 = 64 * 1_024 * 1_024;
 const MAX_LEAF_EXTENTS: usize = 1_024;
@@ -1443,12 +1444,27 @@ pub(crate) fn read_manifest_tree_range<F>(
 where
     F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
 {
+    read_manifest_tree_range_decoded(root, expected_logical_size, offset, length, |id| {
+        decode_manifest_node(id, &mut read).map(Arc::new)
+    })
+}
+
+pub(crate) fn read_manifest_tree_range_decoded<F>(
+    root: MetadataObjectId,
+    expected_logical_size: u64,
+    offset: u64,
+    length: u64,
+    mut read: F,
+) -> Result<Vec<ManifestRangeExtent>, ManifestTreeError>
+where
+    F: FnMut(MetadataObjectId) -> Result<Arc<DecodedManifestNode>, ManifestTreeError>,
+{
     if length == 0 || offset >= expected_logical_size {
         return Ok(Vec::new());
     }
     let end = offset.saturating_add(length).min(expected_logical_size);
     let mut extents = Vec::new();
-    let logical_size = walk_manifest_tree(
+    let logical_size = walk_decoded_manifest_tree(
         root,
         Some((offset, end)),
         Some(expected_logical_size),
@@ -1484,6 +1500,26 @@ pub(crate) fn allocated_bytes_in_manifest_tree_range<F>(
 where
     F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
 {
+    allocated_bytes_in_manifest_tree_range_decoded(
+        root,
+        expected_logical_size,
+        offset,
+        length,
+        |id| decode_manifest_node(id, &mut read).map(Arc::new),
+    )
+}
+
+#[allow(clippy::too_many_lines, reason = "paired authenticated traversal")]
+pub(crate) fn allocated_bytes_in_manifest_tree_range_decoded<F>(
+    root: MetadataObjectId,
+    expected_logical_size: u64,
+    offset: u64,
+    length: u64,
+    mut read: F,
+) -> Result<u64, ManifestTreeError>
+where
+    F: FnMut(MetadataObjectId) -> Result<Arc<DecodedManifestNode>, ManifestTreeError>,
+{
     if length == 0 || offset >= expected_logical_size {
         return Ok(0);
     }
@@ -1497,7 +1533,7 @@ where
     }];
     let mut allocated_bytes = 0_u64;
     while let Some(candidate) = pending.pop() {
-        match decode_manifest_node(candidate.object_id, &mut read)? {
+        match read(candidate.object_id)?.as_ref() {
             DecodedManifestNode::Leaf(leaf) => {
                 let leaf_allocated = manifest_allocated_bytes(leaf.extents())?;
                 if candidate.expected_level.is_some_and(|level| level != 0)
@@ -1590,7 +1626,7 @@ where
 }
 
 #[derive(Debug)]
-enum DecodedManifestNode {
+pub(crate) enum DecodedManifestNode {
     Leaf(ManifestLeaf),
     Inner(ManifestInnerNode),
 }
@@ -1609,10 +1645,30 @@ fn walk_manifest_tree<F, V>(
     requested: Option<(u64, u64)>,
     expected_root_length: Option<u64>,
     read: &mut F,
-    mut visit: V,
+    visit: V,
 ) -> Result<u64, ManifestTreeError>
 where
     F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    V: FnMut(u64, &ManifestExtent) -> Result<(), ManifestTreeError>,
+{
+    walk_decoded_manifest_tree(
+        root,
+        requested,
+        expected_root_length,
+        &mut |id| decode_manifest_node(id, read).map(Arc::new),
+        visit,
+    )
+}
+
+fn walk_decoded_manifest_tree<F, V>(
+    root: MetadataObjectId,
+    requested: Option<(u64, u64)>,
+    expected_root_length: Option<u64>,
+    read: &mut F,
+    mut visit: V,
+) -> Result<u64, ManifestTreeError>
+where
+    F: FnMut(MetadataObjectId) -> Result<Arc<DecodedManifestNode>, ManifestTreeError>,
     V: FnMut(u64, &ManifestExtent) -> Result<(), ManifestTreeError>,
 {
     let mut pending = vec![PendingNode {
@@ -1624,8 +1680,8 @@ where
     }];
     let mut root_length = None;
     while let Some(candidate) = pending.pop() {
-        let node = decode_manifest_node(candidate.object_id, read)?;
-        match node {
+        let node = read(candidate.object_id)?;
+        match node.as_ref() {
             DecodedManifestNode::Leaf(leaf) => {
                 let leaf_allocated_bytes = manifest_allocated_bytes(leaf.extents())?;
                 if candidate.expected_level.is_some_and(|level| level != 0)
@@ -1711,7 +1767,7 @@ where
     root_length.ok_or(ManifestTreeError::InvalidTree)
 }
 
-fn decode_manifest_node<F>(
+pub(crate) fn decode_manifest_node<F>(
     object_id: MetadataObjectId,
     read: &mut F,
 ) -> Result<DecodedManifestNode, ManifestTreeError>

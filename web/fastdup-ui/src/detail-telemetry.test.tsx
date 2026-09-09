@@ -7,13 +7,14 @@ vi.mock("echarts-for-react", () => ({ default: () => <div data-testid="phase-cha
 afterEach(cleanup);
 const operation = {operations:100,errors:2,p50Micros:500,p95Micros:2500,p99Micros:10000};
 const details: DetailTelemetry = {latency:{read:operation,write:{...operation,operations:0,errors:0}},runtime:{runtimeId:"test",ioUring:{ringEntries:64,inflightBytes:1000000,maxInflightBytes:8000000,peakInflightBytes:4000000,submitted:18,completed:16},caches:[{id:"verifiedRead",hits:75,misses:25,evictions:3,residentBytes:1024},{id:"exactIndex",hits:0,misses:0,evictions:0,residentPages:0}],reduction:{enabled:true,queries:7,candidates:4,acceptedPrefixes:2,acceptedSparseXor:1,savedPayloadBytes:5000,fallbacks:4,errors:0},gc:{state:"collected",observedAt:100,totalMs:12,unlinkedBytes:8000},checkpoint:{completedAt:100,generation:8,totalMs:10,phases:[{id:"freeze",wallMs:2,cpuMs:1}]}}};
-it("renders real counters, distinguishes no samples, and switches all five detail views", () => {
+it("renders real counters, distinguishes no samples, and switches all six detail views", () => {
  render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details}} historical={false} loading={false}/></I18nProvider>);
  expect(screen.getByText('0,5 ms')).toBeVisible();
  const write = screen.getByRole('row',{name:/Write/});expect(within(write).getAllByText('—')).toHaveLength(3);
  fireEvent.click(screen.getByRole('tab',{name:'io_uring'}));expect(screen.getByText('1 MB')).toBeVisible();
  fireEvent.click(screen.getByRole('tab',{name:'Caches'}));expect(screen.getByText('75 %')).toBeVisible();expect(within(screen.getByRole('row',{name:/Exact Index/})).getByText('—')).toBeVisible();
- fireEvent.click(screen.getByRole('tab',{name:'GC & Reduction'}));expect(screen.getByText('8 KB')).toBeVisible();expect(screen.getByText('5 KB')).toBeVisible();
+ fireEvent.click(screen.getByRole('tab',{name:'Lesevermeidung'}));expect(screen.getByText('5 KB')).toBeVisible();
+ fireEvent.click(screen.getByRole('tab',{name:'GC & Scrub'}));expect(screen.getByText('8 KB')).toBeVisible();
  fireEvent.click(screen.getByRole('tab',{name:'Checkpoint-Phasen'}));expect(screen.getByTestId('phase-chart')).toBeVisible();expect(screen.getByText('2 ms')).toBeVisible();
  fireEvent.keyDown(screen.getByRole('tab',{name:'Checkpoint-Phasen'}),{key:'Home'});expect(screen.getByRole('tab',{name:'Latenzen'})).toHaveFocus();
 });
@@ -35,7 +36,9 @@ it("shows the shared budget, DATA priority tier and pending donor reservation in
  expect(screen.getByText('92 %')).toBeVisible();expect(screen.getByText('16 GB')).toBeVisible();
  const data = within(screen.getByRole('row',{name:/Verified Read/}));
  expect(data.getByText('DATA')).toBeVisible();expect(data.getByText('90 %')).toBeVisible();
- expect(data.getByText('4 GB')).toBeVisible();expect(data.getAllByText('6 GB')).toHaveLength(2);
+ expect(data.getByText('4 GB')).toBeVisible();expect(data.getAllByText('6 GB')).toHaveLength(1);
+ fireEvent.click(screen.getByRole('checkbox',{name:'Zähler & Reservierung anzeigen'}));
+ expect(data.getAllByText('6 GB')).toHaveLength(2);
  expect(within(screen.getByRole('row',{name:/Exact Index/})).getByText('Metadata')).toBeVisible();
  expect(within(screen.getByRole('row',{name:/Historical Proofs/})).getByText('—')).toBeVisible();
  expect(screen.getByRole('progressbar',{name:'Cache-Budget Belegung'})).toHaveAttribute('value','6500000000');
@@ -84,10 +87,23 @@ it("never substitutes lifetime counters for a missing recent window",()=>{
 it("shows cold-read admission evidence and leaves old samples explicitly unavailable",()=>{
  const runtime = {...details.runtime!,reduction:{...details.runtime!.reduction,skippedColdCandidates:931,explorationReads:32,backendBaseReads:140,warmBaseReuses:710,successfulBaseTrials:411}};
  const view=render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={true} loading={false}/></I18nProvider>);
- fireEvent.click(screen.getByRole('tab',{name:'GC & Reduction'}));
+ fireEvent.click(screen.getByRole('tab',{name:'Lesevermeidung'}));
  expect(within(screen.getByText('Kalte Kandidaten übersprungen').parentElement!).getByText('931')).toBeVisible();
  expect(within(screen.getByText('Backend-Leseversuche (Basen)').parentElement!).getByText('140')).toBeVisible();
  expect(within(screen.getByText('Basen aus RAM wiederverwendet').parentElement!).getByText('710')).toBeVisible();
  view.rerender(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details}} historical={true} loading={false}/></I18nProvider>);
  expect(within(screen.getByText('Kalte Kandidaten übersprungen').parentElement!).getByText('—')).toBeVisible();
+});
+
+it("shows the governed Manifest cache and its recent counters",()=>{
+ const pool={id:"manifestNodes",fallbackTier:"metadata",hits:90,misses:10,evictions:2,residentBytes:4096,targetBytes:8192,leasedBytes:8192};
+ const runtime={...details.runtime!,cacheBudget:{maximumMemoryUsedBasisPoints:9200,effectiveLimitBytes:100000,availableBytes:90000,budgetBytes:90000,pools:[pool]},cacheWindow:{seconds:300,pools:[{id:"manifestNodes",hits:4,misses:1,evictions:0}]}};
+ render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={false} loading={false}/></I18nProvider>);
+ fireEvent.click(screen.getByRole('tab',{name:'Caches'}));
+ const row=screen.getByText('Manifest Nodes').closest('tr')!;
+ expect(within(row).getByText('Metadata')).toBeVisible();
+ expect(within(row).getByText('90 %')).toBeVisible();
+ fireEvent.click(screen.getByRole('button',{name:'Letzte 5 Minuten'}));
+ expect(within(row).getByText('80 %')).toBeVisible();
+ expect(within(row).getByText('4,1 KB')).toBeVisible();
 });

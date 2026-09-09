@@ -40,6 +40,9 @@ if ! grep -q "SAMBA3_MODULE('vfs_fastdup'" "$wscript"; then
 	sed -i '$r '"$workspace/samba/vfs_fastdup/wscript_build.fragment" "$wscript"
 fi
 
+# Update dependencies in a previously configured disposable Samba checkout too.
+sed -i "/SAMBA3_MODULE('vfs_fastdup'/,/enabled=/s/deps='[^']*'/deps='samba-util OFFLOAD_TOKEN PTHREADPOOL'/" "$wscript"
+
 cd "$samba_tree"
 TMPDIR="$workspace_artifacts/tmp" ./configure \
 	--without-ad-dc \

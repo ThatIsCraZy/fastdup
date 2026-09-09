@@ -71,6 +71,7 @@ enum fastdup_contract_status fastdup_validate_clone_v1(
 struct fastdup_handle_fence {
 	uint64_t accepted;
 	uint64_t applied;
+	uint64_t completed; /* Up to 64 accepted operations beyond applied. */
 };
 
 bool fastdup_handle_accept(struct fastdup_handle_fence *fence,

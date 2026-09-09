@@ -67,9 +67,10 @@ unsupported clone into a buffered copy.
 
 Samba CLOSE is an apply fence, not a durability command. For each open target
 handle, every accepted Integrity or Duplicate Extents operation must reach a
-terminal applied-or-failed result before the next CLOSE hook runs. Because the
-v1 adapter executes these operations synchronously, CLOSE cannot overtake a
-successful clone. CLOSE does not add an implicit checkpoint or `fsync`: an
+terminal applied-or-failed result before the next CLOSE hook runs. The original
+v1 adapter enforced this through synchronous execution. The bounded asynchronous
+adapter below preserves the same apply fence through explicit request guards.
+CLOSE does not add an implicit checkpoint or `fsync`: an
 acknowledged successful mutation remains governed by the ordinary checkpoint
 target and hard durability/admission window.
 
@@ -199,3 +200,41 @@ exact EOF endings. Compare the entire target, including untouched bytes, after
 checkpoint and crash recovery. Add unaligned-offset fault injection and a real
 SMB sequence test. A single isolated failing request does not cover continuation
 at the end of a previously accepted partial-cluster operation.
+
+## Bounded asynchronous Samba dispatch (9 September 2026)
+
+The smbd event loop resolves handles/tokens, checks access and captures owned
+file descriptors. Native descriptor stat, Integrity validation and the single
+clone syscall run together through Samba's existing pthread pool, with at most
+eight active and 64 accepted unfinished clones per smbd process. Excess admissions fail explicitly. Workers own duplicate CLOEXEC file
+descriptors and scalar arguments; only the event thread touches Samba handles,
+the scheduler and completion fences. Every clone remains exactly one native
+`copy_file_range`, with no buffered-copy or short-result fallback.
+
+The scheduler allows independent files to overlap and orders conflicting
+read/write or write/write file identities by arrival, including aliases through
+different handles. A per-handle 64-bit completion window permits a synchronous
+Integrity update to complete while an earlier admitted Clone awaits application;
+CLOSE becomes ready only when the entire accepted prefix is terminal. Current
+EOF and Integrity policy are checked in the worker immediately before cloning,
+so queued requests do not trust stale file-size snapshots. Interleaved policy
+changes can cause a queued clone to fail its current-policy check. This is not
+a new ordering guarantee for unrelated concurrent SMB writes or truncates.
+
+Both source and destination handles have a separate non-cancellable AIO request
+guard. Source CLOSE as well as target CLOSE waits for the worker. If a caller
+releases its request before completion, cleanup detaches worker state and its
+guard; the eventual callback references that retained state, never a freed
+request. Only completion releases descriptors and guards. Disconnect/CANCEL do
+not invent success or turn acknowledged application into a durability promise.
+Thread-pool submission failures complete the operation as errors.
+
+Qualification requires real simultaneous IOCTLs on one SMB connection, exact
+contents/untouched neighbors, overlapping clones through distinct handles,
+Integrity interleaving, source/target CLOSE and interrupted clients. Injected
+syscall delay makes CLOSE races deterministic; it is confined to an isolated
+test smbd. Normal throughput measurements run without delay. The independent
+[Manifest-node cache](0046-bound-verified-read-cache-by-live-memory-headroom.md)
+reduces metadata verification work without weakening the clone proof boundary.
+See the [qualification record](../testing/clone-optimization-2026-09-09.md) for
+measurements and the remaining synchronous Samba-core stat limitation.

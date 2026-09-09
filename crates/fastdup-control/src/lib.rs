@@ -263,7 +263,7 @@ pub struct TelemetrySnapshot {
     pub frontend_read_mbps: f64,
     pub frontend_write_mbps: f64,
     pub dedup_rate: f64,
-    pub reduction_ratio: f64,
+    pub reduction_ratio: Option<f64>,
     pub cpu_percent: f64,
     pub ram_percent: f64,
     pub data_used_bytes: u64,
@@ -283,6 +283,17 @@ pub struct StorageUsageTelemetry {
     pub metadata_capacity_bytes: Option<u64>,
     pub data_used_bytes: Option<u64>,
     pub data_capacity_bytes: Option<u64>,
+}
+
+impl StorageUsageTelemetry {
+    /// Current allocated logical bytes per occupied byte across both pools.
+    /// Includes filesystem overhead and storage awaiting GC; never ingest counters.
+    #[must_use]
+    pub fn reduction_ratio(&self) -> Option<f64> {
+        let logical = self.logical_allocated_bytes?;
+        let physical = self.metadata_used_bytes?.checked_add(self.data_used_bytes?)?;
+        (physical != 0).then(|| logical as f64 / physical as f64)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -305,7 +316,7 @@ impl Default for TelemetrySnapshot {
             frontend_read_mbps: 0.0,
             frontend_write_mbps: 0.0,
             dedup_rate: 0.0,
-            reduction_ratio: 0.0,
+            reduction_ratio: None,
             cpu_percent: 0.0,
             ram_percent: 0.0,
             data_used_bytes: 0,

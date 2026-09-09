@@ -178,7 +178,8 @@ enum fastdup_contract_status fastdup_validate_clone_v1(
 bool fastdup_handle_accept(struct fastdup_handle_fence *fence,
 			   uint64_t *sequence)
 {
-	if (fence == NULL || sequence == NULL || fence->accepted == UINT64_MAX) {
+	if (fence == NULL || sequence == NULL || fence->accepted == UINT64_MAX ||
+        fence->accepted - fence->applied >= 64) {
 		return false;
 	}
 	fence->accepted++;
@@ -189,11 +190,16 @@ bool fastdup_handle_accept(struct fastdup_handle_fence *fence,
 bool fastdup_handle_complete(struct fastdup_handle_fence *fence,
 			     uint64_t sequence)
 {
-	if (fence == NULL || sequence != fence->applied + 1 ||
-	    sequence > fence->accepted) {
-		return false;
-	}
-	fence->applied = sequence;
+    uint64_t bit;
+    if (fence == NULL || sequence <= fence->applied || sequence > fence->accepted ||
+        sequence - fence->applied > 64) { return false; }
+    bit = UINT64_C(1) << (sequence - fence->applied - 1);
+    if ((fence->completed & bit) != 0) { return false; }
+    fence->completed |= bit;
+    while ((fence->completed & 1) != 0) {
+        fence->applied++;
+        fence->completed >>= 1;
+    }
 	return true;
 }
 

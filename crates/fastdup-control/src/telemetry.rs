@@ -35,7 +35,6 @@ pub struct SystemSampler {
     previous_frontend_at: Instant,
     exact_hit_bytes: u64,
     new_chunk_bytes: u64,
-    reduction_ratio: f64,
     repository_state: RepositoryState,
     metadata_kernel_name: Option<String>,
     data_kernel_name: Option<String>,
@@ -65,7 +64,6 @@ impl SystemSampler {
             previous_frontend_at: Instant::now(),
             exact_hit_bytes: 0,
             new_chunk_bytes: 0,
-            reduction_ratio: 0.0,
             repository_state: RepositoryState::Uninitialized,
             metadata_kernel_name: None,
             data_kernel_name: None,
@@ -86,21 +84,6 @@ impl SystemSampler {
         self.data_path = data_path;
     }
 
-    pub fn update_frontend(
-        &mut self,
-        read_mbps: f64,
-        write_mbps: f64,
-        exact_hit_bytes: u64,
-        new_chunk_bytes: u64,
-        reduction_ratio: f64,
-    ) {
-        self.frontend_read_mbps = read_mbps.max(0.0);
-        self.frontend_write_mbps = write_mbps.max(0.0);
-        self.exact_hit_bytes = exact_hit_bytes;
-        self.new_chunk_bytes = new_chunk_bytes;
-        self.reduction_ratio = reduction_ratio.max(0.0);
-    }
-
     pub fn update_frontend_counters(&mut self, read_bytes: u64, write_bytes: u64) {
         let now = Instant::now();
         if let Some((previous_read, previous_write)) = self.previous_frontend_bytes {
@@ -117,20 +100,9 @@ impl SystemSampler {
         self.previous_frontend_at = now;
     }
 
-    pub fn update_reduction(
-        &mut self,
-        exact_hit_bytes: u64,
-        new_chunk_bytes: u64,
-        logical_chunk_bytes: u64,
-        physical_container_bytes: u64,
-    ) {
+    pub fn update_dedup(&mut self, exact_hit_bytes: u64, new_chunk_bytes: u64) {
         self.exact_hit_bytes = exact_hit_bytes;
         self.new_chunk_bytes = new_chunk_bytes;
-        self.reduction_ratio = if physical_container_bytes == 0 {
-            0.0
-        } else {
-            logical_chunk_bytes as f64 / physical_container_bytes as f64
-        };
     }
 
     pub fn sample(&mut self) -> TelemetrySnapshot {
@@ -197,7 +169,7 @@ impl SystemSampler {
             frontend_read_mbps: self.frontend_read_mbps,
             frontend_write_mbps: self.frontend_write_mbps,
             dedup_rate: dedup_rate(self.exact_hit_bytes, self.new_chunk_bytes),
-            reduction_ratio: self.reduction_ratio,
+            reduction_ratio: None,
             cpu_percent,
             ram_percent,
             data_used_bytes,
@@ -369,6 +341,29 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_reduction_uses_live_allocation_and_both_pools() {
+        let mut usage = crate::StorageUsageTelemetry {
+            logical_allocated_bytes: Some(678_870_599_109),
+            data_used_bytes: Some(76_671_565_824),
+            metadata_used_bytes: Some(5_906_501_632),
+            ..crate::StorageUsageTelemetry::default()
+        };
+        assert!((usage.reduction_ratio().unwrap() - 8.2209552733).abs() < 1e-9);
+        usage.logical_allocated_bytes = Some(0);
+        assert_eq!(usage.reduction_ratio(), Some(0.0));
+        usage.data_used_bytes = None;
+        assert_eq!(usage.reduction_ratio(), None);
+        usage.data_used_bytes = Some(0);
+        usage.metadata_used_bytes = Some(0);
+        assert_eq!(usage.reduction_ratio(), None);
+        usage.data_used_bytes = Some(u64::MAX);
+        usage.metadata_used_bytes = Some(1);
+        assert_eq!(usage.reduction_ratio(), None);
+        usage.logical_allocated_bytes = None;
+        assert_eq!(usage.reduction_ratio(), None);
+    }
 
     #[test]
     fn dedup_rate_excludes_fill_and_recipe_reuse_by_construction() {

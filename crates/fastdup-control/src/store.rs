@@ -535,7 +535,12 @@ impl TelemetryStore {
         )?;
         let mut result = Vec::new();
         for row in rows {
-            result.push(serde_json::from_str(&row?)?);
+            let mut sample: TelemetrySnapshot = serde_json::from_str(&row?)?;
+            // Old history used ingest counters for this field. Reconstruct
+            // occupancy from the sample itself; never display that old ratio.
+            sample.reduction_ratio = sample.storage_usage.as_deref()
+                .and_then(crate::StorageUsageTelemetry::reduction_ratio);
+            result.push(sample);
         }
         Ok(result)
     }
@@ -612,6 +617,7 @@ struct TelemetryAverage {
     latest: TelemetrySnapshot,
     sums: [f64; 6],
     count: u64,
+    reduction_count: u64,
 }
 
 impl TelemetryAverage {
@@ -620,6 +626,7 @@ impl TelemetryAverage {
             latest: TelemetrySnapshot::default(),
             sums: [0.0; 6],
             count: 0,
+            reduction_count: 0,
         }
     }
 
@@ -628,12 +635,13 @@ impl TelemetryAverage {
             sample.frontend_read_mbps,
             sample.frontend_write_mbps,
             sample.dedup_rate,
-            sample.reduction_ratio,
+            sample.reduction_ratio.unwrap_or(0.0),
             sample.cpu_percent,
             sample.ram_percent,
         ]) {
             *sum += value;
         }
+        self.reduction_count += u64::from(sample.reduction_ratio.is_some());
         self.count += 1;
         sample.series.clear();
         self.latest = sample;
@@ -644,7 +652,8 @@ impl TelemetryAverage {
         self.latest.frontend_read_mbps = self.sums[0] / count;
         self.latest.frontend_write_mbps = self.sums[1] / count;
         self.latest.dedup_rate = self.sums[2] / count;
-        self.latest.reduction_ratio = self.sums[3] / count;
+        self.latest.reduction_ratio = (self.reduction_count != 0)
+            .then(|| self.sums[3] / self.reduction_count as f64);
         self.latest.cpu_percent = self.sums[4] / count;
         self.latest.ram_percent = self.sums[5] / count;
         self.latest
@@ -723,6 +732,23 @@ mod tests {
         let store = ControlStore::open(&path).unwrap();
         assert_eq!(store.user_ui_language("alice").unwrap(), "en");
         assert_eq!(store.user_ui_language("bob").unwrap(), "de");
+    }
+
+    #[test]
+    fn history_replaces_legacy_work_ratios_with_recorded_occupancy() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TelemetryStore::open(&directory.path().join("telemetry.db")).unwrap();
+        let sample = TelemetrySnapshot {
+            reduction_ratio: Some(14_959.0),
+            storage_usage: Some(Box::new(crate::StorageUsageTelemetry {
+                logical_allocated_bytes: Some(800), data_used_bytes: Some(90),
+                metadata_used_bytes: Some(10), ..crate::StorageUsageTelemetry::default()
+            })), ..TelemetrySnapshot::default()
+        };
+        store.insert(100, &sample).unwrap();
+        assert_eq!(store.query(100,100,1).unwrap()[0].reduction_ratio, Some(8.0));
+        store.insert(101, &TelemetrySnapshot { storage_usage: None, ..sample }).unwrap();
+        assert_eq!(store.query(101,101,1).unwrap()[0].reduction_ratio, None);
     }
 
     #[test]
@@ -823,7 +849,7 @@ mod tests {
                 frontend_read_mbps: value,
                 frontend_write_mbps: value * 2.0,
                 dedup_rate: value * 3.0,
-                reduction_ratio: value * 4.0,
+                reduction_ratio: Some(value * 4.0),
                 cpu_percent: value * 5.0,
                 ram_percent: value * 6.0,
                 ..TelemetrySnapshot::default()
@@ -835,7 +861,7 @@ mod tests {
             (result.frontend_read_mbps, 5.0),
             (result.frontend_write_mbps, 10.0),
             (result.dedup_rate, 15.0),
-            (result.reduction_ratio, 20.0),
+            (result.reduction_ratio.unwrap(), 20.0),
             (result.cpu_percent, 25.0),
             (result.ram_percent, 30.0),
         ] {

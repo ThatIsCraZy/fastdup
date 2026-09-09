@@ -17,7 +17,7 @@ from impacket.smb3structs import SMB2_DIALECT_311
 def run():
     server = os.environ["SMB_TEST_SERVER"]
     share = os.environ["SMB_TEST_SHARE"]
-    connection = SMBConnection(server, server, preferredDialect=SMB2_DIALECT_311)
+    connection = SMBConnection(server, server, sess_port=int(os.getenv("SMB_TEST_PORT", "445")), preferredDialect=SMB2_DIALECT_311)
     nt_hash = os.environ.get("SMB_TEST_NT_HASH", "")
     connection.login(os.environ["SMB_TEST_USER"], os.environ.get("SMB_TEST_PASSWORD", ""),
                      nthash=bytes.fromhex(nt_hash) if nt_hash else b"")
@@ -71,7 +71,7 @@ def run():
         connection.getSMBServer().flush(tree, target)
         connection.closeFile(tree, target)
         target = None
-        target = connection.createFile(tree, name, creationDisposition=1)
+        target = connection.createFile(tree, name, creationDisposition=1, desiredAccess=0x120089)
         assert connection.queryInfo(tree, target)["EndOfFile"] == size
         assert read_all(target) == expected, "flush/reopen changed target bytes or size"
         print("PASS: complete 2 MiB target byte-exact before and after flush/reopen", flush=True)

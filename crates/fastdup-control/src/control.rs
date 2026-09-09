@@ -47,8 +47,6 @@ struct RuntimeFrontendCounters {
     write_bytes: u64,
     exact_hit_bytes: u64,
     new_chunk_bytes: u64,
-    logical_chunk_bytes: u64,
-    physical_container_bytes: u64,
     presented_capacity_revision: String,
 }
 
@@ -401,11 +399,9 @@ impl AgentRuntime {
             );
             if let Some(frontend) = &frontend {
                 sampler.update_frontend_counters(frontend.read_bytes, frontend.write_bytes);
-                sampler.update_reduction(
+                sampler.update_dedup(
                     frontend.exact_hit_bytes,
                     frontend.new_chunk_bytes,
-                    frontend.logical_chunk_bytes,
-                    frontend.physical_container_bytes,
                 );
             }
             sampler.sample()
@@ -430,6 +426,9 @@ impl AgentRuntime {
                 data_capacity_bytes: data.map(|value| value.1),
             }));
         }
+
+        snapshot.reduction_ratio = snapshot.storage_usage.as_deref()
+            .and_then(crate::StorageUsageTelemetry::reduction_ratio);
 
         if let Some(checkpoint) = snapshot.details.as_ref().and_then(|d| d.runtime.as_ref()).and_then(|r| r.checkpoint.as_ref()) {
             snapshot.commit_generation = Some(checkpoint.generation);
@@ -1290,12 +1289,6 @@ fn read_frontend_counters() -> Option<RuntimeFrontendCounters> {
             write_bytes: response.pointer("/frontend/write_bytes")?.as_u64()?,
             exact_hit_bytes: response.pointer("/frontend/exact_hit_bytes")?.as_u64()?,
             new_chunk_bytes: response.pointer("/frontend/new_chunk_bytes")?.as_u64()?,
-            logical_chunk_bytes: response
-                .pointer("/frontend/logical_chunk_bytes")?
-                .as_u64()?,
-            physical_container_bytes: response
-                .pointer("/frontend/physical_container_bytes")?
-                .as_u64()?,
             presented_capacity_revision: response
                 .get("presented_capacity_revision")
                 .and_then(serde_json::Value::as_str)

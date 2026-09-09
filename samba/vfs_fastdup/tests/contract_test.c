@@ -290,14 +290,28 @@ static void close_is_fenced_by_every_accepted_metadata_operation(void)
 	assert(first == 1);
 	assert(second == 2);
 	assert(!fastdup_handle_close_ready(&fence));
+	assert(fastdup_handle_complete(&fence, second));
+	assert(!fastdup_handle_close_ready(&fence));
 	assert(!fastdup_handle_complete(&fence, second));
 	assert(fastdup_handle_complete(&fence, first));
-	assert(!fastdup_handle_close_ready(&fence));
-	assert(fastdup_handle_complete(&fence, second));
 	assert(fastdup_handle_close_ready(&fence));
 	assert(!fastdup_handle_complete(&fence, second));
 	assert(!fastdup_handle_close_ready(NULL));
 	assert(!fastdup_handle_accept(NULL, &first));
+
+    /* Every completion ordering retains the incomplete prefix at CLOSE. */
+    for (uint64_t count = 1; count <= 64; count++) {
+        fence = (struct fastdup_handle_fence){0};
+        for (uint64_t i = 0; i < count; i++) { assert(fastdup_handle_accept(&fence, &first)); }
+        if (count == 64) { assert(!fastdup_handle_accept(&fence, &first)); }
+        assert(!fastdup_handle_complete(&fence, count + 1));
+        for (uint64_t i = count; i > 0; i--) {
+            assert(!fastdup_handle_close_ready(&fence));
+            assert(fastdup_handle_complete(&fence, i));
+        }
+        assert(fastdup_handle_close_ready(&fence));
+        assert(fence.completed == 0);
+    }
 	fence.accepted = UINT64_MAX;
 	fence.applied = UINT64_MAX;
 	assert(!fastdup_handle_accept(&fence, &first));

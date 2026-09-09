@@ -41,7 +41,7 @@ export interface TelemetrySnapshot {
   frontendReadMbps: number;
   frontendWriteMbps: number;
   dedupRate: number;
-  reductionRatio: number;
+  reductionRatio: number | null;
   cpuPercent: number;
   ramPercent: number;
   dataUsedBytes: number;
@@ -155,7 +155,7 @@ export function emptyApplianceSnapshot(): ApplianceSnapshot {
       frontendReadMbps: 0,
       frontendWriteMbps: 0,
       dedupRate: 0,
-      reductionRatio: 0,
+      reductionRatio: null,
       cpuPercent: 0,
       ramPercent: 0,
       dataUsedBytes: 0,
