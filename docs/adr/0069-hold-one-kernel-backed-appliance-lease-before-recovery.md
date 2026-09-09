@@ -18,3 +18,10 @@ durable PID record or the existing Online-GC socket. Records cannot safely
 distinguish a dead process from a reused PID, and socket ownership covers only
 Online GC rather than every generation-mutating path. An inability to acquire
 or synchronize the Lease fails closed before ordinary repository access.
+
+After acquiring the Lease, daemon startup may detach a leftover FUSE endpoint
+only if metadata inspection reports ENOTCONN (the FUSE server is disconnected).
+It then rechecks the underlying mount directory before recovery. A live mount,
+missing path, permission failure, or failed detach does not authorize this
+cleanup. This allows systemd restart after SIGABRT/SIGKILL without a repeated
+"mount path is not a directory" failure on the dead endpoint.

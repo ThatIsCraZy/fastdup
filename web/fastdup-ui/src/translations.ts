@@ -1,5 +1,11 @@
 // German source messages keep familiar storage terminology.
 export const english: Record<string, string> = {
+  "Status nicht bestätigt": "Status not confirmed",
+  "Agent verbunden": "Agent connected",
+  "Repository-Runtime nicht erreichbar. SMB-Zugriff ist nicht bestätigt.": "Repository runtime is unreachable. SMB access is not confirmed.",
+  "Repository wartet auf dauerhaften Fortschritt. Neue Schreibzugriffe sind pausiert.": "Repository is waiting for durable progress. New writes are paused.",
+  "Repository hat einen Integritätsfehler erkannt. Schreibzugriffe sind gesperrt.": "Repository detected an integrity failure. Writes are blocked.",
+  "Repository ist nicht betriebsbereit. Details stehen unter Repository und Ereignisse.": "Repository is not ready. See Repository and Events for details.",
   "Verified Read · RAM-Kompression": "Verified Read \u00b7 RAM compression",
   "Häufig genutzte Daten liegen direkt im RAM, weitere Einträge komprimiert. Beide teilen sich das Verified-Read-Budget. Speicherwerte gelten zum Messpunkt.": "Frequently used data stays decoded in RAM; other entries are compressed. Both share the Verified Read budget. Memory values apply at the sample time.",
   "Direkt im RAM": "Decoded in RAM",

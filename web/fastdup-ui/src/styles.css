@@ -407,3 +407,11 @@ progress { accent-color: #63c4d5; height: 6px; }
 
 .read-cache-compression { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border, #253945); }
 .read-cache-compression summary { cursor: pointer; color: var(--muted, #afbecb); padding: .6rem 0; }
+
+.app-shell .topbar:has(.runtime-notice) { flex-wrap: wrap; flex-basis: auto; height: auto; gap: 12px; padding-top: 12px; padding-bottom: 12px; }
+.runtime-notice { flex: 1 0 100%; display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid #75434b; border-radius: 7px; background: #281c22; color: #f1979f; font-size: 13px; line-height: 1.5; }
+.runtime-notice svg { flex-shrink: 0; }
+.topbar .runtime-notice > span { color: inherit; }
+
+.sidebar-health.degraded { border-color: #614c31; background: #282319; color: #f2c16b; }
+.sidebar-health.degraded strong, .sidebar-health.degraded span { color: inherit; }

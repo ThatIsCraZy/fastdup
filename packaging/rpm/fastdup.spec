@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.7.2
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,12 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Wed Sep 09 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.2-2
+- Retire Metadata GC journals before exact collection and safe content republication.
+- Reflect Runtime loss and closed write admission in live UI state and audit events.
+- Recover disconnected FUSE mountpoints after a daemon crash.
+- Compress cold Verified Read entries within the adaptive shared RAM budget.
+
 * Wed Sep 09 2026 fastdup contributors - 0.7.2-1
 - Cache verified Manifest nodes and dispatch independent Samba clones asynchronously
 - Include exact byte-granular Veeam clone continuation fixes

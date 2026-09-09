@@ -33,6 +33,8 @@ use fastdup_store::{
 };
 
 mod common;
+#[path = "../mount_recovery.rs"]
+mod mount_recovery;
 #[path = "../runtime_management.rs"]
 mod runtime_management;
 #[path = "../runtime_scrub.rs"]
@@ -253,6 +255,8 @@ impl From<fastdup_posix::SmallFilePolicySnapshot> for ManagementSmallFilePolicy 
 
 #[derive(Debug, Serialize)]
 struct ManagementFrontendTelemetry {
+    mutation_admission_open: bool,
+    integrity_failed: bool,
     logical_allocated_bytes: Option<u64>,
     logical_allocated_observed_at: Option<u64>,
     read_bytes: u64,
@@ -321,6 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&metadata_root)?;
     let _appliance_lease =
         ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::WritableDaemon)?;
+    mount_recovery::ensure_mount_directory(&mount_path)?;
     let recovery_latch = arm_recovery_latch(&metadata_root)?;
     let metadata_pool = FsStorageIo::open(&metadata_root)?;
     let data_pool = FsStorageIo::open(&container_root)?;
@@ -611,9 +616,6 @@ fn parse_mount_arguments() -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::e
         .ok_or("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT")?;
     if arguments.next().is_some() {
         return Err("usage: fastdup-durable-fuse MOUNT_PATH METADATA_ROOT CONTAINER_ROOT".into());
-    }
-    if !mount_path.is_dir() {
-        return Err(format!("mount path is not a directory: {}", mount_path.display()).into());
     }
     if metadata_root == container_root {
         return Err("metadata and container roots must be distinct".into());
@@ -977,6 +979,8 @@ fn apply_management_operation(
                 ok: true,
                 error: None,
                 frontend: Some(ManagementFrontendTelemetry {
+                    mutation_admission_open: namespace.mutation_admission_open(),
+                    integrity_failed: namespace.integrity_failed(),
                     logical_allocated_bytes: logical_usage.map(|value| value.0),
                     logical_allocated_observed_at: logical_usage.map(|value| value.1),
                     details: None,
@@ -2451,6 +2455,14 @@ mod tests {
         assert!(inspected.ok);
         assert!(inspected.frontend.is_some());
 
+        assert!(inspected.frontend.as_ref().unwrap().mutation_admission_open);
+        namespace.pause_mutation_admission();
+        let paused = apply_management_operation(
+            ManagementOperation::Inspect, &telemetry, &configuration, &capacity_source, &namespace,
+        );
+        assert!(!paused.frontend.as_ref().unwrap().mutation_admission_open);
+        assert!(!paused.frontend.as_ref().unwrap().integrity_failed);
+        namespace.resume_mutation_admission();
         let updated = apply_management_operation(
             ManagementOperation::UpdateOnlineGc {
                 enabled: false,

@@ -1556,6 +1556,27 @@ impl<I: StorageIo> GenerationRepository<I> {
             .expect("ASSERT: Metadata GC generation lock poisoned");
         let barrier_wait = barrier_started.elapsed();
         let mark_epoch = self.metadata_gc_epoch.load(Ordering::Acquire);
+        // Exact collection supersedes every pre-barrier addition. Retire the
+        // old journal and catalog tail BEFORE any fallible publication/unlink:
+        // a pin may drain during I/O, or I/O may fail after removing an object
+        // that a later writer legitimately republishes under the same ID.
+        // Neither case may leave that ID in the previous addition journal.
+        let exact_revision = {
+            let mut journal = self
+                .metadata_gc_delta
+                .lock()
+                .expect("ASSERT: Metadata GC delta journal poisoned before exact mark");
+            journal.unclassified.clear();
+            journal.additions.clear();
+            journal.exact_required = true;
+            journal.exact_reason = Some(exact_reason);
+            advance_metadata_gc_journal_revision(&mut journal);
+            journal.revision
+        };
+        *self
+            .metadata_gc_clean
+            .lock()
+            .expect("ASSERT: Metadata GC clean-catalog state poisoned") = None;
         let records = self.load_complete_commit_records_unlocked()?;
         let commit_binding = metadata_mark_commit_binding(&records);
         let (reachable, object_graph_read_bytes) = self.mark_metadata_gc_roots(&records)?;
@@ -1619,12 +1640,14 @@ impl<I: StorageIo> GenerationRepository<I> {
                 catalog_chain_runs: 1,
             },
         };
-        if self.metadata_gc_epoch.load(Ordering::Acquire) == mark_epoch {
-            *self
-                .metadata_gc_delta
-                .lock()
-                .expect("ASSERT: Metadata GC delta journal poisoned after exact mark") =
-                MetadataGcDeltaJournal::default();
+        let mut journal = self
+            .metadata_gc_delta
+            .lock()
+            .expect("ASSERT: Metadata GC delta journal poisoned after exact mark");
+        if journal.revision == exact_revision
+            && self.metadata_gc_epoch.load(Ordering::Acquire) == mark_epoch
+        {
+            *journal = MetadataGcDeltaJournal::default();
             *self
                 .metadata_gc_clean
                 .lock()

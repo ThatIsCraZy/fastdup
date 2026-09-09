@@ -777,3 +777,35 @@ it("keeps the quota warning in the topbar across missing online samples and clea
   listener.mockRestore();
   vi.unstubAllGlobals();
 });
+
+it("shows a Runtime outage and write pause in the topbar while agent telemetry is live", async () => {
+  const source = new EventTarget();
+  vi.spyOn(EventSource.prototype, "addEventListener").mockImplementation(source.addEventListener.bind(source));
+  vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    const body = url.endsWith("/session") ? { username: "admin", csrfToken: "csrf", mustChangePassword: false }
+      : url.endsWith("/principals") ? { users: [], groups: [] } : previewSnapshot;
+    return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+  }));
+  render(<App />);
+  await screen.findByRole("button", { name: "Telemetrie" });
+  const sample = (runtimeIssue: string | undefined) => act(() => {
+    source.dispatchEvent(new MessageEvent("snapshot", { data: JSON.stringify({
+      ...previewSnapshot.telemetry, repositoryState: runtimeIssue ? "error" : "online",
+      runtimeIssue, details: runtimeIssue === "unavailable" ? null : previewSnapshot.telemetry.details,
+      frontendReadMbps: 0, frontendWriteMbps: 0,
+    }) }));
+  });
+  sample("unavailable");
+  expect(screen.getByRole("alert")).toHaveTextContent("Repository-Runtime nicht erreichbar");
+  expect(screen.getByRole("alert").closest("header")).toHaveClass("topbar");
+  expect(screen.getByText("Agent verbunden")).toBeVisible();
+  expect(screen.queryByText("Live")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Repository" }));
+  expect(document.querySelector(".repo-hero .badge")).toHaveTextContent("Fehler");
+  sample("write_blocked");
+  expect(screen.getByRole("alert")).toHaveTextContent("Neue Schreibzugriffe sind pausiert");
+  sample(undefined);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getAllByText("Live").length).toBeGreaterThan(0);
+});

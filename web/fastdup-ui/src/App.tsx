@@ -64,6 +64,7 @@ import {
   type DiskTelemetry,
   type JobStatus,
   type RepositorySettings,
+  type RepositoryState,
   type SessionInfo,
   type ShareSettings,
   type TelemetrySnapshot,
@@ -292,7 +293,11 @@ function AppSidebar({
   active,
   onChange,
   alarms,
+  state,
+  fresh,
 }: {
+  state: RepositoryState;
+  fresh: boolean;
   active: string;
   onChange: (item: string) => void;
   alarms: number;
@@ -327,11 +332,11 @@ function AppSidebar({
           </button>
         ))}
       </nav>
-      <div className="sidebar-health">
-        <ShieldCheck size={18} />
+      <div className={`sidebar-health ${fresh && state === "online" ? "" : "degraded"}`}>
+        <Database size={18} />
         <div>
-          <strong>{t("System geschützt")}</strong>
-          <span>{t("Kein Appliance-Reboot erforderlich")}</span>
+          <strong>{t("Repository")}</strong>
+          <span>{fresh ? t(stateLabels[state]) : t("Status nicht bestätigt")}</span>
         </div>
       </div>
     </aside>
@@ -2075,7 +2080,9 @@ function Application() {
       ) as TelemetrySnapshot;
       lastSample.current = Date.now();
       setFresh(true);
-      setSnapshot((current) => ({ ...current, telemetry }));
+      setSnapshot((current) => ({ ...current, telemetry,
+        repository: current.repository ? { ...current.repository, state: telemetry.repositoryState } : current.repository,
+      }));
       setLiveResources(current => appendResourceSample(current, telemetry));
     });
     source.addEventListener("job", (event) => {
@@ -2418,7 +2425,7 @@ function Application() {
 
   return (
     <div className="app-shell">
-      <AppSidebar active={active} onChange={setActive} alarms={alerts.length} />
+      <AppSidebar active={active} onChange={setActive} alarms={alerts.length} state={snapshot.telemetry.repositoryState} fresh={fresh} />
       <main ref={workspaceScroll}>
         <header className="topbar">
           <div>
@@ -2427,10 +2434,12 @@ function Application() {
           </div>
           <div className="topbar-actions">
             <SmallFileQuotaNotice telemetry={snapshot.telemetry} />
-            <Badge className={fresh ? "live" : "stale"}>
+            <Badge className={fresh && !snapshot.telemetry.runtimeIssue && snapshot.telemetry.repositoryState !== "error" ? "live" : "stale"}>
               <span className="pulse" />
-              <span className="telemetry-status-full">{fresh ? "Live" : t("Telemetrie veraltet")}</span>
-              <span className="telemetry-status-compact">{fresh ? "Live" : t("Veraltet")}</span>
+              {fresh && (snapshot.telemetry.runtimeIssue || snapshot.telemetry.repositoryState === "error")
+                ? t("Agent verbunden")
+                : <><span className="telemetry-status-full">{fresh ? "Live" : t("Telemetrie veraltet")}</span>
+                  <span className="telemetry-status-compact">{fresh ? "Live" : t("Veraltet")}</span></>}
             </Badge>
             <button
               aria-label={t("Benachrichtigungen")}
@@ -2485,6 +2494,18 @@ function Application() {
               )}
             </div>
           </div>
+          {(snapshot.telemetry.runtimeIssue || snapshot.telemetry.repositoryState === "error") && (
+            <div className="runtime-notice" role="alert">
+              <AlertTriangle size={19} />
+              <span>{t(snapshot.telemetry.runtimeIssue === "write_blocked"
+                ? "Repository wartet auf dauerhaften Fortschritt. Neue Schreibzugriffe sind pausiert."
+                : snapshot.telemetry.runtimeIssue === "integrity_failed"
+                  ? "Repository hat einen Integritätsfehler erkannt. Schreibzugriffe sind gesperrt."
+                  : snapshot.telemetry.runtimeIssue === "unavailable"
+                    ? "Repository-Runtime nicht erreichbar. SMB-Zugriff ist nicht bestätigt."
+                    : "Repository ist nicht betriebsbereit. Details stehen unter Repository und Ereignisse.")}</span>
+            </div>
+          )}
         </header>
         <div className="page-content">
           {content}</div>

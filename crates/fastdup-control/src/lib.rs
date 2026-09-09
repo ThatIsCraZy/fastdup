@@ -53,6 +53,25 @@ pub enum RepositoryState {
     Error,
 }
 
+/// A live observation, never a persisted mount instruction or storage authority.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeIssue {
+    Unavailable,
+    WriteBlocked,
+    IntegrityFailed,
+}
+
+impl RuntimeIssue {
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "Repository-Runtime nicht erreichbar. SMB-Zugriff ist nicht bestätigt.",
+            Self::WriteBlocked => "Repository wartet auf dauerhaften Fortschritt. Neue Schreibzugriffe sind pausiert.",
+            Self::IntegrityFailed => "Repository hat einen Integritätsfehler erkannt. Schreibzugriffe sind gesperrt.",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetRole {
@@ -250,6 +269,8 @@ pub struct SeriesPoint {
 #[serde(rename_all = "camelCase")]
 pub struct TelemetrySnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_issue: Option<RuntimeIssue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub small_file_quota: Option<SmallFileQuotaStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_usage: Option<Box<StorageUsageTelemetry>>,
@@ -306,6 +327,7 @@ pub struct SmallFileQuotaStatus {
 impl Default for TelemetrySnapshot {
     fn default() -> Self {
         Self {
+            runtime_issue: None,
             small_file_quota: None,
             storage_usage: None,
             details: None,

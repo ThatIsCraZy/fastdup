@@ -39,3 +39,18 @@ base generation. Snapshots have base zero; additions name the immediately prior
 catalog generation. Readers accept only v2. Scrub audits every run and its
 chain, while exact collection may replace any older snapshot/delta set from
 Commit and live-pin authority.
+
+An exact pass retires the prior in-memory addition/unclassified sets and clean
+catalog tail while holding the publication barrier, before any fallible catalog
+publication or object removal. It leaves an exact-required journal until the
+complete namespace transition is durable. Installing a new clean state checks
+both epoch and journal revision under the journal lock, so a concurrent live-pin
+or Recovery Checkpoint pin release cannot be lost. A content-identified object
+removed by GC can then be published again without inheriting its former
+publication's journal membership. A failed exact pass also forces an exact retry;
+it cannot extend a catalog tail already removed by the interrupted pass.
+
+The scheduling regression drains a pin during catalog I/O, rotates old roots out
+of the WAL, republishes collected content, and commits it through the normal
+successor-proof path. Fault cases fail before and after the final directory sync;
+all cases must subsequently collect, scrub, and recover the new committed graph.

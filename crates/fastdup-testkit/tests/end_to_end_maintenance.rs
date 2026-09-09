@@ -3559,3 +3559,87 @@ fn catalog_bootstrap_uses_one_name_snapshot_during_concurrent_publication() {
             .any(|row| row.container_id() == ContainerId::new([0xfb; 16]).unwrap())
     );
 }
+
+#[test]
+fn republishing_collected_metadata_after_pin_drain_does_not_duplicate_journal_additions() {
+    republish_after_exact_gc(MemoryStorageIo::new(), false);
+}
+
+#[test]
+fn republishing_after_failed_exact_gc_does_not_reuse_the_retired_journal() {
+    let sync_position = republish_after_exact_gc(MemoryStorageIo::new(), false);
+    for metadata in [MemoryStorageIo::with_fail_before(sync_position), MemoryStorageIo::with_fail_after(sync_position)] {
+        republish_after_exact_gc(metadata, true);
+    }
+}
+
+fn republish_after_exact_gc(metadata: MemoryStorageIo, gc_fails: bool) -> usize {
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        metadata.clone(), StorageOperation::WriteAt, ".metadata-mark-catalog-",
+    );
+    let policy = PolicySetId::new([0xe1; 32]).unwrap();
+    let profile = ExactIndexProfileId::new([0xe2; 32]).unwrap();
+    let generations = GenerationRepository::new(paused.clone(), policy);
+    let containers = ContainerRepository::new(MemoryStorageIo::new());
+    let indexes = ExactIndexRunRepository::new(paused.clone());
+    let maintenance = MaintenanceRepository::new(
+        generations.clone(), containers.clone(), indexes, profile,
+    );
+    let mut record = generations.commit_namespace(
+        &NamespaceRoot::new(1_024, 2, 0, Vec::new(), Vec::new()).unwrap(),
+    ).unwrap();
+    maintenance.garbage_collect_metadata().unwrap();
+    let leaf = ManifestLeaf::new(4_096, vec![ManifestExtent::Fill {
+        logical_length: 4_096, value: 0x6d,
+    }]).unwrap();
+    let predecessor = fastdup_store::SuccessorPredecessor::from_committed_record(record);
+    let proof = generations.publish_manifest_successor(predecessor, &leaf).unwrap();
+    let original = proof.summary().root();
+    let namespace = |sequence, inode, root| NamespaceRoot::new(
+        1_024, inode + 1, sequence,
+        vec![DurableInode::new(inode, 0o640, 1_000, 1_000, 1, sequence, 4_096, root).unwrap()],
+        vec![NamespaceEntry::new(1, inode, b"reused.vbk".to_vec()).unwrap()],
+    ).unwrap();
+    generations.commit_namespace_with_successor_proofs_using(
+        &namespace(1, 2, original), &containers, predecessor, &[proof], &containers,
+    ).unwrap();
+    // Leave the original addition in RAM, then rotate its committed root out
+    // of both WAL slots. Identical content may legitimately be published again.
+    for sequence in 2..=132 {
+        record = generations.commit_namespace(
+            &NamespaceRoot::new(1_024, 3, sequence, Vec::new(), Vec::new()).unwrap(),
+        ).unwrap();
+    }
+    let predecessor = fastdup_store::SuccessorPredecessor::from_committed_record(record);
+    let abandoned = generations.publish_manifest_successor(predecessor,
+        &ManifestLeaf::new(1, vec![ManifestExtent::Fill { logical_length: 1, value: 42 }]).unwrap(),
+    ).unwrap();
+    paused.arm();
+    let collecting = maintenance.clone();
+    let collector = std::thread::spawn(move || collecting.garbage_collect_metadata());
+    let reached = paused.wait_until_reached(Duration::from_secs(2));
+    // A live-reader/recovery-checkpoint pin can drain while exact GC holds the
+    // publication barrier. The changed epoch forbids declaring the mark clean.
+    drop(abandoned);
+    paused.resume();
+    assert!(reached, "exact GC reached catalog publication");
+    let collected = collector.join().unwrap();
+    if gc_fails {
+        assert!(collected.is_err(), "injected final directory-sync fault must fail exact GC");
+    } else {
+        assert!(collected.unwrap().objects_removed() > 0);
+    }
+    let sync_position = metadata.operation_count() - 1;
+    assert_eq!(metadata.operations()[sync_position], StorageOperation::SyncRoot);
+    assert!(generations.read_manifest(original).is_err());
+    let proof = generations.publish_manifest_successor(predecessor, &leaf).unwrap();
+    assert_eq!(proof.summary().root(), original);
+    let committed = generations.commit_namespace_with_successor_proofs_using(
+        &namespace(133, 3, original), &containers, predecessor, &[proof], &containers,
+    ).expect("republished content must not panic on an obsolete journal addition");
+    maintenance.garbage_collect_metadata().unwrap();
+    maintenance.scrub().expect("exact collection preserves the new committed graph");
+    let reopened = GenerationRepository::new(metadata, policy);
+    assert_eq!(reopened.recover_latest_with_data(&containers).unwrap().unwrap().record(), committed.record());
+    sync_position
+}

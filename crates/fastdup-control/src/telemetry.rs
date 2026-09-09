@@ -100,6 +100,15 @@ impl SystemSampler {
         self.previous_frontend_at = now;
     }
 
+    /// A lost Runtime observation invalidates the rate and its counter baseline.
+    pub fn clear_frontend_counters(&mut self) {
+        self.previous_frontend_bytes = None;
+        self.frontend_read_mbps = 0.0;
+        self.frontend_write_mbps = 0.0;
+        self.exact_hit_bytes = 0;
+        self.new_chunk_bytes = 0;
+    }
+
     pub fn update_dedup(&mut self, exact_hit_bytes: u64, new_chunk_bytes: u64) {
         self.exact_hit_bytes = exact_hit_bytes;
         self.new_chunk_bytes = new_chunk_bytes;
@@ -159,6 +168,7 @@ impl SystemSampler {
             .and_then(filesystem_usage)
             .unwrap_or((0, 0));
         TelemetrySnapshot {
+            runtime_issue: None,
             small_file_quota: None,
             storage_usage: None,
             details: None,
