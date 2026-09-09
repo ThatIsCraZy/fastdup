@@ -107,3 +107,19 @@ it("shows the governed Manifest cache and its recent counters",()=>{
  expect(within(row).getByText('80 %')).toBeVisible();
  expect(within(row).getByText('4,1 KB')).toBeVisible();
 });
+
+it("shows cache compression gauges at the selected sample and separate lifetime codec costs",()=>{
+ const readCacheCompression={decodedResidentBytes:1000000,compressedResidentBytes:2000000,compressedLogicalBytes:8000000,attempts:10,admissions:8,compressionNanos:1000000,hits:40,decompressions:20,decompressionNanos:1000000,promotions:3,demotions:2,failures:0,bypasses:2,workingBytes:0,peakWorkingBytes:100000,maxWorkingBytes:1000000};
+ const runtime={...details.runtime!,readCacheCompression};
+ const view=render(<I18nProvider><DetailTelemetryPanel initialTab={2} sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={true} loading={false}/></I18nProvider>);
+ const panel=within(screen.getByLabelText('Verified Read · RAM-Kompression'));
+ expect(panel.getByText('4×')).toBeVisible();
+ expect(within(panel.getByText('RAM durch Kompression gespart').parentElement!).getByText('6 MB')).toBeVisible();
+ fireEvent.click(screen.getByRole('button',{name:'Letzte 5 Minuten'}));
+ expect(panel.getByText('4×')).toBeVisible();
+ fireEvent.click(panel.getByText('Kompressionskosten · seit Mount'));
+ expect(panel.getByText('50 µs')).toBeVisible();
+ expect(panel.getByText('100 µs')).toBeVisible();
+ view.rerender(<I18nProvider><DetailTelemetryPanel initialTab={2} sample={{...previewSnapshot.telemetry,details}} historical={true} loading={false}/></I18nProvider>);
+ expect(screen.queryByLabelText('Verified Read · RAM-Kompression')).not.toBeInTheDocument();
+});

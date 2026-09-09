@@ -12,6 +12,9 @@ use std::time::Instant;
 
 pub(crate) use crate::memory_budget::{MemoryPressureSnapshot, SYSTEM_REFRESH_INTERVAL};
 
+mod compression;
+use compression::{CachedPayload, Compression};
+
 const CACHE_WAYS: usize = 4;
 const CACHE_SLOT_TARGET_BYTES: usize = 16 * 1_024;
 const MAX_RECLAIM_STEPS_PER_GROUP: usize = 256;
@@ -140,6 +143,21 @@ impl std::error::Error for VerifiedReadCacheError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifiedReadCacheStatus {
+    compressed_resident_bytes: usize,
+    compressed_logical_bytes: usize,
+    compression_attempts: u64,
+    compressed_admissions: u64,
+    compression_nanos: u64,
+    compressed_hits: u64,
+    decompressions: u64,
+    decompression_nanos: u64,
+    promotions: u64,
+    demotions: u64,
+    compression_failures: u64,
+    compression_bypasses: u64,
+    codec_working_bytes: usize,
+    codec_peak_working_bytes: usize,
+    codec_max_working_bytes: usize,
     hits: u64,
     misses: u64,
     admissions: u64,
@@ -167,6 +185,21 @@ macro_rules! status_getter {
 }
 
 impl VerifiedReadCacheStatus {
+    status_getter!(compressed_resident_bytes, compressed_resident_bytes, usize);
+    status_getter!(compressed_logical_bytes, compressed_logical_bytes, usize);
+    status_getter!(compression_attempts, compression_attempts, u64);
+    status_getter!(compressed_admissions, compressed_admissions, u64);
+    status_getter!(compression_nanos, compression_nanos, u64);
+    status_getter!(compressed_hits, compressed_hits, u64);
+    status_getter!(decompressions, decompressions, u64);
+    status_getter!(decompression_nanos, decompression_nanos, u64);
+    status_getter!(promotions, promotions, u64);
+    status_getter!(demotions, demotions, u64);
+    status_getter!(compression_failures, compression_failures, u64);
+    status_getter!(compression_bypasses, compression_bypasses, u64);
+    status_getter!(codec_working_bytes, codec_working_bytes, usize);
+    status_getter!(codec_peak_working_bytes, codec_peak_working_bytes, usize);
+    status_getter!(codec_max_working_bytes, codec_max_working_bytes, usize);
     status_getter!(hits, hits, u64);
     status_getter!(misses, misses, u64);
     status_getter!(admissions, admissions, u64);
@@ -192,7 +225,9 @@ struct CacheKey {
 
 #[derive(Clone, Debug)]
 struct CacheEntry {
-    payload: VerifiedChunkPayload,
+    payload: CachedPayload,
+    recent_hits: u8,
+    last_hit_epoch: u64,
     backing_charge: Arc<CacheBackingCharge>,
 }
 
@@ -206,6 +241,7 @@ impl CacheEntry {
 #[derive(Debug)]
 struct CacheBackingCharge {
     bytes: usize,
+    compressed_logical: usize,
 }
 
 /// Result of one verified read operation.
@@ -343,6 +379,7 @@ struct CacheShard {
 #[derive(Debug, Default)]
 struct CacheAdmission {
     reclaim_cursor: usize,
+    compression_cursor: usize,
 }
 
 /// Bounded, sharded cache of immutable bytes that have already passed complete
@@ -368,6 +405,7 @@ pub struct VerifiedReadCache {
     automatic_pressure: bool,
     started: Instant,
     last_refresh_millis: AtomicU64,
+    compression: Compression,
     budget_pool: Option<CachePool>,
 }
 
@@ -473,6 +511,7 @@ impl VerifiedReadCache {
             automatic_pressure,
             started: Instant::now(),
             last_refresh_millis: AtomicU64::new(0),
+            compression: Compression::new(snapshot),
             budget_pool: automatic_pressure.then(|| {
                 CachePool::system(
                     "verifiedRead",
@@ -568,11 +607,34 @@ impl VerifiedReadCache {
         }
     }
 
+    /// Samples consistent resident accounting and cumulative counters.
+    ///
+    /// # Panics
+    /// Panics only if an earlier internal invariant poisoned a cache lock.
     #[must_use]
     pub fn status(&self) -> VerifiedReadCacheStatus {
         self.maybe_refresh_pressure();
+        let _admission = self
+            .admission
+            .lock()
+            .expect("ASSERT: cache admission lock poisoned");
         let counters = self.counters();
         VerifiedReadCacheStatus {
+            compressed_resident_bytes: self.compression.resident.load(Ordering::Relaxed),
+            compressed_logical_bytes: self.compression.logical.load(Ordering::Relaxed),
+            compression_attempts: self.compression.attempts.load(Ordering::Relaxed),
+            compressed_admissions: self.compression.admitted.load(Ordering::Relaxed),
+            compression_nanos: self.compression.compress_ns.load(Ordering::Relaxed),
+            compressed_hits: self.compression.hits.load(Ordering::Relaxed),
+            decompressions: self.compression.decodes.load(Ordering::Relaxed),
+            decompression_nanos: self.compression.decode_ns.load(Ordering::Relaxed),
+            promotions: self.compression.promotions.load(Ordering::Relaxed),
+            demotions: self.compression.demotions.load(Ordering::Relaxed),
+            compression_failures: self.compression.failures.load(Ordering::Relaxed),
+            compression_bypasses: self.compression.bypasses.load(Ordering::Relaxed),
+            codec_peak_working_bytes: self.compression.peak_working.load(Ordering::Relaxed),
+            codec_working_bytes: self.compression.working(),
+            codec_max_working_bytes: self.compression.maximum_working(),
             hits: counters.hits,
             misses: counters.misses,
             admissions: counters.admissions,
@@ -608,24 +670,50 @@ impl VerifiedReadCache {
             .lock()
             .expect("ASSERT: verified read-cache shard lock poisoned");
         let set_index = (hash / self.shards.len()) % state.sets.len();
-        let payload = state.sets[set_index]
+        let epoch = self.compression.epoch.load(Ordering::Relaxed);
+        let window = self.entry_count.load(Ordering::Relaxed).max(1) as u64;
+        let found = state.sets[set_index]
             .ways
-            .iter()
+            .iter_mut()
             .flatten()
             .find(|entry| entry.matches(key))
-            .map(|entry| entry.payload.clone());
-        if let Some(payload) = payload {
-            assert_eq!(
-                u64::try_from(payload.len()).ok(),
-                Some(logical_length),
-                "ASSERT: verified cache entry length changed after admission"
-            );
-            state.counters.hit_bytes = state.counters.hit_bytes.saturating_add(logical_length);
-            state.counters.hits = state.counters.hits.saturating_add(1);
-            return Some(payload);
-        }
-        state.counters.misses = state.counters.misses.saturating_add(1);
-        None
+            .map(|entry| {
+                entry.recent_hits = if epoch.saturating_sub(entry.last_hit_epoch) > window {
+                    1
+                } else {
+                    entry.recent_hits.saturating_add(1)
+                };
+                entry.last_hit_epoch = epoch;
+                (entry.payload.clone(), entry.recent_hits)
+            });
+        let Some((cached, recent_hits)) = found else {
+            state.counters.misses = state.counters.misses.saturating_add(1);
+            return None;
+        };
+        let payload = match cached {
+            CachedPayload::Decoded(payload) => payload,
+            CachedPayload::Compressed(value) => {
+                drop(state);
+                let payload = self.compressed_hit(&value, recent_hits);
+                state = shard
+                    .state
+                    .lock()
+                    .expect("ASSERT: cache shard lock poisoned");
+                let Some(payload) = payload else {
+                    state.counters.misses = state.counters.misses.saturating_add(1);
+                    return None;
+                };
+                payload
+            }
+        };
+        assert_eq!(
+            payload.len() as u64,
+            logical_length,
+            "ASSERT: verified cache entry length changed after admission"
+        );
+        state.counters.hit_bytes = state.counters.hit_bytes.saturating_add(logical_length);
+        state.counters.hits = state.counters.hits.saturating_add(1);
+        Some(payload)
     }
 
     #[cfg(test)]
@@ -643,22 +731,32 @@ impl VerifiedReadCache {
     /// Atomically accounts one decoder backing while admitting any number of
     /// verified Chunk views from that Encoding Record.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn admit_decoded_group(&self, payloads: Vec<VerifiedChunkPayload>) {
+    fn admit_group(&self, payloads: Vec<CachedPayload>) {
         let Some(first) = payloads.first() else {
             return;
         };
-        let allocation_bytes = first.backing_allocation_bytes();
-        for payload in &payloads {
-            assert!(
-                first.shares_backing_with(payload),
-                "ASSERT: one cache admission group must share one backing allocation"
-            );
-            assert_eq!(
-                payload.backing_allocation_bytes(),
-                allocation_bytes,
-                "ASSERT: shared decoded Record views report one allocation"
-            );
-        }
+        let (allocation_bytes, compressed_logical) = match first {
+            CachedPayload::Decoded(first) => {
+                for payload in &payloads {
+                    let CachedPayload::Decoded(payload) = payload else {
+                        panic!("ASSERT: mixed cache admission representations");
+                    };
+                    assert!(
+                        first.shares_backing_with(payload),
+                        "ASSERT: one decoded admission group shares one backing"
+                    );
+                }
+                (first.backing_allocation_bytes(), 0)
+            }
+            CachedPayload::Compressed(value) => {
+                assert_eq!(
+                    payloads.len(),
+                    1,
+                    "ASSERT: compressed chunks own independent storage"
+                );
+                (value.resident_bytes(), value.logical_length())
+            }
+        };
         self.maybe_refresh_pressure();
         let mut admission = self
             .admission
@@ -675,6 +773,7 @@ impl VerifiedReadCache {
         }
         let backing_charge = Arc::new(CacheBackingCharge {
             bytes: allocation_bytes,
+            compressed_logical,
         });
         let mut admitted_group_refs = 0_usize;
         let mut reclaim_steps = MAX_RECLAIM_STEPS_PER_GROUP;
@@ -744,8 +843,21 @@ impl VerifiedReadCache {
                 }
                 let replaced = set.ways[victim].replace(CacheEntry {
                     payload,
+                    recent_hits: 0,
+                    last_hit_epoch: self.compression.epoch.load(Ordering::Relaxed),
                     backing_charge: Arc::clone(&backing_charge),
                 });
+                if victim_bytes != 0 {
+                    self.uncharge(
+                        &replaced
+                            .as_ref()
+                            .expect("ASSERT: charged victim exists")
+                            .backing_charge,
+                    );
+                }
+                if added_bytes != 0 {
+                    self.charge(&backing_charge);
+                }
                 admitted_group_refs = remaining_group_refs + 1;
                 set.next_victim = (victim + 1) % CACHE_WAYS;
                 self.resident_bytes.store(proposed, Ordering::Release);
@@ -806,6 +918,7 @@ impl VerifiedReadCache {
             // final cache view releases its one shared allocation charge.
             if Arc::strong_count(&entry.backing_charge) == 1 {
                 let bytes = entry.backing_charge.bytes;
+                self.uncharge(&entry.backing_charge);
                 let previous = self.resident_bytes.fetch_sub(bytes, Ordering::AcqRel);
                 assert!(
                     previous >= bytes,
@@ -876,6 +989,8 @@ impl VerifiedReadCache {
             "ASSERT: verified read-cache entry accounting disagreed with its shards"
         );
         self.resident_bytes.store(0, Ordering::Release);
+        self.compression.resident.store(0, Ordering::Release);
+        self.compression.logical.store(0, Ordering::Release);
     }
 
     fn counters(&self) -> CacheShardCounters {
@@ -905,6 +1020,10 @@ fn cache_hash(key: CacheKey) -> usize {
 #[cfg(test)]
 #[path = "read_cache/reclamation_tests.rs"]
 mod reclamation_tests;
+
+#[cfg(test)]
+#[path = "read_cache/compression_tests.rs"]
+mod compression_tests;
 
 #[cfg(test)]
 mod tests {
@@ -991,7 +1110,7 @@ mod tests {
         }
     }
 
-    fn verified_payload(bytes: &[u8]) -> VerifiedChunkPayload {
+    pub(super) fn verified_payload(bytes: &[u8]) -> VerifiedChunkPayload {
         let encoded = fastdup_format::RawRecord::encode(bytes).expect("encode fixture Record");
         fastdup_format::RawRecord::decode(&encoded)
             .expect("decode and verify fixture Record")
@@ -1005,6 +1124,7 @@ mod tests {
             MemoryPressureSnapshot::new(8 * 1024 * 1024, 8 * 1024 * 1024, 0),
         )
         .unwrap();
+        cache.compression.enabled.store(false, Ordering::Relaxed);
         let old = verified_payload(&vec![31; 65536]);
         let allocation = old.backing_allocation_bytes();
         let set_count = cache.shards[0].state.lock().unwrap().sets.len();
@@ -1125,6 +1245,7 @@ mod tests {
             MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 8 * 1_024 * 1_024, 0),
         )
         .expect("construct ownership cache");
+        cache.compression.enabled.store(false, Ordering::Relaxed);
         let mut bytes = Vec::with_capacity(128 * 1_024);
         bytes.extend_from_slice(&b"decoder-owned verified payload".repeat(1_024));
         assert!(bytes.capacity() > bytes.len());

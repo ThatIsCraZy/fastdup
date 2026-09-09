@@ -666,7 +666,7 @@ fn dependent_reads_reuse_verified_bases_across_requests_but_scrub_reads_storage(
 }
 
 #[test]
-fn coalesced_raw_cache_charges_shared_encoded_backing_once() {
+fn coalesced_raw_cache_compacts_without_retaining_shared_encoded_backing() {
     use fastdup_store::{MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig};
     use std::num::NonZeroUsize;
     let root = unique_test_root("manifest-raw-backing-cache");
@@ -725,7 +725,8 @@ fn coalesced_raw_cache_charges_shared_encoded_backing_once() {
         .with_active_index(&active)
         .with_verified_read_cache(Arc::clone(&cache));
     assert_eq!(file.read_at(0, 32768).unwrap(), chunks.concat());
-    assert_eq!(cache.status().resident_bytes(), retained);
+    assert!(cache.status().resident_bytes() < retained);
+    assert_eq!(cache.status().compressed_logical_bytes(), 32768);
     assert_eq!(cache.status().entry_count(), 2);
 }
 

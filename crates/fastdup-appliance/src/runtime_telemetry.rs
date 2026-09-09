@@ -109,6 +109,18 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
             "effectiveLimitBytes":budget.effective_limit_bytes,
             "availableBytes":budget.available_bytes,
             "budgetBytes":budget.budget_bytes, "pools":pools},
+        "readCacheCompression": {
+            "decodedResidentBytes":read.resident_bytes().saturating_sub(read.compressed_resident_bytes()),
+            "compressedResidentBytes":read.compressed_resident_bytes(),
+            "compressedLogicalBytes":read.compressed_logical_bytes(),
+            "attempts":read.compression_attempts(), "admissions":read.compressed_admissions(),
+            "compressionNanos":read.compression_nanos(), "hits":read.compressed_hits(),
+            "decompressions":read.decompressions(), "decompressionNanos":read.decompression_nanos(),
+            "promotions":read.promotions(), "demotions":read.demotions(),
+            "failures":read.compression_failures(), "bypasses":read.compression_bypasses(),
+            "workingBytes":read.codec_working_bytes(), "peakWorkingBytes":read.codec_peak_working_bytes(),
+            "maxWorkingBytes":read.codec_max_working_bytes()
+        },
         "scrub": SCRUB.lock().ok().and_then(|status| status.clone()),
         "runtimeId": format!("{}", std::process::id()),
         "ioUring": {"ringEntries":io.ring_entries(), "inflightBytes":io.inflight_bytes(),

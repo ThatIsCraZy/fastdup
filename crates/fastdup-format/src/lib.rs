@@ -41,7 +41,7 @@ pub use commit::{
 };
 pub use container::{
     AdaptiveContainerEncoding, AlignedContainerBytes, BuildingContainerHeader, ChunkId,
-    ContainerHeader, ContainerId, ContainerIntrinsicSummary, ContainerLayout, ContainerRecordRange,
+    CompressedVerifiedChunkPayload, ContainerHeader, ContainerId, ContainerIntrinsicSummary, ContainerLayout, ContainerRecordRange,
     ContainerRecoveryEnvelope, ContainerStructure, DependentCodec, DependentDependency,
     DependentRecord, FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
     IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, MAX_LOGICAL_CHUNK_BYTES,

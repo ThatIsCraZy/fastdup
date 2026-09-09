@@ -8,6 +8,12 @@ export interface DetailTelemetry {
   latency?: { read: OperationLatency; write: OperationLatency } | null;
   runtime?: {
     runtimeId: string;
+    readCacheCompression?: {
+      decodedResidentBytes: number; compressedResidentBytes: number; compressedLogicalBytes: number;
+      attempts: number; admissions: number; compressionNanos: number; hits: number; decompressions: number;
+      decompressionNanos: number; promotions: number; demotions: number; failures: number; bypasses: number;
+      workingBytes: number; peakWorkingBytes: number; maxWorkingBytes: number;
+    } | null;
     cacheWindow?: {seconds: number; pools: {id: string; hits: number; misses: number; evictions: number}[]} | null;
     scrub?: {state: string; totalContainers: number; verifiedContainers: number; resumedContainers?: number; newlyVerifiedContainers?: number; remainingContainers?: number; verifiedBytes: number; readBytes: number; currentContainer?: string | null; error?: string | null} | null;
     cacheBudget?: {
@@ -51,6 +57,7 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
   const reduction = runtime?.reduction;
   const budget = runtime?.cacheBudget;
   const scrub = runtime?.scrub;
+  const compression = runtime?.readCacheCompression;
   const pools = [...(budget?.pools ?? runtime?.caches ?? [])].sort((a, b) => {
     const tier = (id: string) => budget?.pools.find(pool => pool.id === id)?.fallbackTier;
     return Number(tier(b.id) === "data") - Number(tier(a.id) === "data");
@@ -110,6 +117,33 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
               {budget && <><td>{bytes(pool?.targetBytes)}</td>{cacheCounters && <td>{bytes(pool?.leasedBytes)}</td>}</>}
             </tr>;
           })}</tbody></table></div>
+          {compression && <div className="read-cache-compression" aria-label={t("Verified Read · RAM-Kompression")}>
+            <h3>{t("Verified Read · RAM-Kompression")}</h3>
+            <p className="detail-note">{t("Häufig genutzte Daten liegen direkt im RAM, weitere Einträge komprimiert. Beide teilen sich das Verified-Read-Budget. Speicherwerte gelten zum Messpunkt.")}</p>
+            {rows([
+              ["Direkt im RAM", bytes(compression.decodedResidentBytes)],
+              ["Komprimiert im RAM", bytes(compression.compressedResidentBytes)],
+              ["Darin enthaltene Nutzdaten", bytes(compression.compressedLogicalBytes)],
+              ["RAM durch Kompression gespart", bytes(Math.max(0, compression.compressedLogicalBytes - compression.compressedResidentBytes))],
+              ["Cache-Kompressionsfaktor", compression.compressedResidentBytes ? `${number(compression.compressedLogicalBytes / compression.compressedResidentBytes)}×` : "—"]
+            ])}
+            <details><summary>{t("Kompressionskosten · seit Mount")}</summary>
+              {rows([
+                ["Treffer auf komprimierte Einträge", number(compression.hits)],
+                ["Dekompressionen", number(compression.decompressions)],
+                ["Ø Dekompression inkl. Prüfung", compression.decompressions ? `${number(compression.decompressionNanos / compression.decompressions / 1000)} µs` : "—"],
+                ["Ø Kompressionsversuch", compression.attempts ? `${number(compression.compressionNanos / compression.attempts / 1000)} µs` : "—"],
+                ["In direkte Darstellung übernommen", number(compression.promotions)],
+                ["Wieder komprimiert", number(compression.demotions)],
+                ["Kompression ausgelassen", number(compression.bypasses)],
+                ["Ungültige Cache-Einträge", number(compression.failures)],
+                ["Aktive Codec-Arbeitsreserve", bytes(compression.workingBytes)],
+                ["Spitze der Codec-Arbeitsreserve", bytes(compression.peakWorkingBytes)],
+                ["Grenze der Codec-Arbeitsreserve", bytes(compression.maxWorkingBytes)]
+              ])}
+              <p className="detail-note">{t("Komprimierte Treffer benötigen keinen DATA-Zugriff. Gleichzeitig aktive Leser können eine Dekompression teilen. Die Arbeitsreserve begrenzt temporäre Codec-Puffer und zählt separat zur Cache-Belegung.")}</p>
+            </details>
+          </div>}
           {budget && <p className="detail-note">{t("Zielbudget wird laufend angepasst. Reservierter Speicher wird erst nach der Verdrängung für andere Caches freigegeben. Die Belegung enthält Cache-Verwaltungsdaten.")}</p>}
 
         </> : empty)}

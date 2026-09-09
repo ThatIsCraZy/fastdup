@@ -316,8 +316,9 @@ the only durable coverage for a live logical chunk.
 _Avoid_: Small-file location, active location
 
 **Verified cache entry**:
-A decoded chunk or region admitted to a shared read cache only after its complete
-stored encoding and logical content identity were verified.
+A chunk or region admitted to a shared read cache only after its complete
+stored encoding and logical content identity were verified. Its RAM representation
+may be decoded or independently compressed; reuse never requires a storage Base.
 _Avoid_: Kernel-dirty page, cache location
 
 **Verified Manifest node cache**:

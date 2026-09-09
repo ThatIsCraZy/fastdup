@@ -1,3 +1,6 @@
+mod cache_payload;
+pub use cache_payload::CompressedVerifiedChunkPayload;
+
 use core::fmt;
 use std::cell::RefCell;
 use std::num::{NonZeroU32, NonZeroUsize};

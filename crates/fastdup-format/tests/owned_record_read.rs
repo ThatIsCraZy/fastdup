@@ -29,6 +29,7 @@ fn owned_raw_views_preserve_buffer_ownership_and_verified_location_coordinates()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let mut views = Vec::new();
+    let mut compact_views = Vec::new();
     for (ordinal, entry) in entries.iter().copied().enumerate() {
         let range = descriptor.record_range(entry).unwrap();
         let start = usize::try_from(range.offset()).unwrap();
@@ -41,6 +42,12 @@ fn owned_raw_views_preserve_buffer_ownership_and_verified_location_coordinates()
         assert_eq!(view.decoded_offset(), 0);
         assert!(view.matches_independent_candidate(entry));
         assert!(!view.matches_independent_candidate(entries[1 - ordinal]));
+        let compressed = view.compress_for_cache().unwrap();
+        let restored = compressed.decompress().unwrap().0;
+        assert_eq!(restored, view);
+        assert!(restored.matches_independent_candidate(entry));
+        assert!(!restored.matches_independent_candidate(entries[1 - ordinal]));
+        compact_views.push(compressed);
         let mut corrupt = image.as_ref().clone();
         corrupt[start + 192] ^= 1;
         assert!(
@@ -66,4 +73,12 @@ fn owned_raw_views_preserve_buffer_ownership_and_verified_location_coordinates()
     assert_eq!(views[0].backing_allocation_bytes(), image.capacity());
     drop(image);
     assert_eq!(views[1].as_slice(), chunks[1]);
+    drop(views);
+    for (ordinal, compact) in compact_views.into_iter().enumerate() {
+        let (restored, decoded) = compact.decompress().unwrap();
+        assert!(decoded, "the original shared buffer is no longer alive");
+        assert_eq!(restored.as_slice(), chunks[ordinal]);
+        assert!(restored.matches_independent_candidate(entries[ordinal]));
+        assert!(!restored.matches_independent_candidate(relocated));
+    }
 }

@@ -29,6 +29,8 @@ pub struct OperationLatency {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_cache_compression: Option<ReadCacheCompression>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_window: Option<CacheWindowTelemetry>,
     pub cache_budget: Option<CacheBudgetTelemetry>,
     pub scrub: Option<ScrubTelemetry>,
@@ -38,6 +40,28 @@ pub struct RuntimeDetails {
     pub reduction: ReductionTelemetry,
     pub checkpoint: Option<CheckpointTelemetry>,
     pub gc: Option<GcTelemetry>,
+}
+
+/// Gauges at the sample time and codec counters since this runtime started.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadCacheCompression {
+    pub decoded_resident_bytes: u64,
+    pub compressed_resident_bytes: u64,
+    pub compressed_logical_bytes: u64,
+    pub attempts: u64,
+    pub admissions: u64,
+    pub compression_nanos: u64,
+    pub hits: u64,
+    pub decompressions: u64,
+    pub decompression_nanos: u64,
+    pub promotions: u64,
+    pub demotions: u64,
+    pub failures: u64,
+    pub bypasses: u64,
+    pub working_bytes: u64,
+    pub peak_working_bytes: u64,
+    pub max_working_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -225,6 +249,25 @@ mod tests {
                 .state,
             "failed"
         );
+        assert!(
+            details
+                .runtime
+                .as_ref()
+                .unwrap()
+                .read_cache_compression
+                .is_none()
+        );
+        frontend["details"]["readCacheCompression"] = serde_json::json!({
+            "decodedResidentBytes":1000,"compressedResidentBytes":2000,"compressedLogicalBytes":8000,
+            "attempts":10,"admissions":8,"compressionNanos":1000000,"hits":20,"decompressions":10,
+            "decompressionNanos":500000,"promotions":2,"demotions":1,"failures":0,"bypasses":2,
+            "workingBytes":0,"peakWorkingBytes":100000,"maxWorkingBytes":200000
+        });
+        let roundtrip = serde_json::to_value(parse_details(&frontend)).unwrap();
+        assert_eq!(
+            roundtrip["runtime"]["readCacheCompression"],
+            frontend["details"]["readCacheCompression"]
+        );
         let saved = serde_json::to_value(&details).unwrap();
         assert_eq!(saved["runtime"]["scrub"], frontend["details"]["scrub"]);
         frontend["details"]["scrub"]["resumedContainers"] = serde_json::json!(2);
@@ -236,13 +279,25 @@ mod tests {
             saved["runtime"]["cacheBudget"],
             frontend["details"]["cacheBudget"]
         );
-        assert!(saved["runtime"]["reduction"].get("backendBaseReads").is_none());
-        for (key, value) in [("backendBaseReads", 140), ("skippedColdCandidates", 931),
-            ("explorationReads", 32), ("warmBaseReuses", 710), ("successfulBaseTrials", 411)] {
+        assert!(
+            saved["runtime"]["reduction"]
+                .get("backendBaseReads")
+                .is_none()
+        );
+        for (key, value) in [
+            ("backendBaseReads", 140),
+            ("skippedColdCandidates", 931),
+            ("explorationReads", 32),
+            ("warmBaseReuses", 710),
+            ("successfulBaseTrials", 411),
+        ] {
             frontend["details"]["reduction"][key] = serde_json::json!(value);
         }
         let with_gate = serde_json::to_value(parse_details(&frontend)).unwrap();
-        assert_eq!(with_gate["runtime"]["reduction"], frontend["details"]["reduction"]);
+        assert_eq!(
+            with_gate["runtime"]["reduction"],
+            frontend["details"]["reduction"]
+        );
         frontend["details"]
             .as_object_mut()
             .unwrap()

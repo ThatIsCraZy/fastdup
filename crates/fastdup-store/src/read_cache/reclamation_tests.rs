@@ -8,14 +8,16 @@ fn payload(value: u8, length: usize) -> VerifiedChunkPayload {
 }
 
 fn cache(limit: usize) -> VerifiedReadCache {
-    VerifiedReadCache::new_with_snapshot(
+    let cache = VerifiedReadCache::new_with_snapshot(
         VerifiedReadCacheConfig::new(limit, 0, NonZeroUsize::new(4).unwrap()).unwrap(),
         MemoryPressureSnapshot::new(128 * 1024 * 1024, 128 * 1024 * 1024, 0),
     )
-    .unwrap()
+    .unwrap();
+    cache.compression.enabled.store(false, Ordering::Relaxed);
+    cache
 }
 
-fn shared_group() -> Vec<VerifiedChunkPayload> {
+pub(super) fn shared_group() -> Vec<VerifiedChunkPayload> {
     let chunks: Vec<_> = (1..=16).map(|value| vec![value; 16384]).collect();
     let parts: Vec<_> = chunks.iter().map(Vec::as_slice).collect();
     let encoded =
@@ -31,7 +33,7 @@ fn shared_group() -> Vec<VerifiedChunkPayload> {
     group
 }
 
-fn limit_payload(cache: &VerifiedReadCache, bytes: usize) {
+pub(super) fn limit_payload(cache: &VerifiedReadCache, bytes: usize) {
     cache.update_memory_pressure(MemoryPressureSnapshot::new(
         128 * 1024 * 1024,
         u64::try_from(cache.metadata_bytes + bytes).unwrap(),
@@ -39,7 +41,7 @@ fn limit_payload(cache: &VerifiedReadCache, bytes: usize) {
     ));
 }
 
-fn assert_accounting(cache: &VerifiedReadCache) {
+pub(super) fn assert_accounting(cache: &VerifiedReadCache) {
     let _admission = cache.admission.lock().unwrap();
     let mut backings = std::collections::BTreeMap::new();
     let mut entries = 0;
@@ -56,6 +58,29 @@ fn assert_accounting(cache: &VerifiedReadCache) {
     assert_eq!(cache.entry_count.load(Ordering::Acquire), entries);
     let resident = cache.resident_bytes.load(Ordering::Acquire);
     assert_eq!(resident, backings.values().sum::<usize>());
+    let mut compressed = std::collections::BTreeMap::new();
+    for shard in &cache.shards {
+        let state = shard.state.lock().unwrap();
+        for entry in state.sets.iter().flat_map(|set| set.ways.iter().flatten()) {
+            if entry.backing_charge.compressed_logical != 0 {
+                compressed.insert(
+                    Arc::as_ptr(&entry.backing_charge).addr(),
+                    (
+                        entry.backing_charge.bytes,
+                        entry.backing_charge.compressed_logical,
+                    ),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        cache.compression.resident.load(Ordering::Acquire),
+        compressed.values().map(|v| v.0).sum::<usize>()
+    );
+    assert_eq!(
+        cache.compression.logical.load(Ordering::Acquire),
+        compressed.values().map(|v| v.1).sum::<usize>()
+    );
     assert!(resident <= cache.target_bytes.load(Ordering::Acquire));
     assert!(resident + cache.metadata_bytes <= cache.config.hard_limit_bytes);
 }
@@ -68,7 +93,10 @@ fn shared_backing_is_charged_until_its_last_cache_view_is_evicted() {
     limit_payload(&cache, bytes);
     cache.admit_decoded_group(group.clone());
     assert!(cache.status().entry_count() > 1);
-    let protected = Arc::new(CacheBackingCharge { bytes: 0 });
+    let protected = Arc::new(CacheBackingCharge {
+        bytes: 0,
+        compressed_logical: 0,
+    });
     for _ in 0..1024 {
         {
             let mut admission = cache.admission.lock().unwrap();

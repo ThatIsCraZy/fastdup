@@ -404,3 +404,6 @@ progress { accent-color: #63c4d5; height: 6px; }
 .cache-memory progress { width: 100%; }
 @media (max-width: 1100px) { .cache-memory .telemetry-values { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 700px) { .cache-memory .telemetry-values { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+.read-cache-compression { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border, #253945); }
+.read-cache-compression summary { cursor: pointer; color: var(--muted, #afbecb); padding: .6rem 0; }

@@ -400,3 +400,67 @@ Chunk identity and logical length from each payload instead of expanding them
 into a temporary keyed vector and comparing the copied values back again.
 Shared backing identity/size checks, admission serialization, shard locks,
 victim order, pressure behavior and allocation charging remain unchanged.
+
+## Independently compressed Verified Read entries (9 September 2026)
+
+Verified Read now keeps decoded and independently LZ4-compressed representations
+inside the same sharded cache and the same DATA-priority broker lease. There is
+no fixed RAM split. Historical Proofs are unchanged. The compressed RAM format
+is process-local and never written into a Container or used by recovery/scrub.
+
+New verified admissions trial fast LZ4 on complete logical Chunks, including
+fully reconstructed dependent Chunks. A compact entry has no external Base,
+Dictionary, disk address to follow, or backend callback. Its original verified
+independent-Location provenance is retained separately from its RAM encoding.
+Compression is admitted only if compact bytes plus owner/allocation overhead
+are smaller than the represented payload and the complete admission costs less
+than the original shared allocation. A mixed group stays decoded if one sibling
+cannot profitably compress: a remaining raw sibling must not pin a complete
+Record while additional compressed copies consume RAM. Codec workspace
+exhaustion also retains the original decoded group without delaying admission.
+
+Compressed entries keep only weak references to live decoded reader buffers.
+These preserve existing zero-copy slices while a caller already owns the
+original Record or a recent decode, without keeping that allocation resident in
+the cache. A compressed hit with no live view reconstructs exactly one bounded
+Chunk, checks its full logical length and BLAKE3 identity, and only then creates
+a verified payload. Readers of the same entry share the decode while its owned
+result remains alive. A damaged cache copy is removed and becomes an ordinary
+verified storage miss; it cannot repeatedly poison replacement admission or
+create verified bytes. Recovery, full verification and scrub remain independent.
+
+Hot promotion is optional and nonblocking. Reuse evidence ages after roughly one
+resident-entry count of new admission groups. At least two recent hits plus
+measured decode-and-verification nanoseconds per additional resident byte must
+justify decoded retention relative to a smoothed portfolio of observed decodes.
+This is a bounded heuristic, not a calibrated probability or a fixed size quota.
+Promotion uses only free capacity in the current lease: saving CPU must not
+evict another entry that prevents DATA reads. Under admission pressure one old,
+sole-owned decoded victim near a separate bounded demotion cursor may be recompressed
+outside cache locks. Shared decoded allocations retain their existing ownership
+rules; normal bounded replacement handles entries that cannot be demoted.
+
+Compression/decompression never runs with a shard or admission lock held.
+Compression is optional and does not wait for workspace. A RAM hit may wait for
+bounded codec workspace, never turn into disk I/O merely because codecs are
+busy. The conservative workspace bound derives from effective memory reserve
+and available CPUs, with room for at least one maximum-Chunk operation. It
+charges prepared compact output, bounded source/output buffers and codec scratch;
+returned immutable views are ordinary reader working memory, as on a cold read.
+Outstanding views remain valid after eviction, lease shrink, or process-Swap
+admission closure. The existing sampled 92% ceiling remains an operating target,
+not a kernel guarantee against unrelated concurrent allocations.
+
+Resident bytes charge each surviving decoded backing once or each independent
+compact owner once. Promotion, demotion, invalidation and eviction update both
+representations under the admission lock before returning a broker lease.
+Telemetry reports decoded RAM, compact RAM including owner overhead, logical
+bytes represented by compact entries, and workspace current/peak/limit gauges.
+Separate lifetime counters expose compact hits, actual decodes, compression and
+decode/identity-check time, promotions, demotions, bypasses and invalid copies.
+The UI keeps these sample-time gauges separate from its five-minute hit-rate
+window and labels codec cost counters as lifetime values. Missing fields in old
+runtime/history samples remain unavailable.
+
+Validation and performance limits are recorded in
+[compressed read cache qualification](../testing/compressed-read-cache-2026-09-09.md).
