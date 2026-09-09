@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.2/fastdup-0.7.2-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Produktseite</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.2">Release-Informationen</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.3">Release-Informationen</a>
 </p>
 
 fastdup ist eine experimentelle, softwaredefinierte Single-Node-
@@ -31,6 +31,25 @@ HTTPS-WebUI hält die Administration einfach.
 > fastdup ist ein Forschungsprototyp und kein produktionsreifes Backup-Produkt.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
+
+## Neu in v0.7.3 · 9. September 2026
+
+- Verified Read hält seltener wiederverwendete Nutzdaten unabhängig mit LZ4
+  komprimiert, wenn das RAM spart. Häufig genutzte Daten können dekomprimiert
+  bleiben; beide Darstellungen teilen sich das adaptive Cache-Budget.
+- Die Telemetrie zeigt direkt und komprimiert belegtes RAM, enthaltene Nutzdaten,
+  Speicherersparnis, Codec-Kosten und den begrenzten Arbeitsspeicher der Codecs.
+- Behebt den Metadata-GC-Absturz beim erneuten Veröffentlichen gleicher Inhalte
+  nach einer gleichzeitigen Pin-Freigabe oder unterbrochenen exakten Sammlung.
+- Runtime-Ausfälle und pausierte Schreibzugriffe bleiben in der Top-Leiste
+  sichtbar. Ein erreichbarer Agent gilt nicht mehr als gesundes Repository;
+  fehlende Runtime-Messpunkte verwerfen alte Durchsatzwerte.
+- Nach einem Crash bereinigt der Start einen getrennten FUSE-Mount unter der
+  Repository-Sperre und führt anschließend die normale Recovery aus.
+
+[Release-Details v0.7.3](docs/releases/v0.7.3.md) · RPM-Version **0.7.3-1**.
+[Cache-Prüfungen](docs/testing/compressed-read-cache-2026-09-09.md) ·
+[Crash- und Statusprüfungen](docs/testing/metadata-gc-crash-2026-09-09.md).
 
 ## Neu in v0.7.2 · 9. September 2026
 
@@ -194,11 +213,11 @@ Benötigt werden:
 Aktuelles Binärpaket herunterladen und installieren:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.2/fastdup-0.7.2-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.2/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.7.2-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.7.3-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 
@@ -242,9 +261,9 @@ ausgeliefert. Über eine einzige Browseroberfläche kann ein Administrator:
 | --- | --- |
 | ![Repository-Belegung in der fastdup-WebUI](docs/assets/webui-drives.png) | ![Verwaltung von SMB-Freigaben in der fastdup-WebUI](docs/assets/webui-shares.png) |
 
-<p align="center"><em>Die Screenshots stammen automatisiert aus der echten React-WebUI und verwenden deren mitgelieferte Preview-Daten.</em></p>
+<p align="center"><em>WebUI-Vorschau mit synthetischen Beispieldaten.</em></p>
 
-![Cache-Trefferraten der letzten fünf Minuten mit Beispieldaten](docs/assets/webui-cache.png)
+![Cache-Trefferraten der letzten fünf Minuten und Verified-Read-RAM-Kompression mit Beispieldaten](docs/assets/webui-cache.png)
 
 ## Ersteinrichtung
 

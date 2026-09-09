@@ -1,8 +1,8 @@
 %global debug_package %{nil}
 
 Name:           fastdup
-Version:        0.7.2
-Release:        2%{?dist}
+Version:        0.7.3
+Release:        1%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -108,6 +108,10 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Wed Sep 09 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.3-1
+- Release compressed Verified Read caching, Metadata GC crash fixes and live Runtime health.
+- Refresh bilingual README, product page, screenshots and release documentation.
+
 * Wed Sep 09 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.2-2
 - Retire Metadata GC journals before exact collection and safe content republication.
 - Reflect Runtime loss and closed write admission in live UI state and audit events.

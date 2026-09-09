@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.2/fastdup-0.7.2-1.el10.x86_64.rpm">Download the RPM</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm">Download the RPM</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Product page</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.2">Release notes</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.3">Release notes</a>
 </p>
 
 fastdup is an experimental, software-defined single-node storage appliance for
@@ -29,6 +29,25 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > [!WARNING]
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
+
+## New in v0.7.3 · 9 September 2026
+
+- Verified Read retains less frequently reused payloads independently compressed
+  with LZ4 when that saves RAM. Frequently reused data can remain decoded; both
+  representations compete within the existing adaptive cache budget.
+- Cache telemetry shows decoded and compressed RAM, represented payload bytes,
+  saved memory, codec costs and bounded workspace use.
+- Fix a Metadata-GC crash when collected content is published again after a
+  concurrent pin release or an interrupted exact collection.
+- Runtime loss and paused writes appear persistently in the WebUI top bar.
+  Live agent telemetry no longer implies a healthy repository, and missing
+  Runtime samples clear stale throughput.
+- Startup reclaims a disconnected FUSE mount after acquiring the repository
+  lease, then performs normal recovery.
+
+[Release notes v0.7.3](docs/releases/v0.7.3.md) · RPM version **0.7.3-1**.
+[Cache qualification](docs/testing/compressed-read-cache-2026-09-09.md) ·
+[Crash and Runtime-health qualification](docs/testing/metadata-gc-crash-2026-09-09.md).
 
 ## New in v0.7.2 · 9 September 2026
 
@@ -190,11 +209,11 @@ You need:
 Download and install the current binary package:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.2/fastdup-0.7.2-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.2/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.7.2-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.7.3-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 
@@ -237,9 +256,9 @@ single browser interface, an administrator can:
 | --- | --- |
 | ![Repository storage usage in the fastdup WebUI](docs/assets/webui-drives.png) | ![SMB share management in the fastdup WebUI](docs/assets/webui-shares.png) |
 
-<p align="center"><em>These screenshots are generated from the real React WebUI using its bundled preview dataset.</em></p>
+<p align="center"><em>WebUI preview with synthetic sample data.</em></p>
 
-![Five-minute cache hit rates with sample data](docs/assets/webui-cache.png)
+![Five-minute cache hit rates and Verified Read RAM compression with sample data](docs/assets/webui-cache.png)
 
 ## First-time setup
 
