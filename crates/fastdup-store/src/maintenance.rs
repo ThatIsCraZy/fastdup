@@ -220,11 +220,13 @@ fn percentage_greater_than(numerator: u64, denominator: u64, percent: u64) -> bo
 fn build_reverse_dependency_generation<X: StorageIo>(
     exact: &crate::ActivatedExactIndex<X>,
     liveness: &GenerationLivenessProof,
+    cancellation: Option<&crate::MaintenanceCancellation>,
 ) -> Result<ReverseDependencyGeneration, MaintenanceError> {
     let mut required_chunks = liveness.online_chunks().clone();
     let mut dependents_by_base = BTreeMap::<ChunkId, BTreeSet<ChunkId>>::new();
     let mut dependency_edges = 0_u64;
     for (chunk_id, logical_length) in liveness.online_chunks() {
+        cancellation.map_or(Ok(()), crate::MaintenanceCancellation::check)?;
         let logical_length_u32 =
             u32::try_from(*logical_length).map_err(|_| MaintenanceError::ArithmeticOverflow)?;
         let lookup = exact.lookup_transitions(*chunk_id, logical_length_u32)?;
@@ -343,6 +345,7 @@ pub struct MaintenanceRepository<M, C, X> {
     exact_profile: ExactIndexProfileId,
     rebuild_lock: Arc<Mutex<()>>,
     reverse_dependency_cache: Arc<Mutex<Option<Arc<ReverseDependencyGeneration>>>>,
+    cancellation: Option<crate::MaintenanceCancellation>,
 }
 
 impl<M, C, X> MaintenanceRepository<M, C, X> {
@@ -360,6 +363,7 @@ impl<M, C, X> MaintenanceRepository<M, C, X> {
             exact_profile,
             rebuild_lock: Arc::new(Mutex::new(())),
             reverse_dependency_cache: Arc::new(Mutex::new(None)),
+            cancellation: None,
         }
     }
 }
@@ -615,6 +619,7 @@ where
             .copied()
             .take(GC_CANDIDATE_PROOF_MAX_VICTIMS)
         {
+            self.check_cancellation()?;
             let container = self
                 .containers
                 .read_with_index(row.container_id(), &exact)?;
@@ -738,7 +743,11 @@ where
         {
             return Ok(Arc::clone(cached));
         }
-        let built = Arc::new(build_reverse_dependency_generation(exact, liveness)?);
+        let built = Arc::new(build_reverse_dependency_generation(
+            exact,
+            liveness,
+            self.cancellation.as_ref(),
+        )?);
         *cache = Some(Arc::clone(&built));
         Ok(built)
     }
@@ -807,6 +816,7 @@ where
                     .visit_published_intrinsic_summaries::<GcCandidateCatalogStoreError, _>(
                         names,
                         |container_id, container_generation, physical_bytes, summary| {
+                            crate::maintenance_cancellation::check_io(self.cancellation.as_ref())?;
                             emit(GcCandidateCatalogRow::from_intrinsic_summary(
                                 container_id,
                                 container_generation,
@@ -883,6 +893,46 @@ where
         )
     }
 
+    /// Runs an adaptive quantum with cooperative shutdown at safe boundaries.
+    /// The original repository and frontend views remain unaffected.
+    ///
+    /// # Errors
+    /// Returns a classified cancellation or the same failures as the uncancellable cycle.
+    pub fn run_adaptive_online_gc_cycle_cancellable<G>(
+        &self,
+        catalog: &GcCandidateCatalogRepository<G>,
+        pool_usage: DataPoolUsage,
+        mode: OnlineGcRunMode,
+        relocation_workers: NonZeroUsize,
+        cancellation: &crate::MaintenanceCancellation,
+    ) -> Result<OnlineGcCycleReport, MaintenanceError>
+    where
+        M: Send + 'static,
+        C: Send + 'static,
+        X: Send + Sync + 'static,
+        G: Clone + Send + Sync + StorageIo + 'static,
+    {
+        cancellation.check()?;
+        let mut repository = self.clone();
+        repository.generations = repository
+            .generations
+            .with_maintenance_cancellation(cancellation.clone());
+        repository.cancellation = Some(cancellation.clone());
+        repository.run_adaptive_online_gc_cycle_with_workers(
+            catalog,
+            pool_usage,
+            mode,
+            relocation_workers,
+        )
+    }
+
+    fn check_cancellation(&self) -> Result<(), MaintenanceError> {
+        self.cancellation
+            .as_ref()
+            .map_or(Ok(()), crate::MaintenanceCancellation::check)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn run_online_gc_cycle<G: Clone + StorageIo>(
         &self,
@@ -906,12 +956,15 @@ where
             ..OnlineGcMetrics::default()
         };
         let phase_started = Instant::now();
+        self.check_cancellation()?;
         self.finalize_recovered_online_gc()?;
         metrics.recovery_wall = phase_started.elapsed();
         let phase_started = Instant::now();
+        self.check_cancellation()?;
         let metadata_gc = self.garbage_collect_metadata()?;
         metrics.metadata_gc_wall = phase_started.elapsed();
         let phase_started = Instant::now();
+        self.check_cancellation()?;
         if catalog.recover_latest()?.is_none() {
             let rebuilt =
                 self.rebuild_gc_candidate_catalog(catalog, next_gc_catalog_generation(catalog)?)?;
@@ -972,6 +1025,7 @@ where
             });
         }
         let phase_started = Instant::now();
+        self.check_cancellation()?;
         let proof = match self.prove_gc_candidates(&shortlist, pool_usage) {
             Ok(proof) => {
                 metrics.proved_victims = u64::try_from(proof.victim_containers())
@@ -1020,6 +1074,7 @@ where
         };
         let victim_bytes = proof.victim_bytes();
         let phase_started = Instant::now();
+        self.check_cancellation()?;
         let retirement = self.begin_online_gc_retirement_with_workers(proof, relocation_workers)?;
         let collected = self.finish_online_gc_retirement(retirement)?;
         metrics.relocation_wall = phase_started.elapsed();
@@ -1033,6 +1088,7 @@ where
         metrics.data_sync_wall = collected.data_sync_wall();
         metrics.removed_activation_wall = collected.removed_activation_wall();
         let phase_started = Instant::now();
+        self.check_cancellation()?;
         let generation = next_gc_catalog_generation(catalog)?;
         let catalog = self.rebuild_gc_candidate_catalog(catalog, generation)?;
         metrics.catalog_write_bytes = metrics
@@ -1171,6 +1227,7 @@ where
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn begin_online_gc_retirement_with_workers(
         &self,
         proof: GcCandidateProof,
@@ -1228,6 +1285,7 @@ where
             &replacement_chunks,
             relocation_workers,
             |container_id| {
+                self.check_cancellation()?;
                 let image = self.containers.read_verified_image(container_id)?;
                 let container = image.container();
                 retiring_entries
@@ -3163,6 +3221,7 @@ impl BackgroundMaintenanceReport {
 
 #[derive(Debug)]
 pub enum MaintenanceError {
+    Cancelled(crate::MaintenanceCancelled),
     Store(StoreError),
     Generation(GenerationError),
     RecoveryCheckpoint(crate::RecoveryCheckpointError),
@@ -3202,6 +3261,31 @@ pub enum MaintenanceError {
     ContainerRecordLocationMismatch,
     ArithmeticOverflow,
     OutOfMemory,
+}
+
+impl MaintenanceError {
+    /// True only for an explicit cooperative stop, never a coincident I/O failure.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        use crate::maintenance_cancellation::is_cancelled_io;
+        match self {
+            Self::Cancelled(_) => true,
+            Self::Generation(
+                GenerationError::Io(error)
+                | GenerationError::ManifestTree(crate::manifest_tree::ManifestTreeError::Io(error)),
+            )
+            | Self::GcCandidateCatalog(GcCandidateCatalogStoreError::Io(error)) => {
+                is_cancelled_io(error)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl From<crate::MaintenanceCancelled> for MaintenanceError {
+    fn from(error: crate::MaintenanceCancelled) -> Self {
+        Self::Cancelled(error)
+    }
 }
 
 impl fmt::Display for MaintenanceError {

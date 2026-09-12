@@ -83,6 +83,12 @@ pub fn gc_finished(result: &Result<OnlineGcCycleReport, String>) {
     }
 }
 
+pub fn gc_cancelled() {
+    if let Ok(mut last) = GC.lock() {
+        *last = Some(json!({"state":"cancelled", "observedAt":unix_seconds()}));
+    }
+}
+
 pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value {
     let io = storage.inner.status();
     let read = appliance.verified_read_cache_status();

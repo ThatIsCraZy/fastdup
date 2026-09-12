@@ -22,6 +22,8 @@ pub use manifest_tree::{ManifestRangeExtent, ManifestTreeSummary};
 mod cache_budget;
 mod long_lived_arena;
 mod maintenance;
+mod maintenance_cancellation;
+pub use maintenance_cancellation::{MaintenanceCancellation, MaintenanceCancelled};
 mod maintenance_ioprio;
 mod memory_budget;
 mod allocator_memory;

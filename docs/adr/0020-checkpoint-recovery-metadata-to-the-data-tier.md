@@ -40,3 +40,9 @@ scan, verification, and HDD publication hold neither the Commit lock nor the
 Metadata-GC publication barrier. The exact v1 byte layout and crash boundaries
 are specified in
 [`recovery-checkpoint-v1.md`](../specs/recovery-checkpoint-v1.md).
+
+During shutdown the periodic scheduler is stopped immediately, alongside GC and
+Scrub, so it cannot repeatedly copy the same graph while another worker drains.
+An already running copy is awaited. The mandatory final publication runs after
+final Namespace catch-up; stopping periodic scheduling early does not move that
+last disaster-recovery point before the final durable Commit.

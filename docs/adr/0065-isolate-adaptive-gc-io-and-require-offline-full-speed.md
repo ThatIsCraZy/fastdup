@@ -63,3 +63,18 @@ that filesystem socket through a short directory-file-descriptor path, so the
 bounded `sockaddr_un.sun_path` does not impose a shorter-than-POSIX limit on the
 Metadata root while filesystem ownership and mode remain the authorization
 boundary.
+
+An adaptive runtime quantum accepts a cooperative maintenance cancellation
+request. Stop checks occur between Metadata graph objects, candidate identity
+reads, reverse-dependency targets, Container hint rows, and major phases. The
+cancellable Generation repository is a maintenance-only clone sharing the same
+locks and pins; cancelling it cannot cancel frontend commits or final catch-up.
+No storage worker is detached on shutdown.
+
+Cancellation before a durable DATA retirement may leave unused immutable
+replacement objects, which remain ordinary future GC candidates. Once RETIRING
+is activated, the bounded retirement finishes its predecessor-pin drain,
+verified unlink, DATA directory sync, and REMOVED activation. Cancellation must
+not turn an incomplete transition into success. The caller then skips further
+catalog rebuilding and background phases. Existing storage errors and assertion
+failures remain failures, even when a stop was requested at the same time.

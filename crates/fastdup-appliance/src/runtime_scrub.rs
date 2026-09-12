@@ -59,8 +59,12 @@ impl Drop for ScrubHandle {
 }
 
 impl ScrubHandle {
-    pub async fn stop(mut self) -> Result<(), String> {
+    pub fn request_stop(&self) {
         self.gate.0.cancelled.store(true, Ordering::Release);
+    }
+
+    pub async fn stop(mut self) -> Result<(), String> {
+        self.request_stop();
         let worker = self.worker.take().expect("scrub worker joined once");
         tokio::task::spawn_blocking(move || worker.join())
             .await

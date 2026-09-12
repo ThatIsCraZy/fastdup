@@ -46,3 +46,22 @@ Orderly catch-up, FUSE unmount, and latch clearing retain the ordering above.
 A process-isolated regression delivers a real SIGINT after canceling the
 receive wait and before its first poll, and requires both notifications to
 remain available to the supervisor.
+
+On orderly shutdown, the runtime closes mutation admission before waiting for
+management clients or background workers. It immediately signals Online GC,
+Scrub, and the periodic Recovery Checkpoint scheduler. GC observes a shared
+cooperative stop request inside long graph/proof scans, rather than waiting for
+its asynchronous scheduler to regain control after a complete quantum. A stop
+is a distinct maintenance outcome, not an integrity failure. The frontend's
+repository view is not cancelled.
+
+The owner awaits actual worker termination; dropping or aborting an asynchronous
+join handle is not evidence that its blocking storage worker stopped. All
+workers are drained even if an earlier shutdown phase fails. Already admitted
+mutations still undergo final catch-up. The last Recovery Checkpoint is published
+after that catch-up and after any in-flight periodic copy has completed. Only
+successful background termination, catch-up, final recovery publication, and
+unmount permit clearing the latch. Errors retain the latch and are reported
+after cleanup. Phase durations distinguish GC drain, final commit, recovery
+copy, and unmount; shutdown is not promised to outrun a blocked kernel I/O or a
+required durability sync.

@@ -934,6 +934,113 @@ fn adaptive_online_gc_collects_metadata_in_the_idle_io_worker() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn shutdown_cancels_metadata_gc_without_losing_committed_data_or_reusing_partial_marks() {
+    use fastdup_store::MaintenanceCancellation;
+    use std::fmt::Write as _;
+    use std::num::NonZeroUsize;
+
+    for operation in [StorageOperation::Read, StorageOperation::RemoveFile] {
+        let metadata = MemoryStorageIo::new();
+        let (generations, containers, indexes, profile) =
+            seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
+        let mut orphan_names = Vec::new();
+        for value in [0x51, 0x52, 0x53] {
+            let orphan = ManifestLeaf::new(
+                4096,
+                vec![ManifestExtent::Fill {
+                    logical_length: 4096,
+                    value,
+                }],
+            )
+            .expect("valid orphan");
+            let id = generations
+                .publish_manifest(&orphan)
+                .expect("publish orphan");
+            let mut hex = String::new();
+            for byte in id.bytes() {
+                write!(hex, "{byte:02x}").expect("write hex ID");
+            }
+            orphan_names.push(format!("{hex}.fdm"));
+        }
+        orphan_names.sort();
+        MaintenanceRepository::new(generations, containers.clone(), indexes.clone(), profile)
+            .rebuild_exact_index()
+            .expect("activate Exact before online GC");
+        let paused = PausedStorageIo::disarmed_before_name_prefix(
+            metadata.clone(),
+            operation,
+            orphan_names[0].clone(),
+        );
+        let generations = GenerationRepository::new(
+            paused.clone(),
+            PolicySetId::new([0x81; 32]).expect("fixture policy"),
+        );
+        let maintenance =
+            MaintenanceRepository::new(generations.clone(), containers, indexes, profile);
+        let worker_repository = maintenance.clone();
+        let catalog = GcCandidateCatalogRepository::new(metadata.clone());
+        let token = MaintenanceCancellation::new();
+        let worker_token = token.clone();
+        paused.arm();
+        let worker = std::thread::spawn(move || {
+            worker_repository.run_adaptive_online_gc_cycle_cancellable(
+                &catalog,
+                DataPoolUsage::new(50, 100).expect("usage"),
+                OnlineGcRunMode::Background,
+                NonZeroUsize::MIN,
+                &worker_token,
+            )
+        });
+        let reached = paused.wait_until_reached(Duration::from_secs(2));
+        token.cancel();
+        paused.resume();
+        let result = worker.join().expect("worker joined, never detached");
+        assert!(
+            reached,
+            "stop is injected into an active Metadata GC operation"
+        );
+        assert!(
+            result
+                .expect_err("GC must stop instead of finishing the pool")
+                .is_cancelled()
+        );
+        let remaining = orphan_names
+            .iter()
+            .filter(|name| metadata.exists(name).expect("lookup"))
+            .count();
+        assert_eq!(
+            remaining,
+            if operation == StorageOperation::Read {
+                3
+            } else {
+                2
+            },
+            "only the already entered operation may finish after stop"
+        );
+        metadata.crash();
+        maintenance
+            .scrub()
+            .expect("durable committed graph survives interrupted GC");
+        let report = maintenance
+            .garbage_collect_metadata()
+            .expect("uncancelled owner retries GC");
+        assert_eq!(
+            report.mark_mode(),
+            MetadataGcMarkMode::ExactSnapshot,
+            "partial mark must never authorize catalog reuse"
+        );
+        assert_eq!(
+            report.objects_removed(),
+            u64::try_from(remaining).expect("small count")
+        );
+        maintenance
+            .scrub()
+            .expect("completed retry preserves DATA and Metadata");
+    }
+}
+
+#[test]
 fn metadata_gc_retains_a_manifest_pinned_by_a_long_lived_reader() {
     let metadata = MemoryStorageIo::new();
     let (generations, containers, indexes, profile) =

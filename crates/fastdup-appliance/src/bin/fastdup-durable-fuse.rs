@@ -26,10 +26,11 @@ use fastdup_posix::{
 };
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo,
-    GcCandidateCatalogRepository, GenerationRepository, MaintenanceRepository,
-    OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport, OnlineGcRunMode,
-    OwnedContainerPublication, RecoveryCheckpointRepository, SimilarityIndexRepository, StorageIo,
-    StoreError, TieredStorageIo, publication_sample_ranges, system_memory_budget_governor,
+    GcCandidateCatalogRepository, GenerationRepository, MaintenanceCancellation,
+    MaintenanceRepository, OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport,
+    OnlineGcRunMode, OwnedContainerPublication, RecoveryCheckpointRepository,
+    SimilarityIndexRepository, StorageIo, StoreError, TieredStorageIo, publication_sample_ranges,
+    system_memory_budget_governor,
 };
 
 mod common;
@@ -109,6 +110,7 @@ struct OnlineGcRuntimeHandle {
     requests: mpsc::Sender<OnlineGcControlRequest>,
     configuration: watch::Sender<OnlineGcRuntimeConfiguration>,
     shutdown: watch::Sender<bool>,
+    cancellation: MaintenanceCancellation,
     worker: JoinHandle<Result<(), String>>,
 }
 
@@ -281,13 +283,18 @@ struct ManagementFrontendTelemetry {
 struct RecoveryCheckpointRuntimeHandle {
     shutdown: watch::Sender<bool>,
     worker: JoinHandle<Result<(), String>>,
+    generations: GenerationRepository<FsStorageIo>,
+    checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 }
 
 impl OnlineGcRuntimeHandle {
+    fn request_stop(&self) {
+        self.cancellation.cancel();
+        let _ = self.shutdown.send(true);
+    }
+
     async fn stop(self) -> Result<(), String> {
-        self.shutdown
-            .send(true)
-            .map_err(|_| "Online-GC runtime stopped before shutdown".to_owned())?;
+        self.request_stop();
         self.worker
             .await
             .map_err(|error| format!("Online-GC runtime join failed: {error}"))?
@@ -295,13 +302,40 @@ impl OnlineGcRuntimeHandle {
 }
 
 impl RecoveryCheckpointRuntimeHandle {
+    fn request_stop(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
     async fn stop(self) -> Result<(), String> {
-        self.shutdown
-            .send(true)
-            .map_err(|_| "Recovery-Checkpoint runtime stopped before shutdown".to_owned())?;
-        self.worker
+        self.request_stop();
+        let wait_started = Instant::now();
+        let worker_result = self
+            .worker
             .await
-            .map_err(|error| format!("Recovery-Checkpoint runtime join failed: {error}"))?
+            .map_err(|error| format!("Recovery-Checkpoint runtime join failed: {error}"))
+            .and_then(|result| result);
+        eprintln!(
+            "shutdown_phase=recovery_checkpoint_worker elapsed_ms={} ok={}",
+            wait_started.elapsed().as_millis(),
+            worker_result.is_ok(),
+        );
+        let publish_started = Instant::now();
+        let publish_result = publish_recovery_checkpoint_once(self.generations, self.checkpoints)
+            .await
+            .map(drop);
+        eprintln!(
+            "shutdown_phase=recovery_checkpoint_final_copy elapsed_ms={} ok={}",
+            publish_started.elapsed().as_millis(),
+            publish_result.is_ok(),
+        );
+        match (worker_result, publish_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(worker), Ok(())) => Err(worker),
+            (Ok(()), Err(publish)) => Err(publish),
+            (Err(worker), Err(publish)) => {
+                Err(format!("{worker}; final Recovery Checkpoint failed: {publish}"))
+            }
+        }
     }
 }
 
@@ -540,21 +574,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    namespace.pause_mutation_admission();
+    gc_runtime.request_stop();
+    recovery_checkpoint_runtime.request_stop();
+    scrub_runtime.request_stop();
     management_server.stop().await;
-    scrub_runtime.stop().await?;
-    let clean_catch_up = stop_background_and_catch_up(
+    let scrub_started = Instant::now();
+    let scrub_result = scrub_runtime.stop().await;
+    eprintln!(
+        "shutdown_phase=background_scrub elapsed_ms={} ok={}",
+        scrub_started.elapsed().as_millis(),
+        scrub_result.is_ok(),
+    );
+    let background_result = stop_background_and_catch_up(
         Arc::clone(&appliance),
         gc_runtime,
         recovery_checkpoint_runtime,
     )
-    .await?;
-    mount.unmount().await?;
-    if clean_catch_up && !namespace.integrity_failed() {
+    .await;
+    let unmount_started = Instant::now();
+    let unmount_result = mount.unmount().await;
+    eprintln!(
+        "shutdown_phase=unmount elapsed_ms={} ok={}",
+        unmount_started.elapsed().as_millis(),
+        unmount_result.is_ok(),
+    );
+    let clean_shutdown = scrub_result.is_ok()
+        && background_result.is_ok()
+        && unmount_result.is_ok()
+        && !namespace.integrity_failed();
+    if clean_shutdown {
         recovery_latch.mark_clean()?;
     }
     emit_verified_read_cache(&appliance);
     data_storage.emit();
     emit_io_uring_state(&data_storage);
+    scrub_result?;
+    background_result?;
+    unmount_result?;
     Ok(())
 }
 
@@ -588,19 +645,42 @@ async fn stop_background_and_catch_up(
     appliance: Arc<FsAppliance>,
     gc_runtime: OnlineGcRuntimeHandle,
     recovery_checkpoint_runtime: RecoveryCheckpointRuntimeHandle,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     appliance.namespace().pause_mutation_admission();
-    gc_runtime.stop().await?;
-    match catch_up(appliance).await {
+    let gc_started = Instant::now();
+    let gc_result = gc_runtime.stop().await;
+    eprintln!(
+        "shutdown_phase=online_gc elapsed_ms={} ok={}",
+        gc_started.elapsed().as_millis(),
+        gc_result.is_ok(),
+    );
+    let catch_up_started = Instant::now();
+    let catch_up_result = match catch_up(appliance).await {
         Ok(()) => {
-            recovery_checkpoint_runtime.stop().await?;
-            Ok(true)
+            eprintln!(
+                "shutdown_phase=final_catch_up elapsed_ms={} ok=true",
+                catch_up_started.elapsed().as_millis(),
+            );
+            Ok(())
         }
         Err(error) => {
+            eprintln!(
+                "shutdown_phase=final_catch_up elapsed_ms={} ok=false",
+                catch_up_started.elapsed().as_millis(),
+            );
             eprintln!("CRITICAL: final checkpoint failed during shutdown: {error}");
-            recovery_checkpoint_runtime.stop().await?;
-            Ok(false)
+            Err(format!("final checkpoint failed during shutdown: {error}"))
         }
+    };
+    let recovery_result = recovery_checkpoint_runtime.stop().await;
+    let errors = [gc_result, catch_up_result, recovery_result]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -800,12 +880,15 @@ fn start_recovery_checkpoint_runtime(
     checkpoints: RecoveryCheckpointRepository<FsStorageIo>,
 ) -> RecoveryCheckpointRuntimeHandle {
     let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let worker_generations = generations.clone();
+    let worker_checkpoints = checkpoints.clone();
     let worker = tokio::spawn(async move {
         let mut ticks = interval(RECOVERY_CHECKPOINT_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ticks.tick().await;
         loop {
             tokio::select! {
+                biased;
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         break;
@@ -813,17 +896,20 @@ fn start_recovery_checkpoint_runtime(
                 }
                 _ = ticks.tick() => {
                     publish_recovery_checkpoint_background(
-                        generations.clone(),
-                        checkpoints.clone(),
+                        worker_generations.clone(),
+                        worker_checkpoints.clone(),
                     ).await;
                 }
             }
         }
-        publish_recovery_checkpoint_once(generations, checkpoints)
-            .await
-            .map(drop)
+        Ok(())
     });
-    RecoveryCheckpointRuntimeHandle { shutdown, worker }
+    RecoveryCheckpointRuntimeHandle {
+        shutdown,
+        worker,
+        generations,
+        checkpoints,
+    }
 }
 
 async fn publish_recovery_checkpoint_background(
@@ -1203,6 +1289,7 @@ fn start_online_gc_runtime(
     let (configuration, configuration_rx) =
         watch::channel(OnlineGcRuntimeConfiguration { enabled, policy });
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let cancellation = MaintenanceCancellation::new();
     let worker = tokio::spawn(run_online_gc_runtime(
         maintenance,
         catalog,
@@ -1213,12 +1300,14 @@ fn start_online_gc_runtime(
         control,
         configuration_rx,
         shutdown_rx,
+        cancellation.clone(),
         scrub_gate,
     ));
     OnlineGcRuntimeHandle {
         requests,
         configuration,
         shutdown,
+        cancellation,
         worker,
     }
 }
@@ -1234,6 +1323,7 @@ async fn run_online_gc_runtime(
     mut control: mpsc::Receiver<OnlineGcControlRequest>,
     mut configuration: watch::Receiver<OnlineGcRuntimeConfiguration>,
     mut shutdown: watch::Receiver<bool>,
+    cancellation: MaintenanceCancellation,
     scrub_gate: runtime_scrub::ScrubGate,
 ) -> Result<(), String> {
     let now = Instant::now();
@@ -1281,7 +1371,11 @@ async fn run_online_gc_runtime(
                     relocation_workers,
                     "control",
                     scheduler.status(),
+                    cancellation.clone(),
                 ).await;
+                let Some(response) = response else {
+                    return Ok(());
+                };
                 let _ = request.response.send(response);
             }
             _ = ticks.tick() => {
@@ -1306,7 +1400,11 @@ async fn run_online_gc_runtime(
                         relocation_workers,
                         "scheduler",
                         scheduler.status(),
+                        cancellation.clone(),
                     ).await;
+                    let Some(status) = status else {
+                        return Ok(());
+                    };
                     eprint!("{status}");
                 }
             }
@@ -1314,6 +1412,7 @@ async fn run_online_gc_runtime(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_online_gc_quantum(
     maintenance: FsOnlineMaintenance,
     catalog: FsGcCatalog,
@@ -1322,31 +1421,40 @@ async fn run_online_gc_quantum(
     relocation_workers: std::num::NonZeroUsize,
     source: &'static str,
     scheduler: OnlineGcSchedulerStatus,
-) -> String {
+    cancellation: MaintenanceCancellation,
+) -> Option<String> {
     runtime_telemetry::gc_started();
     let result = match usage {
-        Ok(usage) => tokio::task::spawn_blocking(move || {
-            maintenance.run_adaptive_online_gc_cycle_with_workers(
+        Ok(usage) => match tokio::task::spawn_blocking(move || {
+            maintenance.run_adaptive_online_gc_cycle_cancellable(
                 &catalog,
                 usage,
                 mode,
                 relocation_workers,
+                &cancellation,
             )
         })
         .await
-        .map_err(|error| format!("worker_join_failed:{error}"))
-        .and_then(|result| result.map_err(|error| format!("{error}"))),
+        {
+            Ok(Ok(report)) => Ok(report),
+            Ok(Err(error)) if error.is_cancelled() => {
+                runtime_telemetry::gc_cancelled();
+                return None;
+            }
+            Ok(Err(error)) => Err(format!("{error}")),
+            Err(error) => Err(format!("worker_join_failed:{error}")),
+        },
         Err(error) => Err(error),
     };
     runtime_telemetry::gc_finished(&result);
-    match result {
+    Some(match result {
         Ok(report) => online_gc_status_line(source, mode, relocation_workers, &report, scheduler),
         Err(error) => format!(
             "online_gc_ok=false source={source} mode={mode:?} relocation_workers={} error={}\n",
             relocation_workers,
             error.replace(['\n', '\r'], " ")
         ),
-    }
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2329,6 +2437,45 @@ mod tests {
     use fastdup_format::ContainerId;
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn online_gc_stop_cancels_blocking_worker_before_join() {
+        let cancellation = MaintenanceCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let cleanup_cancellation = cancellation.clone();
+        let (entered, entered_rx) = oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _ = entered.send(());
+            while worker_cancellation.check().is_ok() {
+                std::thread::yield_now();
+            }
+            Ok(())
+        });
+        let (requests, _control) = mpsc::channel(1);
+        let (configuration, _configuration) = watch::channel(OnlineGcRuntimeConfiguration {
+            enabled: true,
+            policy: OnlineGcPolicy::default(),
+        });
+        let (shutdown, _shutdown_rx) = watch::channel(false);
+        let handle = OnlineGcRuntimeHandle {
+            requests,
+            configuration,
+            shutdown,
+            cancellation,
+            worker,
+        };
+        entered_rx.await.expect("blocking worker starts");
+
+        handle.request_stop();
+        let stopped = timeout(Duration::from_millis(200), handle.stop()).await;
+        if stopped.is_err() {
+            cleanup_cancellation.cancel();
+        }
+        assert!(
+            stopped.is_ok(),
+            "request_stop must cancel blocking Online-GC work before stop awaits its join"
+        );
+    }
 
     #[test]
     fn shutdown_signal_survives_busy_supervisor_branch() {

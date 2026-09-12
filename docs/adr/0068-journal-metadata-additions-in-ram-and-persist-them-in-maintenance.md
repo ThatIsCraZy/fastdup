@@ -54,3 +54,13 @@ The scheduling regression drains a pin during catalog I/O, rotates old roots out
 of the WAL, republishes collected content, and commits it through the normal
 successor-proof path. Fault cases fail before and after the final directory sync;
 all cases must subsequently collect, scrub, and recover the new committed graph.
+
+Cooperative shutdown may interrupt an exact Metadata pass between graph-object
+reads, candidate verification, or individual unlinks. The exact-required journal
+and cleared clean-catalog tail remain in force on cancellation, just as on an
+I/O failure. If any unlink may have occurred, the collector synchronizes the
+Metadata directory before reporting cancellation; a sync failure remains an
+I/O failure. It never installs a partial mark as a clean state. The next owner
+or uncancelled pass derives a fresh exact mark from Commit and live-pin authority.
+The fault regression stops inside both candidate reading and deletion, simulates
+process loss, checks the committed graph with Scrub, and requires an exact retry.

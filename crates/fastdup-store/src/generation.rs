@@ -97,6 +97,7 @@ pub struct GenerationRepository<I> {
     metadata_gc_clean: Arc<Mutex<Option<MetadataGcCleanState>>>,
     metadata_gc_delta: Arc<Mutex<MetadataGcDeltaJournal>>,
     metadata_gc_run_lock: Arc<Mutex<()>>,
+    maintenance_cancellation: Option<crate::MaintenanceCancellation>,
 }
 
 #[derive(Clone)]
@@ -335,7 +336,20 @@ impl<I: StorageIo> GenerationRepository<I> {
             metadata_gc_clean: Arc::new(Mutex::new(None)),
             metadata_gc_delta: Arc::new(Mutex::new(MetadataGcDeltaJournal::default())),
             metadata_gc_run_lock: Arc::new(Mutex::new(())),
+            maintenance_cancellation: None,
         }
+    }
+
+    pub(crate) fn with_maintenance_cancellation(
+        mut self,
+        token: crate::MaintenanceCancellation,
+    ) -> Self {
+        self.maintenance_cancellation = Some(token);
+        self
+    }
+
+    fn check_maintenance(&self) -> io::Result<()> {
+        crate::maintenance_cancellation::check_io(self.maintenance_cancellation.as_ref())
     }
 
     /// Reports whether the paired Commit WAL selects at least one Commit
@@ -1515,6 +1529,7 @@ impl<I: StorageIo> GenerationRepository<I> {
     pub(crate) fn garbage_collect_metadata(
         &self,
     ) -> Result<GenerationMetadataGcSummary, GenerationError> {
+        self.check_maintenance()?;
         let started = Instant::now();
         let _run_guard = self
             .metadata_gc_run_lock
@@ -1580,6 +1595,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .metadata_gc_clean
             .lock()
             .expect("ASSERT: Metadata GC clean-catalog state poisoned") = None;
+        self.check_maintenance()?;
         let records = self.load_complete_commit_records_unlocked()?;
         let commit_binding = metadata_mark_commit_binding(&records);
         let (reachable, object_graph_read_bytes) = self.mark_metadata_gc_roots(&records)?;
@@ -1589,6 +1605,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .catalog_generation_high_water
             .checked_add(1)
             .ok_or(GenerationError::GenerationExhausted)?;
+        self.check_maintenance()?;
         let prepared_catalog = prepare_metadata_mark_catalog(
             &self.storage,
             catalog_generation,
@@ -1608,9 +1625,11 @@ impl<I: StorageIo> GenerationRepository<I> {
             "ASSERT: durable Metadata mark catalog covers the exact mark set"
         );
         for name in &inventory.catalog_names {
+            self.check_metadata_gc_unlink_stop()?;
             self.storage.remove_file(name)?;
         }
         for (object_id, name) in &inventory.candidates {
+            self.check_metadata_gc_unlink_stop()?;
             assert!(
                 MetadataGcMarkMode::ExactSnapshot.has_deletion_authority(),
                 "ASSERT: only an exact Metadata mark can authorize object unlink"
@@ -1698,6 +1717,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .ok_or(GenerationError::GenerationExhausted)?;
         let row_count =
             u64::try_from(additions.len()).map_err(|_| GenerationError::MetadataTooLarge)?;
+        self.check_maintenance()?;
         let prepared = prepare_metadata_mark_addition(
             &self.storage,
             catalog_generation,
@@ -1877,6 +1897,14 @@ impl<I: StorageIo> GenerationRepository<I> {
         Ok((reachable, bytes_read))
     }
 
+    fn check_metadata_gc_unlink_stop(&self) -> Result<(), GenerationError> {
+        if let Err(stopped) = self.check_maintenance() {
+            self.storage.sync_root()?;
+            return Err(stopped.into());
+        }
+        Ok(())
+    }
+
     fn inventory_metadata_gc(
         &self,
         reachable: &BTreeSet<MetadataObjectId>,
@@ -1891,7 +1919,10 @@ impl<I: StorageIo> GenerationRepository<I> {
             if inventory_error.is_some() {
                 return;
             }
-            let result = inventory_metadata_name(&mut inventory, reachable, name);
+            let result = self
+                .check_maintenance()
+                .map_err(GenerationError::from)
+                .and_then(|()| inventory_metadata_name(&mut inventory, reachable, name));
             if let Err(error) = result {
                 inventory_error = Some(error);
             }
@@ -1908,6 +1939,7 @@ impl<I: StorageIo> GenerationRepository<I> {
     ) -> Result<u64, GenerationError> {
         let mut bytes_removed = 0_u64;
         for (object_id, name) in candidates {
+            self.check_maintenance()?;
             let length = self.storage.object_len(name)?;
             if length > MAX_METADATA_OBJECT_BYTES_U64 {
                 return Err(GenerationError::MetadataIdentityCollision(*object_id));
@@ -1958,6 +1990,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             let (manifests, required) = self.scan_manifest_graph_with_required(&root)?;
             if ordinal >= first_online {
                 for (chunk_id, logical_length) in required {
+                    self.check_maintenance()?;
                     if let Some(previous) = online_chunks.insert(chunk_id, logical_length)
                         && previous != logical_length
                     {
@@ -3014,6 +3047,7 @@ impl<I: StorageIo> GenerationRepository<I> {
     }
 
     fn read_metadata(&self, object_id: MetadataObjectId) -> Result<Vec<u8>, GenerationError> {
+        self.check_maintenance()?;
         let name = metadata_name(object_id);
         let length = self.storage.object_len(&name)?;
         if length > MAX_METADATA_OBJECT_BYTES_U64 {
@@ -3158,6 +3192,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         object_id: MetadataObjectId,
     ) -> Result<Vec<u8>, ManifestTreeError> {
+        self.check_maintenance()?;
         let name = metadata_name(object_id);
         let length = self.storage.object_len(&name)?;
         if length > MAX_METADATA_OBJECT_BYTES_U64 {
