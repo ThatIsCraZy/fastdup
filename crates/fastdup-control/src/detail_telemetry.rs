@@ -29,6 +29,10 @@ pub struct OperationLatency {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_reads: Option<MetadataReadTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_buffers: Option<CodecBufferTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocator_memory: Option<AllocatorMemoryTelemetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_cache_compression: Option<ReadCacheCompression>,
@@ -42,6 +46,34 @@ pub struct RuntimeDetails {
     pub reduction: ReductionTelemetry,
     pub checkpoint: Option<CheckpointTelemetry>,
     pub gc: Option<GcTelemetry>,
+}
+
+/// Reusable work buffers; active owners can also belong to content caches.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodecBufferTelemetry {
+    pub retained_bytes: u64,
+    pub active_bytes: u64,
+    pub peak_active_bytes: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+/// Backend API work; bytes and calls are not physical disk bytes or IOPS.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataReadTelemetry {
+    pub interval_seconds: f64,
+    pub rows: Vec<MetadataReadRow>,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataReadRow {
+    pub reason: String, pub object: String, pub mode: String,
+    pub operations: u64, pub requested_bytes: u64, pub returned_bytes: u64,
+    pub errors: u64, pub elapsed_micros: u64, pub max_micros: u64, pub in_flight: u64,
+    pub operations_per_second: f64, pub requested_mbps: f64,
 }
 
 /// Background allocator sample; free blocks may already be absent from RSS.
@@ -205,6 +237,41 @@ pub(crate) fn parse_details(frontend: &serde_json::Value) -> DetailTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_read_attribution_survives_api_history_roundtrip() {
+        let mut frontend = serde_json::json!({"details": {
+            "runtimeId":"test", "ioUring":{"ringEntries":64,"inflightBytes":0,"maxInflightBytes":1,"peakInflightBytes":0,"submitted":0,"completed":0},
+            "caches":[], "reduction":{"enabled":true,"queries":0,"candidates":0,"acceptedPrefixes":0,"acceptedSparseXor":0,"savedPayloadBytes":0,"fallbacks":0,"errors":0}
+        }});
+        assert!(parse_details(&frontend).runtime.unwrap().metadata_reads.is_none());
+        frontend["details"]["metadataReads"] = serde_json::json!({"intervalSeconds":2.0,"rows":[{
+            "reason":"indexAudit","object":"exactIndex","mode":"mmap",
+            "operations":2,"requestedBytes":8192,"returnedBytes":8192,"errors":0,
+            "elapsedMicros":0,"maxMicros":0,"inFlight":0,"operationsPerSecond":1.0,"requestedMbps":0.004096
+        }]});
+        let saved = serde_json::to_value(parse_details(&frontend)).unwrap();
+        assert_eq!(saved["runtime"]["metadataReads"],frontend["details"]["metadataReads"]);
+        let restored: DetailTelemetry = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.runtime.unwrap().metadata_reads.unwrap().rows[0].mode,"mmap");
+    }
+
+    #[test]
+    fn codec_buffers_survive_api_history_and_missing_legacy_samples() {
+        let mut frontend = serde_json::json!({"details": {
+            "runtimeId":"test", "ioUring":{"ringEntries":64,"inflightBytes":0,"maxInflightBytes":1,"peakInflightBytes":0,"submitted":0,"completed":0},
+            "caches":[], "reduction":{"enabled":true,"queries":0,"candidates":0,"acceptedPrefixes":0,"acceptedSparseXor":0,"savedPayloadBytes":0,"fallbacks":0,"errors":0}
+        }});
+        assert!(parse_details(&frontend).runtime.unwrap().codec_buffers.is_none());
+        frontend["details"]["codecBuffers"] = serde_json::json!({
+            "retainedBytes":262144,"activeBytes":65536,"peakActiveBytes":524288,
+            "hits":1999,"misses":1,"evictions":0
+        });
+        let saved = serde_json::to_value(parse_details(&frontend)).unwrap();
+        assert_eq!(saved["runtime"]["codecBuffers"], frontend["details"]["codecBuffers"]);
+        let restored: DetailTelemetry = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.runtime.unwrap().codec_buffers.unwrap().hits, 1999);
+    }
+
     #[test]
     fn legacy_runtime_is_unavailable_and_zero_samples_remain_explicit() {
         assert_eq!(

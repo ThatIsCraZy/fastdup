@@ -2,9 +2,9 @@
 status: accepted
 ---
 
-# Resume incomplete scrubs from durable progress
+# Resume recent scrub checks from durable progress
 
-A stopped initial Scrub round resumes fully checked immutable Containers instead
+A stopped or completed initial Scrub round resumes fully checked immutable Containers instead
 of rereading their payloads on every mount. This supersedes ADR 0090's
 process-local progress rule and extends ADR 0091's deferred DATA requirements.
 The persisted result means **checked during this round**, never healthy forever,
@@ -18,9 +18,20 @@ and local Metadata/DATA directory device/inode identities. A copied pool pair
 with different local identities starts over. Restoring files in place under the
 same identities cannot be detected from this binding alone. Unknown versions,
 foreign or damaged headers, clock reversal, and rounds at least seven days old
-start a fresh pass. A durable completion marker also starts a new full pass on
-the next mount. There is no permanent healthy flag or new periodic scrub timer;
+start a fresh pass. A durable completion marker retains the preceding checks on
+the next mount. It records historical successful coverage, not current health.
+Subsequent mounts may append checks for new or changed Containers and another
+completion marker. Neither completion nor reuse moves the original round start,
+so restarting cannot indefinitely postpone the seven-day full-pass threshold.
+There is no permanent healthy flag or new periodic scrub timer;
 explicit offline Scrub continues to force complete content verification.
+
+This amends the original completion policy (2026-09-12): a successful scrub
+previously forced a new full payload pass on the very next restart, even after
+an orderly shutdown. Because that discarded every reusable certificate, the
+parallel envelope-resume pool had no work and startup instead used the single
+paced payload verifier. Completion is now replayed as a checksummed marker;
+the journal format and conservative behavior of older readers remain unchanged.
 
 Only a successful full Container check, including decoded identities and
 independent Bases, mints an opaque progress entry. Each entry contains Container
@@ -94,3 +105,7 @@ Telemetry distinguishes carried-forward checks, new checks and remaining
 Containers, including historical UI samples. Regressions hold 32 actual envelope
 reads in flight, reject oversized batches, verify failure leaves coverage
 incomplete, and cancel an in-flight batch before any Footer request is issued.
+Completion/restart regressions also prove envelope-only reads after repeated
+successful passes, replay of appended checks after completion, unextended expiry,
+current-envelope failure, and before/after-I/O crashes during completion replay
+and torn-tail repair. The complete marker alone never opens the GC gate.

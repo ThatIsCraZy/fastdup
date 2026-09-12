@@ -6,6 +6,8 @@
 compile_error!("fastdup supports only 64-bit x86 (x86-64) targets; see ADR 0078");
 
 mod commit;
+mod buffer_pool;
+pub use buffer_pool::{BufferPool, BufferPoolStatus, PooledBuffer};
 mod container;
 mod container_generation_high_water;
 mod exact_index;

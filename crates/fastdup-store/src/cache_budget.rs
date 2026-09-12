@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 
 const PERIOD: Duration = Duration::from_millis(250);
 
-/// The storage tier whose access a successful cache lookup avoids.
+/// Work avoided by reuse: storage access or a work-buffer allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheFallback {
     Data,
     Metadata,
+    /// Reusable work buffers avoid allocation, never storage reads.
+    Memory,
 }
 
 /// Cumulative cache counters, sampled on the cold pressure-refresh path.
@@ -19,7 +21,7 @@ pub struct CacheObservation {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
-    /// Logical bytes whose fallback read was avoided by hits.
+    /// Bytes whose fallback read (or work-buffer allocation) was avoided by hits.
     pub hit_bytes: u64,
     /// Resident payload plus conservatively charged lookup metadata.
     pub resident_bytes: u64,
@@ -204,30 +206,20 @@ impl State {
     fn rebalance(&mut self, snapshot: MemoryPressureSnapshot) {
         self.refreshed = Instant::now();
         self.new_pool = false;
-        self.effective_limit = snapshot.effective_limit_bytes();
-        self.available = snapshot.available_bytes();
-        let resident = self.pools.values().fold(0_u64, |sum, pool| {
-            sum.saturating_add(pool.observed.resident_bytes)
-        });
-        let reserve = cache_memory_reserve(snapshot.effective_limit_bytes());
-        self.budget = if snapshot.swap_used_bytes() != 0 {
-            0
-        } else {
-            resident
-                .saturating_add(
-                    snapshot
-                        .available_bytes()
-                        .min(snapshot.effective_limit_bytes()),
-                )
-                .saturating_sub(reserve)
-                .min(snapshot.effective_limit_bytes().saturating_sub(reserve))
-        };
+        self.refresh_headroom(snapshot);
         let fixed = self
             .pools
             .values()
             .fold(0_u64, |sum, pool| sum.saturating_add(pool.fixed));
         let distributable = self.budget.saturating_sub(fixed);
-        let count = u64::try_from(self.pools.len()).unwrap_or(u64::MAX).max(1);
+        let count = u64::try_from(
+            self.pools
+                .values()
+                .filter(|pool| pool.fallback != CacheFallback::Memory)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+        .max(1);
         // Bounded exploration prevents a cold or previously evicted workload
         // from remaining permanently invisible to the hit-based controller.
         let probe = distributable / 16 / count;
@@ -250,9 +242,15 @@ impl State {
             pool.demand =
                 pool.demand.saturating_mul(3) / 4 + misses.saturating_add(evictions.min(misses));
             pool.previous = pool.observed;
+            if pool.fallback == CacheFallback::Memory {
+                // Idle scratch gets only capacity left after disk-saving demand.
+                pool.desired = pool.fixed;
+                continue;
+            }
             let weight = match pool.fallback {
                 CacheFallback::Data => 16_u128,
                 CacheFallback::Metadata => 1,
+                CacheFallback::Memory => unreachable!("scratch is served last"),
             };
             let density = pool.benefit.saturating_mul(weight).saturating_mul(1024)
                 / u128::from(pool.observed.resident_bytes.max(probe).max(1));
@@ -300,6 +298,48 @@ impl State {
             if before == remaining {
                 break;
             }
+        }
+        self.distribute_idle_buffers(remaining, probe);
+    }
+
+    fn refresh_headroom(&mut self, snapshot: MemoryPressureSnapshot) {
+        self.effective_limit = snapshot.effective_limit_bytes();
+        self.available = snapshot.available_bytes();
+        let resident = self.pools.values().fold(0_u64, |sum, pool| {
+            sum.saturating_add(pool.observed.resident_bytes)
+        });
+        let reserve = cache_memory_reserve(snapshot.effective_limit_bytes());
+        self.budget = if snapshot.swap_used_bytes() != 0 {
+            0
+        } else {
+            resident
+                .saturating_add(
+                    snapshot
+                        .available_bytes()
+                        .min(snapshot.effective_limit_bytes()),
+                )
+                .saturating_sub(reserve)
+                .min(snapshot.effective_limit_bytes().saturating_sub(reserve))
+        };
+    }
+
+    fn distribute_idle_buffers(&mut self, mut remaining: u64, probe: u64) {
+        for pool in self
+            .pools
+            .values_mut()
+            .filter(|pool| pool.fallback == CacheFallback::Memory)
+        {
+            let wanted = if pool.demand > 0 || pool.benefit > 0 {
+                pool.observed
+                    .resident_bytes
+                    .saturating_sub(pool.fixed)
+                    .saturating_add(probe)
+            } else {
+                0
+            };
+            let added = wanted.min(pool.maximum - pool.fixed).min(remaining);
+            pool.desired += added;
+            remaining -= added;
         }
     }
 }
@@ -379,6 +419,57 @@ mod tests {
     }
     fn tick(broker: &Broker, snapshot: MemoryPressureSnapshot) {
         broker.0.lock().unwrap().rebalance(snapshot);
+    }
+
+    #[test]
+    fn idle_buffers_lose_to_data_and_metadata_then_release_their_lease() {
+        for fallback in [CacheFallback::Data, CacheFallback::Metadata] {
+            let broker = Arc::new(Broker::new());
+            let disk = pool(&broker, fallback);
+            let buffers = pool(&broker, CacheFallback::Memory);
+            let _ = buffers.target(
+                pressure(),
+                CacheObservation {
+                    hits: 10_000,
+                    misses: 100,
+                    hit_bytes: 10_000,
+                    ..CacheObservation::default()
+                },
+            );
+            tick(&broker, pressure());
+            let target = buffers.target(
+                pressure(),
+                CacheObservation {
+                    hits: 20_000,
+                    misses: 200,
+                    hit_bytes: 20_000,
+                    ..CacheObservation::default()
+                },
+            );
+            assert!(target > 0, "unused headroom can retain reusable buffers");
+            buffers.applied(target, target);
+            let _ = disk.target(
+                pressure(),
+                CacheObservation {
+                    hits: 1,
+                    misses: 1,
+                    hit_bytes: 4096,
+                    resident_bytes: 90_000,
+                    ..CacheObservation::default()
+                },
+            );
+            let low = MemoryPressureSnapshot::new(100_000, 10_000, 0);
+            tick(&broker, low);
+            assert_eq!(broker.0.lock().unwrap().pools[&buffers.id].desired, 0);
+            assert_eq!(
+                broker.0.lock().unwrap().pools[&buffers.id].leased,
+                target,
+                "donor remains charged until idle buffers are dropped"
+            );
+            assert_eq!(buffers.target(low, CacheObservation::default()), 0);
+            buffers.applied(0, 0);
+            assert_eq!(broker.0.lock().unwrap().pools[&buffers.id].leased, 0);
+        }
     }
     #[test]
     fn data_reuse_wins_contested_memory_and_total_stays_below_ninety_two_percent() {

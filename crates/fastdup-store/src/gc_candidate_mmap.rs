@@ -19,7 +19,7 @@ use crate::gc_candidate_catalog::GcCandidateCatalogStoreError;
 pub(crate) struct ImmutableGcCandidateCatalog {
     // Drop order is significant: unmap before releasing the mutation lease.
     mapping: Mmap,
-    _lease: ImmutableFileLease,
+    lease: ImmutableFileLease,
     descriptor: GcCandidateCatalogDescriptor,
 }
 
@@ -28,6 +28,8 @@ impl ImmutableGcCandidateCatalog {
         lease: ImmutableFileLease,
         expected: GcCandidateCatalogDescriptor,
     ) -> Result<Self, GcCandidateCatalogStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::GarbageCollection);
+        let _mapped_reads = lease.mapping_read_scope();
         let metadata = lease.file().metadata()?;
         if !metadata.is_file() || metadata.len() != expected.file_length() {
             return Err(GcCandidateCatalogStoreError::IdentityMismatch);
@@ -38,7 +40,7 @@ impl ImmutableGcCandidateCatalog {
         // SAFETY: `lease` owns a read-only descriptor for one no-replace
         // published object. FsStorageIo shares a root-wide lease registry that
         // rejects write, truncate, replacement, and remove for this exact name
-        // until `_lease` drops. The appliance owns the directory; unsupported
+        // until `lease` drops. The appliance owns the directory; unsupported
         // out-of-process mutation is outside the StorageIo contract. The exact
         // file length and ordinary-file type were checked immediately above.
         let mapping = unsafe { MmapOptions::new().len(length).map(lease.file())? };
@@ -59,7 +61,7 @@ impl ImmutableGcCandidateCatalog {
         audit_mapping(&mapping, descriptor)?;
         Ok(Self {
             mapping,
-            _lease: lease,
+            lease,
             descriptor,
         })
     }
@@ -72,6 +74,8 @@ impl ImmutableGcCandidateCatalog {
         &self,
         ordinal: u64,
     ) -> Result<GcCandidateCatalogRow, GcCandidateCatalogStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::GarbageCollection);
+        let _mapped_reads = self.lease.mapping_read_scope();
         let offset = self
             .descriptor
             .row_offset(ordinal)
@@ -127,7 +131,9 @@ fn exact_range(
     let end = offset
         .checked_add(length)
         .ok_or(GcCandidateCatalogStoreError::CounterOverflow)?;
-    bytes
+    let result = bytes
         .get(offset..end)
-        .ok_or(GcCandidateCatalogStoreError::IndexCorruption)
+        .ok_or(GcCandidateCatalogStoreError::IndexCorruption);
+    crate::metadata_read_telemetry::mapped_range(length, result.is_ok());
+    result
 }

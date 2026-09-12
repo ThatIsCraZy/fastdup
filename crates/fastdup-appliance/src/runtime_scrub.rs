@@ -87,6 +87,7 @@ pub fn start(
     let worker = std::thread::Builder::new()
         .name("recovery-scrub".to_owned())
         .spawn(move || {
+            let _reads = fastdup_store::MetadataReadScope::enter(fastdup_store::MetadataReadReason::RecoveryScrub);
             let mut journal = None;
             let result = (|| {
                 fastdup_store::set_background_io_priority().map_err(io::Error::other)?;
@@ -443,6 +444,7 @@ impl<I: StorageIo> StorageIo for PacedStorage<I> {
         self.inner.object_len(name)
     }
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        let _reads = fastdup_store::MetadataReadScope::enter(fastdup_store::MetadataReadReason::RecoveryScrub);
         let length = self.inner.object_len(name)?;
         if length > fastdup_format::MAX_CONTAINER_BYTES {
             return Err(io::Error::other("scrub object exceeds Container limit"));
@@ -450,6 +452,7 @@ impl<I: StorageIo> StorageIo for PacedStorage<I> {
         self.read_exact_at(name, 0, usize::try_from(length).map_err(io::Error::other)?)
     }
     fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let _reads = fastdup_store::MetadataReadScope::enter(fastdup_store::MetadataReadReason::RecoveryScrub);
         if length as u64 > fastdup_format::MAX_CONTAINER_BYTES {
             return Err(io::Error::other("scrub range exceeds Container limit"));
         }
@@ -472,6 +475,7 @@ impl<I: StorageIo> StorageIo for PacedStorage<I> {
         Ok(bytes)
     }
     fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let _reads = fastdup_store::MetadataReadScope::enter(fastdup_store::MetadataReadReason::RecoveryScrub);
         self.control.check_cancelled()?;
         let start = Instant::now();
         let bytes = self.inner.read_structure_at(name, offset, length)?;
@@ -718,7 +722,7 @@ mod resume_tests {
     use fastdup_store::{GenerationRepository, TieredStorageIo};
 
     #[tokio::test]
-    async fn orderly_worker_stop_flushes_and_the_next_worker_reuses_only_that_round() {
+    async fn orderly_stop_and_completed_worker_restart_reuse_current_round() {
         let root = std::env::temp_dir().join(format!(
             "scrub-resume-{}-{}",
             std::process::id(),
@@ -796,10 +800,11 @@ mod resume_tests {
         .await
         .unwrap();
         third.stop().await.unwrap();
-        assert_eq!(third_gate.0.progress.lock().unwrap().resumed, 0);
+        assert_eq!(third_gate.0.progress.lock().unwrap().resumed, 3);
+        assert_eq!(third_gate.0.read_bytes.load(Ordering::Relaxed), 3 * 8192);
         assert!(
-            second_gate.0.read_bytes.load(Ordering::Relaxed)
-                < third_gate.0.read_bytes.load(Ordering::Relaxed)
+            third_gate.0.read_bytes.load(Ordering::Relaxed)
+                < second_gate.0.read_bytes.load(Ordering::Relaxed)
         );
         drop(frontend);
         drop(generation);

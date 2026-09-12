@@ -12,6 +12,14 @@ each CQE. `SINGLE_ISSUER` is enabled because that thread also creates the ring.
 `DEFER_TASKRUN` is not enabled: on the Linux 6.12 XFS benchmark it reduced the
 1,000-by-128-KiB publisher by 7.3 and 17.8 percent in two alternating pairs.
 
+**Read-cache amendment, 12 September 2026:** ADR 0046's application-owned
+read-caching policy supersedes the buffered demand-read/kernel-readahead policy
+in the following historical implementation description. Linux page cache and
+file-backed mmap are not a target cache tier. Existing paths remain explicitly
+tracked migration work; Metadata read attribution now exposes them. The
+publication threshold and durability ordering below are not changed by this
+telemetry amendment.
+
 The short-lived Container publication descriptor uses `O_DIRECT` only when
 the sealed image is at least 4 MiB. Smaller publications remain buffered. The
 writer allocates the complete image at a 4-KiB-aligned address, so Direct mode

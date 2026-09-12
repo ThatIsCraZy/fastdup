@@ -2,6 +2,9 @@
 
 //! Durable container lifecycle behind an injectable storage boundary.
 
+mod metadata_read_telemetry;
+pub use metadata_read_telemetry::{MetadataReadReason, MetadataReadScope, MetadataReadRow, MetadataReadStatus, metadata_read_status};
+
 mod cpu_admission;
 pub use cpu_admission::{WorkerPermitLease, WorkerPermits};
 
@@ -896,6 +899,8 @@ fn check_read_end(end: u64, length: u64) -> io::Result<()> {
 /// An opaque read-only file capability whose lifetime prevents cooperating
 /// [`FsStorageIo`] adapters from mutating the same published name.
 pub struct ImmutableFileLease {
+    metadata_reads: Option<Arc<metadata_read_telemetry::MetadataReadCounters>>,
+    metadata_object_class: usize,
     file: File,
     access: FileAccess,
     // Keep the canonical-root registry discoverable even if every adapter
@@ -904,6 +909,10 @@ pub struct ImmutableFileLease {
 }
 
 impl ImmutableFileLease {
+    pub(crate) fn mapping_read_scope(&self) -> metadata_read_telemetry::MappingScope {
+        metadata_read_telemetry::MappingScope::enter(self.metadata_reads.clone(), self.metadata_object_class)
+    }
+
     pub(crate) const fn file(&self) -> &File {
         &self.file
     }
@@ -3977,6 +3986,7 @@ static FS_IMMUTABLE_LEASE_REGISTRIES: OnceLock<
 
 #[derive(Clone, Debug)]
 pub struct FsStorageIo {
+    metadata_reads: Option<Arc<metadata_read_telemetry::MetadataReadCounters>>,
     root: PathBuf,
     immutable_leases: SharedImmutableFileRegistry,
 }
@@ -4003,9 +4013,17 @@ impl FsStorageIo {
                 counts
             });
         Ok(Self {
+            metadata_reads: None,
             root,
             immutable_leases,
         })
+    }
+
+    /// Enables aggregate Metadata-tier read attribution for this adapter and clones.
+    #[must_use]
+    pub fn with_metadata_read_telemetry(mut self) -> Self {
+        self.metadata_reads = Some(Arc::clone(metadata_read_telemetry::system_counters()));
+        self
     }
 
     #[must_use]
@@ -4141,6 +4159,8 @@ impl FsStorageIo {
 
 impl StorageIo for FsStorageIo {
     fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let span = metadata_read_telemetry::ReadSpan::start(self.metadata_reads.as_deref(), name, 2, Some(length));
+        let result = (|| {
         if length > MAX_STORAGE_RANGE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -4157,6 +4177,9 @@ impl StorageIo for FsStorageIo {
         bytes.resize(length, 0);
         file.read_exact_at(&mut bytes, offset)?;
         Ok(bytes)
+            })();
+        span.finish(&result);
+        result
     }
     fn create_new(&self, name: &str) -> io::Result<()> {
         self.with_file_mutation(name, || {
@@ -4184,6 +4207,8 @@ impl StorageIo for FsStorageIo {
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        let span = metadata_read_telemetry::ReadSpan::start(self.metadata_reads.as_deref(), name, 1, None);
+        let result = (|| {
         let mut file = File::open(self.path(name)?)?;
         let declared_length = file.metadata()?.len();
         if declared_length > MAX_CONTAINER_BYTES {
@@ -4199,6 +4224,9 @@ impl StorageIo for FsStorageIo {
             return Err(container_too_large(declared_length));
         }
         Ok(bytes)
+            })();
+        span.finish(&result);
+        result
     }
 
     fn object_len(&self, name: &str) -> io::Result<u64> {
@@ -4206,6 +4234,8 @@ impl StorageIo for FsStorageIo {
     }
 
     fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let span = metadata_read_telemetry::ReadSpan::start(self.metadata_reads.as_deref(), name, 0, Some(length));
+        let result = (|| {
         if length > MAX_STORAGE_RANGE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -4220,6 +4250,9 @@ impl StorageIo for FsStorageIo {
         bytes.resize(length, 0);
         file.read_exact_at(&mut bytes, offset)?;
         Ok(bytes)
+            })();
+        span.finish(&result);
+        result
     }
 
     fn list_names(&self) -> io::Result<Vec<String>> {
@@ -4306,6 +4339,8 @@ impl StorageIo for FsStorageIo {
             .ok_or_else(|| io::Error::other("immutable lease count overflow"))?;
         drop(count);
         Ok(Some(ImmutableFileLease {
+            metadata_reads: self.metadata_reads.clone(),
+            metadata_object_class: metadata_read_telemetry::object_class(name),
             file,
             access,
             _registry: Arc::clone(&self.immutable_leases),

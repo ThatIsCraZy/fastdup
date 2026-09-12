@@ -3047,6 +3047,7 @@ impl<I: StorageIo> GenerationRepository<I> {
     }
 
     fn read_metadata(&self, object_id: MetadataObjectId) -> Result<Vec<u8>, GenerationError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::Namespace);
         self.check_maintenance()?;
         let name = metadata_name(object_id);
         let length = self.storage.object_len(&name)?;
@@ -3192,6 +3193,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         object_id: MetadataObjectId,
     ) -> Result<Vec<u8>, ManifestTreeError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::Manifest);
         self.check_maintenance()?;
         let name = metadata_name(object_id);
         let length = self.storage.object_len(&name)?;

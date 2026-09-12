@@ -362,7 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     mount_recovery::ensure_mount_directory(&mount_path)?;
     let _allocator_reclaimer = fastdup_store::AllocatorReclaimer::start()?;
     let recovery_latch = arm_recovery_latch(&metadata_root)?;
-    let metadata_pool = FsStorageIo::open(&metadata_root)?;
+    let metadata_pool = FsStorageIo::open(&metadata_root)?.with_metadata_read_telemetry();
     let data_pool = FsStorageIo::open(&container_root)?;
     if metadata_pool.root() == data_pool.root() {
         return Err("metadata and DATA roots must resolve to distinct directories".into());
@@ -419,7 +419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
     let data_storage = open_data_storage(&container_root, io_telemetry_enabled)?;
-    let small_file_storage = FsStorageIo::open(&small_file_root)?;
+    let small_file_storage = FsStorageIo::open(&small_file_root)?.with_metadata_read_telemetry();
     let recovered = recover_appliance(
         &metadata_root,
         &data_storage,
@@ -632,7 +632,7 @@ impl ShutdownSignal {
 fn arm_recovery_latch(
     metadata_root: &std::path::Path,
 ) -> io::Result<ApplianceRecoveryLatch<FsStorageIo>> {
-    let latch = ApplianceRecoveryLatch::arm_filesystem(FsStorageIo::open(metadata_root)?)?;
+    let latch = ApplianceRecoveryLatch::arm_filesystem(FsStorageIo::open(metadata_root)?.with_metadata_read_telemetry())?;
     if latch.prior_recovery_required() {
         eprintln!(
             "appliance_recovery_required=true action=verify_generation_before_mutation_admission"
@@ -788,7 +788,7 @@ fn recover_appliance(
     small_file_storage: &FsStorageIo,
     advanced_reduction: AdvancedReductionPolicy,
 ) -> Result<RecoveredAppliance, Box<dyn std::error::Error>> {
-    let metadata_storage = FsStorageIo::open(metadata_root)?;
+    let metadata_storage = FsStorageIo::open(metadata_root)?.with_metadata_read_telemetry();
     let generations = GenerationRepository::new(metadata_storage.clone(), checkpoint_policy_set());
     let containers = ContainerRepository::new(TieredStorageIo::new(
         data_storage.clone(),
@@ -827,7 +827,7 @@ fn recover_appliance(
         checkpoint_exact_index_profile_v1(),
     );
     let online_gc_recovery = online_maintenance.finalize_recovered_online_gc()?;
-    let gc_catalog = GcCandidateCatalogRepository::new(FsStorageIo::open(metadata_root)?);
+    let gc_catalog = GcCandidateCatalogRepository::new(FsStorageIo::open(metadata_root)?.with_metadata_read_telemetry());
     let similarities = Some(SimilarityIndexRepository::new(metadata_storage));
     if restored_from_data_tier.is_some() {
         if advanced_reduction == AdvancedReductionPolicy::DependentV1 {

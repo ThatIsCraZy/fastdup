@@ -5,6 +5,35 @@ import { I18nProvider } from "./i18n";
 import { previewSnapshot } from "./types";
 vi.mock("echarts-for-react", () => ({ default: () => <div data-testid="phase-chart" /> }));
 afterEach(cleanup);
+
+it("distinguishes metadata API reads from physical IO and does not invent mmap timings", () => {
+ const row={reason:"indexLookup",object:"exactIndex",mode:"bufferedRange",operations:10,requestedBytes:40960,returnedBytes:36864,errors:1,elapsedMicros:10000,maxMicros:3000,inFlight:1,operationsPerSecond:5,requestedMbps:0.02048};
+ const metadataReads={intervalSeconds:2,rows:[row,{...row,reason:"indexAudit",mode:"mmap",inFlight:0}]};
+ const value={...details,runtime:{...details.runtime!,metadataReads}};
+ const {rerender}=render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:value}} historical={false} loading={false}/></I18nProvider>);
+ fireEvent.click(screen.getByRole('tab',{name:'Metadata-Reads'}));
+ expect(screen.getByText(/Diese Werte sind keine physischen Plattenzugriffe/)).toBeVisible();
+ fireEvent.click(screen.getByRole('checkbox',{name:'Summen und Lesezeiten seit Mount anzeigen'}));
+ expect(within(screen.getByRole('row',{name:/Index-Abfrage/})).getByText('3 ms')).toBeVisible();
+ expect(within(screen.getByRole('row',{name:/Index-Prüfung/})).getAllByText('—')).toHaveLength(3);
+ rerender(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:{...value,runtime:{...value.runtime,metadataReads:{...metadataReads,intervalSeconds:0}}}}} historical={true} loading={false}/></I18nProvider>);
+ expect(screen.getByText('Erster Messpunkt · Raten noch nicht verfügbar')).toBeVisible();
+ expect(within(screen.getByRole('row',{name:/Index-Prüfung/})).getAllByText('—')).toHaveLength(5);
+});
+
+it("separates allocation reuse from disk-saving cache hit rates", () => {
+ const buffers = {id:"codecBuffers",fallbackTier:"memory",hits:1999,misses:1,evictions:0,residentBytes:262144,targetBytes:524288,leasedBytes:524288};
+ const sampleDetails: DetailTelemetry = {...details,runtime:{...details.runtime!,
+  codecBuffers:{retainedBytes:262144,activeBytes:65536,peakActiveBytes:131072,hits:1999,misses:1,evictions:0},
+  cacheBudget:{maximumMemoryUsedBasisPoints:9200,effectiveLimitBytes:1e9,availableBytes:5e8,budgetBytes:4e8,pools:[buffers]}
+ }};
+ render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:sampleDetails}} historical={false} loading={false}/></I18nProvider>);
+ fireEvent.click(screen.getByRole('tab',{name:'Caches'}));
+ fireEvent.click(screen.getByText('Wiederverwendbare Codec-Puffer'));
+ expect(screen.getByText('Puffer wiederverwendet')).toBeVisible();
+ expect(screen.getByText('1.999')).toBeVisible();
+ expect(screen.queryByRole('row',{name:/codecBuffers/})).not.toBeInTheDocument();
+});
 const operation = {operations:100,errors:2,p50Micros:500,p95Micros:2500,p99Micros:10000};
 const details: DetailTelemetry = {latency:{read:operation,write:{...operation,operations:0,errors:0}},runtime:{runtimeId:"test",ioUring:{ringEntries:64,inflightBytes:1000000,maxInflightBytes:8000000,peakInflightBytes:4000000,submitted:18,completed:16},caches:[{id:"verifiedRead",hits:75,misses:25,evictions:3,residentBytes:1024},{id:"exactIndex",hits:0,misses:0,evictions:0,residentPages:0}],reduction:{enabled:true,queries:7,candidates:4,acceptedPrefixes:2,acceptedSparseXor:1,savedPayloadBytes:5000,fallbacks:4,errors:0},gc:{state:"collected",observedAt:100,totalMs:12,unlinkedBytes:8000},checkpoint:{completedAt:100,generation:8,totalMs:10,phases:[{id:"freeze",wallMs:2,cpuMs:1}]}}};
 it("renders real counters, distinguishes no samples, and switches all six detail views", () => {

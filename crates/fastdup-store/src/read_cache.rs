@@ -158,6 +158,7 @@ pub struct VerifiedReadCacheStatus {
     codec_working_bytes: usize,
     codec_peak_working_bytes: usize,
     codec_max_working_bytes: usize,
+    buffer_pool: fastdup_format::BufferPoolStatus,
     hits: u64,
     misses: u64,
     admissions: u64,
@@ -200,6 +201,7 @@ impl VerifiedReadCacheStatus {
     status_getter!(codec_working_bytes, codec_working_bytes, usize);
     status_getter!(codec_peak_working_bytes, codec_peak_working_bytes, usize);
     status_getter!(codec_max_working_bytes, codec_max_working_bytes, usize);
+    status_getter!(buffer_pool, buffer_pool, fastdup_format::BufferPoolStatus);
     status_getter!(hits, hits, u64);
     status_getter!(misses, misses, u64);
     status_getter!(admissions, admissions, u64);
@@ -511,7 +513,7 @@ impl VerifiedReadCache {
             automatic_pressure,
             started: Instant::now(),
             last_refresh_millis: AtomicU64::new(0),
-            compression: Compression::new(snapshot),
+            compression: Compression::new(snapshot, automatic_pressure),
             budget_pool: automatic_pressure.then(|| {
                 CachePool::system(
                     "verifiedRead",
@@ -542,6 +544,7 @@ impl VerifiedReadCache {
     }
 
     fn apply_memory_pressure(&self, snapshot: MemoryPressureSnapshot) {
+        self.compression.refresh_buffers(snapshot);
         let mut admission = self
             .admission
             .lock()
@@ -635,6 +638,7 @@ impl VerifiedReadCache {
             codec_peak_working_bytes: self.compression.peak_working.load(Ordering::Relaxed),
             codec_working_bytes: self.compression.working(),
             codec_max_working_bytes: self.compression.maximum_working(),
+            buffer_pool: self.compression.buffers.status(),
             hits: counters.hits,
             misses: counters.misses,
             admissions: counters.admissions,

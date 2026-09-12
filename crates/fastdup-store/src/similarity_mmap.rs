@@ -21,7 +21,7 @@ use crate::similarity_index_repository::SimilarityIndexStoreError;
 pub(crate) struct ImmutableSimilarityRun {
     // Drop order is significant: unmap before releasing the mutation lease.
     mapping: Mmap,
-    _lease: ImmutableFileLease,
+    lease: ImmutableFileLease,
     descriptor: SimilarityIndexRunDescriptor,
     minimum_bucket_key: SimilarityBucketKey,
     maximum_bucket_key: SimilarityBucketKey,
@@ -33,6 +33,8 @@ impl ImmutableSimilarityRun {
         expected: SimilarityIndexRunDescriptor,
         observe_bucket_page: impl FnMut(SimilarityBucketKey),
     ) -> Result<Self, SimilarityIndexStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
+        let _mapped_reads = lease.mapping_read_scope();
         let metadata = lease.file().metadata()?;
         if !metadata.is_file() || metadata.len() != expected.file_length() {
             return Err(SimilarityIndexStoreError::IdentityMismatch);
@@ -45,7 +47,7 @@ impl ImmutableSimilarityRun {
         // that rejects write, truncate, rename, and remove operations for this
         // name until the mapping is dropped. The appliance owns this directory;
         // out-of-process mutation is outside the storage interface contract.
-        // The descriptor remains alive in `_lease` for at least as long as the
+        // The descriptor remains alive in `lease` for at least as long as the
         // mapping, and the exact file length was verified above.
         let mapping = unsafe { MmapOptions::new().len(length).map(lease.file())? };
         if mapping.len() != length {
@@ -66,7 +68,7 @@ impl ImmutableSimilarityRun {
             audit_mapping(&mapping, descriptor, observe_bucket_page)?;
         Ok(Self {
             mapping,
-            _lease: lease,
+            lease,
             descriptor,
             minimum_bucket_key,
             maximum_bucket_key,
@@ -86,6 +88,7 @@ impl ImmutableSimilarityRun {
     }
 
     pub(crate) fn page(&self, offset: u64) -> Result<&[u8], SimilarityIndexStoreError> {
+        let _mapped_reads = self.lease.mapping_read_scope();
         let offset =
             usize::try_from(offset).map_err(|_| SimilarityIndexStoreError::IndexCorruption)?;
         exact_range(&self.mapping, offset, SIMILARITY_INDEX_PAGE_BYTES)
@@ -197,7 +200,9 @@ fn exact_range(
     let end = offset
         .checked_add(length)
         .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-    mapping
+    let result = mapping
         .get(offset..end)
-        .ok_or(SimilarityIndexStoreError::IndexCorruption)
+        .ok_or(SimilarityIndexStoreError::IndexCorruption);
+    crate::metadata_read_telemetry::mapped_range(length, result.is_ok());
+    result
 }

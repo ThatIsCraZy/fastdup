@@ -876,6 +876,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     }
 
     fn read_envelope(&self, name: &str) -> Result<OpenedSimilarityRun, SimilarityIndexStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexEnvelope);
         let file_length = self.storage.object_len(name)?;
         let block_bytes = u64::try_from(SIMILARITY_INDEX_PAGE_BYTES)
             .expect("ASSERT: Similarity block bytes fit u64");
@@ -908,6 +909,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         name: &str,
         mut visit: impl FnMut(SimilarityIndexEntry) -> Result<(), SimilarityIndexStoreError>,
     ) -> Result<SimilarityIndexRunDescriptor, SimilarityIndexStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
         let envelope = self.read_envelope(name)?;
         let descriptor = envelope.descriptor;
         let mut audit = descriptor.start_hash_audit();
@@ -971,6 +973,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         ),
         SimilarityIndexStoreError,
     > {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
         let descriptor = self.audit_named(name, |_| Ok(()))?;
         let first_offset = descriptor
             .bucket_page_offset(0)
@@ -1426,6 +1429,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         if let Some(page) = partition.page_cache.get_bucket(run_hash, ordinal) {
             return Ok(page);
         }
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
         let offset = partition
             .descriptor
             .bucket_page_offset(ordinal)
@@ -1481,6 +1485,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         let page = if let Some(page) = partition.page_cache.get_entry(run_hash, page_ordinal) {
             page
         } else {
+            let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
             let offset = partition
                 .descriptor
                 .page_offset(page_ordinal)

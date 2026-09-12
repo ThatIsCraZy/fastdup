@@ -212,6 +212,11 @@ behebt einen reproduzierbaren großen Fallback bei vertauschten benachbarten
 Writes. Die Ursache des nachfolgenden ursprünglichen SMB-Samples bleibt
 ohne damalige Offset-/Sequence-Spur offen.
 
+Eine weitere [Diagnose der Inline-Rezeptübergabe](rechunk-inline-handoff-2026-09-06.md)
+reproduziert und behebt einen 28-MiB-Rest bei einem späteren Ingest-Job über
+einem Frozen Cut. Dieser Exact-/FILL-Fall beweist ebenfalls nicht die Ursache
+des historischen Samples mit überwiegend neuen Chunks.
+
 Im dritten Advanced-Basislauf rechunkt Generation 7 **30.285.275 Byte
 (28,882 MiB)** und encodiert davon 30.165.986 Byte in 361 neuen Chunks.
 Über den ganzen Lauf fallen 31,539 MiB Rechunk-Arbeit an. In den anderen elf

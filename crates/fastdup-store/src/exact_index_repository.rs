@@ -1347,6 +1347,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     }
 
     fn read_envelope(&self, name: &str) -> Result<OpenedRunEnvelope, ExactIndexStoreError> {
+    let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexEnvelope);
         let file_length = self.storage.object_len(name)?;
         if file_length < 2 * u64::try_from(EXACT_INDEX_PAGE_BYTES).expect("ASSERT: 4 KiB fits u64")
         {
@@ -1425,6 +1426,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         envelope: &OpenedRunEnvelope,
         mut visit: impl FnMut(&ExactIndexEntry),
     ) -> Result<(), ExactIndexStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
         let descriptor = envelope.descriptor;
         let mut audit = descriptor.begin_hash_audit();
         audit.update(0, &envelope.header)?;
@@ -2541,6 +2543,7 @@ impl<I: Clone + StorageIo> CompactionSource<I> {
     }
 
     fn load_next_page(&mut self) -> Result<(), ExactIndexStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexCompaction);
         if self.next_page_ordinal == self.descriptor.page_count() {
             let mut audit = self
                 .audit
@@ -3098,6 +3101,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         if let Some(page) = self.page_cache.get(run_hash, page_ordinal) {
             return Ok(page);
         }
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
         let offset = self
             .descriptor
             .page_offset(page_ordinal)

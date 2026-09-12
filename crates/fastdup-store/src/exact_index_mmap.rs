@@ -23,7 +23,7 @@ use crate::exact_index_repository::ExactIndexStoreError;
 pub(crate) struct ImmutableExactIndexRun {
     // Drop order is significant: unmap before releasing the mutation lease.
     mapping: Mmap,
-    _lease: ImmutableFileLease,
+    lease: ImmutableFileLease,
     descriptor: ExactIndexRunDescriptor,
     page_bounds: Box<[ExactPageKeyBounds]>,
 }
@@ -34,6 +34,8 @@ impl ImmutableExactIndexRun {
         expected: ExactIndexRunDescriptor,
         mut visit: impl FnMut(&ExactIndexEntry),
     ) -> Result<Self, ExactIndexStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
+        let _mapped_reads = lease.mapping_read_scope();
         let metadata = lease.file().metadata()?;
         let expected_length = u64::try_from(expected.file_length())
             .map_err(|_| ExactIndexStoreError::CounterOverflow)?;
@@ -45,7 +47,7 @@ impl ImmutableExactIndexRun {
         // published object. FsStorageIo holds a root-wide generation lease
         // that rejects writes, truncation, replacement, and removal for this
         // name until the mapping is dropped. The descriptor stays alive in
-        // `_lease`, and its exact file length was checked above.
+        // `lease`, and its exact file length was checked above.
         let mapping = unsafe {
             MmapOptions::new()
                 .len(expected.file_length())
@@ -93,7 +95,7 @@ impl ImmutableExactIndexRun {
 
         Ok(Self {
             mapping,
-            _lease: lease,
+            lease,
             descriptor,
             page_bounds: page_bounds.into_boxed_slice(),
         })
@@ -119,6 +121,7 @@ impl ImmutableExactIndexRun {
     }
 
     pub(crate) fn page(&self, offset: u64) -> Result<&[u8], ExactIndexStoreError> {
+        let _mapped_reads = self.lease.mapping_read_scope();
         exact_page(&self.mapping, offset)
     }
 }
@@ -179,7 +182,9 @@ fn exact_range(
     let end = offset
         .checked_add(length)
         .ok_or(ExactIndexStoreError::IdentityMismatch)?;
-    mapping
+    let result = mapping
         .get(offset..end)
-        .ok_or(ExactIndexStoreError::IdentityMismatch)
+        .ok_or(ExactIndexStoreError::IdentityMismatch);
+    crate::metadata_read_telemetry::mapped_range(length, result.is_ok());
+    result
 }

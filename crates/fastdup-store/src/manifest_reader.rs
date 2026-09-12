@@ -1096,6 +1096,7 @@ fn read_tree_metadata<I: StorageIo>(
     storage: &I,
     object_id: MetadataObjectId,
 ) -> Result<Vec<u8>, ManifestTreeError> {
+    let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::Manifest);
     let name = metadata_name(object_id);
     let length = storage.object_len(&name)?;
     if length

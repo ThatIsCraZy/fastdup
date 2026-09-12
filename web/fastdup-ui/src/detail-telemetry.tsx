@@ -9,6 +9,8 @@ export interface DetailTelemetry {
   runtime?: {
     runtimeId: string;
     allocatorMemory?: {arenaBytes: number; allocatedBytes: number; freeBytes: number; anonymousResidentBytes: number; trimAttempts: number; lastTrimMicros: number} | null;
+    metadataReads?: {intervalSeconds: number; rows: {reason: string; object: string; mode: string; operations: number; requestedBytes: number; returnedBytes: number; errors: number; elapsedMicros: number; maxMicros: number; inFlight: number; operationsPerSecond: number; requestedMbps: number}[]} | null;
+    codecBuffers?: {retainedBytes: number; activeBytes: number; peakActiveBytes: number; hits: number; misses: number; evictions: number} | null;
     readCacheCompression?: {
       decodedResidentBytes: number; compressedResidentBytes: number; compressedLogicalBytes: number;
       attempts: number; admissions: number; compressionNanos: number; hits: number; decompressions: number;
@@ -29,7 +31,10 @@ export interface DetailTelemetry {
   } | null;
 }
 
-const tabs = ["Latenzen", "io_uring", "Caches", "Lesevermeidung", "GC & Scrub", "Checkpoint-Phasen"];
+const tabs = ["Latenzen", "io_uring", "Caches", "Lesevermeidung", "GC & Scrub", "Checkpoint-Phasen", "Metadata-Reads"];
+const metadataReasons: Record<string,string> = {other:"Nicht zugeordnet",indexLookup:"Index-Abfrage · Cache-Miss",indexCompaction:"Index-Zusammenführung",indexAudit:"Index-Prüfung",indexEnvelope:"Index-Header / Footer",manifest:"Manifest lesen",namespace:"Namespace / Verwaltungsgraph",recoveryScrub:"Recovery / Scrub",garbageCollection:"Garbage Collection"};
+const metadataObjects: Record<string,string> = {exactIndex:"Exact Index",similarityIndex:"Similarity Index",metadataObject:"Metadatenobjekt",smallFile:"Small-File-Container",control:"Commit / Journal / Verwaltung",other:"Weitere Dateien"};
+const metadataModes: Record<string,string> = {bufferedRange:"Gepufferter Bereich",bufferedFile:"Gepufferte Datei",bufferedStructure:"Gepufferte Struktur",mmap:"mmap"};
 const cacheLabels: Record<string, string> = { verifiedRead: "Verified Read", exactIndex: "Exact Index", similarityIndex: "Similarity Index", containerDescriptors: "Container Descriptors", historicalProofs: "Historical Proofs", manifestNodes: "Manifest Nodes" };
 const cacheDescriptions: Record<string, string> = {
   verifiedRead: "Geprüfte Nutzdaten für Lesen und Vergleichsbasen",
@@ -59,7 +64,9 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
   const budget = runtime?.cacheBudget;
   const scrub = runtime?.scrub;
   const compression = runtime?.readCacheCompression;
-  const pools = [...(budget?.pools ?? runtime?.caches ?? [])].sort((a, b) => {
+  const metadataReads = runtime?.metadataReads;
+  const [metadataTotals, setMetadataTotals] = useState(false);
+  const pools = [...(budget?.pools ?? runtime?.caches ?? [])].filter(pool => pool.id !== "codecBuffers").sort((a, b) => {
     const tier = (id: string) => budget?.pools.find(pool => pool.id === id)?.fallbackTier;
     return Number(tier(b.id) === "data") - Number(tier(a.id) === "data");
   });
@@ -98,6 +105,18 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
             {rows([["RAM-Obergrenze", `${number(budget.maximumMemoryUsedBasisPoints / 100)} %`], ["Effektives RAM", bytes(budget.effectiveLimitBytes)], ["Verfügbares RAM", bytes(budget.availableBytes)], ["Gemeinsames Cache-Budget", bytes(budget.budgetBytes)], ["Cache-Belegung", bytes(budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0))]])}
             <progress aria-label={t("Cache-Budget Belegung")} value={budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0)} max={Math.max(1, budget.budgetBytes)} />
           </div>}
+          {runtime.codecBuffers && <details className="telemetry-disclosure"><summary>{t("Wiederverwendbare Codec-Puffer")}</summary>
+            {rows([
+              ["Freie Puffer im Pool", bytes(runtime.codecBuffers.retainedBytes)],
+              ["Puffer in Verwendung", bytes(runtime.codecBuffers.activeBytes)],
+              ["Spitze in Verwendung", bytes(runtime.codecBuffers.peakActiveBytes)],
+              ["Puffer wiederverwendet", number(runtime.codecBuffers.hits)],
+              ["Neue Puffer angelegt", number(runtime.codecBuffers.misses)],
+              ["Puffer freigegeben", number(runtime.codecBuffers.evictions)],
+              ["Zielbudget", bytes(budget?.pools.find(pool => pool.id === "codecBuffers")?.targetBytes)],
+            ])}
+            <small>{t("Freie Puffer nutzen das gemeinsame RAM-Budget nachrangig. Aktive Puffer können auch von Cache-Einträgen oder Lesern gehalten werden; die Werte werden nicht addiert. Zähler gelten seit dem Mount.")}</small>
+          </details>}
           {runtime.allocatorMemory && <details className="detail-note">
             <summary>{t("Prozessspeicher und Allocator")}</summary>
             {rows([
@@ -169,6 +188,20 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
         </> : empty)}
         {tab === 4 && (runtime ? <div className="detail-columns"><div><h3>{t("Letzter GC-Lauf")}</h3>{gc ? <><p className="detail-note">{timestamp(gc.observedAt)} · {t(({running:"Läuft",failed:"Fehlgeschlagen",noCandidates:"Keine Kandidaten",noProfitableCandidates:"Keine profitablen Kandidaten",catalogRebuilt:"Katalog erneuert",collected:"Abgeschlossen"} as Record<string,string>)[gc.state] ?? gc.state)}</p>{rows([["Dauer", gc.totalMs == null ? "—" : `${number(gc.totalMs)} ms`], ["Kandidaten", number(gc.candidates)], ["Geprüfte Victims", number(gc.victims)], ["Abgebrochene Kandidaten", number(gc.abortedCandidates)], ["Relocation Read", bytes(gc.readBytes)], ["Relocation Write", bytes(gc.writeBytes)], ["Unlinked", bytes(gc.unlinkedBytes)]])}</> : <p>{t("Seit dem Mount wurde noch kein GC-Lauf gestartet.")}</p>}</div>
           <div><h3>{t("Hintergrundprüfung")}</h3>{scrub ? <>{rows([["Container geprüft", `${number(scrub.verifiedContainers)} / ${number(scrub.totalContainers)}`], ["aus vorheriger Prüfung übernommen", number(scrub.resumedContainers)], ["neu geprüft", number(scrub.newlyVerifiedContainers)], ["noch ausstehend", number(scrub.remainingContainers)], ["Geprüfte Container-Bytes", bytes(scrub.verifiedBytes)], ["Gelesene Bytes", bytes(scrub.readBytes)]])}</> : <p className="detail-note">{t("Keine Messdaten zur Hintergrundprüfung verfügbar.")}</p>}</div></div> : empty)}
+        {tab === 6 && (metadataReads ? <>
+          <h3>{t("Metadata-Lesewege")}</h3>
+          <p className="detail-note">{t("Angeforderte Backend-Reads nach Ursache. Diese Werte sind keine physischen Plattenzugriffe: gepufferte Reads und mmap können vom Linux-Dateicache bedient werden. Physische MB/s und IOPS stehen bei den Laufwerken.")}</p>
+          <p>{metadataReads.intervalSeconds > 0 ? `${t("Messintervall")}: ${number(metadataReads.intervalSeconds)} s` : t("Erster Messpunkt · Raten noch nicht verfügbar")}</p>
+          <label><input type="checkbox" checked={metadataTotals} onChange={event => setMetadataTotals(event.target.checked)} />{t("Summen und Lesezeiten seit Mount anzeigen")}</label>
+          {metadataReads.rows.length === 0 ? <p>{t("Noch keine Metadata-Reads erfasst.")}</p> : <div className="telemetry-table-scroll"><table><thead><tr>{["Ursache", "Daten", "Zugriffsweg", "Angefordert · MB/s", "Aufrufe/s", "Laufende Reads", ...(metadataTotals ? ["Aufrufe", "Angefordert", "Erfolgreich geliefert", "Fehler", "Ø Lesezeit", "Max. Lesezeit"] : [])].map(label => <th key={label}>{t(label)}</th>)}</tr></thead><tbody>
+            {[...metadataReads.rows].sort((a,b) => b.requestedMbps - a.requestedMbps || b.requestedBytes - a.requestedBytes).map(row => <tr key={`${row.reason}/${row.object}/${row.mode}`}>
+              <th scope="row">{t(metadataReasons[row.reason] ?? row.reason)}</th><td>{t(metadataObjects[row.object] ?? row.object)}</td><td>{t(metadataModes[row.mode] ?? row.mode)}</td>
+              <td>{metadataReads.intervalSeconds > 0 ? number(row.requestedMbps) : "—"}</td><td>{metadataReads.intervalSeconds > 0 ? number(row.operationsPerSecond) : "—"}</td><td>{row.mode === "mmap" ? "—" : number(row.inFlight)}</td>
+              {metadataTotals && <><td>{number(row.operations)}</td><td>{bytes(row.requestedBytes)}</td><td>{bytes(row.returnedBytes)}</td><td>{number(row.errors)}</td><td>{row.mode === "mmap" || !row.operations ? "—" : `${number(row.elapsedMicros / row.operations / 1000)} ms`}</td><td>{row.mode === "mmap" || !row.operations ? "—" : `${number(row.maxMicros / 1000)} ms`}</td></>}
+            </tr>)}
+          </tbody></table></div>}
+          <small>{t("mmap zählt angeforderte Speicherbereiche, keine Page Faults. Lesezeiten umfassen den Backend-Aufruf inklusive Öffnen und Pufferaufbau; mmap-Lesezeiten werden nicht behauptet. Metadatenzugriffe des Host-Dateisystems sind in dieser Aufschlüsselung nicht enthalten.")}</small>
+        </> : empty)}
         {tab === 5 && (checkpoint ? <>
           <p className="detail-note">{t("Letzter abgeschlossener Checkpoint")}: {timestamp(checkpoint.completedAt)} · Generation {number(checkpoint.generation)} · {number(checkpoint.totalMs)} ms</p>
           <ReactECharts style={{height:280}} option={{animation:false,textStyle:{fontFamily:'Inter, "Segoe UI", sans-serif'},grid:{left:145,right:30,top:15,bottom:35},tooltip:{trigger:'axis',valueFormatter:(value:number)=>`${number(value)} ms`},xAxis:{type:'value',name:'ms',axisLabel:{color:'#afbecb'},splitLine:{lineStyle:{color:'#253945'}}},yAxis:{type:'category',inverse:true,data:checkpoint.phases.map(phase=>phaseLabels[phase.id]??phase.id),axisLabel:{color:'#afbecb'}},series:[{type:'bar',data:checkpoint.phases.map(phase=>phase.wallMs),itemStyle:{color:'#63c4d5'},barMaxWidth:16}]}} />

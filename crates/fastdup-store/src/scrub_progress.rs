@@ -11,7 +11,7 @@ use std::io;
 const NAME: &str = ".fastdup-scrub-progress-v1";
 const MAGIC: &[u8; 8] = b"FDSCRB01";
 const HEADER_LEN: usize = 80;
-// A stopped pass cannot postpone latent-corruption checks indefinitely.
+// Neither stopped nor completed passes may postpone latent-corruption checks indefinitely.
 const MAX_ROUND_AGE: u64 = 7 * 24 * 60 * 60;
 
 /// A past complete verification within one scrub round. Opaque and deliberately
@@ -221,7 +221,7 @@ impl ScrubResumePool {
 }
 
 /// Single-writer, checksummed append journal in the Metadata pool. The caller
-/// holds the appliance lease. Only an incomplete, recent round with the exact
+/// holds the appliance lease. Only a recent round with the exact
 /// pool binding is resumable. The in-memory index stores offsets, not Chunk maps.
 pub struct ScrubProgress<I> {
     storage: I,
@@ -233,7 +233,8 @@ pub struct ScrubProgress<I> {
 
 impl<I: StorageIo> ScrubProgress<I> {
     /// Opens the accepted prefix; a torn suffix is discarded before appending.
-    /// Invalid/foreign/expired headers and completed rounds start a new pass.
+    /// Invalid/foreign/expired headers start a new pass. Completion retains checks
+    /// for current-envelope reconciliation; it never proves today's graph healthy.
     /// # Errors
     /// Returns storage failures. Callers may fall back to a full scrub.
     pub fn open(storage: I, binding: [u8; 32], now: u64) -> io::Result<Self> {
@@ -285,7 +286,11 @@ impl<I: StorageIo> ScrubProgress<I> {
                 break;
             }
             if bytes[4] == 2 && bytes.len() == 37 {
-                return Ok(false);
+                // A successful pass does not invalidate its immutable checks.
+                // Later mounts may append checks for new/changed Containers and
+                // another completion, without extending the original round age.
+                self.end += size as u64;
+                continue;
             }
             let Some(entry) = decode_entry(&bytes, self.started, now) else {
                 break;
@@ -443,7 +448,8 @@ impl<I: StorageIo> ScrubProgress<I> {
         self.storage.sync_file(NAME)
     }
 
-    /// Closes the round durably. The next start performs a new full pass.
+    /// Records successful coverage durably. Recent checks remain resumable;
+    /// every next start must reconcile current envelopes and rebuild coverage.
     /// # Errors
     /// Returns storage errors; a lost completion repeats only scheduling work.
     pub fn complete(&mut self) -> io::Result<()> {

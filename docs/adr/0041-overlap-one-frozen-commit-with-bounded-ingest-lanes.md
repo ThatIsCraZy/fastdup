@@ -209,6 +209,18 @@ partial-publication integration test requires same-inode forward progress and
 a second concurrent publication, then crash-recovers only the original Frozen
 prefix byte-exactly.
 
+Inline Exact/FILL reuse must attach its Prepared Extent Recipes to Namespace
+before releasing the Lane lock. A post-cut Ingest job can consume pre-cut Tail
+bytes without belonging to the cut's Ingest fence. Unlike detached Container
+work, its inline recipes have no publication ordinal: returning them to the
+worker after unlocking would leave a window in which the commit drain sees
+neither the Tail nor its recipes. Staging therefore completes this memory-only
+handoff itself. It does not wait for DATA durability or later Ingest retirement.
+Mutation observers release inode state before queue admission; externalization
+does not acquire Observer-order locks. The per-instance test-only pause after
+Lane release exercises both Exact and FILL handoffs through queued writes and
+checkpoint/recovery, including exclusion of the later Active suffix.
+
 ## Preserve stable work across discontinuous writes (2026-09-06)
 
 Two adjacent writes may arrive in reversed offset order. Clearing an entire

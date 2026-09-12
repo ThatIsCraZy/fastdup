@@ -1,12 +1,15 @@
 //! Payload-free structural validation. This is deliberately not a content proof.
+use super::dependent::is_dependent_codec;
+use super::envelope::{IndexEntry, decode_index};
+use super::records::{validate_logical_chunk_length, validate_raw_record_constants};
+use super::summary::IntrinsicSummaryAccumulator;
 use super::{
     CHUNK_TABLE_ENTRY_BYTES, CHUNK_TABLE_ENTRY_BYTES_U16, CONTAINER_COMMITMENT_DOMAIN_V1, ChunkId,
-    FOOTER_CRC_OFFSET, FOOTER_HASH_OFFSET, FORMAT_VERSION, FormatError, HEADER_BYTES, IndexEntry,
-    IntrinsicSummaryAccumulator, MAX_DECODED_RECORD_BYTES, MAX_RECORD_BYTES, MIN_RAW_RECORD_BYTES,
-    RAW_CODEC, RECORD_ALIGNMENT, RECORD_HEADER_BYTES, RECORD_HEADER_BYTES_U16,
-    RECORD_HEADER_BYTES_U32, RECORD_MAGIC, SPARSE_XOR_CODEC, SealedContainerDescriptor, ZSTD_CODEC,
-    ZSTD_LEVEL_V1, ZSTD_PREFIX_CODEC, ZSTD_PREFIX_LEVEL_V1, align_up_usize, decode_index, get_u16,
-    get_u32, is_dependent_codec, validate_logical_chunk_length, validate_raw_record_constants,
+    FOOTER_CRC_OFFSET, FOOTER_HASH_OFFSET, FORMAT_VERSION, FormatError, HEADER_BYTES,
+    MAX_DECODED_RECORD_BYTES, MAX_RECORD_BYTES, MIN_RAW_RECORD_BYTES, RAW_CODEC, RECORD_ALIGNMENT,
+    RECORD_HEADER_BYTES, RECORD_HEADER_BYTES_U16, RECORD_HEADER_BYTES_U32, RECORD_MAGIC,
+    SPARSE_XOR_CODEC, SealedContainerDescriptor, ZSTD_CODEC, ZSTD_LEVEL_V1, ZSTD_PREFIX_CODEC,
+    ZSTD_PREFIX_LEVEL_V1, align_up_usize, get_u16, get_u32,
 };
 
 /// A Chunk identity and optional Depth-1 dependency authenticated by Container

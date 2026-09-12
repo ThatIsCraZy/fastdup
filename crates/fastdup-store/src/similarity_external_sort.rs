@@ -967,6 +967,7 @@ impl<'a, I: StorageIo, R: SpoolRecord> SpoolReader<'a, I, R> {
         let length = count
             .checked_mul(R::BYTES)
             .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexCompaction);
         let bytes = self.storage.read_exact_at(
             self.name,
             u64::try_from(byte_offset).map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
@@ -1028,7 +1029,8 @@ impl<'a, I: StorageIo> RandomEntryReader<'a, I> {
             let byte_length = count
                 .checked_mul(ENTRY_SPOOL_BYTES)
                 .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
-            let bytes = self.storage.read_exact_at(
+            let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexCompaction);
+        let bytes = self.storage.read_exact_at(
                 &self.run.name,
                 u64::try_from(byte_offset)
                     .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,

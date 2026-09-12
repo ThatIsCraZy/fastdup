@@ -105,22 +105,35 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
             json!({"id":pool.name, "fallbackTier":match pool.fallback {
             fastdup_store::CacheFallback::Data => "data",
             fastdup_store::CacheFallback::Metadata => "metadata",
+            fastdup_store::CacheFallback::Memory => "memory",
         }, "residentBytes":pool.resident_bytes, "targetBytes":pool.target_bytes,
             "leasedBytes":pool.leased_bytes, "hits":pool.hits, "misses":pool.misses,
             "evictions":pool.evictions})
         })
         .collect();
+    let metadata_reads = fastdup_store::metadata_read_status();
+    let metadata_rows: Vec<_> = metadata_reads.rows.iter().map(|row| json!({
+        "reason":row.reason,"object":row.object,"mode":row.mode,
+        "operations":row.operations,"requestedBytes":row.requested_bytes,"returnedBytes":row.returned_bytes,
+        "errors":row.errors,"elapsedMicros":row.elapsed_micros,"maxMicros":row.max_micros,
+        "inFlight":row.in_flight,"operationsPerSecond":row.operations_per_second,"requestedMbps":row.requested_mbps
+    })).collect();
+    let buffers = read.buffer_pool();
     let allocator = fastdup_store::allocator_memory_status().map(|status| json!({
         "arenaBytes":status.arena_bytes, "allocatedBytes":status.allocated_bytes,
         "freeBytes":status.free_bytes, "anonymousResidentBytes":status.anonymous_resident_bytes,
         "trimAttempts":status.trim_attempts, "lastTrimMicros":status.last_trim_micros,
     }));
     json!({
+        "metadataReads": {"intervalSeconds":metadata_reads.interval_seconds,"rows":metadata_rows},
         "allocatorMemory": allocator,
         "cacheBudget": {"maximumMemoryUsedBasisPoints":9200,
             "effectiveLimitBytes":budget.effective_limit_bytes,
             "availableBytes":budget.available_bytes,
             "budgetBytes":budget.budget_bytes, "pools":pools},
+        "codecBuffers": {"retainedBytes": buffers.retained_bytes, "activeBytes": buffers.active_bytes,
+            "peakActiveBytes": buffers.peak_active_bytes, "hits": buffers.hits,
+            "misses": buffers.misses, "evictions": buffers.evictions},
         "readCacheCompression": {
             "decodedResidentBytes":read.resident_bytes().saturating_sub(read.compressed_resident_bytes()),
             "compressedResidentBytes":read.compressed_resident_bytes(),

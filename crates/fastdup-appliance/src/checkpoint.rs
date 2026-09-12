@@ -2303,6 +2303,8 @@ struct WriteThroughIngest<C> {
     queue: Arc<IngestQueue>,
     publication_queue: Arc<PublicationQueue>,
     namespace: OnceLock<Weak<Namespace>>,
+    #[cfg(test)]
+    after_inline_stage: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     online_dependency_proofs: Arc<OnlineDependencyProofs>,
 }
@@ -3568,18 +3570,11 @@ where
             IngestJobKind::WriteBatch { fragments } => self.stage_write_batch(job.inode, fragments),
             IngestJobKind::Truncate => {
                 self.reset_lane(job.inode);
-                Ok(Vec::new())
+                Ok(())
             }
         };
-        match result {
-            Ok(externalized) => {
-                if !externalized.is_empty()
-                    && let Some(namespace) = self.namespace.get().and_then(Weak::upgrade)
-                {
-                    namespace.externalize_verified_extents(externalized);
-                }
-            }
-            Err(error) => self.degrade_job(job, &error),
+        if let Err(error) = result {
+            self.degrade_job(job, &error);
         }
     }
 
@@ -3794,7 +3789,7 @@ where
         &self,
         inode: InodeId,
         fragments: &[IngestWriteFragment],
-    ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
+    ) -> Result<(), DurableNamespaceError> {
         assert!(
             !fragments.is_empty(),
             "ASSERT: an Ingest Batch contains at least one fragment"
@@ -3855,8 +3850,28 @@ where
             assert_bounded_write_through_lane(&lane);
         }
         lane.tail.assert_valid();
+        #[cfg(test)]
+        let had_inline = !externalized.is_empty();
+        if !externalized.is_empty()
+            && let Some(namespace) = self.namespace.get().and_then(Weak::upgrade)
+        {
+            // A post-cut job can consume pre-cut Tail bytes. Publish its inline
+            // recipes before the Lane becomes available to the commit drain:
+            // the cut's Ingest fence need not wait for this later job, and the
+            // detached-publication fence cannot see inline Exact/FILL reuse.
+            // This only updates Namespace memory. Mutation observers enqueue
+            // after releasing inode state, so no inode holder waits on this Lane.
+            namespace.externalize_verified_extents(externalized);
+        }
         drop(lane);
-        Ok(externalized)
+        #[cfg(test)]
+        if had_inline {
+            let hook = self.after_inline_stage.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        Ok(())
     }
 
     fn drain_before_lane_reset(
@@ -4543,6 +4558,8 @@ where
         queue: Arc::new(IngestQueue::new()),
         publication_queue: Arc::new(PublicationQueue::new()),
         namespace: OnceLock::new(),
+        #[cfg(test)]
+        after_inline_stage: Mutex::new(None),
         workers: Mutex::new(Vec::new()),
         online_dependency_proofs,
     });
@@ -8768,3 +8785,7 @@ mod tests {
         assert_bounded_write_through_lane(&state);
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint/ingest_handoff_tests.rs"]
+mod ingest_handoff_tests;

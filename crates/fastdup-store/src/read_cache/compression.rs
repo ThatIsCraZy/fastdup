@@ -2,7 +2,8 @@ use super::{
     CacheBackingCharge, CacheKey, ChunkId, MemoryPressureSnapshot, VerifiedChunkPayload,
     VerifiedReadCache, cache_hash, shared_cache_reserve_bytes,
 };
-use fastdup_format::{CompressedVerifiedChunkPayload, MAX_LOGICAL_CHUNK_BYTES};
+use crate::{CacheFallback, CacheObservation, CachePool};
+use fastdup_format::{BufferPool, CompressedVerifiedChunkPayload, MAX_LOGICAL_CHUNK_BYTES};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,9 @@ struct Utility {
 /// Optional compression never waits; mandatory RAM decompression may wait for
 /// another codec operation, without holding a shard or admission lock.
 pub(super) struct Compression {
+    pub(super) buffers: BufferPool,
+    buffer_refresh: Mutex<()>,
+    buffer_budget: Option<CachePool>,
     used: Mutex<usize>,
     ready: Condvar,
     maximum: usize,
@@ -67,11 +71,21 @@ pub(super) struct Compression {
 const CODEC_WORK: usize = 2 * MAX_LOGICAL_CHUNK_BYTES + 128 * 1024;
 
 impl Compression {
-    pub(super) fn new(snapshot: MemoryPressureSnapshot) -> Self {
+    pub(super) fn new(snapshot: MemoryPressureSnapshot, automatic: bool) -> Self {
         let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
         let reserve = usize::try_from(shared_cache_reserve_bytes(snapshot.effective_limit_bytes()))
             .unwrap_or(usize::MAX);
         Self {
+            buffers: BufferPool::new(),
+            buffer_refresh: Mutex::new(()),
+            buffer_budget: automatic.then(|| {
+                CachePool::system(
+                    "codecBuffers",
+                    CacheFallback::Memory,
+                    BufferPool::metadata_bytes() as u64,
+                    (32 * (MAX_LOGICAL_CHUNK_BYTES + 2048) + BufferPool::metadata_bytes()) as u64,
+                )
+            }),
             used: Mutex::new(0),
             ready: Condvar::new(),
             maximum: cpus
@@ -95,6 +109,49 @@ impl Compression {
             peak_working: AtomicUsize::new(0),
             #[cfg(test)]
             enabled: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    pub(super) fn refresh_buffers(&self, snapshot: MemoryPressureSnapshot) {
+        let _refresh = self
+            .buffer_refresh
+            .lock()
+            .expect("ASSERT: buffer refresh lock poisoned");
+        let observed = self.buffers.status();
+        let fixed = BufferPool::metadata_bytes() as u64;
+        let target = if let Some(pool) = &self.buffer_budget {
+            usize::try_from(
+                pool.target(
+                    snapshot,
+                    CacheObservation {
+                        hits: observed.hits,
+                        misses: observed.misses,
+                        evictions: observed.evictions,
+                        // Reuse benefit is allocation work, not claimed avoided DATA bytes.
+                        hit_bytes: observed.reused_bytes,
+                        resident_bytes: fixed + observed.retained_bytes as u64,
+                    },
+                )
+                .saturating_sub(fixed),
+            )
+            .unwrap_or(usize::MAX)
+        } else if snapshot.swap_used_bytes() == 0 {
+            usize::try_from(
+                snapshot
+                    .available_bytes()
+                    .saturating_sub(shared_cache_reserve_bytes(snapshot.effective_limit_bytes())),
+            )
+            .unwrap_or(usize::MAX)
+            .min(self.maximum)
+        } else {
+            0
+        };
+        self.buffers.set_limit(target);
+        if let Some(pool) = &self.buffer_budget {
+            pool.applied(
+                target as u64 + fixed,
+                self.buffers.status().retained_bytes as u64 + fixed,
+            );
         }
     }
 
@@ -198,7 +255,7 @@ impl VerifiedReadCache {
             self.compression.attempts.fetch_add(1, Ordering::Relaxed);
             let result: Option<Vec<_>> = payloads
                 .iter()
-                .map(VerifiedChunkPayload::compress_for_cache)
+                .map(|payload| payload.compress_for_cache_with_pool(&self.compression.buffers))
                 .collect();
             self.compression
                 .compress_ns
@@ -233,7 +290,7 @@ impl VerifiedReadCache {
         }
         let _workspace = self.compression.permit(CODEC_WORK, true)?;
         let start = Instant::now();
-        let Some((payload, decoded)) = value.decompress() else {
+        let Some((payload, decoded)) = value.decompress_with_pool(&self.compression.buffers) else {
             self.compression.failures.fetch_add(1, Ordering::Relaxed);
             self.invalidate_compressed(value);
             return None;
@@ -337,7 +394,7 @@ impl VerifiedReadCache {
         };
         let start = Instant::now();
         self.compression.attempts.fetch_add(1, Ordering::Relaxed);
-        let compressed = payload.compress_for_cache();
+        let compressed = payload.compress_for_cache_with_pool(&self.compression.buffers);
         self.compression
             .compress_ns
             .fetch_add(nanos(start), Ordering::Relaxed);
@@ -479,8 +536,28 @@ mod policy_tests {
     use crate::VerifiedReadCacheConfig;
 
     #[test]
+    fn pressure_closes_pool_retention_while_a_real_cache_hit_remains_readable() {
+        let cache = VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(4 << 20, 0, NonZeroUsize::MIN).unwrap(),
+            MemoryPressureSnapshot::new(128 << 20, 128 << 20, 0),
+        ).unwrap();
+        let payload = crate::read_cache::tests::verified_payload(&vec![73; 65536]);
+        let id = payload.chunk_id();
+        cache.admit_decoded_group(vec![payload]);
+        let reader = cache.get(id, 65536).unwrap();
+        assert!(cache.status().buffer_pool().active_bytes > 0);
+        cache.update_memory_pressure(MemoryPressureSnapshot::new(128 << 20, 0, 1));
+        assert_eq!(reader.as_slice(), &[73; 65536]);
+        assert_eq!(cache.status().buffer_pool().retained_bytes, 0);
+        drop(reader);
+        assert_eq!(cache.status().buffer_pool().active_bytes, 0);
+        assert_eq!(cache.status().buffer_pool().retained_bytes, 0);
+        crate::read_cache::reclamation_tests::assert_accounting(&cache);
+    }
+
+    #[test]
     fn hot_admission_compares_decode_work_per_extra_byte() {
-        let codec = Compression::new(MemoryPressureSnapshot::new(128 << 20, 128 << 20, 0));
+        let codec = Compression::new(MemoryPressureSnapshot::new(128 << 20, 128 << 20, 0), false);
         assert!(!codec.prefer_decoded(100_000, 1024, 1));
         assert!(!codec.prefer_decoded(100, 65536, 2));
         assert!(codec.prefer_decoded(200_000, 1024, 2));
@@ -488,7 +565,7 @@ mod policy_tests {
 
     #[test]
     fn codec_workspace_is_bounded_and_released_on_all_paths() {
-        let codec = Compression::new(MemoryPressureSnapshot::new(128 << 20, 128 << 20, 0));
+        let codec = Compression::new(MemoryPressureSnapshot::new(128 << 20, 128 << 20, 0), false);
         let held = codec.permit(codec.maximum, false).unwrap();
         assert!(codec.permit(1, false).is_none());
         std::thread::scope(|scope| {

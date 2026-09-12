@@ -4,6 +4,56 @@ status: accepted
 
 # Bound the verified read cache by live memory headroom
 
+## Amendment: application-owned read caching (12 September 2026)
+
+The application owns read-cache admission, prioritization and eviction. Linux
+page cache and file-backed mmap are not an additional cache tier in the target
+architecture. Free effective RAM must be available to the shared broker rather
+than retained by an unaccounted duplicate cache underneath fastdup.
+
+Every reusable Metadata or DATA read must consult the appropriate owned cache
+before falling back to storage. This includes immutable Index pages consumed by
+compaction and audits, not just foreground lookups. A cached page can eliminate
+the storage read while the caller still performs all required whole-generation
+hash/order/dependency checks. Reusing bytes never establishes a new integrity
+certificate or permits skipping validation. A cache must bind bytes to the
+correct immutable object identity/generation and retain valid ownership through
+mutation and retirement.
+
+Cold misses, revoked admission and one-pass work may reach storage. One-pass
+work must use a bounded, explicitly identified admission-bypass path rather
+than hiding behind the kernel cache. It must not evict useful DATA-saving
+content just to fill otherwise idle RAM. Host/cgroup pressure and outstanding
+working memory remain part of the existing 92% operating ceiling.
+
+This supersedes the kernel-readahead/read-cache rationale in ADR 0058. It is
+the accepted policy, not a claim that all existing buffered or mapped paths
+have already been replaced. This change adds attribution first: buffered range,
+whole-file, structure and mapped accesses report their cause and object class.
+Remaining direct audit/compaction reads and mappings are migration gaps, not
+approved alternative cache policies. Alignment-safe uncached I/O and owned
+cache coverage must be qualified before switching those paths. `DONTNEED` or
+global `drop_caches` is not a substitute for uncached I/O.
+
+## Metadata read attribution (12 September 2026)
+
+The daemon instruments Metadata and Small-File filesystem adapters, including
+their clones and reopened maintenance adapters. Scoped causes distinguish Index
+cache misses, compaction, audits, envelopes, Manifest reads, namespace graphs,
+recovery/scrub and unclassified work. Mapped Exact/Similarity/GC access records
+include the full audit and repeated semantic passes, not merely mmap creation.
+Unknown work remains visible instead of being silently attributed to a cache.
+
+Fixed-cardinality atomic counters record backend calls, requested/delivered
+bytes, failures, active buffered calls and buffered call duration. Snapshots
+derive rates from elapsed monotonic time between management observations.
+Failed exact reads do not claim partially returned bytes as successful output;
+whole-file failures may not have a known requested length. These counters are
+logical backend work, not physical disk IOPS/bytes. Mapped range accesses do
+not measure page faults or read latency. The UI keeps these distinctions and
+the existing physical disk measurements explicit; first/legacy samples do not
+invent rates. Counters are diagnostic and cannot influence recovery authority.
+
 fastdup shares decoded Chunk bytes only after the complete stored encoding,
 logical length, and BLAKE3 Chunk identity have been verified. The cache is
 attached to installed Manifest readers, not recovery or scrub, so it can never
@@ -486,3 +536,34 @@ hooks; unsupported allocator targets report no measurement.
 The [A/B qualification](../benchmarks/allocator-reclaim-2026-09-12.md) records
 retention reduction, added work and why neither per-request trim nor a universal
 low mmap threshold is suitable for this workload.
+
+## Reusable codec buffers (12 September 2026)
+
+Verified Read compression scratch and decoded cache-hit payloads use an
+initialized, process-local buffer pool. Idle buffers carry no content identity
+or verification evidence. Compression retains only a compact owned copy of its
+output. Decompression overwrites the requested output, checks its complete
+length and BLAKE3 identity, and only then publishes an immutable reader owner.
+The final payload or response owner returns capacity to the pool. A weak
+verification owner cannot be resurrected when that capacity is reused.
+Existing RAW/shared record owners keep their original ownership and zero-copy
+paths. No durable format, recovery rule or scrub certificate changes.
+
+Idle retention participates in the common 92% RAM budget as allocation reuse,
+not as avoided disk I/O. DATA and Metadata caches receive their measured-demand
+shares first; only leftover capacity can be leased to codec buffers. The pool
+allocates on demand, has at most 32 idle slots, and reports actual capacities
+plus fixed pool bookkeeping. This slot bound is not a preallocated RAM quota.
+Shrink drops idle buffers before acknowledging the smaller broker lease;
+already checked-out owners remain valid and respect the new limit on return.
+Active codec concurrency keeps its existing workspace bound. Active decoded
+owners may also be accounted as cached payloads or ordinary reader memory, so
+active-pool gauges must not be added to cache occupancy. Missing pressure or
+process Swap closes idle retention through the existing pressure sampler.
+
+The allocator reclaimer remains available for other free heap memory. Pool
+reuse reduces allocator churn; it does not justify disabling OS reclamation or
+retaining all heap arenas indefinitely. UI allocation-reuse counters remain
+separate from cache hit rates and expose idle bytes, active/peak bytes, new
+buffers and releases. Qualification is recorded in
+[codec buffer reuse](../benchmarks/codec-buffer-reuse-2026-09-12.md).

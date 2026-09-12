@@ -64,6 +64,45 @@ fn clean_stop_and_crash_resume_without_reading_payloads() {
 }
 
 #[test]
+fn completed_scrub_restarts_with_envelope_reads_instead_of_full_payload_reads() {
+    let (metadata, data, _) = fixture(true);
+    let disk = saved(&certificates(&metadata, &data, &[31, 32]));
+    let repository = ContainerRepository::new(data.clone());
+    for now in 101..104 {
+        ScrubProgress::open(disk.clone(), BINDING, now)
+            .unwrap()
+            .complete()
+            .unwrap();
+        disk.crash();
+        let journal = ScrubProgress::open(disk.clone(), BINDING, now).unwrap();
+        let entries = [32, 31].map(|n| {
+            journal
+                .lookup(id(n), now)
+                .unwrap()
+                .expect("a successful scrub must retain prior checks for envelope reconciliation")
+        });
+        let mut work = coverage(&metadata, &data);
+        let before = data.operation_count();
+        let resumed = fastdup_store::ScrubResumePool::new()
+            .unwrap()
+            .resume(&repository, &entries, &mut work)
+            .unwrap();
+        assert_eq!(resumed, [true, true]);
+        work.finish().unwrap();
+        let operations = &data.operations()[before..];
+        assert!(!operations.contains(&StorageOperation::Read));
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|op| **op == StorageOperation::ReadExactAt)
+                .count(),
+            4,
+            "only the Header/Footer pairs are read, including after repeated completions"
+        );
+    }
+}
+
+#[test]
 fn missing_base_cannot_be_hidden_by_resumed_dependent_certificate() {
     let (metadata, data, _) = fixture(true);
     let disk = saved(&certificates(&metadata, &data, &[31, 32]));
@@ -231,14 +270,16 @@ fn old_check_does_not_bypass_demand_or_offline_payload_verification() {
 }
 
 #[test]
-fn completed_expired_foreign_and_clock_reversed_rounds_start_over() {
+fn expired_foreign_and_clock_reversed_rounds_start_over_even_after_completion() {
     let (metadata, data, _) = fixture(false);
     let entries = certificates(&metadata, &data, &[31]);
     for (binding, now, completed) in [
-        (BINDING, 101, true),
         ([74; 32], 101, false),
+        ([74; 32], 101, true),
         (BINDING, 100 + 7 * 86400, false),
+        (BINDING, 100 + 7 * 86400, true),
         (BINDING, 99, false),
+        (BINDING, 99, true),
     ] {
         let disk = saved(&entries);
         if completed {
@@ -251,6 +292,54 @@ fn completed_expired_foreign_and_clock_reversed_rounds_start_over() {
         let journal = ScrubProgress::open(disk, binding, now).unwrap();
         assert!(journal.lookup(id(31), now).unwrap().is_none());
     }
+}
+
+#[test]
+fn checks_after_completion_survive_restart_without_renewing_the_round_age() {
+    let (metadata, data, _) = fixture(true);
+    let entries = certificates(&metadata, &data, &[31, 32]);
+    let disk = saved(&entries[..1]);
+    let mut journal = ScrubProgress::open(disk.clone(), BINDING, 101).unwrap();
+    journal.complete().unwrap();
+    journal.record(&entries[1]).unwrap();
+    journal.complete().unwrap();
+    disk.crash();
+    let mut journal = ScrubProgress::open(disk.clone(), BINDING, 100 + 7 * 86400 - 1).unwrap();
+    for n in [31, 32] {
+        assert!(
+            journal
+                .lookup(id(n), 100 + 7 * 86400 - 1)
+                .unwrap()
+                .is_some()
+        );
+    }
+    journal.complete().unwrap();
+    disk.crash();
+    let journal = ScrubProgress::open(disk, BINDING, 100 + 7 * 86400).unwrap();
+    for n in [31, 32] {
+        assert!(journal.lookup(id(n), 100 + 7 * 86400).unwrap().is_none());
+    }
+}
+
+#[test]
+fn completed_history_still_rejects_a_damaged_current_envelope() {
+    let (metadata, data, _) = fixture(false);
+    let disk = saved(&certificates(&metadata, &data, &[31]));
+    ScrubProgress::open(disk.clone(), BINDING, 101)
+        .unwrap()
+        .complete()
+        .unwrap();
+    disk.crash();
+    let journal = ScrubProgress::open(disk, BINDING, 102).unwrap();
+    let entry = journal.lookup(id(31), 102).unwrap().unwrap();
+    let mut work = coverage(&metadata, &data);
+    data.write_at(&name(31), 0, &[0; 4096]).unwrap();
+    assert!(
+        ContainerRepository::new(data)
+            .resume_scrub(&entry, &mut work)
+            .is_err()
+    );
+    assert!(work.finish().is_err());
 }
 
 #[test]
@@ -406,7 +495,7 @@ fn offline_repository_scrub_ignores_progress_even_when_progress_is_damaged() {
 }
 
 #[test]
-fn crash_during_tail_repair_or_completed_round_reset_never_fabricates_work() {
+fn crash_during_tail_repair_or_completion_reopen_never_fabricates_work() {
     let (metadata, data, _) = fixture(true);
     let entries = certificates(&metadata, &data, &[31, 32]);
     let run = |storage: MemoryStorageIo| -> std::io::Result<()> {
@@ -421,7 +510,8 @@ fn crash_during_tail_repair_or_completed_round_reset_never_fabricates_work() {
         journal.sync()?;
         journal.complete()?;
         let fresh = ScrubProgress::open(storage, BINDING, 102)?;
-        assert!(fresh.lookup(id(31), 102)?.is_none());
+        assert!(fresh.lookup(id(31), 102)?.is_some());
+        assert!(fresh.lookup(id(32), 102)?.is_some());
         Ok(())
     };
     let baseline = MemoryStorageIo::new();
