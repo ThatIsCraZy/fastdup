@@ -36,8 +36,13 @@ The operational bound is therefore 64 active families, not 64 physical Runs.
 
 Compaction performs one complete verified merge pass to determine canonical
 partition boundaries, then a second verified pass that streams every output.
-Each partition is reread, fully audited, file-synchronized, and published by
-no-replace rename. One directory sync after the complete family is the family
+Each partition is validated, file-synchronized, and published by no-replace
+rename. Online compaction under the same exclusive owner validates its encoder
+output and carries its evidence into activation, using the common cache for
+reusable pages (ADR 0046). Known immutable inputs may use their leased readers;
+cold input pages still require checksum validation. Standalone compaction and
+unknown/colliding outputs retain independent full storage audits.
+One directory sync after the complete family is the family
 publication point. Published but unselected partitions are harmless orphans.
 
 The Run Set is the atomic selection unit. Its writer, recovery reader, and
@@ -58,4 +63,3 @@ old Run Set or the complete new Run Set, never a subset of one family.
 - Physical Run count is observable but is not an admission or lookup bound.
 - Future Bloom/Fuse indexes may summarize partitions, but cannot weaken the
   authenticated range or complete-family invariants.
-

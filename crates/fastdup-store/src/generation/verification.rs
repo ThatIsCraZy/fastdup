@@ -18,7 +18,23 @@ impl<C, X> IndexedRequiredChunkVerifier<C, X> {
         containers: ContainerRepository<C>,
         index: crate::ExactIndexGenerationPin<X>,
     ) -> Self {
-        Self { containers, index }
+        Self {
+            containers,
+            index,
+            read_cache: None,
+        }
+    }
+
+    /// Shares already verified DATA with online readers and ingest. Current
+    /// Exact selection and full Location matching remain mandatory; Independent
+    /// intent bypasses reuse for recovery and scrub.
+    #[must_use]
+    pub fn with_verified_read_cache(
+        mut self,
+        cache: std::sync::Arc<crate::VerifiedReadCache>,
+    ) -> Self {
+        self.read_cache = Some(cache);
+        self
     }
 }
 
@@ -35,10 +51,11 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
             if co_verified.remove(chunk_id) {
                 continue;
             }
-            let Some((_, read)) = self.containers.find_verified_candidate_payload_with_index(
+            let Some((_, read)) = self.containers.find_verified_candidate_payload_cached(
                 &self.index,
                 *chunk_id,
                 *logical_length,
+                self.read_cache.as_deref(),
             ) else {
                 missing.insert(*chunk_id, *logical_length);
                 continue;
@@ -51,6 +68,11 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
                     if id > *chunk_id {
                         co_verified.insert(id);
                     }
+                }
+            }
+            if let Some(cache) = &self.read_cache {
+                for group in groups {
+                    cache.admit_decoded_group(group);
                 }
             }
         }

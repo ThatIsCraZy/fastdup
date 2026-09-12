@@ -4948,7 +4948,10 @@ where
     fn graph_verifier(&self, containers: ContainerRepository<C>) -> Box<dyn RequiredChunkVerifier> {
         let active = self.core.repository.pin_active_generation();
         match active {
-            Some(index) => Box::new(IndexedRequiredChunkVerifier::new(containers, index)),
+            Some(index) => Box::new(
+                IndexedRequiredChunkVerifier::new(containers, index)
+                    .with_verified_read_cache(Arc::clone(&self.read_cache)),
+            ),
             None => Box::new(containers),
         }
     }
@@ -4968,14 +4971,19 @@ where
             && active
                 .as_deref()
                 .is_none_or(|index| index.permits_active_overlay(recent).unwrap_or(false))
-            && containers.read_verified_location(recent).is_ok()
+            && containers
+                .verify_location_cached(recent, &self.read_cache)
+                .is_ok()
         {
             return Some(recent);
         }
         let active = active?;
-        if let Ok(location) =
-            containers.find_verified_location_with_index(&active, chunk_id, logical_length)
-        {
+        if let Ok(location) = containers.find_verified_location_with_index_cached(
+            &active,
+            chunk_id,
+            logical_length,
+            &self.read_cache,
+        ) {
             location
         } else {
             self.core.degraded.store(true, Ordering::Release);
@@ -7865,6 +7873,147 @@ mod tests {
     use super::*;
     use fastdup_format::ExactIndexLocation;
     use fastdup_testkit::MemoryStorageIo;
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One fixture follows cold, warm, graph and Independent reuse.
+    fn ingest_dedup_reuses_verified_record_siblings_from_the_shared_cache() {
+        let storage = MemoryStorageIo::new();
+        let containers = ContainerRepository::new(storage.clone());
+        let chunks = [vec![41; 32768], vec![43; 32768]];
+        let publication = containers
+            .publish_adaptive_regions_verified(
+                ContainerId::new([0xc7; 16]).unwrap(),
+                1,
+                &[&[chunks[0].as_slice(), chunks[1].as_slice()]],
+            )
+            .unwrap();
+        let entries: Vec<_> = publication
+            .locations()
+            .iter()
+            .copied()
+            .map(ExactIndexEntry::from_verified)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            entries[0].location().record_offset(),
+            entries[1].location().record_offset()
+        );
+        let indexes = ExactIndexRunRepository::new(MemoryStorageIo::new());
+        let profile = checkpoint_exact_index_profile_v1();
+        indexes.append_level_zero(profile, entries.clone()).unwrap();
+        let core = Arc::new(ExactPublisherCore {
+            repository: indexes,
+            profile,
+            degraded: AtomicBool::new(false),
+            recent: RwLock::new(BTreeMap::new()),
+            similarity: None,
+            failed_reduction_guard: Mutex::new(None),
+        });
+        let snapshot = fastdup_store::MemoryPressureSnapshot::new(1 << 30, 1 << 29, 0);
+        let policy = IndexedManifestReaders {
+            publisher: ExactPublicationQueue::start(Arc::clone(&core)).unwrap(),
+            core,
+            read_cache: Arc::new(
+                VerifiedReadCache::new_with_snapshot(
+                    fastdup_store::VerifiedReadCacheConfig::conservative(snapshot),
+                    snapshot,
+                )
+                .unwrap(),
+            ),
+            reduction: None,
+        };
+        assert_eq!(
+            policy.verified_location(&containers, entries[0].chunk_id(), 32768),
+            Some(entries[0])
+        );
+        let before = storage.operation_count();
+        assert_eq!(
+            policy.verified_location(&containers, entries[1].chunk_id(), 32768),
+            Some(entries[1])
+        );
+        assert_eq!(
+            storage.operation_count() - before,
+            0,
+            "the preceding record verification already decoded and checked this sibling"
+        );
+        policy.core.remember_recent(&entries);
+        let before = storage.operation_count();
+        assert_eq!(
+            policy.verified_location(&containers, entries[0].chunk_id(), 32768),
+            Some(entries[0])
+        );
+        assert_eq!(
+            storage.operation_count() - before,
+            0,
+            "recent overlays share the same cache"
+        );
+        let before = storage.operation_count();
+        policy
+            .graph_verifier(containers.clone())
+            .verify_required_chunks(
+                &entries
+                    .iter()
+                    .map(|entry| (entry.chunk_id(), 32768))
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(
+            storage.operation_count() - before,
+            0,
+            "online Commit dependency verification shares the same checked DATA"
+        );
+        assert!(
+            containers
+                .verify_location_cached(
+                    ExactIndexEntry::retiring(entries[0]).unwrap(),
+                    &policy.read_cache
+                )
+                .is_err()
+        );
+        let forged = ExactIndexEntry::active(
+            entries[0].chunk_id(),
+            entries[0].logical_length(),
+            ExactIndexLocation::raw(
+                ContainerId::new([0xc8; 16]).unwrap(),
+                2,
+                4096,
+                32960,
+                1234,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            containers
+                .verify_location_cached(forged, &policy.read_cache)
+                .is_err(),
+            "matching logical content cannot authorize a different physical Location"
+        );
+        let _independent =
+            fastdup_store::ReadIntentScope::enter(fastdup_store::ReadIntent::Independent);
+        let before = storage.operation_count();
+        containers
+            .verify_location_cached(entries[0], &policy.read_cache)
+            .unwrap();
+        assert!(
+            storage.operation_count() > before,
+            "independent verification must read storage"
+        );
+        let before = storage.operation_count();
+        policy
+            .graph_verifier(containers.clone())
+            .verify_required_chunks(
+                &entries
+                    .iter()
+                    .map(|entry| (entry.chunk_id(), 32768))
+                    .collect(),
+            )
+            .unwrap();
+        assert!(
+            storage.operation_count() > before,
+            "independent graph verification bypasses reuse"
+        );
+    }
 
     #[test]
     fn failed_exact_publication_retains_one_gc_guard_until_owner_teardown() {

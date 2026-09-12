@@ -189,6 +189,7 @@ pub trait RequiredChunkVerifier {
 pub struct IndexedRequiredChunkVerifier<C, X> {
     containers: ContainerRepository<C>,
     index: crate::ExactIndexGenerationPin<X>,
+    read_cache: Option<Arc<crate::VerifiedReadCache>>,
 }
 
 impl<I: StorageIo> GenerationRepository<I> {

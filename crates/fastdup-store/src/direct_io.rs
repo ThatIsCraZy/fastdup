@@ -11,6 +11,11 @@ const BLOCK: usize = 4096;
 const PAYLOAD_OFFSET: u64 = 2 * BLOCK as u64;
 const MAGIC: &[u8; 8] = b"FDIO0001";
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Layout {
     pub(crate) length: u64,
@@ -96,11 +101,17 @@ pub(crate) fn layout(file: &File) -> io::Result<Layout> {
     }
 }
 
-pub(crate) fn initialize(file: &File) -> io::Result<()> {
+pub(crate) fn initialize(file: &File) -> io::Result<Layout> {
     // Only a newly created name reaches here. Both initial heads are identical;
     // subsequent updates alternate slots and never overwrite the current head.
     write_physical(file, 0, &header(1, 0))?;
-    write_physical(file, BLOCK as u64, &header(1, 0))
+    write_physical(file, BLOCK as u64, &header(1, 0))?;
+    Ok(Layout {
+        length: 0,
+        generation: 1,
+        slot: 0,
+        wrapped: true,
+    })
 }
 
 pub(crate) fn object_len(file: &File) -> io::Result<u64> {
@@ -130,7 +141,7 @@ pub(crate) fn read_with_layout(
     read_physical(file, physical, length)
 }
 
-fn set_head(file: &File, previous: Layout, length: u64) -> io::Result<()> {
+fn set_head(file: &File, previous: Layout, length: u64) -> io::Result<Layout> {
     let generation = previous
         .generation
         .checked_add(1)
@@ -144,7 +155,13 @@ fn set_head(file: &File, previous: Layout, length: u64) -> io::Result<()> {
     // Make this body/head pair durable before a following mutation may reuse
     // its predecessor slot. Multiple writes between outer sync_file calls
     // must never overwrite both previously durable length heads.
-    file.sync_data()
+    file.sync_data()?;
+    Ok(Layout {
+        length,
+        generation,
+        slot,
+        wrapped: true,
+    })
 }
 
 fn zero(file: &File, start: u64, end: u64) -> io::Result<()> {
@@ -159,11 +176,20 @@ fn zero(file: &File, start: u64, end: u64) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    write_with_layout(file, layout(file)?, offset, bytes).map(|_| ())
+}
+
+pub(crate) fn write_with_layout(
+    file: &File,
+    previous: Layout,
+    offset: u64,
+    bytes: &[u8],
+) -> io::Result<Layout> {
     if bytes.is_empty() {
-        return Ok(());
+        return Ok(previous);
     }
-    let previous = layout(file)?;
     let end = offset
         .checked_add(bytes.len() as u64)
         .ok_or(io::ErrorKind::InvalidInput)?;
@@ -184,13 +210,16 @@ pub(crate) fn write(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
         bytes,
     )?;
     if end > previous.length {
-        set_head(file, previous, end)?;
+        return set_head(file, previous, end);
     }
-    Ok(())
+    Ok(previous)
 }
 
-pub(crate) fn set_len(file: &File, length: u64) -> io::Result<()> {
-    let previous = layout(file)?;
+pub(crate) fn set_len_with_layout(
+    file: &File,
+    previous: Layout,
+    length: u64,
+) -> io::Result<Layout> {
     if !previous.wrapped {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -198,7 +227,7 @@ pub(crate) fn set_len(file: &File, length: u64) -> io::Result<()> {
         ));
     }
     if length == previous.length {
-        return Ok(());
+        return Ok(previous);
     }
     if length > previous.length {
         zero(file, previous.length, length)?;
@@ -213,12 +242,13 @@ pub(crate) fn set_len(file: &File, length: u64) -> io::Result<()> {
     if length < previous.length && length < rounded {
         zero(file, length, rounded)?;
     }
-    set_head(file, previous, length)?;
+    let next = set_head(file, previous, length)?;
     file.set_len(
         PAYLOAD_OFFSET
             .checked_add(rounded)
             .ok_or(io::ErrorKind::InvalidInput)?,
-    )
+    )?;
+    Ok(next)
 }
 
 pub(crate) fn open(path: &Path, write: bool) -> io::Result<File> {
@@ -327,6 +357,8 @@ fn read_aligned(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             result => result?,
         };
+        #[cfg(test)]
+        READ_BYTES.with(|total| total.set(total.get() + count));
         if count == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
@@ -518,6 +550,74 @@ mod tests {
         io.set_len("object.fdm", 0).unwrap();
         assert!(io.read("object.fdm").unwrap().is_empty());
         assert_eq!(fixture.file().metadata().unwrap().len(), PAYLOAD_OFFSET);
+    }
+
+    #[test]
+    fn sequential_writer_reuses_known_storage_heads_without_disk_reads() {
+        let fixture = Fixture::new();
+        let name = ".index.fdx.building";
+        fixture.storage.create_new(name).unwrap();
+        let before = READ_BYTES.with(std::cell::Cell::get);
+        for page in 0..16 {
+            fixture
+                .storage
+                .write_at(name, page * BLOCK as u64, &[71; BLOCK])
+                .unwrap();
+        }
+        fixture.storage.set_len(name, 16 * BLOCK as u64).unwrap();
+        fixture.storage.sync_file(name).unwrap();
+        assert_eq!(
+            READ_BYTES.with(std::cell::Cell::get) - before,
+            0,
+            "our sequential writer already knows every storage length head"
+        );
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        assert_eq!(fixture.storage.read(name).unwrap(), vec![71; 16 * BLOCK]);
+    }
+
+    #[test]
+    fn independent_reads_obtain_storage_heads_once_per_operation() {
+        let fixture = Fixture::new();
+        fixture
+            .storage
+            .write_at("object.fdm", 0, &[37; BLOCK])
+            .unwrap();
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        for whole in [false, true] {
+            let before = READ_BYTES.with(std::cell::Cell::get);
+            let bytes = if whole {
+                fixture.storage.read("object.fdm").unwrap()
+            } else {
+                fixture
+                    .storage
+                    .read_exact_at("object.fdm", 0, BLOCK)
+                    .unwrap()
+            };
+            assert_eq!(bytes, vec![37; BLOCK]);
+            assert_eq!(
+                READ_BYTES.with(std::cell::Cell::get) - before,
+                3 * BLOCK,
+                "one fresh pair of length heads plus one payload block; whole={whole}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_direct_writer_discards_the_preceding_cached_length_head() {
+        let fixture = Fixture::new();
+        let storage = &fixture.storage;
+        storage.write_at("object.fdm", 0, b"old").unwrap();
+        let failure = storage.mutate_direct_file("object.fdm", false, |file, previous| {
+            write_with_layout(file, previous.unwrap(), 0, b"changed")?;
+            Err(io::Error::other(
+                "injected error after effective head update",
+            ))
+        });
+        assert!(failure.is_err());
+        assert_eq!(storage.object_len("object.fdm").unwrap(), 7);
+        storage.write_at("object.fdm", 7, b"-retry").unwrap();
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        assert_eq!(storage.read("object.fdm").unwrap(), b"changed-retry");
     }
 
     #[test]

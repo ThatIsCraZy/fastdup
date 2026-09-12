@@ -19,6 +19,7 @@ pub(crate) struct ImmutableExactIndexRun {
     lease: ImmutableFileLease,
     descriptor: ExactIndexRunDescriptor,
     bounds_cache: crate::ReadCacheNamespace,
+    writer_pages: Option<crate::ReadCacheNamespace>,
 }
 
 impl ImmutableExactIndexRun {
@@ -89,6 +90,39 @@ impl ImmutableExactIndexRun {
             lease,
             descriptor,
             bounds_cache,
+            writer_pages: None,
+        })
+    }
+
+    /// The caller owns the checked encoder output and completed publication.
+    /// Only optional page/bounds retention enters the common cache. The file
+    /// lease, not a cache hit, prevents mutation while this proof is selected.
+    pub(crate) fn from_writer(
+        lease: ImmutableFileLease,
+        descriptor: ExactIndexRunDescriptor,
+        bounds: Vec<ExactPageKeyBounds>,
+        pages: crate::ReadCacheNamespace,
+    ) -> Result<Self, ExactIndexStoreError> {
+        if bounds.len() != descriptor.page_count() {
+            return Err(ExactIndexStoreError::DependencyMismatch);
+        }
+        let bounds_cache = pages.sibling(crate::ReadCacheClass::ExactPageBounds);
+        let bytes = bounds.capacity() * size_of::<ExactPageKeyBounds>()
+            + size_of::<Box<[ExactPageKeyBounds]>>();
+        bounds_cache.insert(
+            crate::ReadCacheKey {
+                identity: descriptor.run_hash(),
+                ordinal: 0,
+            },
+            Arc::new(bounds.into_boxed_slice()),
+            bytes as u64,
+            EXACT_INDEX_PAGE_BYTES as u64,
+        );
+        Ok(Self {
+            lease,
+            descriptor,
+            bounds_cache,
+            writer_pages: Some(pages),
         })
     }
 
@@ -130,24 +164,34 @@ impl ImmutableExactIndexRun {
     }
 
     pub(crate) fn page(&self, offset: u64) -> Result<Vec<u8>, ExactIndexStoreError> {
+        if let Some(bytes) = self.writer_pages.as_ref().and_then(|pages| {
+            pages.get::<Vec<u8>>(crate::ReadCacheKey {
+                identity: [0; 32],
+                ordinal: offset / EXACT_INDEX_PAGE_BYTES as u64,
+            })
+        }) {
+            return Ok((*bytes).clone());
+        }
         exact_page(&self.lease, offset)
     }
 }
 
 #[derive(Clone, Copy)]
-struct ExactPageKeyBounds {
+pub(crate) struct ExactPageKeyBounds {
     first: (ChunkId, u32),
     last: (ChunkId, u32),
 }
 
 impl ExactPageKeyBounds {
     fn from_page(page: &fastdup_format::ExactIndexPage) -> Self {
-        let first = page
-            .entries()
+        Self::from_entries(page.entries())
+    }
+
+    pub(crate) fn from_entries(entries: &[ExactIndexEntry]) -> Self {
+        let first = entries
             .first()
             .expect("ASSERT: a verified Exact Index page is never empty");
-        let last = page
-            .entries()
+        let last = entries
             .last()
             .expect("ASSERT: a verified Exact Index page is never empty");
         Self {

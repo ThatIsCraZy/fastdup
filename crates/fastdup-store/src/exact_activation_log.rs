@@ -34,6 +34,7 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
 
     pub(crate) fn load_for_append(&self) -> Result<ActivationLogSnapshot, ExactActivationLogError> {
         self.ensure_slots_exist()?;
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         match self.load()? {
             Some(snapshot) => Ok(snapshot),
             None => Ok(ActivationLogSnapshot::empty(0)),
@@ -44,7 +45,8 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
         &self,
         snapshot: &ActivationLogSnapshot,
         record: ExactIndexActivationRecord,
-    ) -> Result<(), ExactActivationLogError> {
+        verify_storage: bool,
+    ) -> Result<ActivationLogSnapshot, ExactActivationLogError> {
         if snapshot.tail != ActivationLogTail::Clean {
             return Err(ExactActivationLogError::NeedsRepair);
         }
@@ -72,6 +74,12 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
             (snapshot.active_slot, bytes)
         };
 
+        // Validate our exact intended chain before submitting any mutation.
+        // An online owner advances this state only after the final sync succeeds.
+        let next = decode_slot(target_slot, expected.clone())?;
+        if next.tail != ActivationLogTail::Clean {
+            return Err(ExactActivationLogError::PublishVerificationMismatch);
+        }
         let target_name = SLOT_NAMES[target_slot];
         if target_slot == snapshot.active_slot {
             let offset = u64::try_from(snapshot.bytes.len())
@@ -97,16 +105,19 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
             u64::try_from(expected.len()).map_err(|_| ExactActivationLogError::SlotTooLarge)?,
         )?;
 
-        let reread = self.storage.read(target_name)?;
-        let verified = decode_slot(target_slot, reread)?;
-        if verified.tail != ActivationLogTail::Clean || verified.bytes != expected {
-            return Err(ExactActivationLogError::PublishVerificationMismatch);
+        if verify_storage {
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+            let reread = self.storage.read(target_name)?;
+            let verified = decode_slot(target_slot, reread)?;
+            if verified.tail != ActivationLogTail::Clean || verified.bytes != expected {
+                return Err(ExactActivationLogError::PublishVerificationMismatch);
+            }
         }
 
         // Both fixed names are directory-durable before the first append. The
         // selected slot sync is the only activation/rotation commit point.
         self.storage.sync_file(target_name)?;
-        Ok(())
+        Ok(next)
     }
 
     pub(crate) fn sync_selected(

@@ -747,6 +747,14 @@ The single live mount owner bound to one verified Metadata/Data Pool pair. Its
 process state is replaceable and does not define the Repository's durable state.
 _Avoid_: Repository, Appliance ID, Control plane
 
+**Online writer state**:
+The serialized Repository owner's validated generation and publication state,
+advanced through its own successful writes and required synchronization. It
+avoids reconstructing known state from disk on every mutation. It is bounded
+required working state, distinct from evictable read acceleration; uncertain
+activation I/O revokes the WAL cursor and recovery reconstructs it independently.
+_Avoid_: Read cache, proof of durability from RAM, durable recovery authority
+
 **Repository format epoch**:
 A compatibility fence carried by the authoritative Commit chain. Every current
 repository begins at epoch one; epoch zero and unknown epochs are unsupported

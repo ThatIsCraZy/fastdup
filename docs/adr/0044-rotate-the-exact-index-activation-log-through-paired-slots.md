@@ -78,16 +78,20 @@ It must never make Namespace DATA unavailable or authorize reclamation.
 ## Append and rotation protocol
 
 All steps run under the Exact Index Repository's activation lock and only after
-the candidate Run Set and every immutable Run dependency have been completely
-audited and made durable.
+the candidate Run Set and every immutable Run dependency have been validated
+and made durable. Under the same exclusive online owner, validated encoder
+output and successful publication supply that evidence (ADR 0046); unknown
+dependencies and standalone activation retain independent storage audits.
 
 For an ordinary append below the 64-record bound:
 
-1. load both bounded slots and select one continuous current prefix;
+1. use the writer's last successfully synchronized snapshot, or independently
+   load both bounded slots when that state is unknown;
 2. require a clean tail and verify the proposed generation, predecessor hash,
    and increasing Run Set generation;
 3. append the new record and set the slot's exact length;
-4. reread and validate the complete slot plus the exact intended bytes; and
+4. retain the exact intended slot bytes, whose chain was validated before
+   mutation; standalone activation additionally rereads the target slot; and
 5. synchronize that slot.
 
 Step 5 is the sole activation commit point.
@@ -98,12 +102,18 @@ At the bound:
 2. truncate only the inactive slot in the process-visible state;
 3. write the selected last record at offset zero as the bridge;
 4. write the new record immediately after it and set the length to 8 KiB;
-5. reread and validate the exact two-record chain and cross-slot overlap; and
+5. retain the exact bridge/successor chain validated before mutation;
+   standalone activation additionally rereads the target slot; and
 6. synchronize the inactive slot.
 
 Step 6 is both rotation and activation commit. A crash before it selects the
 old durable slot. An effective synchronization may select the complete new
 slot even if the call returned an ambiguous error. No mixed Run Set is valid.
+The live cursor advances only on success. A write or sync error discards it;
+the next append must reconstruct the actual stored selector and dependencies,
+including when an effective sync returned an error. Recovery always discards
+the cursor before independently verifying storage. Cache eviction cannot
+discard or advance this bounded required writer state.
 
 Retrying an already-selected Run Set audits its immutable dependencies and
 synchronizes the selected slot without appending another record.
@@ -127,8 +137,9 @@ activation history is not a snapshot and does not pin old Runs or DATA.
 
 ## Paired verification
 
-- Writer: validates the selected snapshot and rereads the exact target bytes
-  before the final slot sync.
+- Writer: validates the selected snapshot and exact intended chain before
+  mutation, then advances the live snapshot only after the final slot sync.
+  Standalone activation retains independent target readback.
 - Reader/recovery: validates both slots, bridge identity, the selected record,
   Run Set identity, and every Run dependency.
 - Offline scrub: uses the explicit activation-log audit seam and fails on a

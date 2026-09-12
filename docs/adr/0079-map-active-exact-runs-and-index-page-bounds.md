@@ -57,6 +57,15 @@ only at candidate pages.
 
 ## Reuse during an in-process L0 append (2026-09-06)
 
+Superseded on 12 September 2026 by ADR 0046's online writer-state protocol:
+the serialized owner carries the last successfully synchronized Activation
+Log snapshot and installed Run Set, without reading their stored copies on
+every append. New Runs carry validated writer evidence through successful
+publication into leased readers. Optional writer pages, bounds and hints belong
+to the common cache. Errors revoke uncertain WAL state; recovery, standalone
+activation, unknown/colliding Runs and scrub retain independent verification.
+The text below records the preceding, more read-intensive boundary.
+
 The serialized L0 append reads and validates the durable Activation Record and
 its stored Run Set before matching the installed generation. It may reuse that
 generation's already audited Mapping owners and Page Bounds only while their

@@ -7,6 +7,133 @@ use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
 const RUN_GENERATION: u64 = 11;
 
+#[test]
+fn retry_after_ambiguous_online_sync_reloads_the_selected_wal() {
+    fn prepare(storage: &MemoryStorageIo) -> ExactIndexRunRepository<MemoryStorageIo> {
+        let repository = ExactIndexRunRepository::new(storage.clone());
+        repository
+            .append_level_zero(profile(), single_entry_run(1, 1).entries().to_vec())
+            .unwrap();
+        repository
+    }
+    let probe_storage = MemoryStorageIo::new();
+    let probe = prepare(&probe_storage);
+    let entries = single_entry_run(2, 2).entries().to_vec();
+    probe.append_level_zero(profile(), entries.clone()).unwrap();
+    let final_sync = probe_storage.operation_count() - 1;
+    assert_eq!(
+        probe_storage.operations()[final_sync],
+        StorageOperation::SyncFile
+    );
+    let storage = MemoryStorageIo::with_fail_after(final_sync);
+    let repository = prepare(&storage);
+    assert!(repository.append_level_zero(profile(), entries).is_err());
+    assert_eq!(
+        repository
+            .pin_active_generation()
+            .unwrap()
+            .record()
+            .generation(),
+        1
+    );
+    // No restart or explicit recovery: the failed writer itself must revoke its
+    // old cursor and discover that generation two actually reached the medium.
+    repository
+        .append_level_zero(profile(), single_entry_run(3, 3).entries().to_vec())
+        .unwrap();
+    assert_eq!(
+        repository
+            .pin_active_generation()
+            .unwrap()
+            .record()
+            .generation(),
+        3
+    );
+    storage.crash();
+    let restarted = ExactIndexRunRepository::new(storage);
+    assert_eq!(
+        restarted
+            .recover_active()
+            .unwrap()
+            .unwrap()
+            .record()
+            .generation(),
+        3
+    );
+    assert!(restarted.audit_activation_log().unwrap().is_some());
+}
+
+#[test]
+fn online_append_faults_keep_selection_atomic_during_compaction_and_rotation() {
+    fn prepare(
+        storage: &MemoryStorageIo,
+        generations: u64,
+    ) -> ExactIndexRunRepository<MemoryStorageIo> {
+        let repository = ExactIndexRunRepository::new(storage.clone());
+        for generation in 1..=generations {
+            repository
+                .append_level_zero(
+                    profile(),
+                    single_entry_run(generation, u8::try_from(generation).unwrap())
+                        .entries()
+                        .to_vec(),
+                )
+                .unwrap();
+        }
+        repository
+    }
+
+    // The fourth append compacts four families; the 65th rotates the WAL.
+    for generations in [3, 64] {
+        let probe_storage = MemoryStorageIo::new();
+        let probe = prepare(&probe_storage, generations);
+        let baseline = probe_storage.operation_count();
+        let entries = single_entry_run(generations + 1, 100).entries().to_vec();
+        probe.append_level_zero(profile(), entries.clone()).unwrap();
+        let operations = probe_storage.operations()[baseline..].to_vec();
+        assert_eq!(operations.last(), Some(&StorageOperation::SyncFile));
+        for (position, operation) in operations.iter().enumerate() {
+            for after in [false, true] {
+                let storage = if after {
+                    MemoryStorageIo::with_fail_after(baseline + position)
+                } else {
+                    MemoryStorageIo::with_fail_before(baseline + position)
+                };
+                let repository = prepare(&storage, generations);
+                assert_eq!(storage.operation_count(), baseline);
+                assert!(
+                    repository
+                        .append_level_zero(profile(), entries.clone())
+                        .is_err(),
+                    "seed={generations}, operation={position}/{operation:?}, after={after}"
+                );
+                assert_eq!(
+                    repository
+                        .pin_active_generation()
+                        .unwrap()
+                        .record()
+                        .generation(),
+                    generations,
+                    "an error must not install the successor in RAM"
+                );
+                storage.crash();
+                let restarted = ExactIndexRunRepository::new(storage.clone());
+                let recovered = restarted.recover_active().unwrap().unwrap();
+                let expected = generations + u64::from(after && position + 1 == operations.len());
+                assert_eq!(
+                    recovered.record().generation(),
+                    expected,
+                    "seed={generations}, operation={position}/{operation:?}, after={after}"
+                );
+                assert_eq!(
+                    restarted.audit_activation_log().unwrap(),
+                    Some(recovered.record())
+                );
+            }
+        }
+    }
+}
+
 fn profile() -> ExactIndexProfileId {
     ExactIndexProfileId::new([0x71; 32]).expect("profile identity is nonzero")
 }

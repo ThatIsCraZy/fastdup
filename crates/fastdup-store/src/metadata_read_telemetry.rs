@@ -101,6 +101,7 @@ pub(crate) fn object_class(name: &str) -> usize {
         || name.contains("commit")
         || name.contains("catalog")
         || name.contains("checkpoint")
+        || name.starts_with("exact-index.activation") && name.ends_with(".wal")
     {
         4
     } else {
@@ -340,7 +341,7 @@ mod tests {
         {
             let mut storage = FsStorageIo::open(&root).unwrap();
             storage.metadata_reads = Some(Arc::clone(&counters));
-            let repository = crate::ExactIndexRunRepository::new(storage);
+            let repository = crate::ExactIndexRunRepository::new(storage.clone());
             let location = ExactIndexLocation::raw(
                 ContainerId::new([9; 16]).unwrap(),
                 9,
@@ -351,10 +352,12 @@ mod tests {
             .unwrap();
             let entry =
                 ExactIndexEntry::active(ChunkId::from_bytes([8; 32]), 16392, location).unwrap();
-            let transition = repository
+            repository
                 .append_level_zero(ExactIndexProfileId::new([0xD8; 32]).unwrap(), vec![entry])
                 .unwrap();
-            let active = transition.current();
+            drop(repository);
+            let repository = crate::ExactIndexRunRepository::new(storage);
+            let active = repository.recover_active().unwrap().unwrap();
             assert!(counters.rows().iter().any(|row| row.reason == "indexAudit"
                 && row.mode == "directLease"
                 && row.returned_bytes > 0));

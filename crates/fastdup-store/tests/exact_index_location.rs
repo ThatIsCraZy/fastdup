@@ -6,7 +6,8 @@ use fastdup_format::{
     ExactIndexRunRef, ExactIndexRunSet, ExactLocationTransition,
 };
 use fastdup_store::{
-    ContainerRepository, ExactIndexRunRepository, FsStorageIo, StorageIo, StoreError,
+    ActivatedExactIndex, ContainerRepository, ExactIndexRunRepository, FsStorageIo, StorageIo,
+    StoreError,
 };
 
 fn test_root(name: &str) -> PathBuf {
@@ -21,6 +22,25 @@ fn test_root(name: &str) -> PathBuf {
             "exact-index-location-{name}-{}-{nonce}",
             std::process::id()
         ))
+}
+
+// Publish the same single-Run activation graph for each encoding fixture.
+fn activate_entries(
+    indexes: &ExactIndexRunRepository<FsStorageIo>,
+    profile: ExactIndexProfileId,
+    entries: Vec<ExactIndexEntry>,
+) -> ActivatedExactIndex<FsStorageIo> {
+    let run = ExactIndexRun::new(profile, 1, entries).expect("build one immutable Exact Index Run");
+    let descriptor = indexes.publish(&run).expect("durably publish the Run");
+    let run_set = ExactIndexRunSet::new(
+        profile,
+        1,
+        vec![ExactIndexRunRef::new(0, descriptor).expect("pin the complete Run descriptor")],
+    )
+    .expect("build one immutable Run Set");
+    indexes
+        .activate(&run_set)
+        .expect("activate only after every index dependency is durable")
 }
 
 #[test]
@@ -63,20 +83,7 @@ fn exact_candidate_is_usable_only_after_pairing_with_its_verified_container() {
 
     let profile = ExactIndexProfileId::new([0x92; 32]).expect("profile identity is nonzero");
     let index_repository = ExactIndexRunRepository::new(storage);
-    let run = ExactIndexRun::new(profile, 1, vec![candidate])
-        .expect("build one immutable Exact Index Run");
-    let descriptor = index_repository
-        .publish(&run)
-        .expect("durably publish the Run");
-    let run_set = ExactIndexRunSet::new(
-        profile,
-        1,
-        vec![ExactIndexRunRef::new(0, descriptor).expect("pin the complete Run descriptor")],
-    )
-    .expect("build one immutable Run Set");
-    index_repository
-        .activate(&run_set)
-        .expect("activate only after every index dependency is durable");
+    activate_entries(&index_repository, profile, vec![candidate]);
     let active = index_repository
         .recover_active()
         .expect("recover the complete activation graph")
@@ -207,19 +214,7 @@ fn zstd_candidates_are_bounded_verified_locations_for_every_logical_chunk() {
 
     let profile = ExactIndexProfileId::new([0xA2; 32]).expect("profile identity is nonzero");
     let index_repository = ExactIndexRunRepository::new(storage);
-    let descriptor = index_repository
-        .publish(&ExactIndexRun::new(profile, 1, entries.clone()).expect("build the immutable Run"))
-        .expect("publish the immutable Run");
-    let active = index_repository
-        .activate(
-            &ExactIndexRunSet::new(
-                profile,
-                1,
-                vec![ExactIndexRunRef::new(0, descriptor).expect("pin the verified Run")],
-            )
-            .expect("build the Run Set"),
-        )
-        .expect("activate the complete Run Set");
+    let active = activate_entries(&index_repository, profile, entries.clone());
 
     for (entry, expected) in entries.iter().zip([first, second]) {
         let lookup = active
@@ -271,22 +266,7 @@ fn zstd_prefix_candidate_resolves_only_an_independent_pool_base() {
 
     let profile = ExactIndexProfileId::new([0xB3; 32]).expect("profile ID is nonzero");
     let index_repository = ExactIndexRunRepository::new(storage);
-    let descriptor = index_repository
-        .publish(
-            &ExactIndexRun::new(profile, 1, vec![base_entry, target_entry])
-                .expect("build mixed independent/dependent Run"),
-        )
-        .expect("publish mixed Run");
-    let active = index_repository
-        .activate(
-            &ExactIndexRunSet::new(
-                profile,
-                1,
-                vec![ExactIndexRunRef::new(0, descriptor).expect("pin verified Run")],
-            )
-            .expect("build mixed Run Set"),
-        )
-        .expect("activate mixed Run Set");
+    let active = activate_entries(&index_repository, profile, vec![base_entry, target_entry]);
 
     assert_eq!(
         repository

@@ -22,6 +22,10 @@ Exact membership filters and page bounds, reverse-dependency projections,
 encoded storage ranges and reusable file handles all
 compete in that engine. Generation pins, Dirty DATA, active codec work and
 in-flight I/O remain required working state; cache eviction cannot release them.
+The serialized Exact writer also retains its last successfully synchronized
+Activation Log snapshot (one bounded slot, at most 256 KiB encoded plus its
+bounded decoded record vector). This is required
+generation/rotation state, not another content-cache directory or budget.
 Codec buffer reuse retains its separately identified memory-reuse lease because
 it contains no reusable storage content.
 
@@ -87,15 +91,50 @@ Every path explicitly preserves one of these intents:
 Online GC may reuse cached Metadata graphs, candidate/index pages and verified
 relocation source bytes. Its reverse-dependency projection is also reclaimable
 by the common cache; a running proof retains its required immutable view.
+Online Exact reuse, recent publication overlays and Commit dependency checks
+also receive the same verified DATA view as demand readers. A reuse hit must
+match the currently eligible candidate's complete independent Record/Chunk
+coordinates, not just its Chunk ID. A cold successful verification admits all
+co-verified Record siblings through common admission. Explicit Independent
+verification bypasses these hits and admission. Dependent Target payloads
+without matching physical-source evidence still require their ordinary
+verification; an identity-only payload cannot authorize a Location.
 Its current Commit binding, live root pins, publication
 barrier, victim validation and final deletion proof remain mandatory. Independent
-recovery, offline/background scrub and fresh publication/deletion verification
+recovery, offline/background scrub and fresh deletion verification
 use Independent intent. A successful cached read never counts as a fresh scrub
 of the physical medium. Synchronous intent scopes nest, restore on unwind and
 cannot cross threads/awaits; dispatched scrub workers establish their own scope.
 
-Initial Exact, Similarity and candidate-Run activation still audits the complete
-current stored hash, checksums, ordering and dependencies. Similarity may reuse
+An online Exact append under the same exclusive Repository owner carries
+validated encoder output through successful file writes, file sync, no-replace
+publication and directory sync into activation. Its serialized writer advances
+the known WAL snapshot only after the final slot sync succeeds. It does not
+reread either WAL slot or the selected Run Set on each append. Newly written
+Runs and compaction outputs carry their checked descriptors and page bounds;
+unchanged Runs retain their immutable leases and exact identity checks.
+Compaction may consume those Runs' common-cache pages. Encoded writer pages,
+optional bounds and membership hints share the existing common cache and remain
+reclaimable. Cold page reads still decode and validate their checksums.
+
+Successful Direct-I/O writes similarly admit the resulting storage length head
+under the final mutation revision in the common range namespace. An owned
+no-replace rename can transfer that known head under the destination identity
+while holding both name barriers. A failed mutation cannot admit its proposed
+head, and a cache miss reads the physical heads normally.
+
+An activation write or sync error revokes the online WAL cursor, including
+ambiguous errors after effective synchronization. The next append reconstructs
+the stored selector and validates its dependencies before reuse. Recovery also
+revokes the cursor before independent verification. Initial/unknown objects,
+publication collisions, public standalone Exact activation, recovery and scrub
+retain independent stored-byte validation. An immediate readback is not proof
+of power-loss durability: successful synchronization and publication ordering
+remain mandatory. This distinction supersedes the repeated online readback
+requirements in ADRs 0044, 0045 and 0079 without changing any durable byte format.
+
+Similarity and candidate-Run activation still audit the complete current stored
+hash, checksums, ordering and dependencies. Similarity may reuse
 individually verified pages for its subsequent semantic cross-reference pass.
 A failed activation cannot become authoritative through a later cache hit.
 Independent Similarity audits may retain up to 32 MiB of their freshly decoded
@@ -142,6 +181,8 @@ ordering remain governed by ADRs 0001, 0028 and the supported storage stack.
 
 The completed checks and their limits are recorded in the
 [qualification report](../testing/unified-read-cache-2026-09-12.md).
+The Exact publisher's online readback correction is qualified separately in
+[the Metadata I/O report](../testing/metadata-read-amplification-2026-09-12.md).
 
 Regression gates cover cross-class eviction, shared-backing ownership,
 concurrent admission, pressure, bounded shared misses, warm-cache corruption,

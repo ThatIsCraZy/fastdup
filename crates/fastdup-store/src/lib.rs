@@ -2508,6 +2508,30 @@ impl<I: StorageIo> ContainerRepository<I> {
             .ok_or(StoreError::ExactLocationMismatch)
     }
 
+    /// Verifies an independent Location for online reuse, sharing previously
+    /// checked Record siblings with demand reads. A hit must match every
+    /// physical candidate coordinate. Independent intent still reads storage.
+    ///
+    /// # Errors
+    /// Returns the ordinary Location, Record, or Chunk verification failure.
+    pub fn verify_location_cached(
+        &self,
+        candidate: ExactIndexEntry,
+        cache: &VerifiedReadCache,
+    ) -> Result<(), StoreError> {
+        if cache
+            .get(candidate.chunk_id(), u64::from(candidate.logical_length()))
+            .is_some_and(|payload| payload.matches_independent_candidate(candidate))
+        {
+            return Ok(());
+        }
+        let (_, groups) = self.read_verified_location_payload(candidate)?.into_parts();
+        for group in groups {
+            cache.admit_decoded_group(group);
+        }
+        Ok(())
+    }
+
     fn read_verified_location_payload(
         &self,
         candidate: ExactIndexEntry,
@@ -2724,6 +2748,36 @@ impl<I: StorageIo> ContainerRepository<I> {
             .map(|(entry, _)| entry))
     }
 
+    /// Resolves current Exact candidates using the shared verified DATA cache.
+    /// Optional cached bytes cannot authorize a different physical Location.
+    ///
+    /// # Errors
+    /// Preserves the bounded fallback semantics of the uncached lookup.
+    ///
+    /// # Panics
+    /// Panics if an activated index violates its candidate identity or bound.
+    pub fn find_verified_location_with_index_cached<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+        cache: &VerifiedReadCache,
+    ) -> Result<Option<ExactIndexEntry>, StoreError> {
+        let Some((entry, read)) = self.find_verified_candidate_payload_cached(
+            index,
+            chunk_id,
+            logical_length,
+            Some(cache),
+        ) else {
+            return Ok(None);
+        };
+        let (_, groups) = read.into_parts();
+        for group in groups {
+            cache.admit_decoded_group(group);
+        }
+        Ok(Some(entry))
+    }
+
     fn find_verified_candidate_with_index<J: StorageIo>(
         &self,
         index: &ActivatedExactIndex<J>,
@@ -2793,6 +2847,12 @@ impl<I: StorageIo> ContainerRepository<I> {
                 break;
             }
             attempted += 1;
+            if let Some(payload) = cache
+                .and_then(|cache| cache.get(chunk_id, logical_length))
+                .filter(|payload| payload.matches_independent_candidate(candidate))
+            {
+                return Some((candidate, VerifiedChunkRead::single(payload, Vec::new())));
+            }
             let verified = if location.dependency_id() == [0; 32] {
                 self.read_verified_location_payload(candidate)
             } else {
@@ -4146,7 +4206,7 @@ fn cached_file_layout(
     name: &str,
     registry: &ImmutableFileRegistry,
 ) -> io::Result<direct_io::Layout> {
-    if read_intent::independent() || !immutable_storage_name(name) {
+    if read_intent::independent() || name.starts_with("reduction-head.") {
         return direct_io::layout(file);
     }
     let access = registry.access(name)?;
@@ -4177,6 +4237,35 @@ fn cached_file_layout(
         Ok(layout)
     })?;
     Ok(layout.layout)
+}
+
+fn remember_file_layout(
+    file: &File,
+    name: &str,
+    registry: &ImmutableFileRegistry,
+    access: &FileAccess,
+    layout: direct_io::Layout,
+) -> io::Result<()> {
+    if read_intent::bypass_admission() || name.starts_with("reduction-head.") {
+        return Ok(());
+    }
+    let key = ReadCacheKey {
+        identity: storage_identity(file, name, access.revision())?,
+        ordinal: u64::MAX,
+    };
+    registry
+        .range_cache
+        .get_or_init(|| ReadCacheNamespace::system(ReadCacheClass::StorageRange))
+        .insert(
+            key,
+            Arc::new(CachedFileLayout {
+                layout,
+                _access: Arc::clone(access),
+            }),
+            (size_of::<CachedFileLayout>() + size_of::<FileAccessState>()) as u64,
+            8192,
+        );
+    Ok(())
 }
 
 fn read_cached_file_range(
@@ -4293,6 +4382,51 @@ pub struct FsStorageIo {
 }
 
 impl FsStorageIo {
+    /// Carries the writer's successfully completed length-head state through
+    /// the same cache as reads. The per-name mutation lock stays held until
+    /// the final revision has been published, so a later writer cannot receive
+    /// an older head under its own revision. Failed writes admit no new state.
+    fn mutate_direct_file(
+        &self,
+        name: &str,
+        create: bool,
+        action: impl FnOnce(&File, Option<direct_io::Layout>) -> io::Result<direct_io::Layout>,
+    ) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        Self::validate_name(name)?;
+        let access = self.immutable_leases.access(name)?;
+        let count = access
+            .lock()
+            .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
+        Self::reject_leased(*count)?;
+        let file = if create {
+            OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(self.path(name)?)?
+        } else {
+            direct_io::open(&self.path(name)?, true)?
+        };
+        let previous = if create {
+            None
+        } else {
+            Some(cached_file_layout(&file, name, &self.immutable_leases)?)
+        };
+        if let Some(cache) = self.immutable_leases.range_cache.get() {
+            cache.remove(ReadCacheKey {
+                identity: storage_identity(&file, name, access.revision())?,
+                ordinal: u64::MAX,
+            });
+        }
+        let mutation = access.mutate();
+        self.immutable_leases.invalidate(name);
+        let next = action(&file, previous)?;
+        drop(mutation);
+        remember_file_layout(&file, name, &self.immutable_leases, &access, next)
+    }
+
     /// Creates a filesystem adapter rooted at one container directory.
     ///
     /// # Errors
@@ -4409,6 +4543,10 @@ impl FsStorageIo {
     ) -> io::Result<Vec<u8>> {
         let opened = if length > MAX_STORAGE_RANGE_BYTES {
             Err(io::ErrorKind::InvalidInput.into())
+        } else if read_intent::independent() {
+            // The range reader obtains and checks one fresh length snapshot.
+            // Opening via open_read_range would read those same heads twice.
+            direct_io::open(&self.path(name)?, false).map(Arc::new)
         } else {
             self.open_read_range(name, offset, length)
         };
@@ -4469,6 +4607,16 @@ impl FsStorageIo {
         new: &str,
         action: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<T> {
+        self.rename_locked(old, new, false, action)
+    }
+
+    fn rename_locked<T>(
+        &self,
+        old: &str,
+        new: &str,
+        preserve_layout: bool,
+        action: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
         Self::validate_name(old)?;
         Self::validate_name(new)?;
         if old == new {
@@ -4485,11 +4633,43 @@ impl FsStorageIo {
             .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
         Self::reject_leased(*first_count)?;
         Self::reject_leased(*second_count)?;
-        let _first_mutation = first_access.mutate();
-        let _second_mutation = second_access.mutate();
+        // Only our no-replace rename may transfer known content state. The
+        // public callback seam can mutate bytes and must invalidate it instead.
+        let old_access = if first == old {
+            &first_access
+        } else {
+            &second_access
+        };
+        let new_access = if first == new {
+            &first_access
+        } else {
+            &second_access
+        };
+        let retained = if preserve_layout && !read_intent::independent() {
+            let file = direct_io::open(&self.path(old)?, false)?;
+            let key = ReadCacheKey {
+                identity: storage_identity(&file, old, old_access.revision())?,
+                ordinal: u64::MAX,
+            };
+            self.immutable_leases
+                .range_cache
+                .get()
+                .and_then(|cache| cache.get::<CachedFileLayout>(key))
+                .map(|layout| (file, layout.layout))
+        } else {
+            None
+        };
+        let first_mutation = first_access.mutate();
+        let second_mutation = second_access.mutate();
         self.immutable_leases.invalidate(old);
         self.immutable_leases.invalidate(new);
-        action()
+        let result = action()?;
+        drop(first_mutation);
+        drop(second_mutation);
+        if let Some((file, layout)) = retained {
+            remember_file_layout(&file, new, &self.immutable_leases, new_access, layout)?;
+        }
+        Ok(result)
     }
 
     fn reject_leased(count: usize) -> io::Result<()> {
@@ -4508,16 +4688,7 @@ impl StorageIo for FsStorageIo {
         self.read_range(name, offset, length, 2)
     }
     fn create_new(&self, name: &str) -> io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-        self.with_file_mutation(name, || {
-            let file = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(self.path(name)?)?;
-            direct_io::initialize(&file)
-        })
+        self.mutate_direct_file(name, true, |file, _| direct_io::initialize(file))
     }
 
     fn exists(&self, name: &str) -> io::Result<bool> {
@@ -4525,16 +4696,34 @@ impl StorageIo for FsStorageIo {
     }
 
     fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        self.with_file_mutation(name, || {
-            direct_io::write(&direct_io::open(&self.path(name)?, true)?, offset, bytes)
+        self.mutate_direct_file(name, false, |file, previous| {
+            direct_io::write_with_layout(
+                file,
+                previous.expect("ASSERT: an existing writer has a layout"),
+                offset,
+                bytes,
+            )
         })
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
         let file = direct_io::open(&self.path(name)?, false)?;
-        let length = cached_file_layout(&file, name, &self.immutable_leases)?.length;
+        let layout = cached_file_layout(&file, name, &self.immutable_leases)?;
+        let length = layout.length;
         if length > MAX_CONTAINER_BYTES {
             return Err(container_too_large(length));
+        }
+        let length = usize::try_from(length).map_err(|_| container_too_large(length))?;
+        if read_intent::independent() {
+            let span = metadata_read_telemetry::ReadSpan::start(
+                self.metadata_reads.as_deref(),
+                name,
+                1,
+                Some(length),
+            );
+            let result = direct_io::read_with_layout(&file, layout, 0, length);
+            span.finish(&result);
+            return result;
         }
         read_cached_file_range(
             &file,
@@ -4542,7 +4731,7 @@ impl StorageIo for FsStorageIo {
             &self.immutable_leases,
             self.metadata_reads.as_deref(),
             0,
-            usize::try_from(length).map_err(|_| container_too_large(length))?,
+            length,
             1,
         )
     }
@@ -4583,8 +4772,12 @@ impl StorageIo for FsStorageIo {
     }
 
     fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
-        self.with_file_mutation(name, || {
-            direct_io::set_len(&direct_io::open(&self.path(name)?, true)?, length)
+        self.mutate_direct_file(name, false, |file, previous| {
+            direct_io::set_len_with_layout(
+                file,
+                previous.expect("ASSERT: an existing writer has a layout"),
+                length,
+            )
         })
     }
 
@@ -4593,7 +4786,7 @@ impl StorageIo for FsStorageIo {
     }
 
     fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
-        self.with_file_rename(temporary_name, published_name, || {
+        self.rename_locked(temporary_name, published_name, true, || {
             let directory = File::open(&self.root)?;
             rustix::fs::renameat_with(
                 &directory,
@@ -4626,7 +4819,9 @@ impl StorageIo for FsStorageIo {
             .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
         let file = direct_io::open(&path, false)?;
         let metadata = file.metadata()?;
-        if !metadata.is_file() || direct_io::object_len(&file)? != expected_length {
+        if !metadata.is_file()
+            || cached_file_layout(&file, name, &self.immutable_leases)?.length != expected_length
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "immutable object identity or length changed before lease acquisition",
