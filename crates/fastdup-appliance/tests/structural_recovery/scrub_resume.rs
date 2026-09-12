@@ -451,3 +451,74 @@ fn crash_during_tail_repair_or_completed_round_reset_never_fabricates_work() {
         }
     }
 }
+
+#[test]
+fn resume_pool_overlaps_32_envelope_reads_and_never_reads_payloads() {
+    use fastdup_store::{SCRUB_RESUME_MAX_IOS, ScrubResumePool};
+    use fastdup_testkit::PausedStorageIo;
+    use std::time::Duration;
+    let (metadata, data, _) = fixture(false);
+    let entries = certificates(&metadata, &data, &[31; SCRUB_RESUME_MAX_IOS]);
+    let work = coverage(&metadata, &data);
+    let paused = PausedStorageIo::before(data.clone(), StorageOperation::ReadExactAt);
+    let repository = ContainerRepository::new(paused.clone());
+    let before = data.operation_count();
+    let worker = std::thread::spawn(move || {
+        let pool = ScrubResumePool::new().unwrap();
+        let mut work = work;
+        let outcomes = pool.resume(&repository, &entries, &mut work).unwrap();
+        assert!(outcomes.iter().all(|matched| *matched));
+        work.finish().unwrap();
+    });
+    let overlapped = paused.wait_until_reached_count(SCRUB_RESUME_MAX_IOS, Duration::from_secs(2));
+    paused.resume();
+    worker.join().unwrap();
+    assert!(
+        overlapped,
+        "all 32 header requests must overlap rather than run serially"
+    );
+    let operations = &data.operations()[before..];
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|op| **op == StorageOperation::ReadExactAt)
+            .count(),
+        64
+    );
+    assert!(!operations.contains(&StorageOperation::Read));
+}
+
+#[test]
+fn resume_pool_rejects_oversized_batches_and_failed_batches_add_no_coverage() {
+    use fastdup_store::{SCRUB_RESUME_MAX_IOS, ScrubResumePool};
+    let (metadata, data, _) = fixture(true);
+    let entries = certificates(&metadata, &data, &[31; SCRUB_RESUME_MAX_IOS + 1]);
+    let mut work = coverage(&metadata, &data);
+    let repository = ContainerRepository::new(data.clone());
+    let pool = ScrubResumePool::new().unwrap();
+    let before = data.operation_count();
+    assert!(pool.resume(&repository, &entries, &mut work).is_err());
+    assert_eq!(data.operation_count(), before);
+    let entries = certificates(&metadata, &data, &[31, 32]);
+    data.write_at(&name(31), 0, &[0; 4096]).unwrap();
+    assert!(pool.resume(&repository, &entries, &mut work).is_err());
+    assert!(
+        work.finish().is_err(),
+        "partial success cannot complete current graph coverage"
+    );
+}
+
+#[test]
+fn resume_prefetch_limits_certificate_memory_as_well_as_io_count() {
+    let (metadata, data, _) = fixture(false);
+    let repository = ContainerRepository::new(data.clone());
+    let chunks = vec![b"x".as_slice(); 30000];
+    repository.publish_raw(id(33), 3, &chunks).unwrap();
+    let entries = certificates(&metadata, &data, &[31, 33]);
+    let disk = saved(&entries);
+    let journal = ScrubProgress::open(disk, BINDING, 101).unwrap();
+    assert_eq!(journal.resume_batch_len(&[id(31); 40], 40), 32);
+    assert_eq!(journal.resume_batch_len(&[id(31); 40], 1), 1);
+    assert_eq!(journal.resume_batch_len(&[id(31), id(33)], 32), 1);
+    assert_eq!(journal.resume_batch_len(&[id(33), id(31)], 32), 1);
+}

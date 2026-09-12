@@ -51,7 +51,7 @@ mod similarity_external_sort;
 mod similarity_index_repository;
 mod similarity_mmap;
 mod similarity_simd;
-pub use scrub_progress::{ScrubCertificate, ScrubCoverage, ScrubProgress};
+pub use scrub_progress::{ScrubCertificate, ScrubCoverage, ScrubProgress, ScrubResumePool, SCRUB_RESUME_MAX_IOS};
 mod recovery_read;
 mod structural_recovery;
 pub use structural_recovery::PendingDataVerification;

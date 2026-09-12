@@ -46,7 +46,8 @@ Physical formats and writer commit barriers do not change.
 After mount, one read-only worker fully verifies a snapshot of published
 Containers, including payloads and dependent Bases. It retains at most one
 bounded Container image and verification working buffers, runs at idle I/O and
-reduced CPU priority, and issues reads in at most 256-KiB portions. Pauses adapt
+reduced CPU priority, and issues payload reads in at most 256-KiB portions. Saved-round envelope
+reconciliation follows ADR 0092’s separate bounded parallel resume path. Payload pauses adapt
 to measured read time and frontend storage activity: approximately 10% read duty
 under activity and at most 50% while idle. These are operating targets, not a
 block-scheduler latency guarantee. Cancellation is checked between portions and

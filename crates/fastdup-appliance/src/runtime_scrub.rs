@@ -2,8 +2,8 @@
 use super::{MaintenanceContainerStorage, TelemetryStorageIo, runtime_telemetry};
 use fastdup_posix::Namespace;
 use fastdup_store::{
-    ContainerRepository, ExactIndexRunRepository, FsStorageIo, ScrubCoverage, ScrubProgress,
-    StorageIo,
+    ContainerRepository, ExactIndexRunRepository, FsStorageIo, SCRUB_RESUME_MAX_IOS, ScrubCoverage,
+    ScrubProgress, ScrubResumePool, StorageIo,
 };
 use std::fmt::Write as _;
 use std::io;
@@ -113,41 +113,54 @@ pub fn start(
                 let paced = PacedStorage {
                     inner: containers.storage().clone(),
                     control: Arc::clone(&control),
+                    fast_resume: false,
                 };
                 let repository = containers.with_maintenance_storage(paced);
                 let index = indexes.pin_active_generation();
-                for id in names {
+                let fast_repository = repository.with_maintenance_storage(PacedStorage {
+                    inner: repository.storage().inner.clone(),
+                    control: Arc::clone(&control),
+                    fast_resume: true,
+                });
+                let mut resume_pool = None;
+                let mut remaining = names.as_slice();
+                while !remaining.is_empty() {
                     control.check_cancelled()?;
-                    control
-                        .progress
-                        .lock()
-                        .expect("scrub progress lock")
-                        .current = Some(id.bytes().iter().fold(
-                        String::with_capacity(32),
-                        |mut output, byte| {
-                            write!(output, "{byte:02x}").expect("String formatting");
-                            output
-                        },
-                    ));
-                    let (bytes, resumed) = verify_next(
-                        &repository,
-                        index.as_deref(),
-                        id,
+                    let width = control.resume_width();
+                    let width = journal
+                        .as_ref()
+                        .map_or(width.min(remaining.len()), |progress| {
+                            progress.resume_batch_len(remaining, width)
+                        });
+                    let (batch, rest) = remaining.split_at(width);
+                    remaining = rest;
+                    let resumed = resume_batch(
+                        &fast_repository,
+                        batch,
                         &mut coverage,
                         &mut journal,
+                        &mut resume_pool,
                     )?;
-                    unsynced += usize::from(!resumed);
-                    if unsynced >= 64 || last_sync.elapsed() >= Duration::from_secs(5) {
-                        sync_progress(&mut journal);
-                        unsynced = 0;
-                        last_sync = Instant::now();
+                    for (&id, resumed_bytes) in batch.iter().zip(resumed) {
+                        control.check_cancelled()?;
+                        control.set_current(id);
+                        let (bytes, resumed) = verify_next(
+                            &repository,
+                            index.as_deref(),
+                            id,
+                            &mut coverage,
+                            &mut journal,
+                            resumed_bytes,
+                        )?;
+                        unsynced += usize::from(!resumed);
+                        if unsynced >= 64 || last_sync.elapsed() >= Duration::from_secs(5) {
+                            sync_progress(&mut journal);
+                            unsynced = 0;
+                            last_sync = Instant::now();
+                        }
+                        control.record_verified(bytes, resumed);
+                        control.report("running", None);
                     }
-                    let mut progress = control.progress.lock().expect("scrub progress lock");
-                    progress.verified += 1;
-                    progress.resumed += usize::from(resumed);
-                    progress.verified_bytes += bytes;
-                    drop(progress);
-                    control.report("running", None);
                 }
                 coverage.finish().map_err(io::Error::other)?;
                 if let Some(progress) = &mut journal
@@ -167,33 +180,63 @@ pub fn start(
     })
 }
 
+fn resume_batch(
+    repository: &ContainerRepository<PacedStorage<MaintenanceContainerStorage>>,
+    ids: &[fastdup_format::ContainerId],
+    coverage: &mut ScrubCoverage,
+    journal: &mut Option<ScrubProgress<FsStorageIo>>,
+    pool: &mut Option<ScrubResumePool>,
+) -> io::Result<Vec<Option<u64>>> {
+    let mut resumed = vec![None; ids.len()];
+    let Some(progress) = journal.as_ref() else {
+        return Ok(resumed);
+    };
+    let mut entries = Vec::new();
+    let mut positions = Vec::new();
+    for (position, id) in ids.iter().enumerate() {
+        repository.storage().control.check_cancelled()?;
+        match progress.lookup(*id, unix_seconds()) {
+            Ok(Some(entry)) => {
+                entries.push(entry);
+                positions.push(position);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                progress_warning(&error);
+                *journal = None;
+                return Ok(resumed);
+            }
+        }
+    }
+    if !entries.is_empty() {
+        if pool.is_none() {
+            *pool = Some(ScrubResumePool::new()?);
+        }
+        let outcomes = pool
+            .as_ref()
+            .expect("resume workers initialized")
+            .resume(repository, &entries, coverage)
+            .map_err(io::Error::other)?;
+        for ((entry, position), matched) in entries.iter().zip(positions).zip(outcomes) {
+            if matched {
+                resumed[position] = Some(entry.bytes());
+            }
+        }
+    }
+    Ok(resumed)
+}
+
 fn verify_next(
     repository: &ContainerRepository<PacedStorage<MaintenanceContainerStorage>>,
     index: Option<&fastdup_store::ActivatedExactIndex<FsStorageIo>>,
     id: fastdup_format::ContainerId,
     coverage: &mut ScrubCoverage,
     journal: &mut Option<ScrubProgress<FsStorageIo>>,
+    resumed_bytes: Option<u64>,
 ) -> io::Result<(u64, bool)> {
-    let cached = match journal
-        .as_ref()
-        .map(|j| j.lookup(id, unix_seconds()))
-        .transpose()
-    {
-        Ok(entry) => entry.flatten(),
-        Err(error) => {
-            progress_warning(&error);
-            *journal = None;
-            None
-        }
-    };
-    let resumed = match cached.as_ref() {
-        Some(entry) => repository
-            .resume_scrub(entry, coverage)
-            .map_err(io::Error::other)?,
-        None => false,
-    };
-    let bytes = if resumed {
-        cached.expect("resumed entry exists").bytes()
+    let resumed = resumed_bytes.is_some();
+    let bytes = if let Some(bytes) = resumed_bytes {
+        bytes
     } else {
         let entry = repository
             .scrub_for_progress(id, index, coverage, unix_seconds())
@@ -255,15 +298,39 @@ impl Control {
         }
     }
 
+    fn set_current(&self, id: fastdup_format::ContainerId) {
+        self.progress.lock().expect("scrub progress lock").current = Some(id.bytes().iter().fold(
+            String::with_capacity(32),
+            |mut output, byte| {
+                write!(output, "{byte:02x}").expect("String formatting");
+                output
+            },
+        ));
+    }
+
+    fn record_verified(&self, bytes: u64, resumed: bool) {
+        let mut progress = self.progress.lock().expect("scrub progress lock");
+        progress.verified += 1;
+        progress.resumed += usize::from(resumed);
+        progress.verified_bytes += bytes;
+    }
+
     fn finish(&self, result: io::Result<()>, namespace: &Namespace) {
-        if self.cancelled.load(Ordering::Acquire) {
-            self.report("cancelled", None);
-        } else if let Err(error) = result {
+        let cancelled = self.cancelled.load(Ordering::Acquire);
+        let result = result.or_else(|error| {
+            let interrupted = error.kind() == io::ErrorKind::Interrupted
+                || error.get_ref().and_then(|source| source.downcast_ref::<fastdup_store::StoreError>())
+                    .is_some_and(|source| matches!(source, fastdup_store::StoreError::Io(inner) if inner.kind() == io::ErrorKind::Interrupted));
+            if cancelled && interrupted { Ok(()) } else { Err(error) }
+        });
+        if let Err(error) = result {
             namespace.fail_integrity();
             self.report("failed", Some(&error.to_string()));
             eprintln!(
                 "CRITICAL: background_scrub_failed=true mutation_admission=integrity_failed error={error}"
             );
+        } else if cancelled {
+            self.report("cancelled", None);
         } else {
             self.complete.store(true, Ordering::Release);
             self.report("complete", None);
@@ -297,8 +364,15 @@ impl Control {
         }));
     }
 
-    fn after_read(&self, bytes: usize, elapsed: Duration) -> io::Result<()> {
-        self.read_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    fn resume_width(&self) -> usize {
+        if self.foreground_busy() {
+            1
+        } else {
+            SCRUB_RESUME_MAX_IOS
+        }
+    }
+
+    fn foreground_busy(&self) -> bool {
         let now = Instant::now();
         let operations = (self.activity)();
         let mut pace = self.pace.lock().expect("scrub pace lock");
@@ -306,9 +380,15 @@ impl Control {
             pace.operations = operations;
             pace.last_busy = Some(now);
         }
-        let busy = pace
-            .last_busy
-            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(5));
+        pace.last_busy
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(5))
+    }
+
+    fn after_read(&self, bytes: usize, elapsed: Duration) -> io::Result<()> {
+        self.read_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let busy = self.foreground_busy();
+        let now = Instant::now();
+        let mut pace = self.pace.lock().expect("scrub pace lock");
         let report = now.duration_since(pace.last_report) >= Duration::from_secs(1);
         if report {
             pace.last_report = now;
@@ -339,6 +419,7 @@ impl Control {
 struct PacedStorage<I> {
     inner: I,
     control: Arc<Control>,
+    fast_resume: bool,
 }
 
 fn read_only() -> io::Error {
@@ -397,6 +478,16 @@ impl<I: StorageIo> StorageIo for PacedStorage<I> {
         self.control
             .read_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if self.fast_resume {
+            // Idle resume issues only small envelopes, without payload duty sleeps.
+            // If frontend traffic starts mid-batch, back off before the next read;
+            // the coordinator reduces the next batch to one outstanding request.
+            if self.control.foreground_busy() {
+                self.control.after_read(0, start.elapsed())?;
+            }
+            self.control.check_cancelled()?;
+            return Ok(bytes);
+        }
         let mut pace = self.control.pace.lock().expect("scrub pace lock");
         pace.structure_bytes += bytes.len();
         pace.structure_elapsed += start.elapsed();
@@ -474,6 +565,89 @@ mod tests {
     }
 
     #[test]
+    fn resume_width_backs_off_on_activity_and_recovers_after_quiet_window() {
+        let control = control(false);
+        assert_eq!(control.resume_width(), 32);
+        // The activity source now differs from its previously sampled counter.
+        control.pace.lock().unwrap().operations = 1;
+        assert_eq!(control.resume_width(), 1);
+        assert_eq!(control.resume_width(), 1);
+        control.pace.lock().unwrap().last_busy = Some(Instant::now() - Duration::from_secs(6));
+        assert_eq!(control.resume_width(), 32);
+    }
+
+    #[test]
+    fn concurrent_stop_does_not_hide_a_real_scrub_failure() {
+        let control = control(false);
+        control.cancelled.store(true, Ordering::Release);
+        let namespace = Namespace::new_volatile(fastdup_posix::NamespaceConfig::default());
+        control.finish(Err(io::Error::other("damaged envelope")), &namespace);
+        assert!(namespace.integrity_failed());
+        assert!(!ScrubGate(control).permits_gc());
+    }
+
+    #[test]
+    fn parallel_resume_cancellation_joins_all_reads_and_keeps_gc_closed() {
+        use fastdup_format::{ContainerId, NamespaceRoot};
+        use fastdup_store::GenerationRepository;
+        use fastdup_testkit::PausedStorageIo;
+        let storage = MemoryStorageIo::new();
+        let repository = ContainerRepository::new(storage.clone());
+        let id = ContainerId::new([51; 16]).unwrap();
+        repository.publish_raw(id, 1, &[&[7; 65536]]).unwrap();
+        let generations = GenerationRepository::new(
+            MemoryStorageIo::new(),
+            fastdup_appliance::checkpoint_policy_set(),
+        );
+        generations
+            .commit_namespace(&NamespaceRoot::new(1024, 2, 0, vec![], vec![]).unwrap())
+            .unwrap();
+        let (_, required) = generations
+            .recover_committed_for_mount(&repository)
+            .unwrap();
+        let mut coverage = ScrubCoverage::new(required);
+        let entries = (0..SCRUB_RESUME_MAX_IOS)
+            .map(|_| {
+                repository
+                    .scrub_for_progress::<MemoryStorageIo>(id, None, &mut coverage, 100)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let paused = PausedStorageIo::before(storage.clone(), StorageOperation::ReadExactAt);
+        let control = control(false);
+        let repository = ContainerRepository::new(PacedStorage {
+            inner: paused.clone(),
+            control: Arc::clone(&control),
+            fast_resume: true,
+        });
+        let before = storage.operation_count();
+        let worker = std::thread::spawn(move || {
+            ScrubResumePool::new()
+                .unwrap()
+                .resume(&repository, &entries, &mut coverage)
+        });
+        let reached = paused.wait_until_reached_count(SCRUB_RESUME_MAX_IOS, Duration::from_secs(2));
+        control.cancelled.store(true, Ordering::Release);
+        paused.resume();
+        let result = worker.join().unwrap();
+        assert!(reached);
+        assert!(result.is_err());
+        let operations = storage.operations();
+        assert_eq!(
+            operations[before..]
+                .iter()
+                .filter(|op| **op == StorageOperation::ReadExactAt)
+                .count(),
+            32,
+            "cancelled header requests join without issuing their footer reads"
+        );
+        let namespace = Namespace::new_volatile(fastdup_posix::NamespaceConfig::default());
+        control.finish(result.map(drop).map_err(io::Error::other), &namespace);
+        assert!(!ScrubGate(control).permits_gc());
+        assert!(!namespace.integrity_failed());
+    }
+
+    #[test]
     fn actual_scrub_failure_blocks_writes_and_never_opens_gc_gate() {
         for damaged in [false, true] {
             let storage = MemoryStorageIo::new();
@@ -490,6 +664,7 @@ mod tests {
             let repository = ContainerRepository::new(PacedStorage {
                 inner: storage.clone(),
                 control: Arc::clone(&control),
+                fast_resume: false,
             });
             let result = repository
                 .scrub_container::<MemoryStorageIo>(id, None)
@@ -517,6 +692,7 @@ mod tests {
         let repository = ContainerRepository::new(PacedStorage {
             inner: storage,
             control: Arc::clone(&control),
+            fast_resume: false,
         });
         let result = repository
             .scrub_container::<MemoryStorageIo>(id, None)

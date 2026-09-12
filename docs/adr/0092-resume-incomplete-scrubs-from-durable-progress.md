@@ -66,9 +66,31 @@ accepted entry. Journal I/O failure disables persistence and reuse for the rest
 of that process while full verification continues, with a journal warning.
 Offline verification never consults this auxiliary journal.
 
-The in-memory journal index stores offsets, not all saved Chunk maps. Replay and
-lookup allocate at most one format-bounded entry at a time. Current graph and
-independent-Base coverage remain pass-local memory. Payload work retains the
-single paced worker; envelope read pacing is batched into 256-KiB groups rather
-than imposing a delay on each 4-KiB block. Telemetry distinguishes carried-forward
-checks, new checks and remaining Containers, including historical UI samples.
+The in-memory journal index stores offsets, not all saved Chunk maps. Replay
+still allocates one format-bounded entry at a time. Resume prefetch groups at
+most 32 entries and at most one MiB of encoded certificate bytes; an individually
+larger entry is handled alone under the existing format bound. Current graph
+and independent-Base coverage remain pass-local memory.
+
+Envelope reconciliation uses a dedicated persistent pool of 32 workers, separate
+from frontend and encoding pools. Each worker issues only one synchronous storage
+operation at a time, so asynchronous batches have at most 32 outstanding resume
+I/Os, not 64 for the Header/Footer pair. Idle I/O scheduling applies to every
+worker. Header and Footer checks remain unchanged: the Footer supplies the
+fingerprint, while cross-checking both envelopes detects mismatched identity,
+generation and layout. No new durable format or validation rule is introduced.
+
+Idle envelope reconciliation has no artificial read-duty sleep. On observed
+frontend DATA activity, the coordinator reduces subsequent batches to one entry
+for the existing five-second activity window; already dispatched envelope reads
+back off before continuing. Payload verification retains its single paced
+worker and existing duty limits. Envelope tasks fully join before coverage is
+merged or payload verification begins, including on error or shutdown. A failed
+batch contributes no coverage. A real envelope or I/O failure takes precedence
+over a concurrent stop request. The ordinary scrub gate and full on-demand checks
+remain authoritative.
+
+Telemetry distinguishes carried-forward checks, new checks and remaining
+Containers, including historical UI samples. Regressions hold 32 actual envelope
+reads in flight, reject oversized batches, verify failure leaves coverage
+incomplete, and cancel an in-flight batch before any Footer request is issued.

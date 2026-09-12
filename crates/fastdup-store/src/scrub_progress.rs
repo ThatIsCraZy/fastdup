@@ -4,6 +4,7 @@ use fastdup_format::{
     ChunkId, ContainerId, ContainerStructure, FOOTER_BYTES, HEADER_BYTES, MAX_CONTAINER_BYTES,
     SealedContainerDescriptor, StructuralChunk,
 };
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
@@ -120,6 +121,16 @@ impl<I: StorageIo> ContainerRepository<I> {
         entry: &ScrubCertificate,
         coverage: &mut ScrubCoverage,
     ) -> Result<bool, StoreError> {
+        if !self.matches_scrub_envelope(entry)? {
+            return Ok(false);
+        }
+        if self.selectable_container(entry.id) {
+            coverage.observe(entry);
+        }
+        Ok(true)
+    }
+
+    fn matches_scrub_envelope(&self, entry: &ScrubCertificate) -> Result<bool, StoreError> {
         let name = crate::published_name(entry.id);
         let length = self.storage.object_len(&name)?;
         if length != entry.length || !(8192..=MAX_CONTAINER_BYTES).contains(&length) {
@@ -137,10 +148,75 @@ impl<I: StorageIo> ContainerRepository<I> {
         {
             return Ok(false);
         }
-        if self.selectable_container(entry.id) {
-            coverage.observe(entry);
-        }
         Ok(true)
+    }
+}
+
+/// Maximum concurrent resume operations; each worker issues one blocking read at a time.
+pub const SCRUB_RESUME_MAX_IOS: usize = 32;
+
+/// Dedicated persistent workers for asynchronous, bounded envelope reconciliation.
+/// Payload verification and graph coverage stay on the scrub coordinator.
+pub struct ScrubResumePool(rayon::ThreadPool);
+
+impl ScrubResumePool {
+    /// Creates workers independent of frontend CPU/encoding pools.
+    /// # Errors
+    /// Returns worker creation or idle I/O priority setup failures.
+    pub fn new() -> io::Result<Self> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(SCRUB_RESUME_MAX_IOS)
+            .thread_name(|index| format!("scrub-resume-{index}"))
+            .build()
+            .map_err(io::Error::other)?;
+        for result in pool.broadcast(|_| crate::set_background_io_priority()) {
+            result?;
+        }
+        Ok(Self(pool))
+    }
+
+    /// Checks at most 32 saved envelopes, then merges successful coverage serially.
+    /// Every submitted task has completed before this returns, including on failure.
+    /// # Errors
+    /// Returns oversized batch, current envelope, or storage errors. Failed batches
+    /// contribute no coverage; saved history never becomes a payload proof.
+    pub fn resume<I: StorageIo + Sync>(
+        &self,
+        repository: &ContainerRepository<I>,
+        entries: &[ScrubCertificate],
+        coverage: &mut ScrubCoverage,
+    ) -> Result<Vec<bool>, StoreError> {
+        if entries.len() > SCRUB_RESUME_MAX_IOS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scrub resume batch exceeds 32 I/Os",
+            )
+            .into());
+        }
+        let mut outcomes: Vec<Result<bool, StoreError>> = self.0.install(|| {
+            entries
+                .par_iter()
+                .map(|entry| repository.matches_scrub_envelope(entry))
+                .collect()
+        });
+        // A concurrent stop must not hide a damaged envelope or real I/O error
+        // returned by another member of the same batch.
+        if let Some(position) = outcomes.iter().position(|outcome| match outcome {
+            Err(StoreError::Io(error)) => error.kind() != io::ErrorKind::Interrupted,
+            Err(_) => true,
+            Ok(_) => false,
+        }) {
+            return Err(outcomes
+                .swap_remove(position)
+                .expect_err("selected failure"));
+        }
+        let outcomes = outcomes.into_iter().collect::<Result<Vec<_>, _>>()?;
+        for (entry, matched) in entries.iter().zip(&outcomes) {
+            if *matched && repository.selectable_container(entry.id) {
+                coverage.observe(entry);
+            }
+        }
+        Ok(outcomes)
     }
 }
 
@@ -248,6 +324,27 @@ impl<I: StorageIo> ScrubProgress<I> {
         self.started = now;
         self.end = HEADER_LEN as u64;
         Ok(())
+    }
+
+    /// Chooses a bounded prefetch batch without loading its Chunk maps.
+    /// At most one storage-range worth of encoded certificates is grouped;
+    /// a larger single entry retains the pre-existing one-entry format bound.
+    #[must_use]
+    pub fn resume_batch_len(&self, ids: &[ContainerId], max_entries: usize) -> usize {
+        let mut bytes = 0_usize;
+        let mut count = 0;
+        for id in ids.iter().take(max_entries.min(SCRUB_RESUME_MAX_IOS)) {
+            let size = self.entries.get(&id.bytes()).map_or(0, |(_, size)| *size);
+            if count != 0
+                && (bytes >= crate::MAX_STORAGE_RANGE_BYTES
+                    || size > crate::MAX_STORAGE_RANGE_BYTES.saturating_sub(bytes))
+            {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            count += 1;
+        }
+        count
     }
 
     /// Loads only the requested entry's Chunk map from Metadata storage.
