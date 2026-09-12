@@ -415,3 +415,62 @@ progress { accent-color: #63c4d5; height: 6px; }
 
 .sidebar-health.degraded { border-color: #614c31; background: #282319; color: #f2c16b; }
 .sidebar-health.degraded strong, .sidebar-health.degraded span { color: inherit; }
+
+/* Telemetry follows the investigation: workload, devices, causes, allocation. */
+.telemetry-page > section { margin-top: 24px; scroll-margin-top: 94px; }
+.telemetry-jump-links { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 24px; }
+.telemetry-jump-links a { padding: 9px 13px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); text-decoration: none; font-size: 13px; background: var(--panel); }
+.telemetry-jump-links a:hover, .telemetry-jump-links a:focus-visible { color: var(--text); border-color: var(--cyan); }
+.telemetry-chart-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 20px; }
+.telemetry-chart-grid > .card { margin: 0; min-width: 0; }
+.telemetry-page .telemetry-title { align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+.telemetry-page .range-picker { flex-wrap: wrap; }
+.telemetry-page .telemetry-occupancy .telemetry-values { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.detail-tab-groups { display: grid; grid-template-columns: 1fr 1.5fr 1fr; gap: 12px; padding: 14px 20px; background: #0c171d; overflow: visible; }
+.detail-tab-group { min-width: 0; }
+.detail-tab-group-label { display: block; margin-bottom: 9px; color: var(--muted); font-size: 11px; letter-spacing: .03em; }
+.detail-tab-group > div { display: flex; flex-wrap: wrap; gap: 4px; }
+.detail-tab-groups button { padding: 9px 10px; border: 1px solid transparent; border-radius: 6px; }
+.detail-tab-groups button[aria-selected="true"] { border-color: #416774; background: #203640; color: #b7ecf4; }
+.detail-tab-groups button:focus-visible, .cache-range button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.detail-panel-hint { font-size: 14px; color: var(--text); margin: 0 0 18px; line-height: 1.5; }
+.cache-advanced { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 22px; align-items: start; }
+.cache-advanced:empty { display: none; }
+.cache-advanced > details { margin: 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 7px; font-size: 12px; color: var(--muted); }
+.cache-advanced summary { cursor: pointer; color: var(--text); }
+.cache-advanced .telemetry-values { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.detail-scrub { padding: 12px 14px; border: 1px solid var(--border); border-radius: 7px; background: #63c4d505; grid-template-columns: auto 1fr; column-gap: 20px; }
+.detail-scrub > progress, .detail-scrub > small, .detail-scrub > span:nth-of-type(2) { grid-column: 1 / -1; }
+.detail-scrub progress { height: 5px; }
+.detail-scrub[role="alert"] { border-color: #75434b; background: #281c22; }
+.telemetry-history-error { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 12px; background: #281c22; color: #f1979f; border: 1px solid #75434b; border-radius: 7px; }
+.telemetry-history-error button { color: inherit; padding: 6px 10px; border: 1px solid currentColor; border-radius: 5px; background: transparent; cursor: pointer; }
+@media (max-width: 1100px) {
+  .telemetry-chart-grid { grid-template-columns: 1fr; }
+  .detail-tab-groups { grid-template-columns: 1fr; gap: 16px; }
+  .detail-tab-group { display: grid; grid-template-columns: 150px 1fr; align-items: start; }
+  .detail-tab-group-label { margin: 9px 0 0; }
+}
+@media (max-width: 700px) {
+  .telemetry-jump-links { display: grid; grid-template-columns: 1fr 1fr; }
+  .telemetry-jump-links a { font-size: 12px; }
+  .detail-tab-groups { padding: 12px; }
+  .detail-tab-group { display: block; }
+  .detail-tab-group-label { margin: 0 0 6px; }
+  .cache-advanced { grid-template-columns: 1fr; }
+  .detail-scrub { grid-template-columns: 1fr; margin: 0 12px 12px; }
+  .telemetry-page .telemetry-occupancy .telemetry-values { grid-template-columns: 1fr 1fr; }
+}
+
+/* The table deliberately reaches the card edge; its explanatory copy does not. */
+.disk-card .card-content > .detail-note { margin: 0; padding: 14px 17px 18px; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .telemetry-page > section { scroll-margin-top: 140px; }
+}
+@media (max-width: 700px) {
+  .disk-card .disk-table.header-row { display: none; }
+  .disk-card .disk-table { min-width: 0; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px 12px; padding: 17px; }
+  .disk-card .disk-table > span:nth-child(6) { grid-column: 2; grid-row: 1; justify-self: end; }
+  .disk-card .disk-table > span[data-label]::before { content: attr(data-label); display: block; color: var(--muted); font-size: 10px; line-height: 1.5; margin-bottom: 6px; }
+  .disk-card .disk-table > .disk-name > span { min-width: 0; }
+}

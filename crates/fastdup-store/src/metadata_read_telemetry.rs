@@ -263,7 +263,7 @@ pub fn metadata_read_status() -> MetadataReadStatus {
     }
 }
 impl MetadataReadCounters {
-    fn rows(&self) -> Vec<MetadataReadRow> {
+    pub(crate) fn rows(&self) -> Vec<MetadataReadRow> {
         self.0
             .iter()
             .enumerate()

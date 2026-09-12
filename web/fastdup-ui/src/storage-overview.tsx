@@ -1,3 +1,4 @@
+import { formatQueueDepth } from "./disk-io";
 import { HardDrive, Database, FileStack } from "lucide-react";
 import { useI18n } from "./i18n";
 import { Card, CardContent, CardHeader } from "./components/ui/card";
@@ -38,7 +39,7 @@ export function StorageOverview({snapshot}: {snapshot: ApplianceSnapshot}) {
     <p className="detail-note">{target?.path ?? volume.kernel} · UUID {volume.uuid}</p>
     <div className="storage-device-list">{devices.map(device => {
      const disk = snapshot.telemetry.disks.find(disk => disk.id === device.kernelName);
-     return <div className="storage-device" key={device.kernelName}><HardDrive size={22}/><div><strong>{device.kernelName} · {device.model || disk?.model || t("Modell nicht verfügbar")}</strong><small>{device.hbaPort || disk?.hbaPort || t("Hardwarepfad nicht verfügbar")}</small><small>{t("Lesen / Schreiben")}: {disk ? `${disk.readMbps.toLocaleString(locale,{maximumFractionDigits:1})} / ${disk.writeMbps.toLocaleString(locale,{maximumFractionDigits:1})} MB/s` : "—"}</small><small>{t("Lesen / Schreiben")}: {disk?.readIops == null ? "—" : disk.readIops.toLocaleString(locale,{maximumFractionDigits:1})} / {disk?.writeIops == null ? "—" : disk.writeIops.toLocaleString(locale,{maximumFractionDigits:1})} IOPS</small><small>{t("Auslastung")}: {disk ? `${disk.utilization.toLocaleString(locale,{maximumFractionDigits:1})} % · ${disk.outstandingIo} ${t("ausstehende I/Os")}` : "—"}</small></div></div>;
+     return <div className="storage-device" key={device.kernelName}><HardDrive size={22}/><div><strong>{device.kernelName} · {device.model || disk?.model || t("Modell nicht verfügbar")}</strong><small>{device.hbaPort || disk?.hbaPort || t("Hardwarepfad nicht verfügbar")}</small><small>{t("Lesen / Schreiben")}: {disk ? `${disk.readMbps.toLocaleString(locale,{maximumFractionDigits:1})} / ${disk.writeMbps.toLocaleString(locale,{maximumFractionDigits:1})} MB/s` : "—"}</small><small>{t("Lesen / Schreiben")}: {disk?.readIops == null ? "—" : disk.readIops.toLocaleString(locale,{maximumFractionDigits:1})} / {disk?.writeIops == null ? "—" : disk.writeIops.toLocaleString(locale,{maximumFractionDigits:1})} IOPS</small><small>{t("Auslastung")}: {disk ? `${disk.utilization.toLocaleString(locale,{maximumFractionDigits:1})} % · Ø ${formatQueueDepth(disk.averageOutstandingIo, locale)} ${t("ausstehende I/Os")} · ${t("Momentan")}: ${disk.outstandingIo.toLocaleString(locale)}` : "—"}</small></div></div>;
     })}</div>
    </CardContent></Card>;
   })}</div>

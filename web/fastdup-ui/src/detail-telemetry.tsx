@@ -31,11 +31,26 @@ export interface DetailTelemetry {
   } | null;
 }
 
+const tabGroups = [
+  { label: "Antwortzeiten & I/O", indices: [0, 1] },
+  { label: "RAM & Lesezugriffe", indices: [2, 6, 3] },
+  { label: "Wartung & Commit", indices: [4, 5] },
+];
+const tabOrder = tabGroups.flatMap(group => group.indices);
+const tabHints = [
+  "Wie lange dauern Dateizugriffe?",
+  "Wie stark ist die asynchrone DATA-Verarbeitung belegt?",
+  "Welche Caches vermeiden Backend-Zugriffe und wie viel RAM nutzen sie?",
+  "Welche Vergleichsversuche vermeiden DATA-Lesezugriffe?",
+  "Was prüfen und bereinigen die Hintergrundprozesse?",
+  "Welche Phase bestimmt die Dauer des letzten Checkpoints?",
+  "Welche Lesewege reichen Anfragen an das Betriebssystem weiter?",
+];
 const tabs = ["Latenzen", "io_uring", "Caches", "Lesevermeidung", "GC & Scrub", "Checkpoint-Phasen", "Metadata-Reads"];
 const metadataReasons: Record<string,string> = {other:"Nicht zugeordnet",indexLookup:"Index-Abfrage · Cache-Miss",indexCompaction:"Index-Zusammenführung",indexAudit:"Index-Prüfung",indexEnvelope:"Index-Header / Footer",manifest:"Manifest lesen",namespace:"Namespace / Verwaltungsgraph",recoveryScrub:"Recovery / Scrub",garbageCollection:"Garbage Collection"};
 const metadataObjects: Record<string,string> = {exactIndex:"Exact Index",similarityIndex:"Similarity Index",metadataObject:"Metadatenobjekt",smallFile:"Small-File-Container",control:"Commit / Journal / Verwaltung",other:"Weitere Dateien"};
 const metadataModes: Record<string,string> = {bufferedRange:"Gepufferter Bereich",bufferedFile:"Gepufferte Datei",bufferedStructure:"Gepufferte Struktur",mmap:"mmap"};
-const cacheLabels: Record<string, string> = { verifiedRead: "Verified Read", exactIndex: "Exact Index", similarityIndex: "Similarity Index", containerDescriptors: "Container Descriptors", historicalProofs: "Historical Proofs", manifestNodes: "Manifest Nodes" };
+const cacheLabels: Record<string, string> = { verifiedRead: "Verified Read", exactIndex: "Exact Index", similarityIndex: "Similarity Index", containerDescriptors: "Container Descriptors", historicalProofs: "Historical Proofs", manifestNodes: "Manifest Nodes", metadataObjects: "Metadata Objects" };
 const cacheDescriptions: Record<string, string> = {
   verifiedRead: "Geprüfte Nutzdaten für Lesen und Vergleichsbasen",
   exactIndex: "Zuordnung von Chunk-IDs zu Speicherorten",
@@ -43,6 +58,7 @@ const cacheDescriptions: Record<string, string> = {
   containerDescriptors: "Aufbau und Speicherorte im Container",
   historicalProofs: "Bereits geprüfte Container-Nachweise",
   manifestNodes: "Geprüfte Dateibereiche für Lesen und Fast Clone",
+  metadataObjects: "Unveränderliche Namespace- und Manifest-Objekte",
 };
 const phaseLabels: Record<string, string> = { freeze: "Freeze", cdc: "CDC", hashFill: "Hash / FILL", exactLookup: "Exact Lookup", encode: "Encoding", containerPublish: "Container Publish", indexPublish: "Index Publish", metadataCommit: "Metadata Commit" };
 
@@ -71,7 +87,7 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
     return Number(tier(b.id) === "data") - Number(tier(a.id) === "data");
   });
   return <section className="detail-telemetry" aria-label={t("Detailtelemetrie")}>
-    <div className="detail-telemetry-heading"><h2>{t("Detailtelemetrie")}</h2><span>{sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</span></div>
+    <div className="detail-telemetry-heading"><h2>{t("Ursachen & Details")}</h2><span>{sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</span></div>
     {scrub && <div className="detail-scrub" role={scrub.state === "failed" ? "alert" : "status"}>
       <strong>{t("Hintergrundprüfung")}: {t(({running:"Läuft",complete:"Abgeschlossen",failed:"Fehlgeschlagen",cancelled:"Unterbrochen"} as Record<string,string>)[scrub.state] ?? scrub.state)}</strong>
       <span>{number(scrub.verifiedContainers)} / {number(scrub.totalContainers)} {t("Container geprüft")} · {bytes(scrub.readBytes)} {t("gelesen")}</span>
@@ -79,15 +95,17 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
       {scrub.state === "running" && <><progress aria-label={t("Hintergrundprüfung")} value={scrub.verifiedContainers} max={Math.max(1, scrub.totalContainers)} /><small>{t("Lesezugriffe werden vollständig geprüft. Die Hintergrundprüfung begrenzt ihre Last; automatische Speicherbereinigung wartet auf ihren Abschluss.")}</small></>}
       {scrub.state === "failed" && <small>{t("Datenprüfung fehlgeschlagen. Neue Schreibzugriffe sind gesperrt. Details stehen im Dienstprotokoll.")}</small>}
     </div>}
-    <div className="detail-tabs" role="tablist" aria-label={t("Detailtelemetrie")}>
-      {tabs.map((label, index) => <button key={label} role="tab" id={`detail-tab-${index}`} aria-controls="detail-panel" aria-selected={tab === index} tabIndex={tab === index ? 0 : -1} onClick={() => setTab(index)} onKeyDown={event => {
+    <div className="detail-tabs detail-tab-groups" role="tablist" aria-label={t("Detailtelemetrie")}>
+      {tabGroups.map(group => <div className="detail-tab-group" role="presentation" key={group.label}><span className="detail-tab-group-label">{t(group.label)}</span><div role="presentation">{group.indices.map(index => <button key={tabs[index]} role="tab" id={`detail-tab-${index}`} aria-controls="detail-panel" aria-selected={tab === index} tabIndex={tab === index ? 0 : -1} onClick={() => setTab(index)} onKeyDown={event => {
         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
         event.preventDefault();
-        const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+        const position = tabOrder.indexOf(index);
+        const next = tabOrder[event.key === "Home" ? 0 : event.key === "End" ? tabOrder.length - 1 : (position + (event.key === "ArrowRight" ? 1 : -1) + tabOrder.length) % tabOrder.length];
         setTab(next); document.getElementById(`detail-tab-${next}`)?.focus();
-      }}>{t(label)}</button>)}
+      }}>{t(tabs[index])}</button>)}</div></div>)}
     </div>
     <div id="detail-panel" role="tabpanel" aria-labelledby={`detail-tab-${tab}`} tabIndex={0} aria-busy={loading}>
+      <p className="detail-panel-hint">{t(tabHints[tab])}</p>
       {loading ? <p>{t("Lädt")}</p> : <>
         {tab === 0 && (details?.latency ? <>
           <p className="detail-note">{t("Histogramm-Perzentile seit dem Mount, inklusive fehlgeschlagener Requests. Werte sind Bucket-Obergrenzen, keine Intervallmittelwerte.")}</p>
@@ -105,30 +123,6 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
             {rows([["RAM-Obergrenze", `${number(budget.maximumMemoryUsedBasisPoints / 100)} %`], ["Effektives RAM", bytes(budget.effectiveLimitBytes)], ["Verfügbares RAM", bytes(budget.availableBytes)], ["Gemeinsames Cache-Budget", bytes(budget.budgetBytes)], ["Cache-Belegung", bytes(budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0))]])}
             <progress aria-label={t("Cache-Budget Belegung")} value={budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0)} max={Math.max(1, budget.budgetBytes)} />
           </div>}
-          {runtime.codecBuffers && <details className="telemetry-disclosure"><summary>{t("Wiederverwendbare Codec-Puffer")}</summary>
-            {rows([
-              ["Freie Puffer im Pool", bytes(runtime.codecBuffers.retainedBytes)],
-              ["Puffer in Verwendung", bytes(runtime.codecBuffers.activeBytes)],
-              ["Spitze in Verwendung", bytes(runtime.codecBuffers.peakActiveBytes)],
-              ["Puffer wiederverwendet", number(runtime.codecBuffers.hits)],
-              ["Neue Puffer angelegt", number(runtime.codecBuffers.misses)],
-              ["Puffer freigegeben", number(runtime.codecBuffers.evictions)],
-              ["Zielbudget", bytes(budget?.pools.find(pool => pool.id === "codecBuffers")?.targetBytes)],
-            ])}
-            <small>{t("Freie Puffer nutzen das gemeinsame RAM-Budget nachrangig. Aktive Puffer können auch von Cache-Einträgen oder Lesern gehalten werden; die Werte werden nicht addiert. Zähler gelten seit dem Mount.")}</small>
-          </details>}
-          {runtime.allocatorMemory && <details className="detail-note">
-            <summary>{t("Prozessspeicher und Allocator")}</summary>
-            {rows([
-              ["Anonymes RAM", bytes(runtime.allocatorMemory.anonymousResidentBytes)],
-              ["Vom Allocator belegt", bytes(runtime.allocatorMemory.allocatedBytes)],
-              ["Freie Allocator-Blöcke", bytes(runtime.allocatorMemory.freeBytes)],
-              ["Allocator-Arenen", bytes(runtime.allocatorMemory.arenaBytes)],
-              ["RAM-Bereinigungen", number(runtime.allocatorMemory.trimAttempts)],
-              ["Letzte RAM-Bereinigung", `${number(runtime.allocatorMemory.lastTrimMicros / 1000)} ms`],
-            ])}
-            <p>{t("Allocator-Werte enthalten Caches und Arbeitsspeicher. Freie Blöcke können bereits aus dem RAM entfernt sein; diese Werte werden nicht addiert. Messung im Hintergrund, normalerweise alle 30 Sekunden.")}</p>
-          </details>}
           <div className="cache-toolbar">
             <div><h3>{t("Cache-Wirkung")}</h3><p className="detail-note">{t("Treffer vermeiden Zugriffe auf das angegebene Tier. DATA-Caches haben Vorrang im RAM-Budget.")}</p></div>
             <div className="cache-range" role="group" aria-label={t("Cache-Zeitraum")}><button aria-pressed={cacheRange === "5m"} onClick={() => setCacheRange("5m")}>{t("Letzte 5 Minuten")}</button><button aria-pressed={cacheRange === "total"} onClick={() => setCacheRange("total")}>{t("Gesamt seit Mount")}</button></div>
@@ -177,6 +171,31 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
             </details>
           </div>}
           {budget && <p className="detail-note">{t("Zielbudget wird laufend angepasst. Reservierter Speicher wird erst nach der Verdrängung für andere Caches freigegeben. Die Belegung enthält Cache-Verwaltungsdaten.")}</p>}
+          <div className="cache-advanced">          {runtime.codecBuffers && <details className="telemetry-disclosure"><summary>{t("Wiederverwendbare Codec-Puffer")}</summary>
+            {rows([
+              ["Freie Puffer im Pool", bytes(runtime.codecBuffers.retainedBytes)],
+              ["Puffer in Verwendung", bytes(runtime.codecBuffers.activeBytes)],
+              ["Spitze in Verwendung", bytes(runtime.codecBuffers.peakActiveBytes)],
+              ["Puffer wiederverwendet", number(runtime.codecBuffers.hits)],
+              ["Neue Puffer angelegt", number(runtime.codecBuffers.misses)],
+              ["Puffer freigegeben", number(runtime.codecBuffers.evictions)],
+              ["Zielbudget", bytes(budget?.pools.find(pool => pool.id === "codecBuffers")?.targetBytes)],
+            ])}
+            <small>{t("Freie Puffer nutzen das gemeinsame RAM-Budget nachrangig. Aktive Puffer können auch von Cache-Einträgen oder Lesern gehalten werden; die Werte werden nicht addiert. Zähler gelten seit dem Mount.")}</small>
+          </details>}
+          {runtime.allocatorMemory && <details className="detail-note">
+            <summary>{t("Prozessspeicher und Allocator")}</summary>
+            {rows([
+              ["Anonymes RAM", bytes(runtime.allocatorMemory.anonymousResidentBytes)],
+              ["Vom Allocator belegt", bytes(runtime.allocatorMemory.allocatedBytes)],
+              ["Freie Allocator-Blöcke", bytes(runtime.allocatorMemory.freeBytes)],
+              ["Allocator-Arenen", bytes(runtime.allocatorMemory.arenaBytes)],
+              ["RAM-Bereinigungen", number(runtime.allocatorMemory.trimAttempts)],
+              ["Letzte RAM-Bereinigung", `${number(runtime.allocatorMemory.lastTrimMicros / 1000)} ms`],
+            ])}
+            <p>{t("Allocator-Werte enthalten Caches und Arbeitsspeicher. Freie Blöcke können bereits aus dem RAM entfernt sein; diese Werte werden nicht addiert. Messung im Hintergrund, normalerweise alle 30 Sekunden.")}</p>
+          </details>}
+          </div>
 
         </> : empty)}
         {tab === 3 && (reduction ? <>

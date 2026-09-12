@@ -477,10 +477,14 @@ describe("FastDup Control Plane UI", () => {
       }),
     );
 
+    Object.assign(live.telemetry.disks[0], { outstandingIo: 0, averageOutstandingIo: 0.42 });
     render(<App />);
     expect(await screen.findByText("Repo Metadata Disk")).toBeVisible();
     expect(screen.getByText("Repo Data Disk")).toBeVisible();
     expect(screen.queryByText("Host System Disk")).not.toBeInTheDocument();
+    expect(screen.getByText("Ø 0,42")).toBeVisible();
+    expect(screen.getByText("Momentan: 0")).toBeVisible();
+    expect(screen.getByText("Ø —")).toBeVisible();
     expect(screen.getByText("123,4 / 56,7 IOPS")).toBeVisible();
     expect(screen.getByText("— / — IOPS")).toBeVisible();
   });

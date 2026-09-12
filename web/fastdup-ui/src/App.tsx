@@ -1,3 +1,4 @@
+import { formatQueueDepth } from "./disk-io";
 import { StorageOverview } from "./storage-overview";
 import { SambaUsersSettings, WebUsersSettings, CertificateSettings } from "./settings-access";
 import { RecentJobs } from "./recent-jobs";
@@ -646,7 +647,7 @@ function Overview({
   );
 }
 
-function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
+function DiskTelemetryTable({ disks, historical = false }: { disks: DiskTelemetry[]; historical?: boolean }) {
   const { t, locale } = useI18n();
   return (
     <Card className="disk-card">
@@ -656,7 +657,7 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
           <h2>{t("Laufwerksaktivität")}</h2>
         </div>
         <Badge className="live">
-          <span className="pulse" />1 s Sampler
+          {historical ? t("Historischer Messpunkt") : <><span className="pulse" />1 s Sampler</>}
         </Badge>
       </CardHeader>
       <CardContent>
@@ -665,7 +666,7 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
           <span>{t("Typ / Kapazität")}</span>
           <span>HBA Port</span>
           <span>{t("Lesen / Schreiben")}</span>
-          <span>Outstanding I/O</span>
+          <span>{t("Outstanding I/O · Durchschnitt")}</span>
           <span>Status</span>
         </div>
         {disks.map((disk) => (
@@ -687,18 +688,19 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
               <strong>{disk.hbaPort || "nicht verfügbar"}</strong>
               <small>{t("Hardwarepfad")}</small>
             </span>
-            <span>
+            <span data-label={t("Lesen / Schreiben")}>
               <strong>
                 {disk.readMbps.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} / {disk.writeMbps.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} MB/s
               </strong>
               <small>{disk.readIops == null ? "—" : disk.readIops.toLocaleString(locale, { maximumFractionDigits: 1 })} / {disk.writeIops == null ? "—" : disk.writeIops.toLocaleString(locale, { maximumFractionDigits: 1 })} IOPS</small>
               <small>{disk.utilization.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} % Utilization</small>
             </span>
-            <span className="io-cell">
-              <strong>{disk.outstandingIo}</strong>
+            <span className="io-cell" data-label={t("Outstanding I/O · Durchschnitt")}>
+              <strong>Ø {formatQueueDepth(disk.averageOutstandingIo, locale)}</strong>
+              <small>{t("Momentan")}: {disk.outstandingIo.toLocaleString(locale)}</small>
               <i>
                 <b
-                  style={{ width: `${Math.min(100, disk.outstandingIo * 2)}%` }}
+                  style={{ width: `${Math.min(100, (disk.averageOutstandingIo ?? 0) * 2)}%` }}
                 />
               </i>
             </span>
@@ -708,9 +710,9 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
             </span>
           </div>
         ))}
-        <p className="detail-note">{t("MB/s und IOPS: Lesen / Schreiben im Messintervall. Outstanding I/O: zum Messzeitpunkt ausstehende Anfragen.")}</p>
+        <p className="detail-note">{t("MB/s, IOPS und Ø Outstanding I/O beziehen sich auf dasselbe Messintervall. Momentan zeigt die beim Abfragen offenen Anfragen; kurze I/Os können dann bereits abgeschlossen sein.")}</p>
         {disks.length === 0 && (
-          <div className="disk-empty">{t("Kein Repository gebunden – keine relevanten Targets.")}</div>
+          <div className="disk-empty">{t(historical ? "Keine Laufwerksmesswerte im gewählten Zeitraum." : "Kein Repository gebunden – keine relevanten Targets.")}</div>
         )}
       </CardContent>
     </Card>
@@ -1466,6 +1468,7 @@ function TelemetryPage({
   const [range, setRange] = useState("Live");
   const [history, setHistory] = useState<TelemetrySnapshot[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [historyError, setHistoryError] = useState(false);
   const ranges = [
     "Live",
     "15 min",
@@ -1497,6 +1500,7 @@ function TelemetryPage({
   const selectRange = (item: string) => {
     const request = ++historyRequest.current;
     setRange(item);
+    setHistoryError(false);
     if (item === "Live") {
       setHistory(null);
       setLoading(false);
@@ -1506,21 +1510,23 @@ function TelemetryPage({
     setLoading(true);
     void loadHistory(rangeSeconds[item] ?? 900)
       .then(samples => { if (request === historyRequest.current) setHistory(samples); })
+      .catch(() => { if (request === historyRequest.current) setHistoryError(true); })
       .finally(() => { if (request === historyRequest.current) setLoading(false); });
   };
   const resourceOption = useMemo(() => resourceChartOption(resourceSamples, locale), [resourceSamples, locale]);
   return (
-    <>
+    <div className="telemetry-page">
       <div className="page-title telemetry-title">
         <div>
-          <span className="section-kicker">Observability</span>
+          <span className="section-kicker">{t("Betrieb & Diagnose")}</span>
           <h1>{t("Tiefentelemetrie")}</h1>
           <p>{t("Durchsatz, Cache-Wirkung und Speicherbelegung. Details zeigen die Ursachen hinter den Messwerten.")}</p>
         </div>
-        <div className="range-picker">
+        <div className="range-picker" role="group" aria-label={t("Zeitraum")}>
           {ranges.map((item) => (
             <button
               className={range === item ? "active" : ""}
+              aria-pressed={range === item}
               onClick={() => selectRange(item)}
               key={item}
             >
@@ -1530,6 +1536,14 @@ function TelemetryPage({
         </div>
       </div>
       <p className="telemetry-sample-note" role="status">{loading ? t("Lädt") : sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</p>
+      {historyError && <p className="telemetry-history-error" role="alert">{t("Verlauf konnte nicht geladen werden.")} <button onClick={() => selectRange(range)}>{t("Erneut versuchen")}</button></p>}
+      <nav className="telemetry-jump-links" aria-label={t("Telemetrie-Bereiche")}>
+        <a href="#telemetry-performance">{t("Durchsatz & Ressourcen")}</a>
+        <a href="#telemetry-disks">{t("Laufwerke & I/O")}</a>
+        <a href="#telemetry-diagnostics">{t("Ursachen & Details")}</a>
+        <a href="#telemetry-capacity">{t("Belegung & Reduktion")}</a>
+      </nav>
+      <section id="telemetry-performance" aria-label={t("Durchsatz & Ressourcen")}>
       <section className="metric-grid telemetry-metrics" aria-busy={loading}>
         <MetricCard
           icon={Activity}
@@ -1548,7 +1562,7 @@ function TelemetryPage({
           icon={CircleGauge}
           label={t("Exact Dedup · seit Mount")}
           value={sample ? `${number(sample.dedupRate)} %` : "—"}
-          detail="exact / (exact + new)"
+          detail={t("Anteil exakt wiederverwendeter Daten")}
           tone="green"
         />
         <MetricCard
@@ -1559,15 +1573,14 @@ function TelemetryPage({
           tone="amber"
         />
       </section>
-      <DetailTelemetryPanel sample={sample} historical={historical} loading={loading} initialTab={2} />
-      <div className="telemetry-section-title"><h2>{t("Verlauf & Speicherbelegung")}</h2><span>{range}</span></div>
+      <div className="telemetry-chart-grid">
       <Card className="telemetry-chart">
         <CardHeader>
           <div>
             <span className="section-kicker">
               {t("Zeitraum")} · {range}
             </span>
-            <h2>{t("POSIX Throughput & gemeinsamer Zeitcursor")}</h2>
+            <h2>{t("Dateizugriffe · Durchsatz")}</h2>
           </div>
           <Badge className={loading ? "warning" : "live"}>
             <span className="pulse" />
@@ -1577,15 +1590,14 @@ function TelemetryPage({
         <CardContent>
           <ReactECharts
             option={throughputOption(displayedSnapshot, true, locale)}
-            style={{ height: 330 }}
+            style={{ height: 260 }}
           />
         </CardContent>
       </Card>
-      <div className="two-column telemetry-row">
         <Card className="telemetry-chart">
           <CardHeader>
             <div>
-              <span className="section-kicker">Host & process</span>
+              <span className="section-kicker">{t("Host-Ressourcen")}</span>
               <h2>{t("CPU und RAM")}</h2>
             </div>
           </CardHeader>
@@ -1595,10 +1607,19 @@ function TelemetryPage({
             <ReactECharts option={resourceOption} style={{ height: 260 }} />
           </CardContent>
         </Card>
+      </div>
+      </section>
+      <section id="telemetry-disks" aria-label={t("Laufwerke & I/O")}>
+        <DiskTelemetryTable disks={historical ? sample?.disks ?? [] : disks} historical={historical} />
+      </section>
+      <section id="telemetry-diagnostics" aria-label={t("Ursachen & Details")}>
+        <DetailTelemetryPanel sample={sample} historical={historical} loading={loading} initialTab={2} />
+      </section>
+      <section id="telemetry-capacity" aria-label={t("Belegung & Reduktion")}>
         <Card>
           <CardHeader>
             <div>
-              <span className="section-kicker">Reduction</span>
+              <span className="section-kicker">{t("Speicherbelegung")}</span>
               <h2>{t("Dedup & physische Reduktion")}</h2>
             </div>
           </CardHeader>
@@ -1615,9 +1636,8 @@ function TelemetryPage({
             {usage?.logicalObservedAt != null && <p className="detail-note">{t("Logische Belegung erfasst")}: {new Date(usage.logicalObservedAt * 1000).toLocaleString(locale)}</p>}
           </CardContent>
         </Card>
-      </div>
-      <DiskTelemetryTable disks={historical ? sample?.disks ?? [] : disks} />
-    </>
+      </section>
+    </div>
   );
 }
 
@@ -2275,21 +2295,11 @@ function Application() {
       });
     }
   };
-  const loadTelemetryHistory = async (seconds: number) => {
+  const loadTelemetryHistory = (seconds: number) => {
     const now = Math.floor(Date.now() / 1000);
-    try {
-      return await api<TelemetrySnapshot[]>(
-        `/api/v1/telemetry/history?from=${now - seconds}&to=${now}&limit=1500`,
-      );
-    } catch (reason) {
-      notify({
-        id: "telemetry-history",
-        tone: "error",
-        title: t("Telemetrie-Zeitraum nicht geladen"),
-        message: reason instanceof Error ? reason.message : t("Unbekannter Fehler"),
-      });
-      return [];
-    }
+    return api<TelemetrySnapshot[]>(
+      `/api/v1/telemetry/history?from=${now - seconds}&to=${now}&limit=1500`,
+    );
   };
   const logout = () => {
     if (!session) return;

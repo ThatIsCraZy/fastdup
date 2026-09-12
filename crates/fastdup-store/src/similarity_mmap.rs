@@ -15,7 +15,8 @@ use fastdup_format::{
 };
 
 use crate::ImmutableFileLease;
-use crate::similarity_index_repository::SimilarityIndexStoreError;
+use crate::similarity_index_repository::{SimilarityIndexStoreError, SimilarityPageCache};
+use std::sync::Arc;
 
 /// One fully audited immutable Similarity Run backed by a read-only mapping.
 pub(crate) struct ImmutableSimilarityRun {
@@ -31,6 +32,7 @@ impl ImmutableSimilarityRun {
     pub(crate) fn open(
         lease: ImmutableFileLease,
         expected: SimilarityIndexRunDescriptor,
+        page_cache: &SimilarityPageCache,
         observe_bucket_page: impl FnMut(SimilarityBucketKey),
     ) -> Result<Self, SimilarityIndexStoreError> {
         let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
@@ -65,7 +67,7 @@ impl ImmutableSimilarityRun {
         }
 
         let (minimum_bucket_key, maximum_bucket_key) =
-            audit_mapping(&mapping, descriptor, observe_bucket_page)?;
+            audit_mapping(&mapping, descriptor, page_cache, observe_bucket_page)?;
         Ok(Self {
             mapping,
             lease,
@@ -98,6 +100,7 @@ impl ImmutableSimilarityRun {
 fn audit_mapping(
     mapping: &[u8],
     descriptor: SimilarityIndexRunDescriptor,
+    page_cache: &SimilarityPageCache,
     mut observe_bucket_page: impl FnMut(SimilarityBucketKey),
 ) -> Result<(SimilarityBucketKey, SimilarityBucketKey), SimilarityIndexStoreError> {
     let mut audit = descriptor.start_hash_audit();
@@ -114,6 +117,34 @@ fn audit_mapping(
         audit.update(offset, bytes)?;
     }
 
+    // Verify the complete fresh on-disk hash and page ordering first. Cached
+    // bytes cannot make a damaged publication pass this gate.
+    for ordinal in 0..descriptor.bucket_page_count() {
+        let offset = descriptor
+            .bucket_page_offset(ordinal)
+            .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+        let bytes = exact_page(mapping, offset)?;
+        let page = descriptor.decode_bucket_page(ordinal, bytes)?;
+        audit.verify_bucket_page(&page)?;
+        audit.update(offset, bytes)?;
+    }
+    let footer_offset = descriptor.footer_offset();
+    audit.update(footer_offset, exact_page(mapping, footer_offset)?)?;
+    audit.finish()?;
+
+    // The Run hash is now bound to the current immutable lease. Retain Entry
+    // pages in the shared budget before the nonlocal Bucket semantic walk.
+    // Admission may fail/shrink: correctness always has the bounded fallback.
+    let run_hash = descriptor.run_hash();
+    for ordinal in 0..descriptor.page_count() {
+        if page_cache.get_entry(run_hash, ordinal).is_none() {
+            let offset = descriptor
+                .page_offset(ordinal)
+                .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+            let page = Arc::new(descriptor.decode_page(ordinal, exact_page(mapping, offset)?)?);
+            page_cache.insert_entry(run_hash, ordinal, page);
+        }
+    }
     let mut semantic_entry_page = None;
     let mut minimum_bucket_key = None;
     let mut maximum_bucket_key = None;
@@ -121,8 +152,10 @@ fn audit_mapping(
         let offset = descriptor
             .bucket_page_offset(ordinal)
             .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-        let bytes = exact_page(mapping, offset)?;
-        let page = descriptor.decode_bucket_page(ordinal, bytes)?;
+        let page = match page_cache.get_bucket(run_hash, ordinal) {
+            Some(page) => page,
+            None => Arc::new(descriptor.decode_bucket_page(ordinal, exact_page(mapping, offset)?)?),
+        };
         minimum_bucket_key.get_or_insert_with(|| page.first_key());
         maximum_bucket_key = Some(page.last_key());
         observe_bucket_page(page.last_key());
@@ -132,6 +165,7 @@ fn audit_mapping(
                 descriptor,
                 reference.entry_ordinal(),
                 &mut semantic_entry_page,
+                page_cache,
             )?;
             let key = reference.key();
             if entry.fingerprint_profile() != key.fingerprint_profile()
@@ -141,14 +175,8 @@ fn audit_mapping(
                 return Err(SimilarityIndexStoreError::IndexCorruption);
             }
         }
-        audit.verify_bucket_page(&page)?;
-        audit.update(offset, bytes)?;
+        page_cache.insert_bucket(run_hash, ordinal, page);
     }
-
-    let footer_offset = descriptor.footer_offset();
-    let footer = exact_page(mapping, footer_offset)?;
-    audit.update(footer_offset, footer)?;
-    audit.finish()?;
     Ok((
         minimum_bucket_key.ok_or(SimilarityIndexStoreError::IndexCorruption)?,
         maximum_bucket_key.ok_or(SimilarityIndexStoreError::IndexCorruption)?,
@@ -159,7 +187,8 @@ fn mapped_entry(
     mapping: &[u8],
     descriptor: SimilarityIndexRunDescriptor,
     entry_ordinal: u32,
-    cached_page: &mut Option<(usize, SimilarityIndexPage)>,
+    cached_page: &mut Option<(usize, Arc<SimilarityIndexPage>)>,
+    page_cache: &SimilarityPageCache,
 ) -> Result<SimilarityIndexEntry, SimilarityIndexStoreError> {
     let entry_ordinal =
         usize::try_from(entry_ordinal).map_err(|_| SimilarityIndexStoreError::IndexCorruption)?;
@@ -174,7 +203,14 @@ fn mapped_entry(
         let offset = descriptor
             .page_offset(page_ordinal)
             .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-        let page = descriptor.decode_page(page_ordinal, exact_page(mapping, offset)?)?;
+        let page = if let Some(page) = page_cache.get_entry(descriptor.run_hash(), page_ordinal) {
+            page
+        } else {
+            let page =
+                Arc::new(descriptor.decode_page(page_ordinal, exact_page(mapping, offset)?)?);
+            page_cache.insert_entry(descriptor.run_hash(), page_ordinal, Arc::clone(&page));
+            page
+        };
         *cached_page = Some((page_ordinal, page));
     }
     cached_page

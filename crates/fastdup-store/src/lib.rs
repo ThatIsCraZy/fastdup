@@ -19,6 +19,7 @@ mod generation;
 mod generation_log;
 mod manifest_reader;
 mod manifest_cache;
+mod metadata_object_cache;
 mod manifest_tree;
 mod metadata_mark_catalog;
 pub use manifest_tree::{ManifestRangeExtent, ManifestTreeSummary};

@@ -137,6 +137,19 @@ it("shows the governed Manifest cache and its recent counters",()=>{
  expect(within(row).getByText('4,1 KB')).toBeVisible();
 });
 
+it("shows the governed Metadata object cache and its recent counters",()=>{
+ const pool={id:"metadataObjects",fallbackTier:"metadata",hits:90,misses:10,evictions:2,residentBytes:4096,targetBytes:8192,leasedBytes:8192};
+ const runtime={...details.runtime!,cacheBudget:{maximumMemoryUsedBasisPoints:9200,effectiveLimitBytes:100000,availableBytes:90000,budgetBytes:90000,pools:[pool]},cacheWindow:{seconds:300,pools:[{id:"metadataObjects",hits:4,misses:1,evictions:0}]}};
+ render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={false} loading={false}/></I18nProvider>);
+ fireEvent.click(screen.getByRole('tab',{name:'Caches'}));
+ const row=screen.getByText('Metadata Objects').closest('tr')!;
+ expect(within(row).getByText('Metadata')).toBeVisible();
+ expect(within(row).getByText('90 %')).toBeVisible();
+ fireEvent.click(screen.getByRole('button',{name:'Letzte 5 Minuten'}));
+ expect(within(row).getByText('80 %')).toBeVisible();
+ expect(within(row).getByText('4,1 KB')).toBeVisible();
+});
+
 it("shows cache compression gauges at the selected sample and separate lifetime codec costs",()=>{
  const readCacheCompression={decodedResidentBytes:1000000,compressedResidentBytes:2000000,compressedLogicalBytes:8000000,attempts:10,admissions:8,compressionNanos:1000000,hits:40,decompressions:20,decompressionNanos:1000000,promotions:3,demotions:2,failures:0,bypasses:2,workingBytes:0,peakWorkingBytes:100000,maxWorkingBytes:1000000};
  const runtime={...details.runtime!,readCacheCompression};

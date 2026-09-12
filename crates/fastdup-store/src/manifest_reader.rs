@@ -167,6 +167,7 @@ struct TreeManifestRecipe<M> {
     metadata: M,
     _root_pin: MetadataRootPin,
     cache: Arc<crate::manifest_cache::ManifestNodeCache>,
+    metadata_cache: Arc<crate::metadata_object_cache::MetadataObjectCache>,
 }
 
 impl<M> fmt::Debug for TreeManifestRecipe<M> {
@@ -202,7 +203,13 @@ where
             self.summary.logical_size(),
             offset,
             length,
-            |object_id| self.cache.read(object_id, || read_tree_metadata(&self.metadata, object_id)),
+            |object_id| {
+                self.cache.read(object_id, || {
+                    self.metadata_cache
+                        .read(object_id, || read_tree_metadata(&self.metadata, object_id))
+                        .map(Arc::unwrap_or_clone)
+                })
+            },
         )
         .map_err(Into::into)
     }
@@ -217,7 +224,13 @@ where
             self.summary.logical_size(),
             offset,
             length,
-            |object_id| self.cache.read(object_id, || read_tree_metadata(&self.metadata, object_id)),
+            |object_id| {
+                self.cache.read(object_id, || {
+                    self.metadata_cache
+                        .read(object_id, || read_tree_metadata(&self.metadata, object_id))
+                        .map(Arc::unwrap_or_clone)
+                })
+            },
         )
         .map_err(Into::into)
     }
@@ -401,6 +414,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
         containers: ContainerRepository<I>,
         root_pin: MetadataRootPin,
         cache: Arc<crate::manifest_cache::ManifestNodeCache>,
+        metadata_cache: Arc<crate::metadata_object_cache::MetadataObjectCache>,
     ) -> Self
     where
         M: Send + Sync + StorageIo + 'static,
@@ -411,6 +425,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
                 metadata,
                 _root_pin: root_pin,
                 cache,
+                metadata_cache,
             }),
             containers,
             indexed_reader: None,

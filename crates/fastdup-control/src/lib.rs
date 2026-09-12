@@ -252,7 +252,12 @@ pub struct DiskTelemetry {
     pub kind: String,
     pub capacity_bytes: u64,
     pub hba_port: String,
+    /// Requests in flight at the sample instant (Linux stat field 9).
     pub outstanding_io: u64,
+    /// Time-weighted mean queue depth over the same interval as throughput.
+    /// Missing until two valid samples are available or after counter reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_outstanding_io: Option<f64>,
     pub read_mbps: f64,
     pub write_mbps: f64,
     pub read_iops: f64,

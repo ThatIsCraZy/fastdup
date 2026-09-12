@@ -18,6 +18,7 @@ struct DiskCounters {
     write_sectors: u64,
     outstanding: u64,
     io_millis: u64,
+    weighted_io_millis: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -135,10 +136,7 @@ impl SystemSampler {
                     continue;
                 }
                 let current = read_disk_counters(&entry.path().join("stat"));
-                let previous = self
-                    .previous_disks
-                    .insert(name.clone(), current)
-                    .unwrap_or(current);
+                let previous = self.previous_disks.insert(name.clone(), current);
                 disks.push(disk_telemetry(
                     &entry.path(),
                     &name,
@@ -261,8 +259,11 @@ fn read_disk_counters(path: &Path) -> DiskCounters {
     };
     let values = contents
         .split_ascii_whitespace()
-        .filter_map(|value| value.parse::<u64>().ok())
-        .collect::<Vec<_>>();
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(values) = values else {
+        return DiskCounters::default();
+    };
     DiskCounters {
         reads: values.first().copied().unwrap_or(0),
         read_sectors: values.get(2).copied().unwrap_or(0),
@@ -270,6 +271,7 @@ fn read_disk_counters(path: &Path) -> DiskCounters {
         write_sectors: values.get(6).copied().unwrap_or(0),
         outstanding: values.get(8).copied().unwrap_or(0),
         io_millis: values.get(9).copied().unwrap_or(0),
+        weighted_io_millis: values.get(10).copied(),
     }
 }
 
@@ -277,10 +279,20 @@ fn disk_telemetry(
     path: &Path,
     name: &str,
     role: String,
-    previous: DiskCounters,
+    previous: Option<DiskCounters>,
     current: DiskCounters,
     elapsed: f64,
 ) -> DiskTelemetry {
+    // Linux stat field 11 integrates queue occupancy in milliseconds. Unlike
+    // field 9, its delta includes requests completed between sampler ticks.
+    // https://docs.kernel.org/admin-guide/iostats.html
+    let average_outstanding_io = previous.and_then(|previous| {
+        let delta = current
+            .weighted_io_millis?
+            .checked_sub(previous.weighted_io_millis?)?;
+        (elapsed.is_finite() && elapsed > 0.0).then(|| delta as f64 / (elapsed * 1000.0))
+    });
+    let previous = previous.unwrap_or(current);
     let read_sectors = current.read_sectors.saturating_sub(previous.read_sectors);
     let write_sectors = current.write_sectors.saturating_sub(previous.write_sectors);
     let read_mbps = read_sectors as f64 * 512.0 / 1_000_000.0 / elapsed;
@@ -304,6 +316,7 @@ fn disk_telemetry(
         capacity_bytes: capacity_sectors.saturating_mul(512),
         hba_port: "nicht verfügbar".to_owned(),
         outstanding_io: current.outstanding,
+        average_outstanding_io,
         read_mbps,
         write_mbps,
         read_iops: current.reads.saturating_sub(previous.reads) as f64 / elapsed,
@@ -351,6 +364,90 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_io_between_ticks_has_nonzero_average_with_zero_in_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let stat = directory.path().join("stat");
+        std::fs::write(&stat, "100 0 200 0 10 0 20 0 0 100 1000").unwrap();
+        let previous = read_disk_counters(&stat);
+        // 1,931 reads complete during the next second, before the next poll.
+        std::fs::write(&stat, "2031 0 33404 420 10 0 20 0 0 520 1420").unwrap();
+        let current = read_disk_counters(&stat);
+        let row = disk_telemetry(
+            directory.path(),
+            "sdc",
+            "DATA".into(),
+            Some(previous),
+            current,
+            1.0,
+        );
+        assert_eq!(row.outstanding_io, 0);
+        assert_eq!(row.average_outstanding_io, Some(0.42));
+        assert_eq!(row.read_iops, 1931.0);
+        assert!(row.read_mbps > 17.0);
+        // Queue depth is neither a percentage nor clamped to one request.
+        let concurrent = DiskCounters {
+            outstanding: 7,
+            weighted_io_millis: Some(64500),
+            ..current
+        };
+        let row = disk_telemetry(
+            directory.path(),
+            "sdc",
+            "DATA".into(),
+            Some(previous),
+            concurrent,
+            2.0,
+        );
+        assert_eq!(row.average_outstanding_io, Some(31.75));
+        assert_eq!(row.outstanding_io, 7);
+        let json = serde_json::to_value(row).unwrap();
+        assert_eq!(json["averageOutstandingIo"], 31.75);
+        assert_eq!(json["outstandingIo"], 7);
+    }
+
+    #[test]
+    fn queue_average_requires_valid_baseline_and_handles_reset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let current = DiskCounters {
+            weighted_io_millis: Some(1000),
+            ..DiskCounters::default()
+        };
+        let average = |previous, current, elapsed| {
+            disk_telemetry(path, "sdc", "DATA".into(), previous, current, elapsed)
+                .average_outstanding_io
+        };
+        assert_eq!(average(None, current, 1.0), None);
+        assert_eq!(average(Some(current), current, 1.0), Some(0.0));
+        let reset = DiskCounters {
+            weighted_io_millis: Some(0),
+            ..current
+        };
+        assert_eq!(average(Some(current), reset, 1.0), None);
+        assert_eq!(average(Some(reset), current, 2.0), Some(0.5));
+        assert_eq!(average(Some(reset), current, 0.0), None);
+        assert_eq!(average(Some(reset), current, f64::NAN), None);
+        let stat = path.join("stat");
+        for text in ["", "1 2 3", "1 2 3 4 5 6 7 8 bad 10 11 12"] {
+            std::fs::write(&stat, text).unwrap();
+            let invalid = read_disk_counters(&stat);
+            assert_eq!(average(Some(current), invalid, 1.0), None);
+            assert_eq!(average(Some(invalid), current, 1.0), None);
+        }
+        std::fs::remove_file(&stat).unwrap();
+        assert_eq!(average(Some(current), read_disk_counters(&stat), 1.0), None);
+        // Saved telemetry from previous packages does not fabricate an average.
+        let mut old = serde_json::to_value(DiskTelemetry::default()).unwrap();
+        old.as_object_mut().unwrap().remove("averageOutstandingIo");
+        assert_eq!(
+            serde_json::from_value::<DiskTelemetry>(old)
+                .unwrap()
+                .average_outstanding_io,
+            None
+        );
+    }
 
     #[test]
     fn physical_reduction_uses_live_allocation_and_both_pools() {

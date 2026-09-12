@@ -35,6 +35,54 @@ approved alternative cache policies. Alignment-safe uncached I/O and owned
 cache coverage must be qualified before switching those paths. `DONTNEED` or
 global `drop_caches` is not a substitute for uncached I/O.
 
+## Owned Metadata objects and Similarity audit reuse (12 September 2026)
+
+Live Generation graph readers share a repository-local, content-identified
+Metadata Object cache. Namespace traversal, Manifest edits/scans and Recovery
+Checkpoint source copying use the same encoded objects; frontend decoded
+Manifest-node misses consult it too. This cache participates as `metadataObjects`
+in the existing Metadata-priority RAM broker, with byte-capacity and ownership
+accounting, hit/miss/eviction counters and the ordinary five-minute UI window.
+It grows on demonstrated demand, not a fixed RAM fraction. Temporary publication
+files, WAL heads and mutable control files never enter this cache.
+
+Hits retain immutable bytes, not selected generations, root pins or liveness
+proofs. Callers still validate their graph relationships and selection bindings.
+The synchronous independent recovery, offline/background scrub and GC deletion
+proof entry points bypass this cache, even when invoked on a warm live repository.
+The bypass is scoped to the current thread, nests and restores on error/unwind;
+it must not be carried across async dispatch. A new repository has a fresh cache.
+Metadata GC invalidates an object's entry before attempting to unlink its name;
+publication still rereads and validates staged/existing bytes directly. Thus a
+cached source cannot hide a failed publication or grant deletion authority.
+Root pins and the single repository owner retain the existing immutable-object
+lifecycle contract. External out-of-process mutation is not made coherent by
+this cache; independent verification still reads the current stored object.
+
+For mapped Similarity Runs, each open first reads and validates the complete
+current Run hash, page checksums and ordering independently of cached pages.
+Only after that gate may decoded Entry pages enter the shared Similarity cache.
+The Bucket-to-Entry semantic pass consults those pages and retains validated
+Bucket pages for subsequent queries. A successful full Run still requires every
+cross-reference check; cached pages alone cannot activate a Run. Failed semantic
+validation may leave individually decoded pages keyed by the already verified
+Run hash, but a later open must repeat the full gate and semantic validation.
+Such pages cannot authorize a different Run or conceal changed durable bytes.
+
+With sufficient current cache admission, an initially cold audit now reads each
+Entry/Bucket page at most twice, rather than repeatedly revisiting Entry pages
+for nonlocal references. Shrink or admission rejection preserves bounded direct
+fallback; it may reduce this performance benefit but cannot weaken checks.
+Independent offline Similarity audits retain their original storage path.
+Mapped audits and initial/cold buffered fallbacks still exist: this amendment
+closes the observed cache-coverage gaps, not the remaining uncached-I/O migration.
+
+Regression tests cover repeated cross-path graph reads, corrupt publication and
+scrub with a warm cache, pressure rejection/shrink, concurrent admission, unlink
+invalidation, Similarity cold-audit read amplification and zero additional query
+reads after an admitted audit. Runtime/UI counters expose the new pool through
+the existing broker schema; unavailable legacy samples remain unavailable.
+
 ## Metadata read attribution (12 September 2026)
 
 The daemon instruments Metadata and Small-File filesystem adapters, including

@@ -17,6 +17,7 @@ export interface DiskTelemetry {
   capacityBytes: number;
   hbaPort: string;
   outstandingIo: number;
+  averageOutstandingIo?: number | null;
   readMbps: number;
   writeMbps: number;
   readIops?: number;

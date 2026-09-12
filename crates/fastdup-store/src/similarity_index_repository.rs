@@ -876,7 +876,8 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     }
 
     fn read_envelope(&self, name: &str) -> Result<OpenedSimilarityRun, SimilarityIndexStoreError> {
-        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexEnvelope);
+        let _read_reason =
+            crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexEnvelope);
         let file_length = self.storage.object_len(name)?;
         let block_bytes = u64::try_from(SIMILARITY_INDEX_PAGE_BYTES)
             .expect("ASSERT: Similarity block bytes fit u64");
@@ -1019,6 +1020,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             let mapping = Arc::new(ImmutableSimilarityRun::open(
                 lease,
                 envelope.descriptor,
+                &self.page_cache,
                 |key| {
                     if collect {
                         fences.push(key);
@@ -1485,7 +1487,8 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         let page = if let Some(page) = partition.page_cache.get_entry(run_hash, page_ordinal) {
             page
         } else {
-            let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
+            let _read_reason =
+                crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
             let offset = partition
                 .descriptor
                 .page_offset(page_ordinal)
@@ -1559,7 +1562,7 @@ struct CachedBucketFences {
     charged_pages: u64,
 }
 
-struct SimilarityPageCache {
+pub(crate) struct SimilarityPageCache {
     fences: Mutex<Vec<CachedBucketFences>>,
     entry_pages: DirectSimilarityPageCache<SimilarityIndexPage>,
     bucket_pages: DirectSimilarityPageCache<SimilarityBucketPage>,
@@ -1691,7 +1694,7 @@ impl SimilarityPageCache {
             .fetch_add(charged_pages, AtomicOrdering::Relaxed);
     }
 
-    fn get_entry(
+    pub(crate) fn get_entry(
         &self,
         run_hash: [u8; 32],
         page_ordinal: usize,
@@ -1699,7 +1702,7 @@ impl SimilarityPageCache {
         self.get(&self.entry_pages, run_hash, page_ordinal)
     }
 
-    fn get_bucket(
+    pub(crate) fn get_bucket(
         &self,
         run_hash: [u8; 32],
         page_ordinal: usize,
@@ -1723,7 +1726,7 @@ impl SimilarityPageCache {
         found
     }
 
-    fn insert_entry(
+    pub(crate) fn insert_entry(
         &self,
         run_hash: [u8; 32],
         page_ordinal: usize,
@@ -1732,7 +1735,7 @@ impl SimilarityPageCache {
         self.insert(&self.entry_pages, run_hash, page_ordinal, page);
     }
 
-    fn insert_bucket(
+    pub(crate) fn insert_bucket(
         &self,
         run_hash: [u8; 32],
         page_ordinal: usize,
@@ -2522,6 +2525,73 @@ impl From<SimilarityIndexFamilyError> for SimilarityIndexStoreError {
 #[cfg(test)]
 mod tests {
     use super::BucketOrdinals;
+
+    #[test]
+    fn audited_similarity_pages_are_warm_for_queries() {
+        use super::*;
+        let root =
+            std::env::temp_dir().join(format!("similarity-audit-cache-{}", std::process::id()));
+        let mut storage = crate::FsStorageIo::open(&root).unwrap();
+        let counters = Arc::new(crate::metadata_read_telemetry::MetadataReadCounters::default());
+        storage.metadata_reads = Some(Arc::clone(&counters));
+        let repo = SimilarityIndexRepository::new_with_memory_snapshot(
+            storage,
+            MemoryPressureSnapshot::new(32 << 30, 30 << 30, 0),
+        );
+        let entries = (1..=512_u64)
+            .map(|n| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&n.to_be_bytes());
+                SimilarityIndexEntry::new(
+                    ChunkId::from_bytes(id),
+                    65536,
+                    1,
+                    [n.wrapping_mul(131) % 1021; 4],
+                    [n; 8],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        repo.publish_entries(1, entries).unwrap();
+        let audit_reads = || {
+            counters
+                .rows()
+                .iter()
+                .filter(|r| r.mode == "mmap")
+                .map(|r| r.operations)
+                .sum::<u64>()
+        };
+        let before_audit = audit_reads();
+        let index = repo.recover_generation(1).unwrap();
+        let descriptor = index.partitions[0].descriptor;
+        assert!(
+            audit_reads() - before_audit
+                <= 2 * (descriptor.page_count() + descriptor.bucket_page_count()) as u64 + 8,
+            "semantic bucket checks must not repeatedly reread all referenced entry pages"
+        );
+        let before = index.page_cache_status().misses();
+        assert!(
+            !index
+                .buckets()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            index.page_cache_status().misses(),
+            before,
+            "a fresh full audit must supply query pages without another backend read"
+        );
+        let name = partition_name(1, 0);
+        drop(index);
+        // The warm decoded cache must not conceal a later bad durable image.
+        repo.storage
+            .write_at(&name, SIMILARITY_INDEX_HEADER_BYTES as u64 + 64, &[255])
+            .unwrap();
+        assert!(repo.recover_generation(1).is_err());
+        drop(repo);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn streamed_buckets_cross_pages_and_fence_eviction_preserves_lookup() {
