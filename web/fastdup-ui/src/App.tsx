@@ -2501,8 +2501,10 @@ function Application() {
                 ? "Repository wartet auf dauerhaften Fortschritt. Neue Schreibzugriffe sind pausiert."
                 : snapshot.telemetry.runtimeIssue === "integrity_failed"
                   ? "Repository hat einen Integritätsfehler erkannt. Schreibzugriffe sind gesperrt."
+                  : snapshot.telemetry.runtimeIssue === "process_exited"
+                    ? "Repository-Runtime ist abgestürzt. Details stehen unter Ereignisse."
                   : snapshot.telemetry.runtimeIssue === "unavailable"
-                    ? "Repository-Runtime nicht erreichbar. SMB-Zugriff ist nicht bestätigt."
+                    ? "Repository-Mount fehlt oder der Runtime-Prozess ist beendet."
                     : "Repository ist nicht betriebsbereit. Details stehen unter Repository und Ereignisse.")}</span>
             </div>
           )}

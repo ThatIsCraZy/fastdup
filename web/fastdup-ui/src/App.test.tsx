@@ -778,7 +778,7 @@ it("keeps the quota warning in the topbar across missing online samples and clea
   vi.unstubAllGlobals();
 });
 
-it("shows a Runtime outage and write pause in the topbar while agent telemetry is live", async () => {
+it("shows confirmed mount/process failures but keeps missing metrics separate", async () => {
   const source = new EventTarget();
   vi.spyOn(EventSource.prototype, "addEventListener").mockImplementation(source.addEventListener.bind(source));
   vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
@@ -797,15 +797,21 @@ it("shows a Runtime outage and write pause in the topbar while agent telemetry i
     }) }));
   });
   sample("unavailable");
-  expect(screen.getByRole("alert")).toHaveTextContent("Repository-Runtime nicht erreichbar");
+  expect(screen.getByRole("alert")).toHaveTextContent("Repository-Mount fehlt");
   expect(screen.getByRole("alert").closest("header")).toHaveClass("topbar");
   expect(screen.getByText("Agent verbunden")).toBeVisible();
   expect(screen.queryByText("Live")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Repository" }));
   expect(document.querySelector(".repo-hero .badge")).toHaveTextContent("Fehler");
-  sample("write_blocked");
-  expect(screen.getByRole("alert")).toHaveTextContent("Neue Schreibzugriffe sind pausiert");
+  sample("process_exited");
+  expect(screen.getByRole("alert")).toHaveTextContent("Repository-Runtime ist abgestürzt");
   sample(undefined);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   expect(screen.getAllByText("Live").length).toBeGreaterThan(0);
+  act(() => source.dispatchEvent(new MessageEvent("snapshot", { data: JSON.stringify({
+    ...previewSnapshot.telemetry, repositoryState: "online", details: null,
+    frontendReadMbps: 0, frontendWriteMbps: 0,
+  }) })));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(document.querySelector(".repo-hero .badge")).toHaveTextContent("Online");
 });

@@ -104,7 +104,13 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
             "evictions":pool.evictions})
         })
         .collect();
+    let allocator = fastdup_store::allocator_memory_status().map(|status| json!({
+        "arenaBytes":status.arena_bytes, "allocatedBytes":status.allocated_bytes,
+        "freeBytes":status.free_bytes, "anonymousResidentBytes":status.anonymous_resident_bytes,
+        "trimAttempts":status.trim_attempts, "lastTrimMicros":status.last_trim_micros,
+    }));
     json!({
+        "allocatorMemory": allocator,
         "cacheBudget": {"maximumMemoryUsedBasisPoints":9200,
             "effectiveLimitBytes":budget.effective_limit_bytes,
             "availableBytes":budget.available_bytes,

@@ -12,6 +12,7 @@
 
 mod auth;
 mod control;
+mod runtime_health;
 mod detail_telemetry;
 mod cache_window;
 mod inventory;
@@ -60,12 +61,14 @@ pub enum RuntimeIssue {
     Unavailable,
     WriteBlocked,
     IntegrityFailed,
+    ProcessExited,
 }
 
 impl RuntimeIssue {
     pub(crate) const fn message(self) -> &'static str {
         match self {
-            Self::Unavailable => "Repository-Runtime nicht erreichbar. SMB-Zugriff ist nicht bestätigt.",
+            Self::Unavailable => "Repository-Mount fehlt oder der Runtime-Prozess ist beendet.",
+            Self::ProcessExited => "Repository-Runtime ist abgestürzt. Details stehen unter Ereignisse.",
             Self::WriteBlocked => "Repository wartet auf dauerhaften Fortschritt. Neue Schreibzugriffe sind pausiert.",
             Self::IntegrityFailed => "Repository hat einen Integritätsfehler erkannt. Schreibzugriffe sind gesperrt.",
         }

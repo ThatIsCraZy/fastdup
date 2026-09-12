@@ -24,6 +24,8 @@ mod long_lived_arena;
 mod maintenance;
 mod maintenance_ioprio;
 mod memory_budget;
+mod allocator_memory;
+pub use allocator_memory::{AllocatorMemoryStatus, AllocatorReclaimer, allocator_memory_status};
 mod page_cache;
 pub use cache_budget::{
     CacheBudgetStatus, CacheFallback, CacheObservation, CachePool, CachePoolStatus,

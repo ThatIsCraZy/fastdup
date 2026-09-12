@@ -123,3 +123,17 @@ it("shows cache compression gauges at the selected sample and separate lifetime 
  view.rerender(<I18nProvider><DetailTelemetryPanel initialTab={2} sample={{...previewSnapshot.telemetry,details}} historical={true} loading={false}/></I18nProvider>);
  expect(screen.queryByLabelText('Verified Read · RAM-Kompression')).not.toBeInTheDocument();
 });
+
+
+it("separates allocator retention from cache occupancy and preserves missing samples", () => {
+ const allocatorMemory = {arenaBytes:9000000000, allocatedBytes:3000000000, freeBytes:6000000000, anonymousResidentBytes:4000000000, trimAttempts:2, lastTrimMicros:108000};
+ const sample = {...previewSnapshot.telemetry, details:{...details, runtime:{...details.runtime!, allocatorMemory}}};
+ const view = render(<I18nProvider><DetailTelemetryPanel sample={sample} historical={false} loading={false} initialTab={2}/></I18nProvider>);
+ fireEvent.click(screen.getByText("Prozessspeicher und Allocator"));
+ expect(screen.getByText("Freie Allocator-Blöcke")).toBeVisible();
+ expect(screen.getByText("6 GB")).toBeVisible();
+ expect(screen.getByText("108 ms")).toBeVisible();
+ expect(screen.getByText(/diese Werte werden nicht addiert/)).toBeVisible();
+ view.rerender(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details}} historical={true} loading={false} initialTab={2}/></I18nProvider>);
+ expect(screen.queryByText("Prozessspeicher und Allocator")).not.toBeInTheDocument();
+});

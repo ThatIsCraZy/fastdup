@@ -8,6 +8,7 @@ export interface DetailTelemetry {
   latency?: { read: OperationLatency; write: OperationLatency } | null;
   runtime?: {
     runtimeId: string;
+    allocatorMemory?: {arenaBytes: number; allocatedBytes: number; freeBytes: number; anonymousResidentBytes: number; trimAttempts: number; lastTrimMicros: number} | null;
     readCacheCompression?: {
       decodedResidentBytes: number; compressedResidentBytes: number; compressedLogicalBytes: number;
       attempts: number; admissions: number; compressionNanos: number; hits: number; decompressions: number;
@@ -97,6 +98,18 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
             {rows([["RAM-Obergrenze", `${number(budget.maximumMemoryUsedBasisPoints / 100)} %`], ["Effektives RAM", bytes(budget.effectiveLimitBytes)], ["Verfügbares RAM", bytes(budget.availableBytes)], ["Gemeinsames Cache-Budget", bytes(budget.budgetBytes)], ["Cache-Belegung", bytes(budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0))]])}
             <progress aria-label={t("Cache-Budget Belegung")} value={budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0)} max={Math.max(1, budget.budgetBytes)} />
           </div>}
+          {runtime.allocatorMemory && <details className="detail-note">
+            <summary>{t("Prozessspeicher und Allocator")}</summary>
+            {rows([
+              ["Anonymes RAM", bytes(runtime.allocatorMemory.anonymousResidentBytes)],
+              ["Vom Allocator belegt", bytes(runtime.allocatorMemory.allocatedBytes)],
+              ["Freie Allocator-Blöcke", bytes(runtime.allocatorMemory.freeBytes)],
+              ["Allocator-Arenen", bytes(runtime.allocatorMemory.arenaBytes)],
+              ["RAM-Bereinigungen", number(runtime.allocatorMemory.trimAttempts)],
+              ["Letzte RAM-Bereinigung", `${number(runtime.allocatorMemory.lastTrimMicros / 1000)} ms`],
+            ])}
+            <p>{t("Allocator-Werte enthalten Caches und Arbeitsspeicher. Freie Blöcke können bereits aus dem RAM entfernt sein; diese Werte werden nicht addiert. Messung im Hintergrund, normalerweise alle 30 Sekunden.")}</p>
+          </details>}
           <div className="cache-toolbar">
             <div><h3>{t("Cache-Wirkung")}</h3><p className="detail-note">{t("Treffer vermeiden Zugriffe auf das angegebene Tier. DATA-Caches haben Vorrang im RAM-Budget.")}</p></div>
             <div className="cache-range" role="group" aria-label={t("Cache-Zeitraum")}><button aria-pressed={cacheRange === "5m"} onClick={() => setCacheRange("5m")}>{t("Letzte 5 Minuten")}</button><button aria-pressed={cacheRange === "total"} onClick={() => setCacheRange("total")}>{t("Gesamt seit Mount")}</button></div>

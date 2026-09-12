@@ -29,6 +29,8 @@ pub struct OperationLatency {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocator_memory: Option<AllocatorMemoryTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_cache_compression: Option<ReadCacheCompression>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_window: Option<CacheWindowTelemetry>,
@@ -40,6 +42,18 @@ pub struct RuntimeDetails {
     pub reduction: ReductionTelemetry,
     pub checkpoint: Option<CheckpointTelemetry>,
     pub gc: Option<GcTelemetry>,
+}
+
+/// Background allocator sample; free blocks may already be absent from RSS.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllocatorMemoryTelemetry {
+    pub arena_bytes: u64,
+    pub allocated_bytes: u64,
+    pub free_bytes: u64,
+    pub anonymous_resident_bytes: u64,
+    pub trim_attempts: u64,
+    pub last_trim_micros: u64,
 }
 
 /// Gauges at the sample time and codec counters since this runtime started.
@@ -263,7 +277,13 @@ mod tests {
             "decompressionNanos":500000,"promotions":2,"demotions":1,"failures":0,"bypasses":2,
             "workingBytes":0,"peakWorkingBytes":100000,"maxWorkingBytes":200000
         });
+        assert!(details.runtime.as_ref().unwrap().allocator_memory.is_none());
+        frontend["details"]["allocatorMemory"] = serde_json::json!({
+            "arenaBytes":900,"allocatedBytes":300,"freeBytes":600,
+            "anonymousResidentBytes":400,"trimAttempts":2,"lastTrimMicros":1000
+        });
         let roundtrip = serde_json::to_value(parse_details(&frontend)).unwrap();
+        assert_eq!(roundtrip["runtime"]["allocatorMemory"], frontend["details"]["allocatorMemory"]);
         assert_eq!(
             roundtrip["runtime"]["readCacheCompression"],
             frontend["details"]["readCacheCompression"]

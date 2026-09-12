@@ -326,6 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _appliance_lease =
         ApplianceLease::acquire(&metadata_root, ApplianceLeaseOwner::WritableDaemon)?;
     mount_recovery::ensure_mount_directory(&mount_path)?;
+    let _allocator_reclaimer = fastdup_store::AllocatorReclaimer::start()?;
     let recovery_latch = arm_recovery_latch(&metadata_root)?;
     let metadata_pool = FsStorageIo::open(&metadata_root)?;
     let data_pool = FsStorageIo::open(&container_root)?;

@@ -31,7 +31,7 @@ export interface SeriesPoint {
 }
 
 export interface TelemetrySnapshot {
-  runtimeIssue?: "unavailable" | "write_blocked" | "integrity_failed";
+  runtimeIssue?: "unavailable" | "write_blocked" | "integrity_failed" | "process_exited";
   storageUsage?: {logicalAllocatedBytes?: number | null; logicalObservedAt?: number | null; metadataUsedBytes?: number | null; metadataCapacityBytes?: number | null; dataUsedBytes?: number | null; dataCapacityBytes?: number | null};
   smallFileQuota?: { requestedBytes: number; effectiveBytes: number };
   details?: import("./detail-telemetry").DetailTelemetry | null;

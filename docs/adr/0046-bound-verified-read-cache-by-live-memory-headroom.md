@@ -464,3 +464,25 @@ runtime/history samples remain unavailable.
 
 Validation and performance limits are recorded in
 [compressed read cache qualification](../testing/compressed-read-cache-2026-09-09.md).
+
+
+## Allocator retention is separate from cache residency (12 September 2026)
+
+Freed cache/working buffers can remain in glibc arenas after application owners
+release them. They do not count as resident cache entries, but their resident
+pages still reduce OS headroom. Increasing cache leases based on virtual free
+allocator counters would overpromise memory and is not permitted.
+
+One daemon-owned background worker instead returns sufficiently large resident
+free-arena slack to the OS. It samples anonymous RSS and glibc counters outside
+hot paths, and trims only when both free blocks and resident slack exceed the
+shared 8% operating reserve. It runs no more than once per 30 seconds and backs
+off according to measured housekeeping cost. It cannot invalidate live cache
+views or touch durable data. The broker keeps using actual OS availability.
+Allocator gauges remain separate from cache gauges because free blocks may
+already have been discarded from RSS. GNU/Linux provides the narrow allocator
+hooks; unsupported allocator targets report no measurement.
+
+The [A/B qualification](../benchmarks/allocator-reclaim-2026-09-12.md) records
+retention reduction, added work and why neither per-request trim nor a universal
+low mmap threshold is suitable for this workload.

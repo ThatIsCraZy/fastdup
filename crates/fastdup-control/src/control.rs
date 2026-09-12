@@ -40,7 +40,6 @@ const REPOSITORY_START_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Debug)]
 struct RuntimeFrontendCounters {
-    mutation_admission_open: bool,
     integrity_failed: bool,
     logical_allocated_bytes: Option<u64>,
     logical_observed_at: Option<u64>,
@@ -351,7 +350,13 @@ impl AgentRuntime {
         let Ok(Some(binding)) = self.store.repository_binding() else {
             return;
         };
-        if repository_mount_is_active() && read_frontend_counters().is_some() {
+        let health = crate::runtime_health::RuntimeHealth::read(POSIX_MOUNT, REPOSITORY_UNIT);
+        if health.mounted == Some(true)
+            && health.process == crate::runtime_health::ProcessState::Running
+        {
+            if binding.state != RepositoryState::Online && read_frontend_counters().is_none() {
+                return;
+            }
             if binding.state != RepositoryState::Online {
                 let _ = self.set_state(RepositoryState::Online);
             }
@@ -376,10 +381,12 @@ impl AgentRuntime {
     }
 
     fn sample_once(&self) {
-        self.sample_frontend(read_frontend_counters().as_ref());
+        let frontend = read_frontend_counters();
+        let health = crate::runtime_health::RuntimeHealth::read(POSIX_MOUNT, REPOSITORY_UNIT);
+        self.sample_frontend(frontend.as_ref(), health);
     }
 
-    fn sample_frontend(&self, frontend: Option<&RuntimeFrontendCounters>) {
+    fn sample_frontend(&self, frontend: Option<&RuntimeFrontendCounters>, health: crate::runtime_health::RuntimeHealth) {
         let binding = self.store.repository_binding().ok().flatten();
         let state = binding
             .as_ref()
@@ -387,6 +394,8 @@ impl AgentRuntime {
                 binding.state.clone()
             });
         let state = if state == RepositoryState::Mounting
+            && health.mounted == Some(true)
+            && health.process == crate::runtime_health::ProcessState::Running
             && frontend.is_some()
             && let Ok(shares) = self.store.shares()
             && sync_share_capacities(&shares).is_ok()
@@ -397,7 +406,8 @@ impl AgentRuntime {
         } else {
             state
         };
-        let runtime_issue = observed_runtime_issue(&state, frontend);
+        let previous = self.latest.read().ok().and_then(|latest| latest.runtime_issue);
+        let runtime_issue = health.issue(&state, frontend.map(|f| f.integrity_failed), previous);
         let state = if runtime_issue.is_some() { RepositoryState::Error } else { state };
         let mut snapshot = {
             let Ok(mut sampler) = self.sampler.lock() else {
@@ -464,7 +474,7 @@ impl AgentRuntime {
                 if let Some(issue) = snapshot.runtime_issue {
                     let _ = self.store.audit("runtime", "repository_health", "failed", issue.message());
                 } else if latest.runtime_issue.is_some() && snapshot.repository_state == RepositoryState::Online {
-                    let _ = self.store.audit("runtime", "repository_health", "recovered", "Repository-Runtime ist wieder erreichbar und beschreibbar");
+                    let _ = self.store.audit("runtime", "repository_health", "recovered", "Repository-Mount und Runtime-Prozess sind wieder aktiv");
                 }
             }
             latest.clone_from(&snapshot);
@@ -1292,21 +1302,6 @@ fn mounted_pool_usage(root: &str) -> Option<(u64,u64)> {
     crate::telemetry::filesystem_usage(Path::new(root))
 }
 
-fn observed_runtime_issue(
-    state: &RepositoryState,
-    frontend: Option<&RuntimeFrontendCounters>,
-) -> Option<crate::RuntimeIssue> {
-    if !matches!(state, RepositoryState::Online | RepositoryState::Error) {
-        return None;
-    }
-    match frontend {
-        None => Some(crate::RuntimeIssue::Unavailable),
-        Some(frontend) if frontend.integrity_failed => Some(crate::RuntimeIssue::IntegrityFailed),
-        Some(frontend) if !frontend.mutation_admission_open => Some(crate::RuntimeIssue::WriteBlocked),
-        Some(_) => None,
-    }
-}
-
 fn read_frontend_counters() -> Option<RuntimeFrontendCounters> {
     let mut stream = StdUnixStream::connect(MANAGEMENT_SOCKET).ok()?;
     stream
@@ -1322,10 +1317,12 @@ fn read_frontend_counters() -> Option<RuntimeFrontendCounters> {
     let mut response = Vec::new();
     stream.take(64 * 1_024).read_to_end(&mut response).ok()?;
     let response: serde_json::Value = serde_json::from_slice(&response).ok()?;
+    parse_frontend_counters(&response)
+}
+
+fn parse_frontend_counters(response: &serde_json::Value) -> Option<RuntimeFrontendCounters> {
     if response.get("ok")?.as_bool()? {
         Some(RuntimeFrontendCounters {
-            mutation_admission_open: response.pointer("/frontend/mutation_admission_open")
-                .and_then(serde_json::Value::as_bool).unwrap_or(true),
             integrity_failed: response.pointer("/frontend/integrity_failed")
                 .and_then(serde_json::Value::as_bool).unwrap_or(false),
             logical_allocated_bytes: response.pointer("/frontend/logical_allocated_bytes").and_then(serde_json::Value::as_u64),
@@ -1590,7 +1587,12 @@ mod tests {
             sampler.update_frontend_counters(1_000_000, 4_000_000);
             assert!(sampler.sample().frontend_write_mbps > 0.0);
         }
-        runtime.sample_frontend(None);
+        let present = crate::runtime_health::RuntimeHealth { mounted: Some(true), process: crate::runtime_health::ProcessState::Running };
+        let absent = crate::runtime_health::RuntimeHealth { mounted: Some(false), ..present };
+        runtime.sample_frontend(None, present);
+        assert_eq!(runtime.inspect().unwrap().telemetry.repository_state, RepositoryState::Online, "a missed metrics sample is not mount failure");
+        assert!(runtime.inspect().unwrap().telemetry.runtime_issue.is_none());
+        runtime.sample_frontend(None, absent);
         let snapshot = runtime.inspect().unwrap();
         assert_eq!(snapshot.telemetry.repository_state, RepositoryState::Error);
         assert_eq!(snapshot.repository.unwrap().state, RepositoryState::Error);
@@ -1598,29 +1600,28 @@ mod tests {
         assert_eq!(snapshot.telemetry.frontend_read_mbps, 0.0);
         assert!(snapshot.telemetry.details.is_none());
         assert_eq!(snapshot.telemetry.runtime_issue, Some(crate::RuntimeIssue::Unavailable));
-        runtime.sample_frontend(None);
+        runtime.sample_frontend(None, absent);
         assert_eq!(runtime.store.recent_audit(20).unwrap().len(), 1, "a continuing outage is one event");
-        let frontend = |open, failed| RuntimeFrontendCounters {
-            mutation_admission_open: open, integrity_failed: failed,
-            logical_allocated_bytes: None, logical_observed_at: None,
-            details: crate::DetailTelemetry::default(), read_bytes: 8_000_000, write_bytes: 10_000_000,
-            exact_hit_bytes: 0, new_chunk_bytes: 0,
-            presented_capacity_revision: share_capacity_revision(&[]),
-        };
-        runtime.sample_frontend(Some(&frontend(true, false)));
+        let frontend = |open, failed| parse_frontend_counters(&serde_json::json!({
+            "ok":true, "presented_capacity_revision":share_capacity_revision(&[]),
+            "frontend": {"mutation_admission_open":open,"integrity_failed":failed,
+                "read_bytes":8_000_000,"write_bytes":10_000_000,
+                "exact_hit_bytes":0,"new_chunk_bytes":0}
+        })).unwrap();
+        runtime.sample_frontend(Some(&frontend(true, false)), present);
         let recovered = runtime.inspect().unwrap();
         assert_eq!(recovered.telemetry.repository_state, RepositoryState::Online);
         assert_eq!(recovered.repository.unwrap().state, RepositoryState::Online);
         assert_eq!(recovered.telemetry.frontend_write_mbps, 0.0, "first observation after loss establishes a new baseline");
         assert!(recovered.telemetry.runtime_issue.is_none());
-        runtime.sample_frontend(Some(&frontend(false, false)));
+        runtime.sample_frontend(Some(&frontend(false, false)), present);
         let paused = runtime.inspect().unwrap();
-        assert_eq!(paused.telemetry.repository_state, RepositoryState::Error);
-        assert_eq!(paused.telemetry.runtime_issue, Some(crate::RuntimeIssue::WriteBlocked));
-        runtime.sample_frontend(Some(&frontend(false, true)));
+        assert_eq!(paused.telemetry.repository_state, RepositoryState::Online, "ordinary write backpressure is not a repository failure");
+        assert!(paused.telemetry.runtime_issue.is_none());
+        runtime.sample_frontend(Some(&frontend(false, true)), present);
         assert_eq!(runtime.inspect().unwrap().telemetry.runtime_issue, Some(crate::RuntimeIssue::IntegrityFailed));
         runtime.set_state(RepositoryState::Unmounted).unwrap();
-        runtime.sample_frontend(None);
+        runtime.sample_frontend(None, absent);
         let unmounted = runtime.inspect().unwrap();
         assert_eq!(unmounted.telemetry.repository_state, RepositoryState::Unmounted);
         assert!(unmounted.telemetry.runtime_issue.is_none());

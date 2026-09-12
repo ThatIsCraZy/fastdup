@@ -8,25 +8,18 @@ libraries, and future regressions.
 
 ## Required production controls
 
-The durable FUSE daemon currently closes mutation admission at 512 MiB of
-unique, reachable active Dirty DATA (eight nominal 64-MiB Containers). Keep that
-limit enabled. One process-wide `MemoryBudgetGovernor` samples host and current
-cgroup memory at most every 250 ms and supplies the same fail-closed snapshot to
-all rebuildable caches. The verified read cache is a separate discardable tier:
-it is hard-capped at one eighth of effective RAM (and at most 8 GiB), while
-reserving at least one quarter of effective RAM or 4 GiB for ingest, XFS, and
-I/O queues. It purges and stops admitting payloads whenever the reserve is
-unavailable or the fastdup process has charged Swap. The persistent Exact Index
-retains only verified hot 4-KiB pages in a separate direct-mapped cache. Its hard geometry is one 128th
-of effective RAM, clamped to 1-256 MiB, while its resident target uses the same
-live reserve and drops to zero on Process Swap. It is never a complete in-memory Chunk
-map. Rebuildable per-Run blocked Bloom hints use a separate active-set budget of
-one 32nd of effective RAM, clamped to 1 MiB-8 GiB and limited by headroom above
-the shared reserve. Every Run-Set activation resamples headroom, and Process
-Swap disables filters in the replacement; Host or shared-cgroup Swap belonging
-to other workloads does not. Filters of at least 2 MiB use their own
-anonymous `MADV_HUGEPAGE` mapping; smaller filters remain normal heap
-allocations. Absence always falls back to the verified Exact pages. The
+The durable FUSE daemon closes mutation admission at 512 MiB of unique,
+reachable active Dirty DATA (eight nominal 64-MiB Containers). Keep that limit
+enabled. One process-wide `MemoryBudgetGovernor` samples host and current cgroup
+memory at most every 250 ms. Rebuildable caches compete for a shared budget with
+an 8% operating reserve; DATA-saving caches receive priority. Admission closes
+on Process Swap. A dedicated background worker returns large free allocator
+reserves when they still occupy anonymous RSS; it does not evict live objects.
+See [ADR 0046](../adr/0046-bound-verified-read-cache-by-live-memory-headroom.md)
+and the [allocator qualification](../benchmarks/allocator-reclaim-2026-09-12.md).
+
+The persistent Exact Index retains verified hot pages and bounded rebuildable
+membership hints; it is never a complete in-memory Chunk map. The
 data-tier `io_uring` adapter has an independent
 256-MiB publication-buffer budget. Its normal owned path transfers a prepared
 Container image once and charges exactly one image for the whole publication.
@@ -51,7 +44,6 @@ Run the daemon with the following service properties:
 
 ```ini
 [Service]
-Environment=MALLOC_MMAP_THRESHOLD_=131072
 Environment=FASTDUP_REQUIRE_CGROUP_NO_SWAP=1
 MemorySwapMax=0
 ```
@@ -73,8 +65,11 @@ checkpoint instead of remaining in allocator arenas. It reduced the comparable
 30-second peak from 1,173,072 KiB to 766,356 KiB and finished the empty
 checkpoint at 81 MiB RSS. An arena-count-only comparison retained about 620 MiB
 after accepting somewhat more data, so arena count was not the primary control.
-This environment setting must be present before the process starts; setting it
-inside an already-running daemon is too late.
+This was evidence for that older workload, not a universal setting. The current
+allocation-heavy A/B workload becomes roughly ten times slower with that low
+mmap threshold. The service therefore uses infrequent background reclamation
+instead. Any operator-selected glibc environment setting must be present before
+the process starts.
 
 ## Acceptance checks
 
