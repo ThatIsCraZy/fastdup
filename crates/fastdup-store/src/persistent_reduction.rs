@@ -696,6 +696,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
                     key.0,
                     key.1,
                     cache,
+                    crate::ReadIntentScope::current(),
                     &mut || {
                         let admit =
                             *decision.get_or_insert_with(|| self.read_gate.decide(gate_key));

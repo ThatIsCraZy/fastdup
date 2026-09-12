@@ -196,6 +196,29 @@ impl VerifiedChunkPayload {
         self.decoded_offset
     }
 
+    /// Carries independently checked physical coordinates without retaining
+    /// the decoded allocation. This evidence is process-local, not liveness
+    /// authority, and is absent when decoding did not establish a Location.
+    #[must_use]
+    pub fn verified_location(&self) -> Option<super::VerifiedChunkLocation> {
+        let source = self.source?;
+        Some(super::VerifiedChunkLocation {
+            chunk_id: self.chunk_id,
+            logical_length: self.length.try_into().ok()?,
+            container_id: source.container_id,
+            container_generation: source.container_generation,
+            record_offset: source.record_offset,
+            record_length: source.record_length.get(),
+            chunk_ordinal: self.chunk_ordinal,
+            decoded_offset: self.decoded_offset.try_into().ok()?,
+            codec_id: source.codec_id,
+            dependency_id: [0; 32],
+            record_crc32c: source.record_crc32c,
+            record_decoded_length: source.record_decoded_length,
+            record_payload_length: source.record_payload_length,
+        })
+    }
+
     /// Matches a current independent Exact candidate against the physical
     /// Record and Chunk coordinates independently verified at decode time.
     #[must_use]

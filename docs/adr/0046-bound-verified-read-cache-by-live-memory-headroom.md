@@ -92,13 +92,29 @@ Online GC may reuse cached Metadata graphs, candidate/index pages and verified
 relocation source bytes. Its reverse-dependency projection is also reclaimable
 by the common cache; a running proof retains its required immutable view.
 Online Exact reuse, recent publication overlays and Commit dependency checks
-also receive the same verified DATA view as demand readers. A reuse hit must
-match the currently eligible candidate's complete independent Record/Chunk
-coordinates, not just its Chunk ID. A cold successful verification admits all
-co-verified Record siblings through common admission. Explicit Independent
-verification bypasses these hits and admission. Dependent Target payloads
-without matching physical-source evidence still require their ordinary
-verification; an identity-only payload cannot authorize a Location.
+share the same cache owner as demand readers. As of 13 September 2026 they
+retain compact Location evidence independently of payload residency. Evidence
+is admitted only after complete Record/Chunk verification (including a Base
+when required), and matches every coordinate of a currently eligible ACTIVE
+Exact candidate. The newest transition for that Location must still allow it.
+An eligible cached Location is preferred before cold alternatives; ordinary
+backend attempts remain bounded at two. Independent Record decoding can emit
+opaque sibling Locations without retaining their decoded allocation.
+
+Verification-only misses use Scan intent for the payload load, then admit
+the checked Locations under the caller's restored intent. They do not retain
+or recompress DATA payloads or populate encoded storage ranges merely to
+remember that verification succeeded. Demand reads retain their normal payload
+admission and also contribute checked Location evidence. This additional typed
+view has no private map, quota, lease or replacement list: pressure evicts it
+through the same owner, and telemetry exposes its hits and charged bytes.
+Evidence eviction causes ordinary revalidation. Explicit Independent scopes
+bypass every hit and admission. Logical bytes without matching physical-source
+evidence still cannot authorize a Location. Recovery, scrub and final deletion
+validation keep their fresh-media contracts.
+The payload-only Scan scope does not suppress ordinary admission of reusable
+Exact pages or compact descriptors. Pass-local sibling discharge remains
+available even when the caller's intent or memory pressure forbids admission.
 Its current Commit binding, live root pins, publication
 barrier, victim validation and final deletion proof remain mandatory. Independent
 recovery, offline/background scrub and fresh deletion verification
@@ -196,6 +212,11 @@ The new envelope costs 8 KiB plus tail padding per generic repository file.
 Length-head synchronization can increase small-write latency. Direct I/O needs
 aligned bounce buffers; scans need explicit application policy instead of kernel
 readahead. These costs are accepted for one controlled file-content cache.
+Immutable Metadata publication batches its already checked encoded input in
+at most one-MiB writes. A four-KiB loop would advance and synchronize the storage
+length head for every page, doubling body/head write traffic and multiplying
+barriers. Batching changes neither encoded bytes nor the independent staging
+readback, file sync, no-replace rename and directory-before-WAL ordering.
 Telemetry reports the common memory lease and direct backend causes; logical
 requested bytes are not physical disk IOPS or device bytes.
 

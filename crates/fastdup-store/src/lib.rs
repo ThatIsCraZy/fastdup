@@ -2508,9 +2508,9 @@ impl<I: StorageIo> ContainerRepository<I> {
             .ok_or(StoreError::ExactLocationMismatch)
     }
 
-    /// Verifies an independent Location for online reuse, sharing previously
-    /// checked Record siblings with demand reads. A hit must match every
-    /// physical candidate coordinate. Independent intent still reads storage.
+    /// Verifies a Location for online reuse, retaining compact checked Record
+    /// sibling evidence in the common cache. Cold reads here support independent
+    /// Records; Independent intent always reads storage.
     ///
     /// # Errors
     /// Returns the ordinary Location, Record, or Chunk verification failure.
@@ -2519,22 +2519,41 @@ impl<I: StorageIo> ContainerRepository<I> {
         candidate: ExactIndexEntry,
         cache: &VerifiedReadCache,
     ) -> Result<(), StoreError> {
+        if candidate.transition() != ExactLocationTransition::Active {
+            return Err(StoreError::ExactLocationMismatch);
+        }
+        if cache.verified_location(candidate.chunk_id(), u64::from(candidate.logical_length()))
+            == Some(candidate)
+        {
+            return Ok(());
+        }
         if cache
             .get(candidate.chunk_id(), u64::from(candidate.logical_length()))
             .is_some_and(|payload| payload.matches_independent_candidate(candidate))
         {
+            cache.admit_verified_location(candidate);
             return Ok(());
         }
-        let (_, groups) = self.read_verified_location_payload(candidate)?.into_parts();
+        let read = self.read_verified_location_payload_with_intent(candidate, ReadIntent::Scan)?;
+        let (_, groups) = read.into_parts();
         for group in groups {
-            cache.admit_decoded_group(group);
+            cache.admit_location_proofs(&group);
         }
+        cache.admit_verified_location(candidate);
         Ok(())
     }
 
     fn read_verified_location_payload(
         &self,
         candidate: ExactIndexEntry,
+    ) -> Result<VerifiedChunkRead, StoreError> {
+        self.read_verified_location_payload_with_intent(candidate, ReadIntentScope::current())
+    }
+
+    fn read_verified_location_payload_with_intent(
+        &self,
+        candidate: ExactIndexEntry,
+        payload_intent: ReadIntent,
     ) -> Result<VerifiedChunkRead, StoreError> {
         if candidate.transition() != ExactLocationTransition::Active {
             return Err(StoreError::ExactLocationMismatch);
@@ -2548,7 +2567,10 @@ impl<I: StorageIo> ContainerRepository<I> {
                 RecordReadCoordinator::wait(&flight).ok_or(StoreError::ExactLocationMismatch)?;
             return verified_record_read(candidate, &payloads);
         }
-        let encoded = Arc::new(self.read_candidate_record_with_descriptor(candidate, descriptor)?);
+        let encoded = {
+            let _payload = ReadIntentScope::enter(payload_intent);
+            Arc::new(self.read_candidate_record_with_descriptor(candidate, descriptor)?)
+        };
         let verified = descriptor
             .decode_owned_candidate_payloads(&[candidate], &encoded, 0..encoded.len())
             .map_err(map_exact_location_error)?;
@@ -2748,8 +2770,9 @@ impl<I: StorageIo> ContainerRepository<I> {
             .map(|(entry, _)| entry))
     }
 
-    /// Resolves current Exact candidates using the shared verified DATA cache.
-    /// Optional cached bytes cannot authorize a different physical Location.
+    /// Resolves current Exact candidates using compact physical-source evidence
+    /// in the shared cache, without retaining payloads for verification alone.
+    /// Optional evidence cannot authorize a different or ineligible Location.
     ///
     /// # Errors
     /// Preserves the bounded fallback semantics of the uncached lookup.
@@ -2763,19 +2786,46 @@ impl<I: StorageIo> ContainerRepository<I> {
         logical_length: u64,
         cache: &VerifiedReadCache,
     ) -> Result<Option<ExactIndexEntry>, StoreError> {
-        let Some((entry, read)) = self.find_verified_candidate_payload_cached(
+        if let Some(known) = Self::cached_verified_location(index, chunk_id, logical_length, cache)
+        {
+            return Ok(Some(known));
+        }
+        let verified = self.find_verified_candidate_payload_with_intent(
             index,
             chunk_id,
             logical_length,
             Some(cache),
-        ) else {
+            ReadIntent::Scan,
+        );
+        let Some((entry, read)) = verified else {
             return Ok(None);
         };
         let (_, groups) = read.into_parts();
         for group in groups {
-            cache.admit_decoded_group(group);
+            cache.admit_location_proofs(&group);
         }
+        cache.admit_verified_location(entry);
         Ok(Some(entry))
+    }
+
+    fn cached_verified_location<J: StorageIo>(
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+        cache: &VerifiedReadCache,
+    ) -> Option<ExactIndexEntry> {
+        // Only the newest transition of this physical Location may authorize
+        // reuse. Prefer eligible warm evidence before trying cold alternatives.
+        let known = cache.verified_location(chunk_id, logical_length)?;
+        let lookup = index
+            .lookup_transitions(chunk_id, logical_length.try_into().ok()?)
+            .ok()?;
+        (lookup
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.location() == known.location())
+            == Some(&known))
+        .then_some(known)
     }
 
     fn find_verified_candidate_with_index<J: StorageIo>(
@@ -2808,6 +2858,23 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u64,
         cache: Option<&VerifiedReadCache>,
+    ) -> Option<(ExactIndexEntry, VerifiedChunkRead)> {
+        self.find_verified_candidate_payload_with_intent(
+            index,
+            chunk_id,
+            logical_length,
+            cache,
+            ReadIntentScope::current(),
+        )
+    }
+
+    fn find_verified_candidate_payload_with_intent<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u64,
+        cache: Option<&VerifiedReadCache>,
+        payload_intent: ReadIntent,
     ) -> Option<(ExactIndexEntry, VerifiedChunkRead)> {
         let Ok(index_length) = u32::try_from(logical_length) else {
             return None;
@@ -2854,14 +2921,16 @@ impl<I: StorageIo> ContainerRepository<I> {
                 return Some((candidate, VerifiedChunkRead::single(payload, Vec::new())));
             }
             let verified = if location.dependency_id() == [0; 32] {
-                self.read_verified_location_payload(candidate)
+                self.read_verified_location_payload_with_intent(candidate, payload_intent)
             } else {
                 let base_id = fastdup_format::ChunkId::from_bytes(location.dependency_id());
-                let Some(base_read) = self.find_verified_independent_base_read_with_index(
+                let Some(base_read) = self.find_verified_independent_base_read_gated(
                     index,
                     base_id,
                     index_length,
                     cache,
+                    payload_intent,
+                    &mut || true,
                 ) else {
                     continue;
                 };
@@ -2869,6 +2938,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                 let Some(base) = base_requested.pop() else {
                     continue;
                 };
+                let _payload = ReadIntentScope::enter(payload_intent);
                 self.read_verified_dependent_location_payload(candidate, &base)
                     .map(|target_read| {
                         let (requested, target_groups) = target_read.into_parts();
@@ -2927,6 +2997,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             chunk_id,
             logical_length,
             cache,
+            ReadIntentScope::current(),
             &mut || true,
         )
     }
@@ -2939,6 +3010,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u32,
         cache: Option<&VerifiedReadCache>,
+        payload_intent: ReadIntent,
         before_backend_read: &mut dyn FnMut() -> bool,
     ) -> Option<VerifiedChunkRead> {
         let lookup = index.lookup_transitions(chunk_id, logical_length).ok()?;
@@ -2985,8 +3057,12 @@ impl<I: StorageIo> ContainerRepository<I> {
             if !before_backend_read() {
                 continue;
             }
-            if let Ok(read) = self.read_verified_location_payload(candidate) {
-                if let Some(cache) = cache {
+            if let Ok(read) =
+                self.read_verified_location_payload_with_intent(candidate, payload_intent)
+            {
+                if let Some(cache) = cache
+                    && payload_intent == ReadIntent::Demand
+                {
                     let (requested, groups) = read.into_parts();
                     for group in groups {
                         cache.admit_decoded_group(group);

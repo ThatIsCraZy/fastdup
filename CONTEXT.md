@@ -67,6 +67,13 @@ A Chunk ID and logical-length match against the Exact Index. It permits location
 reuse without asserting that a physical copy is canonical.
 _Avoid_: Bloom hit, similarity candidate
 
+**Verified Location evidence**:
+Process-local evidence that one exact physical encoding and its logical Chunk
+identity have passed verification. It can outlive the retained payload bytes,
+but reuse still requires a currently eligible Location. It neither establishes
+liveness nor substitutes for independent recovery or physical scrub.
+_Avoid_: Exact hit, retained payload, durable authority
+
 **Similarity fingerprint**:
 A versioned, non-cryptographic description used to retrieve likely compression
 bases for one logical chunk. It never establishes content identity or integrity.

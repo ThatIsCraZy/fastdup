@@ -144,6 +144,7 @@ impl std::error::Error for VerifiedReadCacheError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifiedReadCacheStatus {
+    location_proofs: crate::ReadCacheStats,
     compressed_resident_bytes: usize,
     compressed_logical_bytes: usize,
     compression_attempts: u64,
@@ -187,6 +188,7 @@ macro_rules! status_getter {
 }
 
 impl VerifiedReadCacheStatus {
+    status_getter!(location_proofs, location_proofs, crate::ReadCacheStats);
     status_getter!(compressed_resident_bytes, compressed_resident_bytes, usize);
     status_getter!(compressed_logical_bytes, compressed_logical_bytes, usize);
     status_getter!(compression_attempts, compression_attempts, u64);
@@ -385,15 +387,13 @@ struct CacheAdmission {
     compression_cursor: usize,
 }
 
-/// Bounded, sharded cache of immutable bytes that have already passed complete
-/// stored-encoding and logical-identity verification.
-///
-/// Entries are four-way set associative. Demand hits touch one cache-line-
-/// separated shard and at most four pointers; there is no global LRU chain.
-/// Admission is serialized only after the expensive Container read/VERIFY has
-/// completed so exact byte accounting cannot overrun the current target.
+/// Verified DATA and compact physical-source views in the unified read cache.
+/// The common owner governs allocation, admission, replacement and pressure;
+/// verification-only callers need not retain the payload backing. The former
+/// four-way implementation is retained solely as a test/replay comparator.
 pub struct VerifiedReadCache {
     unified: Option<crate::ReadCacheNamespace>,
+    location_proofs: Option<crate::ReadCacheNamespace>,
     config: VerifiedReadCacheConfig,
     shards: Box<[CacheShard]>,
     metadata_bytes: usize,
@@ -500,14 +500,18 @@ impl VerifiedReadCache {
                 }),
             });
         }
+        let unified = (!legacy).then(|| {
+            if automatic_pressure {
+                crate::ReadCacheNamespace::system(crate::ReadCacheClass::Data)
+            } else {
+                crate::ReadCacheNamespace::isolated(crate::ReadCacheClass::Data, 0)
+            }
+        });
         let cache = Self {
-            unified: (!legacy).then(|| {
-                if automatic_pressure {
-                    crate::ReadCacheNamespace::system(crate::ReadCacheClass::Data)
-                } else {
-                    crate::ReadCacheNamespace::isolated(crate::ReadCacheClass::Data, 0)
-                }
-            }),
+            location_proofs: unified
+                .as_ref()
+                .map(|cache| cache.sibling(crate::ReadCacheClass::LocationProof)),
+            unified,
             config,
             shards: shards.into_boxed_slice(),
             metadata_bytes,
@@ -665,6 +669,10 @@ impl VerifiedReadCache {
             });
         }
         VerifiedReadCacheStatus {
+            location_proofs: self.location_proofs.as_ref().map_or_else(
+                crate::ReadCacheStats::default,
+                crate::ReadCacheNamespace::stats,
+            ),
             compressed_resident_bytes: compressed,
             compressed_logical_bytes: logical,
             compression_attempts: self.compression.attempts.load(Ordering::Relaxed),
@@ -696,6 +704,48 @@ impl VerifiedReadCache {
             effective_limit_bytes: self.effective_limit_bytes.load(Ordering::Acquire),
             available_bytes: self.available_bytes.load(Ordering::Acquire),
             swap_used_bytes: self.swap_used_bytes.load(Ordering::Acquire),
+        }
+    }
+
+    /// Small physical-source evidence in the same owner as the DATA view.
+    /// Returning a proof never returns bytes or selects a live generation.
+    pub(crate) fn verified_location(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u64,
+    ) -> Option<fastdup_format::ExactIndexEntry> {
+        self.location_proofs
+            .as_ref()?
+            .get::<fastdup_format::ExactIndexEntry>(crate::ReadCacheKey {
+                identity: chunk_id.bytes(),
+                ordinal: logical_length,
+            })
+            .map(|entry| *entry)
+    }
+
+    // Call only after this exact candidate's complete stored Record, logical
+    // bytes and any Base have been verified, never on an unverified Exact hit.
+    pub(crate) fn admit_verified_location(&self, entry: fastdup_format::ExactIndexEntry) {
+        if let Some(cache) = &self.location_proofs {
+            cache.insert(
+                crate::ReadCacheKey {
+                    identity: entry.chunk_id().bytes(),
+                    ordinal: u64::from(entry.logical_length()),
+                },
+                Arc::new(entry),
+                size_of::<fastdup_format::ExactIndexEntry>() as u64,
+                u64::from(entry.location().record_length()),
+            );
+        }
+    }
+
+    pub(crate) fn admit_location_proofs(&self, payloads: &[VerifiedChunkPayload]) {
+        for payload in payloads {
+            if let Some(location) = payload.verified_location()
+                && let Ok(entry) = fastdup_format::ExactIndexEntry::from_verified(location)
+            {
+                self.admit_verified_location(entry);
+            }
         }
     }
 

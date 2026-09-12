@@ -56,6 +56,7 @@ impl Drop for FlightLeader<'_> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadCacheClass {
     Data,
+    LocationProof,
     HistoricalProof,
     ContainerDescriptor,
     ExactPage,
@@ -72,7 +73,10 @@ pub enum ReadCacheClass {
 impl ReadCacheClass {
     const fn hit_credit(self) -> u8 {
         match self {
-            Self::Data | Self::HistoricalProof | Self::ContainerDescriptor => 16,
+            Self::Data
+            | Self::LocationProof
+            | Self::HistoricalProof
+            | Self::ContainerDescriptor => 16,
             _ => 1,
         }
     }
@@ -105,7 +109,7 @@ struct Counters {
 }
 
 /// Per-representation observations; capacity belongs to the common cache.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReadCacheStats {
     pub hits: u64,
     pub misses: u64,

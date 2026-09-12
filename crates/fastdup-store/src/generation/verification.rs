@@ -51,12 +51,29 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
             if co_verified.remove(chunk_id) {
                 continue;
             }
-            let Some((_, read)) = self.containers.find_verified_candidate_payload_cached(
+            if let Some(cache) = &self.read_cache
+                && ContainerRepository::<C>::cached_verified_location(
+                    &self.index,
+                    *chunk_id,
+                    *logical_length,
+                    cache,
+                )
+                .is_some()
+            {
+                continue;
+            }
+            let verified = self.containers.find_verified_candidate_payload_with_intent(
                 &self.index,
                 *chunk_id,
                 *logical_length,
                 self.read_cache.as_deref(),
-            ) else {
+                if self.read_cache.is_some() {
+                    crate::ReadIntent::Scan
+                } else {
+                    crate::ReadIntentScope::current()
+                },
+            );
+            let Some((entry, read)) = verified else {
                 missing.insert(*chunk_id, *logical_length);
                 continue;
             };
@@ -70,10 +87,13 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
                     }
                 }
             }
+            // Keep pass-local sibling discharge even when Independent/Scan
+            // intent or pressure forbids admission of reusable evidence.
             if let Some(cache) = &self.read_cache {
                 for group in groups {
-                    cache.admit_decoded_group(group);
+                    cache.admit_location_proofs(&group);
                 }
+                cache.admit_verified_location(entry);
             }
         }
         self.containers.verify_required_chunks(&missing)

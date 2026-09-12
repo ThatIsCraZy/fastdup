@@ -50,9 +50,10 @@ const tabs = ["Latenzen", "io_uring", "Caches", "Lesevermeidung", "GC & Scrub", 
 const metadataReasons: Record<string,string> = {other:"Nicht zugeordnet",indexLookup:"Index-Abfrage · Cache-Miss",indexCompaction:"Index-Zusammenführung",indexAudit:"Index-Prüfung",indexEnvelope:"Index-Header / Footer",manifest:"Manifest lesen",namespace:"Namespace / Verwaltungsgraph",recoveryScrub:"Recovery / Scrub",garbageCollection:"Garbage Collection"};
 const metadataObjects: Record<string,string> = {exactIndex:"Exact Index",similarityIndex:"Similarity Index",metadataObject:"Metadatenobjekt",smallFile:"Small-File-Container",control:"Commit / Journal / Verwaltung",other:"Weitere Dateien"};
 const metadataModes: Record<string,string> = {directRange:"Direkter Bereich",directFile:"Direkte Datei",directStructure:"Direkte Struktur",directLease:"Direkter Zugriff mit Dateilease",bufferedRange:"Gepufferter Bereich",bufferedFile:"Gepufferte Datei",bufferedStructure:"Gepufferte Struktur",mmap:"mmap"};
-const cacheLabels: Record<string, string> = { unifiedRead: "Unified Read Cache", verifiedRead: "Verified Read", exactIndex: "Exact Index", similarityIndex: "Similarity Index", containerDescriptors: "Container Descriptors", historicalProofs: "Historical Proofs", manifestNodes: "Manifest Nodes", metadataObjects: "Metadata Objects" };
+const cacheLabels: Record<string, string> = { unifiedRead: "Unified Read Cache", locationProofs: "Location-Nachweise", verifiedRead: "Verified Read", exactIndex: "Exact Index", similarityIndex: "Similarity Index", containerDescriptors: "Container Descriptors", historicalProofs: "Historical Proofs", manifestNodes: "Manifest Nodes", metadataObjects: "Metadata Objects" };
 const cacheDescriptions: Record<string, string> = {
   unifiedRead: "Gemeinsamer Speicher für Nutzdaten, Metadaten, Indexe und geprüfte Nachweise",
+  locationProofs: "Kompakte Nachweise bereits geprüfter Speicherorte für Dedup und Commit",
   verifiedRead: "Geprüfte Nutzdaten für Lesen und Vergleichsbasen",
   exactIndex: "Zuordnung von Chunk-IDs zu Speicherorten",
   similarityIndex: "Kandidaten für ähnliche Daten",
@@ -144,6 +145,15 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
               {budget && <><td>{bytes(pool?.targetBytes)}</td>{cacheCounters && <td>{bytes(pool?.leasedBytes)}</td>}</>}
             </tr>;
           })}</tbody></table></div>
+          {budget && runtime.caches.filter(cache => cache.id === "locationProofs").map(proof => <details key={proof.id} className="telemetry-disclosure">
+            <summary>{t("Location-Nachweise · seit Mount")}</summary>
+            <p className="detail-note">{t("Treffer ermöglichen Dedup- und Commit-Prüfungen ohne erneutes Lesen der Nutzdaten. Die Belegung ist im gemeinsamen Cache enthalten.")}</p>
+            {rows([
+              ["Hit Rate", proof.hits + proof.misses ? `${number(proof.hits * 100 / (proof.hits + proof.misses))} %` : "—"],
+              ["Hits", number(proof.hits)], ["Misses", number(proof.misses)],
+              ["Evictions", number(proof.evictions)], ["Belegung", bytes(proof.residentBytes)]
+            ])}
+          </details>)}
           {compression && <div className="read-cache-compression" aria-label={t("Verified Read · RAM-Kompression")}>
             <h3>{t("Verified Read · RAM-Kompression")}</h3>
             <p className="detail-note">{t("Geprüfte Nutzdaten bleiben komprimiert im RAM, wenn das Speicher spart; andernfalls bleiben sie unkomprimiert. Beide Darstellungen teilen sich das gemeinsame Cache-Budget. Speicherwerte gelten zum Messpunkt.")}</p>

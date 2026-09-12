@@ -96,6 +96,10 @@ fn compact_record_provenance_keeps_every_candidate_coordinate() {
             let payload = &read.requested()[0];
             assert_eq!(payload.as_slice(), data[ordinal]);
             assert!(payload.matches_independent_candidate(candidate));
+            assert_eq!(
+                ExactIndexEntry::from_verified(payload.verified_location().unwrap()).unwrap(),
+                candidate
+            );
             assert!(!payload.matches_independent_candidate(entries[1 - ordinal]));
             assert_changed_provenance_rejected(payload, candidate);
         }

@@ -226,6 +226,7 @@ impl VerifiedReadCache {
         if payloads.is_empty() {
             return;
         }
+        self.admit_location_proofs(&payloads);
         for payload in &payloads {
             assert!(
                 payloads[0].shares_backing_with(payload),

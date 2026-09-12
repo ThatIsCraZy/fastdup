@@ -7898,9 +7898,15 @@ mod tests {
             entries[0].location().record_offset(),
             entries[1].location().record_offset()
         );
-        let indexes = ExactIndexRunRepository::new(MemoryStorageIo::new());
+        let index_storage = MemoryStorageIo::new();
+        let indexes = ExactIndexRunRepository::new(index_storage.clone());
         let profile = checkpoint_exact_index_profile_v1();
         indexes.append_level_zero(profile, entries.clone()).unwrap();
+        drop(indexes);
+        let snapshot = fastdup_store::MemoryPressureSnapshot::new(1 << 30, 1 << 29, 0);
+        let indexes = ExactIndexRunRepository::new_with_memory_snapshot(index_storage, snapshot);
+        indexes.recover_active_generation().unwrap().unwrap();
+        assert_eq!(indexes.page_cache_status().resident_pages(), 0);
         let core = Arc::new(ExactPublisherCore {
             repository: indexes,
             profile,
@@ -7909,7 +7915,6 @@ mod tests {
             similarity: None,
             failed_reduction_guard: Mutex::new(None),
         });
-        let snapshot = fastdup_store::MemoryPressureSnapshot::new(1 << 30, 1 << 29, 0);
         let policy = IndexedManifestReaders {
             publisher: ExactPublicationQueue::start(Arc::clone(&core)).unwrap(),
             core,
@@ -7926,6 +7931,18 @@ mod tests {
             policy.verified_location(&containers, entries[0].chunk_id(), 32768),
             Some(entries[0])
         );
+        assert_eq!(
+            policy.read_cache.status().resident_bytes(),
+            0,
+            "verification-only ingest must retain compact Location evidence, not DATA payloads"
+        );
+        assert_eq!(policy.read_cache.status().compression_attempts(), 0);
+        assert!(
+            policy.core.repository.page_cache_status().resident_pages() > 0,
+            "verification must still retain reusable Exact pages; only DATA payload loading uses Scan intent"
+        );
+        assert_eq!(policy.read_cache.status().location_proofs().entries, 2);
+        assert!(policy.read_cache.status().location_proofs().resident_bytes < 2048);
         let before = storage.operation_count();
         assert_eq!(
             policy.verified_location(&containers, entries[1].chunk_id(), 32768),
@@ -7999,6 +8016,7 @@ mod tests {
             storage.operation_count() > before,
             "independent verification must read storage"
         );
+        let single_record_operations = storage.operation_count() - before;
         let before = storage.operation_count();
         policy
             .graph_verifier(containers.clone())
@@ -8012,6 +8030,81 @@ mod tests {
         assert!(
             storage.operation_count() > before,
             "independent graph verification bypasses reuse"
+        );
+        assert_eq!(
+            storage.operation_count() - before,
+            single_record_operations,
+            "independent graph verification must check sibling Chunks in one Record pass"
+        );
+        drop(_independent);
+        policy.core.recent.write().unwrap().clear();
+        policy
+            .core
+            .repository
+            .append_level_zero(profile, vec![forged])
+            .unwrap();
+        let before = storage.operation_count();
+        assert_eq!(
+            policy.verified_location(&containers, entries[0].chunk_id(), 32768),
+            Some(entries[0])
+        );
+        assert_eq!(
+            storage.operation_count(),
+            before,
+            "a later eligible warm Location precedes a cold alternative"
+        );
+
+        policy
+            .read_cache
+            .update_memory_pressure(fastdup_store::MemoryPressureSnapshot::new(1 << 30, 0, 0));
+        let before = storage.operation_count();
+        assert_eq!(
+            policy.verified_location(&containers, entries[1].chunk_id(), 32768),
+            Some(entries[1])
+        );
+        assert!(
+            storage.operation_count() > before,
+            "common pressure must evict the compact evidence too"
+        );
+        policy.read_cache.update_memory_pressure(snapshot);
+        assert_eq!(
+            policy.verified_location(&containers, entries[0].chunk_id(), 32768),
+            Some(entries[0])
+        );
+        policy
+            .core
+            .repository
+            .append_level_zero(
+                profile,
+                vec![
+                    ExactIndexEntry::retiring(entries[0]).unwrap(),
+                    ExactIndexEntry::retiring(forged).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            policy.verified_location(&containers, entries[0].chunk_id(), 32768),
+            None,
+            "cached evidence cannot override a newer RETIRING transition"
+        );
+        // Fresh physical validation must still detect damage while compact
+        // evidence is resident. External mutation is deliberately injected.
+        let name = format!("{}.fdc", "c7".repeat(16));
+        let offset = entries[1].location().record_offset();
+        let original = storage.read(&name).unwrap()[usize::try_from(offset).unwrap()];
+        storage.write_at(&name, offset, &[original ^ 1]).unwrap();
+        let _independent =
+            fastdup_store::ReadIntentScope::enter(fastdup_store::ReadIntent::Independent);
+        assert!(
+            containers
+                .verify_location_cached(entries[1], &policy.read_cache)
+                .is_err()
+        );
+        assert!(
+            policy
+                .graph_verifier(containers.clone())
+                .verify_required_chunks(&BTreeMap::from([(entries[1].chunk_id(), 32768)]))
+                .is_err()
         );
     }
 

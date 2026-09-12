@@ -11,6 +11,34 @@ use std::sync::Arc;
 use fastdup_format::{DurableInode, NamespaceEntry};
 
 #[test]
+fn metadata_publication_does_not_sync_a_length_head_per_four_kib() {
+    let path = std::env::temp_dir().join(format!("metadata-batch-{}", std::process::id()));
+    let storage = crate::FsStorageIo::open(&path).unwrap();
+    let repo = GenerationRepository::new(storage, PolicySetId::new([1; 32]).unwrap());
+    let extents = (0..8000)
+        .map(|index| ManifestExtent::Fill {
+            logical_length: 4096,
+            value: u8::try_from(index % 2).unwrap(),
+        })
+        .collect();
+    let bytes = ManifestLeaf::new(8000 * 4096, extents)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let before = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get);
+    let id = repo.stage_metadata(&bytes).unwrap();
+    let writes = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get) - before;
+    assert_eq!(
+        writes, 4,
+        "one immutable object needs one body and three heads"
+    );
+    repo.storage.sync_root().unwrap();
+    let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+    assert_eq!(repo.read_metadata(id).unwrap(), bytes);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn metadata_graph_reads_share_owned_bytes_across_read_paths() {
     let root = std::env::temp_dir().join(format!("metadata-owned-{}", std::process::id()));
     let mut storage = crate::FsStorageIo::open(&root).unwrap();

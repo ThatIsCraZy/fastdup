@@ -152,6 +152,7 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
             "maxInflightBytes":io.max_inflight_bytes(), "peakInflightBytes":io.peak_inflight_bytes(),
             "submitted":io.submitted_operations(), "completed":io.completed_operations()},
         "caches": [
+            {"id":"locationProofs", "hits":read.location_proofs().hits, "misses":read.location_proofs().misses, "evictions":read.location_proofs().evictions, "residentBytes":read.location_proofs().resident_bytes},
             {"id":"verifiedRead", "hits":read.hits(), "misses":read.misses(), "evictions":read.evictions(), "residentBytes":read.resident_bytes()},
             {"id":"exactIndex", "hits":exact.hits(), "misses":exact.misses(), "evictions":exact.evictions(), "residentPages":exact.resident_pages()},
             {"id":"similarityIndex", "hits":similarity.hits(), "misses":similarity.misses(), "evictions":similarity.evictions(), "residentPages":similarity.resident_pages()},

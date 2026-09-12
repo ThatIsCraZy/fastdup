@@ -14,6 +14,7 @@ const MAGIC: &[u8; 8] = b"FDIO0001";
 #[cfg(test)]
 thread_local! {
     pub(crate) static READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -414,6 +415,8 @@ fn write_physical(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
+    #[cfg(test)]
+    WRITE_CALLS.with(|total| total.set(total.get() + 1));
     offset
         .checked_add(bytes.len() as u64)
         .ok_or(io::ErrorKind::InvalidInput)?;

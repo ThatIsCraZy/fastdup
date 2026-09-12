@@ -36,7 +36,10 @@ pub(crate) use results::{GenerationLivenessProof, GenerationMetadataGcSummary};
 
 const METADATA_SUFFIX: &str = ".fdm";
 
-const WRITE_BLOCK_BYTES: usize = 4_096;
+// Each growing StorageIo write advances and synchronizes the aligned length
+// head. Batch the already encoded immutable object at the backend I/O quantum
+// instead of forcing one head write and durability barrier per 4-KiB page.
+const WRITE_BLOCK_BYTES: usize = 1024 * 1024;
 
 const MAX_METADATA_OBJECT_BYTES_U64: u64 = 16 * 1_024 * 1_024;
 
