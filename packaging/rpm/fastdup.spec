@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           fastdup
-Version:        0.7.3
+Version:        0.7.4
 Release:        1%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
@@ -108,6 +108,12 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Sat Sep 12 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-1
+- Bound missing-Exact-index fallback to required Records and dependencies.
+- Separate mount health from telemetry gaps and ordinary write backpressure.
+- Reclaim resident free allocator arenas on a bounded background cadence.
+- Display disk read and write IOPS alongside throughput in the WebUI.
+
 * Wed Sep 09 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.3-1
 - Release compressed Verified Read caching, Metadata GC crash fixes and live Runtime health.
 - Refresh bilingual README, product page, screenshots and release documentation.

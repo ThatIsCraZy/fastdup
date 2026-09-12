@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Produktseite</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.3">Release-Informationen</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.4">Release-Informationen</a>
 </p>
 
 fastdup ist eine experimentelle, softwaredefinierte Single-Node-
@@ -31,6 +31,30 @@ HTTPS-WebUI hält die Administration einfach.
 > fastdup ist ein Forschungsprototyp und kein produktionsreifes Backup-Produkt.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
+
+## Neu in v0.7.4 · 12. September 2026
+
+- Fehlende Exact-Index-Hinweise verwenden jetzt den kompakten Recovery Index
+  jedes Containers und prüfen nur benötigte Records und unabhängige Bases. Ein
+  vollständiger Scrub prüft weiterhin komplette Container.
+- Der Repository-Zustand folgt dem FUSE-Mount und dem systemd-Dienst. Fehlende
+  Telemetrie und normale Schreib-Backpressure melden keinen falschen Ausfall
+  mehr; bestätigte Prozess- und Integritätsfehler bleiben gespeichert.
+- Ein begrenzter Hintergrund-Worker gibt freie glibc-Arena-Seiten zurück, wenn
+  Allocator-Reserve noch anonymes RSS belegt. Er verwirft weder aktive Objekte
+  noch Cache-Einträge; Allocator-Nutzung und Trims erscheinen in der Telemetrie.
+- Laufwerksaktivität und Storage-Übersicht zeigen gemessene Lese-/Schreib-IOPS
+  neben MB/s. Eine fehlende Messung bleibt von null Aktivität unterscheidbar.
+
+Die Fallback-Read-Regression liest für ihr 8-KiB-Ziel keine vollständigen
+Container-Nutzdaten und fordert 50.560 Bytes über begrenzte Reads an. Im
+synthetischen Allocator-A/B sank das gehaltene RSS um rund 96 %. Beide Ergebnisse
+sind keine Ende-zu-Ende-Veeam-Messung; v0.7.4 war beim Erstellen dieser Hinweise
+noch nicht auf der Test-Appliance vermessen.
+
+[Release-Details v0.7.4](docs/releases/v0.7.4.md) · RPM-Version **0.7.4-1**.
+[Fallback-Read-Prüfung](docs/testing/bounded-fallback-reads-2026-09-12.md) ·
+[Status- und Allocator-Prüfung](docs/testing/runtime-health-and-allocator-2026-09-12.md).
 
 ## Neu in v0.7.3 · 9. September 2026
 
@@ -213,11 +237,11 @@ Benötigt werden:
 Aktuelles Binärpaket herunterladen und installieren:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.7.3-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.7.4-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm">Download the RPM</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm">Download the RPM</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Product page</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.3">Release notes</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.4">Release notes</a>
 </p>
 
 fastdup is an experimental, software-defined single-node storage appliance for
@@ -29,6 +29,30 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > [!WARNING]
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
+
+## New in v0.7.4 · 12 September 2026
+
+- Missing Exact-index hints now fall back through each Container's compact
+  Recovery Index and verify only the required Records and independent Bases.
+  Full scrub continues to verify complete Containers.
+- Repository availability now follows the FUSE mount and systemd service state.
+  Missing telemetry and ordinary write backpressure no longer report a false
+  outage, while confirmed process and integrity failures remain latched.
+- A bounded background worker returns free glibc arena pages when allocator
+  slack still occupies anonymous RSS. It does not discard live objects or cache
+  entries; allocator usage and trim activity are visible in Telemetry.
+- Disk activity and the Storage overview show measured read/write IOPS next to
+  MB/s, preserving the distinction between an unavailable sample and zero.
+
+The fallback-read regression performs no whole-Container payload reads for its
+8-KiB target and requests 50,560 bytes through bounded reads. The allocator A/B
+reduced retained RSS by about 96% in its synthetic workload. Neither result is
+an end-to-end Veeam throughput measurement; v0.7.4 had not yet been measured on
+the test appliance when these release notes were prepared.
+
+[Release notes v0.7.4](docs/releases/v0.7.4.md) · RPM version **0.7.4-1**.
+[Fallback-read qualification](docs/testing/bounded-fallback-reads-2026-09-12.md) ·
+[Health and allocator qualification](docs/testing/runtime-health-and-allocator-2026-09-12.md).
 
 ## New in v0.7.3 · 9 September 2026
 
@@ -209,11 +233,11 @@ You need:
 Download and install the current binary package:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.7.3-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.7.4-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

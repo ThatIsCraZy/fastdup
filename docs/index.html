@@ -39,9 +39,9 @@
         "name": "fastdup",
         "applicationCategory": "StorageApplication",
         "operatingSystem": "Rocky Linux 10 x86-64",
-        "softwareVersion": "0.7.3",
+        "softwareVersion": "0.7.4",
         "license": "https://www.apache.org/licenses/LICENSE-2.0",
-        "downloadUrl": "https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm",
+        "downloadUrl": "https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm",
         "codeRepository": "https://github.com/ThatIsCraZy/fastdup"
       }
     </script>
@@ -109,12 +109,12 @@
           <div class="hero-actions">
             <a
               class="button primary lang-de"
-              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm"
+              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm"
               >RPM herunterladen <span>↓</span></a
             >
             <a
               class="button primary lang-en"
-              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm"
+              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm"
               >Download RPM <span>↓</span></a
             >
             <a class="button secondary lang-de" href="#installation"
@@ -133,7 +133,7 @@
             data.
           </p>
           <div class="compatibility">
-            <span>RPM v0.7.3</span><span>Rocky Linux 10</span><span>x86-64</span
+            <span>RPM v0.7.4</span><span>Rocky Linux 10</span><span>x86-64</span
             ><span>Rust</span>
           </div>
         </div>
@@ -156,16 +156,16 @@
 
       <div class="section-shell release-note">
         <p lang="de" class="lang-de">
-          <b>Neu in v0.7.3 · 09.09.2026:</b> Komprimierter Verified-Read-Cache mit
-          sichtbarer RAM-Ersparnis. Metadata-GC-Crashfix, automatisches Bereinigen
-          toter FUSE-Mounts und klare Meldungen bei Runtime-Ausfällen oder Schreibpausen.
-          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.3">Release-Details ↗</a>
+          <b>Neu in v0.7.4 · 12.09.2026:</b> Begrenzte Record-Reads bei fehlenden
+          Exact-Index-Hinweisen, korrekter Mount-/Dienstzustand, zurückgegebenes
+          Allocator-RAM sowie Lese- und Schreib-IOPS in der WebUI.
+          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.4">Release-Details ↗</a>
         </p>
         <p lang="en" class="lang-en">
-          <b>New in v0.7.3 · 9 September 2026:</b> Compressed Verified Read caching with
-          visible RAM savings. A Metadata-GC crash fix, disconnected FUSE mount
-          cleanup, and clear status for Runtime outages or paused writes.
-          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.3">Release details ↗</a>
+          <b>New in v0.7.4 · 12 September 2026:</b> Bounded Record reads when Exact
+          hints are missing, accurate mount/service health, reclaimed allocator
+          RAM, and read/write IOPS in the WebUI.
+          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.4">Release details ↗</a>
         </p>
       </div>
       <section class="trust-strip" aria-label="Produktmerkmale">
@@ -1234,10 +1234,10 @@
             </div>
             <pre
               id="install"
-            ><code>curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm &amp;&amp;
-curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/SHA256SUMS &amp;&amp;
+            ><code>curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm &amp;&amp;
+curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/SHA256SUMS &amp;&amp;
 sha256sum --check --ignore-missing SHA256SUMS &amp;&amp;
-sudo dnf install ./fastdup-0.7.3-1.el10.x86_64.rpm &amp;&amp;
+sudo dnf install ./fastdup-0.7.4-1.el10.x86_64.rpm &amp;&amp;
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code></pre>
             <p id="copy-status" role="status" aria-live="polite"></p>
             <div class="terminal-result">
@@ -1537,22 +1537,22 @@ sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code>
             See the WebUI. Install the RPM. Evaluate fastdup.
           </h2>
           <p class="lang-de">
-            Release 0.7.3 für Rocky Linux 10 auf x86-64. Forschungsprototyp —
+            Release 0.7.4 für Rocky Linux 10 auf x86-64. Forschungsprototyp —
             bitte nicht als einzige Kopie wichtiger Daten einsetzen.
           </p>
           <p class="lang-en">
-            Release 0.7.3 for Rocky Linux 10 on x86-64. Research prototype —
+            Release 0.7.4 for Rocky Linux 10 on x86-64. Research prototype —
             please do not use it as the only copy of important data.
           </p>
         </div>
         <div>
           <a
             class="button primary lang-de"
-            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm"
+            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm"
             >RPM herunterladen <span>↓</span></a
           ><a
             class="button primary lang-en"
-            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.3/fastdup-0.7.3-1.el10.x86_64.rpm"
+            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm"
             >Download RPM <span>↓</span></a
           ><a
             class="button secondary"
