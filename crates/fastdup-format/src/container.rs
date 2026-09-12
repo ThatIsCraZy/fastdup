@@ -686,8 +686,8 @@ pub struct ContainerRecoveryEnvelope {
     descriptor: SealedContainerDescriptor,
 }
 
-/// One independently decodable record candidate obtained from an
-/// authenticated Container Recovery Index.
+/// One unverified Record hint obtained from a checksum-checked Container
+/// Recovery Index. It never establishes content identity by itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryIndexCandidate {
     container_id: ContainerId,
@@ -1246,6 +1246,62 @@ impl ContainerRecoveryEnvelope {
 }
 
 impl VerifiedRecoveryIndex {
+    /// Enumerates bounded Record hints. These are not content proofs: the selected
+    /// Record still requires complete checksum, codec and Chunk-ID verification.
+    pub fn candidates(&self) -> impl Iterator<Item = RecoveryIndexCandidate> + '_ {
+        self.entries
+            .iter()
+            .copied()
+            .map(|entry| RecoveryIndexCandidate {
+                container_id: self.descriptor.container_id(),
+                container_generation: self.descriptor.container_generation(),
+                entry,
+            })
+    }
+
+    /// Verifies one selected Record and returns all independently checked siblings.
+    /// Unrelated Container payloads are not needed to prove these Chunk identities.
+    /// The resolver must select an independent Base; its bytes are rehashed here.
+    ///
+    /// # Errors
+    /// Rejects foreign hints, mismatched coordinates, CRCs, dependencies, lengths
+    /// or decoded Chunk identities. No payload escapes before all checks succeed.
+    pub fn decode_candidate_with_resolver(
+        &self,
+        candidate: RecoveryIndexCandidate,
+        record_bytes: &[u8],
+        resolve: &mut impl FnMut(DependentDependency) -> Result<Vec<u8>, FormatError>,
+    ) -> Result<Vec<VerifiedChunkPayload>, FormatError> {
+        if candidate.container_id != self.descriptor.container_id()
+            || candidate.container_generation != self.descriptor.container_generation()
+            || self.entries.binary_search(&candidate.entry).is_err()
+            || record_bytes.len() != candidate.record_range()?.length()
+        {
+            return Err(FormatError::RecoveryIndexCandidateMismatch);
+        }
+        let chunks = if is_dependent_codec(candidate.entry.codec_id) {
+            let record = ValidatedDependentRecord::new(record_bytes)?;
+            let base = resolve(record.dependency)?;
+            vec![record.decode(&base)?]
+        } else {
+            decode_encoding_record(record_bytes)?.chunks
+        };
+        // Derive coordinates from the validated stored Record, never from the hint.
+        let mut observed = Vec::new();
+        IndexEntry::append_from_encoded_record(
+            record_bytes,
+            candidate.entry.record_offset,
+            &mut observed,
+        )?;
+        if !observed.contains(&candidate.entry) {
+            return Err(FormatError::RecoveryIndexCandidateMismatch);
+        }
+        Ok(chunks
+            .into_iter()
+            .map(RawRecord::into_verified_payload)
+            .collect())
+    }
+
     /// Finds one dependency-free RAW/Zstd candidate for the requested Base.
     /// The returned record must still be read and passed to
     /// [`Self::decode_independent_candidate`].
@@ -1343,6 +1399,16 @@ impl VerifiedRecoveryIndex {
 }
 
 impl RecoveryIndexCandidate {
+    #[must_use]
+    pub const fn chunk_id(self) -> ChunkId {
+        self.entry.chunk_id
+    }
+
+    #[must_use]
+    pub const fn logical_length(self) -> u32 {
+        self.entry.logical_length
+    }
+
     /// Returns the bounded record range named by this verified Index
     /// candidate.
     ///

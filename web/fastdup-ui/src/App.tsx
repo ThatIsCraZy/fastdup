@@ -653,7 +653,7 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
       <CardHeader>
         <div>
           <span className="section-kicker">Storage paths</span>
-          <h2>{t("Outstanding I/O pro Target")}</h2>
+          <h2>{t("Laufwerksaktivität")}</h2>
         </div>
         <Badge className="live">
           <span className="pulse" />1 s Sampler
@@ -664,7 +664,7 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
           <span>{t("Rolle & Gerät")}</span>
           <span>{t("Typ / Kapazität")}</span>
           <span>HBA Port</span>
-          <span>Read / Write</span>
+          <span>{t("Lesen / Schreiben")}</span>
           <span>Outstanding I/O</span>
           <span>Status</span>
         </div>
@@ -691,6 +691,7 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
               <strong>
                 {disk.readMbps.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} / {disk.writeMbps.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} MB/s
               </strong>
+              <small>{disk.readIops == null ? "—" : disk.readIops.toLocaleString(locale, { maximumFractionDigits: 1 })} / {disk.writeIops == null ? "—" : disk.writeIops.toLocaleString(locale, { maximumFractionDigits: 1 })} IOPS</small>
               <small>{disk.utilization.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} % Utilization</small>
             </span>
             <span className="io-cell">
@@ -707,6 +708,7 @@ function DiskTelemetryTable({ disks }: { disks: DiskTelemetry[] }) {
             </span>
           </div>
         ))}
+        <p className="detail-note">{t("MB/s und IOPS: Lesen / Schreiben im Messintervall. Outstanding I/O: zum Messzeitpunkt ausstehende Anfragen.")}</p>
         {disks.length === 0 && (
           <div className="disk-empty">{t("Kein Repository gebunden – keine relevanten Targets.")}</div>
         )}

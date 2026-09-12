@@ -50,6 +50,7 @@ mod similarity_index_repository;
 mod similarity_mmap;
 mod similarity_simd;
 pub use scrub_progress::{ScrubCertificate, ScrubCoverage, ScrubProgress};
+mod recovery_read;
 mod structural_recovery;
 pub use structural_recovery::PendingDataVerification;
 mod tiered_storage;
@@ -2255,8 +2256,8 @@ impl<I: StorageIo> ContainerRepository<I> {
         let footer_offset = actual_length
             .checked_sub(FOOTER_BYTES)
             .ok_or(FormatError::ArithmeticOverflow)?;
-        let header = self.storage.read_exact_at(name, 0, HEADER_BYTES)?;
-        let footer = self.storage.read_exact_at(
+        let header = self.storage.read_structure_at(name, 0, HEADER_BYTES)?;
+        let footer = self.storage.read_structure_at(
             name,
             footer_offset,
             usize::try_from(FOOTER_BYTES).map_err(|_| FormatError::ArithmeticOverflow)?,
@@ -2287,7 +2288,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             let read_offset = offset
                 .checked_add(u64::try_from(completed).map_err(|_| FormatError::ArithmeticOverflow)?)
                 .ok_or(FormatError::ArithmeticOverflow)?;
-            bytes.extend(self.storage.read_exact_at(name, read_offset, read_length)?);
+            bytes.extend(self.storage.read_structure_at(name, read_offset, read_length)?);
             completed = completed
                 .checked_add(read_length)
                 .ok_or(FormatError::ArithmeticOverflow)?;
@@ -2333,12 +2334,11 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(container)
     }
 
-    /// Locates one logical Chunk by identity, fully verifies its containing
-    /// immutable container, and returns an owned byte-exact copy.
+    /// Locates one logical Chunk through Container-local Recovery Index hints,
+    /// fully verifies its selected Record, and returns an owned byte-exact copy.
     ///
-    /// This bounded rebuild/read seam intentionally scans published containers;
-    /// the persistent Exact Index will later accelerate location selection
-    /// without becoming authoritative.
+    /// This fallback scans compact local indexes when persistent Exact hints
+    /// are unavailable. Location hints never replace payload verification.
     ///
     /// # Errors
     ///
@@ -2366,35 +2366,16 @@ impl<I: StorageIo> ContainerRepository<I> {
         chunk_id: fastdup_format::ChunkId,
         logical_length: u64,
     ) -> Result<VerifiedChunkRead, StoreError> {
-        let mut names = self.storage.list_names()?;
-        names.sort_unstable();
-        for name in names {
-            let Some(expected_id) = parse_published_name(&name)? else {
-                continue;
-            };
-            if !self.selectable_container(expected_id) {
-                continue;
+        let required = BTreeMap::from([(chunk_id, logical_length)]);
+        let mut result = None;
+        self.scan_required_records(&required, |payloads| {
+            if let Some(requested) = payloads.iter().find(|payload| {
+                payload.chunk_id() == chunk_id && u64::try_from(payload.len()) == Ok(logical_length)
+            }) {
+                result = Some(VerifiedChunkRead::single(requested.clone(), payloads));
             }
-            let bytes = self.storage.read(&name)?;
-            let container = self.decode_published_bytes(expected_id, &bytes)?;
-            let Some(record_ordinal) = container.records().iter().position(|record| {
-                record.chunk_id() == chunk_id
-                    && u64::try_from(record.payload().len()) == Ok(logical_length)
-            }) else {
-                continue;
-            };
-            let requested = container.records()[record_ordinal].verified_payload();
-            let record_offset = container.locations()[record_ordinal].record_offset();
-            let admission_group = container
-                .records()
-                .iter()
-                .zip(container.locations())
-                .filter(|(_, location)| location.record_offset() == record_offset)
-                .map(|(record, _)| record.verified_payload())
-                .collect();
-            return Ok(VerifiedChunkRead::single(requested, admission_group));
-        }
-        Err(StoreError::MissingVerifiedChunk {
+        })?;
+        result.ok_or(StoreError::MissingVerifiedChunk {
             chunk_id,
             logical_length,
         })
@@ -3923,41 +3904,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         required: &BTreeMap<fastdup_format::ChunkId, u64>,
     ) -> Result<(), StoreError> {
-        if required.is_empty() {
-            return Ok(());
-        }
-        let mut missing = required.clone();
-        let mut names = self.storage.list_names()?;
-        names.sort_unstable();
-        for name in names {
-            let Some(expected_id) = parse_published_name(&name)? else {
-                continue;
-            };
-            if !self.selectable_container(expected_id) {
-                continue;
-            }
-            let bytes = self.storage.read(&name)?;
-            let container = self.decode_published_bytes(expected_id, &bytes)?;
-            for record in container.records() {
-                let chunk_id = record.chunk_id();
-                let Some(required_length) = missing.get(&chunk_id).copied() else {
-                    continue;
-                };
-                if u64::try_from(record.payload().len()) == Ok(required_length) {
-                    missing.remove(&chunk_id);
-                }
-            }
-            if missing.is_empty() {
-                return Ok(());
-            }
-        }
-        let Some((&chunk_id, &logical_length)) = missing.first_key_value() else {
-            unreachable!("ASSERT: nonempty missing map must have a first key")
-        };
-        Err(StoreError::MissingVerifiedChunk {
-            chunk_id,
-            logical_length,
-        })
+        self.scan_required_records(required, drop)
     }
 
     #[must_use]

@@ -288,9 +288,9 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
         &self,
         required: &BTreeMap<fastdup_format::ChunkId, u64>,
     ) -> Result<(), StoreError> {
-        // One fresh proof may cover several required Chunks in the same
-        // Encoding Record. Retain only future required identities, never the
-        // decoded payloads, and never carry this evidence into another pass.
+        // A missing hint must not restart already verified Records or bypass
+        // later valid hints. Retain failed identities, not another full graph.
+        let mut missing = BTreeMap::new();
         let mut co_verified = BTreeSet::new();
         for (chunk_id, logical_length) in required {
             if co_verified.remove(chunk_id) {
@@ -301,18 +301,21 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
                 *chunk_id,
                 *logical_length,
             ) else {
-                return self.containers.verify_required_chunks(required);
+                missing.insert(*chunk_id, *logical_length);
+                continue;
             };
             let (_, groups) = read.into_parts();
             for payload in groups.iter().flatten() {
                 let id = payload.chunk_id();
-                if id > *chunk_id && required.get(&id).copied() == u64::try_from(payload.len()).ok()
-                {
-                    co_verified.insert(id);
+                if required.get(&id).copied() == u64::try_from(payload.len()).ok() {
+                    missing.remove(&id);
+                    if id > *chunk_id {
+                        co_verified.insert(id);
+                    }
                 }
             }
         }
-        Ok(())
+        self.containers.verify_required_chunks(&missing)
     }
 }
 

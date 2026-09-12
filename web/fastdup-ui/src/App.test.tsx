@@ -439,11 +439,13 @@ describe("FastDup Control Plane UI", () => {
         ...previewSnapshot.telemetry.disks[0],
         id: "nvme0n1",
         model: "Repo Metadata Disk",
+        readIops: 123.4, writeIops: 56.7,
       },
       {
         ...previewSnapshot.telemetry.disks[1],
         id: "sdb",
         model: "Repo Data Disk",
+        readIops: undefined, writeIops: undefined,
       },
       {
         ...previewSnapshot.telemetry.disks[0],
@@ -479,6 +481,8 @@ describe("FastDup Control Plane UI", () => {
     expect(await screen.findByText("Repo Metadata Disk")).toBeVisible();
     expect(screen.getByText("Repo Data Disk")).toBeVisible();
     expect(screen.queryByText("Host System Disk")).not.toBeInTheDocument();
+    expect(screen.getByText("123,4 / 56,7 IOPS")).toBeVisible();
+    expect(screen.getByText("— / — IOPS")).toBeVisible();
   });
 
   it("provisioniert nur über erkannte Target-Karten ohne Gerätepfad-Freitext", async () => {

@@ -57,3 +57,12 @@ Tests cover envelope/index/record verification, corrupt Index CRCs, one
 namespace enumeration per dependent Container, and repeated-Base caching.
 Failures close the selected path without returning unchecked bytes or weakening
 GC proof requirements.
+
+## Required Record discovery (2026-09-12)
+
+ADR 0030 extends this same bounded discovery strategy to demand reads and
+required-Chunk proof fallback. The generalized candidate remains unverified
+until its complete selected Record and optional independent Base pass the
+format verifier. Neither the local Recovery Index nor its negative lookup is
+promoted into content or deletion authority. Complete scrub still checks all
+payloads and the structural commitment.

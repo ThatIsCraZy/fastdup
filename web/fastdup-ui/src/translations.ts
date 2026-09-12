@@ -219,6 +219,8 @@ export const english: Record<string, string> = {
 
   "UI-Einstellungen": "UI settings",
   "Veraltet": "Stale",
+  "Laufwerksaktivität": "Disk activity",
+  "MB/s und IOPS: Lesen / Schreiben im Messintervall. Outstanding I/O: zum Messzeitpunkt ausstehende Anfragen.": "MB/s and IOPS: reads / writes over the sample interval. Outstanding I/O: pending requests at the sample instant.",
   "Outstanding I/O pro Target": "Outstanding I/O per target",
   "Keine Messwerte im gewählten Zeitraum.": "No measurements in the selected range.",
   "Übersicht": "Overview",

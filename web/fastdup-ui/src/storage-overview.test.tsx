@@ -20,3 +20,11 @@ it("keeps unavailable usage distinct from an empty repository even without inven
  expect(screen.queryByText('0 B')).not.toBeInTheDocument();
  expect(screen.getByText('Die logische Belegung wird von der laufenden Runtime ermittelt.')).toBeVisible();
 });
+
+it("shows read and write IOPS beside device throughput",()=>{
+ const snapshot=structuredClone(previewSnapshot);
+ snapshot.telemetry.disks[0].id="nvme0n1";
+ snapshot.telemetry.disks.forEach(disk=>{disk.readIops=12.5;disk.writeIops=87.5;});
+ render(<I18nProvider><StorageOverview snapshot={snapshot}/></I18nProvider>);
+ expect(screen.getAllByText("Lesen / Schreiben: 12,5 / 87,5 IOPS").length).toBeGreaterThan(0);
+});
