@@ -4,6 +4,12 @@ status: accepted
 
 # Map active Exact Runs and index their page bounds
 
+Amended by [ADR 0046](0046-bound-verified-read-cache-by-live-memory-headroom.md)
+on 12 September 2026: all reusable read content shares one application cache;
+repository I/O and FUSE file data use direct paths. File-backed mappings and
+separate replacement policies described below are superseded. Immutable leases,
+verification and publication ordering remain required.
+
 Filesystem-backed Exact activation and recovery expose every physical Run in
 the selected Run Set through a read-only mapping held by an immutable-file
 lease. Before a reader becomes selectable, recovery verifies the expected

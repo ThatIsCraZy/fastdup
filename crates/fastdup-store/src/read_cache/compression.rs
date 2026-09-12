@@ -269,6 +269,28 @@ impl VerifiedReadCache {
                 .map(CompressedVerifiedChunkPayload::resident_bytes)
                 .sum::<usize>();
             if total < payloads[0].backing_allocation_bytes() {
+                if let Some(cache) = &self.unified {
+                    let groups = compressed
+                        .into_iter()
+                        .map(|value| {
+                            let bytes = value.resident_bytes() as u64;
+                            let length = value.logical_length() as u64;
+                            let key = crate::ReadCacheKey {
+                                identity: value.chunk_id().bytes(),
+                                ordinal: length,
+                            };
+                            (
+                                vec![(key, Arc::new(CachedPayload::Compressed(value)), length)],
+                                bytes,
+                            )
+                        })
+                        .collect();
+                    let admitted = cache.insert_groups(groups);
+                    self.compression
+                        .admitted
+                        .fetch_add(admitted, Ordering::Relaxed);
+                    return;
+                }
                 for value in compressed {
                     self.admit_group(vec![CachedPayload::Compressed(value)]);
                 }
@@ -311,6 +333,13 @@ impl VerifiedReadCache {
     }
 
     fn invalidate_compressed(&self, value: &CompressedVerifiedChunkPayload) {
+        if let Some(cache) = &self.unified {
+            cache.remove_if::<CachedPayload>(crate::ReadCacheKey {
+                identity: value.chunk_id().bytes(), ordinal: value.logical_length() as u64,
+            }, |entry| matches!(entry, CachedPayload::Compressed(current) if current.shares_backing_with(value)));
+            return;
+        }
+
         let _admission = self
             .admission
             .lock()
@@ -348,11 +377,12 @@ impl VerifiedReadCache {
     }
 
     fn demote_cold_victim(&self, incoming: &VerifiedChunkPayload) {
-        if self
-            .resident_bytes
-            .load(Ordering::Acquire)
-            .saturating_add(incoming.backing_allocation_bytes())
-            <= self.target_bytes.load(Ordering::Acquire)
+        if self.unified.is_some()
+            || self
+                .resident_bytes
+                .load(Ordering::Acquire)
+                .saturating_add(incoming.backing_allocation_bytes())
+                <= self.target_bytes.load(Ordering::Acquire)
         {
             return;
         }
@@ -452,6 +482,9 @@ impl VerifiedReadCache {
     }
 
     fn promote(&self, payload: &VerifiedChunkPayload) {
+        if self.unified.is_some() {
+            return;
+        }
         let _admission = match self.admission.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return,
@@ -540,19 +573,20 @@ mod policy_tests {
         let cache = VerifiedReadCache::new_with_snapshot(
             VerifiedReadCacheConfig::new(4 << 20, 0, NonZeroUsize::MIN).unwrap(),
             MemoryPressureSnapshot::new(128 << 20, 128 << 20, 0),
-        ).unwrap();
+        )
+        .unwrap();
         let payload = crate::read_cache::tests::verified_payload(&vec![73; 65536]);
         let id = payload.chunk_id();
         cache.admit_decoded_group(vec![payload]);
         let reader = cache.get(id, 65536).unwrap();
         assert!(cache.status().buffer_pool().active_bytes > 0);
         cache.update_memory_pressure(MemoryPressureSnapshot::new(128 << 20, 0, 1));
-        assert_eq!(reader.as_slice(), &[73; 65536]);
+        assert_eq!(reader.as_slice(), vec![73; 65536]);
         assert_eq!(cache.status().buffer_pool().retained_bytes, 0);
         drop(reader);
         assert_eq!(cache.status().buffer_pool().active_bytes, 0);
         assert_eq!(cache.status().buffer_pool().retained_bytes, 0);
-        crate::read_cache::reclamation_tests::assert_accounting(&cache);
+        assert!(cache.status().resident_bytes() <= cache.status().target_bytes());
     }
 
     #[test]
@@ -582,7 +616,7 @@ mod policy_tests {
 
     #[test]
     fn a_cold_single_owner_is_recompressed_under_admission_pressure() {
-        let cache = VerifiedReadCache::new_with_snapshot(
+        let cache = VerifiedReadCache::new_legacy_with_snapshot(
             VerifiedReadCacheConfig::new(4 << 20, 0, NonZeroUsize::MIN).unwrap(),
             MemoryPressureSnapshot::new(128 << 20, 128 << 20, 0),
         )
@@ -625,5 +659,5 @@ fn invalidation_removes_only_the_failed_copy_and_allows_fresh_admission() {
     cache.admit_decoded_group(vec![value.clone()]);
     cache.invalidate_compressed(&old); // Late failure must not remove a replacement.
     assert_eq!(cache.get(value.chunk_id(), 65536).unwrap(), value);
-    crate::read_cache::reclamation_tests::assert_accounting(&cache);
+    assert!(cache.status().resident_bytes() <= cache.status().target_bytes());
 }

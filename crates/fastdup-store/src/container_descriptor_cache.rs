@@ -1,75 +1,17 @@
-use crate::read_cache::{
-    MemoryPressureSnapshot, SYSTEM_REFRESH_INTERVAL, shared_cache_reserve_bytes,
+//! Typed Container-envelope verification views in the unified read cache.
+use crate::{
+    MemoryPressureSnapshot, ReadCacheClass, ReadCacheKey, ReadCacheNamespace,
+    shared_cache_reserve_bytes,
 };
-use crate::{CacheFallback, CacheObservation, CachePool};
 use fastdup_format::{ContainerId, SealedContainerDescriptor};
-use std::collections::HashMap;
-use std::mem::size_of;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock};
-use std::time::Instant;
-
-const SHARD_COUNT: usize = 256;
+use std::sync::Arc;
 const HARD_CAPACITY_ENTRIES: usize = 16_777_216;
-const MINIMUM_CONTAINER_BYTES: u64 = 32 * 1_024 * 1_024;
-const ACCOUNTED_ENTRY_BYTES: usize = 160;
-const EFFECTIVE_RAM_DIVISOR: u64 = 50;
-const _: () = assert!(SHARD_COUNT.is_power_of_two());
-const _: () = assert!(HARD_CAPACITY_ENTRIES.is_multiple_of(SHARD_COUNT));
-const _: () =
-    assert!(HARD_CAPACITY_ENTRIES as u64 * MINIMUM_CONTAINER_BYTES >= 500 * 1_024_u64.pow(4));
+const MINIMUM_CONTAINER_BYTES: u64 = 32 * 1024 * 1024;
+const ACCOUNTED_ENTRY_BYTES: usize = size_of::<SealedContainerDescriptor>() + 512;
 
-#[derive(Debug, Default)]
-struct ShardState {
-    entries: HashMap<[u8; 16], SealedContainerDescriptor>,
-    counters: DescriptorShardCounters,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct DescriptorShardCounters {
-    hits: u64,
-    misses: u64,
-    admissions: u64,
-    evictions: u64,
-}
-
-impl DescriptorShardCounters {
-    fn add_assign(&mut self, other: Self) {
-        self.hits = self.hits.saturating_add(other.hits);
-        self.misses = self.misses.saturating_add(other.misses);
-        self.admissions = self.admissions.saturating_add(other.admissions);
-        self.evictions = self.evictions.saturating_add(other.evictions);
-    }
-}
-
-#[repr(align(64))]
-#[derive(Debug, Default)]
-struct DescriptorShard {
-    state: Mutex<ShardState>,
-}
-
-/// Dynamically resident cache of verified immutable Container envelopes.
-///
-/// The hard addressable capacity covers at least 500 TiB using the current
-/// minimum 32-MiB Container size. Shards allocate only as descriptors arrive.
-/// A pressure gate serializes rare target changes with cold admissions; hot
-/// lookups touch one shard and never take a process-global lock.
 #[derive(Debug)]
 pub(crate) struct ContainerDescriptorCache {
-    shards: Box<[DescriptorShard]>,
-    pressure_gate: RwLock<()>,
-    target_entries: AtomicUsize,
-    entry_count: AtomicUsize,
-    unsharded_misses: AtomicU64,
-    pressure_rejections: AtomicU64,
-    allocation_rejections: AtomicU64,
-    effective_limit_bytes: AtomicU64,
-    available_bytes: AtomicU64,
-    swap_used_bytes: AtomicU64,
-    automatic_pressure: bool,
-    started: Instant,
-    last_refresh_millis: AtomicU64,
-    budget_pool: Option<CachePool>,
+    cache: ReadCacheNamespace,
 }
 
 /// Process-local telemetry for verified Container-envelope reuse.
@@ -193,323 +135,73 @@ impl ContainerDescriptorCacheStatus {
 
 impl ContainerDescriptorCache {
     pub(crate) fn new_system() -> Self {
-        let snapshot = MemoryPressureSnapshot::read_system()
-            .unwrap_or_else(|_| MemoryPressureSnapshot::new(0, 0, 1));
-        Self::build(snapshot, true)
-    }
-
-    pub(crate) fn new_with_snapshot(snapshot: MemoryPressureSnapshot) -> Self {
-        Self::build(snapshot, false)
-    }
-
-    fn build(snapshot: MemoryPressureSnapshot, automatic_pressure: bool) -> Self {
-        let mut shards = Vec::new();
-        if shards.try_reserve_exact(SHARD_COUNT).is_ok() {
-            shards.resize_with(SHARD_COUNT, DescriptorShard::default);
+        Self {
+            cache: ReadCacheNamespace::system(ReadCacheClass::ContainerDescriptor),
         }
+    }
+    pub(crate) fn new_with_snapshot(snapshot: MemoryPressureSnapshot) -> Self {
         let cache = Self {
-            shards: shards.into_boxed_slice(),
-            pressure_gate: RwLock::new(()),
-            target_entries: AtomicUsize::new(0),
-            entry_count: AtomicUsize::new(0),
-            unsharded_misses: AtomicU64::new(0),
-            pressure_rejections: AtomicU64::new(0),
-            allocation_rejections: AtomicU64::new(0),
-            effective_limit_bytes: AtomicU64::new(0),
-            available_bytes: AtomicU64::new(0),
-            swap_used_bytes: AtomicU64::new(0),
-            automatic_pressure,
-            started: Instant::now(),
-            last_refresh_millis: AtomicU64::new(0),
-            budget_pool: automatic_pressure.then(|| {
-                CachePool::system(
-                    "containerDescriptors",
-                    CacheFallback::Data,
-                    (SHARD_COUNT * size_of::<DescriptorShard>()) as u64,
-                    (HARD_CAPACITY_ENTRIES * ACCOUNTED_ENTRY_BYTES
-                        + SHARD_COUNT * size_of::<DescriptorShard>()) as u64,
-                )
-            }),
+            cache: ReadCacheNamespace::isolated(ReadCacheClass::ContainerDescriptor, 0),
         };
         cache.apply_memory_pressure(snapshot);
         cache
     }
-
-    pub(crate) fn get(&self, container_id: ContainerId) -> Option<SealedContainerDescriptor> {
-        self.maybe_refresh_pressure();
-        let Some(shard) = self.shards.get(shard_index(container_id)) else {
-            self.unsharded_misses.fetch_add(1, Ordering::Relaxed);
-            return None;
-        };
-        let mut state = shard
-            .state
-            .lock()
-            .expect("ASSERT: Container descriptor cache shard lock poisoned");
-        let descriptor = state.entries.get(&container_id.bytes()).copied();
-        if let Some(descriptor) = descriptor {
-            assert_eq!(
-                descriptor.container_id(),
-                container_id,
-                "ASSERT: cached Container descriptor changed identity"
-            );
-            state.counters.hits = state.counters.hits.saturating_add(1);
-        } else {
-            state.counters.misses = state.counters.misses.saturating_add(1);
+    fn key(id: ContainerId) -> ReadCacheKey {
+        let mut identity = [0; 32];
+        identity[..16].copy_from_slice(&id.bytes());
+        ReadCacheKey {
+            identity,
+            ordinal: 0,
         }
-        descriptor
     }
-
-    pub(crate) fn insert(&self, container_id: ContainerId, descriptor: SealedContainerDescriptor) {
-        assert_eq!(
-            descriptor.container_id(),
-            container_id,
-            "ASSERT: a cached Container descriptor must retain its canonical identity"
-        );
-        self.maybe_refresh_pressure();
-        let _pressure = self
-            .pressure_gate
-            .read()
-            .expect("ASSERT: Container descriptor pressure gate poisoned");
-        let target = self.target_entries.load(Ordering::Acquire);
-        let index = shard_index(container_id);
-        let Some(shard) = self.shards.get(index) else {
-            self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-        let shard_target = target_for_shard(target, index);
-        if shard_target == 0 {
-            self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let mut state = shard
-            .state
-            .lock()
-            .expect("ASSERT: Container descriptor cache shard lock poisoned");
-        let key = container_id.bytes();
-        if let Some(existing) = state.entries.get(&key) {
-            assert_eq!(
-                *existing, descriptor,
-                "ASSERT: immutable Container identity cannot acquire a different envelope"
-            );
-            return;
-        }
-        if state.entries.len() >= shard_target {
-            let victim = *state
-                .entries
-                .keys()
-                .next()
-                .expect("ASSERT: a full descriptor-cache shard is nonempty");
-            assert!(
-                state.entries.remove(&victim).is_some(),
-                "ASSERT: selected descriptor-cache victim must exist"
-            );
-            state.counters.evictions = state.counters.evictions.saturating_add(1);
-            self.entry_count.fetch_sub(1, Ordering::Release);
-        }
-        if state.entries.try_reserve(1).is_err() {
-            self.allocation_rejections.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        assert!(
-            state.entries.insert(key, descriptor).is_none(),
-            "ASSERT: a new descriptor-cache key cannot replace an entry"
-        );
-        let resident = self.entry_count.fetch_add(1, Ordering::Release) + 1;
-        state.counters.admissions = state.counters.admissions.saturating_add(1);
-        assert!(
-            resident <= target,
-            "ASSERT: descriptor cache exceeded its distributed target"
+    pub(crate) fn get(&self, id: ContainerId) -> Option<SealedContainerDescriptor> {
+        self.cache
+            .get::<SealedContainerDescriptor>(Self::key(id))
+            .map(|value| *value)
+    }
+    pub(crate) fn insert(&self, id: ContainerId, descriptor: SealedContainerDescriptor) {
+        assert_eq!(id, descriptor.container_id(), "ASSERT: descriptor identity");
+        self.cache.insert(
+            Self::key(id),
+            Arc::new(descriptor),
+            size_of::<SealedContainerDescriptor>() as u64,
+            8192,
         );
     }
-
-    pub(crate) fn status(&self) -> ContainerDescriptorCacheStatus {
-        self.maybe_refresh_pressure();
-        let entries = self.entry_count.load(Ordering::Acquire);
-        let target = self.target_entries.load(Ordering::Acquire);
-        let mut counters = self.counters();
-        counters.misses = counters
-            .misses
-            .saturating_add(self.unsharded_misses.load(Ordering::Relaxed));
-        ContainerDescriptorCacheStatus {
-            hits: counters.hits,
-            misses: counters.misses,
-            admissions: counters.admissions,
-            evictions: counters.evictions,
-            pressure_rejections: self.pressure_rejections.load(Ordering::Relaxed),
-            allocation_rejections: self.allocation_rejections.load(Ordering::Relaxed),
-            capacity: self.hard_capacity_entries(),
-            target_entries: target,
-            entry_count: entries,
-            resident_bytes: entries.saturating_mul(ACCOUNTED_ENTRY_BYTES),
-            metadata_bytes: self
-                .shards
-                .len()
-                .saturating_mul(size_of::<DescriptorShard>()),
-            hard_coverage_bytes: coverage_bytes(self.hard_capacity_entries()),
-            target_coverage_bytes: coverage_bytes(target),
-            effective_limit_bytes: self.effective_limit_bytes.load(Ordering::Acquire),
-            available_bytes: self.available_bytes.load(Ordering::Acquire),
-            swap_used_bytes: self.swap_used_bytes.load(Ordering::Acquire),
-        }
-    }
-
-    fn maybe_refresh_pressure(&self) {
-        if !self.automatic_pressure {
-            return;
-        }
-        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let interval = u64::try_from(SYSTEM_REFRESH_INTERVAL.as_millis())
-            .expect("ASSERT: memory refresh interval fits u64 milliseconds");
-        let previous = self.last_refresh_millis.load(Ordering::Relaxed);
-        if elapsed.saturating_sub(previous) < interval
-            || self
-                .last_refresh_millis
-                .compare_exchange(previous, elapsed, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-        {
-            return;
-        }
-        let snapshot = MemoryPressureSnapshot::read_system()
-            .unwrap_or_else(|_| MemoryPressureSnapshot::new(0, 0, 1));
-        self.apply_memory_pressure(snapshot);
-    }
-
     fn apply_memory_pressure(&self, snapshot: MemoryPressureSnapshot) {
-        let _pressure = self
-            .pressure_gate
-            .write()
-            .expect("ASSERT: Container descriptor pressure gate poisoned");
-        let reserve = shared_cache_reserve_bytes(snapshot.effective_limit_bytes());
-        let headroom = snapshot.available_bytes().saturating_sub(reserve);
-        let fraction_budget = snapshot.effective_limit_bytes() / EFFECTIVE_RAM_DIVISOR;
-        let metadata = self.shards.len() * size_of::<DescriptorShard>();
-        let budget = if let Some(pool) = &self.budget_pool {
-            let counters = self.counters();
-            pool.target(
-                snapshot,
-                CacheObservation {
-                    hits: counters.hits,
-                    misses: counters.misses,
-                    evictions: counters.evictions,
-                    hit_bytes: counters.hits.saturating_mul(8192),
-                    resident_bytes: (self.entry_count.load(Ordering::Acquire)
-                        * ACCOUNTED_ENTRY_BYTES
-                        + metadata) as u64,
-                },
-            )
-            .saturating_sub(metadata as u64)
-        } else if snapshot.swap_used_bytes() == 0 {
-            headroom.min(fraction_budget)
-        } else {
-            0
-        };
-        let target = usize::try_from(budget / ACCOUNTED_ENTRY_BYTES as u64)
-            .unwrap_or(usize::MAX)
-            .min(self.hard_capacity_entries());
-        self.effective_limit_bytes
-            .store(snapshot.effective_limit_bytes(), Ordering::Release);
-        self.available_bytes
-            .store(snapshot.available_bytes(), Ordering::Release);
-        self.swap_used_bytes
-            .store(snapshot.swap_used_bytes(), Ordering::Release);
-        let previous = self.target_entries.swap(target, Ordering::AcqRel);
-        if target < previous {
-            self.trim_locked(target);
-        }
-        if let Some(pool) = &self.budget_pool {
-            pool.applied(
-                budget + metadata as u64,
-                (self.entry_count.load(Ordering::Acquire) * ACCOUNTED_ENTRY_BYTES + metadata)
-                    as u64,
-            );
-        }
-    }
-
-    fn trim_locked(&self, target: usize) {
-        let mut removed = 0_usize;
-        for (ordinal, shard) in self.shards.iter().enumerate() {
-            let mut state = shard
-                .state
-                .lock()
-                .expect("ASSERT: Container descriptor cache shard lock poisoned");
-            let quota = target_for_shard(target, ordinal);
-            let mut keep = quota;
-            let before = state.entries.len();
-            state.entries.retain(|_, _| {
-                if keep == 0 {
-                    false
-                } else {
-                    keep -= 1;
-                    true
-                }
-            });
-            let shard_removed = before - state.entries.len();
-            removed = removed
-                .checked_add(shard_removed)
-                .expect("ASSERT: descriptor cache entry count cannot overflow");
-            state.entries.shrink_to_fit();
-            state.counters.evictions = state.counters.evictions.saturating_add(
-                u64::try_from(shard_removed)
-                    .expect("ASSERT: descriptor shard entry count fits u64"),
-            );
-        }
-        let accounted = self.entry_count.fetch_sub(removed, Ordering::AcqRel);
-        assert!(
-            accounted >= removed,
-            "ASSERT: descriptor cache victims were charged"
+        self.cache.update_pressure(
+            snapshot,
+            (HARD_CAPACITY_ENTRIES * ACCOUNTED_ENTRY_BYTES) as u64,
+            shared_cache_reserve_bytes(snapshot.effective_limit_bytes()),
         );
     }
-
-    fn counters(&self) -> DescriptorShardCounters {
-        self.shards
-            .iter()
-            .fold(DescriptorShardCounters::default(), |mut total, shard| {
-                let state = shard
-                    .state
-                    .lock()
-                    .expect("ASSERT: Container descriptor cache shard lock poisoned");
-                total.add_assign(state.counters);
-                total
-            })
-    }
-
-    fn hard_capacity_entries(&self) -> usize {
-        if self.shards.len() == SHARD_COUNT {
-            HARD_CAPACITY_ENTRIES
-        } else {
-            0
+    pub(crate) fn status(&self) -> ContainerDescriptorCacheStatus {
+        let stats = self.cache.stats();
+        let pressure = self.cache.pressure();
+        let target = usize::try_from(self.cache.capacity() / ACCOUNTED_ENTRY_BYTES as u64)
+            .unwrap_or(usize::MAX);
+        ContainerDescriptorCacheStatus {
+            hits: stats.hits,
+            misses: stats.misses,
+            admissions: stats.admissions,
+            evictions: stats.evictions,
+            pressure_rejections: stats.rejections,
+            allocation_rejections: 0,
+            capacity: HARD_CAPACITY_ENTRIES,
+            target_entries: target.min(HARD_CAPACITY_ENTRIES),
+            entry_count: usize::try_from(stats.entries).unwrap_or(usize::MAX),
+            resident_bytes: usize::try_from(stats.resident_bytes).unwrap_or(usize::MAX),
+            metadata_bytes: 0,
+            hard_coverage_bytes: coverage_bytes(HARD_CAPACITY_ENTRIES),
+            target_coverage_bytes: coverage_bytes(target.min(HARD_CAPACITY_ENTRIES)),
+            effective_limit_bytes: pressure.effective_limit_bytes(),
+            available_bytes: pressure.available_bytes(),
+            swap_used_bytes: pressure.swap_used_bytes(),
         }
     }
 }
-
-fn target_for_shard(total: usize, shard: usize) -> usize {
-    total / SHARD_COUNT + usize::from(shard < total % SHARD_COUNT)
-}
-
 fn coverage_bytes(entries: usize) -> u64 {
-    u64::try_from(entries)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(MINIMUM_CONTAINER_BYTES)
-}
-
-fn shard_index(container_id: ContainerId) -> usize {
-    descriptor_hash(container_id) & (SHARD_COUNT - 1)
-}
-
-fn descriptor_hash(container_id: ContainerId) -> usize {
-    let bytes = container_id.bytes();
-    let low = u64::from_le_bytes(bytes[..8].try_into().expect("ASSERT: exact ID half"));
-    let high = u64::from_le_bytes(bytes[8..].try_into().expect("ASSERT: exact ID half"));
-    let mut mixed = low ^ high.rotate_left(23);
-    mixed ^= mixed >> 30;
-    mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    mixed ^= mixed >> 27;
-    mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
-    mixed ^= mixed >> 31;
-    usize::try_from(mixed).unwrap_or_else(|_| {
-        usize::try_from((mixed ^ (mixed >> 32)) & u64::from(u32::MAX))
-            .expect("ASSERT: folded descriptor hash fits usize")
-    })
+    (entries as u64).saturating_mul(MINIMUM_CONTAINER_BYTES)
 }
 
 #[cfg(test)]

@@ -4069,14 +4069,6 @@ impl Namespace {
         self.write_payload(inode, handle, offset, payload)
     }
 
-    pub(crate) fn expose_kernel_data_cache(&self, inode: InodeId) -> Result<(), PosixError> {
-        let object = self.resolve_inode(inode)?;
-        object
-            .kernel_data_cache_exposed
-            .store(true, Ordering::Release);
-        Ok(())
-    }
-
     pub(crate) fn kernel_data_cache_exposed(&self, inode: InodeId) -> bool {
         self.resolve_inode(inode)
             .is_ok_and(|object| object.kernel_data_cache_exposed.load(Ordering::Acquire))

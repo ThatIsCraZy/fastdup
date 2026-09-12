@@ -689,7 +689,7 @@ fn discontinuous_writes_retain_one_manifest_path_claim_each() {
 fn one_byte_file_claims_one_manifest_path_not_a_full_large_append_window() {
     let governor = Arc::new(
         CommitCapacityGovernor::new(CommitCapacitySnapshot::new(
-            COMMIT_METADATA_FLOOR_BYTES_V1 + 2 * 1_024 * 1_024 + 40 * 1_024,
+            COMMIT_METADATA_FLOOR_BYTES_V1 + 2 * 1_024 * 1_024 + 48 * 1_024,
             1_024 * 1_024,
         ))
         .expect("capacity floor fits"),
@@ -727,7 +727,7 @@ fn one_byte_file_claims_one_manifest_path_not_a_full_large_append_window() {
 
     assert_eq!(
         governor.status().active_metadata_bytes(),
-        2 * 1_024 * 1_024 + 40 * 1_024,
+        2 * 1_024 * 1_024 + 48 * 1_024,
         "create plus one-leaf tiny Manifest have their exact bounded claims"
     );
 }

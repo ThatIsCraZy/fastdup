@@ -120,9 +120,9 @@ fn activated_filesystem_run_matches_positional_lookup_and_holds_immutable_lease(
         .append_level_zero(profile, vec![expected])
         .expect("publish and activate one Exact Run");
     let activated = transition.current();
-    assert_eq!(activated.membership_status().mapped_run_count(), 1);
+    assert_eq!(activated.membership_status().leased_run_count(), 1);
     assert_eq!(activated.membership_status().positional_run_count(), 0);
-    assert!(activated.membership_status().mapped_page_bounds_bytes() > 0);
+    assert!(activated.membership_status().leased_page_bounds_bytes() > 0);
     let positional = repository
         .open(profile, 1)
         .expect("open the same immutable Run through bounded reads");
@@ -162,9 +162,9 @@ fn adapter_without_immutable_leases_keeps_bounded_positional_exact_reads() {
         .append_level_zero(profile, vec![expected])
         .expect("activate through an adapter without mapping support");
     let active = transition.current();
-    assert_eq!(active.membership_status().mapped_run_count(), 0);
+    assert_eq!(active.membership_status().leased_run_count(), 0);
     assert_eq!(active.membership_status().positional_run_count(), 1);
-    assert_eq!(active.membership_status().mapped_page_bounds_bytes(), 0);
+    assert_eq!(active.membership_status().leased_page_bounds_bytes(), 0);
 
     storage.range_reads.store(0, Ordering::Relaxed);
     let lookup = active
@@ -280,7 +280,7 @@ fn mapped_activation_and_positional_audit_both_reject_a_corrupt_exact_page() {
         .write(true)
         .open(root.join(run_name))
         .expect("open the unpublished-to-readers Run for fault injection");
-    let offset = 4_096_u64 + 128;
+    let offset = 8192 + 4_096_u64 + 128;
     let mut byte = [0_u8; 1];
     file.read_exact_at(&mut byte, offset)
         .expect("read one Exact page byte");
@@ -667,11 +667,11 @@ fn compaction_rejects_a_corrupt_source_without_publishing_output() {
         .expect("open the published source Run");
     let mut byte = [0_u8; 1];
     source
-        .read_exact_at(&mut byte, 4_096 + 128)
+        .read_exact_at(&mut byte, 8192 + 4_096 + 128)
         .expect("read one source entry byte");
     byte[0] ^= 1;
     source
-        .write_all_at(&byte, 4_096 + 128)
+        .write_all_at(&byte, 8192 + 4_096 + 128)
         .expect("corrupt one checksummed source entry byte");
     source.sync_all().expect("make fixture corruption visible");
 

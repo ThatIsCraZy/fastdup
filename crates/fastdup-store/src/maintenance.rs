@@ -35,7 +35,9 @@ const GC_REPLACEMENT_LOGICAL_TARGET_BYTES: u64 = 48 * 1_024 * 1_024;
 const GC_REPLACEMENT_CHUNK_LIMIT: usize = 32_768;
 const GC_COMPRESSION_REGION_BYTES: usize = 512 * 1_024;
 const GC_RAW_CHUNK_PHYSICAL_OVERHEAD_UPPER_BYTES: u64 = 383;
-const GC_CONTAINER_FIXED_PHYSICAL_OVERHEAD_UPPER_BYTES: u64 = 12_351;
+// Includes the generic adapter's two storage length heads. Native owned
+// io_uring publication needs less, so this remains a conservative upper bound.
+const GC_CONTAINER_FIXED_PHYSICAL_OVERHEAD_UPPER_BYTES: u64 = 12_351 + 8_192;
 const GC_CANDIDATE_PROOF_MAX_VICTIMS: usize = 64;
 const GC_CANDIDATE_PROOF_MAX_RAW_REPLACEMENT_BYTES: u64 = 64 * 1_024 * 1_024;
 const ONLINE_GC_BACKGROUND_SHORTLIST: usize = 16;
@@ -344,7 +346,7 @@ pub struct MaintenanceRepository<M, C, X> {
     indexes: ExactIndexRunRepository<X>,
     exact_profile: ExactIndexProfileId,
     rebuild_lock: Arc<Mutex<()>>,
-    reverse_dependency_cache: Arc<Mutex<Option<Arc<ReverseDependencyGeneration>>>>,
+    reverse_dependencies: crate::ReadCacheNamespace,
     cancellation: Option<crate::MaintenanceCancellation>,
 }
 
@@ -362,7 +364,9 @@ impl<M, C, X> MaintenanceRepository<M, C, X> {
             indexes,
             exact_profile,
             rebuild_lock: Arc::new(Mutex::new(())),
-            reverse_dependency_cache: Arc::new(Mutex::new(None)),
+            reverse_dependencies: crate::ReadCacheNamespace::system(
+                crate::ReadCacheClass::ReverseDependencies,
+            ),
             cancellation: None,
         }
     }
@@ -460,6 +464,7 @@ where
     /// failure. Selecting an older recovery generation is a scrub failure,
     /// even though ordinary crash recovery may safely perform that fallback.
     pub fn scrub(&self) -> Result<EndToEndScrubReport, MaintenanceError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let containers = self.containers.audit_published()?;
         self.containers
             .audit_generation_high_water(containers.generation_high_water())?;
@@ -524,6 +529,7 @@ where
         &self,
         pool_usage: DataPoolUsage,
     ) -> Result<GarbageCollectionPlan, MaintenanceError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let mut generation_proof = self.generations.scrub_all_for_gc(&self.containers)?;
         let (_, checkpoint_chunks) =
             RecoveryCheckpointRepository::new(self.containers.storage().clone())
@@ -723,11 +729,13 @@ where
     ) -> Result<Arc<ReverseDependencyGeneration>, MaintenanceError> {
         let exact_activation = exact.record();
         let protected_commit_generation = liveness.summary().latest_generation();
-        let mut cache = self
-            .reverse_dependency_cache
-            .lock()
-            .expect("ASSERT: Reverse Dependency Generation cache lock poisoned");
-        if let Some(cached) = cache.as_ref()
+        let key = crate::ReadCacheKey {
+            identity: [0; 32],
+            ordinal: 0,
+        };
+        if let Some(cached) = self
+            .reverse_dependencies
+            .get::<ReverseDependencyGeneration>(key)
             && cached.exact_activation == exact_activation
             && cached.protected_commit_generation == protected_commit_generation
             && cached.protected_targets.len() == liveness.online_chunks().len()
@@ -741,14 +749,16 @@ where
                 .iter()
                 .all(|(chunk_id, length)| cached.required_chunks.get(chunk_id) == Some(length))
         {
-            return Ok(Arc::clone(cached));
+            return Ok(cached);
         }
+        self.reverse_dependencies.remove(key);
         let built = Arc::new(build_reverse_dependency_generation(
             exact,
             liveness,
             self.cancellation.as_ref(),
         )?);
-        *cache = Some(Arc::clone(&built));
+        self.reverse_dependencies
+            .insert(key, Arc::clone(&built), built.retained_bytes(), 0);
         Ok(built)
     }
 
@@ -2672,6 +2682,19 @@ pub struct ReverseDependencyGeneration {
 }
 
 impl ReverseDependencyGeneration {
+    fn retained_bytes(&self) -> u64 {
+        // Conservative BTree node/allocator allowance: each collection keeps
+        // one spare root allowance, plus partially filled nodes per entry.
+        let collections = 3 + self.dependents_by_base.len() as u64;
+        let entries = (self.protected_targets.len() as u64)
+            .saturating_add(self.required_chunks.len() as u64)
+            .saturating_add(self.dependents_by_base.len() as u64)
+            .saturating_add(self.dependency_edges);
+        (size_of::<Self>() as u64)
+            .saturating_add(collections.saturating_mul(1024))
+            .saturating_add(entries.saturating_mul(256))
+    }
+
     #[must_use]
     pub fn exact_activation(&self) -> ExactIndexActivationRecord {
         self.exact_activation
@@ -3341,5 +3364,70 @@ impl From<ExactIndexFormatError> for MaintenanceError {
 impl From<ExactIndexRunSetError> for MaintenanceError {
     fn from(error: ExactIndexRunSetError) -> Self {
         Self::ExactIndex(ExactIndexStoreError::from(error))
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn reverse_dependencies_share_reclamation_and_preserve_a_running_proof() {
+        let path = std::env::temp_dir().join(format!("gc-projection-cache-{}", std::process::id()));
+        let storage = crate::FsStorageIo::open(&path).unwrap();
+        let profile = ExactIndexProfileId::new([7; 32]).unwrap();
+        let generations = GenerationRepository::new(
+            storage.clone(),
+            fastdup_format::PolicySetId::new([8; 32]).unwrap(),
+        );
+        let empty = fastdup_format::NamespaceRoot::new(4096, 2, 0, vec![], vec![]).unwrap();
+        generations.commit_namespace(&empty).unwrap();
+        let indexes = ExactIndexRunRepository::new(storage.clone());
+        indexes
+            .activate(&ExactIndexRunSet::new(profile, 1, vec![]).unwrap())
+            .unwrap();
+        let exact = indexes.recover_active_generation().unwrap().unwrap();
+        let mut maintenance = MaintenanceRepository::new(
+            generations,
+            ContainerRepository::new(storage),
+            indexes,
+            profile,
+        );
+        maintenance.reverse_dependencies = crate::ReadCacheNamespace::isolated(
+            crate::ReadCacheClass::ReverseDependencies,
+            16 * 1024,
+        );
+        let liveness = maintenance.generations.scan_online_liveness().unwrap();
+        let first = maintenance
+            .reverse_dependency_generation(&exact, &liveness)
+            .unwrap();
+        let reused = maintenance
+            .reverse_dependency_generation(&exact, &liveness)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert!(maintenance.reverse_dependencies.stats().resident_bytes >= first.retained_bytes());
+        maintenance.reverse_dependencies.set_capacity(0);
+        assert_eq!(maintenance.reverse_dependencies.stats().entries, 0);
+        let rebuilt = maintenance
+            .reverse_dependency_generation(&exact, &liveness)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert_eq!(first.exact_activation(), rebuilt.exact_activation());
+        assert_eq!(first.required_chunks(), 0);
+        maintenance.reverse_dependencies.set_capacity(16 * 1024);
+        let before = maintenance
+            .reverse_dependency_generation(&exact, &liveness)
+            .unwrap();
+        maintenance.generations.commit_namespace(&empty).unwrap();
+        let changed = maintenance.generations.scan_online_liveness().unwrap();
+        let after = maintenance
+            .reverse_dependency_generation(&exact, &changed)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_ne!(
+            before.protected_commit_generation(),
+            after.protected_commit_generation()
+        );
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

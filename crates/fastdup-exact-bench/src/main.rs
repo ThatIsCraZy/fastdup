@@ -24,8 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_fixture(&storage, config.entries)?;
     let plan = QueryPlan::new(config.entries, config.queries)?;
 
-    let mapped_repository = ExactIndexRunRepository::new(storage.clone());
-    let mapped = mapped_repository
+    let leased_repository = ExactIndexRunRepository::new(storage.clone());
+    let leased = leased_repository
         .recover_active()?
         .ok_or_else(|| io::Error::other("Exact benchmark activation is missing"))?;
     let positional_repository = ExactIndexRunRepository::new(PositionalStorage(storage));
@@ -33,30 +33,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .recover_active()?
         .ok_or_else(|| io::Error::other("Exact benchmark activation is missing"))?;
 
-    let mapped_status = mapped.membership_status();
+    let leased_status = leased.membership_status();
     let positional_status = positional.membership_status();
-    if mapped_status.mapped_run_count() == 0
-        || mapped_status.positional_run_count() != 0
-        || positional_status.mapped_run_count() != 0
+    if leased_status.leased_run_count() == 0
+        || leased_status.positional_run_count() != 0
+        || positional_status.leased_run_count() != 0
         || positional_status.positional_run_count() == 0
     {
         return Err(io::Error::other("benchmark page-source selection is invalid").into());
     }
 
-    let mut mapped_samples = Vec::with_capacity(config.rounds);
+    let mut leased_samples = Vec::with_capacity(config.rounds);
     let mut positional_samples = Vec::with_capacity(config.rounds);
     for round in 0..config.rounds {
         if round % 2 == 0 {
             positional_samples.push(measure(&positional, &plan)?);
-            mapped_samples.push(measure(&mapped, &plan)?);
+            leased_samples.push(measure(&leased, &plan)?);
         } else {
-            mapped_samples.push(measure(&mapped, &plan)?);
+            leased_samples.push(measure(&leased, &plan)?);
             positional_samples.push(measure(&positional, &plan)?);
         }
     }
 
     let positional = Summary::from_samples(&mut positional_samples, config.queries);
-    let mapped = Summary::from_samples(&mut mapped_samples, config.queries);
+    let leased = Summary::from_samples(&mut leased_samples, config.queries);
     println!("Exact activated-lookup benchmark");
     println!("root={}", root.display());
     println!(
@@ -70,10 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "backend                 median       ns/query  minflt  majflt  peak_rss_kib  peak_swap_kib"
     );
     positional.print("read_exact_at+cache", config.queries);
-    mapped.print("mmap+bounds+cache", config.queries);
+    leased.print("mmap+bounds+cache", config.queries);
     println!(
         "mmap_speedup={:.3}x",
-        positional.ns_per_query / mapped.ns_per_query
+        positional.ns_per_query / leased.ns_per_query
     );
     Ok(())
 }

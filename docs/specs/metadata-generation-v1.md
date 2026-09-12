@@ -451,11 +451,12 @@ reservation end, and inode allocation cursor must each be monotone
 nondecreasing across the structurally valid record chain. A Commit Record
 contains no mutable root pointer and no separately stored self-hash.
 
-Repository Format Epoch is monotonic across the retained Commit chain. The
-current reader accepts epochs zero and one; the current writer emits only epoch
-one. Append, recovery, and Scrub reject an unsupported or decreasing epoch
-before graph fallback. A writable upgrade appends and syncs its epoch-one v2
-Commit before publishing any state whose interpretation depends on that epoch.
+Repository Format Epoch is checked on every retained Commit before graph
+fallback or mutation. The current reader and writer accept only epoch **two**
+(ADR 0046), with Commit Record format v2. Pre-stable epochs zero and one require
+rebuilding; there is no upgrade transaction or legacy writer. Physical files
+use the [aligned storage envelope](aligned-storage-v1.md) below these logical
+format bytes.
 
 `PolicySetId` is currently an opaque nonzero 32-byte identity supplied when the
 repository is opened. Recovery requires every record it reaches to equal the
@@ -785,7 +786,7 @@ is required before that repository can advance again.
 | Metadata GC never removes a live object | mark every selected Commit graph and every live Metadata Root Pin while holding the publication/commit barriers; only classify proof-bearing nonrotating commits as additive hints; verify every candidate before unlink; publish the audited mark catalog and sync the combined directory transition last | recovery and scrub traverse the same retained Commit graphs; live readers retain their root pins independently; scrub audits snapshot/addition chains without treating them as roots | an inflight publication blocks collection, a reader survives WAL rotation and collection, every snapshot/delta publication fault retries, rotation and unpublished-pin drain force exact proof, and fail-before/fail-after deletion always leaves a scrub-valid graph |
 | Counts cannot select unbounded allocations | preflight payload lengths and record equations | prove counts against the bounded payload before vector allocation | `entry_count = u32::MAX` fails as invalid payload under a constrained address space |
 | Policy selection is explicit | store the configured nonzero Policy Set ID in every record | refuse any reached record whose ID is not exactly supported | an unknown newer policy refuses recovery instead of silently rolling back |
-| Writer compatibility is monotonic | write epoch one in Commit Record v2 before epoch-dependent publication | validate every retained epoch before graph fallback and reject unsupported or decreasing values | fail-before/fail-after upgrade recovers only epoch zero or the complete epoch-one fence; a legacy-only writer cannot append beyond it |
+| Writer compatibility is fenced | write epoch two in every Commit Record v2 | validate every retained epoch before graph fallback; reject zero, one and unknown values | correctly checksummed old/unknown epochs are rejected; existing pre-stable repositories require rebuilding |
 
 ## Explicit limitations
 

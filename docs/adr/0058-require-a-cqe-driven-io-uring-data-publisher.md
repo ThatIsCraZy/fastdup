@@ -4,6 +4,12 @@ status: accepted
 
 # Require a CQE-driven io_uring DATA publisher
 
+Amended by [ADR 0046](0046-bound-verified-read-cache-by-live-memory-headroom.md)
+on 12 September 2026: all reusable read content shares one application cache;
+repository I/O and FUSE file data use direct paths. File-backed mappings and
+separate replacement policies described below are superseded. Immutable leases,
+verification and publication ordering remain required.
+
 The DATA tier requires `io_uring`; ring setup failure aborts daemon startup
 instead of selecting a synchronous adapter. One ring-owning thread receives
 commands through a bounded channel and an `eventfd` poll, keeps independent

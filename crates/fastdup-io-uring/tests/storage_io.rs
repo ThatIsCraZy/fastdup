@@ -9,6 +9,16 @@ use fastdup_io_uring::{
 use fastdup_store::{ContainerRepository, StorageIo};
 
 #[test]
+fn buffered_publication_configuration_is_rejected_before_creating_a_root() {
+    let root = test_root("buffered-policy-rejected");
+    let config =
+        IoUringStorageConfig::default().with_publication_io_mode(PublicationIoMode::Buffered);
+    let error = IoUringStorageIo::open(&root, config).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(!root.exists());
+}
+
+#[test]
 fn ring_setup_failure_is_returned_instead_of_selecting_another_adapter() {
     let root = test_root("required-ring");
     let config = IoUringStorageConfig::new(
@@ -232,7 +242,7 @@ fn prepared_container_transfers_owned_image_once_into_the_ring_publisher() {
 }
 
 #[test]
-fn direct_publication_writes_and_samples_reopen_through_buffered_reads() {
+fn direct_publication_writes_and_samples_reopen_through_direct_reads() {
     let root = test_root("direct-publication");
     let config =
         IoUringStorageConfig::default().with_publication_io_mode(PublicationIoMode::Direct);
@@ -265,11 +275,8 @@ fn direct_publication_writes_and_samples_reopen_through_buffered_reads() {
     drop(repository);
     drop(storage);
     let reopened = ContainerRepository::new(
-        IoUringStorageIo::open(
-            &root,
-            IoUringStorageConfig::default().with_publication_io_mode(PublicationIoMode::Buffered),
-        )
-        .expect("reopen buffered reader"),
+        IoUringStorageIo::open(&root, IoUringStorageConfig::default())
+            .expect("reopen direct reader"),
     );
     let recovered = reopened.read(id).expect("published Container recovers");
     for original in chunks {
@@ -284,14 +291,14 @@ fn direct_publication_writes_and_samples_reopen_through_buffered_reads() {
 }
 
 #[test]
-fn adaptive_publication_bypasses_cache_only_at_the_measured_size_gate() {
+fn every_publication_size_bypasses_the_linux_page_cache() {
     let root = test_root("adaptive-direct-publication");
     let storage = IoUringStorageIo::open(&root, IoUringStorageConfig::default())
         .expect("active adaptive publisher");
     let repository = ContainerRepository::new(storage.clone());
     assert_eq!(
         storage.status().publication_io_mode(),
-        PublicationIoMode::Adaptive
+        PublicationIoMode::Direct
     );
 
     repository
@@ -300,8 +307,8 @@ fn adaptive_publication_bypasses_cache_only_at_the_measured_size_gate() {
             41,
             &[&vec![0x71; 128 * 1_024]],
         )
-        .expect("small buffered publication succeeds");
-    assert_eq!(storage.status().direct_publication_write_bytes(), 0);
+        .expect("small direct publication succeeds");
+    assert!(storage.status().direct_publication_write_bytes() > 128 * 1024);
 
     let large = pseudorandom_bytes(DIRECT_PUBLICATION_MIN_BYTES, 0x10f7_33cb_b495_6801);
     let large_chunks = large.chunks(256 * 1_024).collect::<Vec<_>>();
@@ -314,7 +321,17 @@ fn adaptive_publication_bypasses_cache_only_at_the_measured_size_gate() {
         .expect("large Direct publication succeeds");
     let status = storage.status();
     assert!(status.direct_publication_write_bytes() > DIRECT_PUBLICATION_MIN_BYTES as u64);
-    assert_eq!(status.direct_publication_sample_bytes(), 3 * 4_096);
+    assert_eq!(status.direct_publication_sample_bytes(), 6 * 4_096);
+
+    for name in storage.list_names().unwrap() {
+        let output = std::process::Command::new("fincore")
+            .args(["--bytes", "--noheadings", "--output", "RES"])
+            .arg(root.join(name))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "0");
+    }
 
     drop(repository);
     drop(storage);

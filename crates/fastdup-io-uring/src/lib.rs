@@ -5,7 +5,9 @@
 //! publishers can overlap in the kernel. Buffer ownership and the only unsafe
 //! submission call are confined to this platform crate.
 
+#[cfg(test)]
 mod read_buffer;
+#[cfg(test)]
 use read_buffer::ReadBuffer;
 
 use std::collections::{HashMap, VecDeque};
@@ -21,31 +23,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use fastdup_format::{
-    AlignedContainerBytes, HEADER_BYTES, MAX_CONTAINER_BYTES, VerifiedContainerPublication,
-};
+use fastdup_format::{AlignedContainerBytes, HEADER_BYTES, VerifiedContainerPublication};
 use fastdup_store::{
-    FsStorageIo, MAX_STORAGE_RANGE_BYTES, OwnedContainerPublication, PublicationSampleRange,
-    StorageIo, StoreError, publication_sample_ranges, verify_publication_sample,
+    FsStorageIo, OwnedContainerPublication, PublicationSampleRange, StorageIo, StoreError,
+    publication_sample_ranges, verify_publication_sample,
 };
 use io_uring::{IoUring, Probe, opcode, squeue, types};
 
 const DEFAULT_RING_ENTRIES: u32 = 256;
 const DEFAULT_INFLIGHT_BYTES: u64 = 256 * 1_024 * 1_024;
 const WAKE_USER_DATA: u64 = u64::MAX;
-/// Smallest sealed Container for which the XFS A/B benchmark showed no
-/// publication-throughput or tail-latency regression from Direct I/O.
+/// Historical A/B corpus boundary retained by benchmark callers. Production
+/// uses Direct I/O below and above this size under ADR 0046.
 pub const DIRECT_PUBLICATION_MIN_BYTES: usize = 4 * 1_024 * 1_024;
 
 /// Cache policy for the short-lived DATA Container publication descriptor.
 ///
-/// This does not affect ordinary reads after rename; they remain buffered and
-/// retain kernel readahead.
+/// Repository reads and publications use Direct I/O (ADR 0046).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationIoMode {
+    /// Removed policy; opening an adapter with this mode fails closed.
     Buffered,
     Direct,
-    /// Selects Direct I/O only for Containers at least 4 MiB long.
+    /// Compatibility spelling for Direct I/O at every Container size.
     Adaptive,
 }
 
@@ -63,7 +63,7 @@ impl IoUringStorageConfig {
         Self {
             ring_entries,
             max_inflight_bytes,
-            publication_io_mode: PublicationIoMode::Adaptive,
+            publication_io_mode: PublicationIoMode::Direct,
         }
     }
 
@@ -224,6 +224,12 @@ impl IoUringStorageIo {
     ///
     /// Returns root initialization, ring setup, or worker spawn errors.
     pub fn open(root: impl AsRef<Path>, config: IoUringStorageConfig) -> io::Result<Self> {
+        if config.publication_io_mode == PublicationIoMode::Buffered {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "buffered repository I/O is disabled by ADR 0046",
+            ));
+        }
         let filesystem = FsStorageIo::open(root)?;
         let backend = Arc::new(ActiveBackend::start(config)?);
         Ok(Self {
@@ -262,39 +268,11 @@ impl StorageIo for IoUringStorageIo {
     }
 
     fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        let byte_length = u64::try_from(bytes.len())
-            .map_err(|_| invalid_input("write length does not fit u64"))?;
-        offset
-            .checked_add(byte_length)
-            .ok_or_else(|| invalid_input("write range overflows"))?;
-        let lease = self.backend.budget.acquire(byte_length)?;
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(bytes.len())
-            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-        owned.extend_from_slice(bytes);
-        self.backend
-            .counters
-            .callers
-            .borrowed_write_copy_bytes
-            .fetch_add(byte_length, Ordering::Relaxed);
-        self.filesystem.with_file_mutation(name, || {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(self.path(name)?)?;
-            self.backend.write(file, offset, owned, lease)
-        })
+        let _lease = self.backend.budget.acquire(bytes.len() as u64)?;
+        self.filesystem.write_at(name, offset, bytes)
     }
-
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
-        let file = File::open(self.path(name)?)?;
-        let length = file.metadata()?.len();
-        if length > MAX_CONTAINER_BYTES {
-            return Err(invalid_data("container exceeds the format-v1 hard limit"));
-        }
-        self.backend
-            .read(Arc::new(file), 0, usize_from_u64(length)?)
+        self.filesystem.read(name)
     }
 
     fn object_len(&self, name: &str) -> io::Result<u64> {
@@ -302,13 +280,7 @@ impl StorageIo for IoUringStorageIo {
     }
 
     fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        if length > MAX_STORAGE_RANGE_BYTES {
-            return Err(invalid_input(
-                "bounded storage read exceeds the hard allocation limit",
-            ));
-        }
-        let file = self.filesystem.open_read_range(name, offset, length)?;
-        self.backend.read(file, offset, length)
+        self.filesystem.read_exact_at(name, offset, length)
     }
 
     fn list_names(&self) -> io::Result<Vec<String>> {
@@ -350,20 +322,8 @@ impl StorageIo for IoUringStorageIo {
         let published_name = publication.published_name().to_owned();
         let mut options = OpenOptions::new();
         options.create_new(true).read(true).write(true);
-        let resolved_io_mode = match self.config.publication_io_mode {
-            PublicationIoMode::Buffered => PublicationIoMode::Buffered,
-            PublicationIoMode::Direct => PublicationIoMode::Direct,
-            PublicationIoMode::Adaptive => {
-                if publication.sealed_len() >= DIRECT_PUBLICATION_MIN_BYTES {
-                    PublicationIoMode::Direct
-                } else {
-                    PublicationIoMode::Buffered
-                }
-            }
-        };
-        if resolved_io_mode == PublicationIoMode::Direct {
-            options.custom_flags(libc::O_DIRECT);
-        }
+        let resolved_io_mode = PublicationIoMode::Direct;
+        options.custom_flags(libc::O_DIRECT);
         let file = options.open(self.path(&temporary_name)?)?;
         let directory = File::open(self.filesystem.root())?;
         self.backend.publish_owned(
@@ -579,34 +539,6 @@ impl ActiveBackend {
                 .direct_publication_sample_bytes
                 .load(Ordering::Relaxed),
         }
-    }
-
-    fn write(&self, file: File, offset: u64, bytes: Vec<u8>, lease: BudgetLease) -> io::Result<()> {
-        let (reply, receive) = mpsc::sync_channel(1);
-        self.send(Command::Write {
-            file,
-            offset,
-            bytes,
-            lease,
-            reply,
-        })?;
-        receive_reply(&receive)
-    }
-
-    fn read(&self, file: Arc<File>, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        let length_u64 =
-            u64::try_from(length).map_err(|_| invalid_input("read length does not fit u64"))?;
-        let lease = self.budget.acquire(length_u64)?;
-        let bytes = ReadBuffer::new(length)?;
-        let (reply, receive) = mpsc::sync_channel(1);
-        self.send(Command::Read {
-            file,
-            offset,
-            bytes,
-            lease,
-            reply,
-        })?;
-        receive_reply(&receive)
     }
 
     fn fsync(&self, file: File) -> io::Result<()> {
@@ -831,20 +763,6 @@ enum Command {
         publication: Box<OwnedContainerPublication>,
         lease: BudgetLease,
         reply: mpsc::SyncSender<Result<VerifiedContainerPublication, StoreError>>,
-    },
-    Write {
-        file: File,
-        offset: u64,
-        bytes: Vec<u8>,
-        lease: BudgetLease,
-        reply: mpsc::SyncSender<io::Result<()>>,
-    },
-    Read {
-        file: Arc<File>,
-        offset: u64,
-        bytes: ReadBuffer,
-        lease: BudgetLease,
-        reply: mpsc::SyncSender<io::Result<Vec<u8>>>,
     },
     Fsync {
         file: File,
@@ -1271,14 +1189,7 @@ enum OperationCompletion {
 
 enum Operation {
     PublishOwned(Box<PublishOperation>),
-    Write {
-        file: File,
-        offset: u64,
-        bytes: Vec<u8>,
-        progress: usize,
-        _lease: BudgetLease,
-        reply: mpsc::SyncSender<io::Result<()>>,
-    },
+    #[cfg(test)]
     Read {
         file: Arc<File>,
         offset: u64,
@@ -1308,23 +1219,7 @@ impl Operation {
     fn entry(&mut self, user_data: u64) -> io::Result<squeue::Entry> {
         let entry = match self {
             Self::PublishOwned(operation) => operation.entry()?,
-            Self::Write {
-                file,
-                offset,
-                bytes,
-                progress,
-                ..
-            } => {
-                let remaining = &bytes[*progress..];
-                let length = u32::try_from(remaining.len())
-                    .map_err(|_| invalid_input("one io_uring write exceeds u32"))?;
-                let operation_offset = offset
-                    .checked_add(u64::try_from(*progress).expect("ASSERT: usize fits u64"))
-                    .ok_or_else(|| invalid_input("write progress overflows offset"))?;
-                opcode::Write::new(types::Fd(file.as_raw_fd()), remaining.as_ptr(), length)
-                    .offset(operation_offset)
-                    .build()
-            }
+            #[cfg(test)]
             Self::Read {
                 file,
                 offset,
@@ -1380,9 +1275,10 @@ impl Operation {
             Self::PublishOwned(operation) => {
                 operation.fail(StoreError::Io(io::Error::new(kind, message)));
             }
-            Self::Write { reply, .. } | Self::Fsync { reply, .. } | Self::Rename { reply, .. } => {
+            Self::Fsync { reply, .. } | Self::Rename { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(kind, message)));
             }
+            #[cfg(test)]
             Self::Read { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(kind, message)));
             }
@@ -1414,31 +1310,7 @@ fn complete_storage_operation(
         return OperationCompletion::Done;
     }
     match &mut operation {
-        Operation::Write {
-            bytes,
-            progress,
-            reply,
-            ..
-        } => {
-            let transferred =
-                usize::try_from(result).expect("ASSERT: nonnegative io_uring result fits usize");
-            let remaining = bytes.len() - *progress;
-            assert!(
-                transferred <= remaining,
-                "ASSERT: kernel write completion exceeds submitted length"
-            );
-            if transferred == 0 && remaining != 0 {
-                let _ = reply.send(Err(io::Error::from(io::ErrorKind::WriteZero)));
-                return OperationCompletion::Done;
-            }
-            *progress += transferred;
-            if *progress == bytes.len() {
-                let _ = reply.send(Ok(()));
-                OperationCompletion::Done
-            } else {
-                OperationCompletion::Pending(operation)
-            }
-        }
+        #[cfg(test)]
         Operation::Read {
             bytes,
             progress,
@@ -1748,34 +1620,6 @@ fn admit_command(command: Command, ready: &mut VecDeque<Operation>, roots: &mut 
             lease,
             reply,
         )))),
-        Command::Write {
-            file,
-            offset,
-            bytes,
-            lease,
-            reply,
-        } => ready.push_back(Operation::Write {
-            file,
-            offset,
-            bytes,
-            progress: 0,
-            _lease: lease,
-            reply,
-        }),
-        Command::Read {
-            file,
-            offset,
-            bytes,
-            lease,
-            reply,
-        } => ready.push_back(Operation::Read {
-            file,
-            offset,
-            bytes,
-            progress: 0,
-            _lease: lease,
-            reply,
-        }),
         Command::Fsync { file, reply } => ready.push_back(Operation::Fsync { file, reply }),
         Command::Rename {
             directory,
@@ -1930,16 +1774,8 @@ fn c_name(name: &str) -> io::Result<CString> {
     CString::new(name).map_err(|_| invalid_input("storage name contains a NUL byte"))
 }
 
-fn usize_from_u64(value: u64) -> io::Result<usize> {
-    usize::try_from(value).map_err(|_| invalid_input("object length does not fit usize"))
-}
-
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 #[cfg(test)]

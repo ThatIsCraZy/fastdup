@@ -1,5 +1,4 @@
-use crate::page_cache::{ACCOUNTED_PAGE_BYTES, LazyPageCache};
-use crate::{CacheFallback, CacheObservation, CachePool};
+use crate::page_cache::ACCOUNTED_PAGE_BYTES;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
@@ -7,7 +6,6 @@ use std::io;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
-use std::time::Instant;
 
 use fastdup_format::{
     ChunkId, ContainerId, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES,
@@ -19,10 +17,8 @@ use fastdup_format::{
 };
 
 use crate::exact_activation_log::{ExactActivationLog, ExactActivationLogError};
-use crate::exact_index_mmap::ImmutableExactIndexRun;
-use crate::read_cache::{
-    MemoryPressureSnapshot, SYSTEM_REFRESH_INTERVAL, shared_cache_reserve_bytes,
-};
+use crate::exact_index_read::ImmutableExactIndexRun;
+use crate::read_cache::{MemoryPressureSnapshot, shared_cache_reserve_bytes};
 use crate::reduction_filter::{BlockedBloomHint, BloomLookupHint};
 use crate::{ContainerRepository, StorageIo, StoreError};
 
@@ -33,9 +29,6 @@ const EXACT_INDEX_PAGE_CACHE_FALLBACK_SLOTS: usize = 256;
 const EXACT_INDEX_PAGE_CACHE_MINIMUM_BYTES: u64 = 1_024 * 1_024;
 const EXACT_INDEX_PAGE_CACHE_MAXIMUM_BYTES: u64 = 256 * 1_024 * 1_024;
 const EXACT_INDEX_PAGE_CACHE_RAM_DIVISOR: u64 = 128;
-const EXACT_RUN_MEMBERSHIP_RAM_DIVISOR: u64 = 32;
-const EXACT_RUN_MEMBERSHIP_MINIMUM_BYTES: u64 = 1_024 * 1_024;
-const EXACT_RUN_MEMBERSHIP_MAXIMUM_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
 /// Compatibility name for the former physical-Run bound.
 ///
 /// The bound applies to logical Run families since Run-Set v2. Physical
@@ -103,7 +96,6 @@ pub struct ExactIndexRunRepository<I> {
     active_generation: Arc<RwLock<Option<Arc<ExactIndexGenerationState<I>>>>>,
     retired_generations: Arc<Mutex<Vec<Weak<ExactIndexGenerationState<I>>>>>,
     page_cache: Arc<ExactIndexPageCache>,
-    fixed_membership_snapshot: Option<MemoryPressureSnapshot>,
     membership_counters: Arc<ExactRunMembershipCounters>,
 }
 
@@ -415,9 +407,9 @@ impl ExactIndexPageCacheStatus {
 /// Process-lifetime evidence for immutable active-Run membership probes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ExactRunMembershipStatus {
-    mapped_run_count: u64,
+    leased_run_count: u64,
     positional_run_count: u64,
-    mapped_page_bounds_bytes: u64,
+    leased_page_bounds_bytes: u64,
     filter_count: u64,
     allocated_bytes: u64,
     huge_page_advised_filter_count: u64,
@@ -429,8 +421,8 @@ pub struct ExactRunMembershipStatus {
 
 impl ExactRunMembershipStatus {
     #[must_use]
-    pub const fn mapped_run_count(self) -> u64 {
-        self.mapped_run_count
+    pub const fn leased_run_count(self) -> u64 {
+        self.leased_run_count
     }
 
     #[must_use]
@@ -439,8 +431,8 @@ impl ExactRunMembershipStatus {
     }
 
     #[must_use]
-    pub const fn mapped_page_bounds_bytes(self) -> u64 {
-        self.mapped_page_bounds_bytes
+    pub const fn leased_page_bounds_bytes(self) -> u64 {
+        self.leased_page_bounds_bytes
     }
 
     #[must_use]
@@ -518,7 +510,6 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             active_generation: Arc::new(RwLock::new(None)),
             retired_generations: Arc::new(Mutex::new(Vec::new())),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, true)),
-            fixed_membership_snapshot: None,
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
         }
     }
@@ -538,7 +529,6 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             active_generation: Arc::new(RwLock::new(None)),
             retired_generations: Arc::new(Mutex::new(Vec::new())),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, false)),
-            fixed_membership_snapshot: Some(snapshot),
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
         }
     }
@@ -1172,6 +1162,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     pub fn audit_activation_log(
         &self,
     ) -> Result<Option<ExactIndexActivationRecord>, ExactIndexStoreError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let log = ExactActivationLog::new(&self.storage);
         let Some(snapshot) = log.load_for_recovery().map_err(map_activation_log_error)? else {
             return Ok(None);
@@ -1203,6 +1194,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         &self,
         containers: &ContainerRepository<J>,
     ) -> Result<Option<ExactIndexLocationAudit>, ExactIndexStoreError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let log = ExactActivationLog::new(&self.storage);
         let Some(snapshot) = log.load_for_recovery().map_err(map_activation_log_error)? else {
             return Ok(None);
@@ -1347,7 +1339,8 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     }
 
     fn read_envelope(&self, name: &str) -> Result<OpenedRunEnvelope, ExactIndexStoreError> {
-    let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexEnvelope);
+        let _read_reason =
+            crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexEnvelope);
         let file_length = self.storage.object_len(name)?;
         if file_length < 2 * u64::try_from(EXACT_INDEX_PAGE_BYTES).expect("ASSERT: 4 KiB fits u64")
         {
@@ -1375,6 +1368,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     }
 
     fn audit_named(&self, name: &str) -> Result<ExactIndexRunDescriptor, ExactIndexStoreError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let envelope = self.read_envelope(name)?;
         self.audit_opened_run(name, &envelope, |_| {})?;
         Ok(envelope.descriptor)
@@ -1385,7 +1379,10 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         name: &str,
         maximum_bytes: usize,
     ) -> Result<AuditedExactRun, ExactIndexStoreError> {
-        let envelope = self.read_envelope(name)?;
+        let envelope = {
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+            self.read_envelope(name)?
+        };
         let descriptor = envelope.descriptor;
         let mut membership = (maximum_bytes != 0)
             .then(|| BlockedBloomHint::new(descriptor.entry_count(), maximum_bytes).ok())
@@ -1415,7 +1412,15 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             };
         Ok(AuditedExactRun {
             descriptor,
-            membership: membership.map(Arc::new),
+            membership: {
+                membership.map(|filter| {
+                    Arc::new(CachedRunMembership::new(
+                        &self.page_cache.membership,
+                        descriptor.run_hash(),
+                        filter,
+                    ))
+                })
+            },
             mapping,
         })
     }
@@ -1426,6 +1431,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         envelope: &OpenedRunEnvelope,
         mut visit: impl FnMut(&ExactIndexEntry),
     ) -> Result<(), ExactIndexStoreError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
         let descriptor = envelope.descriptor;
         let mut audit = descriptor.begin_hash_audit();
@@ -1831,7 +1837,10 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                     membership: reader
                         .membership
                         .as_ref()
-                        .filter(|filter| filter.allocated_bytes() <= membership_bytes_remaining)
+                        .filter(|filter| {
+                            filter.allocated_bytes() != 0
+                                && filter.allocated_bytes() <= membership_bytes_remaining
+                        })
                         .map(Arc::clone),
                 }
             } else {
@@ -1868,11 +1877,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     }
 
     fn membership_budget_bytes_now(&self) -> usize {
-        let snapshot = self.fixed_membership_snapshot.unwrap_or_else(|| {
-            MemoryPressureSnapshot::read_system()
-                .unwrap_or_else(|_| MemoryPressureSnapshot::new(0, 0, 1))
-        });
-        exact_run_membership_budget(snapshot)
+        usize::try_from(self.page_cache.cache.capacity()).unwrap_or(usize::MAX)
     }
 
     fn publish_run_set(
@@ -2042,13 +2047,13 @@ impl<I> ActivatedExactIndex<I> {
     /// memory-accounting invariants.
     #[must_use]
     pub fn membership_status(&self) -> ExactRunMembershipStatus {
-        let mapped_run_count = self
+        let leased_run_count = self
             .readers
             .iter()
             .filter(|reader| reader.mapping.is_some())
             .count();
-        let positional_run_count = self.readers.len().saturating_sub(mapped_run_count);
-        let mapped_page_bounds_bytes = self.readers.iter().fold(0_usize, |total, reader| {
+        let positional_run_count = self.readers.len().saturating_sub(leased_run_count);
+        let leased_page_bounds_bytes = self.readers.iter().fold(0_usize, |total, reader| {
             total
                 .checked_add(
                     reader
@@ -2061,7 +2066,12 @@ impl<I> ActivatedExactIndex<I> {
         let filter_count = self
             .readers
             .iter()
-            .filter(|reader| reader.membership.is_some())
+            .filter(|reader| {
+                reader
+                    .membership
+                    .as_ref()
+                    .is_some_and(|filter| filter.resident().is_some())
+            })
             .count();
         let allocated_bytes = self.readers.iter().fold(0_usize, |total, reader| {
             total
@@ -2102,11 +2112,11 @@ impl<I> ActivatedExactIndex<I> {
             "ASSERT: one active Exact Index shares one membership counter set"
         );
         ExactRunMembershipStatus {
-            mapped_run_count: u64::try_from(mapped_run_count)
+            leased_run_count: u64::try_from(leased_run_count)
                 .expect("ASSERT: active mapped Exact Run count fits u64"),
             positional_run_count: u64::try_from(positional_run_count)
                 .expect("ASSERT: active positional Exact Run count fits u64"),
-            mapped_page_bounds_bytes: u64::try_from(mapped_page_bounds_bytes)
+            leased_page_bounds_bytes: u64::try_from(leased_page_bounds_bytes)
                 .expect("ASSERT: active mapped Exact page-bound bytes fit u64"),
             filter_count: u64::try_from(filter_count)
                 .expect("ASSERT: active membership filter count fits u64"),
@@ -2229,7 +2239,7 @@ struct OpenedRunEnvelope {
 
 struct AuditedExactRun {
     descriptor: ExactIndexRunDescriptor,
-    membership: Option<Arc<BlockedBloomHint>>,
+    membership: Option<Arc<CachedRunMembership>>,
     mapping: Option<Arc<ImmutableExactIndexRun>>,
 }
 
@@ -2543,7 +2553,8 @@ impl<I: Clone + StorageIo> CompactionSource<I> {
     }
 
     fn load_next_page(&mut self) -> Result<(), ExactIndexStoreError> {
-        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexCompaction);
+        let _read_reason =
+            crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexCompaction);
         if self.next_page_ordinal == self.descriptor.page_count() {
             let mut audit = self
                 .audit
@@ -2733,223 +2744,82 @@ fn write_streamed_page<I: StorageIo>(
 /// Lazy sharded maps keep lookup allocation-free and admit only the shared
 /// budget granted to this pool. FIFO replacement discards acceleration only;
 /// it cannot affect Exact-Index or DATA correctness.
+#[derive(Debug)]
 struct ExactIndexPageCache {
-    pages: LazyPageCache<ExactIndexPage>,
+    cache: crate::ReadCacheNamespace,
+    membership: crate::ReadCacheNamespace,
     capacity_pages: u64,
-    admission: Mutex<()>,
-    target_pages: AtomicU64,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    resident_pages: AtomicU64,
-    evictions: AtomicU64,
-    pressure_rejections: AtomicU64,
-    effective_limit_bytes: AtomicU64,
-    available_bytes: AtomicU64,
-    swap_used_bytes: AtomicU64,
     automatic_pressure: bool,
-    started: Instant,
-    last_refresh_millis: AtomicU64,
-    budget_pool: Option<CachePool>,
 }
-
-impl fmt::Debug for ExactIndexPageCache {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ExactIndexPageCache")
-            .field("status", &self.status())
-            .finish_non_exhaustive()
-    }
-}
-
 impl ExactIndexPageCache {
     fn build(snapshot: MemoryPressureSnapshot, automatic_pressure: bool) -> Self {
-        let pages = LazyPageCache::new();
-        let metadata = pages.metadata_bytes();
         let capacity_pages = if automatic_pressure {
             snapshot.effective_limit_bytes() / ACCOUNTED_PAGE_BYTES
         } else {
             exact_page_cache_capacity(snapshot) as u64
         };
-        let budget_pool = automatic_pressure.then(|| {
-            CachePool::system(
-                "exactIndex",
-                CacheFallback::Metadata,
-                metadata,
-                snapshot.effective_limit_bytes(),
-            )
-        });
+        let namespace = if automatic_pressure {
+            crate::ReadCacheNamespace::system(crate::ReadCacheClass::ExactPage)
+        } else {
+            crate::ReadCacheNamespace::isolated(crate::ReadCacheClass::ExactPage, 0)
+        };
         let cache = Self {
-            pages,
+            membership: namespace.sibling(crate::ReadCacheClass::ExactMembership),
+            cache: namespace,
             capacity_pages,
-            budget_pool,
-            admission: Mutex::new(()),
-            target_pages: AtomicU64::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            resident_pages: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
-            pressure_rejections: AtomicU64::new(0),
-            effective_limit_bytes: AtomicU64::new(snapshot.effective_limit_bytes()),
-            available_bytes: AtomicU64::new(snapshot.available_bytes()),
-            swap_used_bytes: AtomicU64::new(snapshot.swap_used_bytes()),
             automatic_pressure,
-            started: Instant::now(),
-            last_refresh_millis: AtomicU64::new(0),
         };
         cache.apply_pressure_snapshot(snapshot);
         cache
     }
-
     fn get(&self, run_hash: [u8; 32], page_ordinal: usize) -> Option<Arc<ExactIndexPage>> {
-        self.refresh_pressure_if_due();
-        let found = self.pages.get(run_hash, page_ordinal);
-        if found.is_some() {
-            self.hits.fetch_add(1, AtomicOrdering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        found
+        self.cache.get(crate::ReadCacheKey {
+            identity: run_hash,
+            ordinal: page_ordinal as u64,
+        })
     }
-
     fn insert(&self, run_hash: [u8; 32], page_ordinal: usize, page: Arc<ExactIndexPage>) {
         assert_eq!(
             page.ordinal(),
             page_ordinal,
-            "ASSERT: an Exact Index page-cache key matches the verified page ordinal"
+            "ASSERT: verified Exact page ordinal"
         );
-        self.refresh_pressure_if_due();
-        let _admission = self
-            .admission
-            .lock()
-            .expect("ASSERT: Exact Index page-cache admission lock poisoned");
-        let target = self.target_pages.load(AtomicOrdering::Acquire);
-        if target == 0 {
-            self.pressure_rejections
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return;
-        }
-        if let Some((delta, evictions)) = self.pages.insert(run_hash, page_ordinal, page, target) {
-            self.resident_pages
-                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
-                    value.checked_add_signed(delta)
-                })
-                .expect("ASSERT: page accounting stays in range");
-            self.evictions.fetch_add(evictions, AtomicOrdering::Relaxed);
-        } else {
-            self.pressure_rejections
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        }
+        self.cache.insert(
+            crate::ReadCacheKey {
+                identity: run_hash,
+                ordinal: page_ordinal as u64,
+            },
+            page,
+            EXACT_INDEX_PAGE_BYTES as u64,
+            EXACT_INDEX_PAGE_BYTES as u64,
+        );
     }
-
     fn status(&self) -> ExactIndexPageCacheStatus {
-        self.refresh_pressure_if_due();
-        let effective_limit_bytes = self.effective_limit_bytes.load(AtomicOrdering::Relaxed);
+        let stats = self.cache.stats();
+        let pressure = self.cache.pressure();
         ExactIndexPageCacheStatus {
-            hits: self.hits.load(AtomicOrdering::Relaxed),
-            misses: self.misses.load(AtomicOrdering::Relaxed),
-            resident_pages: self.resident_pages.load(AtomicOrdering::Relaxed),
-            evictions: self.evictions.load(AtomicOrdering::Relaxed),
-            pressure_rejections: self.pressure_rejections.load(AtomicOrdering::Relaxed),
-            target_pages: self.target_pages.load(AtomicOrdering::Relaxed),
+            hits: stats.hits,
+            misses: stats.misses,
+            resident_pages: stats.entries,
+            evictions: stats.evictions,
+            pressure_rejections: stats.rejections,
+            target_pages: self.cache.capacity() / ACCOUNTED_PAGE_BYTES,
             capacity_pages: self.capacity_pages,
-            reserve_bytes: shared_cache_reserve_bytes(effective_limit_bytes),
-            effective_limit_bytes,
-            available_bytes: self.available_bytes.load(AtomicOrdering::Relaxed),
-            swap_used_bytes: self.swap_used_bytes.load(AtomicOrdering::Relaxed),
+            reserve_bytes: shared_cache_reserve_bytes(pressure.effective_limit_bytes()),
+            effective_limit_bytes: pressure.effective_limit_bytes(),
+            available_bytes: pressure.available_bytes(),
+            swap_used_bytes: pressure.swap_used_bytes(),
         }
     }
-
-    fn refresh_pressure_if_due(&self) {
-        if !self.automatic_pressure {
-            return;
-        }
-        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let interval = u64::try_from(SYSTEM_REFRESH_INTERVAL.as_millis())
-            .expect("ASSERT: memory refresh interval fits u64 milliseconds");
-        let previous = self.last_refresh_millis.load(AtomicOrdering::Relaxed);
-        if elapsed.saturating_sub(previous) < interval
-            || self
-                .last_refresh_millis
-                .compare_exchange(
-                    previous,
-                    elapsed,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Relaxed,
-                )
-                .is_err()
-        {
-            return;
-        }
-        let snapshot = MemoryPressureSnapshot::read_system()
-            .unwrap_or_else(|_| MemoryPressureSnapshot::new(0, 0, 1));
-        self.apply_pressure_snapshot(snapshot);
-    }
-
     fn apply_pressure_snapshot(&self, snapshot: MemoryPressureSnapshot) {
-        let _admission = self
-            .admission
-            .lock()
-            .expect("ASSERT: Exact page admission lock poisoned");
-        let reserve = shared_cache_reserve_bytes(snapshot.effective_limit_bytes());
-        let available_for_cache = snapshot.available_bytes().saturating_sub(reserve);
-        let page_bytes = ACCOUNTED_PAGE_BYTES;
-        let metadata = self.pages.metadata_bytes();
-        let budget = if let Some(pool) = &self.budget_pool {
-            pool.target(
+        if !self.automatic_pressure {
+            self.cache.update_pressure(
                 snapshot,
-                CacheObservation {
-                    hits: self.hits.load(AtomicOrdering::Relaxed),
-                    misses: self.misses.load(AtomicOrdering::Relaxed),
-                    evictions: self.evictions.load(AtomicOrdering::Relaxed),
-                    hit_bytes: self
-                        .hits
-                        .load(AtomicOrdering::Relaxed)
-                        .saturating_mul(EXACT_INDEX_PAGE_BYTES as u64),
-                    resident_bytes: self.resident_pages.load(AtomicOrdering::Acquire) * page_bytes
-                        + metadata,
-                },
-            )
-            .saturating_sub(metadata)
-        } else if snapshot.swap_used_bytes() == 0 {
-            available_for_cache
-        } else {
-            0
-        };
-        let target = (budget / page_bytes).min(self.capacity_pages);
-        self.effective_limit_bytes
-            .store(snapshot.effective_limit_bytes(), AtomicOrdering::Relaxed);
-        self.available_bytes
-            .store(snapshot.available_bytes(), AtomicOrdering::Relaxed);
-        self.swap_used_bytes
-            .store(snapshot.swap_used_bytes(), AtomicOrdering::Relaxed);
-        let previous = self.target_pages.swap(target, AtomicOrdering::AcqRel);
-        if target < previous {
-            let removed = self.pages.trim(target);
-            self.resident_pages
-                .fetch_sub(removed, AtomicOrdering::AcqRel);
-            self.evictions.fetch_add(removed, AtomicOrdering::Relaxed);
-        }
-        if let Some(pool) = &self.budget_pool {
-            pool.applied(
-                budget + metadata,
-                self.resident_pages.load(AtomicOrdering::Acquire) * page_bytes + metadata,
+                self.capacity_pages * ACCOUNTED_PAGE_BYTES,
+                shared_cache_reserve_bytes(snapshot.effective_limit_bytes()),
             );
         }
     }
-}
-
-fn exact_run_membership_budget(snapshot: MemoryPressureSnapshot) -> usize {
-    if snapshot.swap_used_bytes() != 0 || snapshot.effective_limit_bytes() == 0 {
-        return 0;
-    }
-    let hard_limit = (snapshot.effective_limit_bytes() / EXACT_RUN_MEMBERSHIP_RAM_DIVISOR).clamp(
-        EXACT_RUN_MEMBERSHIP_MINIMUM_BYTES,
-        EXACT_RUN_MEMBERSHIP_MAXIMUM_BYTES,
-    );
-    let available = snapshot
-        .available_bytes()
-        .saturating_sub(shared_cache_reserve_bytes(snapshot.effective_limit_bytes()));
-    usize::try_from(hard_limit.min(available)).unwrap_or(usize::MAX)
 }
 
 fn exact_page_cache_capacity(snapshot: MemoryPressureSnapshot) -> usize {
@@ -2977,6 +2847,47 @@ fn floor_power_of_two(value: usize) -> usize {
     if next == value { value } else { next / 2 }
 }
 
+#[derive(Debug)]
+struct CachedRunMembership {
+    cache: crate::ReadCacheNamespace,
+    key: crate::ReadCacheKey,
+}
+impl CachedRunMembership {
+    fn new(
+        cache: &crate::ReadCacheNamespace,
+        identity: [u8; 32],
+        filter: BlockedBloomHint,
+    ) -> Self {
+        let key = crate::ReadCacheKey {
+            identity,
+            ordinal: 0,
+        };
+        let bytes = filter.allocated_bytes() as u64 + size_of::<BlockedBloomHint>() as u64;
+        cache.insert(key, Arc::new(filter), bytes, EXACT_INDEX_PAGE_BYTES as u64);
+        Self {
+            cache: cache.clone(),
+            key,
+        }
+    }
+    fn resident(&self) -> Option<Arc<BlockedBloomHint>> {
+        self.cache.peek(self.key)
+    }
+    fn allocated_bytes(&self) -> usize {
+        self.resident().map_or(0, |filter| filter.allocated_bytes())
+    }
+    fn huge_page_advised(&self) -> bool {
+        self.resident()
+            .is_some_and(|filter| filter.huge_page_advised())
+    }
+    fn probe_for_exact_lookup(&self, chunk: ChunkId, length: usize) -> BloomLookupHint {
+        self.cache
+            .get::<BlockedBloomHint>(self.key)
+            .map_or(BloomLookupHint::RequiresExactLookup, |filter| {
+                filter.probe_for_exact_lookup(chunk, length)
+            })
+    }
+}
+
 /// Open immutable Run handle backed by bounded reads or an audited active mapping.
 #[derive(Clone, Debug)]
 pub struct ExactIndexRunReader<I> {
@@ -2985,7 +2896,7 @@ pub struct ExactIndexRunReader<I> {
     descriptor: ExactIndexRunDescriptor,
     page_cache: Arc<ExactIndexPageCache>,
     mapping: Option<Arc<ImmutableExactIndexRun>>,
-    membership: Option<Arc<BlockedBloomHint>>,
+    membership: Option<Arc<CachedRunMembership>>,
     membership_counters: Arc<ExactRunMembershipCounters>,
 }
 
@@ -3109,7 +3020,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         let page = if let Some(mapping) = &self.mapping {
             Arc::new(
                 self.descriptor
-                    .decode_page(page_ordinal, mapping.page(offset)?)?,
+                    .decode_page(page_ordinal, &mapping.page(offset)?)?,
             )
         } else {
             let bytes = self
@@ -3475,7 +3386,7 @@ mod tests {
 
     #[test]
     fn append_shares_audited_runs_but_recovery_reaudits_and_pressure_drops_hints() {
-        let mut repository = reuse_repository("mapped");
+        let repository = reuse_repository("mapped");
         let profile = ExactIndexProfileId::new([61; 32]).unwrap();
         repository
             .append_level_zero(profile, (0..1024).map(reuse_fixture).collect())
@@ -3511,8 +3422,9 @@ mod tests {
             old_reader.mapping.as_ref().unwrap()
         ));
         // Swap disables new membership admission, including reused hints.
-        repository.fixed_membership_snapshot =
-            Some(MemoryPressureSnapshot::new(8 << 30, 6 << 30, 1));
+        repository
+            .page_cache
+            .apply_pressure_snapshot(MemoryPressureSnapshot::new(8 << 30, 6 << 30, 1));
         repository
             .append_level_zero(profile, vec![reuse_fixture(2001)])
             .unwrap();
@@ -3761,26 +3673,23 @@ mod tests {
     }
 
     #[test]
-    fn exact_run_membership_budget_preserves_headroom_and_closes_on_swap() {
-        let gib = 1_024_u64 * 1_024 * 1_024;
-
+    fn membership_residency_reclaims_with_the_common_cache() {
+        let cache =
+            crate::ReadCacheNamespace::isolated(crate::ReadCacheClass::ExactMembership, 1 << 20);
+        let mut filter = BlockedBloomHint::new(1000, 1 << 20).unwrap();
+        let chunk = ChunkId::of(b"cached membership");
+        filter.insert_hint(chunk, 17);
+        let hint = CachedRunMembership::new(&cache, [4; 32], filter);
+        assert!(hint.allocated_bytes() > 0);
         assert_eq!(
-            exact_run_membership_budget(MemoryPressureSnapshot::new(16 * gib, 12 * gib, 0)),
-            512 * 1_024 * 1_024
+            hint.probe_for_exact_lookup(chunk, 17),
+            BloomLookupHint::RequiresExactLookup
         );
+        cache.set_capacity(0);
+        assert_eq!(hint.allocated_bytes(), 0);
         assert_eq!(
-            exact_run_membership_budget(MemoryPressureSnapshot::new(
-                16 * gib,
-                shared_cache_reserve_bytes(16 * gib),
-                0
-            )),
-            0,
-            "the shared 8-percent reserve wins over optional membership hints"
-        );
-        assert_eq!(
-            exact_run_membership_budget(MemoryPressureSnapshot::new(16 * gib, 12 * gib, 1)),
-            0,
-            "Swap charged to fastdup disables the next active filter set"
+            hint.probe_for_exact_lookup(ChunkId::of(b"missing"), 17),
+            BloomLookupHint::RequiresExactLookup
         );
     }
 }

@@ -1,4 +1,4 @@
-//! Compare mapped and positional GC-candidate catalog lookups.
+//! Compare leased and positional GC-candidate catalog lookups.
 
 #![deny(unsafe_code)]
 
@@ -23,36 +23,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = FsStorageIo::open(&root)?;
     ensure_fixture(storage.clone())?;
 
-    let mapped = GcCandidateCatalogRepository::new(storage.clone())
+    let leased = GcCandidateCatalogRepository::new(storage.clone())
         .recover_latest()?
-        .ok_or_else(|| io::Error::other("mapped GC benchmark snapshot is missing"))?;
+        .ok_or_else(|| io::Error::other("leased GC benchmark snapshot is missing"))?;
     let positional = GcCandidateCatalogRepository::new(PositionalStorage(storage))
         .recover_latest()?
         .ok_or_else(|| io::Error::other("positional GC benchmark snapshot is missing"))?;
-    if !mapped.mapped() || positional.mapped() {
+    if !leased.leased() || positional.leased() {
         return Err(io::Error::other("GC benchmark selected the wrong page sources").into());
     }
 
     let plan = query_plan();
-    let mut mapped_samples = Vec::with_capacity(ROUNDS);
+    let mut leased_samples = Vec::with_capacity(ROUNDS);
     let mut positional_samples = Vec::with_capacity(ROUNDS);
     for round in 0..ROUNDS {
         if round % 2 == 0 {
             positional_samples.push(measure(&positional, &plan)?);
-            mapped_samples.push(measure(&mapped, &plan)?);
+            leased_samples.push(measure(&leased, &plan)?);
         } else {
-            mapped_samples.push(measure(&mapped, &plan)?);
+            leased_samples.push(measure(&leased, &plan)?);
             positional_samples.push(measure(&positional, &plan)?);
         }
     }
-    let mapped = median(&mut mapped_samples);
+    let leased = median(&mut leased_samples);
     let positional = median(&mut positional_samples);
-    println!("GC candidate mapped-lookup benchmark");
+    println!("GC candidate leased-lookup benchmark");
     println!(
-        "rows={ROWS} queries={QUERIES} rounds={ROUNDS} mapped_ns_per_query={:.1} positional_ns_per_query={:.1} mmap_speedup={:.3}x",
-        nanos_per_query(mapped),
+        "rows={ROWS} queries={QUERIES} rounds={ROUNDS} leased_ns_per_query={:.1} positional_ns_per_query={:.1} leased_speedup={:.3}x",
+        nanos_per_query(leased),
         nanos_per_query(positional),
-        positional.as_secs_f64() / mapped.as_secs_f64(),
+        positional.as_secs_f64() / leased.as_secs_f64(),
     );
     Ok(())
 }

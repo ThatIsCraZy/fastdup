@@ -134,7 +134,7 @@ fn swap_or_lost_headroom_purges_cache_and_refuses_new_admissions() {
     )
     .expect("pressure does not make durable DATA unreadable");
     let operations = &storage.operations()[baseline..];
-    assert!(operations.contains(&StorageOperation::Read));
+    assert!(operations.contains(&StorageOperation::ReadExactAt));
     let status = cache.status();
     assert_eq!(status.entry_count(), 0);
     assert_eq!(status.pressure_rejections(), 1);

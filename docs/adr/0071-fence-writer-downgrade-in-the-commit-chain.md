@@ -4,16 +4,21 @@ status: accepted
 
 # Fence writer downgrade in the authoritative Commit chain
 
-Every Commit Record uses format v2 and carries Repository Format Epoch one in
-the field at offset 22. The current writer reads and writes exactly epoch one.
+ADR 0046 advances the current Repository Format Epoch to **two** for aligned
+Direct-I/O storage. Both older epochs require a pre-stable repository rebuild;
+there is no migration. The Commit-chain downgrade fence and validation-before-
+mutation rules below continue to apply, with epoch two as the sole current epoch.
+
+Every Commit Record uses format v2 and carries Repository Format Epoch two in
+the field at offset 22. The current writer reads and writes exactly epoch two.
 Append, recovery, and offline Scrub validate every retained record before graph
-fallback. Epoch zero, Commit format v1, and unknown epochs are unsupported
+fallback. Epochs zero and one, Commit format v1, and unknown epochs are unsupported
 pre-production state and fail closed before repository mutation.
 
 The Commit chain is the downgrade fence because it is already the authoritative
 mutation boundary and older binaries reject the v2 record structurally. A
 separate marker file was rejected because binaries predating the marker could
-ignore it. Since the repository has not shipped, there is no epoch-zero import,
+ignore it. Since the repository has not shipped, there is no older-epoch import,
 upgrade transaction, downgrade writer model, or migration utility to maintain.
 The first Commit of every repository already carries the fence.
 

@@ -49,9 +49,10 @@ const tabHints = [
 const tabs = ["Latenzen", "io_uring", "Caches", "Lesevermeidung", "GC & Scrub", "Checkpoint-Phasen", "Metadata-Reads"];
 const metadataReasons: Record<string,string> = {other:"Nicht zugeordnet",indexLookup:"Index-Abfrage · Cache-Miss",indexCompaction:"Index-Zusammenführung",indexAudit:"Index-Prüfung",indexEnvelope:"Index-Header / Footer",manifest:"Manifest lesen",namespace:"Namespace / Verwaltungsgraph",recoveryScrub:"Recovery / Scrub",garbageCollection:"Garbage Collection"};
 const metadataObjects: Record<string,string> = {exactIndex:"Exact Index",similarityIndex:"Similarity Index",metadataObject:"Metadatenobjekt",smallFile:"Small-File-Container",control:"Commit / Journal / Verwaltung",other:"Weitere Dateien"};
-const metadataModes: Record<string,string> = {bufferedRange:"Gepufferter Bereich",bufferedFile:"Gepufferte Datei",bufferedStructure:"Gepufferte Struktur",mmap:"mmap"};
-const cacheLabels: Record<string, string> = { verifiedRead: "Verified Read", exactIndex: "Exact Index", similarityIndex: "Similarity Index", containerDescriptors: "Container Descriptors", historicalProofs: "Historical Proofs", manifestNodes: "Manifest Nodes", metadataObjects: "Metadata Objects" };
+const metadataModes: Record<string,string> = {directRange:"Direkter Bereich",directFile:"Direkte Datei",directStructure:"Direkte Struktur",directLease:"Direkter Zugriff mit Dateilease",bufferedRange:"Gepufferter Bereich",bufferedFile:"Gepufferte Datei",bufferedStructure:"Gepufferte Struktur",mmap:"mmap"};
+const cacheLabels: Record<string, string> = { unifiedRead: "Unified Read Cache", verifiedRead: "Verified Read", exactIndex: "Exact Index", similarityIndex: "Similarity Index", containerDescriptors: "Container Descriptors", historicalProofs: "Historical Proofs", manifestNodes: "Manifest Nodes", metadataObjects: "Metadata Objects" };
 const cacheDescriptions: Record<string, string> = {
+  unifiedRead: "Gemeinsamer Speicher für Nutzdaten, Metadaten, Indexe und geprüfte Nachweise",
   verifiedRead: "Geprüfte Nutzdaten für Lesen und Vergleichsbasen",
   exactIndex: "Zuordnung von Chunk-IDs zu Speicherorten",
   similarityIndex: "Kandidaten für ähnliche Daten",
@@ -124,7 +125,7 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
             <progress aria-label={t("Cache-Budget Belegung")} value={budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0)} max={Math.max(1, budget.budgetBytes)} />
           </div>}
           <div className="cache-toolbar">
-            <div><h3>{t("Cache-Wirkung")}</h3><p className="detail-note">{t("Treffer vermeiden Zugriffe auf das angegebene Tier. DATA-Caches haben Vorrang im RAM-Budget.")}</p></div>
+            <div><h3>{t("Cache-Wirkung")}</h3><p className="detail-note">{t("Treffer vermeiden Zugriffe auf das angegebene Tier. Alle Inhalte teilen sich einen Cache; wiederverwendete DATA-Inhalte erhalten mehr Schutz bei der Verdrängung.")}</p></div>
             <div className="cache-range" role="group" aria-label={t("Cache-Zeitraum")}><button aria-pressed={cacheRange === "5m"} onClick={() => setCacheRange("5m")}>{t("Letzte 5 Minuten")}</button><button aria-pressed={cacheRange === "total"} onClick={() => setCacheRange("total")}>{t("Gesamt seit Mount")}</button></div>
             <label className="cache-counter-toggle"><input type="checkbox" checked={cacheCounters} onChange={event => setCacheCounters(event.target.checked)} />{t("Zähler & Reservierung anzeigen")}</label>
           </div>
@@ -136,7 +137,7 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
             const hitRate = counts && counts.hits + counts.misses ? counts.hits * 100 / (counts.hits + counts.misses) : null;
             return <tr key={cache.id}>
               <th scope="row"><span>{cacheLabels[cache.id] ?? cache.id}</span>{cacheDescriptions[cache.id] && <small className="cache-description">{t(cacheDescriptions[cache.id])}</small>}</th>
-              {budget && <td><span className={`cache-tier ${pool?.fallbackTier === "data" ? "data" : "metadata"}`}>{pool?.fallbackTier === "data" ? "DATA" : pool?.fallbackTier === "metadata" ? "Metadata" : "—"}</span></td>}
+              {budget && <td><span className={`cache-tier ${pool?.fallbackTier === "data" ? "data" : "metadata"}`}>{cache.id === "unifiedRead" ? "Metadata + DATA" : pool?.fallbackTier === "data" ? "DATA" : pool?.fallbackTier === "metadata" ? "Metadata" : "—"}</span></td>}
               <td><span className="cache-hit-rate">{hitRate == null ? "—" : `${number(hitRate)} %`}{hitRate != null && <span className="cache-hit-track" aria-hidden="true"><span style={{width: `${hitRate}%`}} /></span>}</span></td>
               {cacheCounters && <><td>{number(counts?.hits)}</td><td>{number(counts?.misses)}</td><td>{number(counts?.evictions)}</td></>}
               <td>{cache.residentBytes != null ? bytes(cache.residentBytes) : "residentPages" in cache && cache.residentPages != null ? `${number(cache.residentPages)} ${t("Seiten")}` : "—"}</td>
@@ -145,7 +146,7 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
           })}</tbody></table></div>
           {compression && <div className="read-cache-compression" aria-label={t("Verified Read · RAM-Kompression")}>
             <h3>{t("Verified Read · RAM-Kompression")}</h3>
-            <p className="detail-note">{t("Häufig genutzte Daten liegen direkt im RAM, weitere Einträge komprimiert. Beide teilen sich das Verified-Read-Budget. Speicherwerte gelten zum Messpunkt.")}</p>
+            <p className="detail-note">{t("Geprüfte Nutzdaten bleiben komprimiert im RAM, wenn das Speicher spart; andernfalls bleiben sie unkomprimiert. Beide Darstellungen teilen sich das gemeinsame Cache-Budget. Speicherwerte gelten zum Messpunkt.")}</p>
             {rows([
               ["Direkt im RAM", bytes(compression.decodedResidentBytes)],
               ["Komprimiert im RAM", bytes(compression.compressedResidentBytes)],
@@ -209,7 +210,7 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
           <div><h3>{t("Hintergrundprüfung")}</h3>{scrub ? <>{rows([["Container geprüft", `${number(scrub.verifiedContainers)} / ${number(scrub.totalContainers)}`], ["aus vorheriger Prüfung übernommen", number(scrub.resumedContainers)], ["neu geprüft", number(scrub.newlyVerifiedContainers)], ["noch ausstehend", number(scrub.remainingContainers)], ["Geprüfte Container-Bytes", bytes(scrub.verifiedBytes)], ["Gelesene Bytes", bytes(scrub.readBytes)]])}</> : <p className="detail-note">{t("Keine Messdaten zur Hintergrundprüfung verfügbar.")}</p>}</div></div> : empty)}
         {tab === 6 && (metadataReads ? <>
           <h3>{t("Metadata-Lesewege")}</h3>
-          <p className="detail-note">{t("Angeforderte Backend-Reads nach Ursache. Diese Werte sind keine physischen Plattenzugriffe: gepufferte Reads und mmap können vom Linux-Dateicache bedient werden. Physische MB/s und IOPS stehen bei den Laufwerken.")}</p>
+          <p className="detail-note">{t("Direkte Backend-Reads nach Ursache. Der Unified Read Cache bedient wiederverwendbare Inhalte vor dem Backend. Angeforderte Bereiche enthalten keinen Ausrichtungs- oder Format-Overhead; physische MB/s und IOPS stehen bei den Laufwerken.")}</p>
           <p>{metadataReads.intervalSeconds > 0 ? `${t("Messintervall")}: ${number(metadataReads.intervalSeconds)} s` : t("Erster Messpunkt · Raten noch nicht verfügbar")}</p>
           <label><input type="checkbox" checked={metadataTotals} onChange={event => setMetadataTotals(event.target.checked)} />{t("Summen und Lesezeiten seit Mount anzeigen")}</label>
           {metadataReads.rows.length === 0 ? <p>{t("Noch keine Metadata-Reads erfasst.")}</p> : <div className="telemetry-table-scroll"><table><thead><tr>{["Ursache", "Daten", "Zugriffsweg", "Angefordert · MB/s", "Aufrufe/s", "Laufende Reads", ...(metadataTotals ? ["Aufrufe", "Angefordert", "Erfolgreich geliefert", "Fehler", "Ø Lesezeit", "Max. Lesezeit"] : [])].map(label => <th key={label}>{t(label)}</th>)}</tr></thead><tbody>
@@ -219,7 +220,7 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
               {metadataTotals && <><td>{number(row.operations)}</td><td>{bytes(row.requestedBytes)}</td><td>{bytes(row.returnedBytes)}</td><td>{number(row.errors)}</td><td>{row.mode === "mmap" || !row.operations ? "—" : `${number(row.elapsedMicros / row.operations / 1000)} ms`}</td><td>{row.mode === "mmap" || !row.operations ? "—" : `${number(row.maxMicros / 1000)} ms`}</td></>}
             </tr>)}
           </tbody></table></div>}
-          <small>{t("mmap zählt angeforderte Speicherbereiche, keine Page Faults. Lesezeiten umfassen den Backend-Aufruf inklusive Öffnen und Pufferaufbau; mmap-Lesezeiten werden nicht behauptet. Metadatenzugriffe des Host-Dateisystems sind in dieser Aufschlüsselung nicht enthalten.")}</small>
+          <small>{t("Lesezeiten erfassen den direkten Backend-Aufruf einschließlich Pufferaufbau. Das Öffnen der Datei ist nicht enthalten. Separate Metadatenzugriffe des Host-Dateisystems werden hier nicht gezählt.")}</small>
         </> : empty)}
         {tab === 5 && (checkpoint ? <>
           <p className="detail-note">{t("Letzter abgeschlossener Checkpoint")}: {timestamp(checkpoint.completedAt)} · Generation {number(checkpoint.generation)} · {number(checkpoint.totalMs)} ms</p>

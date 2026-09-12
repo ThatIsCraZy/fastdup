@@ -1,5 +1,5 @@
 //! Bounded, process-local Metadata read attribution. Never storage authority.
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,12 +37,16 @@ const OBJECTS: [&str; 6] = [
     "control",
     "other",
 ];
-const MODES: [&str; 4] = ["bufferedRange", "bufferedFile", "bufferedStructure", "mmap"];
+const MODES: [&str; 4] = [
+    "directRange",
+    "directFile",
+    "directStructure",
+    "directLease",
+];
 const ROWS: usize = REASONS.len() * OBJECTS.len() * MODES.len();
 
 thread_local! {
     static REASON: Cell<MetadataReadReason> = const { Cell::new(MetadataReadReason::Other) };
-    static MAPPING: RefCell<Option<(Arc<MetadataReadCounters>, usize)>> = const { RefCell::new(None) };
 }
 
 /// Synchronous attribution scope; deliberately cannot cross threads or awaits.
@@ -165,40 +169,7 @@ fn record(counter: &Counters, requested: u64, returned: u64, error: bool, micros
     counter.operations.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) struct MappingScope(
-    Option<(Arc<MetadataReadCounters>, usize)>,
-    PhantomData<Rc<()>>,
-);
-impl MappingScope {
-    pub(crate) fn enter(counters: Option<Arc<MetadataReadCounters>>, object: usize) -> Self {
-        Self(
-            MAPPING.with(|current| current.replace(counters.map(|counters| (counters, object)))),
-            PhantomData,
-        )
-    }
-}
-impl Drop for MappingScope {
-    fn drop(&mut self) {
-        MAPPING.with(|current| {
-            current.replace(self.0.take());
-        });
-    }
-}
-pub(crate) fn mapped_range(length: usize, success: bool) {
-    MAPPING.with(|current| {
-        if let Some((counters, object)) = current.borrow().as_ref() {
-            record(
-                &counters.0[index(*object, 3)],
-                length as u64,
-                if success { length as u64 } else { 0 },
-                !success,
-                0,
-            );
-        }
-    });
-}
-
-/// Logical backend work. Mapped access timing does not measure page faults.
+/// Logical direct backend requests and their observed elapsed time.
 #[derive(Clone, Debug)]
 pub struct MetadataReadRow {
     pub reason: &'static str,
@@ -301,7 +272,9 @@ mod tests {
         let counters = Arc::new(MetadataReadCounters::default());
         let mut storage = FsStorageIo::open(&root).unwrap();
         storage.metadata_reads = Some(Arc::clone(&counters));
-        std::fs::write(root.join("sample.fdx"), vec![91; 8192]).unwrap();
+        storage.create_new("sample.fdx").unwrap();
+        storage.write_at("sample.fdx", 0, &vec![91; 8192]).unwrap();
+        storage.sync_file("sample.fdx").unwrap();
         {
             let _lookup = MetadataReadScope::enter(MetadataReadReason::IndexLookup);
             assert_eq!(
@@ -317,7 +290,10 @@ mod tests {
             }
             assert!(storage.read_exact_at("sample.fdx", 8192, 4096).is_err());
         }
-        storage.read_structure_at("sample.fdx", 0, 4096).unwrap();
+        {
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+            storage.read_structure_at("sample.fdx", 0, 4096).unwrap();
+        }
         let rows = counters.rows();
         let lookup = rows.iter().find(|row| row.reason == "indexLookup").unwrap();
         assert_eq!(
@@ -333,50 +309,13 @@ mod tests {
         let audit = rows.iter().find(|row| row.reason == "indexAudit").unwrap();
         assert_eq!(
             (audit.mode, audit.operations, audit.returned_bytes),
-            ("bufferedFile", 1, 8192)
+            ("directFile", 1, 8192)
         );
         assert!(
             rows.iter()
-                .any(|row| row.reason == "other" && row.mode == "bufferedStructure")
+                .any(|row| row.reason == "other" && row.mode == "directStructure")
         );
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn mapping_accesses_are_separate_and_scopes_do_not_leak_between_workers() {
-        let counters = Arc::new(MetadataReadCounters::default());
-        std::thread::scope(|scope| {
-            for reason in [
-                MetadataReadReason::IndexLookup,
-                MetadataReadReason::IndexAudit,
-            ] {
-                let counters = Arc::clone(&counters);
-                scope.spawn(move || {
-                    let _reason = MetadataReadScope::enter(reason);
-                    let _mapping = MappingScope::enter(Some(counters), 0);
-                    for _ in 0..100 {
-                        mapped_range(4096, true);
-                    }
-                    mapped_range(4096, false);
-                });
-            }
-        });
-        mapped_range(4096, true); // no mapping scope on this thread
-        let rows = counters.rows();
-        assert_eq!(rows.len(), 2);
-        for row in rows {
-            assert_eq!(
-                (
-                    row.mode,
-                    row.operations,
-                    row.requested_bytes,
-                    row.returned_bytes,
-                    row.errors
-                ),
-                ("mmap", 101, 413696, 409600, 1)
-            );
-            assert_eq!((row.elapsed_micros, row.in_flight), (0, 0));
-        }
     }
 
     #[test]
@@ -417,14 +356,14 @@ mod tests {
                 .unwrap();
             let active = transition.current();
             assert!(counters.rows().iter().any(|row| row.reason == "indexAudit"
-                && row.mode == "mmap"
+                && row.mode == "directLease"
                 && row.returned_bytes > 0));
             active
                 .lookup_transitions(entry.chunk_id(), entry.logical_length())
                 .unwrap();
             let before: u64 = counters.rows().iter().map(|row| row.operations).sum();
             assert!(counters.rows().iter().any(|row| row.reason == "indexLookup"
-                && row.mode == "mmap"
+                && row.mode == "directLease"
                 && row.returned_bytes > 0));
             active
                 .lookup_transitions(entry.chunk_id(), entry.logical_length())

@@ -87,7 +87,9 @@ pub fn start(
     let worker = std::thread::Builder::new()
         .name("recovery-scrub".to_owned())
         .spawn(move || {
-            let _reads = fastdup_store::MetadataReadScope::enter(fastdup_store::MetadataReadReason::RecoveryScrub);
+            let _reads = fastdup_store::MetadataReadScope::enter(
+                fastdup_store::MetadataReadReason::RecoveryScrub,
+            );
             let mut journal = None;
             let result = (|| {
                 fastdup_store::set_background_io_priority().map_err(io::Error::other)?;
@@ -444,7 +446,9 @@ impl<I: StorageIo> StorageIo for PacedStorage<I> {
         self.inner.object_len(name)
     }
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
-        let _reads = fastdup_store::MetadataReadScope::enter(fastdup_store::MetadataReadReason::RecoveryScrub);
+        let _reads = fastdup_store::MetadataReadScope::enter(
+            fastdup_store::MetadataReadReason::RecoveryScrub,
+        );
         let length = self.inner.object_len(name)?;
         if length > fastdup_format::MAX_CONTAINER_BYTES {
             return Err(io::Error::other("scrub object exceeds Container limit"));
@@ -452,7 +456,11 @@ impl<I: StorageIo> StorageIo for PacedStorage<I> {
         self.read_exact_at(name, 0, usize::try_from(length).map_err(io::Error::other)?)
     }
     fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        let _reads = fastdup_store::MetadataReadScope::enter(fastdup_store::MetadataReadReason::RecoveryScrub);
+        let _independent =
+            fastdup_store::ReadIntentScope::enter(fastdup_store::ReadIntent::Independent);
+        let _reads = fastdup_store::MetadataReadScope::enter(
+            fastdup_store::MetadataReadReason::RecoveryScrub,
+        );
         if length as u64 > fastdup_format::MAX_CONTAINER_BYTES {
             return Err(io::Error::other("scrub range exceeds Container limit"));
         }
@@ -475,7 +483,9 @@ impl<I: StorageIo> StorageIo for PacedStorage<I> {
         Ok(bytes)
     }
     fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        let _reads = fastdup_store::MetadataReadScope::enter(fastdup_store::MetadataReadReason::RecoveryScrub);
+        let _reads = fastdup_store::MetadataReadScope::enter(
+            fastdup_store::MetadataReadReason::RecoveryScrub,
+        );
         self.control.check_cancelled()?;
         let start = Instant::now();
         let bytes = self.inner.read_structure_at(name, offset, length)?;

@@ -7,7 +7,7 @@ use fastdup_appliance::{
     APPLIANCE_RECOVERY_LATCH_FILE_NAME, AppliancePoolBinding, checkpoint_policy_set,
 };
 use fastdup_format::{ManifestExtent, ManifestLeaf, MetadataObjectId, NamespaceRoot};
-use fastdup_store::{FsStorageIo, GenerationRepository};
+use fastdup_store::{FsStorageIo, GenerationRepository, StorageIo};
 
 fn unique_test_root(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -183,7 +183,13 @@ fn recovery_required_repository_allows_scrub_before_other_offline_mutation() {
         .expect("commit one scrub-valid generation");
     drop(generations);
     let latch = metadata_root.join(APPLIANCE_RECOVERY_LATCH_FILE_NAME);
-    std::fs::write(&latch, []).expect("arm empty recovery latch");
+    let storage = FsStorageIo::open(&metadata_root).unwrap();
+    storage
+        .create_new(APPLIANCE_RECOVERY_LATCH_FILE_NAME)
+        .expect("arm empty recovery latch");
+    storage
+        .sync_file(APPLIANCE_RECOVERY_LATCH_FILE_NAME)
+        .unwrap();
     std::fs::File::open(&metadata_root)
         .expect("open metadata directory")
         .sync_all()

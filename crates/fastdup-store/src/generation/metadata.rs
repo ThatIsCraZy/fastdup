@@ -21,6 +21,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         encoded: &[u8],
     ) -> Result<StagedMetadata, GenerationError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         if encoded.len() > MAX_METADATA_OBJECT_BYTES {
             return Err(GenerationError::MetadataTooLarge);
         }

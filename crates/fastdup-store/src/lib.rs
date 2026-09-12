@@ -3,7 +3,10 @@
 //! Durable container lifecycle behind an injectable storage boundary.
 
 mod metadata_read_telemetry;
-pub use metadata_read_telemetry::{MetadataReadReason, MetadataReadScope, MetadataReadRow, MetadataReadStatus, metadata_read_status};
+pub use metadata_read_telemetry::{
+    MetadataReadReason, MetadataReadRow, MetadataReadScope, MetadataReadStatus,
+    metadata_read_status,
+};
 
 mod cpu_admission;
 pub use cpu_admission::{WorkerPermitLease, WorkerPermits};
@@ -11,35 +14,40 @@ pub use cpu_admission::{WorkerPermitLease, WorkerPermits};
 mod container_descriptor_cache;
 mod container_generation_allocator;
 mod exact_activation_log;
-mod exact_index_mmap;
+mod exact_index_read;
 mod exact_index_repository;
 mod gc_candidate_catalog;
-mod gc_candidate_mmap;
+mod gc_candidate_read;
 mod generation;
 mod generation_log;
-mod manifest_reader;
 mod manifest_cache;
-mod metadata_object_cache;
+mod manifest_reader;
 mod manifest_tree;
 mod metadata_mark_catalog;
+mod metadata_object_cache;
 pub use manifest_tree::{ManifestRangeExtent, ManifestTreeSummary};
 mod cache_budget;
+mod direct_io;
+mod read_intent;
+mod unified_cache;
+pub use read_intent::{ReadIntent, ReadIntentScope};
+pub use unified_cache::{ReadCacheClass, ReadCacheKey, ReadCacheNamespace, ReadCacheStats};
 mod long_lived_arena;
 mod maintenance;
 mod maintenance_cancellation;
 pub use maintenance_cancellation::{MaintenanceCancellation, MaintenanceCancelled};
+mod allocator_memory;
 mod maintenance_ioprio;
 mod memory_budget;
-mod allocator_memory;
 pub use allocator_memory::{AllocatorMemoryStatus, AllocatorReclaimer, allocator_memory_status};
 mod page_cache;
 pub use cache_budget::{
     CacheBudgetStatus, CacheFallback, CacheObservation, CachePool, CachePoolStatus,
     cache_budget_status, cache_memory_reserve,
 };
+mod candidate_read_gate;
 mod online_similarity;
 mod persistent_reduction;
-mod candidate_read_gate;
 mod prefix_context;
 mod read_cache;
 mod recovery_checkpoint;
@@ -53,9 +61,11 @@ mod scrub_progress;
 mod seqcdc;
 mod similarity_external_sort;
 mod similarity_index_repository;
-mod similarity_mmap;
+mod similarity_read;
 mod similarity_simd;
-pub use scrub_progress::{ScrubCertificate, ScrubCoverage, ScrubProgress, ScrubResumePool, SCRUB_RESUME_MAX_IOS};
+pub use scrub_progress::{
+    SCRUB_RESUME_MAX_IOS, ScrubCertificate, ScrubCoverage, ScrubProgress, ScrubResumePool,
+};
 mod recovery_read;
 mod structural_recovery;
 pub use structural_recovery::PendingDataVerification;
@@ -151,9 +161,8 @@ pub use tiered_storage::{TieredStorageError, TieredStorageIo};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::io;
 use std::num::NonZeroUsize;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -443,6 +452,7 @@ impl ContainerStore {
     ///
     /// Returns namespace I/O, naming, or container integrity errors.
     pub fn recover_published(&self) -> Result<Vec<SealedContainer>, StoreError> {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         self.repository.recover_published()
     }
 
@@ -456,6 +466,7 @@ impl ContainerStore {
     ///
     /// Returns namespace I/O, naming, container integrity, or identity errors.
     pub fn verify_published(&self) -> Result<Vec<PublishedContainerSummary>, StoreError> {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         self.repository.verify_published()
     }
 
@@ -783,7 +794,80 @@ pub trait StorageIo {
 const CONTAINER_READ_FD_CAPACITY: usize = 128;
 const FILE_REGISTRY_SHARDS: usize = 8;
 
-type FileAccess = Arc<Mutex<usize>>;
+type FileAccess = Arc<FileAccessState>;
+
+#[derive(Debug)]
+struct FileAccessState {
+    leases: Mutex<usize>,
+    revision: std::sync::atomic::AtomicU64,
+}
+
+impl FileAccessState {
+    fn next_revision() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let revision = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(revision, u64::MAX, "ASSERT: file cache revisions exhausted");
+        revision
+    }
+
+    fn new() -> Self {
+        Self {
+            leases: Mutex::new(0),
+            revision: std::sync::atomic::AtomicU64::new(Self::next_revision()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, usize>> {
+        self.leases.lock()
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mutate(&self) -> FileMutation<'_> {
+        self.changed();
+        FileMutation(self)
+    }
+
+    fn changed(&self) {
+        self.revision
+            .store(Self::next_revision(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+struct FileMutation<'a>(&'a FileAccessState);
+impl Drop for FileMutation<'_> {
+    fn drop(&mut self) {
+        // In-flight reads from before or during a mutation must not populate
+        // the generation seen afterwards, including a failed partial write.
+        self.0.changed();
+    }
+}
+
+// A resource ceiling limits idle descriptors; ownership and replacement remain
+// in the common cache. Active I/O may retain its File after cache eviction.
+static RESIDENT_FILE_HANDLES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[derive(Debug)]
+struct FileHandlePermit;
+impl FileHandlePermit {
+    fn acquire() -> Option<Self> {
+        RESIDENT_FILE_HANDLES
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| (count < CONTAINER_READ_FD_CAPACITY).then_some(count + 1),
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+impl Drop for FileHandlePermit {
+    fn drop(&mut self) {
+        RESIDENT_FILE_HANDLES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug)]
 struct CachedReadFile {
@@ -791,19 +875,20 @@ struct CachedReadFile {
     length: u64,
     // Keeps the name's synchronization identity alive while it is cached.
     _access: FileAccess,
+    _permit: FileHandlePermit,
 }
 
 #[repr(align(64))]
 #[derive(Debug, Default)]
 struct FileRegistryShard {
-    names: Mutex<BTreeMap<String, Weak<Mutex<usize>>>>,
-    reads: Mutex<BTreeMap<String, CachedReadFile>>,
+    names: Mutex<BTreeMap<String, Weak<FileAccessState>>>,
 }
 
 #[derive(Debug, Default)]
 struct ImmutableFileRegistry {
     shards: [FileRegistryShard; FILE_REGISTRY_SHARDS],
-    read_order: Mutex<std::collections::VecDeque<String>>,
+    handles: OnceLock<ReadCacheNamespace>,
+    range_cache: OnceLock<ReadCacheNamespace>,
 }
 
 impl ImmutableFileRegistry {
@@ -827,56 +912,41 @@ impl ImmutableFileRegistry {
         if names.len() >= 256 {
             names.retain(|_, access| access.strong_count() != 0);
         }
-        let access = Arc::new(Mutex::new(0));
+        let access = Arc::new(FileAccessState::new());
         names.insert(name.to_owned(), Arc::downgrade(&access));
         Ok(access)
     }
 
-    fn reads(
-        &self,
-        name: &str,
-    ) -> io::Result<std::sync::MutexGuard<'_, BTreeMap<String, CachedReadFile>>> {
-        self.shard(name)
-            .reads
-            .lock()
-            .map_err(|_| io::Error::other("Container FD cache is poisoned"))
+    fn handle_cache(&self) -> &ReadCacheNamespace {
+        self.handles
+            .get_or_init(|| ReadCacheNamespace::system(ReadCacheClass::StorageHandle))
     }
 
-    fn invalidate(&self, name: &str) -> io::Result<()> {
-        let mut order = self
-            .read_order
-            .lock()
-            .map_err(|_| io::Error::other("FD admission lock is poisoned"))?;
-        if self.reads(name)?.remove(name).is_some() {
-            order.retain(|cached| cached != name);
+    fn handle_key(name: &str) -> ReadCacheKey {
+        ReadCacheKey {
+            identity: *blake3::hash(name.as_bytes()).as_bytes(),
+            ordinal: 0,
         }
-        Ok(())
     }
 
-    fn cache_file(&self, name: &str, file: CachedReadFile) -> io::Result<()> {
-        // Only admissions/invalidations take the FIFO lock. Hot reads take one
-        // shard lock, while all shards retain the full shared 128-FD capacity.
-        let mut order = self
-            .read_order
-            .lock()
-            .map_err(|_| io::Error::other("FD admission lock is poisoned"))?;
-        if self.reads(name)?.remove(name).is_some() {
-            order.retain(|cached| cached != name);
+    fn invalidate(&self, name: &str) {
+        if let Some(cache) = self.handles.get() {
+            cache.remove(Self::handle_key(name));
         }
-        if order.len() == CONTAINER_READ_FD_CAPACITY {
-            let oldest = order
-                .pop_front()
-                .expect("ASSERT: full FD cache has an oldest entry");
-            self.reads(&oldest)?.remove(&oldest);
-        }
-        self.reads(name)?.insert(name.to_owned(), file);
-        order.push_back(name.to_owned());
-        Ok(())
+    }
+
+    fn cache_file(&self, name: &str, file: CachedReadFile) {
+        self.handle_cache().insert(
+            Self::handle_key(name),
+            Arc::new(file),
+            size_of::<CachedReadFile>() as u64,
+            0,
+        );
     }
 
     fn cached(&self, name: &str, end: u64) -> io::Result<Option<Arc<File>>> {
-        self.reads(name)?
-            .get(name)
+        self.handle_cache()
+            .get::<CachedReadFile>(Self::handle_key(name))
             .map(|cached| {
                 check_read_end(end, cached.length)?;
                 Ok(Arc::clone(&cached.file))
@@ -901,17 +971,29 @@ fn check_read_end(end: u64, length: u64) -> io::Result<()> {
 /// [`FsStorageIo`] adapters from mutating the same published name.
 pub struct ImmutableFileLease {
     metadata_reads: Option<Arc<metadata_read_telemetry::MetadataReadCounters>>,
-    metadata_object_class: usize,
+    name: String,
     file: File,
     access: FileAccess,
     // Keep the canonical-root registry discoverable even if every adapter
     // drops before the mapping. A reopened adapter must see this same lease.
-    _registry: SharedImmutableFileRegistry,
+    registry: SharedImmutableFileRegistry,
 }
 
 impl ImmutableFileLease {
-    pub(crate) fn mapping_read_scope(&self) -> metadata_read_telemetry::MappingScope {
-        metadata_read_telemetry::MappingScope::enter(self.metadata_reads.clone(), self.metadata_object_class)
+    pub(crate) fn read_at(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        read_cached_file_range(
+            &self.file,
+            &self.name,
+            &self.registry,
+            self.metadata_reads.as_deref(),
+            offset,
+            length,
+            3,
+        )
+    }
+
+    pub(crate) fn logical_len(&self) -> io::Result<u64> {
+        direct_io::object_len(&self.file)
     }
 
     pub(crate) const fn file(&self) -> &File {
@@ -1046,6 +1128,9 @@ impl RecordReadCoordinator {
     }
 
     fn join(&self, key: RecordReadKey) -> RecordReadJoin {
+        if read_intent::independent() {
+            return RecordReadJoin::Bypass;
+        }
         let shard = &self.shards[Self::shard(key)];
         let Ok(mut flights) = shard.lock() else {
             return RecordReadJoin::Bypass;
@@ -2067,6 +2152,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         let temporary_name = temporary_name(container_id);
         let published_name = published_name(container_id);
         if self.storage.exists(&published_name)? {
+            let _independent = ReadIntentScope::enter(ReadIntent::Independent);
             let existing = self.storage.read(&published_name)?;
             if existing != sealed {
                 return Err(StoreError::PublishVerificationMismatch);
@@ -2190,6 +2276,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         expected_id: ContainerId,
         bytes: &[u8],
     ) -> Result<VerifiedContainerPublication, StoreError> {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         let mut base_resolver = ContainerBaseResolver::new(self);
         let mut resolver_error = None;
         let mut resolve = |dependency: fastdup_format::DependentDependency| match base_resolver
@@ -2300,7 +2387,10 @@ impl<I: StorageIo> ContainerRepository<I> {
             let read_offset = offset
                 .checked_add(u64::try_from(completed).map_err(|_| FormatError::ArithmeticOverflow)?)
                 .ok_or(FormatError::ArithmeticOverflow)?;
-            bytes.extend(self.storage.read_structure_at(name, read_offset, read_length)?);
+            bytes.extend(
+                self.storage
+                    .read_structure_at(name, read_offset, read_length)?,
+            );
             completed = completed
                 .checked_add(read_length)
                 .ok_or(FormatError::ArithmeticOverflow)?;
@@ -2773,7 +2863,11 @@ impl<I: StorageIo> ContainerRepository<I> {
         cache: Option<&VerifiedReadCache>,
     ) -> Option<VerifiedChunkRead> {
         self.find_verified_independent_base_read_gated(
-            index, chunk_id, logical_length, cache, &mut || true,
+            index,
+            chunk_id,
+            logical_length,
+            cache,
+            &mut || true,
         )
     }
 
@@ -3415,6 +3509,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     ///
     /// Returns namespace I/O, naming, format, or identity-pairing errors.
     pub fn recover_published(&self) -> Result<Vec<SealedContainer>, StoreError> {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         let mut names = self.storage.list_names()?;
         names.sort_unstable();
         let mut recovered = Vec::new();
@@ -3440,6 +3535,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         index: &ActivatedExactIndex<J>,
     ) -> Result<Vec<SealedContainer>, StoreError> {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         let mut names = self.storage.list_names()?;
         names.sort_unstable();
         let mut recovered = Vec::new();
@@ -3605,6 +3701,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     ///
     /// Returns namespace I/O, naming, format, or identity-pairing errors.
     pub fn verify_published(&self) -> Result<Vec<PublishedContainerSummary>, StoreError> {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         let mut names = self.storage.list_names()?;
         names.sort_unstable();
         let mut verified = Vec::new();
@@ -3646,6 +3743,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         container_ids: &BTreeMap<[u8; 16], ContainerId>,
     ) -> Result<(u64, ContainerRemovalMetrics), StoreError> {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         let verify_started = Instant::now();
         let mut removed_bytes = 0_u64;
         let mut verified_removals = Vec::new();
@@ -3693,6 +3791,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         retiring_entries: &[ExactIndexEntry],
     ) -> Result<RecoveredRetiringRemoval, StoreError> {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         let mut victims = BTreeMap::<[u8; 16], (ContainerId, Vec<ExactIndexEntry>)>::new();
         for entry in retiring_entries.iter().copied() {
             if entry.transition() != ExactLocationTransition::Retiring {
@@ -3769,6 +3868,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         E: From<StoreError>,
         F: FnMut(&VerifiedContainerPublication) -> Result<(), E>,
     {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         let mut names = self
             .storage
             .list_names()
@@ -3845,6 +3945,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         E: From<StoreError>,
         F: FnMut(&SealedContainer) -> Result<(), E>,
     {
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
         let mut names = self
             .storage
             .list_names()
@@ -3901,7 +4002,10 @@ impl<I: StorageIo> ContainerRepository<I> {
             );
             let decoded = encoded
                 .into_par_iter()
-                .map(|(expected_id, bytes)| self.decode_published_bytes(expected_id, &bytes))
+                .map(|(expected_id, bytes)| {
+                    let _independent = ReadIntentScope::enter(ReadIntent::Independent);
+                    self.decode_published_bytes(expected_id, &bytes)
+                })
                 .collect::<Result<Vec<_>, StoreError>>()
                 .map_err(E::from)?;
             for container in decoded {
@@ -3985,6 +4089,202 @@ static FS_IMMUTABLE_LEASE_REGISTRIES: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<ImmutableFileRegistry>>>,
 > = OnceLock::new();
 
+struct StoragePage {
+    owner: Arc<Vec<u8>>,
+    start: usize,
+    length: usize,
+    _access: FileAccess,
+}
+
+struct CachedFileLayout {
+    layout: direct_io::Layout,
+    _access: FileAccess,
+}
+
+fn immutable_storage_name(name: &str) -> bool {
+    !name.starts_with('.')
+        && !name.starts_with("reduction-head.")
+        && [
+            ".fdc", ".fdm", ".fdx", ".fds", ".run", ".fdxset", ".fdsf", ".fdrc", ".fdd",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// Replaces a locked diagnostic record through the same aligned Direct-I/O
+/// writer used by repository files. The caller holds the kernel file lock;
+/// these bytes are diagnostic only and are never repository authority.
+///
+/// # Errors
+/// Rejects a buffered descriptor, records over 4096 bytes, or failed I/O.
+pub fn write_locked_control_record(file: &File, bytes: &[u8]) -> io::Result<()> {
+    direct_io::write_control_record(file, bytes)
+}
+
+fn storage_identity(file: &File, name: &str, revision: u64) -> io::Result<[u8; 32]> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    let mut identity = blake3::Hasher::new();
+    identity.update(name.as_bytes());
+    identity.update(&revision.to_le_bytes());
+    for value in [
+        metadata.dev().to_le_bytes(),
+        metadata.ino().to_le_bytes(),
+        metadata.len().to_le_bytes(),
+        metadata.mtime().to_le_bytes(),
+        metadata.mtime_nsec().to_le_bytes(),
+        metadata.ctime().to_le_bytes(),
+        metadata.ctime_nsec().to_le_bytes(),
+    ] {
+        identity.update(&value);
+    }
+    Ok(*identity.finalize().as_bytes())
+}
+
+fn cached_file_layout(
+    file: &File,
+    name: &str,
+    registry: &ImmutableFileRegistry,
+) -> io::Result<direct_io::Layout> {
+    if read_intent::independent() || !immutable_storage_name(name) {
+        return direct_io::layout(file);
+    }
+    let access = registry.access(name)?;
+    let key = ReadCacheKey {
+        identity: storage_identity(file, name, access.revision())?,
+        ordinal: u64::MAX,
+    };
+    let cache = registry
+        .range_cache
+        .get_or_init(|| ReadCacheNamespace::system(ReadCacheClass::StorageRange));
+    if let Some(layout) = cache.get::<CachedFileLayout>(key) {
+        return Ok(layout.layout);
+    }
+    let layout = cache.coalesce(key, || {
+        if let Some(layout) = cache.get::<CachedFileLayout>(key) {
+            return Ok(layout);
+        }
+        let layout = Arc::new(CachedFileLayout {
+            layout: direct_io::layout(file)?,
+            _access: access,
+        });
+        cache.insert(
+            key,
+            Arc::clone(&layout),
+            (size_of::<CachedFileLayout>() + size_of::<FileAccessState>()) as u64,
+            8192,
+        );
+        Ok(layout)
+    })?;
+    Ok(layout.layout)
+}
+
+fn read_cached_file_range(
+    file: &File,
+    name: &str,
+    registry: &ImmutableFileRegistry,
+    counters: Option<&metadata_read_telemetry::MetadataReadCounters>,
+    offset: u64,
+    length: usize,
+    mode: usize,
+) -> io::Result<Vec<u8>> {
+    const PAGE: u64 = 4096;
+    let access = registry.access(name)?;
+    let revision = access.revision();
+    let layout = cached_file_layout(file, name, registry)?;
+    if !immutable_storage_name(name) || read_intent::independent() || length == 0 {
+        let span = metadata_read_telemetry::ReadSpan::start(counters, name, mode, Some(length));
+        let result = direct_io::read_with_layout(file, layout, offset, length);
+        span.finish(&result);
+        return result;
+    }
+    let end = offset
+        .checked_add(length as u64)
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    if end > layout.length {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    let identity = storage_identity(file, name, revision)?;
+    let cache = registry
+        .range_cache
+        .get_or_init(|| ReadCacheNamespace::system(ReadCacheClass::StorageRange));
+    let first = offset / PAGE;
+    let last = end.div_ceil(PAGE);
+    let mut hits = Vec::new();
+    for ordinal in first..last {
+        let Some(page) = cache.get::<StoragePage>(ReadCacheKey { identity, ordinal }) else {
+            break;
+        };
+        hits.push(page);
+    }
+    if hits.len() as u64 == last - first {
+        let mut output = Vec::with_capacity(length);
+        for (ordinal, page) in (first..last).zip(hits) {
+            let from = usize::try_from(offset.saturating_sub(ordinal * PAGE))
+                .expect("ASSERT: bounded storage range fits usize");
+            let to = (usize::try_from(end - ordinal * PAGE)
+                .expect("ASSERT: bounded storage range fits usize"))
+            .min(page.length);
+            output.extend_from_slice(&page.owner[page.start + from..page.start + to]);
+        }
+        return Ok(output);
+    }
+    let start = first * PAGE;
+    let disk_end = last.saturating_mul(PAGE).min(layout.length);
+    let mut request = blake3::Hasher::new();
+    request.update(&identity);
+    request.update(&start.to_le_bytes());
+    request.update(&disk_end.to_le_bytes());
+    let request = ReadCacheKey {
+        identity: *request.finalize().as_bytes(),
+        ordinal: 0,
+    };
+    let owner = cache.coalesce(request, || {
+        let span = metadata_read_telemetry::ReadSpan::start(
+            counters,
+            name,
+            mode,
+            Some(
+                usize::try_from(disk_end - start)
+                    .expect("ASSERT: bounded storage range fits usize"),
+            ),
+        );
+        let result = direct_io::read_with_layout(
+            file,
+            layout,
+            start,
+            usize::try_from(disk_end - start).expect("ASSERT: bounded storage range fits usize"),
+        );
+        span.finish(&result);
+        let owner = Arc::new(result?);
+        let values = (first..last)
+            .map(|ordinal| {
+                let start = usize::try_from((ordinal - first) * PAGE)
+                    .expect("ASSERT: bounded storage range fits usize");
+                let length = (owner.len() - start).min(4096);
+                (
+                    ReadCacheKey { identity, ordinal },
+                    Arc::new(StoragePage {
+                        owner: Arc::clone(&owner),
+                        start,
+                        length,
+                        _access: Arc::clone(&access),
+                    }),
+                    length as u64,
+                )
+            })
+            .collect();
+        cache.insert_group(
+            values,
+            owner.capacity() as u64 + size_of::<Vec<u8>>() as u64,
+        );
+        Ok(owner)
+    })?;
+    let from = usize::try_from(offset - start).expect("ASSERT: bounded storage range fits usize");
+    let output = owner[from..from + length].to_vec();
+    Ok(output)
+}
+
 #[derive(Clone, Debug)]
 pub struct FsStorageIo {
     metadata_reads: Option<Arc<metadata_read_telemetry::MetadataReadCounters>>,
@@ -4001,6 +4301,7 @@ impl FsStorageIo {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         std::fs::create_dir_all(root.as_ref())?;
         let root = std::fs::canonicalize(root.as_ref())?;
+        direct_io::validate_filesystem(&File::open(&root)?)?;
         let registries = FS_IMMUTABLE_LEASE_REGISTRIES.get_or_init(|| Mutex::new(BTreeMap::new()));
         let mut registries = registries
             .lock()
@@ -4055,7 +4356,7 @@ impl FsStorageIo {
     /// Rejects invalid names, overflowing ranges, missing files, and EOF.
     ///
     /// # Panics
-    /// Panics if bounded FD-cache and FIFO ownership diverge.
+    /// Panics if common cache ownership locks are poisoned.
     pub fn open_read_range(&self, name: &str, offset: u64, length: usize) -> io::Result<Arc<File>> {
         Self::validate_name(name)?;
         let end = offset
@@ -4063,7 +4364,7 @@ impl FsStorageIo {
                 u64::try_from(length).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
             )
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        // Hits take only a cache-shard lock. A hit linearizes before a racing
+        // Hits consult the common directory. A hit linearizes before a racing
         // invalidation, like an already-open in-flight range read. Misses wait
         // only for mutation of this name; no registry/cache lock spans I/O.
         if let Some(file) = self.immutable_leases.cached(name, end)? {
@@ -4076,23 +4377,64 @@ impl FsStorageIo {
         if let Some(file) = self.immutable_leases.cached(name, end)? {
             return Ok(file);
         }
-        let file = Arc::new(File::open(self.root.join(name))?);
+        let file = Arc::new(direct_io::open(&self.root.join(name), false)?);
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
-        check_read_end(end, metadata.len())?;
-        if matches!(parse_published_name(name), Ok(Some(_))) {
+        let logical_length = cached_file_layout(&file, name, &self.immutable_leases)?.length;
+        check_read_end(end, logical_length)?;
+        if matches!(parse_published_name(name), Ok(Some(_)))
+            && let Some(permit) = FileHandlePermit::acquire()
+        {
             self.immutable_leases.cache_file(
                 name,
                 CachedReadFile {
                     file: Arc::clone(&file),
-                    length: metadata.len(),
+                    length: logical_length,
                     _access: Arc::clone(&access),
+                    _permit: permit,
                 },
-            )?;
+            );
         }
         Ok(file)
+    }
+
+    fn read_range(
+        &self,
+        name: &str,
+        offset: u64,
+        length: usize,
+        mode: usize,
+    ) -> io::Result<Vec<u8>> {
+        let opened = if length > MAX_STORAGE_RANGE_BYTES {
+            Err(io::ErrorKind::InvalidInput.into())
+        } else {
+            self.open_read_range(name, offset, length)
+        };
+        let file = match opened {
+            Ok(file) => file,
+            Err(error) => {
+                let span = metadata_read_telemetry::ReadSpan::start(
+                    self.metadata_reads.as_deref(),
+                    name,
+                    mode,
+                    Some(length),
+                );
+                let result = Err(error);
+                span.finish(&result);
+                return result;
+            }
+        };
+        read_cached_file_range(
+            &file,
+            name,
+            &self.immutable_leases,
+            self.metadata_reads.as_deref(),
+            offset,
+            length,
+            mode,
+        )
     }
 
     /// Serializes mutation of one name with immutable leases and FD invalidation.
@@ -4111,7 +4453,8 @@ impl FsStorageIo {
             .lock()
             .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
         Self::reject_leased(*count)?;
-        self.immutable_leases.invalidate(name)?;
+        let _mutation = access.mutate();
+        self.immutable_leases.invalidate(name);
         action()
     }
 
@@ -4142,8 +4485,10 @@ impl FsStorageIo {
             .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
         Self::reject_leased(*first_count)?;
         Self::reject_leased(*second_count)?;
-        self.immutable_leases.invalidate(old)?;
-        self.immutable_leases.invalidate(new)?;
+        let _first_mutation = first_access.mutate();
+        let _second_mutation = second_access.mutate();
+        self.immutable_leases.invalidate(old);
+        self.immutable_leases.invalidate(new);
         action()
     }
 
@@ -4160,36 +4505,18 @@ impl FsStorageIo {
 
 impl StorageIo for FsStorageIo {
     fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        let span = metadata_read_telemetry::ReadSpan::start(self.metadata_reads.as_deref(), name, 2, Some(length));
-        let result = (|| {
-        if length > MAX_STORAGE_RANGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "structure read exceeds range limit",
-            ));
-        }
-        // A separate FD keeps RANDOM advice off shared foreground read handles.
-        let file = File::open(self.path(name)?)?;
-        rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Random)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| io::ErrorKind::OutOfMemory)?;
-        bytes.resize(length, 0);
-        file.read_exact_at(&mut bytes, offset)?;
-        Ok(bytes)
-            })();
-        span.finish(&result);
-        result
+        self.read_range(name, offset, length, 2)
     }
     fn create_new(&self, name: &str) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
         self.with_file_mutation(name, || {
-            OpenOptions::new()
+            let file = OpenOptions::new()
                 .create_new(true)
                 .read(true)
                 .write(true)
+                .custom_flags(libc::O_DIRECT)
                 .open(self.path(name)?)?;
-            Ok(())
+            direct_io::initialize(&file)
         })
     }
 
@@ -4199,61 +4526,34 @@ impl StorageIo for FsStorageIo {
 
     fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
         self.with_file_mutation(name, || {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(self.path(name)?)?
-                .write_all_at(bytes, offset)
+            direct_io::write(&direct_io::open(&self.path(name)?, true)?, offset, bytes)
         })
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
-        let span = metadata_read_telemetry::ReadSpan::start(self.metadata_reads.as_deref(), name, 1, None);
-        let result = (|| {
-        let mut file = File::open(self.path(name)?)?;
-        let declared_length = file.metadata()?.len();
-        if declared_length > MAX_CONTAINER_BYTES {
-            return Err(container_too_large(declared_length));
+        let file = direct_io::open(&self.path(name)?, false)?;
+        let length = cached_file_layout(&file, name, &self.immutable_leases)?.length;
+        if length > MAX_CONTAINER_BYTES {
+            return Err(container_too_large(length));
         }
-        let capacity =
-            usize::try_from(declared_length).map_err(|_| container_too_large(declared_length))?;
-        let mut bytes = Vec::with_capacity(capacity);
-        file.by_ref()
-            .take(MAX_CONTAINER_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if u64::try_from(bytes.len()).map_or(true, |length| length > MAX_CONTAINER_BYTES) {
-            return Err(container_too_large(declared_length));
-        }
-        Ok(bytes)
-            })();
-        span.finish(&result);
-        result
+        read_cached_file_range(
+            &file,
+            name,
+            &self.immutable_leases,
+            self.metadata_reads.as_deref(),
+            0,
+            usize::try_from(length).map_err(|_| container_too_large(length))?,
+            1,
+        )
     }
 
     fn object_len(&self, name: &str) -> io::Result<u64> {
-        Ok(File::open(self.path(name)?)?.metadata()?.len())
+        let file = direct_io::open(&self.path(name)?, false)?;
+        Ok(cached_file_layout(&file, name, &self.immutable_leases)?.length)
     }
 
     fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        let span = metadata_read_telemetry::ReadSpan::start(self.metadata_reads.as_deref(), name, 0, Some(length));
-        let result = (|| {
-        if length > MAX_STORAGE_RANGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "bounded storage read exceeds the hard allocation limit",
-            ));
-        }
-        let file = self.open_read_range(name, offset, length)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-        bytes.resize(length, 0);
-        file.read_exact_at(&mut bytes, offset)?;
-        Ok(bytes)
-            })();
-        span.finish(&result);
-        result
+        self.read_range(name, offset, length, 0)
     }
 
     fn list_names(&self) -> io::Result<Vec<String>> {
@@ -4284,10 +4584,7 @@ impl StorageIo for FsStorageIo {
 
     fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
         self.with_file_mutation(name, || {
-            OpenOptions::new()
-                .write(true)
-                .open(self.path(name)?)?
-                .set_len(length)
+            direct_io::set_len(&direct_io::open(&self.path(name)?, true)?, length)
         })
     }
 
@@ -4327,9 +4624,9 @@ impl StorageIo for FsStorageIo {
         let mut count = access
             .lock()
             .map_err(|_| io::Error::other("immutable file lock is poisoned"))?;
-        let file = File::open(path)?;
+        let file = direct_io::open(&path, false)?;
         let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() != expected_length {
+        if !metadata.is_file() || direct_io::object_len(&file)? != expected_length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "immutable object identity or length changed before lease acquisition",
@@ -4341,10 +4638,10 @@ impl StorageIo for FsStorageIo {
         drop(count);
         Ok(Some(ImmutableFileLease {
             metadata_reads: self.metadata_reads.clone(),
-            metadata_object_class: metadata_read_telemetry::object_class(name),
+            name: name.to_owned(),
             file,
             access,
-            _registry: Arc::clone(&self.immutable_leases),
+            registry: Arc::clone(&self.immutable_leases),
         }))
     }
 }

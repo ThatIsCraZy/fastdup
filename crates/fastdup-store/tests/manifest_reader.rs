@@ -155,7 +155,7 @@ fn huge_fill_hole_and_verified_data_are_read_byte_exactly_without_file_materiali
 
     let container_path = root.join(format!("{}.fdc", "81".repeat(16)));
     let mut container_bytes = std::fs::read(&container_path).expect("read bounded test container");
-    container_bytes[4_288] ^= 1;
+    container_bytes[8192 + 4_288] ^= 1;
     std::fs::write(&container_path, container_bytes).expect("inject durable test corruption");
     assert!(matches!(
         file.read_at(

@@ -101,7 +101,11 @@ fn repository_wide_page_cache_obeys_shared_memory_headroom() {
 
     let pressured = SimilarityIndexRepository::new_with_memory_snapshot(
         storage,
-        MemoryPressureSnapshot::new(16 * gib, fastdup_store::shared_cache_reserve_bytes(16 * gib), 0),
+        MemoryPressureSnapshot::new(
+            16 * gib,
+            fastdup_store::shared_cache_reserve_bytes(16 * gib),
+            0,
+        ),
     );
     let recovered = pressured
         .recover_latest()
@@ -141,7 +145,7 @@ fn offline_audit_rejects_corrupt_snapshot_page() {
         .write(true)
         .open(root.join(name))
         .expect("open published Similarity run for fault injection");
-    let offset = u64::try_from(4_096 + 96 + 50).expect("fixture offset fits u64");
+    let offset = u64::try_from(8192 + 4_096 + 96 + 50).expect("fixture offset fits u64");
     let mut byte = [0_u8; 1];
     file.read_exact_at(&mut byte, offset)
         .expect("read fault-injection byte");
@@ -180,7 +184,7 @@ fn offline_audit_rejects_corrupt_bucket_page() {
         .write(true)
         .open(root.join(name))
         .expect("open Similarity run for bucket fault injection");
-    let offset = u64::try_from(2 * 4_096 + 80).expect("fixture offset fits u64");
+    let offset = u64::try_from(8192 + 2 * 4_096 + 80).expect("fixture offset fits u64");
     let mut byte = [0_u8; 1];
     file.read_exact_at(&mut byte, offset)
         .expect("read bucket fault-injection byte");
@@ -457,7 +461,7 @@ fn family_query_proposes_the_same_verified_pool_base() {
         .expect("family-query snapshot exists");
     assert_eq!(
         recovered.status().read_mode(),
-        SimilarityIndexReadMode::Mmap
+        SimilarityIndexReadMode::DirectLease
     );
     let mut target = base.clone();
     target[32 * 1_024] ^= 0x5a;
@@ -498,7 +502,7 @@ fn family_recovery_and_scrub_reject_manifest_corruption() {
         .write(true)
         .open(root.join(family_name))
         .expect("open family manifest for fault injection");
-    let offset = 4_096_u64 + 40;
+    let offset = 8192 + 4_096_u64 + 40;
     let mut byte = [0_u8; 1];
     file.read_exact_at(&mut byte, offset)
         .expect("read family-manifest fault byte");
@@ -559,7 +563,7 @@ fn partition_family_recovers_as_one_generation_and_requires_every_partition() {
     assert_eq!(recovered.status().entries_streamed(), 65_600);
     assert_eq!(
         recovered.status().read_mode(),
-        SimilarityIndexReadMode::Mmap
+        SimilarityIndexReadMode::DirectLease
     );
     let audit = repository
         .audit_latest()
@@ -591,17 +595,17 @@ fn partition_family_recovers_as_one_generation_and_requires_every_partition() {
 }
 
 #[test]
-fn mmap_generation_lease_blocks_mutation_until_the_reader_drops() {
-    let root = test_root("mmap-generation-lease");
-    let storage = FsStorageIo::open(&root).expect("open mmap lease repository root");
+fn direct_generation_lease_blocks_mutation_until_the_reader_drops() {
+    let root = test_root("direct-generation-lease");
+    let storage = FsStorageIo::open(&root).expect("open direct lease repository root");
     let repository = SimilarityIndexRepository::new(storage.clone());
     let base = fixture_bytes(64 * 1_024, 91);
     repository
         .publish(&snapshot(61, &[base.as_slice()]))
-        .expect("publish mmap lease fixture");
+        .expect("publish direct lease fixture");
     let run_name = storage
         .list_names()
-        .expect("list mmap lease fixture")
+        .expect("list direct lease fixture")
         .into_iter()
         .find(|name| is_similarity_partition_name(name))
         .expect("published Similarity run exists");
@@ -615,7 +619,7 @@ fn mmap_generation_lease_blocks_mutation_until_the_reader_drops() {
         .expect("mapped fixture exists");
     assert_eq!(
         recovered.status().read_mode(),
-        SimilarityIndexReadMode::Mmap
+        SimilarityIndexReadMode::DirectLease
     );
     let second_reader = repository
         .recover_latest()

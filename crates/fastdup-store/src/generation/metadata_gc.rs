@@ -79,7 +79,7 @@ impl<I: StorageIo> GenerationRepository<I> {
     pub(crate) fn garbage_collect_metadata(
         &self,
     ) -> Result<GenerationMetadataGcSummary, GenerationError> {
-        let _independent = crate::metadata_object_cache::IndependentRead::enter();
+        let _cache_read = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
         self.check_maintenance()?;
         let started = Instant::now();
         let _run_guard = self

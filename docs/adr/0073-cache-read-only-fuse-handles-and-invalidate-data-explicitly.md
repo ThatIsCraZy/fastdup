@@ -4,6 +4,12 @@ status: accepted
 
 # Cache read-only FUSE handles and invalidate DATA explicitly
 
+Amended by [ADR 0046](0046-bound-verified-read-cache-by-live-memory-headroom.md)
+on 12 September 2026: all reusable read content shares one application cache;
+repository I/O and FUSE file data use direct paths. File-backed mappings and
+separate replacement policies described below are superseded. Immutable leases,
+verification and publication ordering remain required.
+
 The v1 kernel-cache policy uses cached I/O only for regular files opened
 read-only. Those opens return `FOPEN_KEEP_CACHE`, so clean pages and kernel
 readahead can serve repeated reads and read-only shared mappings across handle

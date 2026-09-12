@@ -1,15 +1,9 @@
-#![allow(unsafe_code)]
-
-//! Audited read-only mappings for immutable Exact Index Run generations.
-//!
-//! Unsafe code is confined to mapping one fully published file. The mapping
-//! owns an immutable-file lease, so cooperating filesystem adapters cannot
-//! write, truncate, replace, or unlink its name until the mapping is dropped.
+//! Audited immutable-file leases with bounded Direct-I/O reads.
+//! Decoded views and encoded ranges use the common application cache.
 
 use std::fmt;
 use std::mem::size_of;
-
-use memmap2::{Mmap, MmapOptions};
+use std::sync::Arc;
 
 use fastdup_format::{
     ChunkId, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES, ExactIndexEntry,
@@ -19,13 +13,12 @@ use fastdup_format::{
 use crate::ImmutableFileLease;
 use crate::exact_index_repository::ExactIndexStoreError;
 
-/// One fully audited immutable Exact Run backed by a read-only mapping.
+/// One fully audited immutable Exact Run backed by a read-only file lease.
 pub(crate) struct ImmutableExactIndexRun {
-    // Drop order is significant: unmap before releasing the mutation lease.
-    mapping: Mmap,
+    // The lease protects physical identity until the final reader drops.
     lease: ImmutableFileLease,
     descriptor: ExactIndexRunDescriptor,
-    page_bounds: Box<[ExactPageKeyBounds]>,
+    bounds_cache: crate::ReadCacheNamespace,
 }
 
 impl ImmutableExactIndexRun {
@@ -35,35 +28,21 @@ impl ImmutableExactIndexRun {
         mut visit: impl FnMut(&ExactIndexEntry),
     ) -> Result<Self, ExactIndexStoreError> {
         let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
-        let _mapped_reads = lease.mapping_read_scope();
+        let independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let metadata = lease.file().metadata()?;
         let expected_length = u64::try_from(expected.file_length())
             .map_err(|_| ExactIndexStoreError::CounterOverflow)?;
-        if !metadata.is_file() || metadata.len() != expected_length {
+        if !metadata.is_file() || lease.logical_len()? != expected_length {
             return Err(ExactIndexStoreError::IdentityMismatch);
         }
 
-        // SAFETY: `lease` owns a read-only descriptor for a no-replace
-        // published object. FsStorageIo holds a root-wide generation lease
-        // that rejects writes, truncation, replacement, and removal for this
-        // name until the mapping is dropped. The descriptor stays alive in
-        // `lease`, and its exact file length was checked above.
-        let mapping = unsafe {
-            MmapOptions::new()
-                .len(expected.file_length())
-                .map(lease.file())?
-        };
-        if mapping.len() != expected.file_length() {
-            return Err(ExactIndexStoreError::IdentityMismatch);
-        }
-
-        let header = exact_range(&mapping, 0, EXACT_INDEX_HEADER_BYTES)?;
+        let header = exact_range(&lease, 0, EXACT_INDEX_HEADER_BYTES)?;
         let footer_offset = expected
             .file_length()
             .checked_sub(EXACT_INDEX_PAGE_BYTES)
             .ok_or(ExactIndexStoreError::IdentityMismatch)?;
-        let footer = exact_range(&mapping, footer_offset, EXACT_INDEX_PAGE_BYTES)?;
-        let descriptor = ExactIndexRunDescriptor::decode(header, footer, expected_length)?;
+        let footer = exact_range(&lease, footer_offset, EXACT_INDEX_PAGE_BYTES)?;
+        let descriptor = ExactIndexRunDescriptor::decode(&header, &footer, expected_length)?;
         if descriptor != expected {
             return Err(ExactIndexStoreError::IdentityMismatch);
         }
@@ -73,31 +52,43 @@ impl ImmutableExactIndexRun {
         page_bounds
             .try_reserve_exact(descriptor.page_count())
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
-        audit.update(0, header)?;
+        audit.update(0, &header)?;
         for page_ordinal in 0..descriptor.page_count() {
             let offset = descriptor
                 .page_offset(page_ordinal)
                 .ok_or(ExactIndexStoreError::IdentityMismatch)?;
-            let bytes = exact_page(&mapping, offset)?;
-            let page = descriptor.decode_page(page_ordinal, bytes)?;
+            let bytes = exact_page(&lease, offset)?;
+            let page = descriptor.decode_page(page_ordinal, &bytes)?;
             audit.verify_page(&page)?;
             page_bounds.push(ExactPageKeyBounds::from_page(&page));
             for entry in page.entries() {
                 visit(entry);
             }
-            audit.update(offset, bytes)?;
+            audit.update(offset, &bytes)?;
         }
         audit.update(
             u64::try_from(footer_offset).map_err(|_| ExactIndexStoreError::CounterOverflow)?,
-            footer,
+            &footer,
         )?;
         audit.finish()?;
 
+        drop(independent);
+        let bounds_cache =
+            crate::ReadCacheNamespace::system(crate::ReadCacheClass::ExactPageBounds);
+        bounds_cache.insert(
+            crate::ReadCacheKey {
+                identity: descriptor.run_hash(),
+                ordinal: 0,
+            },
+            Arc::new(page_bounds.into_boxed_slice()),
+            (descriptor.page_count() * size_of::<ExactPageKeyBounds>()
+                + size_of::<Box<[ExactPageKeyBounds]>>()) as u64,
+            EXACT_INDEX_PAGE_BYTES as u64,
+        );
         Ok(Self {
-            mapping,
             lease,
             descriptor,
-            page_bounds: page_bounds.into_boxed_slice(),
+            bounds_cache,
         })
     }
 
@@ -107,22 +98,39 @@ impl ImmutableExactIndexRun {
         chunk_id: ChunkId,
         logical_length: u32,
     ) -> Result<ExactIndexPagePosition, ExactIndexStoreError> {
-        self.page_bounds
-            .get(page_ordinal)
-            .map(|bounds| bounds.position(chunk_id, logical_length))
-            .ok_or(ExactIndexStoreError::IdentityMismatch)
+        if let Some(bounds) =
+            self.bounds_cache
+                .get::<Box<[ExactPageKeyBounds]>>(crate::ReadCacheKey {
+                    identity: self.descriptor.run_hash(),
+                    ordinal: 0,
+                })
+        {
+            return bounds
+                .get(page_ordinal)
+                .map(|bounds| bounds.position(chunk_id, logical_length))
+                .ok_or(ExactIndexStoreError::IdentityMismatch);
+        }
+        let offset = self
+            .descriptor
+            .page_offset(page_ordinal)
+            .ok_or(ExactIndexStoreError::IdentityMismatch)?;
+        let page = self
+            .descriptor
+            .decode_page(page_ordinal, &self.page(offset)?)?;
+        Ok(page.position(chunk_id, logical_length))
     }
 
     pub(crate) fn page_bounds_bytes(&self) -> usize {
-        self.page_bounds
-            .len()
-            .checked_mul(size_of::<ExactPageKeyBounds>())
-            .expect("ASSERT: mapped Exact page-bound bytes fit usize")
+        self.bounds_cache
+            .peek::<Box<[ExactPageKeyBounds]>>(crate::ReadCacheKey {
+                identity: self.descriptor.run_hash(),
+                ordinal: 0,
+            })
+            .map_or(0, |bounds| bounds.len() * size_of::<ExactPageKeyBounds>())
     }
 
-    pub(crate) fn page(&self, offset: u64) -> Result<&[u8], ExactIndexStoreError> {
-        let _mapped_reads = self.lease.mapping_read_scope();
-        exact_page(&self.mapping, offset)
+    pub(crate) fn page(&self, offset: u64) -> Result<Vec<u8>, ExactIndexStoreError> {
+        exact_page(&self.lease, offset)
     }
 }
 
@@ -169,22 +177,15 @@ impl fmt::Debug for ImmutableExactIndexRun {
     }
 }
 
-fn exact_page(mapping: &[u8], offset: u64) -> Result<&[u8], ExactIndexStoreError> {
+fn exact_page(lease: &ImmutableFileLease, offset: u64) -> Result<Vec<u8>, ExactIndexStoreError> {
     let offset = usize::try_from(offset).map_err(|_| ExactIndexStoreError::CounterOverflow)?;
-    exact_range(mapping, offset, EXACT_INDEX_PAGE_BYTES)
+    exact_range(lease, offset, EXACT_INDEX_PAGE_BYTES)
 }
 
 fn exact_range(
-    mapping: &[u8],
+    lease: &ImmutableFileLease,
     offset: usize,
     length: usize,
-) -> Result<&[u8], ExactIndexStoreError> {
-    let end = offset
-        .checked_add(length)
-        .ok_or(ExactIndexStoreError::IdentityMismatch)?;
-    let result = mapping
-        .get(offset..end)
-        .ok_or(ExactIndexStoreError::IdentityMismatch);
-    crate::metadata_read_telemetry::mapped_range(length, result.is_ok());
-    result
+) -> Result<Vec<u8>, ExactIndexStoreError> {
+    Ok(lease.read_at(offset as u64, length)?)
 }

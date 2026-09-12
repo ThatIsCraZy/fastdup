@@ -779,12 +779,19 @@ fn missing_data_location_prevents_commit_and_corrupt_newest_data_falls_back() {
     ));
 
     let container_name = format!("{}.fdc", "72".repeat(16));
+    let verified = containers.read(container_id).unwrap();
+    let fault_offset = usize::try_from(verified.locations()[0].record_offset()).unwrap()
+        + fastdup_format::RECORD_HEADER_BYTES;
     let mut bytes = storage
         .read(&container_name)
         .expect("published DATA container exists");
-    bytes[5_000] ^= 1;
+    bytes[fault_offset] ^= 1;
     storage
-        .write_at(&container_name, 5_000, &bytes[5_000..5_001])
+        .write_at(
+            &container_name,
+            fault_offset as u64,
+            &bytes[fault_offset..fault_offset + 1],
+        )
         .expect("inject DATA corruption");
     storage
         .sync_file(&container_name)

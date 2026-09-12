@@ -133,7 +133,8 @@ fn owned_publication_rereads_only_header_middle_and_footer_blocks() {
             .expect("published Container metadata")
             .len(),
     )
-    .expect("format-v1 Container length fits usize");
+    .expect("format-v1 Container length fits usize")
+        - 8192;
     let middle_offset = (file_length / 2 / HEADER_BYTES) * HEADER_BYTES;
     assert_eq!(
         *storage.range_reads.lock().expect("range-read lock"),

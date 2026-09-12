@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek as _, Write as _};
+use std::io;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -58,12 +58,14 @@ impl ApplianceLease {
         let path = metadata_root.join(APPLIANCE_LEASE_FILE_NAME);
         let nofollow = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
             .map_err(|_| io::Error::other("O_NOFOLLOW does not fit OpenOptions custom flags"))?;
-        let mut file = OpenOptions::new()
+        let direct = i32::try_from(rustix::fs::OFlags::DIRECT.bits())
+            .map_err(|_| io::Error::other("O_DIRECT does not fit OpenOptions custom flags"))?;
+        let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .mode(0o600)
-            .custom_flags(nofollow)
+            .custom_flags(nofollow | direct)
             .open(&path)?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
@@ -85,14 +87,12 @@ impl ApplianceLease {
         }
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        file.set_len(0)?;
-        file.rewind()?;
-        writeln!(
-            file,
-            "fastdup-appliance-lease-v1\nowner={}\npid={}",
+        let diagnostic = format!(
+            "fastdup-appliance-lease-v1\nowner={}\npid={}\n",
             owner,
             std::process::id()
-        )?;
+        );
+        fastdup_store::write_locked_control_record(&file, diagnostic.as_bytes())?;
         file.sync_all()?;
         File::open(metadata_root)?.sync_all()?;
 

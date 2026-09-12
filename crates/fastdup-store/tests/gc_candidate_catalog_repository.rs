@@ -33,8 +33,8 @@ fn verified_publication_becomes_a_seed_without_payload_reread() {
 }
 
 #[test]
-fn newest_catalog_recovers_as_an_audited_mapping_and_holds_its_mutation_lease() {
-    let root = test_root("mmap-lease");
+fn newest_catalog_recovers_as_an_audited_direct_reader_and_holds_its_mutation_lease() {
+    let root = test_root("direct-lease");
     let storage = FsStorageIo::open(&root).expect("open catalog root");
     let repository = GcCandidateCatalogRepository::new(storage.clone());
     let summary = fixture_summary();
@@ -49,11 +49,11 @@ fn newest_catalog_recovers_as_an_audited_mapping_and_holds_its_mutation_lease() 
         .recover_latest()
         .expect("recover latest catalog")
         .expect("catalog exists");
-    assert!(snapshot.mapped());
+    assert!(snapshot.leased());
     assert_eq!(snapshot.descriptor().incorporated_commit_generation(), 41);
     let shortlist = snapshot
         .shortlist(GcCandidateSelectionMode::Urgent, 3, 100)
-        .expect("scan mapped catalog");
+        .expect("scan leased catalog");
     assert_eq!(shortlist.rows().len(), 3);
     assert_eq!(shortlist.rows()[0].reachable_target_count(), 0);
 
@@ -61,14 +61,14 @@ fn newest_catalog_recovers_as_an_audited_mapping_and_holds_its_mutation_lease() 
     assert_eq!(
         storage
             .remove_file(&published)
-            .expect_err("mapped generation rejects removal")
+            .expect_err("leased generation rejects removal")
             .kind(),
         io::ErrorKind::PermissionDenied
     );
     drop(snapshot);
     storage
         .remove_file(&published)
-        .expect("last mapping drop releases removal lease");
+        .expect("last reader drop releases removal lease");
 }
 
 #[test]
@@ -91,10 +91,10 @@ fn corrupt_newest_hint_falls_back_without_failing_the_older_catalog() {
         .open(newest)
         .expect("open newest catalog for fault injection");
     let mut byte = [0_u8; 1];
-    file.read_exact_at(&mut byte, 4_096 + 40)
+    file.read_exact_at(&mut byte, 8192 + 4_096 + 40)
         .expect("read row byte");
     byte[0] ^= 1;
-    file.write_all_at(&byte, 4_096 + 40)
+    file.write_all_at(&byte, 8192 + 4_096 + 40)
         .expect("corrupt newest row");
 
     let recovered = repository
@@ -153,9 +153,10 @@ fn hundred_thousand_rows_publish_and_shortlist_without_a_pool_sized_builder() {
         .recover_latest()
         .expect("recover large catalog")
         .expect("large catalog exists");
+    let _scan = fastdup_store::ReadIntentScope::enter(fastdup_store::ReadIntent::Scan);
     let shortlist = snapshot
         .shortlist(GcCandidateSelectionMode::Background, 16, row_count + 1)
-        .expect("bounded shortlist scans mapping");
+        .expect("bounded shortlist scans leased file");
     assert_eq!(shortlist.rows().len(), 16);
     assert!(
         shortlist
@@ -184,7 +185,7 @@ fn adapters_without_immutable_leases_reaudit_with_bounded_reads() {
         .recover_latest()
         .expect("recover through bounded adapter")
         .expect("catalog exists");
-    assert!(!snapshot.mapped());
+    assert!(!snapshot.leased());
     assert_eq!(
         snapshot
             .shortlist(GcCandidateSelectionMode::Urgent, 2, 3)

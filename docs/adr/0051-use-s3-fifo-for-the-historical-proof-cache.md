@@ -4,6 +4,12 @@ status: accepted
 
 # Use S3-FIFO for the historical proof cache
 
+Amended by [ADR 0046](0046-bound-verified-read-cache-by-live-memory-headroom.md)
+on 12 September 2026: all reusable read content shares one application cache;
+repository I/O and FUSE file data use direct paths. File-backed mappings and
+separate replacement policies described below are superseded. Immutable leases,
+verification and publication ordering remain required.
+
 fastdup uses S3-FIFO as the production replacement policy for verified
 historical dependency proofs. The choice follows trace replay with identical
 byte budgets over three unchanged Rocky ISO ingests and 50 minimally changed

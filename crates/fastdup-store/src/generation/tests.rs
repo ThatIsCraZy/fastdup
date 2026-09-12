@@ -1,6 +1,7 @@
 use super::graph::verify_generation_transition_pair;
 use super::metadata::metadata_name;
 use super::{GenerationError, GenerationRepository};
+use crate::StorageIo;
 use fastdup_format::{
     CommitRecord, CommitRecordHash, ManifestExtent, ManifestLeaf, MetadataObjectId, NamespaceRoot,
     PolicySetId,
@@ -43,7 +44,10 @@ fn metadata_graph_reads_share_owned_bytes_across_read_paths() {
     // scrub and publication verification must still reach storage and fail.
     let mut damaged = expected.clone();
     damaged[0] ^= 1;
-    std::fs::write(root.join(metadata_name(id)), damaged).unwrap();
+    repo.storage
+        .write_at(&metadata_name(id), 0, &damaged)
+        .unwrap();
+    repo.storage.sync_file(&metadata_name(id)).unwrap();
     assert!(repo.scrub_manifest_tree_metadata(id).is_err());
     assert!(repo.publish_manifest(&layout).is_err());
     assert_eq!(repo.read_metadata(id).unwrap(), expected);
@@ -85,7 +89,12 @@ fn recovery_rechecks_a_warm_namespace_after_durable_corruption() {
     assert!(repo.recover_latest().unwrap().is_some());
     let mut damaged = encoded.clone();
     damaged[0] ^= 1;
-    std::fs::write(path.join(metadata_name(record.namespace_root())), damaged).unwrap();
+    repo.storage
+        .write_at(&metadata_name(record.namespace_root()), 0, &damaged)
+        .unwrap();
+    repo.storage
+        .sync_file(&metadata_name(record.namespace_root()))
+        .unwrap();
     assert_eq!(
         repo.read_metadata(record.namespace_root()).unwrap(),
         encoded
@@ -95,6 +104,112 @@ fn recovery_rechecks_a_warm_namespace_after_durable_corruption() {
         recovered.record(),
         initial,
         "recovery must reject the damaged newer generation despite its warm bytes"
+    );
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn recovery_and_scrub_reject_damaged_storage_heads_despite_warm_manifest_bytes() {
+    use std::os::unix::fs::FileExt;
+    let path = std::env::temp_dir().join(format!("metadata-head-fault-{}", std::process::id()));
+    let storage = crate::FsStorageIo::open(&path).unwrap();
+    let repo = GenerationRepository::new(storage, PolicySetId::new([1; 32]).unwrap());
+    repo.commit_namespace(&NamespaceRoot::new(4096, 2, 0, vec![], vec![]).unwrap())
+        .unwrap();
+    let manifest = ManifestLeaf::new(
+        4096,
+        vec![ManifestExtent::Fill {
+            logical_length: 4096,
+            value: 5,
+        }],
+    )
+    .unwrap();
+    let id = repo.publish_manifest(&manifest).unwrap();
+    repo.commit_namespace(
+        &NamespaceRoot::new(
+            4096,
+            3,
+            1,
+            vec![DurableInode::new(2, 0o640, 1000, 1000, 1, 1, 4096, id).unwrap()],
+            vec![NamespaceEntry::new(1, 2, b"file".to_vec()).unwrap()],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let warm = repo.read_metadata(id).unwrap();
+    // Fault injection intentionally bypasses StorageIo's logical translation.
+    // Damage both physical length-head checksums without changing the payload.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.join(metadata_name(id)))
+        .unwrap();
+    for offset in [24, 4096 + 24] {
+        let mut byte = [0];
+        file.read_exact_at(&mut byte, offset).unwrap();
+        byte[0] ^= 1;
+        file.write_all_at(&byte, offset).unwrap();
+    }
+    file.sync_all().unwrap();
+    assert_eq!(repo.read_metadata(id).unwrap(), warm);
+    assert!(repo.scrub_manifest_tree_metadata(id).is_err());
+    assert!(repo.publish_manifest(&manifest).is_err());
+    assert!(matches!(
+        repo.recover_latest(),
+        Err(GenerationError::ManifestTree(crate::manifest_tree::ManifestTreeError::Io(error)))
+            if error.kind() == std::io::ErrorKind::InvalidData
+    ));
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn online_gc_reuses_warm_graph_bytes_but_keeps_current_generation_binding() {
+    let path = std::env::temp_dir().join(format!("online-gc-cache-{}", std::process::id()));
+    let mut storage = crate::FsStorageIo::open(&path).unwrap();
+    let counters = Arc::new(crate::metadata_read_telemetry::MetadataReadCounters::default());
+    storage.metadata_reads = Some(Arc::clone(&counters));
+    let repo = GenerationRepository::new(storage, PolicySetId::new([1; 32]).unwrap());
+    let manifest = ManifestLeaf::new(
+        4096,
+        vec![ManifestExtent::Fill {
+            logical_length: 4096,
+            value: 7,
+        }],
+    )
+    .unwrap();
+    let id = repo.publish_manifest(&manifest).unwrap();
+    let namespace = NamespaceRoot::new(
+        4096,
+        3,
+        1,
+        vec![DurableInode::new(2, 0o640, 1000, 1000, 1, 1, 4096, id).unwrap()],
+        vec![NamespaceEntry::new(1, 2, b"file".to_vec()).unwrap()],
+    )
+    .unwrap();
+    let initial = repo
+        .commit_namespace(&NamespaceRoot::new(4096, 2, 0, vec![], vec![]).unwrap())
+        .unwrap();
+    repo.read_namespace_root(initial.namespace_root()).unwrap();
+    let committed = repo.commit_namespace(&namespace).unwrap();
+    repo.read_namespace_root(committed.namespace_root())
+        .unwrap();
+    repo.read_manifest_node(id).unwrap();
+    let reads = || {
+        counters
+            .rows()
+            .iter()
+            .filter(|row| row.object == "metadataObject")
+            .map(|row| row.operations)
+            .sum::<u64>()
+    };
+    let before = reads();
+    let proof = repo.scan_online_liveness().unwrap();
+    assert_eq!(reads(), before, "Online GC must reuse the admitted graph");
+    assert!(repo.gc_proof_is_current(&proof).unwrap());
+    repo.commit_namespace(&namespace).unwrap();
+    assert!(
+        !repo.gc_proof_is_current(&proof).unwrap(),
+        "cached content cannot keep an old GC binding current"
     );
     std::fs::remove_dir_all(path).unwrap();
 }

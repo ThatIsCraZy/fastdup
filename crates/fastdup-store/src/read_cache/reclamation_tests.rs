@@ -8,7 +8,7 @@ fn payload(value: u8, length: usize) -> VerifiedChunkPayload {
 }
 
 fn cache(limit: usize) -> VerifiedReadCache {
-    let cache = VerifiedReadCache::new_with_snapshot(
+    let cache = VerifiedReadCache::new_legacy_with_snapshot(
         VerifiedReadCacheConfig::new(limit, 0, NonZeroUsize::new(4).unwrap()).unwrap(),
         MemoryPressureSnapshot::new(128 * 1024 * 1024, 128 * 1024 * 1024, 0),
     )

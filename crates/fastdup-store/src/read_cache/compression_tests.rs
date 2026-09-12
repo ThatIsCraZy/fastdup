@@ -8,7 +8,7 @@ fn payload(bytes: &[u8]) -> VerifiedChunkPayload {
 }
 
 fn cache() -> VerifiedReadCache {
-    VerifiedReadCache::new_with_snapshot(
+    VerifiedReadCache::new_legacy_with_snapshot(
         VerifiedReadCacheConfig::new(4 * 1024 * 1024, 0, NonZeroUsize::new(4).unwrap()).unwrap(),
         MemoryPressureSnapshot::new(128 * 1024 * 1024, 128 * 1024 * 1024, 0),
     )

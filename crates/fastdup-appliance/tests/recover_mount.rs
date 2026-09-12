@@ -374,9 +374,12 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
         .iter()
         .filter(|operation| **operation == StorageOperation::ReadExactAt)
         .count();
-    assert_eq!(object_lengths, 0);
     assert_eq!(
-        bounded_reads, 1,
+        object_lengths, 1,
+        "independent recovery rechecks the Container envelope"
+    );
+    assert_eq!(
+        bounded_reads, 3,
         "writable recovery verifies the DATA record once and reuses that proof for inode reservation: {writable_recovery_operations:?}"
     );
     let writable_baseline = container_storage.operation_count();
@@ -537,7 +540,7 @@ fn recovered_posix_reads_pin_the_active_exact_index() {
         Ok(Reply::Data(payload.to_vec()))
     );
     let fallback_operations = &container_storage.operations()[fallback_baseline..];
-    assert!(fallback_operations.contains(&StorageOperation::Read));
+    assert!(fallback_operations.contains(&StorageOperation::ReadExactAt));
     assert!(fallback_operations.contains(&StorageOperation::ListNames));
 }
 
@@ -662,8 +665,20 @@ fn writable_restart_proves_data_once_before_reserving_new_inode_ids() {
         .filter(|operation| **operation == StorageOperation::Read)
         .count();
     assert_eq!(
-        reads, 1,
-        "the inode reservation must reuse the freshly verified recovery graph"
+        reads,
+        0,
+        "recovery uses bounded DATA reads: {:?}",
+        &data.operations()[baseline..]
+    );
+    let bounded_reads = data.operations()[baseline..]
+        .iter()
+        .filter(|operation| **operation == StorageOperation::ReadExactAt)
+        .count();
+    assert_eq!(
+        bounded_reads,
+        5,
+        "generation discovery, envelope and one DATA record proof: {:?}",
+        &data.operations()[baseline..]
     );
     let Reply::Created { entry, .. } = appliance
         .namespace()

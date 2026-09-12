@@ -315,6 +315,25 @@ A removable extra physical encoding that can accelerate reads but never provides
 the only durable coverage for a live logical chunk.
 _Avoid_: Small-file location, active location
 
+**Unified Read Cache**:
+One process-wide owner for reusable DATA, Metadata, Index, proof, dependency, range and
+file-handle representations. Typed namespaces share its identity directory,
+admission, replacement and memory accounting. Cache hits never establish
+generation selection, liveness or fresh physical integrity evidence.
+_Avoid_: Budget broker over separate caches, Linux page cache, storage authority
+
+**Independent read**:
+A read of current repository file content that bypasses every reusable cache and
+shared in-flight result. Recovery, scrub and fresh publication/deletion checks
+use it; Online GC may reuse cached content for ordinary graph and source reads.
+_Avoid_: Cold miss, cache flush, generation proof
+
+**Aligned storage envelope**:
+The filesystem representation separating an object's logical length from its
+block-aligned physical EOF. Checked redundant length heads and Direct I/O keep
+unaligned Metadata and WAL content out of the Linux file-content page cache.
+_Avoid_: Logical format padding, atomic payload overwrite, Namespace Commit
+
 **Verified cache entry**:
 A chunk or region admitted to a shared read cache only after its complete
 stored encoding and logical content identity were verified. Its RAM representation
@@ -354,7 +373,7 @@ _Avoid_: Historical proof cache, Exact Index authority
 
 **Historical proof cache**:
 Process-local acceleration for previously verified immutable DATA Locations.
-It uses S3-FIFO, starts empty after restart, and may be purged under memory
+It participates in the Unified Read Cache, starts empty after restart, and may be purged under memory
 pressure without changing correctness or durability.
 _Avoid_: Generation proof set, persistent Exact Index, source of truth
 
@@ -366,7 +385,7 @@ _Avoid_: In-memory Exact Index, hash table
 
 **Cache memory reserve**:
 Host/cgroup headroom that rebuildable caches are forbidden to consume.
-It protects Dirty DATA, reduction workers, XFS clean/writeback pages, and device
+It protects Dirty DATA, reduction workers, filesystem metadata, and device
 queues; pressure shrinks or disables cache admission rather than borrowing it.
 _Avoid_: Cache capacity, free RAM, metadata reserve
 

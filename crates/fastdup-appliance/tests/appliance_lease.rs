@@ -1,3 +1,4 @@
+use fastdup_store::{FsStorageIo, StorageIo};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -232,11 +233,16 @@ fn malformed_recovery_latch_fails_daemon_before_data_repository_open() {
     let container_root = root.join("containers");
     std::fs::create_dir_all(&mount_root).expect("create mount root");
     std::fs::create_dir_all(&metadata_root).expect("create metadata root");
-    std::fs::write(
-        metadata_root.join(APPLIANCE_RECOVERY_LATCH_FILE_NAME),
-        b"not-an-empty-latch",
-    )
-    .expect("write malformed recovery latch");
+    let storage = FsStorageIo::open(&metadata_root).unwrap();
+    storage
+        .create_new(APPLIANCE_RECOVERY_LATCH_FILE_NAME)
+        .unwrap();
+    storage
+        .write_at(APPLIANCE_RECOVERY_LATCH_FILE_NAME, 0, b"not-an-empty-latch")
+        .expect("write malformed logical recovery latch");
+    storage
+        .sync_file(APPLIANCE_RECOVERY_LATCH_FILE_NAME)
+        .unwrap();
     std::fs::write(&container_root, b"DATA sentinel").expect("create invalid DATA root sentinel");
 
     let output = Command::new(env!("CARGO_BIN_EXE_fastdup-durable-fuse"))

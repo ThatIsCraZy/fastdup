@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use fastdup_format::{ChunkId, ExactIndexEntry, ExactLocationTransition};
 use fastdup_store::{
-    CacheFallback, CacheObservation, CachePool, MemoryPressureSnapshot, shared_cache_reserve_bytes,
+    CacheObservation, CachePool, MemoryPressureSnapshot, shared_cache_reserve_bytes,
 };
 use hashbrown::HashTable;
 
@@ -61,7 +61,7 @@ impl HistoricalProofCacheConfig {
     }
 }
 
-/// Rebuildable S3-FIFO cache status for observability and pressure tests.
+/// Historical-proof observations within the common read cache.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HistoricalProofCacheStatus {
     hits: u64,
@@ -255,12 +255,14 @@ struct CacheShard {
     state: Mutex<ShardState>,
 }
 
-/// Sharded, pressure-aware production S3-FIFO for historical DATA proofs.
+/// Typed historical DATA proofs owned by the process-wide unified cache.
+/// The former S3-FIFO implementation is retained only for test/replay comparison.
 ///
 /// Lookups lock one cache-line-separated shard. Pressure refresh takes the
 /// global write gate only on its cold 250-ms path. Cache misses, rejected
 /// admissions, and allocation failures never affect storage correctness.
 pub(crate) struct HistoricalProofCache {
+    unified: Option<fastdup_store::ReadCacheNamespace>,
     config: HistoricalProofCacheConfig,
     shards: Box<[CacheShard]>,
     pressure_gate: RwLock<()>,
@@ -326,8 +328,15 @@ impl HistoricalProofCache {
         shards
             .try_reserve_exact(config.shard_count.get())
             .map_err(|_| HistoricalProofCacheError::OutOfMemory)?;
-        shards.resize_with(config.shard_count.get(), CacheShard::default);
+        if !automatic_pressure {
+            shards.resize_with(config.shard_count.get(), CacheShard::default);
+        }
         let cache = Self {
+            unified: automatic_pressure.then(|| {
+                fastdup_store::ReadCacheNamespace::system(
+                    fastdup_store::ReadCacheClass::HistoricalProof,
+                )
+            }),
             config,
             shards: shards.into_boxed_slice(),
             pressure_gate: RwLock::new(()),
@@ -341,14 +350,7 @@ impl HistoricalProofCache {
             automatic_pressure,
             started: Instant::now(),
             last_refresh_millis: AtomicU64::new(0),
-            budget_pool: automatic_pressure.then(|| {
-                CachePool::system(
-                    "historicalProofs",
-                    CacheFallback::Data,
-                    (config.shard_count.get() * size_of::<CacheShard>()) as u64,
-                    config.hard_limit_bytes as u64,
-                )
-            }),
+            budget_pool: None,
         };
         cache.apply_memory_pressure(snapshot);
         Ok(cache)
@@ -357,11 +359,22 @@ impl HistoricalProofCache {
     /// Returns a verified Location on a full Chunk ID and length match.
     #[must_use]
     pub(crate) fn get(&self, chunk_id: ChunkId, logical_length: u64) -> Option<ExactIndexEntry> {
+        if fastdup_store::ReadIntentScope::current() == fastdup_store::ReadIntent::Independent {
+            return None;
+        }
         self.maybe_refresh_pressure();
         let Ok(logical_length) = u32::try_from(logical_length) else {
             self.unsharded_misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
+        if let Some(cache) = &self.unified {
+            return cache
+                .get::<ExactIndexEntry>(fastdup_store::ReadCacheKey {
+                    identity: chunk_id.bytes(),
+                    ordinal: u64::from(logical_length),
+                })
+                .map(|value| *value);
+        }
         let key = ProofKey::new(chunk_id, logical_length);
         let hash = proof_hash(key);
         let shard = &self.shards[shard_index(hash, self.shards.len())];
@@ -394,12 +407,29 @@ impl HistoricalProofCache {
     ///
     /// Allocation or pressure rejection is deliberately silent to callers.
     pub(crate) fn admit(&self, entry: ExactIndexEntry, admission: HistoricalProofAdmission) {
+        if fastdup_store::ReadIntentScope::current() != fastdup_store::ReadIntent::Demand {
+            return;
+        }
         assert_eq!(
             entry.transition(),
             ExactLocationTransition::Active,
             "ASSERT: Historical Proof Cache accepts only ACTIVE verified Locations"
         );
         self.maybe_refresh_pressure();
+        if let Some(cache) = &self.unified {
+            let key = fastdup_store::ReadCacheKey {
+                identity: entry.chunk_id().bytes(),
+                ordinal: u64::from(entry.logical_length()),
+            };
+            cache.remove(key);
+            cache.insert(
+                key,
+                std::sync::Arc::new(entry),
+                size_of::<ExactIndexEntry>() as u64,
+                u64::from(entry.logical_length()),
+            );
+            return;
+        }
         let _pressure = self
             .pressure_gate
             .read()
@@ -491,7 +521,10 @@ impl HistoricalProofCache {
     #[must_use]
     pub(crate) fn status(&self) -> HistoricalProofCacheStatus {
         self.maybe_refresh_pressure();
-        let entries = self.entry_count.load(Ordering::Acquire);
+        let entries = self.unified.as_ref().map_or_else(
+            || self.entry_count.load(Ordering::Acquire),
+            |cache| usize::try_from(cache.stats().entries).unwrap_or(usize::MAX),
+        );
         let mut counters = self.counters();
         counters.misses = counters
             .misses
@@ -509,7 +542,10 @@ impl HistoricalProofCache {
             ghost_hits: counters.ghost_hits,
             entry_count: entries,
             target_entries: self.target_entries.load(Ordering::Acquire),
-            resident_bytes: entries.saturating_mul(ACCOUNTED_ENTRY_BYTES),
+            resident_bytes: self.unified.as_ref().map_or_else(
+                || entries.saturating_mul(ACCOUNTED_ENTRY_BYTES),
+                |cache| usize::try_from(cache.stats().resident_bytes).unwrap_or(usize::MAX),
+            ),
             metadata_bytes: self.shards.len().saturating_mul(size_of::<CacheShard>()),
             hard_limit_bytes: self.config.hard_limit_bytes,
             reserve_bytes: self.config.reserve_bytes,
@@ -540,6 +576,21 @@ impl HistoricalProofCache {
     }
 
     fn apply_memory_pressure(&self, snapshot: MemoryPressureSnapshot) {
+        if let Some(cache) = &self.unified {
+            self.target_entries.store(
+                usize::try_from(cache.capacity() / ACCOUNTED_ENTRY_BYTES as u64)
+                    .unwrap_or(usize::MAX),
+                Ordering::Release,
+            );
+            self.effective_limit_bytes
+                .store(snapshot.effective_limit_bytes(), Ordering::Release);
+            self.available_bytes
+                .store(snapshot.available_bytes(), Ordering::Release);
+            self.swap_used_bytes
+                .store(snapshot.swap_used_bytes(), Ordering::Release);
+            return;
+        }
+
         let _pressure = self
             .pressure_gate
             .write()
@@ -634,6 +685,19 @@ impl HistoricalProofCache {
     }
 
     fn counters(&self) -> HistoricalShardCounters {
+        if let Some(cache) = &self.unified {
+            let stats = cache.stats();
+            return HistoricalShardCounters {
+                hits: stats.hits,
+                misses: stats.misses,
+                hit_bytes: stats.hit_bytes,
+                admissions: stats.admissions,
+                evictions: stats.evictions,
+                admission_rejections: stats.rejections,
+                ..HistoricalShardCounters::default()
+            };
+        }
+
         self.shards
             .iter()
             .fold(HistoricalShardCounters::default(), |mut total, shard| {

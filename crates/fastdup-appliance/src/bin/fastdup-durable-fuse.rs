@@ -332,9 +332,9 @@ impl RecoveryCheckpointRuntimeHandle {
             (Ok(()), Ok(())) => Ok(()),
             (Err(worker), Ok(())) => Err(worker),
             (Ok(()), Err(publish)) => Err(publish),
-            (Err(worker), Err(publish)) => {
-                Err(format!("{worker}; final Recovery Checkpoint failed: {publish}"))
-            }
+            (Err(worker), Err(publish)) => Err(format!(
+                "{worker}; final Recovery Checkpoint failed: {publish}"
+            )),
         }
     }
 }
@@ -632,7 +632,9 @@ impl ShutdownSignal {
 fn arm_recovery_latch(
     metadata_root: &std::path::Path,
 ) -> io::Result<ApplianceRecoveryLatch<FsStorageIo>> {
-    let latch = ApplianceRecoveryLatch::arm_filesystem(FsStorageIo::open(metadata_root)?.with_metadata_read_telemetry())?;
+    let latch = ApplianceRecoveryLatch::arm_filesystem(
+        FsStorageIo::open(metadata_root)?.with_metadata_read_telemetry(),
+    )?;
     if latch.prior_recovery_required() {
         eprintln!(
             "appliance_recovery_required=true action=verify_generation_before_mutation_admission"
@@ -827,7 +829,9 @@ fn recover_appliance(
         checkpoint_exact_index_profile_v1(),
     );
     let online_gc_recovery = online_maintenance.finalize_recovered_online_gc()?;
-    let gc_catalog = GcCandidateCatalogRepository::new(FsStorageIo::open(metadata_root)?.with_metadata_read_telemetry());
+    let gc_catalog = GcCandidateCatalogRepository::new(
+        FsStorageIo::open(metadata_root)?.with_metadata_read_telemetry(),
+    );
     let similarities = Some(SimilarityIndexRepository::new(metadata_storage));
     if restored_from_data_tier.is_some() {
         if advanced_reduction == AdvancedReductionPolicy::DependentV1 {
@@ -1931,14 +1935,14 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
     let membership = appliance.exact_run_membership_status();
     eprintln!(
         concat!(
-            "exact_run_membership mapped_runs={} positional_runs={} mapped_page_bounds_bytes={} ",
+            "exact_run_membership leased_runs={} positional_runs={} leased_page_bounds_bytes={} ",
             "filters={} allocated_bytes={} ",
             "huge_page_advised_filters={} huge_page_advised_bytes={} probes={} ",
             "definitely_absent={} requires_exact_lookup={}"
         ),
-        membership.mapped_run_count(),
+        membership.leased_run_count(),
         membership.positional_run_count(),
-        membership.mapped_page_bounds_bytes(),
+        membership.leased_page_bounds_bytes(),
         membership.filter_count(),
         membership.allocated_bytes(),
         membership.huge_page_advised_filter_count(),
@@ -2606,7 +2610,11 @@ mod tests {
         assert!(inspected.frontend.as_ref().unwrap().mutation_admission_open);
         namespace.pause_mutation_admission();
         let paused = apply_management_operation(
-            ManagementOperation::Inspect, &telemetry, &configuration, &capacity_source, &namespace,
+            ManagementOperation::Inspect,
+            &telemetry,
+            &configuration,
+            &capacity_source,
+            &namespace,
         );
         assert!(!paused.frontend.as_ref().unwrap().mutation_admission_open);
         assert!(!paused.frontend.as_ref().unwrap().integrity_failed);

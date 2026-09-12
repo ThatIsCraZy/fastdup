@@ -84,6 +84,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         target: &GenerationRepository<M>,
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<Option<RecoveredGeneration>, RecoveryCheckpointError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let candidates = self.head_candidates(false)?;
         let had_candidates = !candidates.is_empty();
         for (head, name) in candidates {
@@ -135,6 +136,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<(RecoveryCheckpointScrubSummary, BTreeMap<ChunkId, u64>), RecoveryCheckpointError>
     {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let mut candidates = self.head_candidates(true)?;
         candidates.reverse();
         let mut summary = RecoveryCheckpointScrubSummary::default();
@@ -526,6 +528,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
 
     #[allow(clippy::too_many_lines)]
     fn audit_named(&self, name: &str) -> Result<AuditedCheckpoint, RecoveryCheckpointError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let actual_length = self.storage.object_len(name)?;
         let minimum_length = RECOVERY_CHECKPOINT_HEADER_BYTES
             .checked_add(COMMIT_RECORD_BYTES)

@@ -12,7 +12,7 @@ it("distinguishes metadata API reads from physical IO and does not invent mmap t
  const value={...details,runtime:{...details.runtime!,metadataReads}};
  const {rerender}=render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details:value}} historical={false} loading={false}/></I18nProvider>);
  fireEvent.click(screen.getByRole('tab',{name:'Metadata-Reads'}));
- expect(screen.getByText(/Diese Werte sind keine physischen Plattenzugriffe/)).toBeVisible();
+ expect(screen.getByText(/Angeforderte Bereiche enthalten keinen Ausrichtungs-/)).toBeVisible();
  fireEvent.click(screen.getByRole('checkbox',{name:'Summen und Lesezeiten seit Mount anzeigen'}));
  expect(within(screen.getByRole('row',{name:/Index-Abfrage/})).getByText('3 ms')).toBeVisible();
  expect(within(screen.getByRole('row',{name:/Index-Prüfung/})).getAllByText('—')).toHaveLength(3);

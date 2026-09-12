@@ -1,13 +1,5 @@
-#![allow(unsafe_code)]
-
-//! Audited read-only mappings for immutable Similarity Run generations.
-//!
-//! Unsafe code is deliberately confined to the one mapping operation. The
-//! lease owns the read-only file descriptor and prevents all cooperating
-//! filesystem adapters from mutating or unlinking the published name until
-//! the mapping is dropped.
-
-use memmap2::{Mmap, MmapOptions};
+//! Audited immutable-file leases with bounded Direct-I/O reads.
+//! Decoded views and encoded ranges use the common application cache.
 
 use fastdup_format::{
     SIMILARITY_INDEX_HEADER_BYTES, SIMILARITY_INDEX_PAGE_BYTES, SimilarityBucketKey,
@@ -18,10 +10,9 @@ use crate::ImmutableFileLease;
 use crate::similarity_index_repository::{SimilarityIndexStoreError, SimilarityPageCache};
 use std::sync::Arc;
 
-/// One fully audited immutable Similarity Run backed by a read-only mapping.
+/// One fully audited immutable Similarity Run backed by a read-only file lease.
 pub(crate) struct ImmutableSimilarityRun {
-    // Drop order is significant: unmap before releasing the mutation lease.
-    mapping: Mmap,
+    // The lease protects physical identity until the final reader drops.
     lease: ImmutableFileLease,
     descriptor: SimilarityIndexRunDescriptor,
     minimum_bucket_key: SimilarityBucketKey,
@@ -36,40 +27,26 @@ impl ImmutableSimilarityRun {
         observe_bucket_page: impl FnMut(SimilarityBucketKey),
     ) -> Result<Self, SimilarityIndexStoreError> {
         let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
-        let _mapped_reads = lease.mapping_read_scope();
+        let independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let metadata = lease.file().metadata()?;
-        if !metadata.is_file() || metadata.len() != expected.file_length() {
-            return Err(SimilarityIndexStoreError::IdentityMismatch);
-        }
-        let length = usize::try_from(expected.file_length())
-            .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?;
-
-        // SAFETY: `lease` owns a read-only descriptor for a no-replace
-        // published object. FsStorageIo holds a root-wide generation lease
-        // that rejects write, truncate, rename, and remove operations for this
-        // name until the mapping is dropped. The appliance owns this directory;
-        // out-of-process mutation is outside the storage interface contract.
-        // The descriptor remains alive in `lease` for at least as long as the
-        // mapping, and the exact file length was verified above.
-        let mapping = unsafe { MmapOptions::new().len(length).map(lease.file())? };
-        if mapping.len() != length {
+        if !metadata.is_file() || lease.logical_len()? != expected.file_length() {
             return Err(SimilarityIndexStoreError::IdentityMismatch);
         }
 
-        let header = exact_range(&mapping, 0, SIMILARITY_INDEX_HEADER_BYTES)?;
+        let header = exact_range(&lease, 0, SIMILARITY_INDEX_HEADER_BYTES)?;
         let footer_offset = usize::try_from(expected.footer_offset())
             .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?;
-        let footer = exact_range(&mapping, footer_offset, SIMILARITY_INDEX_HEADER_BYTES)?;
+        let footer = exact_range(&lease, footer_offset, SIMILARITY_INDEX_HEADER_BYTES)?;
         let descriptor =
-            SimilarityIndexRunDescriptor::decode(header, footer, expected.file_length())?;
+            SimilarityIndexRunDescriptor::decode(&header, &footer, expected.file_length())?;
         if descriptor != expected {
             return Err(SimilarityIndexStoreError::IdentityMismatch);
         }
 
+        drop(independent);
         let (minimum_bucket_key, maximum_bucket_key) =
-            audit_mapping(&mapping, descriptor, page_cache, observe_bucket_page)?;
+            audit_source(&lease, descriptor, page_cache, observe_bucket_page)?;
         Ok(Self {
-            mapping,
             lease,
             descriptor,
             minimum_bucket_key,
@@ -89,32 +66,32 @@ impl ImmutableSimilarityRun {
         self.maximum_bucket_key
     }
 
-    pub(crate) fn page(&self, offset: u64) -> Result<&[u8], SimilarityIndexStoreError> {
-        let _mapped_reads = self.lease.mapping_read_scope();
+    pub(crate) fn page(&self, offset: u64) -> Result<Vec<u8>, SimilarityIndexStoreError> {
         let offset =
             usize::try_from(offset).map_err(|_| SimilarityIndexStoreError::IndexCorruption)?;
-        exact_range(&self.mapping, offset, SIMILARITY_INDEX_PAGE_BYTES)
+        exact_range(&self.lease, offset, SIMILARITY_INDEX_PAGE_BYTES)
     }
 }
 
-fn audit_mapping(
-    mapping: &[u8],
+fn audit_source(
+    lease: &ImmutableFileLease,
     descriptor: SimilarityIndexRunDescriptor,
     page_cache: &SimilarityPageCache,
     mut observe_bucket_page: impl FnMut(SimilarityBucketKey),
 ) -> Result<(SimilarityBucketKey, SimilarityBucketKey), SimilarityIndexStoreError> {
+    let independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
     let mut audit = descriptor.start_hash_audit();
-    let header = exact_range(mapping, 0, SIMILARITY_INDEX_HEADER_BYTES)?;
-    audit.update(0, header)?;
+    let header = exact_range(lease, 0, SIMILARITY_INDEX_HEADER_BYTES)?;
+    audit.update(0, &header)?;
 
     for ordinal in 0..descriptor.page_count() {
         let offset = descriptor
             .page_offset(ordinal)
             .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-        let bytes = exact_page(mapping, offset)?;
-        let page = descriptor.decode_page(ordinal, bytes)?;
+        let bytes = exact_page(lease, offset)?;
+        let page = descriptor.decode_page(ordinal, &bytes)?;
         audit.verify_page(&page)?;
-        audit.update(offset, bytes)?;
+        audit.update(offset, &bytes)?;
     }
 
     // Verify the complete fresh on-disk hash and page ordering first. Cached
@@ -123,14 +100,15 @@ fn audit_mapping(
         let offset = descriptor
             .bucket_page_offset(ordinal)
             .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-        let bytes = exact_page(mapping, offset)?;
-        let page = descriptor.decode_bucket_page(ordinal, bytes)?;
+        let bytes = exact_page(lease, offset)?;
+        let page = descriptor.decode_bucket_page(ordinal, &bytes)?;
         audit.verify_bucket_page(&page)?;
-        audit.update(offset, bytes)?;
+        audit.update(offset, &bytes)?;
     }
     let footer_offset = descriptor.footer_offset();
-    audit.update(footer_offset, exact_page(mapping, footer_offset)?)?;
+    audit.update(footer_offset, &exact_page(lease, footer_offset)?)?;
     audit.finish()?;
+    drop(independent);
 
     // The Run hash is now bound to the current immutable lease. Retain Entry
     // pages in the shared budget before the nonlocal Bucket semantic walk.
@@ -141,7 +119,7 @@ fn audit_mapping(
             let offset = descriptor
                 .page_offset(ordinal)
                 .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-            let page = Arc::new(descriptor.decode_page(ordinal, exact_page(mapping, offset)?)?);
+            let page = Arc::new(descriptor.decode_page(ordinal, &exact_page(lease, offset)?)?);
             page_cache.insert_entry(run_hash, ordinal, page);
         }
     }
@@ -154,14 +132,14 @@ fn audit_mapping(
             .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
         let page = match page_cache.get_bucket(run_hash, ordinal) {
             Some(page) => page,
-            None => Arc::new(descriptor.decode_bucket_page(ordinal, exact_page(mapping, offset)?)?),
+            None => Arc::new(descriptor.decode_bucket_page(ordinal, &exact_page(lease, offset)?)?),
         };
         minimum_bucket_key.get_or_insert_with(|| page.first_key());
         maximum_bucket_key = Some(page.last_key());
         observe_bucket_page(page.last_key());
         for reference in page.references() {
             let entry = mapped_entry(
-                mapping,
+                lease,
                 descriptor,
                 reference.entry_ordinal(),
                 &mut semantic_entry_page,
@@ -184,7 +162,7 @@ fn audit_mapping(
 }
 
 fn mapped_entry(
-    mapping: &[u8],
+    lease: &ImmutableFileLease,
     descriptor: SimilarityIndexRunDescriptor,
     entry_ordinal: u32,
     cached_page: &mut Option<(usize, Arc<SimilarityIndexPage>)>,
@@ -206,8 +184,7 @@ fn mapped_entry(
         let page = if let Some(page) = page_cache.get_entry(descriptor.run_hash(), page_ordinal) {
             page
         } else {
-            let page =
-                Arc::new(descriptor.decode_page(page_ordinal, exact_page(mapping, offset)?)?);
+            let page = Arc::new(descriptor.decode_page(page_ordinal, &exact_page(lease, offset)?)?);
             page_cache.insert_entry(descriptor.run_hash(), page_ordinal, Arc::clone(&page));
             page
         };
@@ -223,22 +200,18 @@ fn mapped_entry(
         .ok_or(SimilarityIndexStoreError::IndexCorruption)
 }
 
-fn exact_page(mapping: &[u8], offset: u64) -> Result<&[u8], SimilarityIndexStoreError> {
+fn exact_page(
+    lease: &ImmutableFileLease,
+    offset: u64,
+) -> Result<Vec<u8>, SimilarityIndexStoreError> {
     let offset = usize::try_from(offset).map_err(|_| SimilarityIndexStoreError::IndexCorruption)?;
-    exact_range(mapping, offset, SIMILARITY_INDEX_PAGE_BYTES)
+    exact_range(lease, offset, SIMILARITY_INDEX_PAGE_BYTES)
 }
 
 fn exact_range(
-    mapping: &[u8],
+    lease: &ImmutableFileLease,
     offset: usize,
     length: usize,
-) -> Result<&[u8], SimilarityIndexStoreError> {
-    let end = offset
-        .checked_add(length)
-        .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-    let result = mapping
-        .get(offset..end)
-        .ok_or(SimilarityIndexStoreError::IndexCorruption);
-    crate::metadata_read_telemetry::mapped_range(length, result.is_ok());
-    result
+) -> Result<Vec<u8>, SimilarityIndexStoreError> {
+    Ok(lease.read_at(offset as u64, length)?)
 }

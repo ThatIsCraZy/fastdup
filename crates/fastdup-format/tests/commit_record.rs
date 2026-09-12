@@ -19,7 +19,7 @@ fn commit_records_have_stable_bytes_and_form_a_hash_chain() {
     assert_eq!(first_bytes.len(), COMMIT_RECORD_BYTES);
     assert_eq!(&first_bytes[0..8], b"FDCMIT01");
     assert_eq!(&first_bytes[8..10], &2_u16.to_le_bytes());
-    assert_eq!(&first_bytes[22..24], &1_u16.to_le_bytes());
+    assert_eq!(&first_bytes[22..24], &2_u16.to_le_bytes());
     assert_eq!(&first_bytes[40..48], &1_u64.to_le_bytes());
     assert_eq!(&first_bytes[152..160], &1_024_u64.to_le_bytes());
     assert_eq!(&first_bytes[160..168], &10_u64.to_le_bytes());
@@ -46,7 +46,7 @@ fn commit_records_have_stable_bytes_and_form_a_hash_chain() {
 }
 
 #[test]
-fn format_epoch_one_has_a_stable_v2_fence_and_round_trips() {
+fn format_epoch_two_has_a_stable_v2_fence_and_round_trips() {
     let record = CommitRecord::new(
         1,
         CommitRecordHash::ZERO,
@@ -56,12 +56,12 @@ fn format_epoch_one_has_a_stable_v2_fence_and_round_trips() {
         4_096,
         2,
     )
-    .expect("epoch-one record is valid");
+    .expect("epoch-two record is valid");
     let bytes = record.encode();
 
     assert_eq!(&bytes[8..10], &2_u16.to_le_bytes());
-    assert_eq!(&bytes[22..24], &1_u16.to_le_bytes());
-    assert_eq!(record.format_epoch(), 1);
+    assert_eq!(&bytes[22..24], &2_u16.to_le_bytes());
+    assert_eq!(record.format_epoch(), 2);
     assert_eq!(CommitRecord::decode(&bytes), Ok(record));
 }
 
@@ -85,4 +85,26 @@ fn preproduction_epoch_zero_commit_is_rejected() {
     legacy[168..172].copy_from_slice(&checksum.to_le_bytes());
 
     assert!(CommitRecord::decode(&legacy).is_err());
+}
+
+#[test]
+fn aligned_storage_epoch_rejects_older_and_unknown_checksumming_valid_records() {
+    let record = CommitRecord::new(
+        1,
+        CommitRecordHash::ZERO,
+        MetadataObjectId::new([0x41; 32]).unwrap(),
+        PolicySetId::new([0xc1; 32]).unwrap(),
+        0,
+        4096,
+        2,
+    )
+    .unwrap();
+    for epoch in [0_u16, 1, 3, u16::MAX] {
+        let mut bytes = record.encode();
+        bytes[22..24].copy_from_slice(&epoch.to_le_bytes());
+        bytes[168..172].fill(0);
+        let checksum = crc32c::crc32c(&bytes);
+        bytes[168..172].copy_from_slice(&checksum.to_le_bytes());
+        assert!(CommitRecord::decode(&bytes).is_err());
+    }
 }

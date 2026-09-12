@@ -20,13 +20,9 @@ fn shrink_releases_cache_ownership_but_keeps_reader_views_valid() {
     let (id, bytes) = object(1);
     let cache = MetadataObjectCache::limited(1 << 20);
     let held = cache.read(id, || Ok(bytes.clone())).unwrap();
-    assert!(cache.admission.lock().unwrap().resident >= bytes.len() as u64);
-    {
-        let mut admission = cache.admission.lock().unwrap();
-        admission.target = 0;
-        cache.trim(&mut admission, 0);
-        assert_eq!(admission.resident, 0);
-    }
+    assert!(cache.cache.stats().resident_bytes >= bytes.len() as u64);
+    cache.cache.set_capacity(0);
+    assert_eq!(cache.cache.stats().resident_bytes, 0);
     assert_eq!(*held, bytes);
     let reads = std::cell::Cell::new(0);
     for _ in 0..2 {
@@ -41,7 +37,7 @@ fn shrink_releases_cache_ownership_but_keeps_reader_views_valid() {
         );
     }
     assert_eq!(reads.get(), 2);
-    assert_eq!(cache.admission.lock().unwrap().resident, 0);
+    assert_eq!(cache.cache.stats().resident_bytes, 0);
 }
 
 #[test]
@@ -50,7 +46,7 @@ fn failed_miss_is_not_admitted_and_independent_scopes_restore_after_errors() {
     let (_, other) = object(2);
     let cache = MetadataObjectCache::limited(1 << 20);
     assert!(cache.read(id, || Ok(other.clone())).is_err());
-    assert_eq!(cache.admission.lock().unwrap().resident, 0);
+    assert_eq!(cache.cache.stats().resident_bytes, 0);
     cache.read(id, || Ok(bytes.clone())).unwrap();
     {
         let _outer = IndependentRead::enter();
@@ -73,7 +69,7 @@ fn failed_miss_is_not_admitted_and_independent_scopes_restore_after_errors() {
         bytes
     );
     cache.invalidate(id);
-    assert_eq!(cache.admission.lock().unwrap().resident, 0);
+    assert_eq!(cache.cache.stats().resident_bytes, 0);
     assert!(
         cache
             .read(id, || Err(
@@ -108,9 +104,9 @@ fn concurrent_admission_charges_one_identity_and_survives_invalidation() {
         }
     });
     assert_eq!(
-        cache.admission.lock().unwrap().resident,
-        bytes.len() as u64 + ENTRY_OVERHEAD
+        cache.cache.stats().resident_bytes,
+        bytes.len() as u64 + size_of::<Vec<u8>>() as u64 + 512
     );
     cache.invalidate(id);
-    assert_eq!(cache.admission.lock().unwrap().resident, 0);
+    assert_eq!(cache.cache.stats().resident_bytes, 0);
 }

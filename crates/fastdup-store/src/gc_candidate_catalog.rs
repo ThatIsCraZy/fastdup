@@ -11,7 +11,7 @@ use fastdup_format::{
     VerifiedContainerPublication,
 };
 
-use crate::gc_candidate_mmap::ImmutableGcCandidateCatalog;
+use crate::gc_candidate_read::ImmutableGcCandidateCatalog;
 use crate::{
     ActivatedExactIndex, ExactIndexStoreError, GenerationLivenessDelta, StorageIo, StoreError,
 };
@@ -44,7 +44,7 @@ pub fn gc_candidate_row_from_publication(
 }
 
 /// Immutable GC-candidate acceleration with streaming publication and bounded
-/// or mmap-backed scans.
+/// or leased Direct-I/O scans through the common cache.
 #[derive(Clone, Debug)]
 pub struct GcCandidateCatalogRepository<I> {
     storage: I,
@@ -408,7 +408,7 @@ impl<I: Clone + StorageIo> GcCandidateCatalogRepository<I> {
                 .storage
                 .lease_immutable_file(&name, descriptor.file_length())?
             {
-                Some(lease) => CatalogSource::Mapped(Arc::new(ImmutableGcCandidateCatalog::open(
+                Some(lease) => CatalogSource::Leased(Arc::new(ImmutableGcCandidateCatalog::open(
                     lease, descriptor,
                 )?)),
                 None => CatalogSource::Bounded {
@@ -457,7 +457,7 @@ pub struct GcCandidateCatalogSnapshot<I> {
 
 #[derive(Clone)]
 enum CatalogSource<I> {
-    Mapped(Arc<ImmutableGcCandidateCatalog>),
+    Leased(Arc<ImmutableGcCandidateCatalog>),
     Bounded {
         storage: I,
         name: String,
@@ -469,14 +469,14 @@ impl<I: Clone + StorageIo> GcCandidateCatalogSnapshot<I> {
     #[must_use]
     pub fn descriptor(&self) -> GcCandidateCatalogDescriptor {
         match &self.source {
-            CatalogSource::Mapped(catalog) => catalog.descriptor(),
+            CatalogSource::Leased(catalog) => catalog.descriptor(),
             CatalogSource::Bounded { descriptor, .. } => *descriptor,
         }
     }
 
     #[must_use]
-    pub const fn mapped(&self) -> bool {
-        matches!(self.source, CatalogSource::Mapped(_))
+    pub const fn leased(&self) -> bool {
+        matches!(self.source, CatalogSource::Leased(_))
     }
 
     /// Finds one Container row by binary search without materializing the
@@ -505,7 +505,7 @@ impl<I: Clone + StorageIo> GcCandidateCatalogSnapshot<I> {
 
     fn row_at(&self, ordinal: u64) -> Result<GcCandidateCatalogRow, GcCandidateCatalogStoreError> {
         match &self.source {
-            CatalogSource::Mapped(catalog) => catalog.row(ordinal),
+            CatalogSource::Leased(catalog) => catalog.row(ordinal),
             CatalogSource::Bounded {
                 storage,
                 name,
@@ -533,6 +533,7 @@ impl<I: Clone + StorageIo> GcCandidateCatalogSnapshot<I> {
         limit: usize,
         current_container_generation: u64,
     ) -> Result<GcCandidateShortlist, GcCandidateCatalogStoreError> {
+        let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
         if limit == 0 || limit > MAX_SHORTLIST_ROWS {
             return Err(GcCandidateCatalogStoreError::InvalidShortlistLimit);
         }
@@ -571,15 +572,11 @@ impl<I: Clone + StorageIo> GcCandidateCatalogSnapshot<I> {
 
     fn visit_rows(
         &self,
-        mut visit: impl FnMut(GcCandidateCatalogRow) -> Result<(), GcCandidateCatalogStoreError>,
+        visit: impl FnMut(GcCandidateCatalogRow) -> Result<(), GcCandidateCatalogStoreError>,
     ) -> Result<(), GcCandidateCatalogStoreError> {
+        let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
         match &self.source {
-            CatalogSource::Mapped(catalog) => {
-                for ordinal in 0..catalog.descriptor().row_count() {
-                    visit(catalog.row(ordinal)?)?;
-                }
-                Ok(())
-            }
+            CatalogSource::Leased(catalog) => catalog.visit_rows(visit),
             CatalogSource::Bounded {
                 storage,
                 name,
@@ -743,6 +740,7 @@ fn audit_named_with<I: StorageIo>(
     name: &str,
     mut visit: impl FnMut(GcCandidateCatalogRow) -> Result<(), GcCandidateCatalogStoreError>,
 ) -> Result<GcCandidateCatalogDescriptor, GcCandidateCatalogStoreError> {
+    let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
     let file_length = storage.object_len(name)?;
     if file_length < (2 * GC_CANDIDATE_CATALOG_HEADER_BYTES) as u64 {
         return Err(GcCandidateCatalogStoreError::IndexCorruption);

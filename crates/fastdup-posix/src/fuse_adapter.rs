@@ -31,7 +31,6 @@ use tokio::sync::Semaphore;
 
 const MAXIMUM_WRITE_BYTES: u32 = 1_024 * 1_024;
 const FOPEN_DIRECT_IO: u32 = 1;
-const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 const ZERO_TTL: Duration = Duration::ZERO;
 const INTERNAL_CONTEXT: RequestContext = RequestContext {
     uid: 0,
@@ -893,11 +892,6 @@ impl Filesystem for FuseFilesystem {
             self.invalidate_data(inode, KernelDataInvalidation::All)
                 .await;
         }
-        if options.access == AccessMode::ReadOnly {
-            self.namespace
-                .expose_kernel_data_cache(inode)
-                .map_err(errno)?;
-        }
         Ok(ReplyOpen {
             fh: handle.get(),
             flags: regular_file_open_flags(options),
@@ -1554,11 +1548,6 @@ impl Filesystem for FuseFilesystem {
             self.invalidate_data(entry.attr.inode, KernelDataInvalidation::All)
                 .await;
         }
-        if options.access == AccessMode::ReadOnly {
-            self.namespace
-                .expose_kernel_data_cache(entry.attr.inode)
-                .map_err(errno)?;
-        }
 
         Ok(ReplyCreated {
             ttl: ZERO_TTL,
@@ -1833,11 +1822,8 @@ fn open_options(flags: u32) -> fuse3::Result<OpenOptions> {
     })
 }
 
-const fn regular_file_open_flags(options: OpenOptions) -> u32 {
-    match options.access {
-        AccessMode::ReadOnly => FOPEN_KEEP_CACHE,
-        AccessMode::WriteOnly | AccessMode::ReadWrite => FOPEN_DIRECT_IO,
-    }
+const fn regular_file_open_flags(_options: OpenOptions) -> u32 {
+    FOPEN_DIRECT_IO
 }
 
 fn lock_kind(value: u32, allow_unlock: bool) -> fuse3::Result<LockKind> {
@@ -2113,8 +2099,8 @@ mod tests {
     }
 
     #[test]
-    fn v1_kernel_cache_policy_caches_only_read_only_regular_handles() {
-        assert_eq!(regular_file_open_flags(OpenOptions::READ_ONLY), 2);
+    fn regular_handles_use_application_owned_read_caching() {
+        assert_eq!(regular_file_open_flags(OpenOptions::READ_ONLY), 1);
         assert_eq!(
             regular_file_open_flags(OpenOptions {
                 access: AccessMode::WriteOnly,
@@ -2148,7 +2134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_mutations_notify_only_after_a_cacheable_open() {
+    async fn direct_handles_never_create_kernel_data_cache_exposure() {
         let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
         let Reply::Created { entry, handle } = namespace
             .dispatch(
@@ -2188,7 +2174,7 @@ mod tests {
             u32::try_from(libc::O_RDONLY).expect("O_RDONLY is nonnegative"),
         )
         .await
-        .expect("cacheable read-only open succeeds");
+        .expect("direct read-only open succeeds");
         Filesystem::release(
             &filesystem,
             Request::default(),
@@ -2199,7 +2185,7 @@ mod tests {
             false,
         )
         .await
-        .expect("cacheable reader closes successfully");
+        .expect("direct reader closes successfully");
         Filesystem::write(
             &filesystem,
             Request::default(),
@@ -2217,7 +2203,7 @@ mod tests {
             *notifications
                 .lock()
                 .expect("notification recorder lock remains healthy"),
-            vec![(entry.attr.inode.get(), 6, 5)]
+            Vec::<(u64, i64, i64)>::new()
         );
     }
 

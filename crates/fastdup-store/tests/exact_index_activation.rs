@@ -125,7 +125,7 @@ fn repeated_rotation_stays_bounded_and_offline_audit_selects_the_latest_record()
             .expect("both fixed activation slots exist")
             .len();
         assert!(
-            length <= SLOT_BYTES,
+            length <= SLOT_BYTES + 8192,
             "rotated slot {name} exceeded the lifetime bound: {length}"
         );
     }
@@ -177,7 +177,7 @@ fn writer_recovery_and_offline_audit_reject_a_corrupt_rotation_peer() {
         .open(root.join("exact-index.activation.wal"))
         .expect("open the now-inactive rotation peer");
     corrupt_peer
-        .write_all_at(&[0], 0)
+        .write_all_at(&[0], 8192)
         .expect("corrupt one authenticated byte");
     corrupt_peer
         .sync_all()

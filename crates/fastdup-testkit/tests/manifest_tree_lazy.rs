@@ -57,7 +57,7 @@ fn append_to_empty_manifest_drops_the_zero_length_predecessor_leaf() {
 }
 
 #[test]
-fn tail_read_of_large_manifest_revalidates_only_its_lazy_tree_path() {
+fn demand_reuses_manifest_but_independent_tail_read_revalidates_its_path() {
     let policy = PolicySetId::new([0xD1; 32]).expect("policy identity is nonzero");
     let metadata = MemoryStorageIo::new();
     let containers = ContainerRepository::new(MemoryStorageIo::new());
@@ -111,11 +111,19 @@ fn tail_read_of_large_manifest_revalidates_only_its_lazy_tree_path() {
         .write_at(&tail_name, 4_096 + 24, &tail_bytes[4_096 + 24..4_096 + 25])
         .expect("inject tail leaf corruption");
 
+    let cached = file
+        .read_at(logical_size - 1, 1)
+        .expect("demand may reuse the verified Manifest");
+    assert_eq!(
+        cached,
+        vec![u8::try_from((extent_count - 1) % 251).unwrap()]
+    );
     let baseline = metadata.operation_count();
-    let result = file.read_at(logical_size - 1, 1);
+    let _independent =
+        fastdup_store::ReadIntentScope::enter(fastdup_store::ReadIntent::Independent);
     assert!(
-        result.is_err(),
-        "a demand read must revalidate every touched Manifest path"
+        file.read_at(logical_size - 1, 1).is_err(),
+        "independent verification must reread a warm Manifest path"
     );
     let metadata_operations = metadata.operation_count() - baseline;
     assert!(

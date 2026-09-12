@@ -1,4 +1,4 @@
-use crate::{CacheFallback, CacheObservation, CachePool};
+use crate::{CacheObservation, CachePool};
 use fastdup_format::ChunkId;
 pub(crate) use fastdup_format::VerifiedChunkPayload;
 use std::array;
@@ -19,7 +19,8 @@ const CACHE_WAYS: usize = 4;
 const CACHE_SLOT_TARGET_BYTES: usize = 16 * 1_024;
 const MAX_RECLAIM_STEPS_PER_GROUP: usize = 256;
 
-/// Hard geometry and memory reserve for the shared verified read cache.
+/// Deterministic geometry and reserve for isolated tests and embedded runtimes.
+/// Production residency is governed by the process-wide unified cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifiedReadCacheConfig {
     hard_limit_bytes: usize,
@@ -392,6 +393,7 @@ struct CacheAdmission {
 /// Admission is serialized only after the expensive Container read/VERIFY has
 /// completed so exact byte accounting cannot overrun the current target.
 pub struct VerifiedReadCache {
+    unified: Option<crate::ReadCacheNamespace>,
     config: VerifiedReadCacheConfig,
     shards: Box<[CacheShard]>,
     metadata_bytes: usize,
@@ -431,19 +433,7 @@ impl VerifiedReadCache {
         let snapshot =
             MemoryPressureSnapshot::read_system().map_err(VerifiedReadCacheError::SystemMemory)?;
         let config = VerifiedReadCacheConfig::conservative(snapshot);
-        Self::build(config, snapshot, true)
-    }
-
-    /// Constructs an explicitly configured cache with automatic pressure
-    /// refresh. This is intended for deployment overrides.
-    ///
-    /// # Errors
-    ///
-    /// Returns system-sampling, invalid-geometry, or allocation failures.
-    pub fn new(config: VerifiedReadCacheConfig) -> Result<Self, VerifiedReadCacheError> {
-        let snapshot =
-            MemoryPressureSnapshot::read_system().map_err(VerifiedReadCacheError::SystemMemory)?;
-        Self::build(config, snapshot, true)
+        Self::build(config, snapshot, true, false)
     }
 
     /// Constructs a deterministic manually refreshed cache for tests and
@@ -456,13 +446,23 @@ impl VerifiedReadCache {
         config: VerifiedReadCacheConfig,
         snapshot: MemoryPressureSnapshot,
     ) -> Result<Self, VerifiedReadCacheError> {
-        Self::build(config, snapshot, false)
+        Self::build(config, snapshot, false, false)
+    }
+
+    // Historical policy retained only as a test/replay comparator.
+    #[cfg(test)]
+    fn new_legacy_with_snapshot(
+        config: VerifiedReadCacheConfig,
+        snapshot: MemoryPressureSnapshot,
+    ) -> Result<Self, VerifiedReadCacheError> {
+        Self::build(config, snapshot, false, true)
     }
 
     fn build(
         config: VerifiedReadCacheConfig,
         snapshot: MemoryPressureSnapshot,
         automatic_pressure: bool,
+        legacy: bool,
     ) -> Result<Self, VerifiedReadCacheError> {
         let shard_count = config.shard_count.get();
         let approximate_set_bytes = CACHE_WAYS
@@ -471,8 +471,11 @@ impl VerifiedReadCache {
             .ok_or(VerifiedReadCacheError::GeometryTooSmall)?;
         let mut set_count = config.hard_limit_bytes / approximate_set_bytes;
         set_count -= set_count % shard_count;
-        if set_count < shard_count {
+        if set_count < shard_count && legacy {
             return Err(VerifiedReadCacheError::GeometryTooSmall);
+        }
+        if !legacy {
+            set_count = 0;
         }
         let sets_per_shard = set_count / shard_count;
         let metadata_bytes = set_count
@@ -485,7 +488,7 @@ impl VerifiedReadCache {
         shards
             .try_reserve_exact(shard_count)
             .map_err(|_| VerifiedReadCacheError::OutOfMemory)?;
-        for _ in 0..shard_count {
+        for _ in 0..if legacy { shard_count } else { 0 } {
             let mut sets = Vec::new();
             sets.try_reserve_exact(sets_per_shard)
                 .map_err(|_| VerifiedReadCacheError::OutOfMemory)?;
@@ -498,6 +501,13 @@ impl VerifiedReadCache {
             });
         }
         let cache = Self {
+            unified: (!legacy).then(|| {
+                if automatic_pressure {
+                    crate::ReadCacheNamespace::system(crate::ReadCacheClass::Data)
+                } else {
+                    crate::ReadCacheNamespace::isolated(crate::ReadCacheClass::Data, 0)
+                }
+            }),
             config,
             shards: shards.into_boxed_slice(),
             metadata_bytes,
@@ -514,14 +524,7 @@ impl VerifiedReadCache {
             started: Instant::now(),
             last_refresh_millis: AtomicU64::new(0),
             compression: Compression::new(snapshot, automatic_pressure),
-            budget_pool: automatic_pressure.then(|| {
-                CachePool::system(
-                    "verifiedRead",
-                    CacheFallback::Data,
-                    metadata_bytes as u64,
-                    config.hard_limit_bytes as u64,
-                )
-            }),
+            budget_pool: None,
         };
         cache.apply_memory_pressure(snapshot);
         Ok(cache)
@@ -544,6 +547,28 @@ impl VerifiedReadCache {
     }
 
     fn apply_memory_pressure(&self, snapshot: MemoryPressureSnapshot) {
+        if let Some(cache) = &self.unified {
+            if !self.automatic_pressure {
+                cache.update_pressure(
+                    snapshot,
+                    self.config.hard_limit_bytes as u64,
+                    self.config.reserve_bytes,
+                );
+            }
+            self.compression.refresh_buffers(snapshot);
+            self.target_bytes.store(
+                usize::try_from(cache.capacity()).unwrap_or(usize::MAX),
+                Ordering::Release,
+            );
+            self.effective_limit_bytes
+                .store(snapshot.effective_limit_bytes(), Ordering::Release);
+            self.available_bytes
+                .store(snapshot.available_bytes(), Ordering::Release);
+            self.swap_used_bytes
+                .store(snapshot.swap_used_bytes(), Ordering::Release);
+            return;
+        }
+
         self.compression.refresh_buffers(snapshot);
         let mut admission = self
             .admission
@@ -622,9 +647,26 @@ impl VerifiedReadCache {
             .lock()
             .expect("ASSERT: cache admission lock poisoned");
         let counters = self.counters();
+        let mut resident = self.resident_bytes.load(Ordering::Acquire);
+        let mut entries = self.entry_count.load(Ordering::Acquire);
+        let mut compressed = self.compression.resident.load(Ordering::Relaxed);
+        let mut logical = self.compression.logical.load(Ordering::Relaxed);
+        if let Some(cache) = &self.unified {
+            let stats = cache.stats();
+            resident = usize::try_from(stats.resident_bytes).unwrap_or(usize::MAX);
+            entries = usize::try_from(stats.entries).unwrap_or(usize::MAX);
+            compressed = 0;
+            logical = 0;
+            cache.visit::<CachedPayload>(|payload| {
+                if let CachedPayload::Compressed(value) = payload {
+                    compressed += value.resident_bytes();
+                    logical += value.logical_length();
+                }
+            });
+        }
         VerifiedReadCacheStatus {
-            compressed_resident_bytes: self.compression.resident.load(Ordering::Relaxed),
-            compressed_logical_bytes: self.compression.logical.load(Ordering::Relaxed),
+            compressed_resident_bytes: compressed,
+            compressed_logical_bytes: logical,
             compression_attempts: self.compression.attempts.load(Ordering::Relaxed),
             compressed_admissions: self.compression.admitted.load(Ordering::Relaxed),
             compression_nanos: self.compression.compress_ns.load(Ordering::Relaxed),
@@ -645,8 +687,8 @@ impl VerifiedReadCache {
             evictions: counters.evictions,
             pressure_rejections: self.pressure_rejections.load(Ordering::Relaxed),
             oversized_rejections: self.oversized_rejections.load(Ordering::Relaxed),
-            entry_count: self.entry_count.load(Ordering::Acquire),
-            resident_bytes: self.resident_bytes.load(Ordering::Acquire),
+            entry_count: entries,
+            resident_bytes: resident,
             target_bytes: self.target_bytes.load(Ordering::Acquire),
             metadata_bytes: self.metadata_bytes,
             hard_limit_bytes: self.config.hard_limit_bytes,
@@ -662,7 +704,21 @@ impl VerifiedReadCache {
         chunk_id: ChunkId,
         logical_length: u64,
     ) -> Option<VerifiedChunkPayload> {
+        if crate::read_intent::independent() {
+            return None;
+        }
         self.maybe_refresh_pressure();
+        if let Some(cache) = &self.unified {
+            let key = crate::ReadCacheKey {
+                identity: chunk_id.bytes(),
+                ordinal: logical_length,
+            };
+            let value = cache.get::<CachedPayload>(key)?;
+            return match value.as_ref() {
+                CachedPayload::Decoded(payload) => Some(payload.clone()),
+                CachedPayload::Compressed(value) => self.compressed_hit(value, 0),
+            };
+        }
         let key = CacheKey {
             chunk_id,
             logical_length,
@@ -736,6 +792,9 @@ impl VerifiedReadCache {
     /// verified Chunk views from that Encoding Record.
     #[allow(clippy::too_many_lines)]
     fn admit_group(&self, payloads: Vec<CachedPayload>) {
+        if crate::read_intent::bypass_admission() {
+            return;
+        }
         let Some(first) = payloads.first() else {
             return;
         };
@@ -762,6 +821,29 @@ impl VerifiedReadCache {
             }
         };
         self.maybe_refresh_pressure();
+        if let Some(cache) = &self.unified {
+            let values = payloads
+                .into_iter()
+                .map(|value| {
+                    let length = value.len() as u64;
+                    (
+                        crate::ReadCacheKey {
+                            identity: value.chunk_id().bytes(),
+                            ordinal: length,
+                        },
+                        Arc::new(value),
+                        length,
+                    )
+                })
+                .collect();
+            let admitted = cache.insert_groups(vec![(values, allocation_bytes as u64)]);
+            if compressed_logical != 0 {
+                self.compression
+                    .admitted
+                    .fetch_add(admitted, Ordering::Relaxed);
+            }
+            return;
+        }
         let mut admission = self
             .admission
             .lock()
@@ -998,6 +1080,17 @@ impl VerifiedReadCache {
     }
 
     fn counters(&self) -> CacheShardCounters {
+        if let Some(cache) = &self.unified {
+            let stats = cache.stats();
+            return CacheShardCounters {
+                hits: stats.hits,
+                misses: stats.misses,
+                admissions: stats.admissions,
+                evictions: stats.evictions,
+                hit_bytes: stats.hit_bytes,
+            };
+        }
+
         self.shards
             .iter()
             .fold(CacheShardCounters::default(), |mut total, shard| {
@@ -1123,7 +1216,7 @@ mod tests {
 
     #[test]
     fn full_byte_budget_admits_a_new_workload_into_an_empty_set() {
-        let cache = VerifiedReadCache::new_with_snapshot(
+        let cache = VerifiedReadCache::new_legacy_with_snapshot(
             VerifiedReadCacheConfig::new(2 * 1024 * 1024, 0, NonZeroUsize::MIN).unwrap(),
             MemoryPressureSnapshot::new(8 * 1024 * 1024, 8 * 1024 * 1024, 0),
         )
@@ -1166,7 +1259,7 @@ mod tests {
             NonZeroUsize::new(4).expect("four shards"),
         )
         .expect("valid cache geometry");
-        let cache = VerifiedReadCache::new_with_snapshot(
+        let cache = VerifiedReadCache::new_legacy_with_snapshot(
             config,
             MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 4 * 1_024 * 1_024, 0),
         )
@@ -1187,7 +1280,7 @@ mod tests {
 
     #[test]
     fn five_colliding_verified_chunks_replace_only_one_four_way_victim() {
-        let cache = VerifiedReadCache::new_with_snapshot(
+        let cache = VerifiedReadCache::new_legacy_with_snapshot(
             VerifiedReadCacheConfig::new(2 * 1_024 * 1_024, 0, NonZeroUsize::MIN)
                 .expect("valid one-shard geometry"),
             MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 8 * 1_024 * 1_024, 0),
@@ -1243,7 +1336,7 @@ mod tests {
 
     #[test]
     fn admission_and_hit_share_and_charge_the_decoder_owned_payload_allocation_once() {
-        let cache = VerifiedReadCache::new_with_snapshot(
+        let cache = VerifiedReadCache::new_legacy_with_snapshot(
             VerifiedReadCacheConfig::new(2 * 1_024 * 1_024, 0, NonZeroUsize::MIN)
                 .expect("valid cache geometry"),
             MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 8 * 1_024 * 1_024, 0),
@@ -1279,7 +1372,7 @@ mod tests {
             3 * 1_024 * 1_024,
             Some(0),
         );
-        let cache = VerifiedReadCache::new_with_snapshot(config, snapshot)
+        let cache = VerifiedReadCache::new_legacy_with_snapshot(config, snapshot)
             .expect("construct host-Swap cache");
 
         assert!(cache.status().target_bytes() > 0);
@@ -1288,7 +1381,7 @@ mod tests {
     #[test]
     #[ignore = "manual release-mode verified DATA hit-path A/B"]
     fn adaptive_budget_hit_path_benchmark() {
-        let cache = VerifiedReadCache::new_with_snapshot(
+        let cache = VerifiedReadCache::new_legacy_with_snapshot(
             VerifiedReadCacheConfig::new(1024 * 1024, 0, NonZeroUsize::MIN).unwrap(),
             MemoryPressureSnapshot::new(8 * 1024 * 1024, 8 * 1024 * 1024, 0),
         )

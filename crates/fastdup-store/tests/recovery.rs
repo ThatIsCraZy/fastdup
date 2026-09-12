@@ -161,12 +161,15 @@ fn recovery_and_offline_audit_reject_nonzero_container_padding() {
         .expect("publish fixture");
     let path = root.join(format!("{}.fdc", encoded_id(0xf1)));
     let mut encoded = std::fs::read(&path).expect("read published fixture for fault injection");
-    let index_offset = usize::try_from(read_u64(&encoded, 72)).expect("index offset fits usize");
-    let index_length = usize::try_from(read_u64(&encoded, 80)).expect("index length fits usize");
-    let footer_offset = usize::try_from(read_u64(&encoded, 88)).expect("footer offset fits usize");
+    let index_offset =
+        usize::try_from(read_u64(&encoded[8192..], 72)).expect("index offset fits usize");
+    let index_length =
+        usize::try_from(read_u64(&encoded[8192..], 80)).expect("index length fits usize");
+    let footer_offset =
+        usize::try_from(read_u64(&encoded[8192..], 88)).expect("footer offset fits usize");
     let fault_offset = index_offset + index_length;
     assert!(fault_offset < footer_offset, "fixture has a padding range");
-    encoded[fault_offset] = 1;
+    encoded[8192 + fault_offset] = 1;
     std::fs::write(path, encoded).expect("inject one nonzero padding byte");
 
     assert!(matches!(

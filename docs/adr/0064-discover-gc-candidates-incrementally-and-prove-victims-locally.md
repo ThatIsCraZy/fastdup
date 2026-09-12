@@ -79,7 +79,9 @@ incomplete lookup or a live target without an ACTIVE Location fails closed. The
 bounded victim read then replaces only protected target Chunks and Base Chunks
 named by that generation. Catalog fanout estimates and Exact negatives remain
 non-authoritative. The projection is discarded after either binding changes
-and rebuilt after process start; it introduces no frontend write.
+and rebuilt after process start; it introduces no frontend write. Under
+ADR 0046 it is owned by the unified read cache and may be evicted even with
+unchanged bindings. A running candidate proof retains its immutable view.
 
 Paired Similarity families authenticate the selected Exact Run Set under ADR
 0062, and paired recovery refuses a family bound to any other Run Set. The
@@ -107,10 +109,10 @@ dependency cost. Merge sets use bounded similar-live-size packing and must beat
 a conservative independent-RAW replacement bound. No approximate value is a
 deletion invariant.
 
-Normal scans use an audited read-only mapping held under the immutable-file
-lease. Adapters without that lease use bounded positional reads. The mapping's
-unsafe operation is confined to that ownership boundary; neither path casts
-file bytes to Rust structs. Publication batches row writes and shortlist
+Under ADR 0046, normal scans use bounded Direct-I/O reads held under the
+immutable-file lease and may reuse the common cache. Adapters without that
+lease use bounded positional reads and re-audit. Scan batches contain at most
+4,096 rows; neither path casts file bytes to Rust structs. Publication batches row writes and shortlist
 selection retains at most 4,096 rows in an `O(container_count * log(limit))`
 heap.
 

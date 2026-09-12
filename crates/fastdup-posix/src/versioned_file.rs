@@ -374,8 +374,8 @@ struct DirtyEpoch {
 
 // A strict append from an empty base whose resulting size remains at most
 // 8 MiB can produce at most 513 SeqCDC Chunks at the 16-KiB minimum, including
-// one drained boundary Chunk. Its single root leaf is at most 40 KiB after the
-// 4-KiB Metadata envelope and alignment. If that file grows beyond 8 MiB, the
+// one drained boundary Chunk. Its single root leaf is at most 48 KiB after the
+// Metadata envelope, 8-KiB storage heads and alignment. If that file grows beyond 8 MiB, the
 // remaining bytes of the ordinary 16-MiB credit are claimed first.
 //
 // An arbitrary 16-MiB sequential append can produce at most 1,025 Chunks.
@@ -383,7 +383,7 @@ struct DirtyEpoch {
 // and one early close at a 64-MiB logical window. Credits are inode-local and
 // belong only to the current Active Dirty Epoch.
 const SINGLE_LEAF_APPEND_COVERAGE_END_BYTES_V1: u64 = 8 * 1_024 * 1_024;
-const SINGLE_LEAF_METADATA_BYTES_V1: u64 = 40 * 1_024;
+const SINGLE_LEAF_METADATA_BYTES_V1: u64 = 48 * 1_024;
 const SEQUENTIAL_APPEND_COVERAGE_BYTES_V1: u64 = 16 * 1_024 * 1_024;
 const SEQUENTIAL_APPEND_PATH_CLAIMS_V1: u64 = 4;
 

@@ -45,10 +45,10 @@ coverage. The 16-KiB minimum SeqCDC Chunk permits at most 1,025 appended Chunks
 in that coverage including one drained boundary Chunk; four paths cover the
 prior tail leaf, two 1,024-entry leaves, and one early close at a 64-MiB logical
 window. A strict append from an empty base whose resulting file is no larger
-than 8 MiB instead claims the exact 40-KiB upper bound of its single root leaf:
+than 8 MiB instead claims the exact 48-KiB upper bound of its single root leaf:
 at the same minimum Chunk size it contains at most 513 extents including the
 drained boundary, and its 64-byte header plus 64-byte entries, 4-KiB Metadata
-envelope, and alignment fit that bound. Growing beyond 8 MiB claims the
+envelope, 8-KiB aligned storage heads (ADR 0046), and alignment fit that bound. Growing beyond 8 MiB claims the
 remaining bytes of the ordinary four-path credit before extending 16-MiB
 coverage. Nonempty committed bases retain the complete path claim because a
 small logical size does not prove a shallow pre-existing tree. Flattening

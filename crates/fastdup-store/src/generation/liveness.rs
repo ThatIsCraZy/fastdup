@@ -53,7 +53,7 @@ impl<I: StorageIo> GenerationRepository<I> {
     /// the complete scrub path above additionally verifies every required
     /// Chunk before returning the same generation binding.
     pub(crate) fn scan_online_liveness(&self) -> Result<GenerationLivenessProof, GenerationError> {
-        let _independent = crate::metadata_object_cache::IndependentRead::enter();
+        let _cache_read = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
         let _publication_guard = self
             .metadata_gc_barrier
             .write()

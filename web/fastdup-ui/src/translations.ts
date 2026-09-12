@@ -1,5 +1,14 @@
 // German source messages keep familiar storage terminology.
 export const english: Record<string, string> = {
+  "Direkter Bereich": "Direct range",
+  "Direkte Datei": "Direct file",
+  "Direkte Struktur": "Direct structure",
+  "Direkter Zugriff mit Dateilease": "Direct access under a file lease",
+  "Gemeinsamer Speicher für Nutzdaten, Metadaten, Indexe und geprüfte Nachweise": "Shared memory for payloads, metadata, indexes and verified evidence",
+  "Treffer vermeiden Zugriffe auf das angegebene Tier. Alle Inhalte teilen sich einen Cache; wiederverwendete DATA-Inhalte erhalten mehr Schutz bei der Verdrängung.": "Hits avoid accesses to the listed tier. All content shares one cache; reused DATA content receives more protection during eviction.",
+  "Geprüfte Nutzdaten bleiben komprimiert im RAM, wenn das Speicher spart; andernfalls bleiben sie unkomprimiert. Beide Darstellungen teilen sich das gemeinsame Cache-Budget. Speicherwerte gelten zum Messpunkt.": "Verified payloads stay compressed in RAM when that saves memory; otherwise they remain decoded. Both representations share the common cache budget. Memory values apply at the sample time.",
+  "Direkte Backend-Reads nach Ursache. Der Unified Read Cache bedient wiederverwendbare Inhalte vor dem Backend. Angeforderte Bereiche enthalten keinen Ausrichtungs- oder Format-Overhead; physische MB/s und IOPS stehen bei den Laufwerken.": "Direct backend reads by cause. The unified read cache serves reusable content before the backend. Requested ranges exclude alignment and format overhead; physical MB/s and IOPS are shown with the drives.",
+  "Lesezeiten erfassen den direkten Backend-Aufruf einschließlich Pufferaufbau. Das Öffnen der Datei ist nicht enthalten. Separate Metadatenzugriffe des Host-Dateisystems werden hier nicht gezählt.": "Read times cover the direct backend call including buffer preparation. File opening is excluded. Separate host filesystem metadata accesses are not counted here.",
   "Welche Lesewege reichen Anfragen an das Betriebssystem weiter?": "Which read paths pass requests to the operating system?",
   "Welche Phase bestimmt die Dauer des letzten Checkpoints?": "Which phase determines the duration of the last checkpoint?",
   "Was prüfen und bereinigen die Hintergrundprozesse?": "What are background processes checking and cleaning up?",

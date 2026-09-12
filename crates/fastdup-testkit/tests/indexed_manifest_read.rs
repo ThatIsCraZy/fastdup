@@ -70,6 +70,7 @@ fn manifest_data_extent_uses_the_active_index_and_bounded_container_reader() {
     assert_eq!(bytes, payload);
     let operations = &storage.operations()[baseline..];
     assert!(!operations.contains(&StorageOperation::Read));
+    assert!(operations.contains(&StorageOperation::ReadExactAt));
     assert!(!operations.contains(&StorageOperation::ListNames));
 }
 
@@ -122,6 +123,7 @@ fn indexed_graph_verification_is_bounded_and_corruption_falls_back_to_one_comple
         .expect("bounded index and Container verification prove the graph");
     let healthy_operations = &storage.operations()[healthy_baseline..];
     assert!(!healthy_operations.contains(&StorageOperation::Read));
+    assert!(healthy_operations.contains(&StorageOperation::ReadExactAt));
     assert!(!healthy_operations.contains(&StorageOperation::ListNames));
 
     let run_name = format!("{}.{:016x}.fdx", "b4".repeat(32), 1);
@@ -133,7 +135,7 @@ fn indexed_graph_verification_is_bounded_and_corruption_falls_back_to_one_comple
         .verify_required_chunks(&required)
         .expect("the verified Container scan remains correctness authority");
     let corrupt_operations = &storage.operations()[corrupt_baseline..];
-    assert!(corrupt_operations.contains(&StorageOperation::Read));
+    assert!(corrupt_operations.contains(&StorageOperation::ReadExactAt));
     assert!(corrupt_operations.contains(&StorageOperation::ListNames));
 }
 use std::collections::BTreeMap;

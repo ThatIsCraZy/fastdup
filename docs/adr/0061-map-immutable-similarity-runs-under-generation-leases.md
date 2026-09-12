@@ -4,6 +4,12 @@ status: accepted
 
 # Map immutable Similarity Runs under generation leases
 
+Amended by [ADR 0046](0046-bound-verified-read-cache-by-live-memory-headroom.md)
+on 12 September 2026: all reusable read content shares one application cache;
+repository I/O and FUSE file data use direct paths. File-backed mappings and
+separate replacement policies described below are superseded. Immutable leases,
+verification and publication ordering remain required.
+
 Filesystem-backed Similarity recovery uses a read-only memory map for every
 physical Run in the selected generation. Recovery first verifies the
 descriptor-authenticated file length and then performs the complete format-v2
