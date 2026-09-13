@@ -51,21 +51,26 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
             if co_verified.remove(chunk_id) {
                 continue;
             }
+            let lookup = u32::try_from(*logical_length).ok().and_then(|length| {
+                self.index
+                    .lookup_transitions(*chunk_id, length)
+                    .ok()
+                    .map(|lookup| (length, lookup))
+            });
+            let Some((index_length, lookup)) = lookup else {
+                missing.insert(*chunk_id, *logical_length);
+                continue;
+            };
             if let Some(cache) = &self.read_cache
-                && ContainerRepository::<C>::cached_verified_location(
-                    &self.index,
-                    *chunk_id,
-                    *logical_length,
-                    cache,
-                )
-                .is_some()
+                && ContainerRepository::<C>::cached_candidate(&lookup, cache).is_some()
             {
                 continue;
             }
-            let verified = self.containers.find_verified_candidate_payload_with_intent(
+            let verified = self.containers.read_verified_candidate_from_lookup(
                 &self.index,
+                &lookup,
                 *chunk_id,
-                *logical_length,
+                index_length,
                 self.read_cache.as_deref(),
                 if self.read_cache.is_some() {
                     crate::ReadIntent::Scan

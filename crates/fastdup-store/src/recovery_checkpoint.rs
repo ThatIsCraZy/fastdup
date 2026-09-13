@@ -14,13 +14,13 @@ use fastdup_format::{
 use crate::generation::{
     GenerationError, GenerationRepository, RecoveredGeneration, RequiredChunkVerifier,
 };
+use crate::immutable_write::ImmutableWriteBuffer;
 use crate::manifest_tree::{ManifestTreeError, scan_manifest_tree};
 use crate::{MAX_STORAGE_RANGE_BYTES, StorageIo, StoreError};
 
 const CHECKPOINT_PREFIX: &str = "recovery-checkpoint.";
 const CHECKPOINT_SUFFIX: &str = ".fdrc";
 const HEAD_NAMES: [&str; 2] = ["recovery-checkpoint.0.head", "recovery-checkpoint.1.head"];
-const WRITE_BLOCK_BYTES: usize = 4_096;
 
 #[derive(Clone, Debug)]
 pub struct RecoveryCheckpointRepository<I> {
@@ -243,8 +243,13 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         let encoded_record = record.encode();
         let commit_offset = u64::try_from(RECOVERY_CHECKPOINT_HEADER_BYTES)
             .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
-        self.storage
-            .write_at(&temporary_name, commit_offset, &encoded_record)?;
+        let mut output = ImmutableWriteBuffer::new()?;
+        output.append(
+            &self.storage,
+            &temporary_name,
+            &[0; RECOVERY_CHECKPOINT_HEADER_BYTES],
+        )?;
+        output.append(&self.storage, &temporary_name, &encoded_record)?;
         let mut body_hasher = blake3::Hasher::new();
         body_hasher.update(&encoded_record);
         let mut cursor = commit_offset
@@ -265,16 +270,9 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
                 crc32c::crc32c(&encoded),
             )?;
             let encoded_header = header.encode();
-            self.storage
-                .write_at(&temporary_name, cursor, &encoded_header)?;
+            output.append(&self.storage, &temporary_name, &encoded_header)?;
             body_hasher.update(&encoded_header);
-            let payload_offset = cursor
-                .checked_add(
-                    u64::try_from(encoded_header.len())
-                        .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-                )
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-            write_blocks(&self.storage, &temporary_name, payload_offset, &encoded)?;
+            output.append(&self.storage, &temporary_name, &encoded)?;
             body_hasher.update(&encoded);
             let padded_length = header.padded_length()?;
             let unpadded_length = u64::try_from(encoded_header.len())
@@ -289,13 +287,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
             if padding_length != 0 {
                 let padding = [0_u8; 63];
                 let padding = &padding[..padding_length];
-                self.storage.write_at(
-                    &temporary_name,
-                    cursor
-                        .checked_add(unpadded_length)
-                        .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?,
-                    padding,
-                )?;
+                output.append(&self.storage, &temporary_name, padding)?;
                 body_hasher.update(padding);
             }
             cursor = cursor
@@ -321,10 +313,12 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
             file_length,
             *body_hasher.finalize().as_bytes(),
         )?;
+        output.append(&self.storage, &temporary_name, &descriptor.encode_footer())?;
+        output.finish(&self.storage, &temporary_name)?;
+        // The body hash is now known. Patch only the fixed header; all entry
+        // fields were batched across boundaries without partial-page appends.
         self.storage
             .write_at(&temporary_name, 0, &descriptor.encode_header())?;
-        self.storage
-            .write_at(&temporary_name, cursor, &descriptor.encode_footer())?;
         self.storage.set_len(&temporary_name, file_length)?;
         let audited = self.audit_named(&temporary_name)?;
         if audited.record != record || !audited.objects.keys().eq(object_ids.iter()) {
@@ -1026,30 +1020,6 @@ fn checkpoint_name(generation: u64) -> String {
     format!("{CHECKPOINT_PREFIX}{generation:016x}{CHECKPOINT_SUFFIX}")
 }
 
-fn write_blocks<I: StorageIo>(
-    storage: &I,
-    name: &str,
-    offset: u64,
-    bytes: &[u8],
-) -> Result<(), RecoveryCheckpointError> {
-    for (ordinal, block) in bytes.chunks(WRITE_BLOCK_BYTES).enumerate() {
-        let block_offset = u64::try_from(
-            ordinal
-                .checked_mul(WRITE_BLOCK_BYTES)
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?,
-        )
-        .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
-        storage.write_at(
-            name,
-            offset
-                .checked_add(block_offset)
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?,
-            block,
-        )?;
-    }
-    Ok(())
-}
-
 fn read_bounded<I: StorageIo>(
     storage: &I,
     name: &str,
@@ -1081,5 +1051,72 @@ fn map_checkpoint_manifest_error(error: RecoveryCheckpointError) -> ManifestTree
     match error {
         RecoveryCheckpointError::Io(error) => ManifestTreeError::Io(error),
         _ => ManifestTreeError::InvalidTree,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastdup_format::{DurableInode, ManifestLeaf, NamespaceEntry, PolicySetId};
+
+    #[test]
+    fn checkpoint_copy_batches_entries_without_per_page_read_modify_write() {
+        let root = std::env::temp_dir().join(format!("checkpoint-batch-{}", std::process::id()));
+        let metadata = crate::FsStorageIo::open(root.join("metadata")).unwrap();
+        let data = crate::FsStorageIo::open(root.join("data")).unwrap();
+        let source = GenerationRepository::new(metadata, PolicySetId::new([1; 32]).unwrap());
+        source
+            .commit_namespace(&NamespaceRoot::new(1024, 2, 0, vec![], vec![]).unwrap())
+            .unwrap();
+        let length = (0..32_000_u64).map(|i| 4096 + i).sum();
+        let manifest = ManifestLeaf::new(
+            length,
+            (0..32_000_u64)
+                .map(|i| ManifestExtent::Fill {
+                    logical_length: 4096 + i,
+                    value: (i % 2) as u8,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let id = source.publish_manifest(&manifest).unwrap();
+        let namespace = NamespaceRoot::new(
+            1024,
+            3,
+            1,
+            vec![DurableInode::new(2, 0o640, 1000, 1000, 1, 1, length, id).unwrap()],
+            vec![NamespaceEntry::new(1, 2, b"backup".to_vec()).unwrap()],
+        )
+        .unwrap();
+        let committed = source.commit_namespace(&namespace).unwrap();
+        let checkpoints = RecoveryCheckpointRepository::new(data);
+        let before = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get);
+        let edges_before = crate::direct_io::WRITE_EDGE_READS.with(std::cell::Cell::get);
+        let summary = checkpoints.publish_committed(&source).unwrap().unwrap();
+        let writes = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get) - before;
+        let edge_reads =
+            crate::direct_io::WRITE_EDGE_READS.with(std::cell::Cell::get) - edges_before;
+        eprintln!(
+            "checkpoint bytes={}, writes={writes}, write-edge reads={edge_reads}",
+            summary.file_length()
+        );
+        assert_eq!(
+            edge_reads, 0,
+            "the aligned checkpoint stream must not read sectors to preserve write edges"
+        );
+        assert!(
+            writes <= 24,
+            "checkpoint body must batch across object boundaries: {writes} physical writes"
+        );
+        assert!(summary.file_length() > 1024 * 1024);
+        let audited = checkpoints
+            .audit_named(&checkpoint_name(committed.generation()))
+            .unwrap();
+        assert_eq!(audited.record, committed);
+        assert_eq!(
+            audited.objects.len() as u64,
+            summary.metadata_object_count()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

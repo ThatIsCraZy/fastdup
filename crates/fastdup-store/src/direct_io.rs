@@ -14,6 +14,7 @@ const MAGIC: &[u8; 8] = b"FDIO0001";
 #[cfg(test)]
 thread_local! {
     pub(crate) static READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static WRITE_EDGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -436,6 +437,8 @@ fn write_physical(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
         if skip != 0 && start < original_length {
             let present = usize::try_from((original_length - start).min(alignment.offset as u64))
                 .map_err(|_| io::ErrorKind::InvalidInput)?;
+            #[cfg(test)]
+            WRITE_EDGE_READS.with(|total| total.set(total.get() + 1));
             read_aligned(
                 file,
                 &mut buffer.bytes_mut()[..alignment.offset],
@@ -452,6 +455,8 @@ fn write_physical(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
             let present =
                 usize::try_from((original_length - tail_start).min(alignment.offset as u64))
                     .map_err(|_| io::ErrorKind::InvalidInput)?;
+            #[cfg(test)]
+            WRITE_EDGE_READS.with(|total| total.set(total.get() + 1));
             read_aligned(
                 file,
                 &mut buffer.bytes_mut()[size - alignment.offset..],

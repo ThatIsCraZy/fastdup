@@ -459,6 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_storage.clone(),
         Arc::clone(&namespace),
         (metadata_pool.clone(), scrub_binding),
+        appliance.verified_read_cache(),
     )?;
     let gc_runtime = start_online_gc_runtime(
         recovered.online_maintenance,

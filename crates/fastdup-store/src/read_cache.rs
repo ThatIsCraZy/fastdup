@@ -709,18 +709,12 @@ impl VerifiedReadCache {
 
     /// Small physical-source evidence in the same owner as the DATA view.
     /// Returning a proof never returns bytes or selects a live generation.
-    pub(crate) fn verified_location(
-        &self,
-        chunk_id: ChunkId,
-        logical_length: u64,
-    ) -> Option<fastdup_format::ExactIndexEntry> {
-        self.location_proofs
-            .as_ref()?
-            .get::<fastdup_format::ExactIndexEntry>(crate::ReadCacheKey {
-                identity: chunk_id.bytes(),
-                ordinal: logical_length,
-            })
-            .map(|entry| *entry)
+    pub(crate) fn has_verified_location(&self, candidate: fastdup_format::ExactIndexEntry) -> bool {
+        self.location_proofs.as_ref().is_some_and(|cache| {
+            cache
+                .get::<fastdup_format::ExactIndexEntry>(location_proof_key(candidate))
+                .is_some_and(|entry| *entry == candidate)
+        })
     }
 
     // Call only after this exact candidate's complete stored Record, logical
@@ -728,10 +722,7 @@ impl VerifiedReadCache {
     pub(crate) fn admit_verified_location(&self, entry: fastdup_format::ExactIndexEntry) {
         if let Some(cache) = &self.location_proofs {
             cache.insert(
-                crate::ReadCacheKey {
-                    identity: entry.chunk_id().bytes(),
-                    ordinal: u64::from(entry.logical_length()),
-                },
+                location_proof_key(entry),
                 Arc::new(entry),
                 size_of::<fastdup_format::ExactIndexEntry>() as u64,
                 u64::from(entry.location().record_length()),
@@ -1151,6 +1142,33 @@ impl VerifiedReadCache {
                 total.add_assign(state.counters);
                 total
             })
+    }
+}
+
+// A logical Chunk can have several independently checked physical copies.
+// Keep them as distinct residents in the common directory, including while
+// predecessor and successor Exact generations are both pinned. Compare the
+// complete entry on every hit as well; the digest is only a directory key.
+fn location_proof_key(entry: fastdup_format::ExactIndexEntry) -> crate::ReadCacheKey {
+    let location = entry.location();
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"fastdup/verified-location/v1");
+    hash.update(&entry.chunk_id().bytes());
+    hash.update(&entry.logical_length().to_le_bytes());
+    hash.update(&location.container_id().bytes());
+    hash.update(&location.container_generation().to_le_bytes());
+    hash.update(&location.record_offset().to_le_bytes());
+    hash.update(&location.record_length().to_le_bytes());
+    hash.update(&location.chunk_ordinal().to_le_bytes());
+    hash.update(&location.decoded_offset().to_le_bytes());
+    hash.update(&location.record_crc32c().to_le_bytes());
+    hash.update(&location.record_decoded_length().to_le_bytes());
+    hash.update(&location.record_payload_length().to_le_bytes());
+    hash.update(&location.codec_id().to_le_bytes());
+    hash.update(&location.dependency_id());
+    crate::ReadCacheKey {
+        identity: *hash.finalize().as_bytes(),
+        ordinal: 0,
     }
 }
 

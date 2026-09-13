@@ -92,6 +92,22 @@ impl<I: StorageIo> ContainerRepository<I> {
         id: ContainerId,
         index: Option<&crate::ActivatedExactIndex<X>>,
     ) -> Result<ContainerStructure, StoreError> {
+        self.scrub_structure_with_evidence(id, index)
+            .map(|(structure, _)| structure)
+    }
+
+    pub(crate) fn scrub_structure_with_evidence<X: StorageIo>(
+        &self,
+        id: ContainerId,
+        index: Option<&crate::ActivatedExactIndex<X>>,
+    ) -> Result<
+        (
+            ContainerStructure,
+            fastdup_format::VerifiedContainerPublication,
+        ),
+        StoreError,
+    > {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let bytes = self.storage.read(&crate::published_name(id))?;
         let mut fallback = crate::ContainerBaseResolver::new(self);
         let mut resolver_error = None;
@@ -117,7 +133,8 @@ impl<I: StorageIo> ContainerRepository<I> {
         if let Some(error) = resolver_error {
             return Err(error);
         }
-        if verified?.header().container_id() != id {
+        let verified = verified?;
+        if verified.header().container_id() != id {
             return Err(StoreError::PublishVerificationMismatch);
         }
         {
@@ -141,7 +158,7 @@ impl<I: StorageIo> ContainerRepository<I> {
                         .ok_or(fastdup_format::FormatError::InvalidContainerLayout)
                 },
             )?;
-            Ok(structure)
+            Ok((structure, verified))
         }
     }
 

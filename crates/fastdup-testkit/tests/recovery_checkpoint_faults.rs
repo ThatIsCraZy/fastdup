@@ -366,6 +366,79 @@ fn torn_inactive_head_is_repaired_by_the_next_checkpoint_publication() {
 }
 
 #[test]
+fn multi_batch_checkpoint_write_faults_never_select_a_partial_image() {
+    let source = GenerationRepository::new(MemoryStorageIo::new(), policy());
+    source.commit_namespace(&reservation_root()).unwrap();
+    let length = (0..32_000_u64).map(|i| 4096 + i).sum();
+    let manifest = ManifestLeaf::new(
+        length,
+        (0..32_000_u64)
+            .map(|i| ManifestExtent::Fill {
+                logical_length: 4096 + i,
+                value: (i % 2) as u8,
+            })
+            .collect(),
+    )
+    .unwrap();
+    let id = source.publish_manifest(&manifest).unwrap();
+    let namespace = visible_root_at(id, length, 1);
+    let committed = source.commit_namespace(&namespace).unwrap();
+    let probe = MemoryStorageIo::new();
+    let summary = RecoveryCheckpointRepository::new(probe.clone())
+        .publish_committed(&source)
+        .unwrap()
+        .unwrap();
+    assert!(summary.file_length() > 2 * 1024 * 1024);
+    let writes: Vec<_> = probe
+        .operations()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| (*op == StorageOperation::WriteAt).then_some(i))
+        .collect();
+    assert_eq!(
+        writes.len(),
+        5,
+        "three body batches, header patch, selector head"
+    );
+    for position in writes {
+        for after in [false, true] {
+            let storage = if after {
+                MemoryStorageIo::with_fail_after(position)
+            } else {
+                MemoryStorageIo::with_fail_before(position)
+            };
+            let checkpoints = RecoveryCheckpointRepository::new(storage.clone());
+            assert!(checkpoints.publish_committed(&source).is_err());
+            storage.crash();
+            let replacement = GenerationRepository::new(MemoryStorageIo::new(), policy());
+            assert!(
+                checkpoints
+                    .recover_latest(&replacement, &AcceptAllRequiredChunks)
+                    .unwrap()
+                    .is_none()
+            );
+            // Retry also exercises an orphan whose first full batch may have
+            // reached storage before a later batch or header patch failed.
+            assert_eq!(
+                checkpoints
+                    .publish_committed(&source)
+                    .unwrap()
+                    .unwrap()
+                    .generation(),
+                committed.generation()
+            );
+            storage.crash();
+            let recovered = checkpoints
+                .recover_latest(&replacement, &AcceptAllRequiredChunks)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.record(), committed);
+            assert_eq!(recovered.namespace_root(), &namespace);
+        }
+    }
+}
+
+#[test]
 fn every_checkpoint_publication_fault_recovers_only_absence_or_the_complete_checkpoint() {
     for committed_only in [false, true] {
         checkpoint_publication_faults(committed_only);

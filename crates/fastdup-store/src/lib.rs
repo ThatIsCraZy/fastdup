@@ -20,6 +20,7 @@ mod gc_candidate_catalog;
 mod gc_candidate_read;
 mod generation;
 mod generation_log;
+mod immutable_write;
 mod manifest_cache;
 mod manifest_reader;
 mod manifest_tree;
@@ -2522,9 +2523,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         if candidate.transition() != ExactLocationTransition::Active {
             return Err(StoreError::ExactLocationMismatch);
         }
-        if cache.verified_location(candidate.chunk_id(), u64::from(candidate.logical_length()))
-            == Some(candidate)
-        {
+        if cache.has_verified_location(candidate) {
             return Ok(());
         }
         if cache
@@ -2786,14 +2785,20 @@ impl<I: StorageIo> ContainerRepository<I> {
         logical_length: u64,
         cache: &VerifiedReadCache,
     ) -> Result<Option<ExactIndexEntry>, StoreError> {
-        if let Some(known) = Self::cached_verified_location(index, chunk_id, logical_length, cache)
-        {
+        let Ok(index_length) = u32::try_from(logical_length) else {
+            return Ok(None);
+        };
+        let Ok(lookup) = index.lookup_transitions(chunk_id, index_length) else {
+            return Ok(None);
+        };
+        if let Some(known) = Self::cached_candidate(&lookup, cache) {
             return Ok(Some(known));
         }
-        let verified = self.find_verified_candidate_payload_with_intent(
+        let verified = self.read_verified_candidate_from_lookup(
             index,
+            &lookup,
             chunk_id,
-            logical_length,
+            index_length,
             Some(cache),
             ReadIntent::Scan,
         );
@@ -2808,24 +2813,24 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(Some(entry))
     }
 
-    fn cached_verified_location<J: StorageIo>(
-        index: &ActivatedExactIndex<J>,
-        chunk_id: fastdup_format::ChunkId,
-        logical_length: u64,
+    fn cached_candidate(
+        lookup: &ExactIndexLookup,
         cache: &VerifiedReadCache,
     ) -> Option<ExactIndexEntry> {
         // Only the newest transition of this physical Location may authorize
         // reuse. Prefer eligible warm evidence before trying cold alternatives.
-        let known = cache.verified_location(chunk_id, logical_length)?;
-        let lookup = index
-            .lookup_transitions(chunk_id, logical_length.try_into().ok()?)
-            .ok()?;
-        (lookup
-            .candidates()
+        let candidates = lookup.candidates();
+        candidates
             .iter()
-            .find(|candidate| candidate.location() == known.location())
-            == Some(&known))
-        .then_some(known)
+            .enumerate()
+            .find_map(|(ordinal, candidate)| {
+                (candidate.transition() == ExactLocationTransition::Active
+                    && !candidates[..ordinal]
+                        .iter()
+                        .any(|newer| newer.location() == candidate.location())
+                    && cache.has_verified_location(*candidate))
+                .then_some(*candidate)
+            })
     }
 
     fn find_verified_candidate_with_index<J: StorageIo>(
@@ -2882,6 +2887,25 @@ impl<I: StorageIo> ContainerRepository<I> {
         let Ok(lookup) = index.lookup_transitions(chunk_id, index_length) else {
             return None;
         };
+        self.read_verified_candidate_from_lookup(
+            index,
+            &lookup,
+            chunk_id,
+            index_length,
+            cache,
+            payload_intent,
+        )
+    }
+
+    fn read_verified_candidate_from_lookup<J: StorageIo>(
+        &self,
+        index: &ActivatedExactIndex<J>,
+        lookup: &ExactIndexLookup,
+        chunk_id: fastdup_format::ChunkId,
+        index_length: u32,
+        cache: Option<&VerifiedReadCache>,
+        payload_intent: ReadIntent,
+    ) -> Option<(ExactIndexEntry, VerifiedChunkRead)> {
         let mut seen_locations: [Option<ExactIndexLocation>; MAX_EXACT_LOOKUP_CANDIDATES] =
             [None; MAX_EXACT_LOOKUP_CANDIDATES];
         let mut seen_count = 0_usize;
@@ -2915,7 +2939,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             }
             attempted += 1;
             if let Some(payload) = cache
-                .and_then(|cache| cache.get(chunk_id, logical_length))
+                .and_then(|cache| cache.get(chunk_id, u64::from(index_length)))
                 .filter(|payload| payload.matches_independent_candidate(candidate))
             {
                 return Some((candidate, VerifiedChunkRead::single(payload, Vec::new())));

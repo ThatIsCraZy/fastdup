@@ -41,6 +41,15 @@ from the same verified image, without extra DATA I/O. The journal is larger than
 a boolean-per-Container table because a new mount may select a newer Namespace
 graph; old verified counts alone cannot discharge its DATA requirements.
 
+Fresh complete checks also hand their typed physical Location evidence to the
+existing online unified cache after Independent verification has ended (ADR
+0046). This evidence comes directly from the full verifier in the current
+process, is evictable, and does not retain Container payloads. Journal recording
+does not create it: resumed entries, failed checks and envelope reconciliation
+never seed that cache. Later scrubs still bypass all cached evidence. Thus the
+handoff avoids a second ingest verification of freshly scrubbed Locations
+without changing the journal's historical meaning or the GC gate.
+
 The next worker inventories current Containers after mounting. A saved entry
 can skip payload work only after two uncached, random-advice Header/Footer reads
 validate the current ID, generation, length, structure fingerprint and Chunk

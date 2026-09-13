@@ -11,6 +11,7 @@ use fastdup_format::{
 };
 
 use crate::StorageIo;
+use crate::immutable_write::ImmutableWriteBuffer;
 use crate::similarity_index_repository::{
     SIMILARITY_FINGERPRINT_PROFILE_V1, SIMILARITY_REPRESENTATIVE_PROFILE_V1,
     SimilarityIndexStoreError,
@@ -423,32 +424,34 @@ pub(crate) fn stream_partition_vectors<I: StorageIo>(
     let page_bytes = u64::try_from(SIMILARITY_INDEX_PAGE_BYTES)
         .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?;
     let mut offset = 0_u64;
-    storage.write_at(output_name, offset, encoder.header())?;
+    let mut output = ImmutableWriteBuffer::new()?;
+    output.append(storage, output_name, encoder.header())?;
     offset = offset
         .checked_add(page_bytes)
         .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
     for page_entries in entries.chunks(SIMILARITY_INDEX_ENTRIES_PER_PAGE) {
         let page = encoder.encode_next_entry_page(page_entries)?;
-        storage.write_at(output_name, offset, &page)?;
+        output.append(storage, output_name, &page)?;
         offset = offset
             .checked_add(page_bytes)
             .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
     }
     for page_references in references.chunks(SIMILARITY_BUCKET_REFERENCES_PER_PAGE) {
         let page = encoder.encode_next_bucket_page(page_references)?;
-        storage.write_at(output_name, offset, &page)?;
+        output.append(storage, output_name, &page)?;
         offset = offset
             .checked_add(page_bytes)
             .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
     }
     let (footer, descriptor) = encoder.finish()?;
-    storage.write_at(output_name, offset, &footer)?;
+    output.append(storage, output_name, &footer)?;
     offset = offset
         .checked_add(page_bytes)
         .ok_or(SimilarityIndexStoreError::CounterOverflow)?;
     if offset != descriptor.file_length() {
         return Err(SimilarityIndexStoreError::IdentityMismatch);
     }
+    output.finish(storage, output_name)?;
     storage.set_len(output_name, offset)?;
     Ok(descriptor)
 }
@@ -1088,6 +1091,52 @@ mod tests {
 
     use super::*;
     use crate::FsStorageIo;
+
+    #[test]
+    fn similarity_partition_batches_physical_writes() {
+        let root = std::env::temp_dir().join(format!("similarity-batch-{}", std::process::id()));
+        let storage = FsStorageIo::open(&root).unwrap();
+        let entries = (0..8000_u64)
+            .map(|i| {
+                SimilarityIndexEntry::new(
+                    ChunkId::of(&i.to_le_bytes()),
+                    65_536,
+                    SIMILARITY_FINGERPRINT_PROFILE_V1,
+                    [i; 4],
+                    [i; 8],
+                )
+                .unwrap()
+            })
+            .collect();
+        let run = fastdup_format::SimilarityIndexRun::new(
+            SIMILARITY_FINGERPRINT_PROFILE_V1,
+            SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+            1,
+            entries,
+        )
+        .unwrap();
+        let before = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get);
+        let descriptor = stream_partition_vectors(
+            &storage,
+            "partition",
+            run.stream_layout(),
+            run.entries(),
+            run.bucket_references(),
+        )
+        .unwrap();
+        let writes = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get) - before;
+        eprintln!(
+            "similarity bytes={}, writes={writes}",
+            descriptor.file_length()
+        );
+        assert_eq!(
+            writes,
+            2 + 2 * (descriptor.file_length() as usize).div_ceil(1024 * 1024)
+        );
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        assert_eq!(storage.read("partition").unwrap(), run.encode().unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn duplicate_chunk_ids_are_compacted_before_partition_streaming() {

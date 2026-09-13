@@ -80,6 +80,7 @@ pub fn start(
     frontend: TelemetryStorageIo,
     namespace: Arc<Namespace>,
     progress_storage: (FsStorageIo, [u8; 32]),
+    read_cache: Arc<fastdup_store::VerifiedReadCache>,
 ) -> io::Result<ScrubHandle> {
     let control = Arc::new(Control::new(frontend));
     control.report("running", None);
@@ -94,17 +95,13 @@ pub fn start(
             let result = (|| {
                 fastdup_store::set_background_io_priority().map_err(io::Error::other)?;
                 rustix::process::nice(10).map_err(io::Error::from)?;
-                journal = match ScrubProgress::open(
+                journal = ScrubProgress::open(
                     progress_storage.0,
                     progress_storage.1,
                     unix_seconds(),
-                ) {
-                    Ok(progress) => Some(progress),
-                    Err(error) => {
-                        progress_warning(&error);
-                        None
-                    }
-                };
+                )
+                .inspect_err(progress_warning)
+                .ok();
                 let mut coverage = ScrubCoverage::new(required);
                 let mut last_sync = Instant::now();
                 let mut unsynced = 0;
@@ -154,6 +151,7 @@ pub fn start(
                             &mut coverage,
                             &mut journal,
                             resumed_bytes,
+                            &read_cache,
                         )?;
                         unsynced += usize::from(!resumed);
                         if unsynced >= 64 || last_sync.elapsed() >= Duration::from_secs(5) {
@@ -236,13 +234,14 @@ fn verify_next(
     coverage: &mut ScrubCoverage,
     journal: &mut Option<ScrubProgress<FsStorageIo>>,
     resumed_bytes: Option<u64>,
+    read_cache: &fastdup_store::VerifiedReadCache,
 ) -> io::Result<(u64, bool)> {
     let resumed = resumed_bytes.is_some();
     let bytes = if let Some(bytes) = resumed_bytes {
         bytes
     } else {
         let entry = repository
-            .scrub_for_progress(id, index, coverage, unix_seconds())
+            .scrub_for_progress_with_cache(id, index, coverage, unix_seconds(), read_cache)
             .map_err(io::Error::other)?;
         if let Some(progress) = journal
             && let Err(error) = progress.record(&entry)
@@ -763,7 +762,15 @@ mod resume_tests {
         let frontend = super::super::open_data_storage(&root.join("data"), false).unwrap();
         let launch = || {
             let (_, required) = generation.recover_committed_for_mount(&repository).unwrap();
-            start(
+            let snapshot = fastdup_store::MemoryPressureSnapshot::new(1 << 30, 1 << 29, 0);
+            let cache = Arc::new(
+                fastdup_store::VerifiedReadCache::new_with_snapshot(
+                    fastdup_store::VerifiedReadCacheConfig::conservative(snapshot),
+                    snapshot,
+                )
+                .unwrap(),
+            );
+            let worker = start(
                 required,
                 repository.clone(),
                 ExactIndexRunRepository::new(metadata.clone()),
@@ -772,10 +779,12 @@ mod resume_tests {
                     fastdup_posix::NamespaceConfig::default(),
                 )),
                 (metadata.clone(), [19; 32]),
+                Arc::clone(&cache),
             )
-            .unwrap()
+            .unwrap();
+            (worker, cache)
         };
-        let first = launch();
+        let (first, first_cache) = launch();
         let first_gate = first.gate.clone();
         tokio::time::timeout(Duration::from_secs(10), async {
             while first_gate.0.progress.lock().unwrap().verified == 0 {
@@ -788,7 +797,8 @@ mod resume_tests {
         let saved = first_gate.0.progress.lock().unwrap().verified;
         assert!((1..3).contains(&saved));
         assert!(!first_gate.permits_gc());
-        let second = launch();
+        assert!(first_cache.status().location_proofs().entries > 0);
+        let (second, second_cache) = launch();
         let second_gate = second.gate.clone();
         tokio::time::timeout(Duration::from_secs(10), async {
             while !second_gate.permits_gc() {
@@ -800,7 +810,8 @@ mod resume_tests {
         second.stop().await.unwrap();
         assert_eq!(second_gate.0.progress.lock().unwrap().resumed, saved);
         assert_eq!(second_gate.0.progress.lock().unwrap().verified, 3);
-        let third = launch();
+        assert!(second_cache.status().location_proofs().entries > 0);
+        let (third, third_cache) = launch();
         let third_gate = third.gate.clone();
         tokio::time::timeout(Duration::from_secs(10), async {
             while !third_gate.permits_gc() {
@@ -811,6 +822,11 @@ mod resume_tests {
         .unwrap();
         third.stop().await.unwrap();
         assert_eq!(third_gate.0.progress.lock().unwrap().resumed, 3);
+        assert_eq!(
+            third_cache.status().location_proofs().entries,
+            0,
+            "historical certificates never seed current Location evidence"
+        );
         assert_eq!(third_gate.0.read_bytes.load(Ordering::Relaxed), 3 * 8192);
         assert!(
             third_gate.0.read_bytes.load(Ordering::Relaxed)

@@ -2,7 +2,7 @@
 use super::metadata_gc::mark_metadata_gc_unclassified;
 use super::{
     GenerationError, GenerationRepository, MAX_METADATA_OBJECT_BYTES_U64, METADATA_SUFFIX,
-    StagedMetadata, WRITE_BLOCK_BYTES,
+    StagedMetadata,
 };
 use crate::StorageIo;
 use crate::manifest_tree::ManifestTreeError;
@@ -41,16 +41,7 @@ impl<I: StorageIo> GenerationRepository<I> {
 
         let temporary_name = format!(".{}.building", encode_object_id(object_id));
         self.storage.create_new(&temporary_name)?;
-        for (ordinal, block) in encoded.chunks(WRITE_BLOCK_BYTES).enumerate() {
-            let offset = ordinal
-                .checked_mul(WRITE_BLOCK_BYTES)
-                .ok_or(GenerationError::MetadataTooLarge)?;
-            self.storage.write_at(
-                &temporary_name,
-                u64::try_from(offset).map_err(|_| GenerationError::MetadataTooLarge)?,
-                block,
-            )?;
-        }
+        crate::immutable_write::write_image(&self.storage, &temporary_name, encoded)?;
         self.storage.set_len(
             &temporary_name,
             u64::try_from(encoded.len()).map_err(|_| GenerationError::MetadataTooLarge)?,

@@ -1,3 +1,4 @@
+use crate::immutable_write::{ImmutableWriteBuffer, write_image};
 use crate::page_cache::ACCOUNTED_PAGE_BYTES;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
@@ -604,11 +605,6 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 EXACT_INDEX_PAGE_BYTES,
                 "ASSERT: Exact Index Run v1 always consists of complete 4-KiB pages"
             );
-            let offset = page_ordinal
-                .checked_mul(EXACT_INDEX_PAGE_BYTES)
-                .and_then(|value| u64::try_from(value).ok())
-                .expect("ASSERT: a bounded Exact Index run offset fits u64");
-            self.storage.write_at(&temporary_name, offset, page)?;
             if page_ordinal > 0
                 && page_ordinal <= expected.page_count()
                 && let Some(evidence) = &mut evidence
@@ -617,6 +613,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 evidence.observe(decoded.entries(), page)?;
             }
         }
+        write_image(&self.storage, &temporary_name, &encoded)?;
         self.storage.set_len(
             &temporary_name,
             u64::try_from(encoded.len())
@@ -1869,14 +1866,13 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        self.storage
-            .write_at(&temporary_name, 0, encoder.header())?;
+        let mut output = ImmutableWriteBuffer::new()?;
+        output.append(&self.storage, &temporary_name, encoder.header())?;
 
         let mut page_entries = Vec::new();
         page_entries
             .try_reserve_exact(31)
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
-        let mut page_ordinal = 0_usize;
         let observed_summary = self.merge_compaction_inputs(inputs, |entry| {
             page_entries.push(entry);
             if page_entries.len() == 31 {
@@ -1884,13 +1880,10 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                     &self.storage,
                     &temporary_name,
                     &mut encoder,
-                    page_ordinal,
+                    &mut output,
                     &page_entries,
                 )?;
                 page_entries.clear();
-                page_ordinal = page_ordinal
-                    .checked_add(1)
-                    .ok_or(ExactIndexStoreError::DependencyMismatch)?;
             }
             Ok(())
         })?;
@@ -1899,7 +1892,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 &self.storage,
                 &temporary_name,
                 &mut encoder,
-                page_ordinal,
+                &mut output,
                 &page_entries,
             )?;
         }
@@ -1907,10 +1900,8 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             return Err(ExactIndexStoreError::DependencyMismatch);
         }
         let (footer, expected) = encoder.finish()?;
-        let footer_offset = u64::try_from(expected.file_length() - EXACT_INDEX_PAGE_BYTES)
-            .map_err(|_| ExactIndexStoreError::DependencyMismatch)?;
-        self.storage
-            .write_at(&temporary_name, footer_offset, &footer)?;
+        output.append(&self.storage, &temporary_name, &footer)?;
+        output.finish(&self.storage, &temporary_name)?;
         self.storage.set_len(
             &temporary_name,
             u64::try_from(expected.file_length())
@@ -2089,13 +2080,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        for (ordinal, page) in encoded.chunks(EXACT_INDEX_PAGE_BYTES).enumerate() {
-            let offset = ordinal
-                .checked_mul(EXACT_INDEX_PAGE_BYTES)
-                .and_then(|value| u64::try_from(value).ok())
-                .expect("ASSERT: a Metadata-v1 object offset fits u64");
-            self.storage.write_at(&temporary_name, offset, page)?;
-        }
+        write_image(&self.storage, &temporary_name, encoded)?;
         self.storage.set_len(
             &temporary_name,
             u64::try_from(encoded.len()).expect("ASSERT: Metadata-v1 length fits u64"),
@@ -2506,7 +2491,7 @@ struct StreamedPartitionOutput {
     temporary_name: String,
     published_name: String,
     page_entries: Vec<ExactIndexEntry>,
-    page_ordinal: usize,
+    output: ImmutableWriteBuffer,
     evidence: Option<RunWriterEvidence>,
 }
 
@@ -2536,9 +2521,8 @@ impl StreamedPartitionOutput {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        repository
-            .storage
-            .write_at(&temporary_name, 0, encoder.header())?;
+        let mut output = ImmutableWriteBuffer::new()?;
+        output.append(&repository.storage, &temporary_name, encoder.header())?;
         let mut page_entries = Vec::new();
         page_entries
             .try_reserve_exact(31)
@@ -2548,7 +2532,7 @@ impl StreamedPartitionOutput {
             temporary_name,
             published_name,
             page_entries,
-            page_ordinal: 0,
+            output,
             evidence: owned_writer
                 .then(|| RunWriterEvidence::new(summary.entry_count, &repository.page_cache))
                 .transpose()?,
@@ -2566,17 +2550,13 @@ impl StreamedPartitionOutput {
                 storage,
                 &self.temporary_name,
                 &mut self.encoder,
-                self.page_ordinal,
+                &mut self.output,
                 &self.page_entries,
             )?;
             if let Some(evidence) = &mut self.evidence {
                 evidence.observe(&self.page_entries, &page)?;
             }
             self.page_entries.clear();
-            self.page_ordinal = self
-                .page_ordinal
-                .checked_add(1)
-                .ok_or(ExactIndexStoreError::DependencyMismatch)?;
         }
         Ok(())
     }
@@ -2590,7 +2570,7 @@ impl StreamedPartitionOutput {
                 &repository.storage,
                 &self.temporary_name,
                 &mut self.encoder,
-                self.page_ordinal,
+                &mut self.output,
                 &self.page_entries,
             )?;
             if let Some(evidence) = &mut self.evidence {
@@ -2598,11 +2578,10 @@ impl StreamedPartitionOutput {
             }
         }
         let (footer, expected) = self.encoder.finish()?;
-        let footer_offset = u64::try_from(expected.file_length() - EXACT_INDEX_PAGE_BYTES)
-            .map_err(|_| ExactIndexStoreError::DependencyMismatch)?;
-        repository
-            .storage
-            .write_at(&self.temporary_name, footer_offset, &footer)?;
+        self.output
+            .append(&repository.storage, &self.temporary_name, &footer)?;
+        self.output
+            .finish(&repository.storage, &self.temporary_name)?;
         repository.storage.set_len(
             &self.temporary_name,
             u64::try_from(expected.file_length())
@@ -3029,19 +3008,11 @@ fn write_streamed_page<I: StorageIo>(
     storage: &I,
     temporary_name: &str,
     encoder: &mut ExactIndexRunStreamEncoder,
-    page_ordinal: usize,
+    output: &mut ImmutableWriteBuffer,
     entries: &[ExactIndexEntry],
 ) -> Result<[u8; EXACT_INDEX_PAGE_BYTES], ExactIndexStoreError> {
     let page = encoder.encode_next_page(entries)?;
-    let offset = EXACT_INDEX_HEADER_BYTES
-        .checked_add(
-            page_ordinal
-                .checked_mul(EXACT_INDEX_PAGE_BYTES)
-                .ok_or(ExactIndexStoreError::DependencyMismatch)?,
-        )
-        .and_then(|value| u64::try_from(value).ok())
-        .ok_or(ExactIndexStoreError::DependencyMismatch)?;
-    storage.write_at(temporary_name, offset, &page)?;
+    output.append(storage, temporary_name, &page)?;
     Ok(page)
 }
 
@@ -3703,6 +3674,53 @@ mod tests {
             )
             .unwrap();
         repository
+    }
+
+    #[test]
+    fn immutable_index_publication_batches_physical_writes() {
+        for mode in ["run", "compaction", "family"] {
+            let repository = reuse_repository(&format!("write-batch-{mode}"));
+            let profile = ExactIndexProfileId::new([97; 32]).unwrap();
+            let entries: Vec<_> = (0..16_000).map(reuse_fixture).collect();
+            let expected = ExactIndexRun::new(profile, 3, entries.clone()).unwrap();
+            let mut inputs = Vec::new();
+            if mode != "run" {
+                for (i, part) in entries.chunks(8000).enumerate() {
+                    let run = ExactIndexRun::new(profile, i as u64 + 1, part.to_vec()).unwrap();
+                    let descriptor = repository.publish(&run).unwrap();
+                    inputs.push(ExactIndexRunRef::new(0, descriptor).unwrap());
+                }
+            }
+            let before = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get);
+            let descriptor = match mode {
+                "run" => repository.publish(&expected).unwrap(),
+                "compaction" => repository.compact(&inputs, 3).unwrap(),
+                _ => {
+                    repository.compact_family(&inputs, 1, 3).unwrap();
+                    repository.audit(profile, 3).unwrap()
+                }
+            };
+            let writes = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get) - before;
+            let batches = expected.encode().unwrap().len().div_ceil(1024 * 1024);
+            eprintln!(
+                "{mode}: bytes={}, physical writes={writes}",
+                descriptor.file_length()
+            );
+            assert_eq!(
+                writes,
+                2 + 2 * batches,
+                "{mode}: one body/head pair per MiB, plus initial heads"
+            );
+            assert_eq!(repository.audit(profile, 3).unwrap(), descriptor);
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+            assert_eq!(
+                repository
+                    .storage
+                    .read(&published_name(profile, 3))
+                    .unwrap(),
+                expected.encode().unwrap()
+            );
+        }
     }
 
     #[test]

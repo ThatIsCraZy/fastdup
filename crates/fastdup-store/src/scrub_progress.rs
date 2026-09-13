@@ -95,6 +95,36 @@ impl ScrubCoverage {
 }
 
 impl<I: StorageIo> ContainerRepository<I> {
+    /// Fully scrubs current bytes and offers the resulting physical evidence to
+    /// the common online cache. Historical resume entries cannot use this path.
+    ///
+    /// # Errors
+    /// Returns the same integrity and I/O failures as `scrub_for_progress`.
+    pub fn scrub_for_progress_with_cache<X: StorageIo>(
+        &self,
+        id: ContainerId,
+        index: Option<&crate::ActivatedExactIndex<X>>,
+        coverage: &mut ScrubCoverage,
+        checked_at: u64,
+        cache: &crate::VerifiedReadCache,
+    ) -> Result<ScrubCertificate, StoreError> {
+        let (structure, verified) = self.scrub_structure_with_evidence(id, index)?;
+        let entry = ScrubCertificate::new(&structure, checked_at);
+        if self.selectable_container(id) {
+            coverage.observe(&entry);
+            // The fresh-media scope has ended. Offer only compact evidence
+            // from this successful full verification, never a resumed journal
+            // certificate or payload bytes. The caller's intent and common
+            // pressure owner may still decline all admission.
+            for location in verified.locations() {
+                let checked = fastdup_format::ExactIndexEntry::from_verified(*location)
+                    .map_err(|_| StoreError::ExactLocationMismatch)?;
+                cache.admit_verified_location(checked);
+            }
+        }
+        Ok(entry)
+    }
+
     /// Fully checks bytes and dependencies before minting a progress entry.
     /// # Errors
     /// Returns full scrub integrity, dependency, or I/O failures.

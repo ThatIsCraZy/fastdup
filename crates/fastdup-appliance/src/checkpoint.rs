@@ -4618,7 +4618,10 @@ trait ManifestReaderPolicy<C>: fmt::Debug + Send + Sync {
     fn exact_index_degraded(&self) -> bool;
     fn exact_index_page_cache_status(&self) -> ExactIndexPageCacheStatus;
     fn exact_run_membership_status(&self) -> ExactRunMembershipStatus;
-    fn read_cache_status(&self) -> VerifiedReadCacheStatus;
+    fn read_cache(&self) -> &Arc<VerifiedReadCache>;
+    fn read_cache_status(&self) -> VerifiedReadCacheStatus {
+        self.read_cache().status()
+    }
     fn advanced_reduction_status(&self) -> PersistentReductionStatus;
     fn similarity_page_cache_status(&self) -> SimilarityIndexPageCacheStatus;
 }
@@ -4678,8 +4681,8 @@ impl<C: StorageIo + 'static> ManifestReaderPolicy<C> for ScanManifestReaders {
         ExactRunMembershipStatus::default()
     }
 
-    fn read_cache_status(&self) -> VerifiedReadCacheStatus {
-        self.read_cache.status()
+    fn read_cache(&self) -> &Arc<VerifiedReadCache> {
+        &self.read_cache
     }
 
     fn advanced_reduction_status(&self) -> PersistentReductionStatus {
@@ -5087,8 +5090,8 @@ where
             })
     }
 
-    fn read_cache_status(&self) -> VerifiedReadCacheStatus {
-        self.read_cache.status()
+    fn read_cache(&self) -> &Arc<VerifiedReadCache> {
+        &self.read_cache
     }
 
     fn advanced_reduction_status(&self) -> PersistentReductionStatus {
@@ -5587,6 +5590,13 @@ where
     #[must_use]
     pub fn verified_read_cache_status(&self) -> VerifiedReadCacheStatus {
         self.manifest_readers.read_cache_status()
+    }
+
+    /// Shares the existing online cache with background work, including fresh
+    /// scrub evidence. It does not create another cache owner or memory quota.
+    #[must_use]
+    pub fn verified_read_cache(&self) -> Arc<VerifiedReadCache> {
+        Arc::clone(self.manifest_readers.read_cache())
     }
 
     /// Returns process-local verified Container-envelope cache telemetry.

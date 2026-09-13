@@ -112,6 +112,28 @@ Evidence eviction causes ordinary revalidation. Explicit Independent scopes
 bypass every hit and admission. Logical bytes without matching physical-source
 evidence still cannot authorize a Location. Recovery, scrub and final deletion
 validation keep their fresh-media contracts.
+
+Location evidence is keyed by the complete logical identity and physical
+Location, with full entry comparison on a hit. Different verified copies of
+one Chunk coexist in the common directory and share its existing accounting
+and replacement policy. A logical-ID-only slot let an old resident block
+admission of its verified replacement indefinitely. Lookup now checks the newest
+transition for each candidate Location, prefers any eligible warm proof, and
+reuses the same bounded Exact lookup result for cold fallback. Retiring a
+Location never makes its cached proof selectable through a newer generation.
+
+A successful full online scrub can offer its compact Location evidence to this
+same cache after its Independent verification scope ends. The complete image,
+logical identities and dependent Bases must have verified before any such
+handoff; neither encoded nor decoded payloads are admitted by the scrub. Caller
+Scan/Independent intent and the common pressure owner can still decline the
+handoff. A subsequent scrub remains fully Independent even with warm evidence.
+Resumed historical certificates supply no current Location evidence. This
+avoids discarding fresh verification work only to repeat it during ingest,
+without promoting persisted progress into current payload truth. The paired
+tests and sampled live limits are recorded in
+[the Location reuse report](../testing/location-proof-reuse-2026-09-13.md).
+
 The payload-only Scan scope does not suppress ordinary admission of reusable
 Exact pages or compact descriptors. Pass-local sibling discharge remains
 available even when the caller's intent or memory pressure forbids admission.
@@ -212,11 +234,25 @@ The new envelope costs 8 KiB plus tail padding per generic repository file.
 Length-head synchronization can increase small-write latency. Direct I/O needs
 aligned bounce buffers; scans need explicit application policy instead of kernel
 readahead. These costs are accepted for one controlled file-content cache.
-Immutable Metadata publication batches its already checked encoded input in
-at most one-MiB writes. A four-KiB loop would advance and synchronize the storage
-length head for every page, doubling body/head write traffic and multiplying
-barriers. Batching changes neither encoded bytes nor the independent staging
-readback, file sync, no-replace rename and directory-before-WAL ordering.
+Immutable publication uses one shared bounded writer implementation for
+Metadata images, Exact Runs and Run Sets, streamed Exact compaction families,
+Similarity partitions, and DATA-tier Recovery Checkpoints. Already encoded
+images are written in at most one-MiB slices; streamed output uses one temporary
+one-MiB buffer, starting at offset zero and batching across format fields and
+object boundaries. This buffer is required writer workspace, not retained read
+acceleration or a separate write-back cache. It is explicitly drained before
+verification, file synchronization or publication; failure leaves only an
+unselected temporary object.
+
+A four-KiB loop would advance and synchronize the storage length head for every
+page, doubling body/head write traffic and multiplying barriers. Unaligned
+checkpoint-entry writes additionally read existing edge sectors to preserve
+their untouched bytes. Batching changes neither encoded bytes nor the required
+staging verification, file sync, no-replace rename and directory-before-WAL
+ordering. A Recovery Checkpoint patches its aligned fixed Header after computing
+the complete body hash and still independently audits the resulting image.
+The measured write counts and remaining cold-read limits are recorded in
+[the remaining I/O report](../testing/remaining-io-amplification-2026-09-13.md).
 Telemetry reports the common memory lease and direct backend causes; logical
 requested bytes are not physical disk IOPS or device bytes.
 
