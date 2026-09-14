@@ -103,8 +103,8 @@ generation and layout. No new durable format or validation rule is introduced.
 Idle envelope reconciliation has no artificial read-duty sleep. On observed
 frontend DATA activity, the coordinator reduces subsequent batches to one entry
 for the existing five-second activity window; already dispatched envelope reads
-back off before continuing. Payload verification retains its single paced
-worker and existing duty limits. Envelope tasks fully join before coverage is
+back off before continuing. Payload verification shares the same bounded pool
+(see the extension below) and retains its per-worker duty limits. Envelope tasks fully join before coverage is
 merged or payload verification begins, including on error or shutdown. A failed
 batch contributes no coverage. A real envelope or I/O failure takes precedence
 over a concurrent stop request. The ordinary scrub gate and full on-demand checks
@@ -118,3 +118,29 @@ Completion/restart regressions also prove envelope-only reads after repeated
 successful passes, replay of appended checks after completion, unextended expiry,
 current-envelope failure, and before/after-I/O crashes during completion replay
 and torn-tail repair. The complete marker alone never opens the GC gate.
+
+## Concurrent full verification (2026-09-13)
+
+New or changed Containers now undergo full verification asynchronously on the
+same dedicated 32-worker pool. Envelope reconciliation and full verification
+run in successive batches, so they cannot double the outstanding-I/O limit.
+Each worker performs at most one blocking storage operation at a time, including
+dependency reads; asynchronous dispatch is implemented by the existing pool,
+not a new kernel-I/O backend. Independent intent and complete verification of
+payloads, identities and dependencies remain unchanged.
+
+Each input batch contains at most 32 Containers. Before submitting payload work,
+their validated lengths split it further into groups whose Container images
+sum to at most 64 MiB. This bounds primary image memory; decoder, dependency,
+certificate and coverage working memory are additional existing verifier state.
+Workers read in at most 256-KiB portions with cancellation and the existing
+activity-sensitive duty delay. Frontend activity reduces subsequent batches to
+one Container. Every submitted task joins before a batch returns, including on
+error. Real corruption or storage errors take precedence over cancellation.
+
+Successful certificates merge into coverage on the coordinator only after the
+complete verification batch succeeds. Journal writes and progress accounting
+remain ordered and single-writer. Failed or cancelled batches cannot open the
+GC gate. Fresh successful physical evidence may still enter the unified cache;
+neither that evidence nor historical progress bypasses independent scrub reads.
+There is no durable format change.

@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
+use std::sync::{Arc, Mutex};
 
 use fastdup_format::{
     COMMIT_RECORD_BYTES, ChunkId, CommitFormatError, CommitRecord, ManifestExtent,
@@ -25,12 +26,17 @@ const HEAD_NAMES: [&str; 2] = ["recovery-checkpoint.0.head", "recovery-checkpoin
 #[derive(Clone, Debug)]
 pub struct RecoveryCheckpointRepository<I> {
     storage: I,
+    // One successful publication receipt, shared by this destination owner.
+    publication: Arc<Mutex<Option<(CommitRecord, RecoveryCheckpointSummary)>>>,
 }
 
 impl<I: StorageIo> RecoveryCheckpointRepository<I> {
     #[must_use]
-    pub const fn new(storage: I) -> Self {
-        Self { storage }
+    pub fn new(storage: I) -> Self {
+        Self {
+            storage,
+            publication: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Publishes the newest wholly verified Commit graph as one immutable,
@@ -46,26 +52,47 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
     ///
     /// Returns a source-graph, DATA-verification, format, identity, storage, or
     /// durability error without selecting a partial checkpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process-local publication lock is poisoned.
     pub fn publish<M: StorageIo>(
         &self,
         source: &GenerationRepository<M>,
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<Option<RecoveryCheckpointSummary>, RecoveryCheckpointError> {
-        source.publish_latest_recovery_checkpoint_to(self, Some(verifier))
+        let mut publication = self
+            .publication
+            .lock()
+            .expect("ASSERT: checkpoint publication lock poisoned");
+        *publication = None;
+        source.publish_latest_recovery_checkpoint_to(self, Some(verifier), &mut publication)
     }
 
     /// Copies a committed graph whose DATA durability was established before
-    /// its Commit WAL record. Validates the complete copied Metadata graph and
-    /// checkpoint image without repeating a full DATA scrub. Recovery and offline
+    /// its Commit WAL record. Validates the pinned source graph and hash-binds
+    /// every copied object while writing, without rereading the new image.
+    /// Recovery and offline
     /// scrub still independently verify DATA before restoring a lost Metadata tier.
     ///
     /// # Errors
     /// Returns source/copy graph, identity, format, or durability failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process-local publication lock is poisoned.
     pub fn publish_committed<M: StorageIo>(
         &self,
         source: &GenerationRepository<M>,
     ) -> Result<Option<RecoveryCheckpointSummary>, RecoveryCheckpointError> {
-        source.publish_latest_recovery_checkpoint_to(self, None)
+        let mut publication = self
+            .publication
+            .lock()
+            .expect("ASSERT: checkpoint publication lock poisoned");
+        if crate::read_intent::independent() {
+            *publication = None;
+        }
+        source.publish_latest_recovery_checkpoint_to(self, None, &mut publication)
     }
 
     /// Selects the greatest wholly valid checkpoint and installs its exact
@@ -79,11 +106,23 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
     ///
     /// Returns an error when no selected candidate is complete, transient I/O
     /// prevents verification, or the target cannot accept the exact anchor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process-local publication lock is poisoned.
     pub fn recover_latest<M: StorageIo>(
         &self,
         target: &GenerationRepository<M>,
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<Option<RecoveredGeneration>, RecoveryCheckpointError> {
+        let mut publication = self
+            .publication
+            .lock()
+            .expect("ASSERT: checkpoint publication lock poisoned");
+        // Independent recovery establishes fresh stored-byte evidence. A
+        // previous online publication receipt must not survive that boundary,
+        // including when recovery later returns a candidate or I/O error.
+        *publication = None;
         let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let candidates = self.head_candidates(false)?;
         let had_candidates = !candidates.is_empty();
@@ -136,6 +175,11 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<(RecoveryCheckpointScrubSummary, BTreeMap<ChunkId, u64>), RecoveryCheckpointError>
     {
+        let mut publication = self
+            .publication
+            .lock()
+            .expect("ASSERT: checkpoint publication lock poisoned");
+        *publication = None;
         let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let mut candidates = self.head_candidates(true)?;
         candidates.reverse();
@@ -210,6 +254,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         &self,
         record: CommitRecord,
         object_ids: &BTreeSet<MetadataObjectId>,
+        required_chunk_count: usize,
         verifier: Option<&dyn RequiredChunkVerifier>,
         mut read_object: F,
     ) -> Result<RecoveryCheckpointSummary, RecoveryCheckpointError>
@@ -320,11 +365,20 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         self.storage
             .write_at(&temporary_name, 0, &descriptor.encode_header())?;
         self.storage.set_len(&temporary_name, file_length)?;
-        let audited = self.audit_named(&temporary_name)?;
-        if audited.record != record || !audited.objects.keys().eq(object_ids.iter()) {
-            return Err(RecoveryCheckpointError::IdentityMismatch);
-        }
-        let summary = self.verify_publication_graph(&audited, verifier)?;
+        // The pinned source graph was validated by the sole caller before
+        // copying. Every copied object is hash-bound to that graph above;
+        // lengths, entry CRCs and the body hash come from the emitted bytes.
+        // Do not read our fresh file back as a substitute for durability.
+        // Recovery/scrub and existing-file collisions still audit stored bytes.
+        let summary = RecoveryCheckpointSummary {
+            generation: record.generation(),
+            metadata_object_count: u64::try_from(object_ids.len())
+                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
+            metadata_payload_bytes,
+            required_chunk_count: u64::try_from(required_chunk_count)
+                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
+            file_length,
+        };
         self.storage.sync_file(&temporary_name)?;
         match self
             .storage
@@ -333,17 +387,18 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let raced = self.audit_named(&published_name)?;
-                if raced.record != record || !raced.objects.keys().eq(object_ids.iter()) {
+                if raced.record != record
+                    || !raced.objects.keys().eq(object_ids.iter())
+                    || raced.descriptor != descriptor
+                {
                     return Err(RecoveryCheckpointError::IdentityMismatch);
                 }
             }
             Err(error) => return Err(error.into()),
         }
         self.storage.sync_root()?;
-        let obsolete = self.publish_head(audited.descriptor)?;
+        let obsolete = self.publish_head(descriptor)?;
         self.prune_obsolete(&obsolete)?;
-        debug_assert_eq!(summary.metadata_payload_bytes, metadata_payload_bytes);
-        debug_assert_eq!(summary.file_length, file_length);
         Ok(summary)
     }
 

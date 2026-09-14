@@ -5,8 +5,8 @@
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("fastdup supports only 64-bit x86 (x86-64) targets; see ADR 0078");
 
-mod commit;
 mod buffer_pool;
+mod commit;
 pub use buffer_pool::{BufferPool, BufferPoolStatus, PooledBuffer};
 mod container;
 mod container_generation_high_water;
@@ -43,27 +43,29 @@ pub use commit::{
 };
 pub use container::{
     AdaptiveContainerEncoding, AlignedContainerBytes, BuildingContainerHeader, ChunkId,
-    CompressedVerifiedChunkPayload, ContainerHeader, ContainerId, ContainerIntrinsicSummary, ContainerLayout, ContainerRecordRange,
-    ContainerRecoveryEnvelope, ContainerStructure, DependentCodec, DependentDependency,
-    DependentRecord, FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
-    IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, MAX_LOGICAL_CHUNK_BYTES,
-    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, PreparedDependentRecord,
-    PreparedEncodedRecord, PreparedIndependentRecord, PreparedSparseXorRecord,
-    PreparedZstdPrefixRecord, RECORD_HEADER_BYTES, RawRecord, RecoveryIndexCandidate,
-    SealedContainer, SealedContainerDescriptor, SparseXorRecord, SparseXorRun, StructuralChunk,
-    VerifiedChunkBackingId, VerifiedChunkLocation, VerifiedChunkPayload, VerifiedContainerImage,
-    VerifiedContainerPublication, VerifiedRawLocation, VerifiedReadView, VerifiedRecordPayloads,
-    VerifiedRecoveryIndex, ZstdPrefixDependency, ZstdPrefixRecord,
+    CompressedVerifiedChunkPayload, ContainerHeader, ContainerId, ContainerIntrinsicSummary,
+    ContainerLayout, ContainerRecordRange, ContainerRecoveryEnvelope, ContainerStructure,
+    DependentCodec, DependentDependency, DependentRecord, FOOTER_BYTES, FormatError, HEADER_BYTES,
+    IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
+    MAX_LOGICAL_CHUNK_BYTES, PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion,
+    PreparedDependentRecord, PreparedEncodedRecord, PreparedIndependentRecord,
+    PreparedSparseXorRecord, PreparedZstdPrefixRecord, RECORD_HEADER_BYTES, RawRecord,
+    RecoveryIndexCandidate, SealedContainer, SealedContainerDescriptor, SparseXorRecord,
+    SparseXorRun, StructuralChunk, VerifiedChunkBackingId, VerifiedChunkLocation,
+    VerifiedChunkPayload, VerifiedContainerImage, VerifiedContainerPublication,
+    VerifiedRawLocation, VerifiedReadView, VerifiedRecordPayloads, VerifiedRecoveryIndex,
+    ZstdPrefixDependency, ZstdPrefixRecord,
 };
 pub use container_generation_high_water::{
     CONTAINER_GENERATION_HIGH_WATER_RECORD_BYTES, ContainerGenerationHighWaterFormatError,
     ContainerGenerationHighWaterHash, ContainerGenerationHighWaterRecord,
 };
 pub use exact_index::{
-    EXACT_INDEX_ENTRY_BYTES, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES, ExactIndexEntry,
-    ExactIndexFormatError, ExactIndexLocation, ExactIndexPage, ExactIndexPagePosition,
-    ExactIndexProfileId, ExactIndexRun, ExactIndexRunDescriptor, ExactIndexRunHashAudit,
-    ExactIndexRunStreamEncoder, ExactLocationTransition,
+    EXACT_INDEX_ENTRIES_PER_PAGE, EXACT_INDEX_ENTRY_BYTES, EXACT_INDEX_HEADER_BYTES,
+    EXACT_INDEX_PAGE_BYTES, ExactIndexEntry, ExactIndexFormatError, ExactIndexLocation,
+    ExactIndexPage, ExactIndexPagePosition, ExactIndexProfileId, ExactIndexRun,
+    ExactIndexRunDescriptor, ExactIndexRunHashAudit, ExactIndexRunStreamEncoder,
+    ExactLocationTransition,
 };
 pub use exact_index_activation::{
     EXACT_INDEX_ACTIVATION_RECORD_BYTES, ExactIndexActivationError, ExactIndexActivationHash,

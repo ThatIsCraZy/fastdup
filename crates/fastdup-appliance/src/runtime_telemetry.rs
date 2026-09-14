@@ -1,5 +1,6 @@
 //! Bounded, read-only management observations. No storage decisions depend on these.
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
@@ -9,6 +10,27 @@ use serde_json::{Value, json};
 
 static CHECKPOINT: Mutex<Option<Value>> = Mutex::new(None);
 static SCRUB: Mutex<Option<Value>> = Mutex::new(None);
+static EXACT_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
+static NEW_CHUNK_BYTES: AtomicU64 = AtomicU64::new(0);
+static LOGICAL_CHUNK_BYTES: AtomicU64 = AtomicU64::new(0);
+static PHYSICAL_CONTAINER_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IngestCounters {
+    pub exact_hit: u64,
+    pub new_chunk: u64,
+    pub logical_chunk: u64,
+    pub physical_container: u64,
+}
+
+pub fn ingest_counters() -> IngestCounters {
+    IngestCounters {
+        exact_hit: EXACT_HIT_BYTES.load(Ordering::Relaxed),
+        new_chunk: NEW_CHUNK_BYTES.load(Ordering::Relaxed),
+        logical_chunk: LOGICAL_CHUNK_BYTES.load(Ordering::Relaxed),
+        physical_container: PHYSICAL_CONTAINER_BYTES.load(Ordering::Relaxed),
+    }
+}
 
 pub fn record_scrub(value: Value) {
     if let Ok(mut status) = SCRUB.lock() {
@@ -27,8 +49,24 @@ fn unix_seconds() -> u64 {
 
 pub fn record_checkpoint(profiled: &ProfiledCheckpoint) {
     let metrics = profiled.metrics();
+    EXACT_HIT_BYTES.fetch_add(metrics.exact_hit_bytes(), Ordering::Relaxed);
+    NEW_CHUNK_BYTES.fetch_add(metrics.new_chunk_bytes(), Ordering::Relaxed);
+    LOGICAL_CHUNK_BYTES.fetch_add(metrics.logical_chunk_bytes(), Ordering::Relaxed);
+    PHYSICAL_CONTAINER_BYTES.fetch_add(metrics.container_file_bytes(), Ordering::Relaxed);
     let phases: Vec<_> = [
+        ("checkpointLock", metrics.checkpoint_lock()),
+        ("proofFreeze", metrics.proof_freeze()),
+        ("cutCapture", metrics.cut_capture()),
         ("freeze", metrics.freeze()),
+        ("ingestWait", metrics.ingest_wait()),
+        ("publicationWait", metrics.publication_wait()),
+        ("laneLock", metrics.lane_lock()),
+        ("stableExtract", metrics.stable_extract()),
+        ("publicationEnqueue", metrics.publication_enqueue()),
+        ("publicationRetire", metrics.publication_retire()),
+        ("recipeAttach", metrics.recipe_attach()),
+        ("writerSetup", metrics.writer_setup()),
+        ("manifestPlan", metrics.manifest_plan()),
         ("cdc", metrics.cdc()),
         ("hashFill", metrics.hash_and_fill()),
         ("exactLookup", metrics.exact_lookup()),
@@ -49,6 +87,7 @@ pub fn record_checkpoint(profiled: &ProfiledCheckpoint) {
         *last = Some(json!({
             "completedAt": unix_seconds(), "generation": profiled.record().generation(),
             "totalMs": metrics.total().wall().as_secs_f64() * 1000.0,
+            "unattributedMs": metrics.unattributed().as_secs_f64() * 1000.0,
             "phases": phases,
         }));
     }
@@ -90,6 +129,19 @@ pub fn gc_cancelled() {
 }
 
 pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value {
+    let admission = appliance.namespace().admission_status();
+    let pipeline: Vec<_> = appliance
+        .pipeline_timings()
+        .into_iter()
+        .map(|phase| {
+            json!({
+                "id":phase.id, "active":phase.active, "completed":phase.completed,
+                "totalMs":phase.total.as_secs_f64() * 1000.0,
+                "maximumMs":phase.maximum.as_secs_f64() * 1000.0,
+                "busyMs":phase.busy.as_secs_f64() * 1000.0,
+            })
+        })
+        .collect();
     let io = storage.inner.status();
     let read = appliance.verified_read_cache_status();
     let exact = appliance.exact_index_page_cache_status();
@@ -119,11 +171,13 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
         "inFlight":row.in_flight,"operationsPerSecond":row.operations_per_second,"requestedMbps":row.requested_mbps
     })).collect();
     let buffers = read.buffer_pool();
-    let allocator = fastdup_store::allocator_memory_status().map(|status| json!({
-        "arenaBytes":status.arena_bytes, "allocatedBytes":status.allocated_bytes,
-        "freeBytes":status.free_bytes, "anonymousResidentBytes":status.anonymous_resident_bytes,
-        "trimAttempts":status.trim_attempts, "lastTrimMicros":status.last_trim_micros,
-    }));
+    let allocator = fastdup_store::allocator_memory_status().map(|status| {
+        json!({
+            "arenaBytes":status.arena_bytes, "allocatedBytes":status.allocated_bytes,
+            "freeBytes":status.free_bytes, "anonymousResidentBytes":status.anonymous_resident_bytes,
+            "trimAttempts":status.trim_attempts, "lastTrimMicros":status.last_trim_micros,
+        })
+    });
     json!({
         "metadataReads": {"intervalSeconds":metadata_reads.interval_seconds,"rows":metadata_rows},
         "allocatorMemory": allocator,
@@ -162,6 +216,12 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
         "reduction": {"skippedColdCandidates":reduction.skipped_cold_candidates(), "explorationReads":reduction.exploration_reads(), "backendBaseReads":reduction.backend_base_reads(), "warmBaseReuses":reduction.warm_base_reuses(), "successfulBaseTrials":reduction.successful_base_trials(), "enabled":reduction.enabled(), "queries":reduction.queries(), "candidates":reduction.candidates(),
             "acceptedPrefixes":reduction.accepted_prefixes(), "acceptedSparseXor":reduction.accepted_sparse_xor(),
             "savedPayloadBytes":reduction.saved_payload_bytes(), "fallbacks":reduction.independent_fallbacks(), "errors":reduction.errors()},
+        "pipeline": {"operations":pipeline, "admission": {
+            "open":admission.open, "reason":admission.reason.map(fastdup_posix::AdmissionPauseReason::name),
+            "closures":admission.closures, "closedMs":admission.closed.as_secs_f64() * 1000.0,
+            "currentClosedMs":admission.current_closed.as_secs_f64() * 1000.0,
+            "maximumClosedMs":admission.maximum_closed.as_secs_f64() * 1000.0,
+        }},
         "checkpoint":CHECKPOINT.lock().ok().and_then(|last| last.clone()),
         "gc":GC.lock().ok().and_then(|last| last.clone()),
     })

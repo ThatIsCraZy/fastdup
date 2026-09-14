@@ -1,5 +1,6 @@
 import { useState } from "react";
 import ReactECharts from "echarts-for-react";
+import { PipelineTelemetryPanel, checkpointPhaseLabels as phaseLabels, type PipelineTelemetry } from "./pipeline-telemetry";
 import { useI18n } from "./i18n";
 import type { TelemetrySnapshot } from "./types";
 
@@ -8,6 +9,7 @@ export interface DetailTelemetry {
   latency?: { read: OperationLatency; write: OperationLatency } | null;
   runtime?: {
     runtimeId: string;
+    pipeline?: PipelineTelemetry | null;
     allocatorMemory?: {arenaBytes: number; allocatedBytes: number; freeBytes: number; anonymousResidentBytes: number; trimAttempts: number; lastTrimMicros: number} | null;
     metadataReads?: {intervalSeconds: number; rows: {reason: string; object: string; mode: string; operations: number; requestedBytes: number; returnedBytes: number; errors: number; elapsedMicros: number; maxMicros: number; inFlight: number; operationsPerSecond: number; requestedMbps: number}[]} | null;
     codecBuffers?: {retainedBytes: number; activeBytes: number; peakActiveBytes: number; hits: number; misses: number; evictions: number} | null;
@@ -26,7 +28,7 @@ export interface DetailTelemetry {
     ioUring: { ringEntries: number; inflightBytes: number; maxInflightBytes: number; peakInflightBytes: number; submitted: number; completed: number };
     caches: { id: string; hits: number; misses: number; evictions: number; residentBytes?: number | null; residentPages?: number | null }[];
     reduction: { skippedColdCandidates?: number; explorationReads?: number; backendBaseReads?: number; warmBaseReuses?: number; successfulBaseTrials?: number; enabled: boolean; queries: number; candidates: number; acceptedPrefixes: number; acceptedSparseXor: number; savedPayloadBytes: number; fallbacks: number; errors: number };
-    checkpoint?: { completedAt: number; generation: number; totalMs: number; phases: { id: string; wallMs: number; cpuMs: number }[] } | null;
+    checkpoint?: { completedAt: number; generation: number; totalMs: number; unattributedMs?: number | null; phases: { id: string; wallMs: number; cpuMs: number }[] } | null;
     gc?: { state: string; observedAt: number; totalMs?: number | null; readBytes?: number | null; writeBytes?: number | null; unlinkedBytes?: number | null; candidates?: number | null; victims?: number | null; abortedCandidates?: number | null } | null;
   } | null;
 }
@@ -43,7 +45,7 @@ const tabHints = [
   "Welche Caches vermeiden Backend-Zugriffe und wie viel RAM nutzen sie?",
   "Welche Vergleichsversuche vermeiden DATA-Lesezugriffe?",
   "Was prüfen und bereinigen die Hintergrundprozesse?",
-  "Welche Phase bestimmt die Dauer des letzten Checkpoints?",
+  "Wo wartet die Pipeline und warum ist die Schreibannahme gesperrt?",
   "Welche Lesewege reichen Anfragen an das Betriebssystem weiter?",
 ];
 const tabs = ["Latenzen", "io_uring", "Caches", "Lesevermeidung", "GC & Scrub", "Checkpoint-Phasen", "Metadata-Reads"];
@@ -62,7 +64,7 @@ const cacheDescriptions: Record<string, string> = {
   manifestNodes: "Geprüfte Dateibereiche für Lesen und Fast Clone",
   metadataObjects: "Unveränderliche Namespace- und Manifest-Objekte",
 };
-const phaseLabels: Record<string, string> = { freeze: "Freeze", cdc: "CDC", hashFill: "Hash / FILL", exactLookup: "Exact Lookup", encode: "Encoding", containerPublish: "Container Publish", indexPublish: "Index Publish", metadataCommit: "Metadata Commit" };
+
 
 export function DetailTelemetryPanel({ sample, historical, loading, initialTab = 0 }: { sample?: TelemetrySnapshot; historical: boolean; loading: boolean; initialTab?: number }) {
   const { t, locale } = useI18n();
@@ -77,6 +79,10 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
   const empty = <p className="detail-empty">{t("Runtime-Messdaten sind momentan nicht verfügbar. Die Anzeige wird automatisch aktualisiert.")}</p>;
   const rows = (values: [string, string][]) => <dl className="telemetry-values">{values.map(([label, value]) => <div key={label}><dt>{t(label)}</dt><dd>{value}</dd></div>)}</dl>;
   const checkpoint = runtime?.checkpoint;
+  const nestedPhases = new Set(["cdc", "hashFill", "exactLookup", "encode", "containerPublish"]);
+  const chartPhases = checkpoint?.unattributedMs != null
+    ? [...checkpoint.phases.filter(phase => !nestedPhases.has(phase.id)), {id:"unattributed", wallMs:checkpoint.unattributedMs}]
+    : checkpoint?.phases ?? [];
   const gc = runtime?.gc;
   const reduction = runtime?.reduction;
   const budget = runtime?.cacheBudget;
@@ -232,12 +238,14 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
           </tbody></table></div>}
           <small>{t("Lesezeiten erfassen den direkten Backend-Aufruf einschließlich Pufferaufbau. Das Öffnen der Datei ist nicht enthalten. Separate Metadatenzugriffe des Host-Dateisystems werden hier nicht gezählt.")}</small>
         </> : empty)}
-        {tab === 5 && (checkpoint ? <>
+        {tab === 5 && <>
+          {runtime?.pipeline && <PipelineTelemetryPanel pipeline={runtime.pipeline} />}
+          {checkpoint ? <>
           <p className="detail-note">{t("Letzter abgeschlossener Checkpoint")}: {timestamp(checkpoint.completedAt)} · Generation {number(checkpoint.generation)} · {number(checkpoint.totalMs)} ms</p>
-          <ReactECharts style={{height:280}} option={{animation:false,textStyle:{fontFamily:'Inter, "Segoe UI", sans-serif'},grid:{left:145,right:30,top:15,bottom:35},tooltip:{trigger:'axis',valueFormatter:(value:number)=>`${number(value)} ms`},xAxis:{type:'value',name:'ms',axisLabel:{color:'#afbecb'},splitLine:{lineStyle:{color:'#253945'}}},yAxis:{type:'category',inverse:true,data:checkpoint.phases.map(phase=>phaseLabels[phase.id]??phase.id),axisLabel:{color:'#afbecb'}},series:[{type:'bar',data:checkpoint.phases.map(phase=>phase.wallMs),itemStyle:{color:'#63c4d5'},barMaxWidth:16}]}} />
-          <div className="telemetry-table-scroll"><table><thead><tr><th>{t("Phase")}</th><th>Wall time</th><th>Process CPU</th></tr></thead><tbody>{checkpoint.phases.map(phase=><tr key={phase.id}><th>{phaseLabels[phase.id]??phase.id}</th><td>{number(phase.wallMs)} ms</td><td>{number(phase.cpuMs)} ms</td></tr>)}</tbody></table></div>
-          <p className="detail-note">{t("Process CPU umfasst alle während der Phase aktiven Threads. Die Phasen bilden nicht die gesamte Checkpoint-Dauer ab.")}</p>
-        </> : runtime ? <p className="detail-empty">{t("Seit dem Mount wurde noch kein Checkpoint abgeschlossen.")}</p> : empty)}
+          <ReactECharts style={{height:Math.max(280, chartPhases.length * 28)}} option={{animation:false,textStyle:{fontFamily:'Inter, "Segoe UI", sans-serif'},grid:{left:230,right:30,top:15,bottom:35},tooltip:{trigger:'axis',valueFormatter:(value:number)=>`${number(value)} ms`},xAxis:{type:'value',name:'ms',axisLabel:{color:'#afbecb'},splitLine:{lineStyle:{color:'#253945'}}},yAxis:{type:'category',inverse:true,data:chartPhases.map(phase=>t(phaseLabels[phase.id]??phase.id)),axisLabel:{color:'#afbecb'}},series:[{type:'bar',data:chartPhases.map(phase=>phase.wallMs),itemStyle:{color:'#63c4d5'},barMaxWidth:16}]}} />
+          <div className="telemetry-table-scroll"><table><thead><tr><th>{t("Phase")}</th><th>Wall time</th><th>Process CPU</th></tr></thead><tbody>{checkpoint.phases.map(phase=><tr key={phase.id}><th>{t(phaseLabels[phase.id]??phase.id)}</th><td>{number(phase.wallMs)} ms</td><td>{number(phase.cpuMs)} ms</td></tr>)}</tbody></table></div>
+          <p className="detail-note">{t(checkpoint.unattributedMs != null ? "Das Diagramm zeigt getrennte Hauptphasen. CDC, Hash, Exact Lookup, Encoding und Container Publish sind Teil der Manifestplanung. Sonstige Verwaltung ist die verbleibende Gesamtdauer. Process CPU umfasst alle Prozess-Threads während einer Phase." : "Process CPU umfasst alle während der Phase aktiven Threads. Die Phasen bilden nicht die gesamte Checkpoint-Dauer ab.")}</p>
+        </> : runtime ? <p className="detail-empty">{t("Seit dem Mount wurde noch kein Checkpoint abgeschlossen.")}</p> : empty}</>}
       </>}
     </div>
   </section>;

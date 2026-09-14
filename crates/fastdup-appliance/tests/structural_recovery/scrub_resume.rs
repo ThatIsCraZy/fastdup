@@ -1,7 +1,225 @@
 use super::*;
 use fastdup_store::{ScrubCertificate, ScrubCoverage, ScrubProgress};
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 const JOURNAL: &str = ".fastdup-scrub-progress-v1";
 const BINDING: [u8; 32] = [73; 32];
+
+#[derive(Clone)]
+struct TrackedScrubStorage {
+    inner: MemoryStorageIo,
+    state: Arc<TrackedScrubState>,
+}
+
+struct TrackedScrubState {
+    active_reads: AtomicUsize,
+    peak_reads: AtomicUsize,
+    total_reads: AtomicUsize,
+    hold_reads: AtomicBool,
+    released: Mutex<bool>,
+    changed: Condvar,
+    interrupted_name: Option<String>,
+    corrupt_name: Option<String>,
+}
+
+impl TrackedScrubStorage {
+    fn new(inner: MemoryStorageIo) -> Self {
+        Self::with_failures(inner, None, None)
+    }
+
+    fn with_failures(
+        inner: MemoryStorageIo,
+        interrupted_name: Option<String>,
+        corrupt_name: Option<String>,
+    ) -> Self {
+        Self {
+            inner,
+            state: Arc::new(TrackedScrubState {
+                active_reads: AtomicUsize::new(0),
+                peak_reads: AtomicUsize::new(0),
+                total_reads: AtomicUsize::new(0),
+                hold_reads: AtomicBool::new(false),
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+                interrupted_name,
+                corrupt_name,
+            }),
+        }
+    }
+
+    fn hold_reads(&self) {
+        self.state.hold_reads.store(true, Ordering::Release);
+    }
+
+    fn release_reads(&self) {
+        *self
+            .state
+            .released
+            .lock()
+            .expect("tracked scrub release lock is not poisoned") = true;
+        self.state.changed.notify_all();
+    }
+
+    fn wait_for_active(&self, target: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut released = self
+            .state
+            .released
+            .lock()
+            .expect("tracked scrub wait lock is not poisoned");
+        loop {
+            if self.state.active_reads.load(Ordering::Acquire) >= target {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next, result) = self
+                .state
+                .changed
+                .wait_timeout(released, remaining)
+                .expect("tracked scrub wait lock is not poisoned");
+            released = next;
+            if result.timed_out() {
+                return self.state.active_reads.load(Ordering::Acquire) >= target;
+            }
+        }
+    }
+
+    fn peak_reads(&self) -> usize {
+        self.state.peak_reads.load(Ordering::Acquire)
+    }
+
+    fn active_reads(&self) -> usize {
+        self.state.active_reads.load(Ordering::Acquire)
+    }
+
+    fn total_reads(&self) -> usize {
+        self.state.total_reads.load(Ordering::Acquire)
+    }
+}
+
+struct ActiveScrubRead {
+    state: Arc<TrackedScrubState>,
+}
+
+impl Drop for ActiveScrubRead {
+    fn drop(&mut self) {
+        self.state.active_reads.fetch_sub(1, Ordering::AcqRel);
+        self.state.changed.notify_all();
+    }
+}
+
+impl StorageIo for TrackedScrubStorage {
+    fn create_new(&self, name: &str) -> io::Result<()> {
+        self.inner.create_new(name)
+    }
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        self.inner.exists(name)
+    }
+
+    fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.inner.write_at(name, offset, bytes)
+    }
+
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        let active = self
+            .state
+            .active_reads
+            .fetch_add(1, Ordering::AcqRel)
+            .checked_add(1)
+            .expect("tracked scrub read count cannot overflow");
+        self.state.total_reads.fetch_add(1, Ordering::AcqRel);
+        self.state.peak_reads.fetch_max(active, Ordering::AcqRel);
+        self.state.changed.notify_all();
+        let _active = ActiveScrubRead {
+            state: Arc::clone(&self.state),
+        };
+        if self.state.hold_reads.load(Ordering::Acquire) {
+            let mut released = self
+                .state
+                .released
+                .lock()
+                .expect("tracked scrub release lock is not poisoned");
+            while !*released {
+                released = self
+                    .state
+                    .changed
+                    .wait(released)
+                    .expect("tracked scrub release lock is not poisoned");
+            }
+        }
+        if self
+            .state
+            .interrupted_name
+            .as_deref()
+            .is_some_and(|interrupted| interrupted == name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "scrub cancellation injected",
+            ));
+        }
+        let mut bytes = self.inner.read(name)?;
+        if self
+            .state
+            .corrupt_name
+            .as_deref()
+            .is_some_and(|corrupt| corrupt == name)
+        {
+            bytes[4096 + 192] ^= 1;
+        }
+        Ok(bytes)
+    }
+
+    fn object_len(&self, name: &str) -> io::Result<u64> {
+        self.inner.object_len(name)
+    }
+
+    fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.inner.read_exact_at(name, offset, length)
+    }
+
+    fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.inner.read_structure_at(name, offset, length)
+    }
+
+    fn list_names(&self) -> io::Result<Vec<String>> {
+        self.inner.list_names()
+    }
+
+    fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
+        self.inner.set_len(name, length)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        self.inner.sync_file(name)
+    }
+
+    fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
+        self.inner.publish_noreplace(temporary_name, published_name)
+    }
+
+    fn remove_file(&self, name: &str) -> io::Result<()> {
+        self.inner.remove_file(name)
+    }
+
+    fn sync_root(&self) -> io::Result<()> {
+        self.inner.sync_root()
+    }
+}
+
+fn scrub_cache() -> fastdup_store::VerifiedReadCache {
+    let snapshot = fastdup_store::MemoryPressureSnapshot::new(1 << 30, 1 << 29, 0);
+    fastdup_store::VerifiedReadCache::new_with_snapshot(
+        fastdup_store::VerifiedReadCacheConfig::conservative(snapshot),
+        snapshot,
+    )
+    .expect("construct scrub cache")
+}
 
 fn coverage(metadata: &MemoryStorageIo, data: &MemoryStorageIo) -> ScrubCoverage {
     let (_, required) = GenerationRepository::new(metadata.clone(), checkpoint_policy_set())
@@ -595,6 +813,118 @@ fn resume_pool_rejects_oversized_batches_and_failed_batches_add_no_coverage() {
     assert!(
         work.finish().is_err(),
         "partial success cannot complete current graph coverage"
+    );
+}
+
+#[test]
+fn verify_pool_overlaps_payload_reads_and_caps_outstanding_work_at_32() {
+    use fastdup_store::{SCRUB_RESUME_MAX_IOS, ScrubResumePool};
+
+    let (metadata, data, _) = fixture(false);
+    let publisher = ContainerRepository::new(data.clone());
+    let mut ids = vec![id(31)];
+    for byte in 40..(40 + SCRUB_RESUME_MAX_IOS as u8 - 1) {
+        let payload = vec![byte; 65_536];
+        publisher
+            .publish_raw(id(byte), u64::from(byte), &[&payload])
+            .unwrap();
+        ids.push(id(byte));
+    }
+    assert_eq!(ids.len(), SCRUB_RESUME_MAX_IOS);
+
+    let tracked = TrackedScrubStorage::new(data);
+    let repository = ContainerRepository::new(tracked.clone());
+    let pool = ScrubResumePool::new().unwrap();
+    let cache = scrub_cache();
+    let too_many = vec![id(31); SCRUB_RESUME_MAX_IOS + 1];
+    let mut rejected_work = coverage(&metadata, &repository.storage().inner);
+    assert!(
+        pool.verify(
+            &repository,
+            &too_many,
+            None::<&fastdup_store::ActivatedExactIndex<MemoryStorageIo>>,
+            &mut rejected_work,
+            101,
+            &cache,
+        )
+        .is_err()
+    );
+    assert_eq!(tracked.total_reads(), 0);
+
+    tracked.hold_reads();
+    let mut work = coverage(&metadata, &repository.storage().inner);
+    let worker = std::thread::spawn(move || {
+        let result = pool.verify(
+            &repository,
+            &ids,
+            None::<&fastdup_store::ActivatedExactIndex<MemoryStorageIo>>,
+            &mut work,
+            101,
+            &cache,
+        );
+        (result, work)
+    });
+    let all_workers_reached = tracked.wait_for_active(SCRUB_RESUME_MAX_IOS, Duration::from_secs(2));
+    tracked.release_reads();
+
+    let (entries, work) = worker.join().unwrap();
+    assert!(
+        all_workers_reached,
+        "the full verifier must dispatch every bounded worker before waiting"
+    );
+    assert!(tracked.peak_reads() <= SCRUB_RESUME_MAX_IOS);
+    assert_eq!(entries.unwrap().len(), SCRUB_RESUME_MAX_IOS);
+    assert_eq!(tracked.peak_reads(), SCRUB_RESUME_MAX_IOS);
+    assert_eq!(
+        tracked.active_reads(),
+        0,
+        "all payload reads must be joined"
+    );
+    assert_eq!(tracked.total_reads(), SCRUB_RESUME_MAX_IOS);
+    work.finish().unwrap();
+}
+
+#[test]
+fn verify_pool_joins_cancelled_and_corrupt_reads_without_opening_coverage() {
+    use fastdup_store::{SCRUB_RESUME_MAX_IOS, ScrubResumePool};
+
+    let (metadata, data, _) = fixture(false);
+    let publisher = ContainerRepository::new(data.clone());
+    let mut ids = vec![id(31)];
+    for byte in 40..(40 + SCRUB_RESUME_MAX_IOS as u8 - 1) {
+        let payload = vec![byte; 65_536];
+        publisher
+            .publish_raw(id(byte), u64::from(byte), &[&payload])
+            .unwrap();
+        ids.push(id(byte));
+    }
+    let tracked = TrackedScrubStorage::with_failures(data, Some(name(31)), Some(name(40)));
+    let repository = ContainerRepository::new(tracked.clone());
+    let pool = ScrubResumePool::new().unwrap();
+    let cache = scrub_cache();
+    let mut work = coverage(&metadata, &repository.storage().inner);
+    let result = pool.verify(
+        &repository,
+        &ids,
+        None::<&fastdup_store::ActivatedExactIndex<MemoryStorageIo>>,
+        &mut work,
+        101,
+        &cache,
+    );
+
+    assert!(
+        matches!(result, Err(fastdup_store::StoreError::Format(_))),
+        "corruption must take precedence over a concurrent cancellation"
+    );
+    assert_eq!(tracked.total_reads(), SCRUB_RESUME_MAX_IOS);
+    assert_eq!(
+        tracked.active_reads(),
+        0,
+        "failed batches must join every read"
+    );
+    assert!(
+        work.finish().is_err(),
+        "failed or cancelled verification must leave the GC gate closed"
     );
 }
 

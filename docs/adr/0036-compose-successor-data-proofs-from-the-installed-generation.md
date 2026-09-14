@@ -82,9 +82,14 @@ and enters the normal corruption path.
 
 The installed online state is an opaque Manifest Root, logical length, and
 verified allocated-byte scalar; it is not a flattened file recipe. Equal-size
-dirty updates read only intersecting tree paths, expand boundaries across whole
-DATA extents, publish replacement leaves child-first, and retain every remote
-subtree ID exactly.
+dirty updates read only intersecting tree paths and replace the actual mutation
+range. The persistent tree retains unchanged DATA edges as authenticated
+DATA_SLICE recipes, including an offset into an already sliced Chunk. It does
+not expand a small overwrite to the complete old DATA extent or read unchanged
+payload edges for rechunking. Replacement leaves publish child-first, and every
+remote subtree ID remains unchanged. Truncation similarly retains the surviving
+slice without materializing the old Chunk. Recovery and scrub still verify the
+complete referenced Chunk and slice bounds as specified in ADRs 0011 and 0043.
 
 Sequential length-increasing updates now use an append-native persistent tree
 operation. The store verifies the installed predecessor Root while descending
@@ -117,8 +122,12 @@ that commit boundary a stable structural seam; partially filled leaves at
 successive checkpoint boundaries are accepted. Inner nodes retain the normal
 1,024-child maximum and a root is raised only when right-spine overflow
 requires it. The commit verifies only newly introduced Chunk dependencies;
-new metadata objects are reread by the content-addressed publisher before its
-directory sync, and the Commit WAL remains the sole visibility point.
+new Metadata objects carry their validated encoder image through successful
+file writes, file sync and no-replace publication as specified in ADR 0046.
+The publisher offers that image to the Unified Read Cache without immediate
+readback. The directory sync remains required, and the Commit WAL remains the
+sole visibility point. Existing same-name objects retain independent collision
+verification; cache admission does not establish durability or liveness.
 
 The writer's structural pairing is the append/replacement descent plus verified
 publication of every new node and the opaque predecessor capability. Process

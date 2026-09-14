@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOr
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 use fastdup_format::{
-    ChunkId, ContainerId, EXACT_INDEX_HEADER_BYTES, EXACT_INDEX_PAGE_BYTES,
-    ExactIndexActivationError, ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError,
-    ExactIndexPage, ExactIndexPagePosition, ExactIndexProfileId, ExactIndexRun,
-    ExactIndexRunDescriptor, ExactIndexRunHashAudit, ExactIndexRunRef, ExactIndexRunSet,
-    ExactIndexRunSetError, ExactIndexRunSetId, ExactIndexRunStreamEncoder, ExactLocationTransition,
-    MAX_METADATA_OBJECT_BYTES,
+    ChunkId, ContainerId, EXACT_INDEX_ENTRIES_PER_PAGE, EXACT_INDEX_HEADER_BYTES,
+    EXACT_INDEX_PAGE_BYTES, ExactIndexActivationError, ExactIndexActivationRecord, ExactIndexEntry,
+    ExactIndexFormatError, ExactIndexPage, ExactIndexPagePosition, ExactIndexProfileId,
+    ExactIndexRun, ExactIndexRunDescriptor, ExactIndexRunHashAudit, ExactIndexRunRef,
+    ExactIndexRunSet, ExactIndexRunSetError, ExactIndexRunSetId, ExactIndexRunStreamEncoder,
+    ExactLocationTransition, MAX_METADATA_OBJECT_BYTES,
 };
 
 use crate::exact_activation_log::{
@@ -99,10 +99,32 @@ pub struct ExactIndexRunRepository<I> {
     // Required live writer state, bounded by one 64-record slot. This is not
     // evictable read acceleration. Taking it before I/O makes failure revoke it.
     activation_writer: Arc<Mutex<Option<ActivationLogSnapshot>>>,
+    run_generations: Arc<Mutex<RunGenerationAllocator>>,
     active_generation: Arc<RwLock<Option<Arc<ExactIndexGenerationState<I>>>>>,
     retired_generations: Arc<Mutex<Vec<Weak<ExactIndexGenerationState<I>>>>>,
     page_cache: Arc<ExactIndexPageCache>,
     membership_counters: Arc<ExactRunMembershipCounters>,
+    publication_timings: ExactPublicationTimings,
+}
+
+/// One constant-sized allocator across profiles. Explicit publication and
+/// compaction observe their whole reserved range before I/O. A fresh owner
+/// discovers all canonical names once, including unselected orphan Runs.
+#[derive(Debug, Default)]
+struct RunGenerationAllocator {
+    discovered: bool,
+    high_water: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExactPublicationTimings {
+    generation_lock: crate::OperationTiming,
+    recover: crate::OperationTiming,
+    validate: crate::OperationTiming,
+    run_publish: crate::OperationTiming,
+    generation_discovery: crate::OperationTiming,
+    compaction: crate::OperationTiming,
+    activation: crate::OperationTiming,
 }
 
 #[derive(Debug)]
@@ -514,10 +536,12 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             publish_lock: Arc::new(Mutex::new(())),
             generation_publish_lock: Arc::new(Mutex::new(())),
             activation_writer: Arc::new(Mutex::new(None)),
+            run_generations: Arc::new(Mutex::new(RunGenerationAllocator::default())),
             active_generation: Arc::new(RwLock::new(None)),
             retired_generations: Arc::new(Mutex::new(Vec::new())),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, true)),
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
+            publication_timings: ExactPublicationTimings::default(),
         }
     }
 
@@ -534,11 +558,31 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             publish_lock: Arc::new(Mutex::new(())),
             generation_publish_lock: Arc::new(Mutex::new(())),
             activation_writer: Arc::new(Mutex::new(None)),
+            run_generations: Arc::new(Mutex::new(RunGenerationAllocator::default())),
             active_generation: Arc::new(RwLock::new(None)),
             retired_generations: Arc::new(Mutex::new(Vec::new())),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, false)),
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
+            publication_timings: ExactPublicationTimings::default(),
         }
+    }
+
+    /// Read-only timings shared by all publishers, including Online GC.
+    #[must_use]
+    pub fn publication_timings(&self) -> Vec<crate::OperationTimingSnapshot> {
+        let timings = &self.publication_timings;
+        [
+            ("exactGenerationLock", &timings.generation_lock),
+            ("exactRecover", &timings.recover),
+            ("exactValidate", &timings.validate),
+            ("exactRunPublish", &timings.run_publish),
+            ("exactGenerationDiscovery", &timings.generation_discovery),
+            ("exactCompaction", &timings.compaction),
+            ("exactActivation", &timings.activation),
+        ]
+        .into_iter()
+        .map(|(id, timing)| timing.snapshot(id))
+        .collect()
     }
 
     /// Returns repository-wide bounded Exact-Index hot-page cache evidence.
@@ -579,6 +623,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .publish_lock
             .lock()
             .expect("ASSERT: Exact Index run publication lock poisoned");
+        self.observe_run_generation(run.generation());
         let encoded = run.encode()?;
         let expected = descriptor_from_complete_bytes(&encoded)?;
         let temporary_name = temporary_name(run.profile(), run.generation());
@@ -599,18 +644,17 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         let mut evidence = owned_writer
             .then(|| RunWriterEvidence::new(expected.entry_count(), &self.page_cache))
             .transpose()?;
-        for (page_ordinal, page) in encoded.chunks(EXACT_INDEX_PAGE_BYTES).enumerate() {
-            assert_eq!(
-                page.len(),
-                EXACT_INDEX_PAGE_BYTES,
-                "ASSERT: Exact Index Run v1 always consists of complete 4-KiB pages"
-            );
-            if page_ordinal > 0
-                && page_ordinal <= expected.page_count()
-                && let Some(evidence) = &mut evidence
+        if let Some(evidence) = &mut evidence {
+            // The immutable Run already validated these entries before encoding.
+            // Carry the encoder's page partition directly, as streamed compaction
+            // does; independent readers still decode and checksum stored pages.
+            for (ordinal, entries) in run
+                .entries()
+                .chunks(EXACT_INDEX_ENTRIES_PER_PAGE)
+                .enumerate()
             {
-                let decoded = expected.decode_page(page_ordinal - 1, page)?;
-                evidence.observe(decoded.entries(), page)?;
+                let offset = EXACT_INDEX_HEADER_BYTES + ordinal * EXACT_INDEX_PAGE_BYTES;
+                evidence.observe(entries, &encoded[offset..offset + EXACT_INDEX_PAGE_BYTES])?;
             }
         }
         write_image(&self.storage, &temporary_name, &encoded)?;
@@ -738,6 +782,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .publish_lock
             .lock()
             .expect("ASSERT: Exact Index streaming compaction lock poisoned");
+        self.observe_run_generation(target_generation);
         self.publish_streamed_compaction(&ordered_inputs, profile, target_generation, summary)
     }
 
@@ -767,7 +812,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         self.compact_family_using(
             inputs,
             target_level,
-            first_generation,
+            Some(first_generation),
             &mut Vec::new(),
             false,
         )
@@ -777,23 +822,39 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         &self,
         inputs: &[ExactIndexRunRef],
         target_level: u16,
-        first_generation: u64,
+        requested_generation: Option<u64>,
         readers: &mut Vec<ExactIndexRunReader<I>>,
         owned_writer: bool,
     ) -> Result<ExactIndexRunFamily, ExactIndexStoreError> {
-        let input_families =
-            validate_family_compaction_inputs(inputs, target_level, first_generation)?;
+        let minimum_generation = inputs
+            .iter()
+            .map(|run| run.generation())
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
+        let input_families = validate_family_compaction_inputs(
+            inputs,
+            target_level,
+            requested_generation.unwrap_or(minimum_generation),
+        )?;
         let profile = input_families[0].refs[0].profile();
         let summaries = self.compaction_partition_summaries(&input_families, readers)?;
         let partition_count = u16::try_from(summaries.len())
             .map_err(|_| ExactIndexStoreError::TooManyRunPartitions)?;
-        first_generation
-            .checked_add(u64::from(partition_count) - 1)
-            .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
         let _guard = self
             .publish_lock
             .lock()
             .expect("ASSERT: Exact Index family compaction lock poisoned");
+        let first_generation = if let Some(first) = requested_generation {
+            let last = first
+                .checked_add(u64::from(partition_count) - 1)
+                .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
+            self.observe_run_generation(last);
+            first
+        } else {
+            self.reserve_run_generations(u64::from(partition_count))?
+        };
         let (descriptors, outputs) = self.publish_streamed_family(
             &input_families,
             profile,
@@ -904,7 +965,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             run_set.generation(),
         )?;
         let next = log
-            .append(&snapshot, record, !owned_writer)
+            .append(snapshot, record, !owned_writer)
             .map_err(map_activation_log_error)?;
         *writer = Some(next);
         ActivatedExactIndex::new(record, run_set.clone(), readers)
@@ -933,7 +994,9 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         self.recover_active_locked()
     }
 
-    fn recover_active_locked(&self) -> Result<Option<ActivatedExactIndex<I>>, ExactIndexStoreError> {
+    fn recover_active_locked(
+        &self,
+    ) -> Result<Option<ActivatedExactIndex<I>>, ExactIndexStoreError> {
         let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let mut writer = self
             .activation_writer
@@ -999,6 +1062,37 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .read()
             .expect("ASSERT: active Exact generation lock poisoned");
         active.as_ref().map(|state| pin_exact_generation(state))
+    }
+
+    /// Reuse the owner's installed generation for online maintenance. Unknown
+    /// state and explicit independent verification still reconstruct storage.
+    pub(crate) fn pin_online_generation(
+        &self,
+    ) -> Result<Option<ExactIndexGenerationPin<I>>, ExactIndexStoreError> {
+        let _generation = self
+            .generation_publish_lock
+            .lock()
+            .expect("ASSERT: Exact generation publication lock poisoned");
+        if !crate::read_intent::independent() {
+            let writer = self
+                .activation_writer
+                .lock()
+                .expect("ASSERT: Exact activation writer lock poisoned");
+            if let Some(record) = writer.as_ref().and_then(ActivationLogSnapshot::last_record)
+                && let Some(pin) = self.pin_matching_generation(record)
+            {
+                return Ok(Some(pin));
+            }
+        }
+        // An ambiguous activation revokes the writer snapshot. An old pin
+        // alone must not suppress reconstruction of the effective selector.
+        let Some(active) = self.recover_active_locked()? else {
+            return Ok(None);
+        };
+        if let Some(current) = self.pin_matching_generation(active.record()) {
+            return Ok(Some(current));
+        }
+        Ok(Some(self.install_active_generation(active).current))
     }
 
     /// Derives the effective RETIRING Container set from one fully opened
@@ -1074,11 +1168,15 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         if entries.is_empty() {
             return Err(ExactIndexStoreError::InvalidCompactionInput);
         }
+        let lock_timer = self.publication_timings.generation_lock.begin();
         let _generation = self
             .generation_publish_lock
             .lock()
             .expect("ASSERT: Exact generation publication lock poisoned");
+        drop(lock_timer);
+        let recover_timer = self.publication_timings.recover.begin();
         let previous = self.recover_for_append()?;
+        drop(recover_timer);
         self.append_level_zero_from(profile, entries, previous.as_ref())
     }
 
@@ -1103,11 +1201,15 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         if entries.is_empty() {
             return Err(ExactIndexStoreError::InvalidCompactionInput);
         }
+        let lock_timer = self.publication_timings.generation_lock.begin();
         let _generation = self
             .generation_publish_lock
             .lock()
             .expect("ASSERT: Exact generation publication lock poisoned");
+        drop(lock_timer);
+        let recover_timer = self.publication_timings.recover.begin();
         let previous = self.recover_for_append()?;
+        drop(recover_timer);
         if previous.as_ref().map(ActivatedExactIndex::record) != Some(expected) {
             return Err(ExactIndexStoreError::ActivationChanged);
         }
@@ -1124,13 +1226,18 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         if previous.is_some_and(|active| active.run_set().profile() != profile) {
             return Err(ExactIndexStoreError::DependencyMismatch);
         }
+        let validation_timer = self.publication_timings.validate.begin();
         validate_level_zero_transitions(previous, &entries)?;
-        let mut newest_run_generation = self
-            .discover_run_generation_high_water(profile)?
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
-        let run = ExactIndexRun::new(profile, newest_run_generation, entries)?;
+        drop(validation_timer);
+        let run_timer = self.publication_timings.run_publish.begin();
+        let generation = {
+            let _publication = self
+                .publish_lock
+                .lock()
+                .expect("ASSERT: Exact Index run publication lock poisoned");
+            self.reserve_run_generations(1)?
+        };
+        let run = ExactIndexRun::new(profile, generation, entries)?;
         let (descriptor, evidence) = self.publish_run(&run, owned_writer)?;
         let mut readers = previous.map_or_else(Vec::new, |active| active.readers.clone());
         readers.push(self.reader_from_writer(descriptor, evidence)?);
@@ -1140,21 +1247,14 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .try_reserve(1)
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
         run_refs.push(ExactIndexRunRef::new(0, descriptor)?);
+        drop(run_timer);
         while let Some((source_level, inputs)) = select_level_zero_compaction(&run_refs) {
-            let first_output_generation = newest_run_generation
-                .checked_add(1)
-                .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
+            let _compaction_timer = self.publication_timings.compaction.begin();
             let target_level = source_level
                 .checked_add(1)
                 .ok_or(ExactIndexStoreError::InvalidCompactionInput)?;
-            let compacted = self.compact_family_using(
-                &inputs,
-                target_level,
-                first_output_generation,
-                &mut readers,
-                owned_writer,
-            )?;
-            newest_run_generation = compacted.last_generation();
+            let compacted =
+                self.compact_family_using(&inputs, target_level, None, &mut readers, owned_writer)?;
             run_refs.retain(|run| {
                 !inputs
                     .iter()
@@ -1172,9 +1272,44 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 .checked_add(1)
                 .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)
         })?;
+        let _activation_timer = self.publication_timings.activation.begin();
         let run_set = ExactIndexRunSet::new(profile, run_set_generation, run_refs)?;
         let active = self.activate_with_readers(&run_set, &readers, owned_writer)?;
         Ok(self.install_active_generation(active))
+    }
+
+    // Both methods are called under publish_lock. Reservations precede any
+    // object I/O and survive errors; only a new owner reconstructs from disk.
+    fn observe_run_generation(&self, generation: u64) {
+        let mut allocator = self
+            .run_generations
+            .lock()
+            .expect("ASSERT: Exact Run allocator lock poisoned");
+        allocator.high_water = allocator.high_water.max(generation);
+    }
+
+    fn reserve_run_generations(&self, count: u64) -> Result<u64, ExactIndexStoreError> {
+        assert!(count > 0, "ASSERT: Exact Run reservation is nonempty");
+        let mut allocator = self
+            .run_generations
+            .lock()
+            .expect("ASSERT: Exact Run allocator lock poisoned");
+        if !allocator.discovered {
+            let _discovery = self.publication_timings.generation_discovery.begin();
+            for name in self.storage.list_names()? {
+                if let Some((_, generation)) = parse_run_name(&name)? {
+                    allocator.high_water = allocator.high_water.max(generation);
+                }
+            }
+            allocator.discovered = true;
+        }
+        let last = allocator
+            .high_water
+            .checked_add(count)
+            .ok_or(ExactIndexStoreError::NonMonotonicRunSetGeneration)?;
+        let first = allocator.high_water + 1;
+        allocator.high_water = last;
+        Ok(first)
     }
 
     /// The exclusive writer carries its synchronized selector across appends.
@@ -1188,9 +1323,17 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         if crate::read_intent::independent() {
             *writer = None;
         }
-        let trusted = writer.is_some();
-        let _independent =
-            (!trusted).then(|| crate::ReadIntentScope::enter(crate::ReadIntent::Independent));
+        if let Some(record) = writer.as_ref().and_then(ActivationLogSnapshot::last_record)
+            && let Some(pin) = self.pin_matching_generation(record)
+            && pin.readers.iter().all(|reader| reader.mapping.is_some())
+        {
+            // Reuse the validated selection without cloning the full WAL slot
+            // or reconstructing the same lookup-family directory.
+            return Ok(Some((*pin).clone()));
+        }
+        let _independent = writer
+            .is_none()
+            .then(|| crate::ReadIntentScope::enter(crate::ReadIntent::Independent));
         let snapshot = match writer.as_ref() {
             Some(snapshot) => snapshot.clone(),
             None => log.load_for_append().map_err(map_activation_log_error)?,
@@ -1199,14 +1342,6 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             *writer = Some(snapshot);
             return Ok(None);
         };
-        if trusted
-            && !crate::read_intent::independent()
-            && let Some(pin) = self.pin_matching_generation(record)
-            && pin.readers.iter().all(|reader| reader.mapping.is_some())
-        {
-            return ActivatedExactIndex::new(record, pin.run_set.clone(), pin.readers.clone())
-                .map(Some);
-        }
         let run_set = self.read_activated_run_set(record)?;
         let readers = self.verify_run_set_dependencies(&run_set)?;
         *writer = Some(snapshot);
@@ -2312,6 +2447,38 @@ impl<I> ActivatedExactIndex<I> {
 }
 
 impl<I: StorageIo> ActivatedExactIndex<I> {
+    /// Selects an ACTIVE Exact reference for trusted-client ingest (ADR 0015).
+    /// Hash and length come from the incoming bytes; this checks index pages
+    /// and newest physical transitions, without reading or certifying DATA.
+    /// The caller must exclude retirement until the reference is committed.
+    /// Demand reads, recovery and scrub still verify payload independently.
+    ///
+    /// # Errors
+    /// Returns touched-page I/O, integrity, or bounded-allocation failures.
+    pub fn active_reference(
+        &self,
+        chunk_id: ChunkId,
+        logical_length: u32,
+        preferred: Option<ExactIndexEntry>,
+    ) -> Result<Option<ExactIndexEntry>, ExactIndexStoreError> {
+        let lookup = self.lookup_transitions(chunk_id, logical_length)?;
+        let mut first = None;
+        for (ordinal, candidate) in lookup.candidates().iter().copied().enumerate() {
+            if lookup.candidates()[..ordinal]
+                .iter()
+                .any(|newer| newer.location() == candidate.location())
+                || candidate.transition() != ExactLocationTransition::Active
+            {
+                continue;
+            }
+            if preferred.is_none() || preferred == Some(candidate) {
+                return Ok(Some(candidate));
+            }
+            first.get_or_insert(candidate);
+        }
+        Ok(first)
+    }
+
     /// Checks whether one unpublished ACTIVE overlay Location remains
     /// selectable in this generation.
     ///
@@ -2343,7 +2510,8 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
 
     /// Returns a newest-Run-first bounded transition prefix across the active
     /// Run Set. Callers must merge transitions by complete physical Location
-    /// identity and verify any selected ACTIVE candidate against its Container.
+    /// identity. Payload readers verify selected candidates against DATA;
+    /// trusted-client ingest may select a guarded reference via ADR 0015.
     ///
     /// `complete=true` covers this Run Set only. It never makes a negative
     /// result authoritative for durable content.
@@ -2433,7 +2601,7 @@ impl RunWriterEvidence {
     fn new(entries: usize, cache: &ExactIndexPageCache) -> Result<Self, ExactIndexStoreError> {
         let mut bounds = Vec::new();
         bounds
-            .try_reserve_exact(entries.div_ceil(31))
+            .try_reserve_exact(entries.div_ceil(EXACT_INDEX_ENTRIES_PER_PAGE))
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
         let capacity = usize::try_from(cache.cache.capacity()).unwrap_or(usize::MAX);
         let membership = (capacity != 0)
@@ -3637,6 +3805,52 @@ fn encode_hex<const N: usize>(bytes: [u8; N]) -> String {
 mod tests {
     use super::*;
 
+    mod publisher_tests;
+
+    #[test]
+    fn publication_timing_is_visible_during_generation_lock_contention() {
+        let repository = reuse_repository("publication-timing");
+        let guard = repository.generation_publish_lock.lock().unwrap();
+        let writer = repository.clone();
+        let thread = std::thread::spawn(move || {
+            writer.append_level_zero(
+                ExactIndexProfileId::new([7; 32]).unwrap(),
+                vec![reuse_fixture(1)],
+            )
+        });
+        let observer = repository.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Some(wait) = observer
+                    .publication_timings()
+                    .into_iter()
+                    .find(|row| row.id == "exactGenerationLock" && row.active == 1)
+                {
+                    let _ = send.send(wait);
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_millis(400));
+        drop(guard);
+        thread.join().unwrap().unwrap();
+        reader.join().unwrap();
+        assert!(observed.unwrap().busy > std::time::Duration::ZERO);
+        let finished = repository.publication_timings();
+        assert!(finished.iter().all(|row| row.active == 0));
+        assert!(
+            finished
+                .iter()
+                .any(|row| row.id == "exactActivation" && row.completed == 1)
+        );
+    }
+
     fn reuse_fixture(ordinal: u64) -> ExactIndexEntry {
         let location = fastdup_format::ExactIndexLocation::raw(
             ContainerId::new([71; 16]).unwrap(),
@@ -3841,6 +4055,40 @@ mod tests {
     }
 
     #[test]
+    fn revoked_online_writer_snapshot_forces_exact_recovery_before_reuse() {
+        let repository = reuse_repository("revoked-online-pin");
+        let profile = ExactIndexProfileId::new([98; 32]).unwrap();
+        repository
+            .append_level_zero(profile, vec![reuse_fixture(1)])
+            .unwrap();
+
+        let warm_before = crate::direct_io::READ_BYTES.with(std::cell::Cell::get);
+        assert!(repository.pin_online_generation().unwrap().is_some());
+        assert_eq!(
+            crate::direct_io::READ_BYTES.with(std::cell::Cell::get),
+            warm_before,
+            "a synchronized writer snapshot should reuse the installed generation"
+        );
+
+        // Model an ambiguous activation or sync result. The installed pin is
+        // deliberately retained, but it no longer proves that the durable
+        // selector still names the same generation.
+        *repository.activation_writer.lock().unwrap() = None;
+        let recovery_before = crate::direct_io::READ_BYTES.with(std::cell::Cell::get);
+        let recovered = repository
+            .pin_online_generation()
+            .unwrap()
+            .expect("durable Exact generation remains recoverable");
+
+        assert_eq!(recovered.record().generation(), 1);
+        assert!(
+            crate::direct_io::READ_BYTES.with(std::cell::Cell::get) > recovery_before,
+            "a revoked writer snapshot must independently reread the selector and Run Set"
+        );
+        assert!(repository.activation_writer.lock().unwrap().is_some());
+    }
+
+    #[test]
     fn online_append_uses_writer_run_evidence_instead_of_disk_audits() {
         let mut repository = reuse_repository("online-run-proof");
         let counters = Arc::new(crate::metadata_read_telemetry::MetadataReadCounters::default());
@@ -4023,6 +4271,7 @@ mod tests {
     struct ReuseFaultStorage {
         inner: crate::FsStorageIo,
         fault: Arc<AtomicUsize>,
+        scans: Arc<AtomicUsize>,
     }
 
     impl StorageIo for ReuseFaultStorage {
@@ -4042,13 +4291,31 @@ mod tests {
             self.inner.read_exact_at(name, offset, length)
         }
         fn list_names(&self) -> io::Result<Vec<String>> {
+            self.scans.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.list_names()
         }
         fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
             self.inner.set_len(name, length)
         }
         fn publish_noreplace(&self, temporary: &str, published: &str) -> io::Result<()> {
-            self.inner.publish_noreplace(temporary, published)
+            if published.ends_with(".fdx")
+                && self
+                    .fault
+                    .compare_exchange(3, 0, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+                    .is_ok()
+            {
+                return Err(io::Error::other("injected before Run rename"));
+            }
+            self.inner.publish_noreplace(temporary, published)?;
+            if published.ends_with(".fdx")
+                && self
+                    .fault
+                    .compare_exchange(4, 0, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+                    .is_ok()
+            {
+                return Err(io::Error::other("injected after Run rename"));
+            }
+            Ok(())
         }
         fn remove_file(&self, name: &str) -> io::Result<()> {
             self.inner.remove_file(name)
@@ -4099,6 +4366,7 @@ mod tests {
             let storage = ReuseFaultStorage {
                 inner: initial.storage,
                 fault: Arc::new(AtomicUsize::new(0)),
+                scans: Arc::new(AtomicUsize::new(0)),
             };
             let repository = ExactIndexRunRepository::new(storage.clone());
             let profile = ExactIndexProfileId::new([64; 32]).unwrap();

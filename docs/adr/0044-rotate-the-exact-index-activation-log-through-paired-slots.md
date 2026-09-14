@@ -90,8 +90,8 @@ For an ordinary append below the 64-record bound:
 2. require a clean tail and verify the proposed generation, predecessor hash,
    and increasing Run Set generation;
 3. append the new record and set the slot's exact length;
-4. retain the exact intended slot bytes, whose chain was validated before
-   mutation; standalone activation additionally rereads the target slot; and
+4. validate the new successor against the already validated prefix and extend
+   the owned slot buffer; standalone activation additionally rereads the target slot; and
 5. synchronize that slot.
 
 Step 5 is the sole activation commit point.
@@ -102,7 +102,8 @@ At the bound:
 2. truncate only the inactive slot in the process-visible state;
 3. write the selected last record at offset zero as the bridge;
 4. write the new record immediately after it and set the length to 8 KiB;
-5. retain the exact bridge/successor chain validated before mutation;
+5. move the exact last encoded record into the retained buffer as the bridge
+   and append its validated successor;
    standalone activation additionally rereads the target slot; and
 6. synchronize the inactive slot.
 
@@ -157,3 +158,21 @@ successor activations because one of each
 64 records is the bridge. The record byte format is unchanged. This decision
 does not solve large Exact-Run compaction or index-object garbage collection.
 Repository-wide format-epoch fencing is supplied separately by ADR 0071.
+
+## Bounded online writer work (2026-09-13)
+
+The writer consumes and returns its existing bounded slot snapshot. Appending
+one valid successor does not require copying, rehashing or decoding the whole
+known prefix. Rotation moves the exact last encoded record within that buffer;
+the same allocation can serve later rotations. Only a successful final file
+sync returns the advanced snapshot to the Repository. Every failure discards
+the consumed snapshot, so retry independently reconstructs storage, including
+an effective sync that returned an error. Standalone activation still reads
+back and decodes the target. Recovery and offline audit always validate both
+complete stored chains and their bridge.
+
+The online predecessor lookup also borrows the known selector and reuses its
+matching installed lookup directory without cloning the WAL image or rebuilding
+the same family directory. A selector mismatch retains the independent path.
+Tests compare the moved writer buffer with independent recovery through two
+rotations, and inject failures before/after every activation and rotation I/O.

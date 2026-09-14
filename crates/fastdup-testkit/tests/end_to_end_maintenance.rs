@@ -2270,7 +2270,7 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
     ));
     let pending_reduction = containers
         .with_maintenance_storage(data.clone())
-        .try_pin_reduction_publication()
+        .try_pin_data_reference()
         .expect("admit dependent publication");
     let blocked_proof = maintenance
         .prove_gc_candidates(&current_shortlist, DataPoolUsage::new(50, 100).unwrap())
@@ -2301,7 +2301,7 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
         .expect("replacement and RETIRING transition activate atomically");
     assert_eq!(retirement.victim_containers(), 2);
     assert!(
-        containers.try_pin_reduction_publication().is_none(),
+        containers.try_pin_data_reference().is_none(),
         "RETIRING selects independent fallback without waiting"
     );
     assert!(!retirement.pins_drained());
@@ -2336,7 +2336,7 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
     assert_eq!(report.containers_removed(), 2);
     assert_eq!(report.replacement_containers(), 1);
     assert_eq!(report.chunks_relocated(), 2);
-    assert!(containers.try_pin_reduction_publication().is_some());
+    assert!(containers.try_pin_data_reference().is_some());
     assert_eq!(
         containers
             .audit_published()

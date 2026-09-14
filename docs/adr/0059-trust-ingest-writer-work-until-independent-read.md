@@ -95,11 +95,17 @@ hash or immediate DATA reread is introduced at this writer boundary.
 
 ## One lookup and promotion for online reuse (2026-09-06)
 
-An ingest proof hit finds and marks an Active proof in one Generation critical
-section. A Frozen hit is copied into Active under that same lock before reuse;
-a Historical hit retains ordinary Active admission. Full identity and length,
-combined proof bounds, reuse-origin precedence and lookup/admission trace events
-remain paired. Checkpoint-only lookup retains its separate Frozen semantics.
+Updated 2026-09-13 by ADR 0015: cached historical references are preferences in
+current Exact selection, rather than sufficient physical evidence on their own.
+Ingest and commit-only dependency checks do not reread DATA for a valid ACTIVE
+Exact result. Promotion preserves bounded generation ownership and carries the
+epoch's GC admission through Commit even when individual evidence is rejected.
+The independent demand/recovery/scrub boundary remains unchanged.
+
+An ingest proof hit supplies a preferred Location to current Exact selection.
+Successful selection promotes it to Active; checkpoint-only selection promotes
+it to Frozen. Full identity and length, combined proof bounds, reuse-origin
+precedence and lookup/admission trace events remain paired.
 The resulting external view does not repeat Active admission. Neither this
 promotion nor the cache layout can bypass independent demand/recovery/scrub
 verification.

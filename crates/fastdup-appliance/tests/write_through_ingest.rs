@@ -9,8 +9,8 @@ use fastdup_posix::{
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, GenerationRepository, MaintenanceRepository,
-    PersistentReductionStatus, SeqCdcConfig, SimilarityIndexRepository, StorageIo, TieredStorageIo,
-    seqcdc_cut,
+    PersistentReductionStatus, ReadIntent, ReadIntentScope, SeqCdcConfig,
+    SimilarityIndexRepository, StorageIo, TieredStorageIo, seqcdc_cut,
 };
 use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
 use std::ops::Range;
@@ -1588,6 +1588,102 @@ fn partial_update_rechunks_only_the_affected_recipe_and_recovers_byte_exact() {
     .expect("recover recipe-backed generation")
     .expect("committed generation exists");
     assert_eq!(read_named_all(&recovered, b"recipe-boundary"), expected);
+}
+
+/// A tiny overwrite keeps the old DATA edges as DATA_SLICE recipes. The
+/// checkpoint therefore does not reread the untouched predecessor bytes.
+#[test]
+fn partial_overwrite_preserves_cold_data_edges_without_reads() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let appliance = open_appliance_on(metadata.clone(), data.clone(), MemoryStorageIo::new());
+    let (inode, handle) = create_file(&appliance, b"cold-partial-overwrite");
+    let mut expected = fixture_block();
+
+    write_at(&appliance, inode, handle, 0, &expected);
+    appliance
+        .checkpoint()
+        .expect("initial DATA extent checkpoint succeeds")
+        .expect("initial write creates one committed generation");
+
+    // Keep the predecessor cold: no file read occurs between the two
+    // checkpoints, so any DATA operation in the second window is planner
+    // traffic rather than a frontend read.
+    let before_partial_checkpoint = data.operation_count();
+    let changed_offset = 12_345_u64;
+    write_at(&appliance, inode, handle, changed_offset, b"X");
+    expected[usize::try_from(changed_offset).expect("fixture offset fits usize")] = b'X';
+    let committed = {
+        // Force any accidental predecessor read to reach the DATA storage.
+        // The independent scope also prevents this checkpoint from hiding a
+        // planner read behind the writer's logical-byte cache handoff.
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
+        appliance
+            .checkpoint_profiled()
+            .expect("partial overwrite checkpoint succeeds")
+            .expect("partial overwrite creates one committed generation")
+    };
+
+    let partial_operations = data.operations()[before_partial_checkpoint..].to_vec();
+    let first_publication = partial_operations
+        .iter()
+        .position(|operation| *operation == StorageOperation::CreateNew)
+        .unwrap_or(partial_operations.len());
+    let planner_reads = partial_operations[..first_publication]
+        .iter()
+        .filter(|operation| **operation == StorageOperation::ReadExactAt)
+        .count();
+    eprintln!(
+        "partial overwrite DATA operations: planner_read_exact_at={planner_reads} operations={partial_operations:?} rechunk_bytes={}",
+        committed.metrics().checkpoint_rechunk_bytes()
+    );
+    assert_eq!(
+        planner_reads, 0,
+        "the checkpoint must not read untouched predecessor DATA before publication"
+    );
+    assert!(
+        committed.metrics().checkpoint_rechunk_bytes() <= 1,
+        "tiny overwrite must rechunk only the changed byte: {:?}",
+        committed.metrics()
+    );
+
+    assert_eq!(
+        read_named_all(appliance.namespace(), b"cold-partial-overwrite"),
+        expected
+    );
+
+    // A no-op checkpoint has no new cut and must not create another physical
+    // DATA read; this distinguishes the planner amplification from a generic
+    // read-after-write effect.
+    // The first follow-up retires the sealed publication evidence left by the
+    // partial checkpoint. It is namespace-clean but intentionally still a
+    // lifecycle checkpoint; the second call is the true no-op boundary.
+    appliance
+        .checkpoint_profiled()
+        .expect("publication-evidence checkpoint succeeds");
+    let after_repeat = data.operation_count();
+    assert!(
+        appliance
+            .checkpoint_profiled()
+            .expect("no-op checkpoint succeeds")
+            .is_none()
+    );
+    assert_eq!(data.operation_count(), after_repeat);
+
+    drop(appliance);
+    metadata.crash();
+    data.crash();
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, checkpoint_policy_set()),
+        &ContainerRepository::new(data),
+    )
+    .expect("recover byte-granular partial overwrite")
+    .expect("partial overwrite generation exists");
+    assert_eq!(
+        read_named_all(&recovered, b"cold-partial-overwrite"),
+        expected
+    );
 }
 
 #[test]

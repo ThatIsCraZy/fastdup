@@ -48,6 +48,13 @@ fn metadata_graph_reads_share_owned_bytes_across_read_paths() {
     repo.metadata_cache = Arc::new(crate::metadata_object_cache::MetadataObjectCache::limited(
         1 << 20,
     ));
+    let metadata_reads = || {
+        counters
+            .rows()
+            .iter()
+            .map(|row| row.operations)
+            .sum::<u64>()
+    };
     let layout = ManifestLeaf::new(
         4096,
         vec![ManifestExtent::Fill {
@@ -56,14 +63,26 @@ fn metadata_graph_reads_share_owned_bytes_across_read_paths() {
         }],
     )
     .unwrap();
+    let before_publication = metadata_reads();
     let id = repo.publish_manifest(&layout).unwrap();
+    assert_eq!(
+        metadata_reads(),
+        before_publication,
+        "new metadata publication must not reread its freshly written image"
+    );
+    let before_first_read = metadata_reads();
     let expected = repo.read_manifest_node(id).unwrap();
-    let before: u64 = counters.rows().iter().map(|r| r.operations).sum();
+    assert_eq!(
+        metadata_reads(),
+        before_first_read,
+        "the first read after publication must use the admitted image"
+    );
+    let before = metadata_reads();
     for _ in 0..8 {
         assert_eq!(repo.read_metadata(id).unwrap(), expected);
         assert_eq!(repo.read_manifest_node(id).unwrap(), expected);
     }
-    let after: u64 = counters.rows().iter().map(|r| r.operations).sum();
+    let after = metadata_reads();
     assert_eq!(
         after, before,
         "immutable graph reads must not reach storage again"

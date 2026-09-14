@@ -21,13 +21,15 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         encoded: &[u8],
     ) -> Result<StagedMetadata, GenerationError> {
-        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         if encoded.len() > MAX_METADATA_OBJECT_BYTES {
             return Err(GenerationError::MetadataTooLarge);
         }
         let object_id = MetadataObjectId::from_encoded(encoded)?;
         let published_name = metadata_name(object_id);
         if self.storage.exists(&published_name)? {
+            // An existing image is not evidence from this publication. Verify
+            // collisions independently, even when its object bytes are cached.
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
             let existing = self.storage.read(&published_name)?;
             let existing_id = MetadataObjectId::from_encoded(&existing)?;
             if existing_id != object_id || existing != encoded {
@@ -46,14 +48,15 @@ impl<I: StorageIo> GenerationRepository<I> {
             &temporary_name,
             u64::try_from(encoded.len()).map_err(|_| GenerationError::MetadataTooLarge)?,
         )?;
-        let reread = self.storage.read(&temporary_name)?;
-        if reread != encoded || MetadataObjectId::from_encoded(&reread)? != object_id {
-            return Err(GenerationError::PublishVerificationMismatch);
-        }
         self.storage.sync_file(&temporary_name)?;
         self.storage
             .publish_noreplace(&temporary_name, &published_name)?;
         mark_metadata_gc_unclassified(&self.metadata_gc_epoch, &self.metadata_gc_delta, object_id);
+        // The complete encoder image was validated above. Successful writes,
+        // file sync and no-replace publication carry that image forward without
+        // rereading it. Cache residency is not a Commit/root durability proof;
+        // callers still owe their directory and activation barriers.
+        self.metadata_cache.admit_validated(object_id, encoded);
         Ok(StagedMetadata {
             object_id,
             published_new: true,

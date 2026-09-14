@@ -136,6 +136,19 @@ impl VerifiedChunkPayload {
     pub fn backing_id(&self) -> VerifiedChunkBackingId {
         VerifiedChunkBackingId(self.backing.id())
     }
+    /// Validates logical writer bytes for reuse in the application cache.
+    /// This supplies no physical Record provenance or fresh-media proof.
+    #[must_use]
+    pub fn verify_writer_bytes(chunk_id: ChunkId, bytes: Vec<u8>) -> Option<Self> {
+        if bytes.is_empty()
+            || bytes.len() > crate::MAX_LOGICAL_CHUNK_BYTES
+            || ChunkId::of(&bytes) != chunk_id
+        {
+            return None;
+        }
+        Some(Self::from_owned(chunk_id, bytes))
+    }
+
     pub(super) fn from_owned(chunk_id: ChunkId, bytes: Vec<u8>) -> Self {
         let length = bytes.len();
         Self {

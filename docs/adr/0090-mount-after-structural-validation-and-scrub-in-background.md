@@ -43,9 +43,10 @@ may be inherited after structural startup because their original Commit already
 established durability; this carries no claim that startup rehashed their bytes.
 Physical formats and writer commit barriers do not change.
 
-After mount, one read-only worker fully verifies a snapshot of published
-Containers, including payloads and dependent Bases. It retains at most one
-bounded Container image and verification working buffers, runs at idle I/O and
+After mount, one read-only coordinator fully verifies a snapshot of published
+Containers, including payloads and dependent Bases. ADR 0092's concurrent full
+verification extension supersedes the original single-image worker: up to 32
+I/Os share bounded image groups and retain independent verification. It runs at idle I/O and
 reduced CPU priority, and issues payload reads in at most 256-KiB portions. Saved-round envelope
 reconciliation follows ADR 0092’s separate bounded parallel resume path. Payload pauses adapt
 to measured read time and frontend storage activity: approximately 10% read duty
@@ -67,6 +68,11 @@ latch. Demand reads continue to validate their own data. No automatic rollback,
 repair or object deletion occurs on scrub failure.
 
 ## Recovery Checkpoint publication
+
+Update (2026-09-13): ADR 0020's writer-carried checkpoint validation supersedes
+the immediate copied-image readback described below. Source graph validation,
+per-object identity checks during copying and all durability barriers remain;
+recovery and scrub continue to validate stored bytes independently.
 
 The runtime's periodic DATA-tier Metadata copy uses an exact, pinned committed
 graph and independently verifies the copied objects, graph, image and selector

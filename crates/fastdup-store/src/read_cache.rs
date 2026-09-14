@@ -719,6 +719,41 @@ impl VerifiedReadCache {
 
     // Call only after this exact candidate's complete stored Record, logical
     // bytes and any Base have been verified, never on an unverified Exact hit.
+    /// Offers bounded logical writer bytes after successful publication.
+    /// Uses the common cache budget and never creates physical Location proof.
+    /// Invalid bytes, memory pressure and Scan/Independent intent decline reuse.
+    pub fn admit_writer_chunk(&self, chunk_id: ChunkId, segments: &[&[u8]]) {
+        if crate::read_intent::bypass_admission() {
+            return;
+        }
+        self.maybe_refresh_pressure();
+        if self.target_bytes.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Some(length) = segments
+            .iter()
+            .try_fold(0_usize, |sum, bytes| sum.checked_add(bytes.len()))
+        else {
+            return;
+        };
+        if length == 0
+            || length > fastdup_format::MAX_LOGICAL_CHUNK_BYTES
+            || self.get(chunk_id, length as u64).is_some()
+        {
+            return;
+        }
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(length).is_err() {
+            return;
+        }
+        for segment in segments {
+            bytes.extend_from_slice(segment);
+        }
+        if let Some(payload) = VerifiedChunkPayload::verify_writer_bytes(chunk_id, bytes) {
+            self.admit_decoded_group(vec![payload]);
+        }
+    }
+
     pub(crate) fn admit_verified_location(&self, entry: fastdup_format::ExactIndexEntry) {
         if let Some(cache) = &self.location_proofs {
             cache.insert(
@@ -1193,6 +1228,7 @@ mod compression_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ReadIntent, ReadIntentScope};
 
     fn linear_groups(groups: Vec<Vec<VerifiedChunkPayload>>) -> Vec<Vec<VerifiedChunkPayload>> {
         let mut merged: Vec<Vec<VerifiedChunkPayload>> = Vec::new();
@@ -1280,6 +1316,77 @@ mod tests {
         fastdup_format::RawRecord::decode(&encoded)
             .expect("decode and verify fixture Record")
             .into_verified_payload()
+    }
+
+    #[test]
+    fn writer_admission_reuses_logical_bytes_without_location_proof_or_independent_bypass() {
+        let cache = VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(
+                2 * 1_024 * 1_024,
+                0,
+                NonZeroUsize::new(2).expect("two cache shards"),
+            )
+            .expect("valid writer admission cache geometry"),
+            MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 4 * 1_024 * 1_024, 0),
+        )
+        .expect("construct writer admission cache");
+        let bytes = b"writer-owned logical bytes".repeat(4_096);
+        let chunk_id = ChunkId::of(&bytes);
+        let split = 37;
+
+        cache.admit_writer_chunk(chunk_id, &[&bytes[..split], &bytes[split..]]);
+        assert_eq!(
+            cache.get(
+                chunk_id,
+                u64::try_from(bytes.len()).expect("fixture length fits u64")
+            ),
+            Some(verified_payload(&bytes)),
+            "published writer bytes must be available to the first demand reader"
+        );
+        assert_eq!(
+            cache.status().location_proofs().entries,
+            0,
+            "logical writer bytes cannot mint physical Location evidence"
+        );
+
+        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
+        assert_eq!(
+            cache.get(
+                chunk_id,
+                u64::try_from(bytes.len()).expect("fixture length fits u64")
+            ),
+            None,
+            "Independent verification must bypass writer admission"
+        );
+    }
+
+    #[test]
+    fn writer_admission_rejects_mismatched_bytes_and_non_demand_intents() {
+        let cache = VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(
+                2 * 1_024 * 1_024,
+                0,
+                NonZeroUsize::new(2).expect("two cache shards"),
+            )
+            .expect("valid writer admission cache geometry"),
+            MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 4 * 1_024 * 1_024, 0),
+        )
+        .expect("construct writer admission cache");
+        let bytes = b"writer admission must validate its content identity".to_vec();
+        let chunk_id = ChunkId::of(&bytes);
+        let wrong_id = ChunkId::of(b"different bytes");
+
+        cache.admit_writer_chunk(wrong_id, &[&bytes]);
+        assert_eq!(cache.status().entry_count(), 0);
+        {
+            let _scan = ReadIntentScope::enter(ReadIntent::Scan);
+            cache.admit_writer_chunk(chunk_id, &[&bytes]);
+        }
+        assert_eq!(
+            cache.status().entry_count(),
+            0,
+            "Scan work must not populate the reusable cache"
+        );
     }
 
     #[test]

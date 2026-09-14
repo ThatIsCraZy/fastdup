@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
+mod admission_telemetry;
+use admission_telemetry::AdmissionTelemetry;
+pub use admission_telemetry::{AdmissionPauseReason, AdmissionStatus};
+
 mod fuse_adapter;
 mod inode_metadata;
 mod logical_quota;
@@ -2602,6 +2606,7 @@ pub struct Namespace {
     config: NamespaceConfig,
     mutations_supported: bool,
     mutations_admitted: RwLock<bool>,
+    admission_telemetry: AdmissionTelemetry,
     integrity_failed: AtomicBool,
     admission_changed: Notify,
     dirty_payload: DirtyPayloadTracker,
@@ -2667,6 +2672,7 @@ impl Namespace {
             config,
             mutations_supported: true,
             mutations_admitted: RwLock::new(true),
+            admission_telemetry: AdmissionTelemetry::new(true),
             integrity_failed: AtomicBool::new(false),
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
@@ -2934,6 +2940,7 @@ impl Namespace {
             config,
             mutations_supported: mutations_enabled,
             mutations_admitted: RwLock::new(mutations_enabled),
+            admission_telemetry: AdmissionTelemetry::new(mutations_enabled),
             integrity_failed: AtomicBool::new(false),
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
@@ -2969,10 +2976,26 @@ impl Namespace {
     ///
     /// Panics when a prior impossible invariant poisoned the admission lock.
     pub fn pause_mutation_admission(&self) {
-        *self
+        self.pause_mutation_admission_for(AdmissionPauseReason::Unspecified);
+    }
+
+    /// Pauses mutation admission and records the diagnostic reason.
+    ///
+    /// # Panics
+    /// Panics if an earlier invariant failure poisoned the admission lock.
+    pub fn pause_mutation_admission_for(&self, reason: AdmissionPauseReason) {
+        let mut admitted = self
             .mutations_admitted
             .write()
-            .expect("ASSERT: mutation admission lock poisoned") = false;
+            .expect("ASSERT: mutation admission lock poisoned");
+        *admitted = false;
+        self.admission_telemetry.set(false, reason);
+    }
+
+    /// Reads transition counters without waiting for a Namespace commit fence.
+    #[must_use]
+    pub fn admission_status(&self) -> AdmissionStatus {
+        self.admission_telemetry.snapshot()
     }
 
     /// Latches an integrity failure for this mount. New mutations fail with I/O
@@ -2987,6 +3010,8 @@ impl Namespace {
             .expect("mutation admission lock");
         self.integrity_failed.store(true, Ordering::Release);
         *admitted = false;
+        self.admission_telemetry
+            .set(false, AdmissionPauseReason::IntegrityFailure);
         drop(admitted);
         self.admission_changed.notify_waiters();
     }
@@ -3011,6 +3036,8 @@ impl Namespace {
             .write()
             .expect("ASSERT: mutation admission lock poisoned");
         *admitted = !self.integrity_failed();
+        self.admission_telemetry
+            .set(*admitted, AdmissionPauseReason::IntegrityFailure);
         drop(admitted);
         self.admission_changed.notify_waiters();
     }

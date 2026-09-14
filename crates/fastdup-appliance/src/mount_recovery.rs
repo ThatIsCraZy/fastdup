@@ -37,7 +37,10 @@ fn check_directory(
     if directory {
         Ok(())
     } else {
-        Err(io::Error::new(io::ErrorKind::InvalidInput, "mount path is not a directory"))
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mount path is not a directory",
+        ))
     }
 }
 
@@ -49,28 +52,54 @@ mod tests {
     fn only_a_disconnected_mount_is_detached_and_rechecked() {
         let mut inspections = 0;
         let mut detached = false;
-        check_directory(|| {
-            inspections += 1;
-            if inspections == 1 { Err(io::Error::from_raw_os_error(107)) } else { Ok(true) }
-        }, || { detached = true; Ok(()) }).unwrap();
+        check_directory(
+            || {
+                inspections += 1;
+                if inspections == 1 {
+                    Err(io::Error::from_raw_os_error(107))
+                } else {
+                    Ok(true)
+                }
+            },
+            || {
+                detached = true;
+                Ok(())
+            },
+        )
+        .unwrap();
         assert!(detached);
         assert_eq!(inspections, 2);
-        for initial in [Ok(true), Ok(false), Err(io::Error::from(io::ErrorKind::PermissionDenied)), Err(io::Error::from(io::ErrorKind::NotFound))] {
+        for initial in [
+            Ok(true),
+            Ok(false),
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            Err(io::Error::from(io::ErrorKind::NotFound)),
+        ] {
             let expected_success = matches!(initial, Ok(true));
             let mut initial = Some(initial);
-            let result = check_directory(|| initial.take().unwrap(), || panic!("must not detach a live mount or unrelated path"));
+            let result = check_directory(
+                || initial.take().unwrap(),
+                || panic!("must not detach a live mount or unrelated path"),
+            );
             assert_eq!(result.is_ok(), expected_success);
         }
     }
 
     #[test]
     fn failed_detach_or_still_disconnected_mount_cannot_start() {
-        assert!(check_directory(
-            || Err(io::Error::from(io::ErrorKind::NotConnected)),
-            || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
-        ).is_err());
-        assert!(check_directory(
-            || Err(io::Error::from(io::ErrorKind::NotConnected)), || Ok(()),
-        ).is_err());
+        assert!(
+            check_directory(
+                || Err(io::Error::from(io::ErrorKind::NotConnected)),
+                || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            )
+            .is_err()
+        );
+        assert!(
+            check_directory(
+                || Err(io::Error::from(io::ErrorKind::NotConnected)),
+                || Ok(()),
+            )
+            .is_err()
+        );
     }
 }

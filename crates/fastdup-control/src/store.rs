@@ -538,7 +538,9 @@ impl TelemetryStore {
             let mut sample: TelemetrySnapshot = serde_json::from_str(&row?)?;
             // Old history used ingest counters for this field. Reconstruct
             // occupancy from the sample itself; never display that old ratio.
-            sample.reduction_ratio = sample.storage_usage.as_deref()
+            sample.reduction_ratio = sample
+                .storage_usage
+                .as_deref()
                 .and_then(crate::StorageUsageTelemetry::reduction_ratio);
             result.push(sample);
         }
@@ -652,8 +654,8 @@ impl TelemetryAverage {
         self.latest.frontend_read_mbps = self.sums[0] / count;
         self.latest.frontend_write_mbps = self.sums[1] / count;
         self.latest.dedup_rate = self.sums[2] / count;
-        self.latest.reduction_ratio = (self.reduction_count != 0)
-            .then(|| self.sums[3] / self.reduction_count as f64);
+        self.latest.reduction_ratio =
+            (self.reduction_count != 0).then(|| self.sums[3] / self.reduction_count as f64);
         self.latest.cpu_percent = self.sums[4] / count;
         self.latest.ram_percent = self.sums[5] / count;
         self.latest
@@ -741,14 +743,28 @@ mod tests {
         let sample = TelemetrySnapshot {
             reduction_ratio: Some(14_959.0),
             storage_usage: Some(Box::new(crate::StorageUsageTelemetry {
-                logical_allocated_bytes: Some(800), data_used_bytes: Some(90),
-                metadata_used_bytes: Some(10), ..crate::StorageUsageTelemetry::default()
-            })), ..TelemetrySnapshot::default()
+                logical_allocated_bytes: Some(800),
+                data_used_bytes: Some(90),
+                metadata_used_bytes: Some(10),
+                ..crate::StorageUsageTelemetry::default()
+            })),
+            ..TelemetrySnapshot::default()
         };
         store.insert(100, &sample).unwrap();
-        assert_eq!(store.query(100,100,1).unwrap()[0].reduction_ratio, Some(8.0));
-        store.insert(101, &TelemetrySnapshot { storage_usage: None, ..sample }).unwrap();
-        assert_eq!(store.query(101,101,1).unwrap()[0].reduction_ratio, None);
+        assert_eq!(
+            store.query(100, 100, 1).unwrap()[0].reduction_ratio,
+            Some(8.0)
+        );
+        store
+            .insert(
+                101,
+                &TelemetrySnapshot {
+                    storage_usage: None,
+                    ..sample
+                },
+            )
+            .unwrap();
+        assert_eq!(store.query(101, 101, 1).unwrap()[0].reduction_ratio, None);
     }
 
     #[test]

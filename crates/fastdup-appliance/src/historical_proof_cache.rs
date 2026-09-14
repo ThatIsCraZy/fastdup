@@ -22,12 +22,12 @@ const EFFECTIVE_RAM_DIVISOR: u64 = 50;
 const REFRESH_MILLIS: u64 = 250;
 const NONE: u32 = u32::MAX;
 
-/// How a fully verified historical proof entered the cache.
+/// How a committed online dependency entered the common historical cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HistoricalProofAdmission {
     /// A newly published Chunk starts in S3-FIFO Small probation.
     Published,
-    /// A physically reverified Exact reuse enters Main immediately.
+    /// A selected Exact reuse enters Main immediately; this is not payload proof.
     ExactReuse,
 }
 

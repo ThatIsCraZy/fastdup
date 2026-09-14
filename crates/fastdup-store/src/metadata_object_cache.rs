@@ -49,6 +49,26 @@ impl MetadataObjectCache {
         });
     }
 
+    /// Offer a successfully published image whose full encoded identity the
+    /// caller has already validated. This conveys bytes, never durability or
+    /// liveness authority. Scan/Independent intent and pressure may decline it.
+    pub(crate) fn admit_validated(&self, id: MetadataObjectId, encoded: &[u8]) {
+        if crate::read_intent::bypass_admission() {
+            return;
+        }
+        let bytes = encoded.to_vec();
+        let charge = (bytes.capacity() + size_of::<Vec<u8>>()) as u64;
+        self.cache.insert(
+            ReadCacheKey {
+                identity: id.bytes(),
+                ordinal: 0,
+            },
+            Arc::new(bytes),
+            charge,
+            encoded.len() as u64,
+        );
+    }
+
     #[cfg(test)]
     pub(crate) fn limited(target: u64) -> Self {
         Self {

@@ -109,7 +109,10 @@ For the highest complete candidate, publication:
 1. writes a same-directory `.building` file from length zero;
 2. writes the Commit and sorted Metadata entries incrementally;
 3. writes the authenticated header and footer and fixes the file length;
-4. independently rereads the entire file, exact graph, and required DATA;
+4. carries validation from the pinned source graph: every emitted object must
+   hash to its selected identity, with checksums and lengths computed while
+   writing; explicit full publication verifies required DATA against the source
+   graph once, while committed publication inherits its DATA durability;
 5. syncs the temporary file, publishes it without replacement, and syncs the
    DATA directory;
 6. overwrites only the inactive head, rereads it exactly, and syncs that head;
@@ -119,6 +122,11 @@ For the highest complete candidate, publication:
 Only step 6 changes selection authority. Every fail-before/fail-after point
 therefore recovers either the preceding selection or one complete new
 checkpoint. The current and previous selected files are retained.
+
+New images are not reread during publication. Existing published files found
+on retry or no-replace collision still require stored-byte validation; a racing
+image must match the writer descriptor. Recovery and scrub below remain
+independent of writer-carried validation. This changes no serialized fields.
 
 ## Recovery and scrub
 

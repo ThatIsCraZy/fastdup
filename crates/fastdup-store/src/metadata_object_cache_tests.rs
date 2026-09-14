@@ -110,3 +110,73 @@ fn concurrent_admission_charges_one_identity_and_survives_invalidation() {
     cache.invalidate(id);
     assert_eq!(cache.cache.stats().resident_bytes, 0);
 }
+
+#[test]
+fn validated_admission_obeys_intent_capacity_and_invalidation() {
+    let (id, bytes) = object(4);
+    let cache = MetadataObjectCache::limited(1 << 20);
+
+    cache.admit_validated(id, &bytes);
+    assert_eq!(
+        *cache
+            .read(id, || panic!(
+                "a demand admission must be immediately readable"
+            ))
+            .unwrap(),
+        bytes
+    );
+
+    cache.invalidate(id);
+    let reads = std::cell::Cell::new(0);
+    assert_eq!(
+        *cache
+            .read(id, || {
+                reads.set(reads.get() + 1);
+                Ok(bytes.clone())
+            })
+            .unwrap(),
+        bytes
+    );
+    assert_eq!(reads.get(), 1);
+
+    cache.invalidate(id);
+    {
+        let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
+        cache.admit_validated(id, &bytes);
+    }
+    assert!(
+        cache
+            .read(id, || {
+                reads.set(reads.get() + 1);
+                Ok(bytes.clone())
+            })
+            .is_ok()
+    );
+    assert_eq!(reads.get(), 2, "Scan admission must be declined");
+
+    cache.invalidate(id);
+    {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        cache.admit_validated(id, &bytes);
+    }
+    assert!(
+        cache
+            .read(id, || {
+                reads.set(reads.get() + 1);
+                Ok(bytes.clone())
+            })
+            .is_ok()
+    );
+    assert_eq!(reads.get(), 3, "Independent admission must be declined");
+
+    let zero = MetadataObjectCache::limited(0);
+    zero.admit_validated(id, &bytes);
+    assert!(
+        zero.read(id, || {
+            reads.set(reads.get() + 1);
+            Ok(bytes.clone())
+        })
+        .is_ok()
+    );
+    assert_eq!(reads.get(), 4, "zero capacity must reject admission");
+}

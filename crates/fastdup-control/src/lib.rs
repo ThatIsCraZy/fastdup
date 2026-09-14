@@ -11,19 +11,19 @@
 //! retains only operator configuration, rebuildable observations, and jobs.
 
 mod auth;
-mod control;
-mod runtime_health;
-mod detail_telemetry;
 mod cache_window;
-mod inventory;
+mod control;
+mod detail_telemetry;
 mod firewall;
+mod inventory;
+mod runtime_health;
 mod samba;
 mod samba_users;
 pub use samba_users::SambaUserRequest;
+mod pfx;
 mod store;
 mod telemetry;
 mod tls;
-mod pfx;
 pub use pfx::decode_pfx;
 
 pub use auth::{AuthError, AuthenticatedSession, LoginResult, SessionManager, WebUser};
@@ -68,9 +68,15 @@ impl RuntimeIssue {
     pub(crate) const fn message(self) -> &'static str {
         match self {
             Self::Unavailable => "Repository-Mount fehlt oder der Runtime-Prozess ist beendet.",
-            Self::ProcessExited => "Repository-Runtime ist abgestürzt. Details stehen unter Ereignisse.",
-            Self::WriteBlocked => "Repository wartet auf dauerhaften Fortschritt. Neue Schreibzugriffe sind pausiert.",
-            Self::IntegrityFailed => "Repository hat einen Integritätsfehler erkannt. Schreibzugriffe sind gesperrt.",
+            Self::ProcessExited => {
+                "Repository-Runtime ist abgestürzt. Details stehen unter Ereignisse."
+            }
+            Self::WriteBlocked => {
+                "Repository wartet auf dauerhaften Fortschritt. Neue Schreibzugriffe sind pausiert."
+            }
+            Self::IntegrityFailed => {
+                "Repository hat einen Integritätsfehler erkannt. Schreibzugriffe sind gesperrt."
+            }
         }
     }
 }
@@ -320,7 +326,9 @@ impl StorageUsageTelemetry {
     #[must_use]
     pub fn reduction_ratio(&self) -> Option<f64> {
         let logical = self.logical_allocated_bytes?;
-        let physical = self.metadata_used_bytes?.checked_add(self.data_used_bytes?)?;
+        let physical = self
+            .metadata_used_bytes?
+            .checked_add(self.data_used_bytes?)?;
         (physical != 0).then(|| logical as f64 / physical as f64)
     }
 }
@@ -467,7 +475,9 @@ pub struct AgentRequest {
 pub enum AgentOperation {
     Inspect,
     SambaUsers,
-    CreateSambaUser { request: SambaUserRequest },
+    CreateSambaUser {
+        request: SambaUserRequest,
+    },
     Submit {
         command: Command,
         idempotency_key: String,

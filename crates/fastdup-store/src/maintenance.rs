@@ -603,7 +603,7 @@ where
     ) -> Result<GcCandidateProof, MaintenanceError> {
         let exact = self
             .indexes
-            .recover_active()?
+            .pin_online_generation()?
             .ok_or(MaintenanceError::GcProofRequiresActiveExactIndex)?;
         if exact.record().profile() != self.exact_profile {
             return Err(MaintenanceError::ExactProfileMismatch);
@@ -791,7 +791,7 @@ where
         }
         let exact = self
             .indexes
-            .recover_active()?
+            .pin_online_generation()?
             .ok_or(MaintenanceError::GcProofRequiresActiveExactIndex)?;
         if exact.record().profile() != self.exact_profile {
             return Err(MaintenanceError::ExactProfileMismatch);
@@ -967,7 +967,7 @@ where
         };
         let phase_started = Instant::now();
         self.check_cancellation()?;
-        self.finalize_recovered_online_gc()?;
+        self.finalize_online_gc(false)?;
         metrics.recovery_wall = phase_started.elapsed();
         let phase_started = Instant::now();
         self.check_cancellation()?;
@@ -1166,7 +1166,7 @@ where
         }
         let _exact = self
             .indexes
-            .recover_active()?
+            .pin_online_generation()?
             .filter(|active| active.record() == exact_activation)
             .ok_or(MaintenanceError::StaleGcPlan)?;
         let replacements = self.publish_gc_replacements_using(
@@ -1246,12 +1246,12 @@ where
     where
         X: Send + Sync + 'static,
     {
-        // Cheap preflight avoids speculative replacement I/O while a new
-        // dependent target is still being published. Rechecked atomically
+        // Cheap preflight avoids speculative replacement I/O while a writer
+        // introduces DATA references. Rechecked atomically
         // under the selection barrier immediately before RETIRING activation.
         if self
             .containers
-            .reduction_publications
+            .data_references
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
         {
@@ -1286,7 +1286,7 @@ where
         }
         let _exact = self
             .indexes
-            .recover_active_generation()?
+            .pin_online_generation()?
             .filter(|active| active.record() == exact_activation)
             .ok_or(MaintenanceError::StaleGcPlan)?;
         let mut retiring_entries = Vec::new();
@@ -1448,7 +1448,22 @@ where
     where
         X: Send + Sync + 'static,
     {
-        let Some(active) = self.indexes.recover_active_generation()? else {
+        self.finalize_online_gc(true)
+    }
+
+    fn finalize_online_gc(
+        &self,
+        independent: bool,
+    ) -> Result<OnlineGcRecoveryReport, MaintenanceError>
+    where
+        X: Send + Sync + 'static,
+    {
+        let active = if independent {
+            self.indexes.recover_active_generation()?
+        } else {
+            self.indexes.pin_online_generation()?
+        };
+        let Some(active) = active else {
             return Ok(OnlineGcRecoveryReport::default());
         };
         if active.record().profile() != self.exact_profile {
@@ -1498,7 +1513,7 @@ where
     ) -> Result<bool, MaintenanceError> {
         Ok(self
             .indexes
-            .recover_active()?
+            .pin_online_generation()?
             .is_some_and(|active| active.record() == expected))
     }
 

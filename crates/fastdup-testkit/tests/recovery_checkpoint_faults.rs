@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
+use std::io;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use fastdup_format::{
-    ChunkId, DurableInode, DurableXattr, ManifestExtent, ManifestLeaf, NamespaceEntry,
+    ChunkId, ContainerId, DurableInode, DurableXattr, ManifestExtent, ManifestLeaf, NamespaceEntry,
     NamespaceRoot, PolicySetId,
 };
 use fastdup_store::{
@@ -13,6 +16,104 @@ use fastdup_store::{
     StorageIo, StoreError,
 };
 use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
+
+#[derive(Clone, Debug)]
+struct ReadRecordingStorage {
+    inner: MemoryStorageIo,
+    reads: Arc<Mutex<Vec<(StorageOperation, String)>>>,
+}
+
+impl ReadRecordingStorage {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStorageIo::new(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn read_names(&self) -> Vec<(StorageOperation, String)> {
+        self.reads
+            .lock()
+            .expect("read recording lock is valid")
+            .clone()
+    }
+
+    fn crash(&self) {
+        self.inner.crash();
+    }
+
+    fn record_read(&self, operation: StorageOperation, name: &str) {
+        self.reads
+            .lock()
+            .expect("read recording lock is valid")
+            .push((operation, name.to_owned()));
+    }
+}
+
+impl StorageIo for ReadRecordingStorage {
+    fn create_new(&self, name: &str) -> io::Result<()> {
+        self.inner.create_new(name)
+    }
+
+    fn exists(&self, name: &str) -> io::Result<bool> {
+        self.inner.exists(name)
+    }
+
+    fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.inner.write_at(name, offset, bytes)
+    }
+
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        self.record_read(StorageOperation::Read, name);
+        self.inner.read(name)
+    }
+
+    fn object_len(&self, name: &str) -> io::Result<u64> {
+        self.inner.object_len(name)
+    }
+
+    fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.record_read(StorageOperation::ReadExactAt, name);
+        self.inner.read_exact_at(name, offset, length)
+    }
+
+    fn list_names(&self) -> io::Result<Vec<String>> {
+        self.inner.list_names()
+    }
+
+    fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
+        self.inner.set_len(name, length)
+    }
+
+    fn sync_file(&self, name: &str) -> io::Result<()> {
+        self.inner.sync_file(name)
+    }
+
+    fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
+        self.inner.publish_noreplace(temporary_name, published_name)
+    }
+
+    fn remove_file(&self, name: &str) -> io::Result<()> {
+        self.inner.remove_file(name)
+    }
+
+    fn sync_root(&self) -> io::Result<()> {
+        self.inner.sync_root()
+    }
+}
+
+#[derive(Debug)]
+struct CountingRequiredChunkVerifier<I> {
+    containers: ContainerRepository<I>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl<I: StorageIo> RequiredChunkVerifier for CountingRequiredChunkVerifier<I> {
+    fn verify_required_chunks(&self, required: &BTreeMap<ChunkId, u64>) -> Result<(), StoreError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        RequiredChunkVerifier::verify_required_chunks(&self.containers, required)
+    }
+}
 
 #[derive(Debug)]
 struct AcceptAllRequiredChunks;
@@ -100,7 +201,18 @@ fn seed_source() -> (
     fastdup_format::CommitRecord,
     NamespaceRoot,
 ) {
+    let (source, committed, namespace, _metadata) = seed_source_with_storage();
+    (source, committed, namespace)
+}
+
+fn seed_source_with_storage() -> (
+    GenerationRepository<MemoryStorageIo>,
+    fastdup_format::CommitRecord,
+    NamespaceRoot,
+    MemoryStorageIo,
+) {
     let metadata = MemoryStorageIo::new();
+    let source_metadata = metadata.clone();
     let source = GenerationRepository::new(metadata, policy());
     source
         .commit_namespace(&reservation_root())
@@ -119,7 +231,7 @@ fn seed_source() -> (
     let committed = source
         .commit_namespace(&namespace)
         .expect("commit source generation");
-    (source, committed, namespace)
+    (source, committed, namespace, source_metadata)
 }
 
 #[test]
@@ -152,6 +264,244 @@ fn metadata_tier_loss_recovers_the_latest_self_contained_checkpoint() {
         .expect("the restored Commit anchor is durable");
     assert_eq!(reopened.record(), committed);
     assert_eq!(reopened.namespace_root(), &namespace);
+}
+
+#[test]
+fn independent_new_checkpoint_is_not_read_back_and_recovers_after_crash() {
+    let metadata = MemoryStorageIo::new();
+    let source = GenerationRepository::new(metadata, policy());
+    source
+        .commit_namespace(&reservation_root())
+        .expect("reserve inode identities before visibility");
+
+    let payload = b"checkpoint DATA payload";
+    let chunk_id = ChunkId::of(payload);
+    let containers = ContainerRepository::new(MemoryStorageIo::new());
+    containers
+        .publish_raw(
+            ContainerId::new([0xa4; 16]).expect("fixture Container ID is nonzero"),
+            1,
+            &[payload],
+        )
+        .expect("publish the source DATA Container");
+    let manifest = ManifestLeaf::new(
+        u64::try_from(payload.len()).expect("fixture payload length fits u64"),
+        vec![ManifestExtent::Data {
+            logical_length: u64::try_from(payload.len()).expect("fixture length fits u64"),
+            chunk_id,
+        }],
+    )
+    .expect("DATA Manifest is valid");
+    let manifest_root = source
+        .publish_manifest(&manifest)
+        .expect("publish source DATA Manifest");
+
+    // Keep enough metadata in the Namespace graph to force multiple checkpoint
+    // write batches. The checkpoint path must not hide a fresh-image readback
+    // behind the small fixture case.
+    let value = vec![0x5a; 60 * 1_024];
+    let mut inodes = Vec::new();
+    let mut entries = Vec::new();
+    for ordinal in 0_u64..64 {
+        let inode = ordinal + 2;
+        inodes.push(
+            DurableInode::new_with_metadata(
+                inode,
+                0o600,
+                1_000,
+                1_000,
+                1,
+                ordinal + 1,
+                u64::try_from(payload.len()).expect("fixture length fits u64"),
+                manifest_root,
+                0,
+                vec![
+                    DurableXattr::new(b"user.large".to_vec(), value.clone())
+                        .expect("fixture xattr is valid"),
+                ],
+            )
+            .expect("large DATA-backed Namespace inode"),
+        );
+        entries.push(
+            NamespaceEntry::new(1, inode, format!("file-{ordinal:04}").into_bytes())
+                .expect("Namespace entry is valid"),
+        );
+    }
+    let namespace = NamespaceRoot::new(1_024, 66, 64, inodes, entries)
+        .expect("large sharded Namespace graph is valid");
+    let committed = source
+        .commit_namespace_with_verified_files_using(&namespace, &containers, &containers)
+        .expect("commit DATA-backed Namespace graph")
+        .record();
+
+    let destination = ReadRecordingStorage::new();
+    let checkpoints = RecoveryCheckpointRepository::new(destination.clone());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let verifier = CountingRequiredChunkVerifier {
+        containers: containers.clone(),
+        calls: Arc::clone(&verifier_calls),
+    };
+    let _independent =
+        fastdup_store::ReadIntentScope::enter(fastdup_store::ReadIntent::Independent);
+    let summary = checkpoints
+        .publish(&source, &verifier)
+        .expect("publish the new checkpoint under Independent intent")
+        .expect("one committed source generation exists");
+    assert!(
+        summary.file_length() > 2 * 1024 * 1024,
+        "fixture must exercise multiple checkpoint write batches"
+    );
+    assert_eq!(summary.required_chunk_count(), 1);
+    assert_eq!(
+        verifier_calls.load(Ordering::Relaxed),
+        1,
+        "explicit publication verifies the pinned source DATA graph once"
+    );
+    let checkpoint_reads = destination
+        .read_names()
+        .into_iter()
+        .filter(|(_, name)| name.contains(".fdrc"))
+        .collect::<Vec<_>>();
+    assert!(
+        checkpoint_reads.is_empty(),
+        "publication must not read back a fresh checkpoint image: {checkpoint_reads:?}"
+    );
+    drop(_independent);
+
+    destination.crash();
+    let replacement = GenerationRepository::new(MemoryStorageIo::new(), policy());
+    let recovered = checkpoints
+        .recover_latest(&replacement, &containers)
+        .expect("recover the durable checkpoint after a crash")
+        .expect("the complete checkpoint remains selected after a crash");
+    assert_eq!(recovered.record(), committed);
+    assert_eq!(recovered.namespace_root(), &namespace);
+}
+
+#[test]
+fn unchanged_committed_checkpoint_reuses_receipt_without_graph_or_destination_io() {
+    let (source, committed, _namespace, source_metadata) = seed_source_with_storage();
+    let data = MemoryStorageIo::new();
+    let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+
+    let first = checkpoints
+        .publish_committed(&source)
+        .expect("publish the initial committed checkpoint")
+        .expect("the source has one committed generation");
+    assert_eq!(first.generation(), committed.generation());
+
+    let source_before = source_metadata.operation_count();
+    let destination_before = data.operation_count();
+    let repeated = checkpoints
+        .publish_committed(&source)
+        .expect("reuse an unchanged committed checkpoint")
+        .expect("the receipt remains available");
+
+    assert_eq!(repeated, first);
+    assert_eq!(
+        data.operation_count(),
+        destination_before,
+        "an unchanged receipt must avoid all destination checkpoint I/O"
+    );
+    // Candidate selection still validates the source Commit/WAL boundary. The
+    // receipt must short-circuit before the Namespace/Manifest graph walk,
+    // which would otherwise add complete-object reads here.
+    assert_eq!(
+        &source_metadata.operations()[source_before..],
+        &[
+            StorageOperation::ObjectLen,
+            StorageOperation::Read,
+            StorageOperation::ObjectLen,
+            StorageOperation::Read,
+        ],
+        "only the two source WAL slots are checked; the Namespace/Manifest graph is not walked"
+    );
+}
+
+#[test]
+fn a_new_commit_invalidates_the_checkpoint_receipt_and_publishes_again() {
+    let (source, first_record, namespace, _source_metadata) = seed_source_with_storage();
+    let data = MemoryStorageIo::new();
+    let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+    checkpoints
+        .publish_committed(&source)
+        .expect("publish the initial committed checkpoint")
+        .expect("the source has one committed generation");
+
+    let committed = source
+        .commit_namespace(&namespace)
+        .expect("publish a new Commit Record for the same visible graph");
+    assert!(committed.generation() > first_record.generation());
+    let destination_before = data.operation_count();
+    let published = checkpoints
+        .publish_committed(&source)
+        .expect("publish the changed committed checkpoint")
+        .expect("the new generation has a checkpoint");
+
+    assert_eq!(published.generation(), committed.generation());
+    assert!(
+        data.operation_count() > destination_before,
+        "a changed Commit Record must not reuse the old checkpoint receipt"
+    );
+}
+
+#[test]
+fn independent_scrub_invalidates_the_online_checkpoint_receipt() {
+    let (source, _committed, _namespace) = seed_source();
+    let data = MemoryStorageIo::new();
+    let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+    checkpoints
+        .publish_committed(&source)
+        .expect("publish the initial committed checkpoint")
+        .expect("the source has one committed generation");
+
+    checkpoints
+        .scrub(&AcceptAllRequiredChunks)
+        .expect("independently scrub the retained checkpoint");
+    let before_republish = data.operation_count();
+    checkpoints
+        .publish_committed(&source)
+        .expect("republish after independent scrub")
+        .expect("the source still has one committed generation");
+
+    assert!(
+        data.operation_count() > before_republish,
+        "independent scrub must revoke the receipt and force fresh destination validation"
+    );
+}
+
+#[test]
+fn failed_independent_recovery_invalidates_the_online_checkpoint_receipt() {
+    let (source, committed, _namespace) = seed_source();
+    let data = MemoryStorageIo::new();
+    let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+    checkpoints
+        .publish_committed(&source)
+        .expect("publish the initial committed checkpoint")
+        .expect("the source has one committed generation");
+    data.inject_durable_torn_write(
+        &format!("recovery-checkpoint.{:016x}.fdrc", committed.generation()),
+        0,
+    )
+    .expect("inject a durable checkpoint truncation");
+    data.crash();
+
+    let replacement = GenerationRepository::new(MemoryStorageIo::new(), policy());
+    assert!(
+        checkpoints
+            .recover_latest(&replacement, &AcceptAllRequiredChunks)
+            .is_err(),
+        "independent recovery must report the torn checkpoint"
+    );
+    let before_retry = data.operation_count();
+    assert!(
+        checkpoints.publish_committed(&source).is_err(),
+        "the torn checkpoint cannot be reused as a successful receipt"
+    );
+    assert!(
+        data.operation_count() > before_retry,
+        "an independent recovery error must revoke the receipt before retry"
+    );
 }
 
 #[test]

@@ -43,73 +43,73 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
 
     pub(crate) fn append(
         &self,
-        snapshot: &ActivationLogSnapshot,
+        mut snapshot: ActivationLogSnapshot,
         record: ExactIndexActivationRecord,
         verify_storage: bool,
     ) -> Result<ActivationLogSnapshot, ExactActivationLogError> {
         if snapshot.tail != ActivationLogTail::Clean {
             return Err(ExactActivationLogError::NeedsRepair);
         }
-        verify_successor(snapshot, record)?;
+        verify_successor(&snapshot, record)?;
 
+        // This snapshot was independently decoded on open or advanced after a
+        // successful sync. Validate only the successor, then move the existing
+        // bounded slot buffer forward; do not rehash/decode its old prefix.
         let encoded_record = record.encode();
-        let (target_slot, expected) = if snapshot.record_count() >= MAX_SLOT_RECORDS {
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(2 * EXACT_INDEX_ACTIVATION_RECORD_BYTES)
-                .map_err(|_| ExactActivationLogError::OutOfMemory)?;
-            bytes.extend_from_slice(
-                snapshot
-                    .last_encoded()
-                    .ok_or(ExactActivationLogError::EmptyAfterInitialization)?,
-            );
-            bytes.extend_from_slice(&encoded_record);
-            (1 - snapshot.active_slot, bytes)
-        } else {
-            let mut bytes = snapshot.bytes.clone();
-            bytes
-                .try_reserve_exact(EXACT_INDEX_ACTIVATION_RECORD_BYTES)
-                .map_err(|_| ExactActivationLogError::OutOfMemory)?;
-            bytes.extend_from_slice(&encoded_record);
-            (snapshot.active_slot, bytes)
-        };
-
-        // Validate our exact intended chain before submitting any mutation.
-        // An online owner advances this state only after the final sync succeeds.
-        let next = decode_slot(target_slot, expected.clone())?;
-        if next.tail != ActivationLogTail::Clean {
-            return Err(ExactActivationLogError::PublishVerificationMismatch);
+        let append_offset = snapshot.bytes.len();
+        let rotating = snapshot.record_count() >= MAX_SLOT_RECORDS;
+        snapshot
+            .bytes
+            .try_reserve_exact(MAX_SLOT_BYTES - snapshot.bytes.len())
+            .map_err(|_| ExactActivationLogError::OutOfMemory)?;
+        snapshot
+            .records
+            .try_reserve_exact(MAX_SLOT_RECORDS - snapshot.records.len())
+            .map_err(|_| ExactActivationLogError::OutOfMemory)?;
+        if rotating {
+            let bridge = snapshot
+                .last_record()
+                .ok_or(ExactActivationLogError::EmptyAfterInitialization)?;
+            snapshot
+                .bytes
+                .copy_within(append_offset - EXACT_INDEX_ACTIVATION_RECORD_BYTES.., 0);
+            snapshot.bytes.truncate(EXACT_INDEX_ACTIVATION_RECORD_BYTES);
+            snapshot.records.clear();
+            snapshot.records.push(bridge);
+            snapshot.active_slot = 1 - snapshot.active_slot;
         }
-        let target_name = SLOT_NAMES[target_slot];
-        if target_slot == snapshot.active_slot {
-            let offset = u64::try_from(snapshot.bytes.len())
-                .map_err(|_| ExactActivationLogError::SlotTooLarge)?;
-            self.storage
-                .write_at(target_name, offset, &encoded_record)?;
-        } else {
+        snapshot.bytes.extend_from_slice(&encoded_record);
+        snapshot.records.push(record);
+        let target_name = SLOT_NAMES[snapshot.active_slot];
+        if rotating {
             self.storage.set_len(target_name, 0)?;
             self.storage.write_at(
                 target_name,
                 0,
-                &expected[..EXACT_INDEX_ACTIVATION_RECORD_BYTES],
+                &snapshot.bytes[..EXACT_INDEX_ACTIVATION_RECORD_BYTES],
             )?;
             self.storage.write_at(
                 target_name,
                 u64::try_from(EXACT_INDEX_ACTIVATION_RECORD_BYTES)
                     .expect("ASSERT: activation record byte count fits u64"),
-                &expected[EXACT_INDEX_ACTIVATION_RECORD_BYTES..],
+                &encoded_record,
             )?;
+        } else {
+            let offset =
+                u64::try_from(append_offset).map_err(|_| ExactActivationLogError::SlotTooLarge)?;
+            self.storage
+                .write_at(target_name, offset, &encoded_record)?;
         }
         self.storage.set_len(
             target_name,
-            u64::try_from(expected.len()).map_err(|_| ExactActivationLogError::SlotTooLarge)?,
+            u64::try_from(snapshot.bytes.len())
+                .map_err(|_| ExactActivationLogError::SlotTooLarge)?,
         )?;
-
         if verify_storage {
             let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
             let reread = self.storage.read(target_name)?;
-            let verified = decode_slot(target_slot, reread)?;
-            if verified.tail != ActivationLogTail::Clean || verified.bytes != expected {
+            let verified = decode_slot(snapshot.active_slot, reread)?;
+            if verified.tail != ActivationLogTail::Clean || verified.bytes != snapshot.bytes {
                 return Err(ExactActivationLogError::PublishVerificationMismatch);
             }
         }
@@ -117,7 +117,7 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
         // Both fixed names are directory-durable before the first append. The
         // selected slot sync is the only activation/rotation commit point.
         self.storage.sync_file(target_name)?;
-        Ok(next)
+        Ok(snapshot)
     }
 
     pub(crate) fn sync_selected(
@@ -378,5 +378,54 @@ impl std::error::Error for ExactActivationLogError {
 impl From<io::Error> for ExactActivationLogError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastdup_format::{ExactIndexProfileId, ExactIndexRunSet};
+
+    #[test]
+    fn moved_writer_slot_matches_independent_recovery_through_two_rotations() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/tests")
+            .join(format!("exact-wal-moved-buffer-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        let storage = crate::FsStorageIo::open(&root).unwrap();
+        let log = ExactActivationLog::new(&storage);
+        let profile = ExactIndexProfileId::new([105; 32]).unwrap();
+        let mut snapshot = log.load_for_append().unwrap();
+        let mut buffers = None;
+        for generation in 1..=130 {
+            let id = ExactIndexRunSet::new(profile, generation, vec![])
+                .unwrap()
+                .id()
+                .unwrap();
+            let record = ExactIndexActivationRecord::new(
+                generation,
+                snapshot
+                    .last_hash()
+                    .unwrap_or(ExactIndexActivationHash::ZERO),
+                id,
+                profile,
+                generation,
+            )
+            .unwrap();
+            snapshot = log.append(snapshot, record, false).unwrap();
+            let allocated = (snapshot.bytes.as_ptr(), snapshot.records.as_ptr());
+            if let Some(previous) = buffers {
+                assert_eq!(allocated, previous);
+            }
+            buffers = Some(allocated);
+            let recovered = log.load_for_recovery().unwrap().unwrap();
+            assert_eq!(recovered.bytes, snapshot.bytes);
+            assert_eq!(recovered.records, snapshot.records);
+            assert_eq!(recovered.active_slot, snapshot.active_slot);
+            assert_eq!(recovered.tail, ActivationLogTail::Clean);
+            assert!(snapshot.bytes.capacity() <= MAX_SLOT_BYTES);
+        }
     }
 }

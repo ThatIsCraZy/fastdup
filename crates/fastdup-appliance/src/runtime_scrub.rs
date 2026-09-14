@@ -95,13 +95,10 @@ pub fn start(
             let result = (|| {
                 fastdup_store::set_background_io_priority().map_err(io::Error::other)?;
                 rustix::process::nice(10).map_err(io::Error::from)?;
-                journal = ScrubProgress::open(
-                    progress_storage.0,
-                    progress_storage.1,
-                    unix_seconds(),
-                )
-                .inspect_err(progress_warning)
-                .ok();
+                journal =
+                    ScrubProgress::open(progress_storage.0, progress_storage.1, unix_seconds())
+                        .inspect_err(progress_warning)
+                        .ok();
                 let mut coverage = ScrubCoverage::new(required);
                 let mut last_sync = Instant::now();
                 let mut unsynced = 0;
@@ -141,27 +138,30 @@ pub fn start(
                         &mut journal,
                         &mut resume_pool,
                     )?;
-                    for (&id, resumed_bytes) in batch.iter().zip(resumed) {
-                        control.check_cancelled()?;
-                        control.set_current(id);
-                        let (bytes, resumed) = verify_next(
-                            &repository,
-                            index.as_deref(),
-                            id,
-                            &mut coverage,
-                            &mut journal,
-                            resumed_bytes,
-                            &read_cache,
-                        )?;
-                        unsynced += usize::from(!resumed);
-                        if unsynced >= 64 || last_sync.elapsed() >= Duration::from_secs(5) {
-                            sync_progress(&mut journal);
-                            unsynced = 0;
-                            last_sync = Instant::now();
-                        }
-                        control.record_verified(bytes, resumed);
-                        control.report("running", None);
+                    let pending = pending_ids(batch, &resumed);
+                    if !pending.is_empty() && resume_pool.is_none() {
+                        resume_pool = Some(ScrubResumePool::new()?);
                     }
+                    if let Some(id) = pending.first() {
+                        control.set_current(*id);
+                    }
+                    let verified = verify_batch(
+                        &repository,
+                        &pending,
+                        index.as_deref(),
+                        &mut coverage,
+                        resume_pool.as_ref().expect("scrub workers initialized"),
+                        &read_cache,
+                    )?;
+                    record_verified_batch(
+                        &control,
+                        batch,
+                        resumed,
+                        verified,
+                        &mut journal,
+                        &mut unsynced,
+                        &mut last_sync,
+                    )?;
                 }
                 coverage.finish().map_err(io::Error::other)?;
                 if let Some(progress) = &mut journal
@@ -179,6 +179,70 @@ pub fn start(
         gate,
         worker: Some(worker),
     })
+}
+
+fn verify_batch(
+    repository: &ContainerRepository<PacedStorage<MaintenanceContainerStorage>>,
+    ids: &[fastdup_format::ContainerId],
+    index: Option<&fastdup_store::ActivatedExactIndex<FsStorageIo>>,
+    coverage: &mut ScrubCoverage,
+    pool: &ScrubResumePool,
+    read_cache: &fastdup_store::VerifiedReadCache,
+) -> io::Result<Vec<fastdup_store::ScrubCertificate>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    pool.verify(repository, ids, index, coverage, unix_seconds(), read_cache)
+        .map_err(io::Error::other)
+}
+
+fn pending_ids(
+    batch: &[fastdup_format::ContainerId],
+    resumed: &[Option<u64>],
+) -> Vec<fastdup_format::ContainerId> {
+    batch
+        .iter()
+        .zip(resumed)
+        .filter_map(|(id, resumed)| resumed.is_none().then_some(*id))
+        .collect()
+}
+
+fn record_verified_batch(
+    control: &Control,
+    batch: &[fastdup_format::ContainerId],
+    resumed: Vec<Option<u64>>,
+    verified: Vec<fastdup_store::ScrubCertificate>,
+    journal: &mut Option<ScrubProgress<FsStorageIo>>,
+    unsynced: &mut usize,
+    last_sync: &mut Instant,
+) -> io::Result<()> {
+    let mut verified = verified.into_iter();
+    for (&id, resumed_bytes) in batch.iter().zip(resumed) {
+        control.check_cancelled()?;
+        control.set_current(id);
+        let resumed = resumed_bytes.is_some();
+        let bytes = if let Some(bytes) = resumed_bytes {
+            bytes
+        } else {
+            let entry = verified.next().expect("one result per pending Container");
+            if let Some(progress) = journal
+                && let Err(error) = progress.record(&entry)
+            {
+                progress_warning(&error);
+                *journal = None;
+            }
+            entry.bytes()
+        };
+        *unsynced += usize::from(!resumed);
+        if *unsynced >= 64 || last_sync.elapsed() >= Duration::from_secs(5) {
+            sync_progress(journal);
+            *unsynced = 0;
+            *last_sync = Instant::now();
+        }
+        control.record_verified(bytes, resumed);
+        control.report("running", None);
+    }
+    Ok(())
 }
 
 fn resume_batch(
@@ -225,33 +289,6 @@ fn resume_batch(
         }
     }
     Ok(resumed)
-}
-
-fn verify_next(
-    repository: &ContainerRepository<PacedStorage<MaintenanceContainerStorage>>,
-    index: Option<&fastdup_store::ActivatedExactIndex<FsStorageIo>>,
-    id: fastdup_format::ContainerId,
-    coverage: &mut ScrubCoverage,
-    journal: &mut Option<ScrubProgress<FsStorageIo>>,
-    resumed_bytes: Option<u64>,
-    read_cache: &fastdup_store::VerifiedReadCache,
-) -> io::Result<(u64, bool)> {
-    let resumed = resumed_bytes.is_some();
-    let bytes = if let Some(bytes) = resumed_bytes {
-        bytes
-    } else {
-        let entry = repository
-            .scrub_for_progress_with_cache(id, index, coverage, unix_seconds(), read_cache)
-            .map_err(io::Error::other)?;
-        if let Some(progress) = journal
-            && let Err(error) = progress.record(&entry)
-        {
-            progress_warning(&error);
-            *journal = None;
-        }
-        entry.bytes()
-    };
-    Ok((bytes, resumed))
 }
 
 fn unix_seconds() -> u64 {
@@ -399,7 +436,8 @@ impl Control {
         if report {
             self.report("running", None);
         }
-        // At most one 256-KiB operation at a time. Under foreground load spend
+        // Each of at most 32 workers issues one 256-KiB operation at a time.
+        // Under foreground load spend
         // at most roughly one tenth of the measured read+sleep cycle doing I/O;
         // retain a 50% duty limit while idle. Linux idle I/O priority is separate.
         let delay = elapsed
@@ -759,7 +797,7 @@ mod resume_tests {
         generation
             .commit_namespace(&NamespaceRoot::new(1024, 2, 0, vec![], vec![]).unwrap())
             .unwrap();
-        let frontend = super::super::open_data_storage(&root.join("data"), false).unwrap();
+        let frontend = super::super::TelemetryStorageIo::open(&root.join("data"), false).unwrap();
         let launch = || {
             let (_, required) = generation.recover_committed_for_mount(&repository).unwrap();
             let snapshot = fastdup_store::MemoryPressureSnapshot::new(1 << 30, 1 << 29, 0);

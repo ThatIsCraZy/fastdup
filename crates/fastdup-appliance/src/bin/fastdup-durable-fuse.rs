@@ -1,9 +1,7 @@
-use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fastdup_appliance::OnlineGcSchedulerStatus;
@@ -17,23 +15,18 @@ use fastdup_appliance::{
     bind_online_gc_control_socket, checkpoint_exact_index_profile_v1, checkpoint_policy_set,
     online_gc_control_path,
 };
-use fastdup_copy_metrics::copy_telemetry;
-use fastdup_format::{HEADER_BYTES, VerifiedContainerPublication};
-use fastdup_io_uring::{IoUringStorageConfig, IoUringStorageIo};
-use fastdup_posix::{
-    FrontendTelemetry, FuseFilesystem, InodeId, LogicalQuotaRule, Namespace, NamespaceConfig,
-    volatile_mount_options,
-};
+use fastdup_posix::{FuseFilesystem, NamespaceConfig, volatile_mount_options};
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo,
     GcCandidateCatalogRepository, GenerationRepository, MaintenanceCancellation,
     MaintenanceRepository, OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport,
-    OnlineGcRunMode, OwnedContainerPublication, RecoveryCheckpointRepository,
-    SimilarityIndexRepository, StorageIo, StoreError, TieredStorageIo, publication_sample_ranges,
+    OnlineGcRunMode, RecoveryCheckpointRepository, SimilarityIndexRepository, TieredStorageIo,
     system_memory_budget_governor,
 };
 
 mod common;
+#[path = "../data_io_telemetry.rs"]
+mod data_io_telemetry;
 #[path = "../mount_recovery.rs"]
 mod mount_recovery;
 #[path = "../runtime_management.rs"]
@@ -44,6 +37,7 @@ mod runtime_scrub;
 mod runtime_telemetry;
 
 use common::metadata_gc_status_fields;
+use data_io_telemetry::TelemetryStorageIo;
 use fuse3::raw::Session;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -51,18 +45,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 
-use serde::{Deserialize, Serialize};
-
 const SCHEDULER_RESOLUTION: Duration = Duration::from_millis(50);
 const CHECKPOINT_WARNING: Duration = Duration::from_secs(5);
 const ONLINE_GC_SCHEDULER_RESOLUTION: Duration = Duration::from_secs(5);
 const RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(90);
-const MANAGEMENT_PROTOCOL_VERSION: u16 = 1;
-const MANAGEMENT_SOCKET_NAME: &str = ".fastdup-management.sock";
-static TELEMETRY_EXACT_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
-static TELEMETRY_NEW_CHUNK_BYTES: AtomicU64 = AtomicU64::new(0);
-static TELEMETRY_LOGICAL_CHUNK_BYTES: AtomicU64 = AtomicU64::new(0);
-static TELEMETRY_PHYSICAL_CONTAINER_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdvancedReductionPolicy {
@@ -118,166 +104,6 @@ struct OnlineGcRuntimeHandle {
 struct OnlineGcRuntimeConfiguration {
     enabled: bool,
     policy: OnlineGcPolicy,
-}
-
-#[derive(Debug, Deserialize)]
-struct ManagementRequest {
-    version: u16,
-    operation: ManagementOperation,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ManagementOperation {
-    Inspect,
-    UpdateOnlineGc {
-        enabled: bool,
-        pressure_low_basis_points: u16,
-        pressure_high_basis_points: u16,
-    },
-    UpdatePresentedCapacities {
-        revision: String,
-        rules: Vec<ManagementPresentedCapacityRule>,
-        #[serde(default)]
-        reduction_rules: Option<Vec<ManagementReductionRule>>,
-    },
-    UpdateAdvancedReductionDefault {
-        enabled: bool,
-    },
-    UpdateSmallFileExtensions {
-        revision: String,
-        extensions: Vec<String>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-struct ManagementPresentedCapacityRule {
-    inode: u64,
-    capacity_bytes: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShareCapacityManifest {
-    version: u16,
-    revision: String,
-    rules: Vec<ManagementPresentedCapacityRule>,
-    #[serde(default)]
-    reduction_rules: Vec<ManagementReductionRule>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-struct ManagementReductionRule {
-    inode: u64,
-    enabled: bool,
-}
-
-fn apply_reduction_rules(
-    namespace: &Namespace,
-    rules: Vec<ManagementReductionRule>,
-) -> Result<(), String> {
-    let rules = rules
-        .into_iter()
-        .map(|r| {
-            InodeId::new(r.inode)
-                .map(|inode| (inode, r.enabled))
-                .ok_or_else(|| "Share inode must be nonzero".to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    namespace
-        .replace_share_reduction(namespace.advanced_reduction_default(), rules)
-        .map_err(|e| format!("{e:?}"))
-}
-
-trait PresentedCapacityControl: Send + Sync {
-    fn replace(&self, revision: String, rules: Vec<(u64, u64)>) -> io::Result<()>;
-    fn revision(&self) -> io::Result<String>;
-}
-
-#[derive(Clone, Debug)]
-struct RuntimePresentedCapacityControl {
-    statfs: TieredStatFsSource,
-    namespace: Arc<Namespace>,
-}
-
-impl PresentedCapacityControl for RuntimePresentedCapacityControl {
-    fn replace(&self, revision: String, rules: Vec<(u64, u64)>) -> io::Result<()> {
-        let logical_rules = rules
-            .iter()
-            .map(|&(inode, capacity_bytes)| {
-                let inode = InodeId::new(inode).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "quota inode must be nonzero")
-                })?;
-                LogicalQuotaRule::new(inode, capacity_bytes).map_err(|error| {
-                    io::Error::new(io::ErrorKind::InvalidInput, format!("{error:?}"))
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        self.namespace
-            .replace_logical_quotas(revision.clone(), logical_rules)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("{error:?}")))?;
-        self.statfs.replace_presented_capacities(revision, rules)
-    }
-
-    fn revision(&self) -> io::Result<String> {
-        let logical = self.namespace.logical_quota_revision();
-        let presented = self.statfs.presented_capacity_revision()?;
-        if logical != presented {
-            return Err(io::Error::other(
-                "logical quota and statfs presentation revisions differ",
-            ));
-        }
-        Ok(logical)
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ManagementResponse {
-    version: u16,
-    ok: bool,
-    error: Option<String>,
-    frontend: Option<ManagementFrontendTelemetry>,
-    presented_capacity_revision: Option<String>,
-    small_file_policy: Option<ManagementSmallFilePolicy>,
-}
-
-#[derive(Debug, Serialize)]
-struct ManagementSmallFilePolicy {
-    revision: String,
-    extensions: Vec<String>,
-}
-
-impl From<fastdup_posix::SmallFilePolicySnapshot> for ManagementSmallFilePolicy {
-    fn from(snapshot: fastdup_posix::SmallFilePolicySnapshot) -> Self {
-        Self {
-            revision: snapshot.revision,
-            extensions: snapshot.extensions,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ManagementFrontendTelemetry {
-    mutation_admission_open: bool,
-    integrity_failed: bool,
-    logical_allocated_bytes: Option<u64>,
-    logical_allocated_observed_at: Option<u64>,
-    read_bytes: u64,
-    write_bytes: u64,
-    read_operations: u64,
-    write_operations: u64,
-    read_errors: u64,
-    write_errors: u64,
-    read_latency_micros_p50: u64,
-    read_latency_micros_p95: u64,
-    read_latency_micros_p99: u64,
-    write_latency_micros_p50: u64,
-    write_latency_micros_p95: u64,
-    write_latency_micros_p99: u64,
-    exact_hit_bytes: u64,
-    new_chunk_bytes: u64,
-    logical_chunk_bytes: u64,
-    physical_container_bytes: u64,
-    details: Option<serde_json::Value>,
 }
 
 struct RecoveryCheckpointRuntimeHandle {
@@ -415,10 +241,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         statfs_override,
     )?;
     let (control_listener, _control_guard) = bind_online_gc_control(&metadata_root)?;
-    let (management_listener, _management_guard) = bind_management_control(&metadata_root)?;
+    let management_listener = runtime_management::ManagementListener::bind(&metadata_root)?;
 
     let io_telemetry_enabled = std::env::var_os("FASTDUP_IO_TELEMETRY").is_some();
-    let data_storage = open_data_storage(&container_root, io_telemetry_enabled)?;
+    let data_storage = TelemetryStorageIo::open(&container_root, io_telemetry_enabled)?;
     let small_file_storage = FsStorageIo::open(&small_file_root)?.with_metadata_read_telemetry();
     let recovered = recover_appliance(
         &metadata_root,
@@ -432,22 +258,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     namespace
         .set_advanced_reduction_default(advanced_reduction == AdvancedReductionPolicy::DependentV1);
     namespace.replace_small_file_extensions(small_file_policy_revision, small_file_extensions)?;
-    capacity_source.attach_logical_quota_namespace(&namespace)?;
-    let presented_capacity_control = RuntimePresentedCapacityControl {
-        statfs: capacity_source.clone(),
-        namespace: Arc::clone(&namespace),
-    };
-    if let Some(manifest) = load_share_capacity_manifest()? {
-        apply_reduction_rules(&namespace, manifest.reduction_rules)?;
-        presented_capacity_control.replace(
-            manifest.revision,
-            manifest
-                .rules
-                .into_iter()
-                .map(|rule| (rule.inode, rule.capacity_bytes))
-                .collect(),
-        )?;
-    }
+    let presented_capacity_control = runtime_management::PresentedCapacityControl::configure(
+        capacity_source.clone(),
+        Arc::clone(&namespace),
+    )?;
     let filesystem = configured_filesystem(&appliance, capacity_source.clone());
     let frontend_telemetry = filesystem.frontend_telemetry();
     let session = Session::new(volatile_mount_options());
@@ -485,37 +299,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         advanced_reduction,
     );
 
-    let management_server = {
-        let telemetry = Arc::clone(&frontend_telemetry);
-        let configuration = gc_runtime.configuration.clone();
-        let capacity_control = presented_capacity_control.clone();
-        let namespace = Arc::clone(&namespace);
-        let appliance = Arc::clone(&appliance);
-        let storage = data_storage.clone();
-        runtime_management::ManagementServer::start(management_listener, move |stream| {
-            let telemetry = Arc::clone(&telemetry);
-            let configuration = configuration.clone();
-            let capacity_control = capacity_control.clone();
-            let namespace = Arc::clone(&namespace);
-            let appliance = Arc::clone(&appliance);
-            let storage = storage.clone();
-            async move {
-                if let Err(error) = handle_management_control(
-                    stream,
-                    telemetry,
-                    configuration,
-                    capacity_control,
-                    namespace,
-                    appliance,
-                    storage,
-                )
-                .await
-                {
-                    eprintln!("management_control_error={error}");
-                }
-            }
-        })
-    };
+    let management_server = management_listener.start(
+        frontend_telemetry,
+        gc_runtime.configuration.clone(),
+        presented_capacity_control,
+        Arc::clone(&namespace),
+        Arc::clone(&appliance),
+        data_storage.clone(),
+    );
 
     let mut shutdown_signal = ShutdownSignal::new()?;
     let mut ticks = interval(SCHEDULER_RESOLUTION);
@@ -534,11 +325,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 if !matches!(action, CheckpointAction::Wait(_)) {
                     if matches!(action, CheckpointAction::PauseAndCommit(_)) {
-                        appliance.namespace().pause_mutation_admission();
+                        appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::DurabilityLag);
                     }
                     let checkpoint_started = supervisor_epoch.elapsed();
                     if let Err(error) = checkpoint_cycle(Arc::clone(&appliance)).await {
-                        appliance.namespace().pause_mutation_admission();
+                        appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::ProgressFailure);
                         eprintln!(
                             "CRITICAL: durable progress failed; mutation admission remains closed: {error}"
                         );
@@ -549,7 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dirty_bytes = appliance
                 .namespace()
                 .wait_for_checkpointable_dirty_payload(CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1) => {
-                appliance.namespace().pause_mutation_admission();
+                appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::DirtyPressure);
                 emit_checkpoint_pressure(&appliance, dirty_bytes, false);
                 if let Err(error) = checkpoint_cycle(Arc::clone(&appliance)).await {
                     eprintln!(
@@ -575,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    namespace.pause_mutation_admission();
+    namespace.pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::Shutdown);
     gc_runtime.request_stop();
     recovery_checkpoint_runtime.request_stop();
     scrub_runtime.request_stop();
@@ -609,7 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     emit_verified_read_cache(&appliance);
     data_storage.emit();
-    emit_io_uring_state(&data_storage);
+    data_storage.emit_backend_state();
     scrub_result?;
     background_result?;
     unmount_result?;
@@ -649,7 +440,9 @@ async fn stop_background_and_catch_up(
     gc_runtime: OnlineGcRuntimeHandle,
     recovery_checkpoint_runtime: RecoveryCheckpointRuntimeHandle,
 ) -> Result<(), String> {
-    appliance.namespace().pause_mutation_admission();
+    appliance
+        .namespace()
+        .pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::Shutdown);
     let gc_started = Instant::now();
     let gc_result = gc_runtime.stop().await;
     eprintln!(
@@ -971,264 +764,6 @@ fn bind_online_gc_control(
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
     Ok((listener, guard))
-}
-
-fn bind_management_control(
-    metadata_root: &std::path::Path,
-) -> io::Result<(UnixListener, OnlineGcSocketGuard)> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let path = metadata_root.join(MANAGEMENT_SOCKET_NAME);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let listener = std::os::unix::net::UnixListener::bind(&path)?;
-    // Only the root agent may mutate live filesystem policy. The unprivileged
-    // HTTPS process reaches this seam exclusively through the typed agent.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
-    Ok((
-        UnixListener::from_std(listener)?,
-        OnlineGcSocketGuard { path },
-    ))
-}
-
-async fn handle_management_control(
-    mut stream: UnixStream,
-    telemetry: Arc<FrontendTelemetry>,
-    configuration: watch::Sender<OnlineGcRuntimeConfiguration>,
-    capacity_source: RuntimePresentedCapacityControl,
-    namespace: Arc<Namespace>,
-    appliance: Arc<FsAppliance>,
-    storage: TelemetryStorageIo,
-) -> Result<(), String> {
-    let mut request = Vec::new();
-    timeout(
-        Duration::from_secs(5),
-        (&mut stream).take(1_048_577).read_to_end(&mut request),
-    )
-    .await
-    .map_err(|_| "management request timed out".to_owned())?
-    .map_err(|error| format!("management request read failed: {error}"))?;
-    let mut response = match serde_json::from_slice::<ManagementRequest>(&request) {
-        Ok(request) if request.version == MANAGEMENT_PROTOCOL_VERSION => {
-            apply_management_operation(
-                request.operation,
-                &telemetry,
-                &configuration,
-                &capacity_source,
-                &namespace,
-            )
-        }
-        Ok(_) => ManagementResponse {
-            version: MANAGEMENT_PROTOCOL_VERSION,
-            ok: false,
-            error: Some("unsupported_version".to_owned()),
-            frontend: None,
-            presented_capacity_revision: None,
-            small_file_policy: None,
-        },
-        Err(_) => ManagementResponse {
-            version: MANAGEMENT_PROTOCOL_VERSION,
-            ok: false,
-            error: Some("invalid_request".to_owned()),
-            frontend: None,
-            presented_capacity_revision: None,
-            small_file_policy: None,
-        },
-    };
-    if let Some(frontend) = response.frontend.as_mut() {
-        frontend.details =
-            tokio::task::spawn_blocking(move || runtime_telemetry::snapshot(&appliance, &storage))
-                .await
-                .ok();
-    }
-    let mut encoded = serde_json::to_vec(&response)
-        .map_err(|error| format!("management response encode failed: {error}"))?;
-    encoded.push(b'\n');
-    stream
-        .write_all(&encoded)
-        .await
-        .map_err(|error| format!("management response write failed: {error}"))
-}
-
-#[allow(clippy::too_many_lines, reason = "typed management operation dispatch")]
-fn apply_management_operation(
-    operation: ManagementOperation,
-    telemetry: &FrontendTelemetry,
-    configuration: &watch::Sender<OnlineGcRuntimeConfiguration>,
-    capacity_source: &dyn PresentedCapacityControl,
-    namespace: &Namespace,
-) -> ManagementResponse {
-    match operation {
-        ManagementOperation::Inspect => {
-            let snapshot = telemetry.snapshot();
-            let logical_usage = namespace.sample_logical_usage();
-            ManagementResponse {
-                version: MANAGEMENT_PROTOCOL_VERSION,
-                ok: true,
-                error: None,
-                frontend: Some(ManagementFrontendTelemetry {
-                    mutation_admission_open: namespace.mutation_admission_open(),
-                    integrity_failed: namespace.integrity_failed(),
-                    logical_allocated_bytes: logical_usage.map(|value| value.0),
-                    logical_allocated_observed_at: logical_usage.map(|value| value.1),
-                    details: None,
-                    read_bytes: snapshot.read_bytes,
-                    write_bytes: snapshot.write_bytes,
-                    read_operations: snapshot.read_operations,
-                    write_operations: snapshot.write_operations,
-                    read_errors: snapshot.read_errors,
-                    write_errors: snapshot.write_errors,
-                    read_latency_micros_p50: snapshot.read_latency_micros_p50,
-                    read_latency_micros_p95: snapshot.read_latency_micros_p95,
-                    read_latency_micros_p99: snapshot.read_latency_micros_p99,
-                    write_latency_micros_p50: snapshot.write_latency_micros_p50,
-                    write_latency_micros_p95: snapshot.write_latency_micros_p95,
-                    write_latency_micros_p99: snapshot.write_latency_micros_p99,
-                    exact_hit_bytes: TELEMETRY_EXACT_HIT_BYTES.load(Ordering::Relaxed),
-                    new_chunk_bytes: TELEMETRY_NEW_CHUNK_BYTES.load(Ordering::Relaxed),
-                    logical_chunk_bytes: TELEMETRY_LOGICAL_CHUNK_BYTES.load(Ordering::Relaxed),
-                    physical_container_bytes: TELEMETRY_PHYSICAL_CONTAINER_BYTES
-                        .load(Ordering::Relaxed),
-                }),
-                presented_capacity_revision: capacity_source.revision().ok(),
-                small_file_policy: Some(namespace.small_file_policy().into()),
-            }
-        }
-        ManagementOperation::UpdateOnlineGc {
-            enabled,
-            pressure_low_basis_points,
-            pressure_high_basis_points,
-        } => {
-            let current = *configuration.borrow();
-            let policy = current
-                .policy
-                .with_pressure_watermarks(pressure_low_basis_points, pressure_high_basis_points);
-            match policy {
-                Ok(policy)
-                    if configuration
-                        .send(OnlineGcRuntimeConfiguration { enabled, policy })
-                        .is_ok() =>
-                {
-                    ManagementResponse {
-                        version: MANAGEMENT_PROTOCOL_VERSION,
-                        ok: true,
-                        error: None,
-                        frontend: None,
-                        presented_capacity_revision: None,
-                        small_file_policy: None,
-                    }
-                }
-                Ok(_) => ManagementResponse {
-                    version: MANAGEMENT_PROTOCOL_VERSION,
-                    ok: false,
-                    error: Some("online_gc_runtime_unavailable".to_owned()),
-                    frontend: None,
-                    presented_capacity_revision: None,
-                    small_file_policy: None,
-                },
-                Err(error) => ManagementResponse {
-                    version: MANAGEMENT_PROTOCOL_VERSION,
-                    ok: false,
-                    error: Some(error.to_string()),
-                    frontend: None,
-                    presented_capacity_revision: None,
-                    small_file_policy: None,
-                },
-            }
-        }
-        ManagementOperation::UpdatePresentedCapacities {
-            revision,
-            rules,
-            reduction_rules,
-        } => {
-            let mut response = update_presented_capacities(capacity_source, revision, rules);
-            if response.ok
-                && let Some(rules) = reduction_rules
-                && let Err(error) = apply_reduction_rules(namespace, rules)
-            {
-                response.ok = false;
-                response.error = Some(error);
-            }
-            response
-        }
-        ManagementOperation::UpdateAdvancedReductionDefault { enabled } => {
-            namespace.set_advanced_reduction_default(enabled);
-            ManagementResponse {
-                version: MANAGEMENT_PROTOCOL_VERSION,
-                ok: true,
-                error: None,
-                frontend: None,
-                presented_capacity_revision: None,
-                small_file_policy: None,
-            }
-        }
-        ManagementOperation::UpdateSmallFileExtensions {
-            revision,
-            extensions,
-        } => match namespace.replace_small_file_extensions(revision, extensions) {
-            Ok(snapshot) => ManagementResponse {
-                version: MANAGEMENT_PROTOCOL_VERSION,
-                ok: true,
-                error: None,
-                frontend: None,
-                presented_capacity_revision: None,
-                small_file_policy: Some(snapshot.into()),
-            },
-            Err(error) => ManagementResponse {
-                version: MANAGEMENT_PROTOCOL_VERSION,
-                ok: false,
-                error: Some(error.to_string()),
-                frontend: None,
-                presented_capacity_revision: None,
-                small_file_policy: None,
-            },
-        },
-    }
-}
-
-fn update_presented_capacities(
-    capacity_source: &dyn PresentedCapacityControl,
-    revision: String,
-    rules: Vec<ManagementPresentedCapacityRule>,
-) -> ManagementResponse {
-    if rules.len() > 4_096 {
-        return ManagementResponse {
-            version: MANAGEMENT_PROTOCOL_VERSION,
-            ok: false,
-            error: Some("too_many_presented_capacity_rules".to_owned()),
-            frontend: None,
-            presented_capacity_revision: None,
-            small_file_policy: None,
-        };
-    }
-    match capacity_source.replace(
-        revision.clone(),
-        rules
-            .into_iter()
-            .map(|rule| (rule.inode, rule.capacity_bytes))
-            .collect(),
-    ) {
-        Ok(()) => ManagementResponse {
-            version: MANAGEMENT_PROTOCOL_VERSION,
-            ok: true,
-            error: None,
-            frontend: None,
-            presented_capacity_revision: Some(revision),
-            small_file_policy: None,
-        },
-        Err(error) => ManagementResponse {
-            version: MANAGEMENT_PROTOCOL_VERSION,
-            ok: false,
-            error: Some(error.to_string()),
-            frontend: None,
-            presented_capacity_revision: None,
-            small_file_policy: None,
-        },
-    }
 }
 
 fn online_gc_enabled() -> bool {
@@ -1592,7 +1127,7 @@ fn emit_mount_state(
     );
     emit_io_telemetry_state(io_telemetry_enabled);
     emit_statfs_state(statfs_override);
-    emit_io_uring_state(data_storage);
+    data_storage.emit_backend_state();
     emit_verified_read_cache(appliance);
 }
 
@@ -1610,27 +1145,6 @@ fn statfs_override_from_environment() -> Result<Option<StatFsOverride>, Box<dyn 
     let capacity = std::env::var_os(CAPACITY);
     let available = std::env::var_os(AVAILABLE);
     statfs_override_from_values(capacity.as_deref(), available.as_deref())
-}
-
-fn load_share_capacity_manifest()
--> Result<Option<ShareCapacityManifest>, Box<dyn std::error::Error>> {
-    let Some(path) = std::env::var_os("FASTDUP_SHARE_CAPACITY_MANIFEST") else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(path);
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.len() > 1_048_576 {
-        return Err("Share capacity manifest exceeds one MiB".into());
-    }
-    let manifest: ShareCapacityManifest = serde_json::from_slice(&std::fs::read(&path)?)?;
-    if manifest.version != MANAGEMENT_PROTOCOL_VERSION || manifest.rules.len() > 4_096 {
-        return Err("Share capacity manifest version or rule count is invalid".into());
-    }
-    Ok(Some(manifest))
 }
 
 fn statfs_override_from_values(
@@ -1676,11 +1190,6 @@ fn emit_statfs_state(capacity_override: Option<StatFsOverride>) {
     }
 }
 
-fn open_data_storage(root: &std::path::Path, telemetry: bool) -> io::Result<TelemetryStorageIo> {
-    let storage = IoUringStorageIo::open(root, IoUringStorageConfig::default())?;
-    Ok(TelemetryStorageIo::new(storage, telemetry))
-}
-
 fn emit_small_file_tier(isolation: &SmallFileTierIsolation) {
     eprintln!(
         "small_file_tier enabled=true enforced={} project_id={} hard_limit_bytes={} root={} quota_env={} project_env={}",
@@ -1697,46 +1206,6 @@ fn emit_io_telemetry_state(enabled: bool) {
     if enabled {
         eprintln!("data-tier StorageIo telemetry is enabled for this mount");
     }
-}
-
-fn emit_io_uring_state(storage: &TelemetryStorageIo) {
-    let status = storage.inner.status();
-    eprintln!(
-        concat!(
-            "data_io_uring ring_entries={} max_inflight_bytes={} ",
-            "inflight_bytes={} peak_inflight_bytes={} submitted_operations={} ",
-            "completed_operations={} root_sync_callers={} root_sync_submissions={} ",
-            "owned_publications_started={} owned_publications_completed={} ",
-            "borrowed_write_copy_bytes={}"
-        ),
-        status.ring_entries(),
-        status.max_inflight_bytes(),
-        status.inflight_bytes(),
-        status.peak_inflight_bytes(),
-        status.submitted_operations(),
-        status.completed_operations(),
-        status.root_sync_callers(),
-        status.root_sync_submissions(),
-        status.owned_publications_started(),
-        status.owned_publications_completed(),
-        status.borrowed_write_copy_bytes(),
-    );
-    let copies = copy_telemetry();
-    eprintln!(
-        concat!(
-            "copy_bytes checksum_scratch_bytes={} publication_verify_materialization_bytes={} ",
-            "fuse_request_adaptation_bytes={} container_assembly_bytes={} ",
-            "chunk_fragment_coalescing_bytes={} compression_region_materialization_bytes={} ",
-            "compression_region_concatenation_bytes={}"
-        ),
-        copies.checksum_scratch_bytes,
-        copies.publication_verify_materialization_bytes,
-        copies.fuse_request_adaptation_bytes,
-        copies.container_assembly_bytes,
-        copies.chunk_fragment_coalescing_bytes,
-        copies.compression_region_materialization_bytes,
-        copies.compression_region_concatenation_bytes,
-    );
 }
 
 fn emit_write_through_cpu_state(appliance: &FsAppliance) {
@@ -1888,7 +1357,7 @@ async fn checkpoint_cycle(appliance: Arc<FsAppliance>) -> Result<(), String> {
                 if DurabilitySupervisor::checkpoint_progress(CHECKPOINT_WARNING)
                     == CheckpointProgressAction::CloseAdmission
                 {
-                    appliance.namespace().pause_mutation_admission();
+                    appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::CheckpointTimeout);
                     eprintln!(
                         "CRITICAL: checkpoint exceeded five seconds; mutation admission is closed"
                     );
@@ -1898,7 +1367,7 @@ async fn checkpoint_cycle(appliance: Arc<FsAppliance>) -> Result<(), String> {
             dirty_bytes = appliance
                 .namespace()
                 .wait_for_checkpointable_dirty_payload(CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1) => {
-                appliance.namespace().pause_mutation_admission();
+                appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::DirtyPressure);
                 emit_checkpoint_pressure(&appliance, dirty_bytes, true);
                 await_worker(worker).await?
             }
@@ -2142,14 +1611,45 @@ fn map_worker_result(
         .map_err(|error| format!("checkpoint failed: {error}"))
 }
 
+fn emit_checkpoint_wait_metrics(profiled: &ProfiledCheckpoint) {
+    let metrics = profiled.metrics();
+    eprintln!(
+        concat!(
+            "checkpoint_wait_metrics generation={} ",
+            "checkpoint_lock_wall_ns={} ",
+            "proof_freeze_wall_ns={} ",
+            "cut_capture_wall_ns={} ",
+            "ingest_wait_wall_ns={} ",
+            "publication_wait_wall_ns={} ",
+            "lane_lock_wall_ns={} ",
+            "stable_extract_wall_ns={} ",
+            "publication_enqueue_wall_ns={} ",
+            "publication_retire_wall_ns={} ",
+            "recipe_attach_wall_ns={} ",
+            "writer_setup_wall_ns={} ",
+            "unattributed_wall_ns={}"
+        ),
+        profiled.record().generation(),
+        metrics.checkpoint_lock().wall().as_nanos(),
+        metrics.proof_freeze().wall().as_nanos(),
+        metrics.cut_capture().wall().as_nanos(),
+        metrics.ingest_wait().wall().as_nanos(),
+        metrics.publication_wait().wall().as_nanos(),
+        metrics.lane_lock().wall().as_nanos(),
+        metrics.stable_extract().wall().as_nanos(),
+        metrics.publication_enqueue().wall().as_nanos(),
+        metrics.publication_retire().wall().as_nanos(),
+        metrics.recipe_attach().wall().as_nanos(),
+        metrics.writer_setup().wall().as_nanos(),
+        metrics.unattributed().as_nanos(),
+    );
+}
+
 fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
     runtime_telemetry::record_checkpoint(profiled);
     let metrics = profiled.metrics();
-    TELEMETRY_EXACT_HIT_BYTES.fetch_add(metrics.exact_hit_bytes(), Ordering::Relaxed);
-    TELEMETRY_NEW_CHUNK_BYTES.fetch_add(metrics.new_chunk_bytes(), Ordering::Relaxed);
-    TELEMETRY_LOGICAL_CHUNK_BYTES.fetch_add(metrics.logical_chunk_bytes(), Ordering::Relaxed);
-    TELEMETRY_PHYSICAL_CONTAINER_BYTES.fetch_add(metrics.container_file_bytes(), Ordering::Relaxed);
     let gate = metrics.incompressibility_gate();
+    emit_checkpoint_wait_metrics(profiled);
     eprintln!(
         concat!(
             "checkpoint_metrics generation={} ",
@@ -2222,224 +1722,12 @@ fn emit_checkpoint_metrics(profiled: &ProfiledCheckpoint) {
     );
 }
 
-#[derive(Clone, Debug)]
-struct TelemetryStorageIo {
-    inner: IoUringStorageIo,
-    enabled: bool,
-    telemetry: Arc<DataIoTelemetry>,
-}
-
-impl TelemetryStorageIo {
-    fn new(inner: IoUringStorageIo, enabled: bool) -> Self {
-        Self {
-            inner,
-            enabled,
-            telemetry: Arc::new(DataIoTelemetry::default()),
-        }
-    }
-
-    fn emit(&self) {
-        if !self.enabled {
-            return;
-        }
-        eprintln!(
-            concat!(
-                "data_io_metrics whole_reads={} whole_read_bytes={} range_reads={} ",
-                "range_read_bytes={} random_range_reads={} writes={} write_bytes={} ",
-                "nonsequential_writes={}"
-            ),
-            self.telemetry.whole_reads.load(Ordering::Relaxed),
-            self.telemetry.whole_read_bytes.load(Ordering::Relaxed),
-            self.telemetry.range_reads.load(Ordering::Relaxed),
-            self.telemetry.range_read_bytes.load(Ordering::Relaxed),
-            self.telemetry.random_range_reads.load(Ordering::Relaxed),
-            self.telemetry.writes.load(Ordering::Relaxed),
-            self.telemetry.write_bytes.load(Ordering::Relaxed),
-            self.telemetry.nonsequential_writes.load(Ordering::Relaxed),
-        );
-    }
-}
-
-#[derive(Debug, Default)]
-struct DataIoTelemetry {
-    whole_reads: AtomicU64,
-    whole_read_bytes: AtomicU64,
-    range_reads: AtomicU64,
-    range_read_bytes: AtomicU64,
-    random_range_reads: AtomicU64,
-    writes: AtomicU64,
-    write_bytes: AtomicU64,
-    nonsequential_writes: AtomicU64,
-    last_read_end: Mutex<BTreeMap<String, u64>>,
-    last_write_end: Mutex<BTreeMap<String, u64>>,
-}
-
-impl DataIoTelemetry {
-    fn classify_range_read(&self, name: &str, offset: u64, length: usize) {
-        let mut ends = self
-            .last_read_end
-            .lock()
-            .expect("ASSERT: data-tier read telemetry lock poisoned");
-        let random = ends.get(name).map_or(offset != 0, |end| *end != offset);
-        let length = u64::try_from(length).expect("ASSERT: range-read length fits u64");
-        let end = offset.saturating_add(length);
-        ends.insert(name.to_owned(), end);
-        if random {
-            self.random_range_reads.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn classify_write(&self, name: &str, offset: u64, length: usize) {
-        let mut ends = self
-            .last_write_end
-            .lock()
-            .expect("ASSERT: data-tier write telemetry lock poisoned");
-        let nonsequential = ends.get(name).map_or(offset != 0, |end| *end != offset);
-        let length = u64::try_from(length).expect("ASSERT: write length fits u64");
-        let end = offset.saturating_add(length);
-        ends.insert(name.to_owned(), end);
-        if nonsequential {
-            self.nonsequential_writes.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn record_owned_publication(&self, temporary_name: &str, sealed_bytes: usize) {
-        let ranges = publication_sample_ranges(sealed_bytes)
-            .expect("ASSERT: owned publication has valid format-v1 sample ranges");
-        let sealed_bytes =
-            u64::try_from(sealed_bytes).expect("ASSERT: format-v1 Container length fits u64");
-        let durable_write_bytes = sealed_bytes
-            .checked_add(
-                u64::try_from(HEADER_BYTES).expect("ASSERT: format Header length fits u64"),
-            )
-            .expect("ASSERT: bounded Container publication bytes cannot overflow");
-        for range in ranges {
-            self.classify_range_read(temporary_name, range.offset(), range.length());
-            self.range_reads.fetch_add(1, Ordering::Relaxed);
-            self.range_read_bytes.fetch_add(
-                u64::try_from(range.length()).expect("ASSERT: sample length fits u64"),
-                Ordering::Relaxed,
-            );
-        }
-        self.writes.fetch_add(3, Ordering::Relaxed);
-        self.write_bytes
-            .fetch_add(durable_write_bytes, Ordering::Relaxed);
-        self.nonsequential_writes.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-impl StorageIo for TelemetryStorageIo {
-    fn read_structure_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        self.inner.read_structure_at(name, offset, length)
-    }
-    fn create_new(&self, name: &str) -> io::Result<()> {
-        self.inner.create_new(name)?;
-        if self.enabled {
-            self.telemetry
-                .last_write_end
-                .lock()
-                .expect("ASSERT: data-tier write telemetry lock poisoned")
-                .insert(name.to_owned(), 0);
-        }
-        Ok(())
-    }
-
-    fn exists(&self, name: &str) -> io::Result<bool> {
-        self.inner.exists(name)
-    }
-
-    fn write_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        self.inner.write_at(name, offset, bytes)?;
-        if !self.enabled {
-            return Ok(());
-        }
-        self.telemetry.classify_write(name, offset, bytes.len());
-        self.telemetry.writes.fetch_add(1, Ordering::Relaxed);
-        self.telemetry.write_bytes.fetch_add(
-            u64::try_from(bytes.len()).expect("ASSERT: write length fits u64"),
-            Ordering::Relaxed,
-        );
-        Ok(())
-    }
-
-    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
-        let bytes = self.inner.read(name)?;
-        if !self.enabled {
-            return Ok(bytes);
-        }
-        self.telemetry.whole_reads.fetch_add(1, Ordering::Relaxed);
-        self.telemetry.whole_read_bytes.fetch_add(
-            u64::try_from(bytes.len()).expect("ASSERT: whole-object read length fits u64"),
-            Ordering::Relaxed,
-        );
-        Ok(bytes)
-    }
-
-    fn object_len(&self, name: &str) -> io::Result<u64> {
-        self.inner.object_len(name)
-    }
-
-    fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
-        let bytes = self.inner.read_exact_at(name, offset, length)?;
-        if !self.enabled {
-            return Ok(bytes);
-        }
-        self.telemetry.classify_range_read(name, offset, length);
-        self.telemetry.range_reads.fetch_add(1, Ordering::Relaxed);
-        self.telemetry.range_read_bytes.fetch_add(
-            u64::try_from(length).expect("ASSERT: range-read length fits u64"),
-            Ordering::Relaxed,
-        );
-        Ok(bytes)
-    }
-
-    fn list_names(&self) -> io::Result<Vec<String>> {
-        self.inner.list_names()
-    }
-
-    fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
-        self.inner.set_len(name, length)
-    }
-
-    fn sync_file(&self, name: &str) -> io::Result<()> {
-        self.inner.sync_file(name)
-    }
-
-    fn publish_noreplace(&self, temporary_name: &str, published_name: &str) -> io::Result<()> {
-        self.inner.publish_noreplace(temporary_name, published_name)
-    }
-
-    fn remove_file(&self, name: &str) -> io::Result<()> {
-        self.inner.remove_file(name)
-    }
-
-    fn sync_root(&self) -> io::Result<()> {
-        self.inner.sync_root()
-    }
-
-    fn publish_owned_container(
-        &self,
-        publication: OwnedContainerPublication,
-    ) -> Result<VerifiedContainerPublication, StoreError> {
-        let sealed_bytes = publication.sealed_len();
-        let temporary_name = publication.temporary_name().to_owned();
-        let verified = self.inner.publish_owned_container(publication)?;
-        if self.enabled {
-            self.telemetry
-                .record_owned_publication(&temporary_name, sealed_bytes);
-        }
-        Ok(verified)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::num::NonZeroUsize;
     use std::os::unix::fs::PermissionsExt;
 
     use fastdup_appliance::request_online_gc_now;
-    use fastdup_format::ContainerId;
 
     use super::*;
 
@@ -2545,177 +1833,6 @@ mod tests {
     }
 
     #[test]
-    fn persisted_share_reduction_and_hot_default_are_backward_compatible() {
-        let namespace = Namespace::new_volatile(NamespaceConfig::default());
-        namespace.set_advanced_reduction_default(false);
-        let legacy: ShareCapacityManifest =
-            serde_json::from_str(r#"{"version":1,"revision":"old","rules":[]}"#).unwrap();
-        assert!(legacy.reduction_rules.is_empty());
-        let selected: ShareCapacityManifest = serde_json::from_str(
-            r#"{"version":1,"revision":"new","rules":[],"reduction_rules":[{"inode":1,"enabled":true}]}"#,
-        ).unwrap();
-        apply_reduction_rules(&namespace, selected.reduction_rules).unwrap();
-        assert!(namespace.advanced_reduction_enabled(fastdup_posix::ROOT_INODE));
-        let (configuration, _rx) = watch::channel(OnlineGcRuntimeConfiguration {
-            enabled: false,
-            policy: OnlineGcPolicy::default(),
-        });
-        let response = apply_management_operation(
-            ManagementOperation::UpdateAdvancedReductionDefault { enabled: false },
-            &FrontendTelemetry::default(),
-            &configuration,
-            &TestPresentedCapacityControl::default(),
-            &namespace,
-        );
-        assert!(response.ok);
-        assert!(
-            namespace.advanced_reduction_enabled(fastdup_posix::ROOT_INODE),
-            "an explicit Share override survives a default update"
-        );
-        apply_reduction_rules(&namespace, legacy.reduction_rules).unwrap();
-        assert!(!namespace.advanced_reduction_enabled(fastdup_posix::ROOT_INODE));
-        assert!(
-            apply_reduction_rules(
-                &namespace,
-                vec![ManagementReductionRule {
-                    inode: 0,
-                    enabled: true
-                }]
-            )
-            .is_err()
-        );
-        assert!(!namespace.advanced_reduction_enabled(fastdup_posix::ROOT_INODE));
-    }
-
-    #[test]
-    fn management_protocol_exposes_frontend_counters_and_hot_gc_policy() {
-        let telemetry = FrontendTelemetry::default();
-        let initial = OnlineGcRuntimeConfiguration {
-            enabled: true,
-            policy: OnlineGcPolicy::default(),
-        };
-        let (configuration, _configuration_rx) = watch::channel(initial);
-        let capacity_source = TestPresentedCapacityControl::default();
-        let namespace = Namespace::new_volatile(NamespaceConfig::default());
-
-        let inspected = apply_management_operation(
-            ManagementOperation::Inspect,
-            &telemetry,
-            &configuration,
-            &capacity_source,
-            &namespace,
-        );
-        assert!(inspected.ok);
-        assert!(inspected.frontend.is_some());
-
-        assert!(inspected.frontend.as_ref().unwrap().mutation_admission_open);
-        namespace.pause_mutation_admission();
-        let paused = apply_management_operation(
-            ManagementOperation::Inspect,
-            &telemetry,
-            &configuration,
-            &capacity_source,
-            &namespace,
-        );
-        assert!(!paused.frontend.as_ref().unwrap().mutation_admission_open);
-        assert!(!paused.frontend.as_ref().unwrap().integrity_failed);
-        namespace.resume_mutation_admission();
-        let updated = apply_management_operation(
-            ManagementOperation::UpdateOnlineGc {
-                enabled: false,
-                pressure_low_basis_points: 8_100,
-                pressure_high_basis_points: 8_800,
-            },
-            &telemetry,
-            &configuration,
-            &capacity_source,
-            &namespace,
-        );
-        assert!(updated.ok);
-        assert!(!configuration.borrow().enabled);
-
-        let quota = apply_management_operation(
-            ManagementOperation::UpdatePresentedCapacities {
-                reduction_rules: None,
-                revision: "shares-r1".to_owned(),
-                rules: vec![ManagementPresentedCapacityRule {
-                    inode: 42,
-                    capacity_bytes: 25_000_000_000_000,
-                }],
-            },
-            &telemetry,
-            &configuration,
-            &capacity_source,
-            &namespace,
-        );
-        assert!(quota.ok);
-        assert_eq!(
-            capacity_source.revision().expect("capacity revision"),
-            "shares-r1"
-        );
-
-        let suffixes = apply_management_operation(
-            ManagementOperation::UpdateSmallFileExtensions {
-                revision: "settings-2".to_owned(),
-                extensions: vec![".VMDK".to_owned()],
-            },
-            &telemetry,
-            &configuration,
-            &capacity_source,
-            &namespace,
-        );
-        assert!(suffixes.ok);
-        assert_eq!(namespace.small_file_policy().extensions, [".vmdk"]);
-
-        let rejected = apply_management_operation(
-            ManagementOperation::UpdateSmallFileExtensions {
-                revision: "settings-3".to_owned(),
-                extensions: vec!["vmdk".to_owned()],
-            },
-            &telemetry,
-            &configuration,
-            &capacity_source,
-            &namespace,
-        );
-        assert!(!rejected.ok);
-        assert_eq!(namespace.small_file_policy().extensions, [".vmdk"]);
-    }
-
-    #[tokio::test]
-    async fn management_socket_is_root_only() {
-        let root = std::env::temp_dir().join(format!(
-            "fastdup-management-permissions-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create management fixture root");
-        let (_listener, guard) = bind_management_control(&root).expect("bind management socket");
-        let mode = std::fs::metadata(root.join(MANAGEMENT_SOCKET_NAME))
-            .expect("management socket metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-        drop(guard);
-        std::fs::remove_dir(root).expect("remove management fixture root");
-    }
-
-    #[derive(Debug, Default)]
-    struct TestPresentedCapacityControl {
-        revision: Mutex<String>,
-    }
-
-    impl PresentedCapacityControl for TestPresentedCapacityControl {
-        fn replace(&self, revision: String, _rules: Vec<(u64, u64)>) -> io::Result<()> {
-            *self.revision.lock().expect("test capacity lock") = revision;
-            Ok(())
-        }
-
-        fn revision(&self) -> io::Result<String> {
-            Ok(self.revision.lock().expect("test capacity lock").clone())
-        }
-    }
-
-    #[test]
     fn statfs_override_requires_a_complete_bounded_decimal_pair() {
         assert_eq!(
             statfs_override_from_values(None, None).expect("no override"),
@@ -2731,77 +1848,6 @@ mod tests {
                 .expect("valid override"),
             Some(StatFsOverride::new(1_000, 750).expect("valid fixture"))
         );
-    }
-
-    #[test]
-    fn production_data_storage_requires_io_uring() {
-        let root =
-            std::env::temp_dir().join(format!("fastdup-default-io-uring-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create unique test root");
-
-        let storage = open_data_storage(&root, false).expect("open production data storage");
-
-        assert!(storage.inner.status().ring_entries() > 0);
-        drop(storage);
-        std::fs::remove_dir_all(root).expect("remove test root");
-    }
-
-    #[test]
-    fn telemetry_adapter_records_sampled_owned_container_publication() {
-        let root =
-            std::env::temp_dir().join(format!("fastdup-telemetry-owned-{}", std::process::id()));
-        std::fs::create_dir(&root).expect("create unique test root");
-        let inner = IoUringStorageIo::open(&root, IoUringStorageConfig::default())
-            .expect("open the production io_uring backend");
-        let storage = TelemetryStorageIo::new(inner, true);
-        let repository = ContainerRepository::new(storage.clone());
-        let chunk = b"telemetry-owned-publication".repeat(8_192);
-        let region = [chunk.as_slice()];
-        let regions = [region.as_slice()];
-        let prepared =
-            ContainerRepository::<TelemetryStorageIo>::prepare_adaptive_regions_parallel(
-                ContainerId::new([0xA7; 16]).expect("fixture Container ID is nonzero"),
-                1,
-                &regions,
-                NonZeroUsize::MIN,
-            )
-            .expect("prepare fixture Container");
-
-        let (_, metrics) = repository
-            .publish_prepared_adaptive_profiled(prepared)
-            .expect("publish fixture Container through telemetry adapter");
-
-        let status = storage.inner.status();
-        assert_eq!(status.owned_publications_started(), 1);
-        assert_eq!(status.owned_publications_completed(), 1);
-        assert_eq!(status.borrowed_write_copy_bytes(), 0);
-        assert_eq!(storage.telemetry.whole_reads.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            storage.telemetry.whole_read_bytes.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(storage.telemetry.range_reads.load(Ordering::Relaxed), 3);
-        assert_eq!(
-            storage.telemetry.range_read_bytes.load(Ordering::Relaxed),
-            u64::try_from(HEADER_BYTES * 3).expect("sample bytes fit u64")
-        );
-        assert_eq!(storage.telemetry.writes.load(Ordering::Relaxed), 3);
-        assert_eq!(
-            storage.telemetry.write_bytes.load(Ordering::Relaxed),
-            metrics.file_bytes()
-                + u64::try_from(HEADER_BYTES).expect("format Header length fits u64")
-        );
-        assert_eq!(
-            storage
-                .telemetry
-                .nonsequential_writes
-                .load(Ordering::Relaxed),
-            1
-        );
-
-        drop(repository);
-        drop(storage);
-        std::fs::remove_dir_all(root).expect("remove test root");
     }
 
     #[tokio::test]

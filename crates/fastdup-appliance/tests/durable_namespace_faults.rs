@@ -4,7 +4,7 @@ use fastdup_posix::{
     FS_IMMUTABLE_FL, FallocateMode, HandleId, InodeId, Namespace, NamespaceConfig, OpenOptions,
     Operation, PosixError, ROOT_INODE, Reply, RequestContext, XattrSetMode,
 };
-use fastdup_store::{ContainerRepository, GenerationRepository};
+use fastdup_store::{ContainerRepository, GenerationRepository, ReadIntent, ReadIntentScope};
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
 const CALLER: RequestContext = RequestContext {
@@ -350,6 +350,101 @@ fn metadata_failure_keeps_verified_data_proofs_frozen_until_retry_commits() {
         .expect("retry commits the generation");
     assert_eq!(appliance.generation_proof_set_status().frozen_proofs(), 0);
     assert_historical_demotion_or_memory_pressure(appliance.historical_proof_cache_status());
+}
+
+#[test]
+fn cold_exact_reuse_preserves_data_across_every_metadata_fault() {
+    let probe_metadata = MemoryStorageIo::new();
+    let probe = cold_exact_fixture(probe_metadata.clone(), MemoryStorageIo::new());
+    let baseline = probe_metadata.operation_count();
+    write_fixture(&probe);
+    probe.checkpoint().unwrap().unwrap();
+    let commit_operations = probe_metadata.operation_count() - baseline;
+    for relative in 0..commit_operations {
+        for after in [false, true] {
+            let metadata = if after {
+                MemoryStorageIo::with_fail_after(baseline + relative)
+            } else {
+                MemoryStorageIo::with_fail_before(baseline + relative)
+            };
+            let data = MemoryStorageIo::new();
+            let appliance = cold_exact_fixture(metadata.clone(), data.clone());
+            let data_before = data.operation_count();
+            write_fixture(&appliance);
+            assert!(
+                appliance.checkpoint().is_err(),
+                "fault {relative}, after={after}"
+            );
+            assert!(appliance.generation_proof_set_status().frozen_proofs() > 0);
+            let retried = relative == 0 && !after;
+            if retried {
+                appliance.checkpoint().unwrap().unwrap();
+            }
+            assert!(
+                data.operations()[data_before..]
+                    .iter()
+                    .all(|operation| !matches!(
+                        operation,
+                        StorageOperation::Read
+                            | StorageOperation::ReadExactAt
+                            | StorageOperation::CreateNew
+                    )),
+                "Exact reference and Commit retry must use no DATA I/O, fault {relative}, after={after}"
+            );
+            drop(appliance);
+            metadata.crash();
+            data.crash();
+            let recovered = recover_mount(
+                NamespaceConfig::default(),
+                &GenerationRepository::new(metadata, policy()),
+                &ContainerRepository::new(data),
+            )
+            .unwrap()
+            .unwrap();
+            if retried || (after && relative + 1 == commit_operations) {
+                assert_complete(&recovered);
+            } else {
+                assert_eq!(
+                    recovered.dispatch(
+                        CALLER,
+                        Operation::Lookup {
+                            parent: ROOT_INODE,
+                            name: NAME,
+                        }
+                    ),
+                    Err(PosixError::NoEntry)
+                );
+            }
+        }
+    }
+}
+
+fn cold_exact_fixture(
+    metadata: MemoryStorageIo,
+    data: MemoryStorageIo,
+) -> DurableNamespace<MemoryStorageIo, MemoryStorageIo> {
+    let index = MemoryStorageIo::new();
+    {
+        let appliance = DurableNamespace::open_with_index(
+            NamespaceConfig::default(),
+            GenerationRepository::new(metadata.clone(), policy()),
+            ContainerRepository::new(data.clone()),
+            &fastdup_store::ExactIndexRunRepository::new(index.clone()),
+            16,
+        )
+        .unwrap();
+        write_named(&appliance, b"original", PAYLOAD);
+        appliance.checkpoint().unwrap().unwrap();
+    }
+    DurableNamespace::open_with_committed_recovery(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, policy()),
+        ContainerRepository::new(data),
+        &fastdup_store::ExactIndexRunRepository::new(index),
+        &fastdup_store::SimilarityIndexRepository::new(MemoryStorageIo::new()),
+        16,
+    )
+    .unwrap()
 }
 
 fn assert_historical_demotion_or_memory_pressure(status: HistoricalProofCacheStatus) {
@@ -1394,6 +1489,7 @@ fn assert_complete(namespace: &Namespace) {
 
 #[test]
 fn every_frozen_replace_fault_excludes_later_truncate_and_unlink() {
+    let _independent = ReadIntentScope::enter(ReadIntent::Independent);
     let probe_metadata = MemoryStorageIo::new();
     let probe_data = MemoryStorageIo::new();
     let probe = frozen_replace_fixture(probe_metadata.clone(), probe_data.clone());
@@ -1632,12 +1728,36 @@ fn assert_replace_image(namespace: &Namespace, committed: bool) {
     }
 }
 
+#[test]
+fn frozen_replace_without_fault_recovers_the_committed_layout() {
+    let _independent = ReadIntentScope::enter(ReadIntent::Independent);
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let appliance = frozen_replace_fixture(metadata.clone(), data.clone());
+    appliance
+        .checkpoint()
+        .expect("unfaulted frozen replace checkpoint")
+        .expect("unfaulted frozen replace publishes");
+    drop(appliance);
+    metadata.crash();
+    data.crash();
+    let recovered = recover_mount(
+        NamespaceConfig::default(),
+        &GenerationRepository::new(metadata, policy()),
+        &ContainerRepository::new(data),
+    )
+    .expect("recover unfaulted frozen replace")
+    .expect("committed frozen replace generation exists");
+    assert_replace_image(&recovered, true);
+}
+
 fn policy() -> PolicySetId {
     PolicySetId::new([0x6D; 32]).expect("fixture Policy Set ID is nonzero")
 }
 
 #[test]
 fn every_mixed_growth_checkpoint_fault_recovers_one_complete_layout() {
+    let _independent = ReadIntentScope::enter(ReadIntent::Independent);
     fn change(
         appliance: &DurableNamespace<MemoryStorageIo, MemoryStorageIo>,
         inode: InodeId,

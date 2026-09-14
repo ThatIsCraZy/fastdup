@@ -171,7 +171,10 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/shares", get(shares).post(upsert_share))
         .route("/api/v1/shares/{id}", delete(delete_share))
         .route("/api/v1/samba/principals", get(samba_principals))
-        .route("/api/v1/samba/users", get(list_samba_users).post(create_samba_user))
+        .route(
+            "/api/v1/samba/users",
+            get(list_samba_users).post(create_samba_user),
+        )
         .route("/api/v1/telemetry/history", get(history))
         .route("/api/v1/audit", get(audit_log))
         .route("/api/v1/events", get(events))
@@ -390,10 +393,17 @@ async fn activate_tls(
     let identity = tokio::task::spawn_blocking(move || {
         let identity = TlsIdentity::publish_pem(&directory, &certificate, &key)?;
         // Complete activation even if the importing browser disconnects.
-        if let Some(tls) = live_tls { tls.reload_from_config(config.get_inner()); }
-        if let Ok(mut fingerprint) = live_fingerprint.write() { identity.fingerprint.clone_into(&mut fingerprint); }
+        if let Some(tls) = live_tls {
+            tls.reload_from_config(config.get_inner());
+        }
+        if let Ok(mut fingerprint) = live_fingerprint.write() {
+            identity.fingerprint.clone_into(&mut fingerprint);
+        }
         Ok::<_, fastdup_control::TlsIdentityError>(identity)
-    }).await.map_err(internal_error)?.map_err(internal_error)?;
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
     state
         .store
         .audit(
@@ -517,21 +527,39 @@ async fn shares(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
     Ok(Json(state.control.inspect().await.map_err(control_error)?.shares).into_response())
 }
 
-async fn list_samba_users(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+async fn list_samba_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     authenticate(&state, &headers, false)?;
     Ok(Json(state.control.samba_users().await.map_err(control_error)?).into_response())
 }
 
-async fn create_samba_user(State(state): State<AppState>, headers: HeaderMap,
-    Json(request): Json<fastdup_control::SambaUserRequest>) -> Result<Response, ApiError> {
+async fn create_samba_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<fastdup_control::SambaUserRequest>,
+) -> Result<Response, ApiError> {
     let session = authenticate(&state, &headers, false)?;
     require_csrf(&headers, &session.csrf_token)?;
     request.validate().map_err(control_error)?;
     let username = request.username.clone();
     let result = state.control.create_samba_user(request).await;
-    state.store.audit(&session.username, "samba_user_create", if result.is_ok() { "success" } else { "failure" }, &username).map_err(store_error)?;
+    state
+        .store
+        .audit(
+            &session.username,
+            "samba_user_create",
+            if result.is_ok() { "success" } else { "failure" },
+            &username,
+        )
+        .map_err(store_error)?;
     result.map_err(control_error)?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({"username": username}))).into_response())
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({"username": username})),
+    )
+        .into_response())
 }
 
 async fn samba_principals(
@@ -898,16 +926,56 @@ mod settings_api_tests {
     #[tokio::test]
     async fn smb_accounts_require_login_password_change_and_csrf() {
         let (_directory, state) = fixture();
-        let request = || Json(fastdup_control::SambaUserRequest { username: "backup".into(), password: "backup-test-password".into() });
-        assert_eq!(create_samba_user(State(state.clone()), HeaderMap::new(), request()).await.unwrap_err().status, StatusCode::UNAUTHORIZED);
-        assert_eq!(list_samba_users(State(state.clone()), HeaderMap::new()).await.unwrap_err().status, StatusCode::UNAUTHORIZED);
+        let request = || {
+            Json(fastdup_control::SambaUserRequest {
+                username: "backup".into(),
+                password: "backup-test-password".into(),
+            })
+        };
+        assert_eq!(
+            create_samba_user(State(state.clone()), HeaderMap::new(), request())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            list_samba_users(State(state.clone()), HeaderMap::new())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
         let login = state.sessions.login("admin", "fastdup01.").unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert("cookie", format!("fastdup_session={}", login.session_token).parse().unwrap());
-        assert!(create_samba_user(State(state.clone()), headers.clone(), request()).await.is_err());
-        let login = state.sessions.change_password(&login.session_token, "fastdup01.", "long-test-password").unwrap();
-        headers.insert("cookie", format!("fastdup_session={}", login.session_token).parse().unwrap());
-        assert_eq!(create_samba_user(State(state.clone()), headers, request()).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        headers.insert(
+            "cookie",
+            format!("fastdup_session={}", login.session_token)
+                .parse()
+                .unwrap(),
+        );
+        assert!(
+            create_samba_user(State(state.clone()), headers.clone(), request())
+                .await
+                .is_err()
+        );
+        let login = state
+            .sessions
+            .change_password(&login.session_token, "fastdup01.", "long-test-password")
+            .unwrap();
+        headers.insert(
+            "cookie",
+            format!("fastdup_session={}", login.session_token)
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            create_samba_user(State(state.clone()), headers, request())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

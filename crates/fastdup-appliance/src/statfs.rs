@@ -611,8 +611,18 @@ mod tests {
         assert_eq!(used.free_bytes(), 876_544);
         assert_eq!(used.available_bytes(), 876_544);
         let physically_full = StatFsSnapshot::new(100_000, 0, 0, 100, 90, 4096, 255).unwrap();
-        assert_eq!(presented_snapshot(physically_full, 1_000_000, Some(876_544)).unwrap().available_bytes(), 876_544);
-        assert_eq!(presented_snapshot(physical, 1_000_000, Some(0)).unwrap().available_bytes(), 0);
+        assert_eq!(
+            presented_snapshot(physically_full, 1_000_000, Some(876_544))
+                .unwrap()
+                .available_bytes(),
+            876_544
+        );
+        assert_eq!(
+            presented_snapshot(physical, 1_000_000, Some(0))
+                .unwrap()
+                .available_bytes(),
+            0
+        );
     }
 
     #[test]

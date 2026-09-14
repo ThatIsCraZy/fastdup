@@ -17,15 +17,26 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         checkpoints: &crate::recovery_checkpoint::RecoveryCheckpointRepository<D>,
         verifier: Option<&dyn RequiredChunkVerifier>,
+        publication: &mut Option<(CommitRecord, crate::RecoveryCheckpointSummary)>,
     ) -> Result<
         Option<crate::recovery_checkpoint::RecoveryCheckpointSummary>,
         crate::recovery_checkpoint::RecoveryCheckpointError,
     > {
+        // Take before fallible work: errors revoke even an earlier receipt.
+        let previous = publication.take();
         let candidates = self.recovery_checkpoint_candidates()?;
         if candidates.is_empty() {
             return Ok(None);
         }
         for candidate in candidates {
+            if let Some((record, summary)) = previous
+                && record == candidate.record
+                && verifier.is_none()
+                && !crate::read_intent::independent()
+            {
+                *publication = previous;
+                return Ok(Some(summary));
+            }
             let graph = self.scan_recovery_checkpoint_candidate(candidate.record);
             let (object_ids, required) = match graph {
                 Ok(graph) => graph,
@@ -41,11 +52,17 @@ impl<I: StorageIo> GenerationRepository<I> {
                 }
                 return Err(error.into());
             }
-            return checkpoints
-                .publish_source(candidate.record, &object_ids, verifier, |object_id| {
-                    self.read_metadata(object_id).map_err(Into::into)
-                })
-                .map(Some);
+            let summary = checkpoints.publish_source(
+                candidate.record,
+                &object_ids,
+                required.len(),
+                verifier,
+                |object_id| self.read_metadata(object_id).map_err(Into::into),
+            )?;
+            // Only the successful checkpoint/head durability boundary issues
+            // this receipt. It is not reusable recovery or scrub evidence.
+            *publication = Some((candidate.record, summary));
+            return Ok(Some(summary));
         }
         Err(GenerationError::NoRecoverableGeneration.into())
     }

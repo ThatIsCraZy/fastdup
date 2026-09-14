@@ -64,7 +64,9 @@ _Avoid_: Run Set, shard replica, independent Run generation
 
 **Exact hit**:
 A Chunk ID and logical-length match against the Exact Index. It permits location
-reuse without asserting that a physical copy is canonical.
+reuse during trusted-client ingest without rereading DATA, provided current
+transitions allow the Location and writer admission protects it through Commit.
+It is not independent verification of the stored payload.
 _Avoid_: Bloom hit, similarity candidate
 
 **Verified Location evidence**:
@@ -373,21 +375,25 @@ only placement, never Manifest order, Chunk identity, or liveness.
 _Avoid_: Similarity Reorder, canonical Location, defragmentation
 
 **Generation proof set**:
-The bounded in-memory set of verified DATA Locations required by the Active and
-Frozen Commit Generations. Its entries remain pinned until the owning generation
+The bounded in-memory set of writer-carried or Exact-selected DATA references
+required by the Active and Frozen Commit Generations. Its entries remain pinned until the owning generation
 commits, aborts, or rolls back; a historical cache policy cannot evict them.
+Separate per-epoch DATA-reference admission protects reuse against GC even when
+this per-Chunk set has no capacity.
 _Avoid_: Historical proof cache, Exact Index authority
 
 **Historical proof cache**:
-Process-local acceleration for previously verified immutable DATA Locations.
+Process-local acceleration for previously committed DATA references.
 It participates in the Unified Read Cache, starts empty after restart, and may be purged under memory
-pressure without changing correctness or durability.
+pressure without changing correctness or durability. Reuse still checks current
+Exact selection; this cache supplies no independent physical Location evidence.
 _Avoid_: Generation proof set, persistent Exact Index, source of truth
 
 **Exact Index hot page**:
 An independently verified, decoded page from an immutable Exact Index Run,
-retained as bounded RAM acceleration. It is distinct from the generation-pinned
-Run view and never authorizes Chunk reuse or replaces DATA Location verification.
+retained as bounded RAM acceleration. Exact reuse additionally requires the
+activated Run Set, full identity lookup, transition merge and writer admission;
+a page alone supplies no physical DATA verification.
 _Avoid_: In-memory Exact Index, hash table
 
 **Cache memory reserve**:
@@ -687,7 +693,8 @@ _Avoid_: Recovered generation, complete DATA graph
 **Successor graph proof**:
 The complete DATA-dependency proof for one new Commit Group formed by retaining
 unchanged dependencies from the immediately preceding verified generation and
-fully verifying every newly introduced dependency. It is valid only while that
+checking every newly introduced dependency using writer publication evidence,
+guarded Exact reference selection, or independent DATA verification. It is valid only while that
 predecessor remains the installed generation and immutable storage stays under
 the same appliance process; full recovery and offline scrub construct fresh complete proofs.
 _Avoid_: Exact-Index authority, cache hit, partial verification
@@ -760,6 +767,9 @@ advanced through its own successful writes and required synchronization. It
 avoids reconstructing known state from disk on every mutation. It is bounded
 required working state, distinct from evictable read acceleration; uncertain
 activation I/O revokes the WAL cursor and recovery reconstructs it independently.
+The constant-sized Exact Run allocator skips observed orphan names and consumes
+reserved output ranges before I/O; it is shared with GC and reconstructed by a
+new owner, rather than scanning the Metadata directory on each publication.
 _Avoid_: Read cache, proof of durability from RAM, durable recovery authority
 
 **Repository format epoch**:

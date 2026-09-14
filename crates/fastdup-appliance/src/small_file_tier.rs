@@ -80,7 +80,9 @@ impl SmallFileTierIsolation {
         let requested_limit_bytes = hard_limit_bytes;
         let hard_limit_bytes = effective_quota(capacity_bytes, requested_limit_bytes)?;
         if hard_limit_bytes < requested_limit_bytes {
-            eprintln!("warning=small_file_quota_reduced requested_bytes={requested_limit_bytes} effective_bytes={hard_limit_bytes} metadata_capacity_bytes={capacity_bytes}");
+            eprintln!(
+                "warning=small_file_quota_reduced requested_bytes={requested_limit_bytes} effective_bytes={hard_limit_bytes} metadata_capacity_bytes={capacity_bytes}"
+            );
         }
 
         let project_command = format!("chproj -R {project_id}");
@@ -221,10 +223,17 @@ impl From<io::Error> for SmallFileTierIsolationError {
 // Oversized configuration is a capacity hint, not a reason to reject a healthy
 // Metadata filesystem. Keep ample metadata headroom when adapting the default.
 fn effective_quota(capacity: u64, requested: u64) -> Result<u64, SmallFileTierIsolationError> {
-    let available = capacity.checked_sub(COMMIT_METADATA_FLOOR_BYTES_V1)
+    let available = capacity
+        .checked_sub(COMMIT_METADATA_FLOOR_BYTES_V1)
         .ok_or(SmallFileTierIsolationError::MetadataReserveAtRisk)?;
-    let limit = if requested <= available { requested } else { (capacity / 5).min(available) / 1024 * 1024 };
-    if limit == 0 { return Err(SmallFileTierIsolationError::MetadataReserveAtRisk); }
+    let limit = if requested <= available {
+        requested
+    } else {
+        (capacity / 5).min(available) / 1024 * 1024
+    };
+    if limit == 0 {
+        return Err(SmallFileTierIsolationError::MetadataReserveAtRisk);
+    }
     Ok(limit)
 }
 

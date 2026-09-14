@@ -29,6 +29,8 @@ pub struct OperationLatency {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<PipelineTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_reads: Option<MetadataReadTelemetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codec_buffers: Option<CodecBufferTelemetry>,
@@ -70,10 +72,18 @@ pub struct MetadataReadTelemetry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataReadRow {
-    pub reason: String, pub object: String, pub mode: String,
-    pub operations: u64, pub requested_bytes: u64, pub returned_bytes: u64,
-    pub errors: u64, pub elapsed_micros: u64, pub max_micros: u64, pub in_flight: u64,
-    pub operations_per_second: f64, pub requested_mbps: f64,
+    pub reason: String,
+    pub object: String,
+    pub mode: String,
+    pub operations: u64,
+    pub requested_bytes: u64,
+    pub returned_bytes: u64,
+    pub errors: u64,
+    pub elapsed_micros: u64,
+    pub max_micros: u64,
+    pub in_flight: u64,
+    pub operations_per_second: f64,
+    pub requested_mbps: f64,
 }
 
 /// Background allocator sample; free blocks may already be absent from RSS.
@@ -185,6 +195,8 @@ pub struct CheckpointTelemetry {
     pub generation: u64,
     pub total_ms: f64,
     pub phases: Vec<CheckpointPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattributed_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -238,21 +250,62 @@ pub(crate) fn parse_details(frontend: &serde_json::Value) -> DetailTelemetry {
 mod tests {
     use super::*;
     #[test]
+    fn pipeline_waits_and_open_admission_history_survive_roundtrip() {
+        let mut frontend = serde_json::json!({"details": {
+            "runtimeId":"test", "ioUring":{"ringEntries":64,"inflightBytes":0,"maxInflightBytes":1,"peakInflightBytes":0,"submitted":0,"completed":0},
+            "caches":[], "reduction":{"enabled":true,"queries":0,"candidates":0,"acceptedPrefixes":0,"acceptedSparseXor":0,"savedPayloadBytes":0,"fallbacks":0,"errors":0}
+        }});
+        assert!(parse_details(&frontend).runtime.unwrap().pipeline.is_none());
+        frontend["details"]["pipeline"] = serde_json::json!({
+            "admission":{"open":false,"reason":"checkpointTimeout","closures":2,"closedMs":26000.0,"currentClosedMs":12000.0,"maximumClosedMs":14000.0},
+            "operations":[{"id":"exactEnqueue","active":3,"completed":9,"totalMs":2100.0,"maximumMs":2000.0,"busyMs":8000.0}]
+        });
+        frontend["details"]["checkpoint"] = serde_json::json!({"completedAt":100,"generation":8,"totalMs":16000,"unattributedMs":10,
+            "phases":[{"id":"publicationWait","wallMs":14000,"cpuMs":1000}]});
+        let saved = serde_json::to_value(parse_details(&frontend)).unwrap();
+        assert_eq!(
+            saved["runtime"]["pipeline"],
+            frontend["details"]["pipeline"]
+        );
+        let restored: DetailTelemetry = serde_json::from_value(saved).unwrap();
+        let runtime = restored.runtime.unwrap();
+        assert_eq!(runtime.checkpoint.unwrap().unattributed_ms, Some(10.0));
+        assert_eq!(runtime.pipeline.unwrap().operations[0].active, 3);
+        frontend["details"]["pipeline"]["admission"]["open"] = serde_json::json!(true);
+        frontend["details"]["pipeline"]["admission"]["reason"] = serde_json::Value::Null;
+        frontend["details"]["pipeline"]["admission"]["currentClosedMs"] = serde_json::json!(0);
+        let current = parse_details(&frontend).runtime.unwrap().pipeline.unwrap();
+        assert!(current.admission.open);
+        assert_eq!(current.admission.closed_ms, 26000.0);
+    }
+    #[test]
     fn metadata_read_attribution_survives_api_history_roundtrip() {
         let mut frontend = serde_json::json!({"details": {
             "runtimeId":"test", "ioUring":{"ringEntries":64,"inflightBytes":0,"maxInflightBytes":1,"peakInflightBytes":0,"submitted":0,"completed":0},
             "caches":[], "reduction":{"enabled":true,"queries":0,"candidates":0,"acceptedPrefixes":0,"acceptedSparseXor":0,"savedPayloadBytes":0,"fallbacks":0,"errors":0}
         }});
-        assert!(parse_details(&frontend).runtime.unwrap().metadata_reads.is_none());
+        assert!(
+            parse_details(&frontend)
+                .runtime
+                .unwrap()
+                .metadata_reads
+                .is_none()
+        );
         frontend["details"]["metadataReads"] = serde_json::json!({"intervalSeconds":2.0,"rows":[{
             "reason":"indexAudit","object":"exactIndex","mode":"mmap",
             "operations":2,"requestedBytes":8192,"returnedBytes":8192,"errors":0,
             "elapsedMicros":0,"maxMicros":0,"inFlight":0,"operationsPerSecond":1.0,"requestedMbps":0.004096
         }]});
         let saved = serde_json::to_value(parse_details(&frontend)).unwrap();
-        assert_eq!(saved["runtime"]["metadataReads"],frontend["details"]["metadataReads"]);
+        assert_eq!(
+            saved["runtime"]["metadataReads"],
+            frontend["details"]["metadataReads"]
+        );
         let restored: DetailTelemetry = serde_json::from_value(saved).unwrap();
-        assert_eq!(restored.runtime.unwrap().metadata_reads.unwrap().rows[0].mode,"mmap");
+        assert_eq!(
+            restored.runtime.unwrap().metadata_reads.unwrap().rows[0].mode,
+            "mmap"
+        );
     }
 
     #[test]
@@ -261,13 +314,22 @@ mod tests {
             "runtimeId":"test", "ioUring":{"ringEntries":64,"inflightBytes":0,"maxInflightBytes":1,"peakInflightBytes":0,"submitted":0,"completed":0},
             "caches":[], "reduction":{"enabled":true,"queries":0,"candidates":0,"acceptedPrefixes":0,"acceptedSparseXor":0,"savedPayloadBytes":0,"fallbacks":0,"errors":0}
         }});
-        assert!(parse_details(&frontend).runtime.unwrap().codec_buffers.is_none());
+        assert!(
+            parse_details(&frontend)
+                .runtime
+                .unwrap()
+                .codec_buffers
+                .is_none()
+        );
         frontend["details"]["codecBuffers"] = serde_json::json!({
             "retainedBytes":262144,"activeBytes":65536,"peakActiveBytes":524288,
             "hits":1999,"misses":1,"evictions":0
         });
         let saved = serde_json::to_value(parse_details(&frontend)).unwrap();
-        assert_eq!(saved["runtime"]["codecBuffers"], frontend["details"]["codecBuffers"]);
+        assert_eq!(
+            saved["runtime"]["codecBuffers"],
+            frontend["details"]["codecBuffers"]
+        );
         let restored: DetailTelemetry = serde_json::from_value(saved).unwrap();
         assert_eq!(restored.runtime.unwrap().codec_buffers.unwrap().hits, 1999);
     }
@@ -350,7 +412,10 @@ mod tests {
             "anonymousResidentBytes":400,"trimAttempts":2,"lastTrimMicros":1000
         });
         let roundtrip = serde_json::to_value(parse_details(&frontend)).unwrap();
-        assert_eq!(roundtrip["runtime"]["allocatorMemory"], frontend["details"]["allocatorMemory"]);
+        assert_eq!(
+            roundtrip["runtime"]["allocatorMemory"],
+            frontend["details"]["allocatorMemory"]
+        );
         assert_eq!(
             roundtrip["runtime"]["readCacheCompression"],
             frontend["details"]["readCacheCompression"]
@@ -428,4 +493,34 @@ pub struct CacheWindowCounters {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+}
+
+/// Bounded runtime observations, stored unchanged with each historical sample.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineTelemetry {
+    pub operations: Vec<PipelineOperation>,
+    pub admission: AdmissionTelemetry,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineOperation {
+    pub id: String,
+    pub active: u64,
+    pub completed: u64,
+    pub total_ms: f64,
+    pub maximum_ms: f64,
+    pub busy_ms: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionTelemetry {
+    pub open: bool,
+    pub reason: Option<String>,
+    pub closures: u64,
+    pub closed_ms: f64,
+    pub current_closed_ms: f64,
+    pub maximum_closed_ms: f64,
 }

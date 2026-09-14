@@ -1045,6 +1045,11 @@ fn seed_generation_log_rotation_boundary(
 
 #[test]
 fn every_rotation_failpoint_recovers_only_the_previous_or_complete_next_generation() {
+    // This matrix compares operation positions from a probe with fresh
+    // backends. Keep all metadata access independent so shared process-local
+    // cache residency cannot change the replayed operation sequence.
+    let _independent =
+        fastdup_store::ReadIntentScope::enter(fastdup_store::ReadIntent::Independent);
     let policy = PolicySetId::new([0x62; 32]).expect("policy identity is nonzero");
     let previous_root = reservation_root(1_024);
     let next_root = reservation_root(2_048);

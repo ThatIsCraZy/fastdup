@@ -91,9 +91,14 @@ Every path explicitly preserves one of these intents:
 Online GC may reuse cached Metadata graphs, candidate/index pages and verified
 relocation source bytes. Its reverse-dependency projection is also reclaimable
 by the common cache; a running proof retains its required immutable view.
-Online Exact reuse, recent publication overlays and Commit dependency checks
-share the same cache owner as demand readers. As of 13 September 2026 they
-retain compact Location evidence independently of payload residency. Evidence
+Online Exact reuse and Commit reference checks follow ADR 0015: a valid ACTIVE
+Exact mapping needs no DATA read even with an empty cache. Historical references
+remain in the common owner and require current selection; they never become
+physical verification evidence. Per-epoch GC admission is required writer
+workspace, bounded independently of cache residency.
+
+Independent DATA verification paths and demand readers share compact Location
+evidence independently of payload residency. Evidence
 is admitted only after complete Record/Chunk verification (including a Base
 when required), and matches every coordinate of a currently eligible ACTIVE
 Exact candidate. The newest transition for that Location must still allow it.
@@ -108,7 +113,8 @@ remember that verification succeeded. Demand reads retain their normal payload
 admission and also contribute checked Location evidence. This additional typed
 view has no private map, quota, lease or replacement list: pressure evicts it
 through the same owner, and telemetry exposes its hits and charged bytes.
-Evidence eviction causes ordinary revalidation. Explicit Independent scopes
+Evidence eviction causes revalidation where physical evidence is required; it
+does not add a payload check to trusted Exact ingest. Explicit Independent scopes
 bypass every hit and admission. Logical bytes without matching physical-source
 evidence still cannot authorize a Location. Recovery, scrub and final deletion
 validation keep their fresh-media contracts.
@@ -129,7 +135,7 @@ handoff; neither encoded nor decoded payloads are admitted by the scrub. Caller
 Scan/Independent intent and the common pressure owner can still decline the
 handoff. A subsequent scrub remains fully Independent even with warm evidence.
 Resumed historical certificates supply no current Location evidence. This
-avoids discarding fresh verification work only to repeat it during ingest,
+avoids discarding fresh verification work before other physical-proof consumers,
 without promoting persisted progress into current payload truth. The paired
 tests and sampled live limits are recorded in
 [the Location reuse report](../testing/location-proof-reuse-2026-09-13.md).
@@ -262,3 +268,63 @@ contracts are [Linux open(2)](https://man7.org/linux/man-pages/man2/open.2.html)
 [statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html),
 [Linux FUSE I/O](https://docs.kernel.org/filesystems/fuse/fuse-io.html) and
 [the XFS size-change implementation](https://raw.githubusercontent.com/torvalds/linux/v6.12/fs/xfs/xfs_iops.c).
+
+
+## Exact writer evidence (2026-09-13)
+
+Ordinary L0 publication derives page bounds and membership hints directly from
+the validated immutable Run entries and the encoder's fixed page partition, as
+streamed compaction already does. It does not decode and checksum its newly
+encoded RAM pages a second time. Their byte representations still enter the
+Unified Read Cache, and independent demand, recovery and scrub readers retain
+stored page CRC, full Run hash and ordering checks. The shared format page-entry
+constant prevents the evidence partition from drifting from serialization.
+
+## Metadata writer image handoff (2026-09-13)
+
+New content-addressed Metadata images carry their validated encoder bytes
+through complete writes, length finalization, file synchronization and successful
+no-replace publication. The writer does not reread its own temporary image.
+After successful publication it offers those bytes to the existing Metadata
+object namespace in the Unified Read Cache. Admission remains subject to the
+caller's read intent and the common pressure budget; it adds no private cache.
+
+This handoff supplies immutable content, not a durable root or liveness proof.
+The caller still owes the Metadata directory barrier before Commit/WAL
+visibility. A failed write, file sync or publication cannot admit the proposed
+image, including an error reported after the operation took effect. Existing
+same-name objects still undergo independent stored-byte collision verification.
+Recovery and scrub continue to bypass warm bytes; GC keeps its publication
+barrier and invalidates object bytes before deletion. This supersedes immediate
+Metadata staging readback, without changing the durable format or synchronization
+requirements.
+
+## Online maintenance selection (2026-09-13)
+
+Ordinary GC selection, candidate proof/refresh and activation-binding checks
+reuse an installed Exact generation only when it matches the exclusive
+writer's last synchronized activation snapshot. Selection is serialized with
+generation publication. A remaining old pin alone is insufficient after an
+ambiguous activation error: absent/mismatched writer evidence reconstructs the
+selector and dependencies. Explicit Independent intent and startup GC recovery
+continue to reconstruct storage. Final victim verification, retirement
+barriers and deletion ordering remain unchanged. Cold selected pages still
+need their normal verified reads; this removes repeated whole-generation
+recovery, not those demand reads.
+
+## Writer payload handoff (2026-09-13)
+
+Before replacing resident ingest bytes with a location-backed read recipe,
+write-through offers the logical Chunk bytes to the existing Unified DATA
+cache. The checkpoint writer uses the same admission seam after successful
+Container publication or confirmed Exact reuse. Complete logical identity and
+bounded Chunk length are checked before admission. The common pressure budget,
+replacement and Scan/Independent intent still govern residency; admission can
+be declined without affecting publication or correctness.
+
+These payloads deliberately carry no physical Record provenance. They can
+satisfy logical demand reads but cannot certify a Location, establish liveness
+or count as independent media verification. Recovery and scrub bypass them;
+proof consumers still require their own eligible publication/activation or
+physical evidence. No second cache or unbounded writer-retained payload map is
+introduced, and no on-disk format changes.

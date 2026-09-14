@@ -108,10 +108,23 @@ impl<I: StorageIo> ContainerRepository<I> {
         checked_at: u64,
         cache: &crate::VerifiedReadCache,
     ) -> Result<ScrubCertificate, StoreError> {
+        let entry = self.scrub_certificate_with_cache(id, index, checked_at, cache)?;
+        if self.selectable_container(id) {
+            coverage.observe(&entry);
+        }
+        Ok(entry)
+    }
+
+    fn scrub_certificate_with_cache<X: StorageIo>(
+        &self,
+        id: ContainerId,
+        index: Option<&crate::ActivatedExactIndex<X>>,
+        checked_at: u64,
+        cache: &crate::VerifiedReadCache,
+    ) -> Result<ScrubCertificate, StoreError> {
         let (structure, verified) = self.scrub_structure_with_evidence(id, index)?;
         let entry = ScrubCertificate::new(&structure, checked_at);
         if self.selectable_container(id) {
-            coverage.observe(&entry);
             // The fresh-media scope has ended. Offer only compact evidence
             // from this successful full verification, never a resumed journal
             // certificate or payload bytes. The caller's intent and common
@@ -185,11 +198,82 @@ impl<I: StorageIo> ContainerRepository<I> {
 /// Maximum concurrent resume operations; each worker issues one blocking read at a time.
 pub const SCRUB_RESUME_MAX_IOS: usize = 32;
 
-/// Dedicated persistent workers for asynchronous, bounded envelope reconciliation.
-/// Payload verification and graph coverage stay on the scrub coordinator.
+/// Dedicated persistent workers for bounded asynchronous scrub I/O.
+/// Envelope and payload batches share workers; coverage is merged serially.
 pub struct ScrubResumePool(rayon::ThreadPool);
 
 impl ScrubResumePool {
+    /// Fully verifies up to 32 Containers concurrently, then merges coverage.
+    /// Image lengths further bound each submitted group to 64 MiB in total.
+    /// Each worker issues one storage operation at a time, including Base reads.
+    /// All submitted work is joined even on error; no failed group adds coverage.
+    /// # Errors
+    /// Returns invalid batch, full verification, allocation or storage errors.
+    pub fn verify<I: StorageIo + Sync, X: StorageIo + Sync>(
+        &self,
+        repository: &ContainerRepository<I>,
+        ids: &[ContainerId],
+        index: Option<&crate::ActivatedExactIndex<X>>,
+        coverage: &mut ScrubCoverage,
+        checked_at: u64,
+        cache: &crate::VerifiedReadCache,
+    ) -> Result<Vec<ScrubCertificate>, StoreError> {
+        if ids.len() > SCRUB_RESUME_MAX_IOS {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "scrub batch exceeds 32 I/Os").into(),
+            );
+        }
+        let lengths = ids
+            .iter()
+            .map(|id| {
+                let length = repository.storage.object_len(&crate::published_name(*id))?;
+                if !(8192..=MAX_CONTAINER_BYTES).contains(&length) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid scrub Container length",
+                    ));
+                }
+                Ok(length)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut entries = Vec::new();
+        let mut start = 0;
+        while start < ids.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < ids.len() && bytes + lengths[end] <= MAX_CONTAINER_BYTES {
+                bytes += lengths[end];
+                end += 1;
+            }
+            let mut outcomes: Vec<Result<ScrubCertificate, StoreError>> = self.0.install(|| {
+                ids[start..end]
+                    .par_iter()
+                    .map(|id| {
+                        repository.scrub_certificate_with_cache(*id, index, checked_at, cache)
+                    })
+                    .collect()
+            });
+            // Cancellation must not mask corruption from another submitted read.
+            if let Some(position) = outcomes.iter().position(|outcome| match outcome {
+                Err(StoreError::Io(error)) => error.kind() != io::ErrorKind::Interrupted,
+                Err(_) => true,
+                Ok(_) => false,
+            }) {
+                return Err(outcomes
+                    .swap_remove(position)
+                    .expect_err("selected failure"));
+            }
+            entries.extend(outcomes.into_iter().collect::<Result<Vec<_>, _>>()?);
+            start = end;
+        }
+        for entry in &entries {
+            if repository.selectable_container(entry.id) {
+                coverage.observe(entry);
+            }
+        }
+        Ok(entries)
+    }
+
     /// Creates workers independent of frontend CPU/encoding pools.
     /// # Errors
     /// Returns worker creation or idle I/O priority setup failures.

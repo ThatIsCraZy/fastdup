@@ -60,10 +60,19 @@ pub trait ApplianceControl: Send + Sync {
         idempotency_key: String,
     ) -> Result<JobStatus, ControlProblem>;
     async fn samba_users(&self) -> Result<Vec<String>, ControlProblem> {
-        Err(ControlProblem::new("unsupported", "SMB account management is unavailable"))
+        Err(ControlProblem::new(
+            "unsupported",
+            "SMB account management is unavailable",
+        ))
     }
-    async fn create_samba_user(&self, _request: crate::SambaUserRequest) -> Result<(), ControlProblem> {
-        Err(ControlProblem::new("unsupported", "SMB account management is unavailable"))
+    async fn create_samba_user(
+        &self,
+        _request: crate::SambaUserRequest,
+    ) -> Result<(), ControlProblem> {
+        Err(ControlProblem::new(
+            "unsupported",
+            "SMB account management is unavailable",
+        ))
     }
     fn subscribe(&self) -> broadcast::Receiver<ControlEvent>;
 }
@@ -94,7 +103,8 @@ impl AgentControl {
                         known_issue = snapshot.telemetry.runtime_issue;
                         if let Some(issue) = known_issue {
                             let _ = polling.events.send(ControlEvent::Alert {
-                                code: "repository_health".to_owned(), message: issue.message().to_owned(),
+                                code: "repository_health".to_owned(),
+                                message: issue.message().to_owned(),
                             });
                         }
                     }
@@ -162,13 +172,25 @@ impl ApplianceControl for AgentControl {
     async fn samba_users(&self) -> Result<Vec<String>, ControlProblem> {
         match self.request(AgentOperation::SambaUsers).await? {
             AgentResult::SambaUsers { users } => Ok(users),
-            _ => Err(ControlProblem::new("protocol_mismatch", "Expected SMB users")),
+            _ => Err(ControlProblem::new(
+                "protocol_mismatch",
+                "Expected SMB users",
+            )),
         }
     }
-    async fn create_samba_user(&self, request: crate::SambaUserRequest) -> Result<(), ControlProblem> {
-        match self.request(AgentOperation::CreateSambaUser { request }).await? {
+    async fn create_samba_user(
+        &self,
+        request: crate::SambaUserRequest,
+    ) -> Result<(), ControlProblem> {
+        match self
+            .request(AgentOperation::CreateSambaUser { request })
+            .await?
+        {
             AgentResult::SambaUserCreated => Ok(()),
-            _ => Err(ControlProblem::new("protocol_mismatch", "Expected SMB account result")),
+            _ => Err(ControlProblem::new(
+                "protocol_mismatch",
+                "Expected SMB account result",
+            )),
         }
     }
 
@@ -189,9 +211,7 @@ impl ApplianceControl for AgentControl {
             .await?
         {
             AgentResult::Job { job } => Ok(job),
-            _ => {
-                Err(ControlProblem::new("protocol_mismatch", "Expected job"))
-            }
+            _ => Err(ControlProblem::new("protocol_mismatch", "Expected job")),
         }
     }
 
@@ -343,7 +363,8 @@ impl AgentRuntime {
         let runtime = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             if let Ok(shares) = runtime.store.shares()
-                && let Err(error) = crate::firewall::ensure_smb(shares.len()) {
+                && let Err(error) = crate::firewall::ensure_smb(shares.len())
+            {
                 tracing::warn!(?error, "SMB firewall reconciliation failed");
             }
         });
@@ -364,7 +385,10 @@ impl AgentRuntime {
         }
         // An agent restart must not retry a failed/provisioning repository.
         // Recovery remains an explicit operator action.
-        if matches!(binding.state, RepositoryState::Error | RepositoryState::Provisioning | RepositoryState::Uninitialized) {
+        if matches!(
+            binding.state,
+            RepositoryState::Error | RepositoryState::Provisioning | RepositoryState::Uninitialized
+        ) {
             return;
         }
         let Ok(settings) = self.store.settings() else {
@@ -386,7 +410,11 @@ impl AgentRuntime {
         self.sample_frontend(frontend.as_ref(), health);
     }
 
-    fn sample_frontend(&self, frontend: Option<&RuntimeFrontendCounters>, health: crate::runtime_health::RuntimeHealth) {
+    fn sample_frontend(
+        &self,
+        frontend: Option<&RuntimeFrontendCounters>,
+        health: crate::runtime_health::RuntimeHealth,
+    ) {
         let binding = self.store.repository_binding().ok().flatten();
         let state = binding
             .as_ref()
@@ -406,9 +434,17 @@ impl AgentRuntime {
         } else {
             state
         };
-        let previous = self.latest.read().ok().and_then(|latest| latest.runtime_issue);
+        let previous = self
+            .latest
+            .read()
+            .ok()
+            .and_then(|latest| latest.runtime_issue);
         let runtime_issue = health.issue(&state, frontend.map(|f| f.integrity_failed), previous);
-        let state = if runtime_issue.is_some() { RepositoryState::Error } else { state };
+        let state = if runtime_issue.is_some() {
+            RepositoryState::Error
+        } else {
+            state
+        };
         let mut snapshot = {
             let Ok(mut sampler) = self.sampler.lock() else {
                 return;
@@ -425,10 +461,7 @@ impl AgentRuntime {
             );
             if let Some(frontend) = frontend {
                 sampler.update_frontend_counters(frontend.read_bytes, frontend.write_bytes);
-                sampler.update_dedup(
-                    frontend.exact_hit_bytes,
-                    frontend.new_chunk_bytes,
-                );
+                sampler.update_dedup(frontend.exact_hit_bytes, frontend.new_chunk_bytes);
             } else {
                 sampler.clear_frontend_counters();
             }
@@ -436,11 +469,16 @@ impl AgentRuntime {
         };
         snapshot.runtime_issue = runtime_issue;
         snapshot.small_file_quota = if frontend.is_some() {
-            std::fs::read("/run/fastdup/small-file-quota.json").ok().and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        } else { None };
+            std::fs::read("/run/fastdup/small-file-quota.json")
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        } else {
+            None
+        };
         snapshot.details = frontend.map(|frontend| Box::new(frontend.details.clone()));
         if let Some(runtime) = snapshot.details.as_mut().and_then(|d| d.runtime.as_mut())
-            && let Ok(mut window) = self.cache_window.lock() {
+            && let Ok(mut window) = self.cache_window.lock()
+        {
             window.observe(u64::try_from(unix_seconds()).unwrap_or_default(), runtime);
         }
         if binding.is_some() {
@@ -456,12 +494,23 @@ impl AgentRuntime {
             }));
         }
 
-        snapshot.reduction_ratio = snapshot.storage_usage.as_deref()
+        snapshot.reduction_ratio = snapshot
+            .storage_usage
+            .as_deref()
             .and_then(crate::StorageUsageTelemetry::reduction_ratio);
 
-        if let Some(checkpoint) = snapshot.details.as_ref().and_then(|d| d.runtime.as_ref()).and_then(|r| r.checkpoint.as_ref()) {
+        if let Some(checkpoint) = snapshot
+            .details
+            .as_ref()
+            .and_then(|d| d.runtime.as_ref())
+            .and_then(|r| r.checkpoint.as_ref())
+        {
             snapshot.commit_generation = Some(checkpoint.generation);
-            snapshot.last_checkpoint_seconds = Some(u64::try_from(unix_seconds()).unwrap_or_default().saturating_sub(checkpoint.completed_at));
+            snapshot.last_checkpoint_seconds = Some(
+                u64::try_from(unix_seconds())
+                    .unwrap_or_default()
+                    .saturating_sub(checkpoint.completed_at),
+            );
         }
         if let Some(frontend) = frontend
             && let Ok(shares) = self.store.shares()
@@ -472,9 +521,18 @@ impl AgentRuntime {
         if let Ok(mut latest) = self.latest.write() {
             if latest.runtime_issue != snapshot.runtime_issue {
                 if let Some(issue) = snapshot.runtime_issue {
-                    let _ = self.store.audit("runtime", "repository_health", "failed", issue.message());
-                } else if latest.runtime_issue.is_some() && snapshot.repository_state == RepositoryState::Online {
-                    let _ = self.store.audit("runtime", "repository_health", "recovered", "Repository-Mount und Runtime-Prozess sind wieder aktiv");
+                    let _ =
+                        self.store
+                            .audit("runtime", "repository_health", "failed", issue.message());
+                } else if latest.runtime_issue.is_some()
+                    && snapshot.repository_state == RepositoryState::Online
+                {
+                    let _ = self.store.audit(
+                        "runtime",
+                        "repository_health",
+                        "recovered",
+                        "Repository-Mount und Runtime-Prozess sind wieder aktiv",
+                    );
                 }
             }
             latest.clone_from(&snapshot);
@@ -489,8 +547,13 @@ impl AgentRuntime {
             .read()
             .map(|snapshot| snapshot.clone())
             .map_err(|_| ControlProblem::new("state_poisoned", "Telemetry state is unavailable"))?;
-        let mut repository = self.store.repository_binding().map_err(problem("binding_failed"))?;
-        if telemetry.sequence != 0 && let Some(binding) = repository.as_mut() {
+        let mut repository = self
+            .store
+            .repository_binding()
+            .map_err(problem("binding_failed"))?;
+        if telemetry.sequence != 0
+            && let Some(binding) = repository.as_mut()
+        {
             binding.state.clone_from(&telemetry.repository_state);
         }
         Ok(ApplianceSnapshot {
@@ -661,7 +724,10 @@ impl AgentRuntime {
                 expected_revision,
                 share,
             } => {
-                let binding = self.store.repository_binding().map_err(problem("binding_failed"))?;
+                let binding = self
+                    .store
+                    .repository_binding()
+                    .map_err(problem("binding_failed"))?;
                 require_share_repository(binding.as_ref())?;
                 let current = self.store.shares().map_err(problem("shares_failed"))?;
                 let mut candidate = current.clone();
@@ -995,10 +1061,14 @@ impl AgentRuntime {
         let request_id = request.request_id.clone();
         let result = if request.version == AGENT_PROTOCOL_VERSION {
             match request.operation {
-                AgentOperation::SambaUsers => crate::samba_users::list().map(|users| AgentResult::SambaUsers { users }),
+                AgentOperation::SambaUsers => {
+                    crate::samba_users::list().map(|users| AgentResult::SambaUsers { users })
+                }
                 AgentOperation::CreateSambaUser { request } => {
                     static ACCOUNTS: Mutex<()> = Mutex::new(());
-                    let _guard = ACCOUNTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _guard = ACCOUNTS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     crate::samba_users::create(&request).map(|()| AgentResult::SambaUserCreated)
                 }
 
@@ -1296,9 +1366,14 @@ fn write_runtime_environment(settings: &crate::RepositorySettings) -> Result<(),
         .map_err(problem("runtime_sync"))
 }
 
-fn mounted_pool_usage(root: &str) -> Option<(u64,u64)> {
+fn mounted_pool_usage(root: &str) -> Option<(u64, u64)> {
     let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    if !mounts.lines().any(|line| line.split_whitespace().nth(4)==Some(root)) { return None; }
+    if !mounts
+        .lines()
+        .any(|line| line.split_whitespace().nth(4) == Some(root))
+    {
+        return None;
+    }
     crate::telemetry::filesystem_usage(Path::new(root))
 }
 
@@ -1323,10 +1398,16 @@ fn read_frontend_counters() -> Option<RuntimeFrontendCounters> {
 fn parse_frontend_counters(response: &serde_json::Value) -> Option<RuntimeFrontendCounters> {
     if response.get("ok")?.as_bool()? {
         Some(RuntimeFrontendCounters {
-            integrity_failed: response.pointer("/frontend/integrity_failed")
-                .and_then(serde_json::Value::as_bool).unwrap_or(false),
-            logical_allocated_bytes: response.pointer("/frontend/logical_allocated_bytes").and_then(serde_json::Value::as_u64),
-            logical_observed_at: response.pointer("/frontend/logical_allocated_observed_at").and_then(serde_json::Value::as_u64),
+            integrity_failed: response
+                .pointer("/frontend/integrity_failed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            logical_allocated_bytes: response
+                .pointer("/frontend/logical_allocated_bytes")
+                .and_then(serde_json::Value::as_u64),
+            logical_observed_at: response
+                .pointer("/frontend/logical_allocated_observed_at")
+                .and_then(serde_json::Value::as_u64),
             details: crate::detail_telemetry::parse_details(response.get("frontend")?),
             read_bytes: response.pointer("/frontend/read_bytes")?.as_u64()?,
             write_bytes: response.pointer("/frontend/write_bytes")?.as_u64()?,
@@ -1547,7 +1628,6 @@ fn problem<E: std::fmt::Display>(code: &'static str) -> impl FnOnce(E) -> Contro
     move |error| ControlProblem::new(code, error.to_string())
 }
 
-
 fn repository_start_error_state(error: &ControlProblem) -> RepositoryState {
     if error.code == "repository_start_pending" {
         RepositoryState::Mounting
@@ -1557,8 +1637,16 @@ fn repository_start_error_state(error: &ControlProblem) -> RepositoryState {
 }
 
 fn require_share_repository(binding: Option<&RepositoryBinding>) -> Result<(), ControlProblem> {
-    if binding.is_none_or(|binding| !matches!(binding.state, RepositoryState::Online | RepositoryState::Unmounted)) {
-        return Err(ControlProblem::new("repository_uninitialized", "Vor dem Anlegen einer Freigabe muss ein Repository eingerichtet werden"));
+    if binding.is_none_or(|binding| {
+        !matches!(
+            binding.state,
+            RepositoryState::Online | RepositoryState::Unmounted
+        )
+    }) {
+        return Err(ControlProblem::new(
+            "repository_uninitialized",
+            "Vor dem Anlegen einer Freigabe muss ein Repository eingerichtet werden",
+        ));
     }
     Ok(())
 }
@@ -1571,15 +1659,22 @@ mod tests {
     fn missing_runtime_clears_online_state_and_stale_throughput() {
         let directory = tempfile::tempdir().unwrap();
         let store = ControlStore::open(&directory.path().join("control.db")).unwrap();
-        store.set_repository_binding(&RepositoryBinding {
-            metadata_target: "meta".into(), data_target: "data".into(),
-            metadata_uuid: "meta-uuid".into(), data_uuid: "data-uuid".into(),
-            metadata_kernel_name: "absent-meta".into(), data_kernel_name: "absent-data".into(),
-            state: RepositoryState::Online,
-        }).unwrap();
+        store
+            .set_repository_binding(&RepositoryBinding {
+                metadata_target: "meta".into(),
+                data_target: "data".into(),
+                metadata_uuid: "meta-uuid".into(),
+                data_uuid: "data-uuid".into(),
+                metadata_kernel_name: "absent-meta".into(),
+                data_kernel_name: "absent-data".into(),
+                state: RepositoryState::Online,
+            })
+            .unwrap();
         let runtime = AgentRuntime::new(
-            store, TelemetryStore::open(&directory.path().join("telemetry.db")).unwrap(),
-            SambaConfig::new(directory.path().join("shares.conf")), String::new(),
+            store,
+            TelemetryStore::open(&directory.path().join("telemetry.db")).unwrap(),
+            SambaConfig::new(directory.path().join("shares.conf")),
+            String::new(),
         );
         {
             let mut sampler = runtime.sampler.lock().unwrap();
@@ -1587,10 +1682,20 @@ mod tests {
             sampler.update_frontend_counters(1_000_000, 4_000_000);
             assert!(sampler.sample().frontend_write_mbps > 0.0);
         }
-        let present = crate::runtime_health::RuntimeHealth { mounted: Some(true), process: crate::runtime_health::ProcessState::Running };
-        let absent = crate::runtime_health::RuntimeHealth { mounted: Some(false), ..present };
+        let present = crate::runtime_health::RuntimeHealth {
+            mounted: Some(true),
+            process: crate::runtime_health::ProcessState::Running,
+        };
+        let absent = crate::runtime_health::RuntimeHealth {
+            mounted: Some(false),
+            ..present
+        };
         runtime.sample_frontend(None, present);
-        assert_eq!(runtime.inspect().unwrap().telemetry.repository_state, RepositoryState::Online, "a missed metrics sample is not mount failure");
+        assert_eq!(
+            runtime.inspect().unwrap().telemetry.repository_state,
+            RepositoryState::Online,
+            "a missed metrics sample is not mount failure"
+        );
         assert!(runtime.inspect().unwrap().telemetry.runtime_issue.is_none());
         runtime.sample_frontend(None, absent);
         let snapshot = runtime.inspect().unwrap();
@@ -1599,41 +1704,72 @@ mod tests {
         assert_eq!(snapshot.telemetry.frontend_write_mbps, 0.0);
         assert_eq!(snapshot.telemetry.frontend_read_mbps, 0.0);
         assert!(snapshot.telemetry.details.is_none());
-        assert_eq!(snapshot.telemetry.runtime_issue, Some(crate::RuntimeIssue::Unavailable));
+        assert_eq!(
+            snapshot.telemetry.runtime_issue,
+            Some(crate::RuntimeIssue::Unavailable)
+        );
         runtime.sample_frontend(None, absent);
-        assert_eq!(runtime.store.recent_audit(20).unwrap().len(), 1, "a continuing outage is one event");
-        let frontend = |open, failed| parse_frontend_counters(&serde_json::json!({
-            "ok":true, "presented_capacity_revision":share_capacity_revision(&[]),
-            "frontend": {"mutation_admission_open":open,"integrity_failed":failed,
-                "read_bytes":8_000_000,"write_bytes":10_000_000,
-                "exact_hit_bytes":0,"new_chunk_bytes":0}
-        })).unwrap();
+        assert_eq!(
+            runtime.store.recent_audit(20).unwrap().len(),
+            1,
+            "a continuing outage is one event"
+        );
+        let frontend = |open, failed| {
+            parse_frontend_counters(&serde_json::json!({
+                "ok":true, "presented_capacity_revision":share_capacity_revision(&[]),
+                "frontend": {"mutation_admission_open":open,"integrity_failed":failed,
+                    "read_bytes":8_000_000,"write_bytes":10_000_000,
+                    "exact_hit_bytes":0,"new_chunk_bytes":0}
+            }))
+            .unwrap()
+        };
         runtime.sample_frontend(Some(&frontend(true, false)), present);
         let recovered = runtime.inspect().unwrap();
-        assert_eq!(recovered.telemetry.repository_state, RepositoryState::Online);
+        assert_eq!(
+            recovered.telemetry.repository_state,
+            RepositoryState::Online
+        );
         assert_eq!(recovered.repository.unwrap().state, RepositoryState::Online);
-        assert_eq!(recovered.telemetry.frontend_write_mbps, 0.0, "first observation after loss establishes a new baseline");
+        assert_eq!(
+            recovered.telemetry.frontend_write_mbps, 0.0,
+            "first observation after loss establishes a new baseline"
+        );
         assert!(recovered.telemetry.runtime_issue.is_none());
         runtime.sample_frontend(Some(&frontend(false, false)), present);
         let paused = runtime.inspect().unwrap();
-        assert_eq!(paused.telemetry.repository_state, RepositoryState::Online, "ordinary write backpressure is not a repository failure");
+        assert_eq!(
+            paused.telemetry.repository_state,
+            RepositoryState::Online,
+            "ordinary write backpressure is not a repository failure"
+        );
         assert!(paused.telemetry.runtime_issue.is_none());
         runtime.sample_frontend(Some(&frontend(false, true)), present);
-        assert_eq!(runtime.inspect().unwrap().telemetry.runtime_issue, Some(crate::RuntimeIssue::IntegrityFailed));
+        assert_eq!(
+            runtime.inspect().unwrap().telemetry.runtime_issue,
+            Some(crate::RuntimeIssue::IntegrityFailed)
+        );
         runtime.set_state(RepositoryState::Unmounted).unwrap();
         runtime.sample_frontend(None, absent);
         let unmounted = runtime.inspect().unwrap();
-        assert_eq!(unmounted.telemetry.repository_state, RepositoryState::Unmounted);
+        assert_eq!(
+            unmounted.telemetry.repository_state,
+            RepositoryState::Unmounted
+        );
         assert!(unmounted.telemetry.runtime_issue.is_none());
     }
-
 
     #[test]
     fn startup_deadline_keeps_pending_recovery_distinct_from_failure() {
         let pending = ControlProblem::new("repository_start_pending", "still verifying");
-        assert_eq!(repository_start_error_state(&pending), RepositoryState::Mounting);
+        assert_eq!(
+            repository_start_error_state(&pending),
+            RepositoryState::Mounting
+        );
         let failure = ControlProblem::new("command_failed", "runtime exited");
-        assert_eq!(repository_start_error_state(&failure), RepositoryState::Error);
+        assert_eq!(
+            repository_start_error_state(&failure),
+            RepositoryState::Error
+        );
     }
 
     #[test]
@@ -1641,15 +1777,23 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = ControlStore::open(&directory.path().join("control.db")).unwrap();
         let runtime = AgentRuntime::new(
-            store.clone(), TelemetryStore::open(&directory.path().join("telemetry.db")).unwrap(),
-            SambaConfig::new(directory.path().join("shares.conf")), String::new(),
+            store.clone(),
+            TelemetryStore::open(&directory.path().join("telemetry.db")).unwrap(),
+            SambaConfig::new(directory.path().join("shares.conf")),
+            String::new(),
         );
         let share: ShareSettings = serde_json::from_value(serde_json::json!({
             "id":"test", "revision":0, "name":"test", "description":"", "enabled":true,
             "hidden":false, "readOnly":false, "guestAccess":false, "encryption":"desired",
             "accessBasedEnumeration":true, "allowedUsers":[], "allowedGroups":[]
-        })).unwrap();
-        let error = runtime.execute_command(Command::UpsertShare {expected_revision:None, share}).unwrap_err();
+        }))
+        .unwrap();
+        let error = runtime
+            .execute_command(Command::UpsertShare {
+                expected_revision: None,
+                share,
+            })
+            .unwrap_err();
         assert_eq!(error.code, "repository_uninitialized");
         assert!(store.shares().unwrap().is_empty());
         assert!(!directory.path().join("shares.conf").exists());

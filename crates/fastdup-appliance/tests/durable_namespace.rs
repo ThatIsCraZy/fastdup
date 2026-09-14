@@ -2520,7 +2520,91 @@ fn checkpoint_consumes_writer_verified_dependencies_without_record_reread() {
 }
 
 #[test]
-fn second_identical_file_reuses_online_proofs_or_reverifies_under_memory_pressure() {
+fn cold_exact_duplicate_ingest_and_commit_do_not_read_data() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let index = MemoryStorageIo::new();
+    let payload = pseudorandom_payload(2 * 1_024 * 1_024, 0x197e_38a4_cd52_f06b);
+    {
+        let appliance = DurableNamespace::open_with_index(
+            NamespaceConfig::default(),
+            GenerationRepository::new(metadata.clone(), checkpoint_policy_set()),
+            ContainerRepository::new(data.clone()),
+            &ExactIndexRunRepository::new(index.clone()),
+            16,
+        )
+        .unwrap();
+        create_and_write(&appliance, b"first-copy", &payload);
+        appliance.checkpoint().unwrap().unwrap();
+    }
+    let appliance = DurableNamespace::open_with_committed_recovery(
+        NamespaceConfig::default(),
+        GenerationRepository::new(metadata, checkpoint_policy_set()),
+        ContainerRepository::new(data.clone()),
+        &ExactIndexRunRepository::new(index),
+        &fastdup_store::SimilarityIndexRepository::new(MemoryStorageIo::new()),
+        16,
+    )
+    .unwrap();
+    let before = data.operation_count();
+    let duplicate = create_and_write(&appliance, b"cold-duplicate", &payload);
+    appliance.checkpoint().unwrap().unwrap();
+    let operations = data.operations();
+    let reads = operations[before..]
+        .iter()
+        .filter(|op| matches!(op, StorageOperation::Read | StorageOperation::ReadExactAt))
+        .count();
+    assert_eq!(
+        reads, 0,
+        "Exact reuse through Commit must not read DATA, even after restart"
+    );
+    assert!(
+        !operations[before..].contains(&StorageOperation::CreateNew),
+        "an Exact duplicate must reuse the existing Containers"
+    );
+    // No reference-only reuse may grant unchecked bytes to a real reader.
+    use fastdup_store::StorageIo;
+    for name in data
+        .list_names()
+        .unwrap()
+        .into_iter()
+        .filter(|name| name.ends_with(".fdc"))
+    {
+        data.write_at(&name, 4096, b"BAD!").unwrap();
+    }
+    let Reply::Opened(handle) = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: duplicate,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("open duplicate");
+    };
+    assert!(
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::Read {
+                    inode: duplicate,
+                    handle,
+                    offset: 0,
+                    length: 32768,
+                }
+            )
+            .is_err(),
+        "demand reads must detect corrupt DATA after reference-only ingest"
+    );
+}
+
+#[test]
+fn second_identical_file_reuses_exact_references_under_memory_pressure() {
     let metadata = MemoryStorageIo::new();
     let containers = MemoryStorageIo::new();
     let indexes = MemoryStorageIo::new();
@@ -2578,9 +2662,9 @@ fn second_identical_file_reuses_online_proofs_or_reverifies_under_memory_pressur
         );
     } else {
         assert!(historical_after_first.swap_used_bytes() > 0);
-        assert!(
-            record_rereads > 0,
-            "pressure-rejected acceleration must fall back to DATA verification"
+        assert_eq!(
+            record_rereads, 0,
+            "cache rejection must not trigger DATA verification for Exact reuse"
         );
     }
 }

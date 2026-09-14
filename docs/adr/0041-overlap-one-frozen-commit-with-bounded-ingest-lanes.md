@@ -264,3 +264,37 @@ Hardlinks, an open replaced inode, and post-cut truncate/unlink. Failures before
 and after Metadata/DATA operations must recover the preceding or complete
 Frozen generation, never the later Active image. Independent read, recovery,
 and scrub verification remain required.
+
+## Coalesced Exact publication (2026-09-13)
+
+The single Exact publisher consumes at most eight already queued ACTIVE-addition
+commands, with at most 16,384 entries in a combined batch, into one L0 family and
+one activation. It introduces no waiting window. An individually larger command
+keeps its existing bound and runs alone. The bounded channel stays at eight
+commands; the worker may retain one dequeued boundary command for its next
+iteration. Neither a Flush nor a non-ACTIVE transition may be crossed. Identical
+repeated additions are idempotent; distinct Locations remain separate and Run
+validation still rejects conflicting identity or length.
+
+All DATA-reference admissions survive the common activation, each original
+Similarity handoff and recent-overlay retirement. A failed combined publication
+retains one shared GC admission just as a failed individual dependent publication
+does. Flush still acknowledges only after the preceding commands have completed
+their attempts; index failure degrades acceleration rather than inventing
+Namespace durability. Queue-command and combined-publication counts remain
+separate in telemetry.
+
+The Run allocator is constant-sized online writer state shared by Repository
+clones, including GC. Its first allocation discovers the maximum canonical Run
+name across all profiles, including unselected orphans. Later allocations do no
+directory scan. Public standalone publication/compaction observes its requested
+range before I/O; automatic family compaction reserves all output partition
+numbers together. Errors consume reservations for the current owner. A new owner
+reconstructs published names, while temporary files remain unselected. Number
+gaps are legal; profile identity and file formats do not change. Allocator
+mutation uses the object-publication lock and the full online transaction retains
+the existing generation-publication lock. Offline rebuild still requires its
+exclusive appliance owner and performs explicit discovery.
+
+The measured work reduction and recovery/fault checks are recorded in
+[the Exact publisher report](../testing/exact-publisher-2026-09-13.md).

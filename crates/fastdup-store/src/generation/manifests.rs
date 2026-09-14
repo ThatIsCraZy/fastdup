@@ -37,7 +37,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .root())
     }
 
-    /// Publishes and rereads one complete Manifest tree while returning an
+    /// Publishes one validated complete Manifest tree while returning an
     /// opaque proof suitable for an incremental successor commit.
     ///
     /// # Errors

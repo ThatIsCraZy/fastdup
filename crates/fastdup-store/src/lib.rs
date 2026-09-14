@@ -11,6 +11,9 @@ pub use metadata_read_telemetry::{
 mod cpu_admission;
 pub use cpu_admission::{WorkerPermitLease, WorkerPermits};
 
+mod operation_timing;
+pub use operation_timing::{OperationTimer, OperationTiming, OperationTimingSnapshot};
+
 mod container_descriptor_cache;
 mod container_generation_allocator;
 mod exact_activation_log;
@@ -1030,27 +1033,29 @@ pub struct ContainerRepository<I> {
     record_reads: Arc<RecordReadCoordinator>,
     cpu_admission: Arc<OnceLock<Arc<WorkerPermits>>>,
     retiring: Arc<RwLock<BTreeMap<[u8; 16], usize>>>,
-    reduction_publications: Arc<std::sync::atomic::AtomicUsize>,
+    data_references: Arc<std::sync::atomic::AtomicUsize>,
     generation_allocator_barrier: Arc<Mutex<()>>,
     generation_allocator_registry:
         Arc<container_generation_allocator::ContainerGenerationAllocatorRegistry>,
 }
 
-/// Keeps online GC from authorizing retirement between Base selection and
-/// durable Exact publication of a dependent target. Does not hold an I/O lock.
+/// Keeps online GC from authorizing retirement while a writer introduces a
+/// reference to existing DATA. Exact reuse holds it through Namespace Commit;
+/// dependent encoding holds it through durable Exact publication of the target.
+/// Does not hold an I/O lock or retain cached DATA.
 #[derive(Debug)]
-pub struct ReductionPublicationGuard {
+pub struct DataReferenceGuard {
     active: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl Drop for ReductionPublicationGuard {
+impl Drop for DataReferenceGuard {
     fn drop(&mut self) {
         let previous = self
             .active
             .fetch_sub(1, std::sync::atomic::Ordering::Release);
         assert!(
             previous > 0,
-            "reduction publication admission has a matching release"
+            "DATA-reference admission has a matching release"
         );
     }
 }
@@ -1346,7 +1351,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             record_reads: Arc::new(RecordReadCoordinator::new()),
             cpu_admission: Arc::new(OnceLock::new()),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
-            reduction_publications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            data_references: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             generation_allocator_barrier: Arc::new(Mutex::new(())),
             generation_allocator_registry: Arc::new(
                 container_generation_allocator::ContainerGenerationAllocatorRegistry::default(),
@@ -1425,7 +1430,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             record_reads: Arc::clone(&self.record_reads),
             cpu_admission: Arc::clone(&self.cpu_admission),
             retiring: Arc::clone(&self.retiring),
-            reduction_publications: Arc::clone(&self.reduction_publications),
+            data_references: Arc::clone(&self.data_references),
             generation_allocator_barrier: Arc::clone(&self.generation_allocator_barrier),
             generation_allocator_registry: Arc::clone(&self.generation_allocator_registry),
         }
@@ -1449,7 +1454,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             record_reads: Arc::new(RecordReadCoordinator::new()),
             cpu_admission: Arc::new(OnceLock::new()),
             retiring: Arc::new(RwLock::new(BTreeMap::new())),
-            reduction_publications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            data_references: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             generation_allocator_barrier: Arc::new(Mutex::new(())),
             generation_allocator_registry: Arc::new(
                 container_generation_allocator::ContainerGenerationAllocatorRegistry::default(),
@@ -1463,28 +1468,29 @@ impl<I: StorageIo> ContainerRepository<I> {
         self.descriptors.status()
     }
 
-    /// Admits a bounded dependent-write transaction, or returns `None` while
-    /// GC is retiring Containers. Hold until the target's Exact publication;
-    /// on publication failure retain until writable-owner teardown. Callers
-    /// falling back to independent encoding need no guard.
+    /// Admits a writer's DATA-reference transaction, or returns `None` while
+    /// GC is retiring Containers. Exact reuse holds this through Namespace
+    /// Commit (including failed-commit retries); dependent encoding holds it
+    /// through the target's Exact publication. On publication failure retain
+    /// until writable-owner teardown. Independent encoding needs no guard.
     ///
     /// # Panics
     /// Panics on a poisoned lifecycle lock or impossible admission overflow.
     #[must_use]
-    pub fn try_pin_reduction_publication(&self) -> Option<ReductionPublicationGuard> {
+    pub fn try_pin_data_reference(&self) -> Option<DataReferenceGuard> {
         let retiring = self.retiring.read().expect("Container selection lock");
         if !retiring.is_empty() {
             return None;
         }
-        self.reduction_publications
+        self.data_references
             .fetch_update(
                 std::sync::atomic::Ordering::Acquire,
                 std::sync::atomic::Ordering::Relaxed,
                 |value| value.checked_add(1),
             )
-            .expect("bounded reduction publications cannot overflow");
-        Some(ReductionPublicationGuard {
-            active: Arc::clone(&self.reduction_publications),
+            .expect("bounded DATA-reference admissions cannot overflow");
+        Some(DataReferenceGuard {
+            active: Arc::clone(&self.data_references),
         })
     }
 
@@ -1520,7 +1526,7 @@ impl<I: StorageIo> ContainerRepository<I> {
             .write()
             .expect("ASSERT: retiring Container selection lock poisoned");
         if self
-            .reduction_publications
+            .data_references
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
         {
