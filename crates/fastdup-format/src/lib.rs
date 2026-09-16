@@ -75,10 +75,11 @@ pub use exact_index_run_set::{
     ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError, ExactIndexRunSetId,
 };
 pub use gc_candidate_catalog::{
-    GC_CANDIDATE_CATALOG_HEADER_BYTES, GC_CANDIDATE_CATALOG_ROW_BYTES, GcCandidateCatalog,
-    GcCandidateCatalogAudit, GcCandidateCatalogDescriptor, GcCandidateCatalogError,
-    GcCandidateCatalogRow, GcCandidateCatalogStreamEncoder, GcCandidateLivenessEstimate,
-    GcCandidateLocationState, GcDependencyEstimate, GcRecordLivenessEstimate,
+    GC_CANDIDATE_CATALOG_HEADER_BYTES, GC_CANDIDATE_CATALOG_ROW_BYTES,
+    GC_FILL_COMPACTION_PHYSICAL_MAX_BYTES, GcCandidateCatalog, GcCandidateCatalogAudit,
+    GcCandidateCatalogDescriptor, GcCandidateCatalogError, GcCandidateCatalogRow,
+    GcCandidateCatalogStreamEncoder, GcCandidateLivenessEstimate, GcCandidateLocationState,
+    GcDependencyEstimate, GcRecordLivenessEstimate,
 };
 pub use manifest::{MANIFEST_HEADER_BYTES, ManifestExtent, ManifestLayout, ManifestLeaf};
 pub use manifest_inner::{

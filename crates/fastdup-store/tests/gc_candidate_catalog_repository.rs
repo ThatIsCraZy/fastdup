@@ -324,6 +324,73 @@ fn published_name(storage: &FsStorageIo) -> String {
 }
 
 #[test]
+fn second_recovery_reuses_the_process_audit_but_fresh_recovery_reaudits() {
+    let root = test_root("cached-recovery");
+    let storage = FsStorageIo::open(&root).expect("open cached catalog root");
+    let repository = GcCandidateCatalogRepository::new(storage.clone());
+    let summary = fixture_summary();
+    let rows = (0_u8..8)
+        .map(|ordinal| estimated_row(ordinal + 1, u64::from(ordinal) + 1, summary))
+        .collect::<Vec<_>>();
+    repository
+        .publish_rows(1, 41, 17, 8, rows)
+        .expect("publish first catalog");
+
+    let snapshot = repository
+        .recover_latest()
+        .expect("first recovery succeeds")
+        .expect("catalog exists");
+    assert!(snapshot.leased());
+    assert_eq!(snapshot.descriptor().generation(), 1);
+    drop(snapshot);
+
+    // The row hash is intentionally changed without changing the Header/Footer
+    // envelope. A fresh process must reject this newest hint, while the process
+    // that already completely audited its immutable descriptor can reuse the
+    // cached hint proof without rereading every row.
+    let published = published_name(&storage);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join(&published))
+        .expect("open catalog row for fault injection");
+    let mut byte = [0_u8; 1];
+    file.read_exact_at(&mut byte, 8192 + 4_096 + 40)
+        .expect("read catalog row byte");
+    byte[0] ^= 1;
+    file.write_all_at(&byte, 8192 + 4_096 + 40)
+        .expect("corrupt catalog row after the first process audit");
+    drop(file);
+
+    let cached = repository
+        .recover_latest()
+        .expect(
+            "process-local hint audit cache skips only the already-audited immutable generation",
+        )
+        .expect("cached catalog exists");
+    assert!(cached.leased());
+    assert_eq!(cached.descriptor().generation(), 1);
+    drop(cached);
+
+    assert!(
+        GcCandidateCatalogRepository::new(storage.clone())
+            .recover_latest()
+            .expect("fresh recovery rejects corrupt hint")
+            .is_none(),
+        "the durable Hint remains self-authenticating even after the cache is discarded"
+    );
+
+    repository
+        .publish_rows(2, 42, 18, 1, [seed_row(9, 9, summary)])
+        .expect("publish successor");
+    let successor = repository
+        .recover_latest()
+        .expect("successor recovery succeeds")
+        .expect("successor exists");
+    assert_eq!(successor.descriptor().generation(), 2);
+}
+
+#[test]
 fn generation_high_water_includes_a_corrupt_ignored_hint_name() {
     let root = test_root("corrupt-high-water");
     let storage = FsStorageIo::open(&root).expect("open catalog root");
@@ -345,6 +412,105 @@ fn generation_high_water_includes_a_corrupt_ignored_hint_name() {
             .expect("name high-water is readable"),
         Some(9)
     );
+}
+
+#[test]
+fn retirement_removes_superseded_generations_and_preserves_the_name_high_water() {
+    let root = test_root("retirement");
+    let storage = FsStorageIo::open(&root).expect("open catalog root");
+    let catalog = GcCandidateCatalogRepository::new(storage.clone());
+    let summary = fixture_summary();
+    for generation in 1_u64..=3 {
+        catalog
+            .publish_rows(
+                generation,
+                40 + generation,
+                17,
+                1,
+                [seed_row(1, generation, summary)],
+            )
+            .expect("publish catalog generation");
+    }
+    storage
+        .create_new(".gc-candidate-catalog-0000000000000002.run.building")
+        .expect("create abandoned publication temporary");
+
+    assert_eq!(
+        catalog
+            .retire_superseded()
+            .expect("retire superseded catalog"),
+        3,
+        "generations one and two and the abandoned temporary retire together"
+    );
+    let names = storage.list_names().expect("list after retirement");
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.contains("gc-candidate-catalog-"))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["gc-candidate-catalog-0000000000000003.run"],
+        "only the greatest canonical generation survives retirement"
+    );
+    assert_eq!(
+        catalog
+            .discover_generation_high_water()
+            .expect("high-water after retirement"),
+        Some(3),
+        "the surviving greatest name alone carries the immutable-name high-water"
+    );
+    assert_eq!(
+        catalog
+            .retire_superseded()
+            .expect("retirement is idempotent"),
+        0,
+        "a second sweep finds nothing to retire"
+    );
+}
+
+#[test]
+fn retirement_keeps_a_corrupt_greatest_name_and_a_leased_fallback() {
+    let root = test_root("retirement-lease");
+    let storage = FsStorageIo::open(&root).expect("open catalog root");
+    let catalog = GcCandidateCatalogRepository::new(storage.clone());
+    let summary = fixture_summary();
+    catalog
+        .publish_rows(1, 41, 17, 1, [seed_row(1, 1, summary)])
+        .expect("publish gen 1");
+    catalog
+        .publish_rows(2, 42, 17, 1, [seed_row(2, 2, summary)])
+        .expect("publish gen 2");
+    storage
+        .create_new("gc-candidate-catalog-0000000000000009.run")
+        .expect("create corrupt greatest name");
+    storage.sync_root().expect("persist corrupt greatest name");
+
+    let snapshot = catalog
+        .recover_latest()
+        .expect("corrupt greatest falls back")
+        .expect("valid older catalog remains readable");
+    assert_eq!(snapshot.descriptor().generation(), 2);
+
+    assert_eq!(
+        catalog
+            .retire_superseded()
+            .expect("retire below a leased fallback"),
+        1,
+        "only the unleased generation one retires while the lease and the high-water survive"
+    );
+    assert!(!Path::new(&root.join("gc-candidate-catalog-0000000000000001.run")).exists());
+    assert!(Path::new(&root.join("gc-candidate-catalog-0000000000000002.run")).exists());
+    assert!(Path::new(&root.join("gc-candidate-catalog-0000000000000009.run")).exists());
+
+    drop(snapshot);
+    assert_eq!(
+        catalog
+            .retire_superseded()
+            .expect("retry after last reader drop"),
+        1,
+        "the released predecessor retires on the next sweep"
+    );
+    assert!(!Path::new(&root.join("gc-candidate-catalog-0000000000000002.run")).exists());
 }
 
 fn test_root(name: &str) -> PathBuf {

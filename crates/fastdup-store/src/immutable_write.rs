@@ -15,20 +15,46 @@ pub(crate) fn write_image<I: StorageIo>(storage: &I, name: &str, bytes: &[u8]) -
     Ok(())
 }
 
+/// Writes an unpublished temporary image. Its caller must fix the final length
+/// and synchronize the file before publication.
+pub(crate) fn write_image_unpublished<I: StorageIo>(
+    storage: &I,
+    name: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    for (ordinal, batch) in bytes.chunks(WRITE_BATCH_BYTES).enumerate() {
+        storage.write_unpublished_at(name, (ordinal * WRITE_BATCH_BYTES) as u64, batch)?;
+    }
+    Ok(())
+}
+
 /// Sequential output starts at zero so intermediate writes end at aligned
 /// offsets, even when individual format fields and entries are unaligned.
 pub(crate) struct ImmutableWriteBuffer {
     bytes: Vec<u8>,
     offset: u64,
+    unpublished: bool,
 }
 
 impl ImmutableWriteBuffer {
     pub(crate) fn new() -> io::Result<Self> {
+        Self::with_unpublished(false)
+    }
+
+    pub(crate) fn new_unpublished() -> io::Result<Self> {
+        Self::with_unpublished(true)
+    }
+
+    fn with_unpublished(unpublished: bool) -> io::Result<Self> {
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(WRITE_BATCH_BYTES)
             .map_err(io::Error::other)?;
-        Ok(Self { bytes, offset: 0 })
+        Ok(Self {
+            bytes,
+            offset: 0,
+            unpublished,
+        })
     }
 
     pub(crate) fn append<I: StorageIo>(
@@ -58,7 +84,11 @@ impl ImmutableWriteBuffer {
                 .offset
                 .checked_add(self.bytes.len() as u64)
                 .ok_or(io::ErrorKind::InvalidInput)?;
-            storage.write_at(name, self.offset, &self.bytes)?;
+            if self.unpublished {
+                storage.write_unpublished_at(name, self.offset, &self.bytes)?;
+            } else {
+                storage.write_at(name, self.offset, &self.bytes)?;
+            }
             self.offset = end;
             self.bytes.clear();
         }

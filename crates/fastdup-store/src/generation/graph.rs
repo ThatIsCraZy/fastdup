@@ -34,7 +34,10 @@ impl<I: StorageIo> GenerationRepository<I> {
         let mut byte_count =
             u64::try_from(bytes.len()).map_err(|_| GenerationError::MetadataTooLarge)?;
         let mut shards = BTreeMap::new();
-        for reference in descriptor.shards() {
+        for (ordinal, reference) in descriptor.shards().iter().copied().enumerate() {
+            if ordinal % 256 == 0 {
+                self.check_maintenance()?;
+            }
             let shard_id = reference.object_id();
             if object_ids.insert(shard_id) {
                 let shard = self.read_metadata(shard_id)?;
@@ -65,7 +68,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         root: &NamespaceRoot,
         verifier: Option<&dyn RequiredChunkVerifier>,
     ) -> Result<(VerifiedManifests, BTreeMap<fastdup_format::ChunkId, u64>), GenerationError> {
-        let (manifests, required_chunks) = self.scan_manifest_graph_with_required(root)?;
+        let (manifests, required_chunks) = self.scan_manifest_graph_with_required(root, None)?;
         if required_chunks.is_empty() {
             return Ok((manifests, required_chunks));
         }
@@ -79,18 +82,31 @@ impl<I: StorageIo> GenerationRepository<I> {
     pub(super) fn scan_manifest_graph_with_required(
         &self,
         root: &NamespaceRoot,
+        selected_chunks: Option<&BTreeSet<fastdup_format::ChunkId>>,
     ) -> Result<(VerifiedManifests, BTreeMap<fastdup_format::ChunkId, u64>), GenerationError> {
         let mut required_chunks = BTreeMap::new();
         let mut chunk_length_conflict = None;
         let mut manifests = Vec::new();
+        let traversal_probes = std::cell::Cell::new(0_u64);
         manifests
             .try_reserve_exact(root.file_inode_count())
             .map_err(|_| GenerationError::OutOfMemory)?;
         for inode in root.file_inodes() {
+            self.check_maintenance()?;
             let summary = scan_manifest_tree(
                 inode.manifest_root(),
-                |node_id| self.read_manifest_node(node_id),
+                |node_id| {
+                    traversal_probes.set(traversal_probes.get() + 1);
+                    if traversal_probes.get().is_multiple_of(256) {
+                        self.check_manifest_maintenance()?;
+                    }
+                    self.read_manifest_node(node_id)
+                },
                 |_logical_offset, extent| {
+                    traversal_probes.set(traversal_probes.get() + 1);
+                    if traversal_probes.get().is_multiple_of(256) {
+                        self.check_manifest_maintenance()?;
+                    }
                     let (chunk_id, logical_length) = match *extent {
                         ManifestExtent::Data {
                             logical_length,
@@ -105,6 +121,9 @@ impl<I: StorageIo> GenerationRepository<I> {
                             return Ok(());
                         }
                     };
+                    if selected_chunks.is_some_and(|selected| !selected.contains(&chunk_id)) {
+                        return Ok(());
+                    }
                     if let Some(previous_length) = required_chunks.get(&chunk_id).copied() {
                         if previous_length != logical_length {
                             chunk_length_conflict =
@@ -138,13 +157,26 @@ impl<I: StorageIo> GenerationRepository<I> {
     pub(super) fn scan_manifest_root_required_chunks(
         &self,
         root: MetadataObjectId,
+        selected_chunks: Option<&BTreeSet<fastdup_format::ChunkId>>,
         required_chunks: &mut BTreeMap<fastdup_format::ChunkId, u64>,
     ) -> Result<(), GenerationError> {
         let mut chunk_length_conflict = None;
+        let traversal_probes = std::cell::Cell::new(0_u64);
+        self.check_maintenance()?;
         scan_manifest_tree(
             root,
-            |node_id| self.read_manifest_node(node_id),
+            |node_id| {
+                traversal_probes.set(traversal_probes.get() + 1);
+                if traversal_probes.get().is_multiple_of(256) {
+                    self.check_manifest_maintenance()?;
+                }
+                self.read_manifest_node(node_id)
+            },
             |_logical_offset, extent| {
+                traversal_probes.set(traversal_probes.get() + 1);
+                if traversal_probes.get().is_multiple_of(256) {
+                    self.check_manifest_maintenance()?;
+                }
                 let (chunk_id, logical_length) = match *extent {
                     ManifestExtent::Data {
                         logical_length,
@@ -157,6 +189,9 @@ impl<I: StorageIo> GenerationRepository<I> {
                     } => (chunk_id, u64::from(chunk_length)),
                     ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => return Ok(()),
                 };
+                if selected_chunks.is_some_and(|selected| !selected.contains(&chunk_id)) {
+                    return Ok(());
+                }
                 if let Some(previous_length) = required_chunks.get(&chunk_id).copied() {
                     if previous_length != logical_length {
                         chunk_length_conflict = Some((chunk_id, previous_length, logical_length));

@@ -22,6 +22,21 @@ const EFFECTIVE_RAM_DIVISOR: u64 = 50;
 const REFRESH_MILLIS: u64 = 250;
 const NONE: u32 = u32::MAX;
 
+fn stable_capacity_entries(capacity: u64, entry_bytes: u64) -> usize {
+    const MIB: u64 = 1 << 20;
+    if capacity == 0 || entry_bytes == 0 {
+        return 0;
+    }
+    let granularity_bytes = (2 * MIB).min(capacity);
+    let granularity_entries =
+        usize::try_from(granularity_bytes.div_ceil(entry_bytes)).unwrap_or(usize::MAX);
+    let entries = usize::try_from(capacity / entry_bytes).unwrap_or(usize::MAX);
+    entries
+        .checked_div(granularity_entries)
+        .unwrap_or(entries)
+        .saturating_mul(granularity_entries)
+}
+
 /// How a committed online dependency entered the common historical cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HistoricalProofAdmission {
@@ -578,8 +593,7 @@ impl HistoricalProofCache {
     fn apply_memory_pressure(&self, snapshot: MemoryPressureSnapshot) {
         if let Some(cache) = &self.unified {
             self.target_entries.store(
-                usize::try_from(cache.capacity() / ACCOUNTED_ENTRY_BYTES as u64)
-                    .unwrap_or(usize::MAX),
+                stable_capacity_entries(cache.capacity(), ACCOUNTED_ENTRY_BYTES as u64),
                 Ordering::Release,
             );
             self.effective_limit_bytes

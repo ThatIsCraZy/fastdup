@@ -34,9 +34,13 @@ proofs and Container descriptors more protection than Metadata acceleration
 (16 versus one credit, bounded at 32). Admission and pressure eviction share
 one serialized owner ledger; no I/O, codec work or user callback runs under
 that lock. Ordinary admission searches at most 4096 victim steps and may reject
-admission. Pressure reclamation continues until the common target is met.
-There is no per-class byte reservation or fixed RAM fraction. Exact membership
-filters are reclaimable even while their Run remains active.
+admission. Pressure reclamation continues until the common target is met,
+preferring unprotected bytes before protected Exact acceleration. Verified DATA
+is subject to the dated 20% class ceiling below; protected Exact acceleration
+cannot be displaced by Verified DATA but remains reclaimable by its own class
+and under host memory pressure once unprotected bytes cannot meet the target.
+Exact membership filters remain in the common owner but are pinned non-evictable
+working acceleration while their Run is active, as amended below.
 
 The ledger charges retained representation capacity, shared backing once per
 admission group, and conservative directory/owner overhead. Returning immutable
@@ -45,7 +49,8 @@ reduces sampled process headroom as working memory. This is a sampled operating
 ceiling, not an exact bound on all process allocations or a kernel OOM guarantee.
 The effective host/cgroup limit, available memory, outstanding working memory and
 8% reserve retain the 92% operating ceiling. Sampling failure and Process Swap
-revoke admission and reclaim residents. Production uses one `unifiedRead` broker
+revoke admission and reclaim evictable residents. Active-Run membership filters
+are the non-evictable exception dated below. Production uses one `unifiedRead` broker
 lease; representation observations must not be summed as independent quotas.
 Externally supplied deterministic test/replay configurations are not production
 memory policies.
@@ -328,3 +333,83 @@ or count as independent media verification. Recovery and scrub bypass them;
 proof consumers still require their own eligible publication/activation or
 physical evidence. No second cache or unbounded writer-retained payload map is
 introduced, and no on-disk format changes.
+
+## Verified DATA ceiling and Exact displacement guard (2026-09-15)
+
+Verified DATA retains its normal high reuse credit but may occupy no more than
+20% of the common `unifiedRead` target. The ceiling uses one minimum DATA charge
+as a floor so a tiny deterministic or low-pressure target remains usable. It is
+a class ceiling inside the one common owner, not a separate cache, quota, lease,
+resident map or replacement queue. The common target remains governed by live
+memory headroom and can fall below the ceiling.
+
+Exact index pages, membership filters and page bounds form protected Exact
+acceleration. Admission of Verified DATA may reclaim Verified DATA but must not
+displace protected Exact bytes. Admission of other unprotected acceleration may
+reclaim unprotected bytes only; it cannot displace protected Exact bytes. When
+total pressure must reclaim bytes, unprotected Verified DATA and other
+acceleration are reclaimed before protected Exact acceleration. If protected
+Exact alone exceeds the target, host memory pressure can still reclaim it.
+Protected Exact admission may reclaim its own older Exact entries before
+unprotected entries, but it never weakens the Verified DATA ceiling or permits
+Verified DATA to become the dominant resident class.
+
+The guard concerns placement within the common cache. Exact bytes remain
+acceleration, never durable index, Location or liveness authority; an empty or
+pressure-reduced Exact page cache preserves correctness through its normal
+verified cold-read path.
+
+## Protected Exact ceiling and bounded proactive warming (2026-09-16)
+
+Protected Exact acceleration may occupy no more than 70% of the common
+`unifiedRead` target. One minimum protected charge is the floor for a tiny
+target. The ceiling is enforced before exact admission and after a lowered
+target; it is one class limit inside the same owner ledger, not a private Exact
+cache, quota, resident map or replacement queue. This leaves the Verified DATA
+20% ceiling and at least the remaining headroom room for descriptors, Similarity
+and other acceleration.
+
+An optional appliance worker may proactively rebuild missing active-Run
+membership/page-bounds structures and warm bounded nonresident Exact pages. It
+uses Demand verified reads and the same admission, accounting and replacement
+owner. Its default work budget is bounded by pages, structures and per-Run pages,
+advances a process cursor round-robin, and stops on cancellation, budget, cache
+admission rejection or memory pressure. It waits for completed startup scrub,
+idle POSIX frontend read/write submission and open mutation admission. It does
+not wait for Online-GC quiescence: bounded Exact warming may overlap a running
+GC while its background I/O priority and common-cache admission limit its
+interference. Frontend idleness is measured from successful POSIX read and write
+counts, so GC and other backend I/O are not mistaken for frontend demand.
+The worker is background acceleration only: an active Run remains lookup-correct
+with dormant wrappers and a cold verified page read. It neither selects a
+generation, pins a root, certifies a Location, nor changes the durable Exact
+format. Telemetry distinguishes protected limit/resident bytes, constructed and
+missing filters/page bounds, and the last warm/skip state.
+
+## ExactMembership residency floor (2026-09-16)
+
+Active-Run `ExactMembership` filters are the sole cache class exempt from
+replacement. They stay in the common owner and remain visible in protected Exact
+residency accounting, but admission bypasses the common target and class ceilings
+and no admission, pressure, swap or ceiling reclamation can select one. Demand,
+Scan and Independent work may all populate this one pinned class after the
+audited filter has been constructed; no other class may use it to bypass its
+normal intent rule. Dropping the
+representation namespace or retiring its Run remains the only release. Exact
+pages and page bounds remain ordinary protected Exact entries and can still yield
+to or be reclaimed by pressure.
+
+Pinned membership is charged outside the evictable common target so a non-zero
+target cannot prevent it from becoming resident. The sampled governor still
+observes and reports it; if it alone consumes available headroom, evictable
+classes shrink to zero while the filter stays. The warm budget also prioritizes
+membership independently of the remaining page-bound budget, and protected Exact
+page budget subtracts the pinned charge so the classes cannot jointly overshoot
+their ceiling. Run publication evidence and active-Run audit construct a missing
+membership before consulting the evictable budget rather than leaving it dormant
+until a later warm cycle. This makes filter residency a bounded working-state
+floor rather
+than cache acceleration: at roughly 10 bits per active key, it costs less than
+one percent of the active Exact page charge while preserving warm lookup and GC
+reuse without waiting for a cold filter rebuild. An out-of-memory filter
+construction remains false-negative-safe and is retried by later warm cycles.

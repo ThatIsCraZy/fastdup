@@ -170,6 +170,7 @@ pub struct VerifiedReadCacheStatus {
     entry_count: usize,
     resident_bytes: usize,
     target_bytes: usize,
+    verified_share_limit_bytes: usize,
     metadata_bytes: usize,
     hard_limit_bytes: usize,
     reserve_bytes: u64,
@@ -214,6 +215,11 @@ impl VerifiedReadCacheStatus {
     status_getter!(entry_count, entry_count, usize);
     status_getter!(resident_bytes, resident_bytes, usize);
     status_getter!(target_bytes, target_bytes, usize);
+    status_getter!(
+        verified_share_limit_bytes,
+        verified_share_limit_bytes,
+        usize
+    );
     status_getter!(metadata_bytes, metadata_bytes, usize);
     status_getter!(hard_limit_bytes, hard_limit_bytes, usize);
     status_getter!(reserve_bytes, reserve_bytes, u64);
@@ -507,10 +513,17 @@ impl VerifiedReadCache {
                 crate::ReadCacheNamespace::isolated(crate::ReadCacheClass::Data, 0)
             }
         });
-        let cache = Self {
-            location_proofs: unified
+        let location_proofs = if legacy {
+            None
+        } else if automatic_pressure {
+            Some(system_location_proofs())
+        } else {
+            unified
                 .as_ref()
-                .map(|cache| cache.sibling(crate::ReadCacheClass::LocationProof)),
+                .map(|cache| cache.sibling(crate::ReadCacheClass::LocationProof))
+        };
+        let cache = Self {
+            location_proofs,
             unified,
             config,
             shards: shards.into_boxed_slice(),
@@ -655,10 +668,13 @@ impl VerifiedReadCache {
         let mut entries = self.entry_count.load(Ordering::Acquire);
         let mut compressed = self.compression.resident.load(Ordering::Relaxed);
         let mut logical = self.compression.logical.load(Ordering::Relaxed);
+        let mut verified_share_limit = self.target_bytes.load(Ordering::Acquire);
         if let Some(cache) = &self.unified {
             let stats = cache.stats();
             resident = usize::try_from(stats.resident_bytes).unwrap_or(usize::MAX);
             entries = usize::try_from(stats.entries).unwrap_or(usize::MAX);
+            verified_share_limit =
+                usize::try_from(cache.verified_data_limit()).unwrap_or(usize::MAX);
             compressed = 0;
             logical = 0;
             cache.visit::<CachedPayload>(|payload| {
@@ -698,6 +714,7 @@ impl VerifiedReadCache {
             entry_count: entries,
             resident_bytes: resident,
             target_bytes: self.target_bytes.load(Ordering::Acquire),
+            verified_share_limit_bytes: verified_share_limit,
             metadata_bytes: self.metadata_bytes,
             hard_limit_bytes: self.config.hard_limit_bytes,
             reserve_bytes: self.config.reserve_bytes,
@@ -738,7 +755,7 @@ impl VerifiedReadCache {
         };
         if length == 0
             || length > fastdup_format::MAX_LOGICAL_CHUNK_BYTES
-            || self.get(chunk_id, length as u64).is_some()
+            || self.contains(chunk_id, length as u64)
         {
             return;
         }
@@ -773,6 +790,40 @@ impl VerifiedReadCache {
                 self.admit_verified_location(entry);
             }
         }
+    }
+
+    /// Identity-and-length presence probe: it neither decodes a compressed
+    /// entry, counts a hit, nor promotes recency. Used only to avoid
+    /// double-admitting writer bytes that are already cached; a false miss
+    /// merely re-admits verified bytes and a false positive keeps an entry
+    /// that real reads still verify on retrieval.
+    fn contains(&self, chunk_id: ChunkId, logical_length: u64) -> bool {
+        if crate::read_intent::independent() {
+            return false;
+        }
+        if let Some(cache) = &self.unified {
+            let key = crate::ReadCacheKey {
+                identity: chunk_id.bytes(),
+                ordinal: logical_length,
+            };
+            return cache.get::<CachedPayload>(key).is_some();
+        }
+        let key = CacheKey {
+            chunk_id,
+            logical_length,
+        };
+        let hash = cache_hash(key);
+        let shard = &self.shards[hash & (self.shards.len() - 1)];
+        let state = shard
+            .state
+            .lock()
+            .expect("ASSERT: verified read-cache shard lock poisoned");
+        let set_index = (hash / self.shards.len()) % state.sets.len();
+        state.sets[set_index]
+            .ways
+            .iter()
+            .flatten()
+            .any(|entry| entry.matches(key))
     }
 
     pub(crate) fn get(
@@ -1184,6 +1235,36 @@ impl VerifiedReadCache {
 // Keep them as distinct residents in the common directory, including while
 // predecessor and successor Exact generations are both pinned. Compare the
 // complete entry on every hit as well; the digest is only a directory key.
+/// One process-wide verified-Location namespace for automatically governed
+/// caches, so every governed repository instance and the retirement purge
+/// address the same entries.
+fn system_location_proofs() -> crate::ReadCacheNamespace {
+    static LOCATION_PROOFS: std::sync::OnceLock<crate::ReadCacheNamespace> =
+        std::sync::OnceLock::new();
+    LOCATION_PROOFS
+        .get_or_init(|| crate::ReadCacheNamespace::system(crate::ReadCacheClass::LocationProof))
+        .clone()
+}
+
+/// Drops process-local verified Location evidence for Locations whose
+/// Containers have been physically removed.
+///
+/// Production verified-read caches live in the process-wide system Core under
+/// one shared namespace, so removal reaches the same entries the demand path
+/// would reuse regardless of which repository instance verified them. Legacy
+/// isolated caches keep their entries until CLOCK eviction; deleting a
+/// Location can never be undone by cache evidence, so this is memory hygiene
+/// and honest deletion reflection, not a correctness gate.
+pub(crate) fn forget_retired_location_proofs(entries: &[fastdup_format::ExactIndexEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    let cache = system_location_proofs();
+    for entry in entries {
+        cache.remove(location_proof_key(*entry));
+    }
+}
+
 fn location_proof_key(entry: fastdup_format::ExactIndexEntry) -> crate::ReadCacheKey {
     let location = entry.location();
     let mut hash = blake3::Hasher::new();

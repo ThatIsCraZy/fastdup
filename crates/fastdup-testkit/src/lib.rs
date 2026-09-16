@@ -310,6 +310,13 @@ impl MemoryStorageIo {
         Ok(())
     }
 
+    /// Clears any scheduled injection so a retry uses ordinary storage.
+    pub fn clear_faults(&self) {
+        let mut state = self.lock();
+        state.fail_before = None;
+        state.fail_after = None;
+    }
+
     #[must_use]
     pub fn operation_count(&self) -> usize {
         self.lock().operations.len()

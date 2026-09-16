@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use fastdup_format::{
     ChunkId, ContainerId, DurableInode, ExactIndexEntry, ExactIndexFormatError, ExactIndexLocation,
-    ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, GcCandidateCatalogRow,
-    ManifestExtent, ManifestLeaf, NamespaceEntry, NamespaceRoot, PolicySetId, SealedContainer,
+    ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, FOOTER_BYTES,
+    GcCandidateCatalogRow, HEADER_BYTES, ManifestExtent, ManifestLeaf, NamespaceEntry,
+    NamespaceRoot, PolicySetId, SealedContainer,
 };
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, ExactIndexStoreError,
@@ -2193,8 +2194,12 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
     catalog
         .publish_rows(1, 0, 0, 2, rows)
         .expect("publish publication-only catalog");
+    let previous = catalog
+        .recover_latest()
+        .expect("open publication-only catalog")
+        .expect("publication-only catalog exists");
     maintenance
-        .refresh_gc_candidate_catalog(&catalog, 2)
+        .refresh_gc_candidate_catalog(&catalog, &previous, 2)
         .expect("derive and publish Metadata delta successor");
     let current = catalog
         .recover_latest()
@@ -2350,6 +2355,539 @@ fn metadata_liveness_delta_updates_catalog_and_local_proof_compacts_without_scru
 }
 
 #[test]
+fn stale_gc_candidate_with_missing_container_cannot_fail_the_proof() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_mixed_repositories_using(metadata.clone(), data.clone());
+    let maintenance = MaintenanceRepository::new(
+        generations,
+        containers.with_maintenance_storage(data.clone()),
+        indexes.clone(),
+        profile,
+    );
+    maintenance
+        .rebuild_exact_index()
+        .expect("activate complete Exact generation");
+
+    let catalog = GcCandidateCatalogRepository::new(metadata);
+    catalog
+        .publish_rows(
+            1,
+            0,
+            0,
+            1,
+            [candidate_row(
+                [0x91; 16],
+                1,
+                &[b"stale-missing-gc-candidate"],
+            )],
+        )
+        .expect("publish stale candidate hint");
+    let current = catalog
+        .recover_latest()
+        .expect("open stale candidate catalog")
+        .expect("stale candidate catalog exists");
+    let shortlist = current
+        .shortlist(GcCandidateSelectionMode::Urgent, 1, 1)
+        .expect("rank stale candidate");
+    assert_eq!(shortlist.rows().len(), 1);
+
+    assert!(matches!(
+        maintenance.prove_gc_candidates(
+            &shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+        ),
+        Err(MaintenanceError::EmptyGcCandidateProof)
+    ));
+}
+
+fn published_container_name(container_id: ContainerId) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    container_id
+        .bytes()
+        .iter()
+        .fold(String::with_capacity(36), |mut name, byte| {
+            name.push(char::from(HEX[usize::from(byte >> 4)]));
+            name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            name
+        })
+        + ".fdc"
+}
+
+fn catalog_backed_fixture(
+    metadata: &MemoryStorageIo,
+    rows: Vec<GcCandidateCatalogRow>,
+) -> (
+    GcCandidateCatalogRepository<MemoryStorageIo>,
+    fastdup_store::GcCandidateCatalogSnapshot<MemoryStorageIo>,
+) {
+    let catalog = GcCandidateCatalogRepository::new(metadata.clone());
+    let row_count = u64::try_from(rows.len()).expect("fixture row count fits u64");
+    catalog
+        .publish_rows(1, 0, 0, row_count, rows)
+        .expect("publish fixture catalog");
+    let previous = catalog
+        .recover_latest()
+        .expect("open fixture catalog")
+        .expect("fixture catalog exists");
+    (catalog, previous)
+}
+
+fn maintenance_for(
+    generations: fastdup_store::GenerationRepository<MemoryStorageIo>,
+    containers: &fastdup_store::ContainerRepository<MemoryStorageIo>,
+    data: &MemoryStorageIo,
+    indexes: fastdup_store::ExactIndexRunRepository<MemoryStorageIo>,
+    profile: ExactIndexProfileId,
+) -> fastdup_store::MaintenanceRepository<MemoryStorageIo, MemoryStorageIo, MemoryStorageIo> {
+    let maintenance = MaintenanceRepository::new(
+        generations,
+        containers.with_maintenance_storage(data.clone()),
+        indexes,
+        profile,
+    );
+    maintenance
+        .rebuild_exact_index()
+        .expect("activate complete Exact generation for proof");
+    maintenance
+}
+
+#[test]
+fn proof_fanout_workers_do_not_change_the_candidate_proof() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_mixed_repositories_using(metadata.clone(), data.clone());
+    let rows = vec![
+        candidate_row(
+            [0x83; 16],
+            1,
+            &[
+                b"maintenance-first-chunk".as_slice(),
+                b"maintenance-second-chunk".as_slice(),
+            ],
+        ),
+        candidate_row(
+            [0x88; 16],
+            2,
+            &[
+                b"maintenance-third-live-chunk".as_slice(),
+                b"maintenance-fourth-dead-chunk".as_slice(),
+            ],
+        ),
+    ];
+    let (catalog, previous) = catalog_backed_fixture(&metadata, rows);
+    let maintenance = maintenance_for(
+        generations.clone(),
+        &containers,
+        &data,
+        indexes.clone(),
+        profile,
+    );
+    maintenance
+        .refresh_gc_candidate_catalog(&catalog, &previous, 2)
+        .expect("derive liveness successor");
+    let current = catalog
+        .recover_latest()
+        .expect("recover liveness successor")
+        .expect("liveness successor exists");
+    let shortlist = current
+        .shortlist(GcCandidateSelectionMode::Background, 2, 4)
+        .expect("rank bounded victims");
+
+    let single = maintenance
+        .prove_gc_candidates_with_workers(
+            &shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+            std::num::NonZeroUsize::MIN,
+        )
+        .expect("sequential proof succeeds");
+    let fanned = maintenance
+        .prove_gc_candidates_with_workers(
+            &shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+            std::num::NonZeroUsize::new(4).expect("four readers is nonzero"),
+        )
+        .expect("fanned-out proof succeeds");
+
+    assert!(single.victim_containers() > 0, "fixture yields victims");
+    assert_eq!(single.victim_containers(), fanned.victim_containers());
+    assert_eq!(
+        single.replacement_chunks(),
+        fanned.replacement_chunks(),
+        "reader count never changes the relocation plan"
+    );
+    assert_eq!(
+        single.reachable_victim_chunks(),
+        fanned.reachable_victim_chunks()
+    );
+    assert_eq!(single.victim_bytes(), fanned.victim_bytes());
+    assert_eq!(
+        single.replacement_upper_bound(),
+        fanned.replacement_upper_bound()
+    );
+    assert_eq!(
+        single.replacement_estimated_bytes(),
+        fanned.replacement_estimated_bytes()
+    );
+}
+
+#[test]
+fn online_gc_identity_change_after_proof_blocks_removal() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_mixed_repositories_using(metadata.clone(), data.clone());
+    let rows = vec![
+        candidate_row(
+            [0x83; 16],
+            1,
+            &[
+                b"maintenance-first-chunk".as_slice(),
+                b"maintenance-second-chunk".as_slice(),
+            ],
+        ),
+        candidate_row(
+            [0x88; 16],
+            2,
+            &[
+                b"maintenance-third-live-chunk".as_slice(),
+                b"maintenance-fourth-dead-chunk".as_slice(),
+            ],
+        ),
+    ];
+    let (catalog, previous) = catalog_backed_fixture(&metadata, rows);
+    let maintenance = maintenance_for(
+        generations.clone(),
+        &containers,
+        &data,
+        indexes.clone(),
+        profile,
+    );
+    maintenance
+        .refresh_gc_candidate_catalog(&catalog, &previous, 2)
+        .expect("derive liveness successor");
+    let current = catalog
+        .recover_latest()
+        .expect("recover liveness successor")
+        .expect("liveness successor exists");
+    let shortlist = current
+        .shortlist(GcCandidateSelectionMode::Background, 2, 4)
+        .expect("rank bounded victims");
+    let proof = maintenance
+        .prove_gc_candidates(
+            &shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+        )
+        .expect("proof binds current state");
+    let held_generation = indexes
+        .recover_active_generation()
+        .expect("install the proof's Exact generation")
+        .expect("the proof has an active Exact generation");
+    let retirement = maintenance
+        .begin_online_gc_retirement(proof)
+        .expect("replacement and RETIRING transition activate atomically");
+
+    let decoy = ContainerId::new([0x9c; 16]).expect("decoy ID is nonzero");
+    containers
+        .publish_raw(decoy, 5, &[b"tampering-decoy-image"])
+        .expect("publish a foreign sealed image");
+    let decoy_bytes = data
+        .read(&published_container_name(decoy))
+        .expect("read the decoy image");
+    let victim_name =
+        published_container_name(ContainerId::new([0x88; 16]).expect("victim ID is nonzero"));
+    let untouched_name = published_container_name(
+        ContainerId::new([0x83; 16]).expect("second victim ID is nonzero"),
+    );
+    data.write_at(
+        &victim_name,
+        0,
+        decoy_bytes.get(..HEADER_BYTES).expect("decoy has a header"),
+    )
+    .expect("swap the victim envelope identity after proof");
+
+    drop(held_generation);
+    assert!(
+        maintenance.finish_online_gc_retirement(retirement).is_err(),
+        "a victim name that no longer pairs to the proven sealed identity must block removal"
+    );
+    assert!(
+        data.exists(&victim_name).unwrap_or(false),
+        "the rejected victim survives the failed identity check"
+    );
+    assert!(
+        data.exists(&untouched_name).unwrap_or(false),
+        "no unlink happens when any victim identity check fails"
+    );
+
+    let restarted = ExactIndexRunRepository::new(metadata.clone());
+    let restarted_generation = restarted
+        .recover_active_generation()
+        .expect("restart recovers the RETIRING activation")
+        .expect("RETIRING activation remains durable");
+    assert_eq!(
+        restarted
+            .retiring_containers(&restarted_generation)
+            .expect("restart derives the retiring selection set")
+            .len(),
+        2,
+        "the RETIRING barrier stays recoverable after the blocked removal"
+    );
+}
+
+#[test]
+fn online_gc_stop_interrupts_generation_drain_without_unlinking_retiring_victims() {
+    use fastdup_store::MaintenanceCancellation;
+
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_mixed_repositories_using(metadata.clone(), data.clone());
+    let rows = vec![
+        candidate_row(
+            [0x83; 16],
+            1,
+            &[
+                b"maintenance-first-chunk".as_slice(),
+                b"maintenance-second-chunk".as_slice(),
+            ],
+        ),
+        candidate_row(
+            [0x88; 16],
+            2,
+            &[
+                b"maintenance-third-live-chunk".as_slice(),
+                b"maintenance-fourth-dead-chunk".as_slice(),
+            ],
+        ),
+    ];
+    let (catalog, previous) = catalog_backed_fixture(&metadata, rows);
+    let maintenance = maintenance_for(
+        generations.clone(),
+        &containers,
+        &data,
+        indexes.clone(),
+        profile,
+    );
+    maintenance
+        .refresh_gc_candidate_catalog(&catalog, &previous, 2)
+        .expect("derive liveness successor");
+    let current = catalog
+        .recover_latest()
+        .expect("recover liveness successor")
+        .expect("liveness successor exists");
+    let shortlist = current
+        .shortlist(GcCandidateSelectionMode::Background, 2, 4)
+        .expect("rank bounded victims");
+    let proof = maintenance
+        .prove_gc_candidates(
+            &shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+        )
+        .expect("proof binds current state");
+    let held_generation = indexes
+        .recover_active_generation()
+        .expect("install the proof's Exact generation")
+        .expect("the proof has an active Exact generation");
+
+    let cancellation = MaintenanceCancellation::new();
+    let cancellable = maintenance.with_maintenance_cancellation(cancellation.clone());
+    let retirement = cancellable
+        .begin_online_gc_retirement(proof)
+        .expect("replacement and RETIRING transition activate atomically");
+    cancellation.cancel();
+
+    let error = cancellable
+        .finish_online_gc_retirement(retirement)
+        .expect_err("a held Exact pin must remain cancellable");
+    assert!(
+        error.is_cancelled(),
+        "stop is not integrity corruption: {error}"
+    );
+
+    for victim in [
+        ContainerId::new([0x83; 16]).expect("victim ID is nonzero"),
+        ContainerId::new([0x88; 16]).expect("victim ID is nonzero"),
+    ] {
+        assert!(
+            data.exists(&published_container_name(victim))
+                .unwrap_or(false),
+            "cancellation must not unlink a RETIRING victim: {victim:?}"
+        );
+    }
+    drop(held_generation);
+
+    let restarted = ExactIndexRunRepository::new(metadata.clone());
+    let restarted_generation = restarted
+        .recover_active_generation()
+        .expect("restart recovers the RETIRING activation")
+        .expect("RETIRING activation remains durable");
+    assert_eq!(
+        restarted
+            .retiring_containers(&restarted_generation)
+            .expect("restart derives the retiring selection set")
+            .len(),
+        2,
+        "the interrupted RETIRING barrier remains recoverable"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn compressed_estimate_collects_where_raw_bound_rejected() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), data.clone());
+
+    let chunk_length = 256_usize * 1_024;
+    let chunks = (0_u8..16)
+        .map(|index| {
+            (0..chunk_length)
+                .map(|position| {
+                    if position % 8 == 0 {
+                        let block = u32::try_from(position / 8).expect("block index fits u32");
+                        let mixed = (u32::from(index).wrapping_mul(0x0100_0193))
+                            ^ block.wrapping_mul(0x9E37_79B1);
+                        u8::try_from(mixed >> ((block % 4) * 8) & 0xff).expect("byte fits")
+                    } else {
+                        0
+                    }
+                })
+                .collect::<Vec<u8>>()
+        })
+        .collect::<Vec<_>>();
+    let victim = ContainerId::new([0xb1; 16]).expect("victim ID is nonzero");
+    let pairs = (0_usize..8)
+        .map(|region| [chunks[region].as_slice(), chunks[region + 8].as_slice()])
+        .collect::<Vec<[&[u8]; 2]>>();
+    let regions = pairs
+        .iter()
+        .map(|pair| pair as &[&[u8]])
+        .collect::<Vec<_>>();
+    containers
+        .publish_adaptive_regions(victim, 2, &regions)
+        .expect("publish a mixed live/dead compressed Container");
+    let sealed = containers
+        .read(victim)
+        .expect("read the compressed victim back");
+    let physical_bytes = sealed.header().layout().file_length;
+    assert!(
+        physical_bytes < 1_024 * 1_024,
+        "the gate must keep this compressible Container well below its 4 MiB RAW size"
+    );
+
+    let extents = (0_usize..8)
+        .map(|index| ManifestExtent::Data {
+            logical_length: u64::try_from(chunk_length).expect("fixture length fits u64"),
+            chunk_id: ChunkId::of(&chunks[index]),
+        })
+        .collect::<Vec<_>>();
+    let logical_length = u64::try_from(8 * chunk_length).expect("fixture length fits u64");
+    let manifest = ManifestLeaf::new(logical_length, extents).expect("successor Manifest is valid");
+    let manifest_root = generations
+        .publish_manifest(&manifest)
+        .expect("publish successor Manifest");
+    let namespace = NamespaceRoot::new(
+        1_024,
+        3,
+        2,
+        vec![
+            DurableInode::new(2, 0o640, 1_000, 1_000, 1, 2, logical_length, manifest_root)
+                .expect("successor inode is valid"),
+        ],
+        vec![NamespaceEntry::new(1, 2, b"backup.vbk".to_vec()).expect("fixture name is valid")],
+    )
+    .expect("successor Namespace Root is valid");
+    generations
+        .commit_namespace_with_data(&namespace, &containers)
+        .expect("commit eight live Chunks of the compressed victim");
+
+    let victim_name = published_container_name(victim);
+    let envelope_header = data
+        .read_exact_at(&victim_name, 0, HEADER_BYTES)
+        .expect("read victim header");
+    let envelope_footer = data
+        .read_exact_at(
+            &victim_name,
+            physical_bytes
+                .checked_sub(FOOTER_BYTES)
+                .expect("victim is longer than its footer"),
+            usize::try_from(FOOTER_BYTES).expect("footer length fits usize"),
+        )
+        .expect("read victim footer");
+    let row = GcCandidateCatalogRow::from_intrinsic_summary(
+        victim,
+        2,
+        physical_bytes,
+        fastdup_format::SealedContainerDescriptor::decode_intrinsic_summary(
+            &envelope_header,
+            &envelope_footer,
+            physical_bytes,
+        )
+        .expect("envelope reconstructs the intrinsic summary"),
+    )
+    .expect("candidate row is valid");
+    let (catalog, previous) = catalog_backed_fixture(&metadata, vec![row]);
+    let maintenance = maintenance_for(
+        generations.clone(),
+        &containers,
+        &data,
+        indexes.clone(),
+        profile,
+    );
+    maintenance
+        .refresh_gc_candidate_catalog(&catalog, &previous, 2)
+        .expect("derive liveness successor");
+    let current = catalog
+        .recover_latest()
+        .expect("recover liveness successor")
+        .expect("liveness successor exists");
+    let observed = current
+        .find_row(victim)
+        .expect("binary catalog lookup succeeds")
+        .expect("compressed victim row remains present");
+    assert_eq!(observed.reachable_target_count(), 8);
+
+    let shortlist = current
+        .shortlist(GcCandidateSelectionMode::Background, 2, 4)
+        .expect("rank bounded victims");
+    let proof = maintenance
+        .prove_gc_candidates(
+            &shortlist,
+            DataPoolUsage::new(50, 100).expect("worked pool usage is valid"),
+        )
+        .expect("compressed victim proves");
+    assert_eq!(proof.victim_containers(), 1);
+    assert_eq!(proof.reachable_victim_chunks(), 8);
+    assert!(
+        proof.replacement_upper_bound() > proof.victim_bytes(),
+        "the RAW upper bound exceeds this mostly-live compressed Container"
+    );
+    assert!(
+        proof.replacement_estimated_bytes() < proof.victim_bytes(),
+        "the compressed estimate collects where the RAW bound alone would reject"
+    );
+
+    let report = maintenance
+        .garbage_collect_proved_candidates(proof)
+        .expect("collect the compressed-bound profitable victim");
+    assert_eq!(report.containers_removed(), 1);
+    assert_eq!(report.chunks_relocated(), 8);
+    assert!(
+        !data
+            .exists(&published_container_name(victim))
+            .expect("compressed victim was unlinked"),
+        "the proven victim DATA is gone after retirement"
+    );
+    maintenance
+        .scrub()
+        .expect("post-collection full audit remains clean");
+}
+
+#[test]
 fn recovered_online_gc_finalizer_is_idempotent_after_durable_partial_unlink() {
     let metadata = MemoryStorageIo::new();
     let data = MemoryStorageIo::new();
@@ -2487,7 +3025,13 @@ fn adaptive_online_gc_cycle_bootstraps_hints_and_collects_one_bounded_quantum() 
             .containers(),
         1
     );
-    assert_eq!(cycle.catalog().row_count(), 1);
+    assert_eq!(
+        cycle
+            .catalog()
+            .expect("data phase wrote the catalog")
+            .row_count(),
+        2
+    );
     let metrics = cycle.metrics();
     assert_eq!(metrics.shortlisted_candidates(), 2);
     assert_eq!(metrics.proved_victims(), 2);
@@ -2547,7 +3091,13 @@ fn adaptive_online_gc_reclaims_victims_without_relocation_when_protected_data_is
     assert_eq!(collected.containers_removed(), 2);
     assert_eq!(collected.replacement_containers(), 0);
     assert_eq!(collected.chunks_relocated(), 0);
-    assert_eq!(cycle.catalog().row_count(), 0);
+    assert_eq!(
+        cycle
+            .catalog()
+            .expect("data phase wrote the catalog")
+            .row_count(),
+        2
+    );
     assert_eq!(
         containers
             .audit_published()
@@ -2560,6 +3110,74 @@ fn adaptive_online_gc_reclaims_victims_without_relocation_when_protected_data_is
         .expect("empty DATA and zero-active Exact state remain scrub-clean");
     assert_eq!(scrub.containers(), 0);
     assert_eq!(scrub.exact_active_locations_verified(), 0);
+}
+
+#[test]
+fn online_gc_retirement_bounds_durable_hint_files_across_quanta() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_mixed_repositories_using(metadata.clone(), data.clone());
+    let maintenance = MaintenanceRepository::new(
+        generations.clone(),
+        containers.clone(),
+        indexes.clone(),
+        profile,
+    );
+    maintenance
+        .rebuild_exact_index()
+        .expect("online scheduler requires one active Exact generation");
+    let empty = NamespaceRoot::new(1_024, 3, 3, Vec::new(), Vec::new())
+        .expect("empty successor Namespace is valid");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("first empty generation commits");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("second empty generation drains the last DATA predecessor");
+    let catalog = GcCandidateCatalogRepository::new(metadata.clone());
+    let catalog_files = || -> usize {
+        metadata
+            .list_names()
+            .expect("list Metadata tier")
+            .into_iter()
+            .filter(|name| name.starts_with("gc-candidate-catalog-") && !name.starts_with('.'))
+            .count()
+    };
+
+    let mut retired_total = 0_u64;
+    for _ in 0..3 {
+        let cycle = maintenance
+            .run_adaptive_online_gc_cycle(
+                &catalog,
+                DataPoolUsage::new(50, 100).expect("fixture pool usage is valid"),
+                OnlineGcRunMode::Urgent,
+            )
+            .expect("zero-live Online-GC quantum succeeds");
+        retired_total = retired_total.saturating_add(cycle.metrics().catalog_files_retired());
+        assert!(
+            catalog_files() <= 3,
+            "a sweep leaves at most the greatest generation plus this quantum's successors"
+        );
+    }
+    assert_eq!(
+        catalog_files(),
+        1,
+        "an idle steady state keeps exactly one durable hint generation"
+    );
+    assert!(
+        retired_total >= 1,
+        "collection publishes one bounded successor and the sweep retires superseded hint generations, saw {retired_total}"
+    );
+
+    indexes
+        .recover_active_generation()
+        .expect("Exact selection survives hint retirement")
+        .expect("fixture keeps one active Exact generation");
+    let scrub = maintenance
+        .scrub()
+        .expect("post-retirement scrub verifies the live graph");
+    assert_eq!(scrub.containers(), 0);
 }
 
 #[test]
@@ -2633,7 +3251,76 @@ fn online_gc_holds_commit_binding_through_retiring_activation() {
 }
 
 #[test]
-fn urgent_zero_live_gc_drains_more_than_one_candidate_quantum_and_becomes_idempotent() {
+fn gc_phase_selection_defers_data_relocation_until_requested() {
+    let metadata = MemoryStorageIo::new();
+    let (generations, containers, indexes, profile) =
+        seeded_replaced_generation_repositories(4, metadata.clone(), MemoryStorageIo::new());
+    let maintenance =
+        MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+    maintenance
+        .rebuild_exact_index()
+        .expect("build Exact coverage for the four Containers");
+    let empty = NamespaceRoot::new(1_024, 3, 5, Vec::new(), Vec::new())
+        .expect("empty successor Namespace is valid");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("first empty generation commits");
+    generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("second empty generation drains the last DATA predecessor");
+    let catalog = GcCandidateCatalogRepository::new(metadata.clone());
+    let usage = DataPoolUsage::new(50, 100).expect("fixture pool usage is valid");
+
+    let metadata_only = maintenance
+        .run_adaptive_online_gc_cycle_with_phases(
+            &catalog,
+            usage,
+            OnlineGcRunMode::Urgent,
+            fastdup_store::GcPhaseRequest::metadata_only(),
+        )
+        .expect("Metadata-only quantum succeeds");
+    assert!(matches!(
+        metadata_only.outcome(),
+        fastdup_store::OnlineGcCycleOutcome::MetadataOnly
+    ));
+    assert!(
+        metadata_only.catalog().is_none(),
+        "a Metadata-only quantum must not bootstrap or read the candidate catalog"
+    );
+    assert_eq!(
+        containers
+            .audit_published()
+            .expect("audit live DATA")
+            .containers(),
+        4,
+        "a Metadata-only quantum must never relocate DATA"
+    );
+
+    let data_only = maintenance
+        .run_adaptive_online_gc_cycle_with_phases(
+            &catalog,
+            usage,
+            OnlineGcRunMode::Urgent,
+            fastdup_store::GcPhaseRequest::data_only(),
+        )
+        .expect("Data-only quantum succeeds");
+    let fastdup_store::OnlineGcCycleOutcome::Collected(collected) = data_only.outcome() else {
+        panic!("ASSERT: the Data-only quantum must collect the four zero-live Containers");
+    };
+    assert_eq!(collected.containers_removed(), 4);
+    assert_eq!(data_only.metadata_gc().bytes_removed(), 0);
+    assert_eq!(data_only.metadata_gc().objects_removed(), 0);
+    assert_eq!(
+        containers
+            .audit_published()
+            .expect("audit empty DATA")
+            .containers(),
+        0
+    );
+}
+
+#[test]
+fn urgent_zero_live_gc_drains_the_bounded_candidate_quantum_and_becomes_idempotent() {
     let metadata = MemoryStorageIo::new();
     let (generations, containers, indexes, profile) =
         seeded_replaced_generation_repositories(70, metadata.clone(), MemoryStorageIo::new());
@@ -2659,17 +3346,8 @@ fn urgent_zero_live_gc_drains_more_than_one_candidate_quantum_and_becomes_idempo
     let OnlineGcCycleOutcome::Collected(first) = first.outcome() else {
         panic!("ASSERT: first urgent quantum must collect its bounded shortlist");
     };
-    assert_eq!(first.containers_removed(), 64);
+    assert_eq!(first.containers_removed(), 70);
     assert_eq!(first.replacement_containers(), 0);
-
-    let second = maintenance
-        .run_adaptive_online_gc_cycle(&catalog, usage, OnlineGcRunMode::Urgent)
-        .expect("second bounded zero-live quantum succeeds");
-    let OnlineGcCycleOutcome::Collected(second) = second.outcome() else {
-        panic!("ASSERT: second urgent quantum must collect the remaining shortlist");
-    };
-    assert_eq!(second.containers_removed(), 6);
-    assert_eq!(second.replacement_containers(), 0);
 
     let stable = maintenance
         .run_adaptive_online_gc_cycle(&catalog, usage, OnlineGcRunMode::Urgent)
@@ -3685,6 +4363,7 @@ fn republishing_after_failed_exact_gc_does_not_reuse_the_retired_journal() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn republish_after_exact_gc(metadata: MemoryStorageIo, gc_fails: bool) -> usize {
     let paused = PausedStorageIo::disarmed_before_name_prefix(
         metadata.clone(),

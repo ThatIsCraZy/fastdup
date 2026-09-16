@@ -170,6 +170,39 @@ impl<'a, I: StorageIo> ExactActivationLog<'a, I> {
         }
         select_current(slots)
     }
+
+    /// Returns every wholly valid record across both paired slots for one
+    /// conservative object-retirement reference window.
+    ///
+    /// Recovery after corruption may legitimately select either slot, so
+    /// retirement must treat both slots' records as reachable. A slot whose
+    /// chain fails validation aborts the sweep rather than risk unlinking a
+    /// Run or Run Set that a recoverable record still names. Torn suffixes
+    /// are inherently uncommitted and their records are not referenced.
+    pub(crate) fn load_retirement_reference_records(
+        &self,
+    ) -> Result<Vec<ExactIndexActivationRecord>, ExactActivationLogError> {
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(MAX_SLOT_RECORDS * SLOT_NAMES.len())
+            .map_err(|_| ExactActivationLogError::OutOfMemory)?;
+        for (slot, name) in SLOT_NAMES.into_iter().enumerate() {
+            let length = match self.storage.object_len(name) {
+                Ok(length) => length,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if length > maximum_slot_bytes() {
+                return Err(ExactActivationLogError::SlotTooLarge);
+            }
+            let bytes = self.storage.read(name)?;
+            if u64::try_from(bytes.len()) != Ok(length) {
+                return Err(ExactActivationLogError::PublishVerificationMismatch);
+            }
+            records.extend(decode_slot(slot, bytes)?.records);
+        }
+        Ok(records)
+    }
 }
 
 fn maximum_slot_bytes() -> u64 {

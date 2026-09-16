@@ -5,6 +5,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const PERIOD: Duration = Duration::from_millis(250);
+const MIB: u64 = 1 << 20;
+/// A candidate outside its deadband must persist for this many periods before
+/// stable targets move. This removes one-sample memory-headroom oscillation.
+const TARGET_STREAK_TRIGGER: i8 = 4;
 
 /// Work avoided by reuse: storage access or a work-buffer allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +43,8 @@ struct PoolState {
     demand: u64,
     desired: u64,
     leased: u64,
+    pinned: u64,
+    target_drift: i8,
 }
 
 #[derive(Debug)]
@@ -46,6 +52,7 @@ struct State {
     pools: BTreeMap<u64, PoolState>,
     next_id: u64,
     budget: u64,
+    hard_pressure: bool,
     refreshed: Instant,
     new_pool: bool,
     effective_limit: u64,
@@ -101,6 +108,8 @@ impl CachePool {
                     demand: 0,
                     desired: fixed,
                     leased: fixed,
+                    pinned: 0,
+                    target_drift: 0,
                 },
             );
             id
@@ -115,16 +124,41 @@ impl CachePool {
     /// Panics if an internal controller lock or registration invariant failed.
     #[must_use]
     pub fn target(&self, snapshot: MemoryPressureSnapshot, observation: CacheObservation) -> u64 {
+        self.target_with_pinned_floor(snapshot, observation, 0)
+    }
+
+    /// Requests an evictable byte target while charging a non-evictable resident
+    /// floor against the shared headroom. The returned target excludes `pinned`
+    /// so pressure cannot admit more evictable capacity merely to reserve room
+    /// for a pinned resident set.
+    ///
+    /// # Panics
+    /// Panics if an internal controller lock or registration invariant failed.
+    #[must_use]
+    pub fn target_with_pinned_floor(
+        &self,
+        snapshot: MemoryPressureSnapshot,
+        observation: CacheObservation,
+        pinned: u64,
+    ) -> u64 {
         let mut state = self
             .broker
             .0
             .lock()
             .expect("ASSERT: cache budget lock poisoned");
-        state
+        let prior_pinned = state
             .pools
-            .get_mut(&self.id)
+            .get(&self.id)
             .expect("ASSERT: registered cache pool exists")
-            .observed = observation;
+            .pinned;
+        {
+            let pool = state
+                .pools
+                .get_mut(&self.id)
+                .expect("ASSERT: registered cache pool exists");
+            pool.observed = observation;
+            pool.pinned = pinned;
+        }
         if state.new_pool
             || state.refreshed.elapsed() >= PERIOD
             || state.budget == 0
@@ -138,16 +172,20 @@ impl CachePool {
             .pools
             .values()
             .fold(0_u64, |sum, pool| sum.saturating_add(pool.leased));
+        let leased = if pinned >= prior_pinned {
+            leased.saturating_add(pinned - prior_pinned)
+        } else {
+            leased.saturating_sub(prior_pinned - pinned)
+        };
         let free = state.budget.saturating_sub(leased);
         let pool = state
             .pools
             .get_mut(&self.id)
             .expect("ASSERT: registered cache pool exists");
-        let target = pool
-            .desired
-            .min(pool.leased.saturating_add(free))
-            .max(pool.fixed);
-        pool.leased = pool.leased.max(target);
+        let desired = pool.desired.saturating_sub(pinned).max(pool.fixed);
+        let granted = pool.leased.saturating_sub(prior_pinned);
+        let target = desired.min(granted.saturating_add(free)).max(pool.fixed);
+        pool.leased = pool.leased.max(target.saturating_add(pinned));
         target
     }
 
@@ -158,6 +196,17 @@ impl CachePool {
     /// Panics if eviction has not reached the target, a lease was not granted,
     /// or an internal controller lock or registration invariant failed.
     pub fn applied(&self, target: u64, resident: u64) {
+        self.applied_with_pinned_floor(target, resident, 0);
+    }
+
+    /// Acknowledges the evictable portion of a target and replaces the charged
+    /// non-evictable resident floor. `resident` must exclude `pinned`; total
+    /// headroom accounting adds it back after the lease is reduced.
+    ///
+    /// # Panics
+    /// Panics if eviction has not reached the evictable target, a lease was not
+    /// granted, or an internal controller lock or registration invariant failed.
+    pub fn applied_with_pinned_floor(&self, target: u64, resident: u64, pinned: u64) {
         let mut state = self
             .broker
             .0
@@ -167,16 +216,18 @@ impl CachePool {
             .pools
             .get_mut(&self.id)
             .expect("ASSERT: registered cache pool exists");
+        let prior_pinned = pool.pinned;
         assert!(
             resident <= target.max(pool.fixed),
             "ASSERT: cache applied its byte target before releasing the lease"
         );
         assert!(
-            target <= pool.leased,
+            target <= pool.leased.saturating_sub(prior_pinned),
             "ASSERT: cache cannot acknowledge an ungranted lease"
         );
-        pool.leased = target.max(pool.fixed);
-        pool.observed.resident_bytes = resident;
+        pool.pinned = pinned;
+        pool.leased = target.max(pool.fixed).saturating_add(pinned);
+        pool.observed.resident_bytes = resident.saturating_add(pinned);
     }
 }
 
@@ -194,6 +245,7 @@ impl Broker {
             pools: BTreeMap::new(),
             next_id: 0,
             budget: 0,
+            hard_pressure: true,
             refreshed: Instant::now(),
             new_pool: false,
             effective_limit: 0,
@@ -207,6 +259,12 @@ impl State {
         self.refreshed = Instant::now();
         self.new_pool = false;
         self.refresh_headroom(snapshot);
+        let hard_pressure = self.hard_pressure;
+        let old: BTreeMap<u64, u64> = self
+            .pools
+            .iter()
+            .map(|(id, pool)| (*id, pool.desired))
+            .collect();
         let fixed = self
             .pools
             .values()
@@ -222,8 +280,10 @@ impl State {
         .max(1);
         // Bounded exploration prevents a cold or previously evicted workload
         // from remaining permanently invisible to the hit-based controller.
-        let probe = distributable / 16 / count;
-        let growth = distributable / 16;
+        let probe = bounded_share(distributable, 12, 32 * MIB, 128 * MIB)
+            .saturating_div(count)
+            .max(u64::from(distributable > 0));
+        let growth = bounded_share(distributable, 25, 16 * MIB, 128 * MIB);
         let mut scores = Vec::with_capacity(self.pools.len());
         for (&id, pool) in &mut self.pools {
             let hits = pool.observed.hits.saturating_sub(pool.previous.hits);
@@ -269,6 +329,15 @@ impl State {
             pool.desired = pool.fixed.saturating_add(probe.min(cap));
             scores.push((id, score, cap));
         }
+        let remaining = self.water_fill_scores(&scores, distributable);
+        self.distribute_idle_buffers(remaining, probe);
+        let step = bounded_share(distributable, 30, 8 * MIB, 128 * MIB);
+        let deadband = bounded_share(distributable, 20, 8 * MIB, 32 * MIB);
+        self.damp_targets(&old, step, deadband, hard_pressure);
+        self.retain_target_budget(fixed, distributable);
+    }
+
+    fn water_fill_scores(&mut self, scores: &[(u64, u128, u64)], distributable: u64) -> u64 {
         // Water fill: capped/fully served pools return the unused share, so a
         // small hot metadata cache cannot hoard idle capacity from DATA caches.
         let mut remaining =
@@ -283,7 +352,7 @@ impl State {
                 break;
             }
             let before = remaining;
-            for &(id, score, cap) in &scores {
+            for &(id, score, cap) in scores {
                 let pool = self
                     .pools
                     .get_mut(&id)
@@ -299,17 +368,74 @@ impl State {
                 break;
             }
         }
-        self.distribute_idle_buffers(remaining, probe);
+        remaining
+    }
+
+    fn damp_targets(
+        &mut self,
+        old: &BTreeMap<u64, u64>,
+        step: u64,
+        deadband: u64,
+        hard_pressure: bool,
+    ) {
+        let candidate: BTreeMap<u64, u64> = self
+            .pools
+            .iter()
+            .map(|(id, pool)| (*id, pool.desired))
+            .collect();
+        for (&id, pool) in &mut self.pools {
+            let old = old.get(&id).copied().unwrap_or(pool.fixed);
+            let candidate = candidate.get(&id).copied().unwrap_or(pool.fixed);
+            if hard_pressure {
+                pool.desired = old.min(candidate);
+                pool.target_drift = 0;
+                continue;
+            }
+            if old == pool.fixed && candidate > pool.fixed {
+                pool.desired = candidate;
+                pool.target_drift = 0;
+                continue;
+            }
+            let deadband = deadband.min(old.saturating_sub(pool.fixed) / 4).max(1);
+            let direction = i32::from(candidate > old.saturating_add(deadband))
+                - i32::from(candidate.saturating_add(deadband) <= old);
+            let drift = if direction == 0 {
+                0
+            } else if direction > 0 {
+                if pool.target_drift > 0 {
+                    pool.target_drift.saturating_add(1)
+                } else {
+                    1
+                }
+            } else if pool.target_drift < 0 {
+                pool.target_drift.saturating_sub(1)
+            } else {
+                -1
+            };
+            pool.target_drift = drift;
+            if drift.abs() >= TARGET_STREAK_TRIGGER {
+                let difference = candidate.abs_diff(old);
+                let movement = step.max(difference / 8).min(difference);
+                pool.desired = if candidate > old {
+                    old.saturating_add(movement)
+                } else {
+                    old.saturating_sub(movement)
+                };
+            } else {
+                pool.desired = old;
+            }
+        }
     }
 
     fn refresh_headroom(&mut self, snapshot: MemoryPressureSnapshot) {
+        let previous_effective_limit = self.effective_limit;
         self.effective_limit = snapshot.effective_limit_bytes();
         self.available = snapshot.available_bytes();
         let resident = self.pools.values().fold(0_u64, |sum, pool| {
             sum.saturating_add(pool.observed.resident_bytes)
         });
         let reserve = cache_memory_reserve(snapshot.effective_limit_bytes());
-        self.budget = if snapshot.swap_used_bytes() != 0 {
+        let raw = if snapshot.swap_used_bytes() != 0 {
             0
         } else {
             resident
@@ -321,6 +447,63 @@ impl State {
                 .saturating_sub(reserve)
                 .min(snapshot.effective_limit_bytes().saturating_sub(reserve))
         };
+        self.hard_pressure = snapshot.swap_used_bytes() != 0
+            || snapshot.available_bytes() < reserve
+            || (previous_effective_limit != 0
+                && snapshot.effective_limit_bytes() < previous_effective_limit)
+            || raw == 0;
+        self.budget = if raw == 0 || self.hard_pressure || self.budget == 0 {
+            raw
+        } else {
+            let smoothed = if raw < self.budget {
+                self.budget.saturating_sub((self.budget - raw).div_ceil(4))
+            } else {
+                self.budget.saturating_add((raw - self.budget) / 8)
+            };
+            smoothed.min(self.effective_limit.saturating_sub(reserve))
+        };
+    }
+
+    fn retain_target_budget(&mut self, fixed: u64, distributable: u64) {
+        let total = self
+            .pools
+            .values()
+            .fold(0_u64, |sum, pool| sum.saturating_add(pool.desired));
+        if total <= distributable.saturating_add(fixed) {
+            return;
+        }
+        let variable_total = total.saturating_sub(fixed);
+        if variable_total == 0 {
+            return;
+        }
+        let mut excess = total - distributable.saturating_add(fixed);
+        let variables: Vec<(u64, u64)> = self
+            .pools
+            .iter()
+            .map(|(id, pool)| (*id, pool.desired.saturating_sub(pool.fixed)))
+            .collect();
+        for (id, variable) in &variables {
+            let reduction = u64::try_from(
+                u128::from(excess) * u128::from(*variable) / u128::from(variable_total.max(1)),
+            )
+            .unwrap_or(u64::MAX)
+            .min(*variable);
+            if reduction == 0 {
+                continue;
+            }
+            if let Some(pool) = self.pools.get_mut(id) {
+                pool.desired = pool.desired.saturating_sub(reduction);
+            }
+            excess = excess.saturating_sub(reduction);
+        }
+        for pool in self.pools.values_mut() {
+            if excess == 0 {
+                break;
+            }
+            let reduction = excess.min(pool.desired.saturating_sub(pool.fixed));
+            pool.desired = pool.desired.saturating_sub(reduction);
+            excess = excess.saturating_sub(reduction);
+        }
     }
 
     fn distribute_idle_buffers(&mut self, mut remaining: u64, probe: u64) {
@@ -348,6 +531,16 @@ impl State {
 #[must_use]
 pub const fn cache_memory_reserve(effective: u64) -> u64 {
     effective / 100 * 8 + (effective % 100 * 8).div_ceil(100)
+}
+
+fn bounded_share(budget: u64, basis_points: u64, minimum: u64, maximum: u64) -> u64 {
+    if budget == 0 {
+        return 0;
+    }
+    let scaled = budget.saturating_mul(basis_points) / 10_000;
+    let floor = minimum.min(scaled.max(1));
+    let ceiling = maximum.min(budget);
+    scaled.max(floor).min(ceiling)
 }
 
 fn system_broker() -> &'static Arc<Broker> {
@@ -459,7 +652,12 @@ mod tests {
                 },
             );
             let low = MemoryPressureSnapshot::new(100_000, 10_000, 0);
-            tick(&broker, low);
+            for _ in 0..50 {
+                tick(&broker, low);
+                if broker.0.lock().unwrap().pools[&buffers.id].desired == 0 {
+                    break;
+                }
+            }
             assert_eq!(broker.0.lock().unwrap().pools[&buffers.id].desired, 0);
             assert_eq!(
                 broker.0.lock().unwrap().pools[&buffers.id].leased,
@@ -493,6 +691,42 @@ mod tests {
         assert!(state.pools[&data.id].desired > state.pools[&meta.id].desired);
         assert!(state.pools.values().map(|p| p.desired).sum::<u64>() <= 92_000);
     }
+    #[test]
+    fn pinned_floor_consumes_headroom_without_entering_the_evictable_target() {
+        let broker = Arc::new(Broker::new());
+        let unified = CachePool::register(
+            Arc::clone(&broker),
+            "unified",
+            CacheFallback::Data,
+            10,
+            100_000,
+        );
+        {
+            let mut state = broker.0.lock().unwrap();
+            state.new_pool = false;
+            state.budget = 50;
+            let pool = state.pools.get_mut(&unified.id).unwrap();
+            pool.desired = 100;
+            pool.leased = 50;
+            pool.pinned = 40;
+            pool.observed.resident_bytes = 50;
+        }
+        let target = unified.target_with_pinned_floor(
+            pressure(),
+            CacheObservation {
+                resident_bytes: 50,
+                ..CacheObservation::default()
+            },
+            40,
+        );
+        assert_eq!(target, 10, "the requested target covers only fixed state");
+        unified.applied_with_pinned_floor(target, target, 40);
+        let state = broker.0.lock().unwrap();
+        let pool = state.pools.get(&unified.id).unwrap();
+        assert_eq!(pool.leased, 50, "the pinned floor stays charged");
+        assert_eq!(pool.observed.resident_bytes, 50);
+    }
+
     #[test]
     fn a_donor_keeps_its_lease_until_eviction_is_acknowledged() {
         let broker = Arc::new(Broker::new());
@@ -628,5 +862,56 @@ mod tests {
         let state = broker.0.lock().unwrap();
         assert_eq!(state.pools.len(), 1);
         assert_eq!(state.pools[&cold.id].leased, cold_target);
+    }
+
+    #[test]
+    fn volatile_candidate_oscillation_does_not_move_a_stable_target() {
+        let broker = Arc::new(Broker::new());
+        let data = CachePool::register(Arc::clone(&broker), "test", CacheFallback::Data, 0, 100);
+        let mut state = broker.0.lock().unwrap();
+        state.pools.get_mut(&data.id).unwrap().desired = 50;
+        let old: BTreeMap<u64, u64> = [(data.id, 50_u64)].into_iter().collect();
+        for _ in 0..20 {
+            for candidate in [80, 30] {
+                state.pools.get_mut(&data.id).unwrap().desired = candidate;
+                state.damp_targets(&old, 10, 4, false);
+                assert_eq!(state.pools[&data.id].desired, 50);
+            }
+        }
+        assert!(state.pools[&data.id].target_drift.abs() < TARGET_STREAK_TRIGGER);
+    }
+
+    #[test]
+    fn a_sustained_candidate_shift_moves_the_target_by_one_damped_step() {
+        let broker = Arc::new(Broker::new());
+        let data = CachePool::register(Arc::clone(&broker), "test", CacheFallback::Data, 0, 100);
+        let mut state = broker.0.lock().unwrap();
+        state.pools.get_mut(&data.id).unwrap().desired = 50;
+        let old: BTreeMap<u64, u64> = [(data.id, 50_u64)].into_iter().collect();
+        for _ in 0..3 {
+            state.pools.get_mut(&data.id).unwrap().desired = 80;
+            state.damp_targets(&old, 10, 4, false);
+            assert_eq!(state.pools[&data.id].desired, 50);
+        }
+        state.pools.get_mut(&data.id).unwrap().desired = 80;
+        state.damp_targets(&old, 10, 4, false);
+        assert_eq!(state.pools[&data.id].desired, 60);
+        assert_eq!(state.pools[&data.id].target_drift, TARGET_STREAK_TRIGGER);
+    }
+
+    #[test]
+    fn hard_pressure_rejects_growth_immediately_but_preserves_admission_shrink() {
+        let broker = Arc::new(Broker::new());
+        let data = CachePool::register(Arc::clone(&broker), "test", CacheFallback::Data, 0, 100);
+        let mut state = broker.0.lock().unwrap();
+        state.pools.get_mut(&data.id).unwrap().desired = 50;
+        let old: BTreeMap<u64, u64> = [(data.id, 50_u64)].into_iter().collect();
+        state.pools.get_mut(&data.id).unwrap().desired = 80;
+        state.damp_targets(&old, 10, 4, true);
+        assert_eq!(state.pools[&data.id].desired, 50);
+        state.pools.get_mut(&data.id).unwrap().desired = 30;
+        state.damp_targets(&old, 10, 4, true);
+        assert_eq!(state.pools[&data.id].desired, 30);
+        assert_eq!(state.pools[&data.id].target_drift, 0);
     }
 }

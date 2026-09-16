@@ -121,3 +121,16 @@ cancelled Freeze retains an already newer Active entry and its reuse origin.
 The combined 65,536-Proof bound and publication claims remain unchanged.
 Reported heap usage includes actual arena and hash-table capacities for both
 generations, including reserved slots, rather than a fixed per-entry estimate.
+
+## Same boundary at verified DATA retirement (2026-09-14)
+
+Amended by ADR 0065. The retirement removal identity check applies this
+sampled-structure boundary at deletion: each victim name is re-read
+independently as its sealed Header/Footer envelope and must still pair to the
+proven Container identity, generation, and immutable length. Payload
+re-verification and dependent Base resolution at removal are excluded because
+the single independent candidate-proof read already established content truth
+and repeated verification of bytes about to be destroyed cannot rescue a
+wrong liveness decision. Scrub remains the independent content auditor, and
+the recovery finalizer keeps full cold-path re-verification where no
+in-process proof exists.

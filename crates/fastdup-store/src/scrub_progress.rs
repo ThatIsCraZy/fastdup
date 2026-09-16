@@ -11,6 +11,7 @@ use std::io;
 const NAME: &str = ".fastdup-scrub-progress-v1";
 const MAGIC: &[u8; 8] = b"FDSCRB01";
 const HEADER_LEN: usize = 80;
+const PENDING_FLUSH_BYTES: usize = 1024 * 1024;
 // Neither stopped nor completed passes may postpone latent-corruption checks indefinitely.
 const MAX_ROUND_AGE: u64 = 7 * 24 * 60 * 60;
 
@@ -342,6 +343,8 @@ pub struct ScrubProgress<I> {
     header_hash: [u8; 32],
     started: u64,
     end: u64,
+    flushed_end: u64,
+    pending: Vec<u8>,
     entries: BTreeMap<[u8; 16], (u64, usize)>,
 }
 
@@ -357,6 +360,8 @@ impl<I: StorageIo> ScrubProgress<I> {
             header_hash: [0; 32],
             started: now,
             end: 0,
+            flushed_end: 0,
+            pending: Vec::new(),
             entries: BTreeMap::new(),
         };
         if this.storage.exists(NAME)? && this.load(binding, now)? {
@@ -384,6 +389,8 @@ impl<I: StorageIo> ScrubProgress<I> {
         }
         self.header_hash.copy_from_slice(&header[48..]);
         self.end = HEADER_LEN as u64;
+        self.flushed_end = self.end;
+        self.pending.clear();
         while self.end < length {
             if length - self.end < 4 {
                 break;
@@ -418,6 +425,8 @@ impl<I: StorageIo> ScrubProgress<I> {
             self.storage.set_len(NAME, self.end)?;
             self.storage.sync_file(NAME)?;
         }
+        self.flushed_end = self.end;
+        self.pending.clear();
         Ok(true)
     }
 
@@ -440,8 +449,10 @@ impl<I: StorageIo> ScrubProgress<I> {
         self.storage.sync_file(NAME)?;
         self.storage.sync_root()?;
         self.entries.clear();
+        self.pending.clear();
         self.started = now;
         self.end = HEADER_LEN as u64;
+        self.flushed_end = self.end;
         Ok(())
     }
 
@@ -473,7 +484,7 @@ impl<I: StorageIo> ScrubProgress<I> {
         let Some(&(offset, size)) = self.entries.get(&id.bytes()) else {
             return Ok(None);
         };
-        let bytes = self.read_frame(offset, size)?;
+        let bytes = self.read_visible_frame(offset, size)?;
         if !valid_frame(&bytes, &self.header_hash) {
             return Err(invalid());
         }
@@ -498,8 +509,22 @@ impl<I: StorageIo> ScrubProgress<I> {
         Ok(bytes)
     }
 
-    /// Appends only an entry minted by full verification. Call `sync` in bounded
-    /// batches and at clean cancellation; unflushed suffixes may be repeated.
+    fn read_visible_frame(&self, offset: u64, size: usize) -> io::Result<Vec<u8>> {
+        if offset >= self.flushed_end {
+            let start = usize::try_from(offset - self.flushed_end).map_err(|_| invalid())?;
+            let end = start.checked_add(size).ok_or_else(invalid)?;
+            return self
+                .pending
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(invalid);
+        }
+        self.read_frame(offset, size)
+    }
+
+    /// Appends only an entry minted by full verification. Frames are buffered
+    /// and flushed by `sync`, clean cancellation, or the bounded pending limit;
+    /// unflushed suffixes may be repeated.
     /// # Errors
     /// Returns storage/size errors. Stop using this writer after any failure.
     pub fn record(&mut self, entry: &ScrubCertificate) -> io::Result<()> {
@@ -547,19 +572,38 @@ impl<I: StorageIo> ScrubProgress<I> {
         bytes.extend_from_slice(payload);
         let hash = frame_hash(&bytes, &self.header_hash);
         bytes.extend_from_slice(&hash);
-        self.storage.write_at(NAME, self.end, &bytes)?;
-        if self.read_frame(self.end, size)? != bytes {
-            return Err(invalid());
+        if self.pending.len() + bytes.len() >= PENDING_FLUSH_BYTES && !self.pending.is_empty() {
+            self.flush_frames()?;
         }
+        self.pending.extend_from_slice(&bytes);
         self.end += size as u64;
+        if self.pending.len() >= PENDING_FLUSH_BYTES {
+            self.flush_frames()?;
+        }
         Ok(size)
     }
 
     /// Persists the accepted work prefix, including after clean cancellation.
     /// # Errors
     /// Returns the Metadata storage sync error.
-    pub fn sync(&self) -> io::Result<()> {
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.flush_frames()?;
         self.storage.sync_file(NAME)
+    }
+
+    fn flush_frames(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let offset = self.flushed_end;
+        let mut written = 0_u64;
+        for chunk in self.pending.chunks(crate::MAX_STORAGE_RANGE_BYTES) {
+            self.storage.write_at(NAME, offset + written, chunk)?;
+            written += u64::try_from(chunk.len()).map_err(|_| invalid())?;
+        }
+        self.flushed_end = self.end;
+        self.pending.clear();
+        Ok(())
     }
 
     /// Records successful coverage durably. Recent checks remain resumable;

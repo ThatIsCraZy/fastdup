@@ -81,6 +81,213 @@ fn fixed_publication_fence_does_not_wait_for_later_arrivals() {
     queue.finish(&later);
 }
 
+fn publication_chunks(first_sequence: u64) -> (Vec<PendingWriteThroughChunk>, usize) {
+    let bytes = vec![17; 16_384];
+    (
+        vec![PendingWriteThroughChunk {
+            offset: 0,
+            chunk_id: ChunkId::of(&bytes),
+            bytes: ChunkFragments::new_through(
+                vec![MutationPayload::from_owned_bytes(bytes)],
+                16_384,
+                first_sequence,
+            ),
+            placement: ContainerPlacement::Data,
+        }],
+        16_384,
+    )
+}
+
+fn publication_fixture_for_inode(
+    inode: InodeId,
+    first_sequence: u64,
+    through_sequence: u64,
+) -> DetachedContainerWork {
+    let (chunks, payload_bytes) = publication_chunks(first_sequence);
+    DetachedContainerWork::new(inode, through_sequence, chunks, payload_bytes)
+}
+
+#[test]
+fn shared_publication_barrier_blocks_until_the_group_finishes() {
+    let queue = PublicationQueue::new();
+    let first_inode = InodeId::new(2).unwrap();
+    let second_inode = InodeId::new(3).unwrap();
+    let earlier = publication_fixture_for_inode(first_inode, 6, 7);
+    queue.enqueue(earlier);
+    let PublicationUnit::Single(earlier) = queue.next_unit().unwrap() else {
+        panic!("ASSERT: earlier publication is single")
+    };
+    queue.finish(&earlier);
+    assert_eq!(queue.retirement_target(first_inode), 1);
+    assert_eq!(queue.retirement_target(second_inode), 0);
+
+    let first = partial_candidate_fixture(first_inode, 8, 10);
+    let second = partial_candidate_fixture(second_inode, 8, 11);
+    let payload_bytes = first.payload_bytes + second.payload_bytes;
+    queue.reserve_local_bytes(payload_bytes);
+    queue.begin_drain_candidate(first_inode);
+    queue.begin_drain_candidate(second_inode);
+
+    let group = PublicationGroup {
+        id: 0,
+        members: vec![first.into_member(), second.into_member()],
+        payload_bytes,
+    };
+    let (group_id, targets) = queue.try_enqueue_group(group, payload_bytes).unwrap();
+    assert_eq!(targets[&first_inode], 1);
+    assert_eq!(targets[&second_inode], 0);
+    assert_eq!(queue.shared_batch_bytes(), 0);
+    assert_eq!(queue.buffered_bytes(), payload_bytes);
+    let state = queue
+        .state
+        .lock()
+        .expect("ASSERT: publication queue lock poisoned in test");
+    assert_eq!(state.inodes[&first_inode].drain_candidates, 0);
+    assert_eq!(state.inodes[&second_inode].drain_candidates, 0);
+    drop(state);
+
+    let later = publication_fixture_for_inode(first_inode, 12, 13);
+    let later_target = queue.enqueue_with_reservation(later, 0);
+    assert_eq!(later_target, 2);
+    let unit = queue.next_unit().unwrap();
+    let PublicationUnit::Group(dispatched) = unit else {
+        panic!("ASSERT: grouped publication is dispatched before later single work")
+    };
+    assert_eq!(dispatched.id, group_id);
+
+    let state = queue
+        .state
+        .lock()
+        .expect("ASSERT: publication queue lock poisoned in test");
+    assert!(state.ready_inodes.is_empty());
+    assert_eq!(
+        state
+            .inodes
+            .get(&first_inode)
+            .expect("ASSERT: grouped inode retains a queue")
+            .barrier,
+        Some(group_id)
+    );
+    drop(state);
+
+    queue.finish_group(&dispatched);
+    queue.wait_for_retirement(second_inode, targets[&second_inode]);
+    let unit = queue.next_unit().unwrap();
+    let PublicationUnit::Single(later) = unit else {
+        panic!("ASSERT: later single publication becomes ready after the group barrier clears")
+    };
+    assert_eq!(later.inode, first_inode);
+    assert_eq!(later.through_sequence, 13);
+    queue.finish(&later);
+    queue.wait_for_retirement(first_inode, later_target);
+}
+
+#[test]
+fn commit_drain_marker_blocks_later_direct_publication_until_release() {
+    let queue = Arc::new(PublicationQueue::new());
+    let inode = InodeId::new(2).unwrap();
+    queue.begin_drain_candidate(inode);
+
+    let waiter = Arc::clone(&queue);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let work = publication_fixture_for_inode(inode, 11, 12);
+        let target = waiter.enqueue_with_reservation(work, 0);
+        sender.send(target).unwrap();
+    });
+    for _ in 0..5_000 {
+        if queue.direct_drain_waiters() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(queue.direct_drain_waiters(), 1);
+    assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+
+    queue.clear_drain_candidate(inode);
+    let target = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    thread.join().unwrap();
+    assert_eq!(target, 1);
+
+    let unit = queue.next_unit().unwrap();
+    let PublicationUnit::Single(work) = unit else {
+        panic!("ASSERT: released direct work is a single publication")
+    };
+    assert_eq!(work.inode, inode);
+    assert_eq!(work.through_sequence, 12);
+    queue.finish(&work);
+    queue.wait_for_retirement(inode, target);
+}
+
+#[test]
+fn commit_drain_publication_consumes_its_own_marker() {
+    let queue = PublicationQueue::new();
+    let inode = InodeId::new(2).unwrap();
+    let work = publication_fixture_for_inode(inode, 10, 11);
+    queue.begin_drain_candidate(inode);
+
+    let target = queue.enqueue_drain_candidate(work, 0);
+    let state = queue
+        .state
+        .lock()
+        .expect("ASSERT: publication queue lock poisoned in test");
+    assert_eq!(state.inodes[&inode].drain_candidates, 0);
+    drop(state);
+    assert_eq!(queue.direct_drain_waiters(), 0);
+
+    let unit = queue.next_unit().unwrap();
+    let PublicationUnit::Single(work) = unit else {
+        panic!("ASSERT: commit-drain work remains a single publication")
+    };
+    assert_eq!(work.through_sequence, 11);
+    queue.finish(&work);
+    queue.wait_for_retirement(inode, target);
+}
+
+#[test]
+fn shared_reservation_handoff_charges_the_publication_queue_once() {
+    let queue = PublicationQueue::new();
+    let inode = InodeId::new(2).unwrap();
+    let work = publication_fixture_for_inode(inode, 7, 10);
+    let payload_bytes = work.payload_bytes;
+
+    queue.reserve_local_bytes(payload_bytes);
+    assert_eq!(queue.shared_batch_bytes(), payload_bytes);
+    assert_eq!(queue.buffered_bytes(), 0);
+
+    let target = queue.enqueue_with_reservation(work, payload_bytes);
+    assert_eq!(queue.shared_batch_bytes(), 0);
+    assert_eq!(queue.buffered_bytes(), payload_bytes);
+    assert_eq!(queue.retirement_target(inode), target);
+
+    let unit = queue.next_unit().unwrap();
+    let PublicationUnit::Single(work) = unit else {
+        panic!("ASSERT: reservation handoff remains a single publication")
+    };
+    assert_eq!(work.inode, inode);
+    assert_eq!(work.payload_bytes, payload_bytes);
+    assert_eq!(work.publication_ordinal, 0);
+    queue.finish(&work);
+    assert_eq!(queue.buffered_bytes(), 0);
+    queue.wait_for_retirement(inode, target);
+}
+
+fn partial_candidate_fixture(
+    inode: InodeId,
+    first_sequence: u64,
+    through_sequence: u64,
+) -> PartialCandidate {
+    let (chunks, payload_bytes) = publication_chunks(first_sequence);
+    PartialCandidate::new(
+        inode,
+        through_sequence,
+        chunks,
+        payload_bytes,
+        ContainerPlacement::Data,
+        false,
+    )
+}
+
 fn budget_entry(ordinal: usize) -> ExactIndexEntry {
     let location =
         ExactIndexLocation::raw(ContainerId::new([29; 16]).unwrap(), 1, 4096, 256, 0).unwrap();

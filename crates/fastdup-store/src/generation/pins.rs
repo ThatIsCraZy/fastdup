@@ -73,15 +73,21 @@ impl Drop for RecoveryCheckpointRootPin {
             pins.remove(&self.root);
         }
         drop(pins);
-        mark_metadata_gc_exact_required(
-            &self.metadata_gc_epoch,
-            &self.metadata_gc_delta,
-            MetadataGcExactReason::RecoveryCheckpointPinChange,
-        );
+        if remove {
+            mark_metadata_gc_exact_required(
+                &self.metadata_gc_epoch,
+                &self.metadata_gc_delta,
+                MetadataGcExactReason::RecoveryCheckpointPinChange,
+            );
+        }
     }
 }
 
 impl<I: StorageIo> GenerationRepository<I> {
+    /// Recovery-Checkpoint invalidation tracks the protected root set, not the
+    /// transient refcount used to overlap one candidate publication with its
+    /// predecessor. Duplicate acquisition and non-final release leave that set
+    /// unchanged, so the clean Metadata mark remains valid.
     pub(super) fn pin_recovery_checkpoint_root(
         &self,
         root: MetadataObjectId,
@@ -90,16 +96,19 @@ impl<I: StorageIo> GenerationRepository<I> {
             .recovery_checkpoint_root_pins
             .lock()
             .expect("ASSERT: Recovery Checkpoint root pin registry poisoned");
+        let newly_protected = !pins.contains_key(&root);
         let count = pins.entry(root).or_insert(0);
         *count = count
             .checked_add(1)
             .expect("ASSERT: Recovery Checkpoint root pin count cannot overflow");
         drop(pins);
-        mark_metadata_gc_exact_required(
-            &self.metadata_gc_epoch,
-            &self.metadata_gc_delta,
-            MetadataGcExactReason::RecoveryCheckpointPinChange,
-        );
+        if newly_protected {
+            mark_metadata_gc_exact_required(
+                &self.metadata_gc_epoch,
+                &self.metadata_gc_delta,
+                MetadataGcExactReason::RecoveryCheckpointPinChange,
+            );
+        }
         RecoveryCheckpointRootPin {
             root,
             pins: Arc::clone(&self.recovery_checkpoint_root_pins),
@@ -164,4 +173,60 @@ impl<I: StorageIo> GenerationRepository<I> {
             true
         });
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GenerationRepository;
+    use fastdup_format::{MetadataObjectId, PolicySetId};
+
+    #[test]
+    fn recovery_checkpoint_pins_invalidate_only_at_protected_root_set_edges() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fastdup-recovery-checkpoint-pin-{}-{nonce}",
+            std::process::id()
+        ));
+        let storage = crate::FsStorageIo::open(&root).expect("open pin test root");
+        let repository =
+            GenerationRepository::new(storage, PolicySetId::new([1; 32]).expect("fixture policy"));
+        let epoch = Arc::clone(&repository.metadata_gc_epoch);
+        let root_id = MetadataObjectId::new([7; 32]).expect("fixture root is nonzero");
+
+        let before = epoch.load(Ordering::Acquire);
+        let first = repository.pin_recovery_checkpoint_root(root_id);
+        let after_first_pin = epoch.load(Ordering::Acquire);
+        assert_ne!(
+            after_first_pin, before,
+            "a newly protected checkpoint root requires an exact refresh"
+        );
+
+        let second = repository.pin_recovery_checkpoint_root(root_id);
+        assert_eq!(
+            epoch.load(Ordering::Acquire),
+            after_first_pin,
+            "a duplicate pin does not change the protected root set"
+        );
+        drop(second);
+        assert_eq!(
+            epoch.load(Ordering::Acquire),
+            after_first_pin,
+            "a non-final release does not change the protected root set"
+        );
+
+        drop(first);
+        assert_ne!(
+            epoch.load(Ordering::Acquire),
+            after_first_pin,
+            "removing the last pin changes the protected root set"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 }

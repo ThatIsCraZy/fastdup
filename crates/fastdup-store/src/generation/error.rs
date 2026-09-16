@@ -139,7 +139,8 @@ impl GenerationError {
                 | StoreError::ContainerGenerationHighWaterFormat(_)
                 | StoreError::ContainerGenerationHighWaterMissing
                 | StoreError::ContainerGenerationHighWaterChain
-                | StoreError::ContainerGenerationHighWaterBehind { .. },
+                | StoreError::ContainerGenerationHighWaterBehind { .. }
+                | StoreError::CandidateChunkLimitExceeded { .. },
             )
             | Self::MetadataTooLarge
             | Self::WalTooLarge

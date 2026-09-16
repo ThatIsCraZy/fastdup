@@ -159,6 +159,9 @@ impl ContainerDescriptorCache {
             .get::<SealedContainerDescriptor>(Self::key(id))
             .map(|value| *value)
     }
+    pub(crate) fn forget(&self, id: ContainerId) {
+        self.cache.remove(Self::key(id));
+    }
     pub(crate) fn insert(&self, id: ContainerId, descriptor: SealedContainerDescriptor) {
         assert_eq!(id, descriptor.container_id(), "ASSERT: descriptor identity");
         self.cache.insert(

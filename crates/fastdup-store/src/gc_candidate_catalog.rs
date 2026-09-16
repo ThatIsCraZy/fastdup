@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use fastdup_format::{
     ContainerId, ExactLocationTransition, FormatError, GC_CANDIDATE_CATALOG_HEADER_BYTES,
-    GC_CANDIDATE_CATALOG_ROW_BYTES, GcCandidateCatalogDescriptor, GcCandidateCatalogError,
-    GcCandidateCatalogRow, GcCandidateCatalogStreamEncoder, GcCandidateLocationState,
-    VerifiedContainerPublication,
+    GC_CANDIDATE_CATALOG_ROW_BYTES, GC_FILL_COMPACTION_PHYSICAL_MAX_BYTES,
+    GcCandidateCatalogDescriptor, GcCandidateCatalogError, GcCandidateCatalogRow,
+    GcCandidateCatalogStreamEncoder, GcCandidateLocationState, VerifiedContainerPublication,
 };
 
 use crate::gc_candidate_read::ImmutableGcCandidateCatalog;
@@ -19,6 +19,10 @@ use crate::{
 const AUDIT_BATCH_ROWS: u64 = 8_192;
 const ROW_WRITE_BATCH_BYTES: usize = 8_192 * GC_CANDIDATE_CATALOG_ROW_BYTES;
 const MAX_SHORTLIST_ROWS: usize = 4_096;
+pub(crate) const GC_CANDIDATE_QUEUE_CAPACITY: usize = 65_536;
+pub(crate) const GC_PENDING_CATALOG_UPDATE_LIMIT: usize = 65_536;
+pub(crate) const GC_CATALOG_SCAN_BATCH_ROWS: u64 = 8_192;
+const GC_FILL_COMPACTION_PHYSICAL_SCORE_BASIS_BYTES: u64 = 1_024;
 const PUBLISHED_PREFIX: &str = "gc-candidate-catalog-";
 const PUBLISHED_SUFFIX: &str = ".run";
 
@@ -49,6 +53,13 @@ pub fn gc_candidate_row_from_publication(
 pub struct GcCandidateCatalogRepository<I> {
     storage: I,
     publish_lock: Arc<Mutex<()>>,
+    cached_latest: Arc<Mutex<Option<CachedGcCandidateCatalog>>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedGcCandidateCatalog {
+    name: String,
+    descriptor: GcCandidateCatalogDescriptor,
 }
 
 impl<I: Clone + StorageIo> GcCandidateCatalogRepository<I> {
@@ -57,6 +68,7 @@ impl<I: Clone + StorageIo> GcCandidateCatalogRepository<I> {
         Self {
             storage,
             publish_lock: Arc::new(Mutex::new(())),
+            cached_latest: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -204,18 +216,11 @@ impl<I: Clone + StorageIo> GcCandidateCatalogRepository<I> {
     ///
     /// Panics only if a format-validated Exact Location exposes the forbidden
     /// all-zero Container ID.
-    pub fn publish_liveness_delta<X: Clone + StorageIo>(
-        &self,
+    pub(crate) fn candidate_updates_from_liveness_delta<X: Clone + StorageIo>(
         previous: &GcCandidateCatalogSnapshot<I>,
-        generation: u64,
         delta: &GenerationLivenessDelta,
         exact: &ActivatedExactIndex<X>,
-    ) -> Result<GcCandidateCatalogDescriptor, GcCandidateCatalogStoreError> {
-        let descriptor = previous.descriptor();
-        if descriptor.incorporated_commit_generation() != delta.base_generation().unwrap_or(0) {
-            return Err(GcCandidateCatalogStoreError::LivenessDeltaBaseMismatch);
-        }
-        let latest = delta.latest_generation().unwrap_or(0);
+    ) -> Result<Vec<GcCandidateCatalogRow>, GcCandidateCatalogStoreError> {
         let mut changes = BTreeMap::<[u8; 16], i64>::new();
         for (chunk_id, logical_length, direction) in delta
             .added()
@@ -264,6 +269,29 @@ impl<I: Clone + StorageIo> GcCandidateCatalogRepository<I> {
             };
             updates.push(row.with_reachable_target_delta(change)?);
         }
+        Ok(updates)
+    }
+
+    /// Publishes one successor that folds `delta` into the rows reachable
+    /// through `previous` and the pinned active `exact` generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a base-generation mismatch, catalog lookup, Exact lookup,
+    /// successor publication, or storage failure.
+    pub fn publish_liveness_delta<X: Clone + StorageIo>(
+        &self,
+        previous: &GcCandidateCatalogSnapshot<I>,
+        generation: u64,
+        delta: &GenerationLivenessDelta,
+        exact: &ActivatedExactIndex<X>,
+    ) -> Result<GcCandidateCatalogDescriptor, GcCandidateCatalogStoreError> {
+        let descriptor = previous.descriptor();
+        if descriptor.incorporated_commit_generation() != delta.base_generation().unwrap_or(0) {
+            return Err(GcCandidateCatalogStoreError::LivenessDeltaBaseMismatch);
+        }
+        let latest = delta.latest_generation().unwrap_or(0);
+        let updates = Self::candidate_updates_from_liveness_delta(previous, delta, exact)?;
         self.publish_successor(
             previous,
             generation,
@@ -381,11 +409,21 @@ impl<I: Clone + StorageIo> GcCandidateCatalogRepository<I> {
     /// Recovers the newest completely valid catalog generation. A corrupt
     /// newer hint run is ignored in favor of an older valid generation.
     ///
+    /// The process-local cache retains only an already-audited immutable lease.
+    /// A later call checks the highest canonical name and its Header/Footer
+    /// envelope before reusing it; publication, replacement, removal, or a
+    /// changed physical descriptor forces one fresh complete audit.
+    ///
     /// # Errors
     ///
     /// Returns directory or transient storage I/O failures. Catalog corruption
     /// is non-authoritative and therefore causes fallback rather than DATA or
     /// Namespace failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a prior invariant panic poisoned the process-local recovery
+    /// cache lock.
     pub fn recover_latest(
         &self,
     ) -> Result<Option<GcCandidateCatalogSnapshot<I>>, GcCandidateCatalogStoreError> {
@@ -398,28 +436,110 @@ impl<I: Clone + StorageIo> GcCandidateCatalogRepository<I> {
             })
             .collect::<Vec<_>>();
         generations.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        let cached = self
+            .cached_latest
+            .lock()
+            .expect("ASSERT: GC candidate catalog recovery cache lock poisoned")
+            .clone();
+        if let Some(cached) = cached
+            && let Some((_, name)) = generations
+                .first()
+                .filter(|(_, cached_name)| *cached_name == cached.name)
+        {
+            let descriptor = descriptor_named(&self.storage, name)?;
+            if descriptor != cached.descriptor {
+                self.invalidate_cached_latest();
+            } else if let Some(lease) = self
+                .storage
+                .lease_immutable_file(name, descriptor.file_length())?
+            {
+                match ImmutableGcCandidateCatalog::open_verified(lease, descriptor) {
+                    Ok(catalog) => {
+                        return Ok(Some(GcCandidateCatalogSnapshot {
+                            source: CatalogSource::Leased(Arc::new(catalog)),
+                        }));
+                    }
+                    Err(error) if error.is_catalog_corruption() => {
+                        self.invalidate_cached_latest();
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                // Bounded readers repeat the complete row audit while visiting
+                // rows. A lease is unnecessary while the cached generation is
+                // idle, and its absence keeps snapshot lifetime lease-neutral.
+                return Ok(Some(GcCandidateCatalogSnapshot {
+                    source: CatalogSource::Bounded {
+                        storage: self.storage.clone(),
+                        name: name.to_owned(),
+                        descriptor,
+                    },
+                }));
+            }
+        } else if generations.is_empty() {
+            self.invalidate_cached_latest();
+        }
+
         for (_generation, name) in generations {
-            let descriptor = match self.audit_named(&name) {
+            let descriptor = match descriptor_named(&self.storage, &name) {
                 Ok(descriptor) => descriptor,
                 Err(error) if error.is_catalog_corruption() => continue,
                 Err(error) => return Err(error),
             };
-            let source = match self
+            if let Some(lease) = self
                 .storage
                 .lease_immutable_file(&name, descriptor.file_length())?
             {
-                Some(lease) => CatalogSource::Leased(Arc::new(ImmutableGcCandidateCatalog::open(
-                    lease, descriptor,
-                )?)),
-                None => CatalogSource::Bounded {
+                // The lease freezes the inode against every repository
+                // mutation, so one complete audit of the leased bytes is the
+                // reader boundary; no second unleased re-audit precedes use.
+                let catalog = match ImmutableGcCandidateCatalog::open(lease, descriptor) {
+                    Ok(catalog) => catalog,
+                    Err(error) if error.is_catalog_corruption() => continue,
+                    Err(error) => return Err(error),
+                };
+                let snapshot = GcCandidateCatalogSnapshot {
+                    source: CatalogSource::Leased(Arc::new(catalog)),
+                };
+                self.cache_latest(&name, descriptor);
+                return Ok(Some(snapshot));
+            }
+
+            let audit = match self.audit_named(&name) {
+                Ok(audit) => audit,
+                Err(error) if error.is_catalog_corruption() => continue,
+                Err(error) => return Err(error),
+            };
+            require_same_descriptor(descriptor, audit)?;
+            let snapshot = GcCandidateCatalogSnapshot {
+                source: CatalogSource::Bounded {
                     storage: self.storage.clone(),
-                    name,
-                    descriptor,
+                    name: name.clone(),
+                    descriptor: audit,
                 },
             };
-            return Ok(Some(GcCandidateCatalogSnapshot { source }));
+            self.cache_latest(&name, audit);
+            return Ok(Some(snapshot));
         }
         Ok(None)
+    }
+
+    fn cache_latest(&self, name: &str, descriptor: GcCandidateCatalogDescriptor) {
+        *self
+            .cached_latest
+            .lock()
+            .expect("ASSERT: GC candidate catalog recovery cache lock poisoned") =
+            Some(CachedGcCandidateCatalog {
+                name: name.to_owned(),
+                descriptor,
+            });
+    }
+
+    fn invalidate_cached_latest(&self) {
+        *self
+            .cached_latest
+            .lock()
+            .expect("ASSERT: GC candidate catalog recovery cache lock poisoned") = None;
     }
 
     /// Discovers the greatest published catalog generation from canonical
@@ -440,6 +560,65 @@ impl<I: Clone + StorageIo> GcCandidateCatalogRepository<I> {
             .into_iter()
             .filter_map(|name| parse_published_generation(&name))
             .max())
+    }
+
+    /// Retires every superseded immutable catalog generation.
+    ///
+    /// Only the greatest canonical generation — valid or deliberately
+    /// corrupt — carries forward the whole pool view, so every strictly
+    /// older published object and every abandoned `.building` temporary
+    /// below that high-water is inert. The greatest canonical name is
+    /// never unlinked: it alone preserves the allocator high-water that
+    /// forbids immutable-name reuse after an unlink. Names whose
+    /// removal a live lease or a concurrent sweep refuses, and names
+    /// already absent, are retained for a later quantum; a crash
+    /// between successor publication and this sweep therefore leaves
+    /// only inert files that the next sweep removes.
+    ///
+    /// # Errors
+    ///
+    /// Returns directory enumeration or unlink failures other than
+    /// benign absence and lease-held removal denial.
+    pub fn retire_superseded(&self) -> Result<u64, GcCandidateCatalogStoreError> {
+        let mut greatest = None;
+        let mut candidates: Vec<(String, u64)> = Vec::new();
+        for name in self.storage.list_names()? {
+            let generation =
+                parse_published_generation(&name).or_else(|| parse_temporary_generation(&name));
+            if let Some(generation) = generation {
+                greatest = Some(greatest.map_or(generation, |value: u64| value.max(generation)));
+                candidates
+                    .try_reserve_exact(candidates.len() + 1)
+                    .map_err(|_| GcCandidateCatalogStoreError::OutOfMemory)?;
+                candidates.push((name, generation));
+            }
+        }
+        let Some(high_water) = greatest else {
+            return Ok(0);
+        };
+        let mut removed = 0_u64;
+        for (name, generation) in candidates {
+            if generation == high_water {
+                continue;
+            }
+            match self.storage.remove_file(&name) {
+                Ok(()) => {
+                    removed = removed
+                        .checked_add(1)
+                        .ok_or(GcCandidateCatalogStoreError::CounterOverflow)?;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if removed != 0 {
+            self.storage.sync_root()?;
+        }
+        Ok(removed)
     }
 
     fn audit_named(
@@ -570,6 +749,50 @@ impl<I: Clone + StorageIo> GcCandidateCatalogSnapshot<I> {
         })
     }
 
+    pub(crate) fn visit_range(
+        &self,
+        start: u64,
+        rows: u64,
+        mut visit: impl FnMut(GcCandidateCatalogRow) -> Result<(), GcCandidateCatalogStoreError>,
+    ) -> Result<u64, GcCandidateCatalogStoreError> {
+        let snapshot_descriptor = self.descriptor();
+        if start >= snapshot_descriptor.row_count() || rows == 0 {
+            return Ok(0);
+        }
+        let rows = rows.min(snapshot_descriptor.row_count() - start);
+        match &self.source {
+            CatalogSource::Leased(catalog) => catalog.visit_range(start, rows, visit),
+            CatalogSource::Bounded {
+                storage,
+                name,
+                descriptor,
+            } => {
+                let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
+                let mut ordinal = start;
+                let mut scanned = 0_u64;
+                while scanned < rows {
+                    let batch = (rows - scanned).min(AUDIT_BATCH_ROWS);
+                    let offset = descriptor
+                        .row_offset(ordinal)
+                        .ok_or(GcCandidateCatalogStoreError::IndexCorruption)?;
+                    let length = usize::try_from(
+                        batch
+                            .checked_mul(GC_CANDIDATE_CATALOG_ROW_BYTES as u64)
+                            .ok_or(GcCandidateCatalogStoreError::CounterOverflow)?,
+                    )
+                    .map_err(|_| GcCandidateCatalogStoreError::CounterOverflow)?;
+                    let bytes = storage.read_exact_at(name, offset, length)?;
+                    for row_bytes in bytes.chunks_exact(GC_CANDIDATE_CATALOG_ROW_BYTES) {
+                        visit(descriptor.decode_row(ordinal, row_bytes)?)?;
+                        ordinal += 1;
+                        scanned += 1;
+                    }
+                }
+                Ok(scanned)
+            }
+        }
+    }
+
     fn visit_rows(
         &self,
         visit: impl FnMut(GcCandidateCatalogRow) -> Result<(), GcCandidateCatalogStoreError>,
@@ -586,6 +809,253 @@ impl<I: Clone + StorageIo> GcCandidateCatalogSnapshot<I> {
                 require_same_descriptor(*descriptor, observed)
             }
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct GcCandidateQueueFill {
+    pub(crate) scanned_rows: u64,
+    pub(crate) scan_complete: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct GcCandidateSelectionQueue {
+    base_generation: Option<u64>,
+    incorporated_commit_generation: u64,
+    pending_limit: usize,
+    cursor: u64,
+    scan_complete: bool,
+    requires_rebuild: bool,
+    ranked: BTreeMap<CandidateRank, GcCandidateCatalogRow>,
+    pending_updates: BTreeMap<[u8; 16], GcCandidateCatalogRow>,
+    removed: BTreeSet<[u8; 16]>,
+}
+
+impl GcCandidateSelectionQueue {
+    pub(crate) fn sync_catalog_generation(
+        &mut self,
+        descriptor: GcCandidateCatalogDescriptor,
+        pending_limit: usize,
+    ) {
+        if self.base_generation != Some(descriptor.generation())
+            || self.pending_limit != pending_limit
+        {
+            *self = Self {
+                base_generation: Some(descriptor.generation()),
+                incorporated_commit_generation: descriptor.incorporated_commit_generation(),
+                pending_limit,
+                ..Self::default()
+            };
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn incorporated_commit_generation(&self) -> u64 {
+        self.incorporated_commit_generation
+    }
+
+    #[must_use]
+    pub(crate) fn retained(&self) -> usize {
+        self.ranked.len()
+    }
+
+    #[must_use]
+    pub(crate) fn pending_updates(&self) -> usize {
+        self.pending_updates.len()
+    }
+
+    #[must_use]
+    pub(crate) const fn requires_rebuild(&self) -> bool {
+        self.requires_rebuild
+    }
+
+    pub(crate) const fn request_rebuild(&mut self) {
+        self.requires_rebuild = true;
+    }
+
+    #[must_use]
+    pub(crate) fn needs_flush(&self) -> bool {
+        self.pending_updates.len() >= self.pending_limit || self.removed.len() >= self.pending_limit
+    }
+
+    pub(crate) fn apply_liveness_updates(
+        &mut self,
+        updates: Vec<GcCandidateCatalogRow>,
+        incorporated_commit_generation: u64,
+        capacity: usize,
+    ) {
+        for row in updates {
+            self.apply_candidate_update(row, capacity);
+        }
+        self.incorporated_commit_generation = incorporated_commit_generation;
+    }
+
+    pub(crate) fn note_collection(
+        &mut self,
+        rows: impl IntoIterator<Item = GcCandidateCatalogRow>,
+        capacity: usize,
+    ) -> Result<(), GcCandidateCatalogStoreError> {
+        for row in rows {
+            if row.location_state() != GcCandidateLocationState::Active {
+                continue;
+            }
+            let update =
+                row.with_estimate(GcCandidateLocationState::Retiring, retired_estimate(row)?)?;
+            self.apply_candidate_update(update, capacity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.ranked.clear();
+        self.cursor = 0;
+        self.scan_complete = false;
+    }
+
+    pub(crate) fn take(&mut self, limit: usize) -> Vec<GcCandidateCatalogRow> {
+        let mut selected = Vec::new();
+        let mut seen = BTreeSet::new();
+        while selected.len() < limit {
+            let Some((_, row)) = self.ranked.pop_last() else {
+                break;
+            };
+            let id = row.container_id().bytes();
+            if self.removed.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            let row = self.pending_updates.get(&id).copied().unwrap_or(row);
+            if row.location_state() != GcCandidateLocationState::Active {
+                continue;
+            }
+            selected.push(row);
+        }
+        selected
+    }
+
+    pub(crate) fn take_successor_updates(&mut self) -> Vec<GcCandidateCatalogRow> {
+        self.removed.clear();
+        std::mem::take(&mut self.pending_updates)
+            .into_values()
+            .collect()
+    }
+
+    pub(crate) fn fill<I: Clone + StorageIo>(
+        &mut self,
+        snapshot: &GcCandidateCatalogSnapshot<I>,
+        mode: GcCandidateSelectionMode,
+        capacity: usize,
+        max_rows: u64,
+    ) -> Result<GcCandidateQueueFill, GcCandidateCatalogStoreError> {
+        if self.base_generation != Some(snapshot.descriptor().generation()) {
+            return Err(GcCandidateCatalogStoreError::StaleSuccessor);
+        }
+        if self.scan_complete || self.ranked.len() >= capacity {
+            return Ok(GcCandidateQueueFill {
+                scanned_rows: 0,
+                scan_complete: self.scan_complete,
+            });
+        }
+        let descriptor = snapshot.descriptor();
+        if self.cursor >= descriptor.row_count() {
+            self.scan_complete = true;
+            return Ok(GcCandidateQueueFill {
+                scanned_rows: 0,
+                scan_complete: true,
+            });
+        }
+        let rows = max_rows.min(descriptor.row_count() - self.cursor);
+        let mut heap = std::mem::take(&mut self.ranked);
+        let pending = &self.pending_updates;
+        let removed = &self.removed;
+        let mut scanned = 0_u64;
+        let result = snapshot.visit_range(self.cursor, rows, |row| {
+            scanned = scanned.saturating_add(1);
+            let id = row.container_id().bytes();
+            if row.location_state() != GcCandidateLocationState::Active
+                || removed.contains(&id)
+                || pending.contains_key(&id)
+            {
+                return Ok(());
+            }
+            insert_bounded_rank(&mut heap, row, mode, capacity);
+            Ok(())
+        });
+        self.ranked = heap;
+        self.cursor = self.cursor.saturating_add(scanned);
+        self.scan_complete = self.cursor >= descriptor.row_count();
+        result?;
+        Ok(GcCandidateQueueFill {
+            scanned_rows: scanned,
+            scan_complete: self.scan_complete,
+        })
+    }
+
+    fn apply_candidate_update(&mut self, row: GcCandidateCatalogRow, capacity: usize) {
+        let id = row.container_id().bytes();
+        self.pending_updates.insert(id, row);
+        if row.location_state() == GcCandidateLocationState::Active {
+            insert_bounded_rank(
+                &mut self.ranked,
+                row,
+                GcCandidateSelectionMode::Urgent,
+                capacity,
+            );
+        } else {
+            self.removed.insert(id);
+            self.ranked
+                .retain(|_, existing| existing.container_id().bytes() != id);
+        }
+    }
+}
+
+fn retired_estimate(
+    row: GcCandidateCatalogRow,
+) -> Result<fastdup_format::GcCandidateLivenessEstimate, GcCandidateCatalogError> {
+    let record_area = row
+        .physical_bytes()
+        .checked_sub(2 * GC_CANDIDATE_CATALOG_HEADER_BYTES as u64)
+        .ok_or(GcCandidateCatalogError::InvalidRow)?;
+    let records = fastdup_format::GcRecordLivenessEstimate::new(
+        row.dead_record_bytes(),
+        row.wholly_live_record_bytes(),
+        row.partial_record_bytes(),
+        record_area,
+    )?;
+    let dependencies = row.dependency_estimate_known().then(|| {
+        fastdup_format::GcDependencyEstimate::new(
+            row.live_independent_bases(),
+            row.incoming_base_fanout(),
+        )
+    });
+    fastdup_format::GcCandidateLivenessEstimate::new(
+        row.reachable_target_count(),
+        row.estimated_encoded_coverage(),
+        records,
+        dependencies,
+        record_area,
+    )
+}
+
+fn insert_bounded_rank(
+    ranked: &mut BTreeMap<CandidateRank, GcCandidateCatalogRow>,
+    row: GcCandidateCatalogRow,
+    mode: GcCandidateSelectionMode,
+    capacity: usize,
+) {
+    if capacity == 0 {
+        return;
+    }
+    let rank = candidate_rank(row, mode, u64::MAX);
+    if ranked.len() < capacity {
+        ranked.insert(rank, row);
+        return;
+    }
+    if ranked
+        .first_key_value()
+        .is_some_and(|(worst, _)| rank > *worst)
+    {
+        ranked.pop_first();
+        ranked.insert(rank, row);
     }
 }
 
@@ -611,10 +1081,34 @@ impl GcCandidateShortlist {
     pub fn rows(&self) -> &[GcCandidateCatalogRow] {
         &self.rows
     }
+
+    pub(crate) fn from_rows(
+        descriptor: GcCandidateCatalogDescriptor,
+        rows: impl IntoIterator<Item = GcCandidateCatalogRow>,
+        mode: GcCandidateSelectionMode,
+        current_container_generation: u64,
+    ) -> Self {
+        let mut seen = BTreeSet::new();
+        let mut ranked = Vec::new();
+        for row in rows {
+            if row.location_state() != GcCandidateLocationState::Active
+                || !seen.insert(row.container_id().bytes())
+            {
+                continue;
+            }
+            ranked.push((candidate_rank(row, mode, current_container_generation), row));
+        }
+        ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        ranked.truncate(MAX_SHORTLIST_ROWS);
+        Self {
+            descriptor,
+            rows: ranked.into_iter().map(|(_, row)| row).collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct CandidateRank {
+pub(crate) struct CandidateRank {
     confidence_tier: u8,
     score: u128,
     reclaim_hint: u64,
@@ -649,7 +1143,7 @@ impl Ord for RankedCandidate {
     }
 }
 
-fn candidate_rank(
+pub(crate) fn candidate_rank(
     row: GcCandidateCatalogRow,
     mode: GcCandidateSelectionMode,
     current_generation: u64,
@@ -676,6 +1170,8 @@ fn candidate_rank(
     } else {
         row.raw_replacement_upper_bound()
     };
+    let fill_hint = fill_compaction_hint(row, age);
+    let reclaim_hint = reclaim_hint.max(fill_hint);
     let score = match mode {
         GcCandidateSelectionMode::Urgent => u128::from(reclaim_hint),
         GcCandidateSelectionMode::Background => {
@@ -683,7 +1179,10 @@ fn candidate_rank(
                 .physical_bytes()
                 .saturating_add(row.raw_replacement_upper_bound())
                 .max(1);
-            u128::from(reclaim_hint).saturating_mul(u128::from(age.max(1))) / u128::from(cost)
+            u128::from(reclaim_hint)
+                .saturating_mul(u128::from(age.max(1)))
+                .saturating_mul(u128::from(GC_FILL_COMPACTION_PHYSICAL_SCORE_BASIS_BYTES))
+                / u128::from(cost)
         }
     };
     let mut inverse_container_id = row.container_id().bytes();
@@ -698,6 +1197,17 @@ fn candidate_rank(
         age,
         inverse_container_id,
     }
+}
+
+fn fill_compaction_hint(row: GcCandidateCatalogRow, age: u64) -> u64 {
+    if age == 0
+        || row.location_state() != GcCandidateLocationState::Active
+        || !row.estimate_known()
+        || row.physical_bytes() >= GC_FILL_COMPACTION_PHYSICAL_MAX_BYTES
+    {
+        return 0;
+    }
+    GC_FILL_COMPACTION_PHYSICAL_MAX_BYTES.saturating_sub(row.physical_bytes())
 }
 
 fn validate_update_order(
@@ -733,6 +1243,32 @@ fn audit_named<I: StorageIo>(
     name: &str,
 ) -> Result<GcCandidateCatalogDescriptor, GcCandidateCatalogStoreError> {
     audit_named_with(storage, name, |_| Ok(()))
+}
+
+/// Decodes and pairs the Header/Footer envelope of one named generation with
+/// its physical length, without hashing rows.
+///
+/// Row audit belongs to the single reader that holds the immutable lease, so
+/// one recovery performs exactly one complete content audit per generation.
+fn descriptor_named<I: StorageIo>(
+    storage: &I,
+    name: &str,
+) -> Result<GcCandidateCatalogDescriptor, GcCandidateCatalogStoreError> {
+    let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+    let file_length = storage.object_len(name)?;
+    if file_length < (2 * GC_CANDIDATE_CATALOG_HEADER_BYTES) as u64 {
+        return Err(GcCandidateCatalogStoreError::IndexCorruption);
+    }
+    let header = storage.read_exact_at(name, 0, GC_CANDIDATE_CATALOG_HEADER_BYTES)?;
+    let footer_offset = file_length
+        .checked_sub(GC_CANDIDATE_CATALOG_HEADER_BYTES as u64)
+        .ok_or(GcCandidateCatalogStoreError::CounterOverflow)?;
+    let footer = storage.read_exact_at(name, footer_offset, GC_CANDIDATE_CATALOG_HEADER_BYTES)?;
+    Ok(GcCandidateCatalogDescriptor::decode(
+        &header,
+        &footer,
+        file_length,
+    )?)
 }
 
 fn audit_named_with<I: StorageIo>(
@@ -822,6 +1358,19 @@ fn parse_published_generation(name: &str) -> Option<u64> {
         .filter(|value| *value != 0)
 }
 
+fn parse_temporary_generation(name: &str) -> Option<u64> {
+    let digits = name
+        .strip_prefix('.')?
+        .strip_prefix(PUBLISHED_PREFIX)?
+        .strip_suffix(&format!("{PUBLISHED_SUFFIX}.building"))?;
+    if digits.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(digits, 16)
+        .ok()
+        .filter(|value| *value != 0)
+}
+
 #[derive(Debug)]
 pub enum GcCandidateCatalogStoreError {
     Io(io::Error),
@@ -888,5 +1437,70 @@ impl From<FormatError> for GcCandidateCatalogStoreError {
 impl From<ExactIndexStoreError> for GcCandidateCatalogStoreError {
     fn from(error: ExactIndexStoreError) -> Self {
         Self::Exact(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastdup_format::{
+        ContainerIntrinsicSummary, GcCandidateLivenessEstimate, GcDependencyEstimate,
+        GcRecordLivenessEstimate, SealedContainer,
+    };
+
+    fn fixture_summary() -> ContainerIntrinsicSummary {
+        let id = ContainerId::new([0xA5; 16]).expect("fixture identity is nonzero");
+        let (_image, publication) =
+            SealedContainer::encode_with_writer_evidence(id, 1, &[b"fill compaction fixture"])
+                .expect("fixture Container encodes")
+                .into_publication_parts();
+        publication
+            .intrinsic_summary()
+            .expect("publication evidence reconstructs intrinsic summary")
+    }
+
+    fn estimated_row(id: u8, generation: u64, physical_bytes: u64) -> GcCandidateCatalogRow {
+        let mut bytes = [0_u8; 16];
+        bytes[15] = id;
+        let container_id = ContainerId::new(bytes).expect("test Container ID");
+        let row = GcCandidateCatalogRow::from_intrinsic_summary(
+            container_id,
+            generation,
+            physical_bytes,
+            fixture_summary(),
+        )
+        .expect("valid test row");
+        let records = GcRecordLivenessEstimate::new(0, 0, 0, physical_bytes - 8_192)
+            .expect("valid record estimate");
+        row.with_estimate(
+            GcCandidateLocationState::Active,
+            GcCandidateLivenessEstimate::new(
+                0,
+                0,
+                records,
+                Some(GcDependencyEstimate::new(0, 1)),
+                physical_bytes - 8_192,
+            )
+            .expect("valid liveness estimate"),
+        )
+        .expect("valid estimated row")
+    }
+
+    #[test]
+    fn fill_compaction_promotes_underfilled_active_candidates() {
+        let current_generation = 100;
+        let underfilled = estimated_row(1, 90, 16 * 1024);
+        let filled = estimated_row(2, 90, GC_FILL_COMPACTION_PHYSICAL_MAX_BYTES);
+        assert!(
+            candidate_rank(
+                underfilled,
+                GcCandidateSelectionMode::Background,
+                current_generation
+            ) > candidate_rank(
+                filled,
+                GcCandidateSelectionMode::Background,
+                current_generation
+            )
+        );
     }
 }

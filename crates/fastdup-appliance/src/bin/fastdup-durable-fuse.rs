@@ -15,10 +15,10 @@ use fastdup_appliance::{
     bind_online_gc_control_socket, checkpoint_exact_index_profile_v1, checkpoint_policy_set,
     online_gc_control_path,
 };
-use fastdup_posix::{FuseFilesystem, NamespaceConfig, volatile_mount_options};
+use fastdup_posix::{FuseFilesystem, Namespace, NamespaceConfig, volatile_mount_options};
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo,
-    GcCandidateCatalogRepository, GenerationRepository, MaintenanceCancellation,
+    GcCandidateCatalogRepository, GcPhaseRequest, GenerationRepository, MaintenanceCancellation,
     MaintenanceRepository, OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport,
     OnlineGcRunMode, RecoveryCheckpointRepository, SimilarityIndexRepository, TieredStorageIo,
     system_memory_budget_governor,
@@ -29,12 +29,16 @@ mod common;
 mod data_io_telemetry;
 #[path = "../mount_recovery.rs"]
 mod mount_recovery;
+#[path = "../runtime_exact_warm.rs"]
+mod runtime_exact_warm;
 #[path = "../runtime_management.rs"]
 mod runtime_management;
 #[path = "../runtime_scrub.rs"]
 mod runtime_scrub;
 #[path = "../runtime_telemetry.rs"]
 mod runtime_telemetry;
+#[path = "../share_backend.rs"]
+mod share_backend;
 
 use common::metadata_gc_status_fields;
 use data_io_telemetry::TelemetryStorageIo;
@@ -59,6 +63,7 @@ enum AdvancedReductionPolicy {
 struct StartupPolicies {
     statfs_override: Option<StatFsOverride>,
     online_gc: OnlineGcPolicy,
+    exact_cache_warm: runtime_exact_warm::ExactCacheWarmRuntimePolicy,
     advanced_reduction: AdvancedReductionPolicy,
     pool_isolation: PoolIsolationPolicy,
     small_file_policy_revision: String,
@@ -266,6 +271,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frontend_telemetry = filesystem.frontend_telemetry();
     let session = Session::new(volatile_mount_options());
     let mount = session.mount(filesystem, &mount_path).await?;
+    tokio::spawn(async {
+        let outcome = share_backend::start_after_mount().await;
+        eprintln!("share_backend_start outcome={}", outcome.as_str());
+    });
     let scrub_runtime = runtime_scrub::start(
         recovered.startup_data_verification,
         recovered.recovery_containers.clone(),
@@ -276,6 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         appliance.verified_read_cache(),
     )?;
     let gc_runtime = start_online_gc_runtime(
+        Arc::clone(&namespace),
         recovered.online_maintenance,
         recovered.gc_catalog,
         data_storage.clone(),
@@ -287,6 +297,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recovery_checkpoint_runtime = start_recovery_checkpoint_runtime(
         recovered.recovery_generations,
         recovered.recovery_checkpoints,
+    );
+    runtime_exact_warm::emit_policy(policies.exact_cache_warm);
+    let exact_warm_frontend = Arc::clone(&frontend_telemetry);
+    let exact_warm_runtime = runtime_exact_warm::start(
+        recovered.recovery_indexes.clone(),
+        policies.exact_cache_warm,
+        Arc::new(move || {
+            let frontend = exact_warm_frontend.snapshot();
+            frontend
+                .read_operations
+                .saturating_add(frontend.write_operations)
+        }),
+        Arc::clone(&namespace),
+        scrub_runtime.gate.clone(),
     );
     emit_mount_state(
         &appliance,
@@ -328,7 +352,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::DurabilityLag);
                     }
                     let checkpoint_started = supervisor_epoch.elapsed();
-                    if let Err(error) = checkpoint_cycle(Arc::clone(&appliance)).await {
+                    if let Err(error) = checkpoint_cycle(
+                        Arc::clone(&appliance),
+                        gc_runtime.cancellation.clone(),
+                    )
+                    .await
+                    {
                         appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::ProgressFailure);
                         eprintln!(
                             "CRITICAL: durable progress failed; mutation admission remains closed: {error}"
@@ -342,7 +371,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .wait_for_checkpointable_dirty_payload(CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1) => {
                 appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::DirtyPressure);
                 emit_checkpoint_pressure(&appliance, dirty_bytes, false);
-                if let Err(error) = checkpoint_cycle(Arc::clone(&appliance)).await {
+                if let Err(error) = checkpoint_cycle(
+                    Arc::clone(&appliance),
+                    gc_runtime.cancellation.clone(),
+                )
+                .await
+                {
                     eprintln!(
                         "CRITICAL: pressure checkpoint failed; mutation admission remains closed: {error}"
                     );
@@ -367,8 +401,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     namespace.pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::Shutdown);
+    let backend_started = Instant::now();
+    let backend_result = share_backend::stop_for_unmount().await;
+    eprintln!(
+        "shutdown_phase=share_backend_stop elapsed_ms={} outcome={}",
+        backend_started.elapsed().as_millis(),
+        backend_result.as_str(),
+    );
     gc_runtime.request_stop();
     recovery_checkpoint_runtime.request_stop();
+    exact_warm_runtime.request_stop();
     scrub_runtime.request_stop();
     management_server.stop().await;
     let scrub_started = Instant::now();
@@ -378,6 +420,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scrub_started.elapsed().as_millis(),
         scrub_result.is_ok(),
     );
+    let warm_started = Instant::now();
+    let warm_result = exact_warm_runtime.stop().await;
+    eprintln!(
+        "shutdown_phase=exact_cache_warmer elapsed_ms={} ok={}",
+        warm_started.elapsed().as_millis(),
+        warm_result.is_ok(),
+    );
     let background_result = stop_background_and_catch_up(
         Arc::clone(&appliance),
         gc_runtime,
@@ -385,15 +434,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
     let unmount_started = Instant::now();
-    let unmount_result = mount.unmount().await;
+    let mut unmount_ok = mount.unmount().await.is_ok();
+    for attempt in 1..=2 {
+        if unmount_ok {
+            break;
+        }
+        let retry_backend = share_backend::stop_for_unmount().await;
+        eprintln!(
+            "shutdown_phase=share_backend_retry_unmount attempt={} outcome={}",
+            attempt,
+            retry_backend.as_str(),
+        );
+        sleep(Duration::from_secs(1)).await;
+        unmount_ok = share_backend::force_unmount(&mount_path).await;
+    }
     eprintln!(
         "shutdown_phase=unmount elapsed_ms={} ok={}",
         unmount_started.elapsed().as_millis(),
-        unmount_result.is_ok(),
+        unmount_ok,
     );
     let clean_shutdown = scrub_result.is_ok()
+        && warm_result.is_ok()
         && background_result.is_ok()
-        && unmount_result.is_ok()
+        && unmount_ok
         && !namespace.integrity_failed();
     if clean_shutdown {
         recovery_latch.mark_clean()?;
@@ -402,8 +465,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     data_storage.emit();
     data_storage.emit_backend_state();
     scrub_result?;
+    warm_result?;
     background_result?;
-    unmount_result?;
+    if !unmount_ok {
+        return Err(io::Error::other("repository mount could not be released").into());
+    }
     Ok(())
 }
 
@@ -528,6 +594,7 @@ fn validate_memory_budget_policy() -> Result<(), Box<dyn std::error::Error>> {
 fn validated_startup_policies() -> Result<StartupPolicies, Box<dyn std::error::Error>> {
     let statfs_override = statfs_override_from_environment()?;
     let online_gc_policy = OnlineGcPolicy::from_environment()?;
+    let exact_cache_warm = runtime_exact_warm::ExactCacheWarmRuntimePolicy::from_environment()?;
     let advanced_reduction = advanced_reduction_policy_from_environment()?;
     let pool_isolation = PoolIsolationPolicy::from_environment()?;
     let (small_file_policy_revision, small_file_extensions) = small_file_policy_from_environment()?;
@@ -535,6 +602,7 @@ fn validated_startup_policies() -> Result<StartupPolicies, Box<dyn std::error::E
     Ok(StartupPolicies {
         statfs_override,
         online_gc: online_gc_policy,
+        exact_cache_warm,
         advanced_reduction,
         pool_isolation,
         small_file_policy_revision,
@@ -622,7 +690,16 @@ fn recover_appliance(
         indexes.clone(),
         checkpoint_exact_index_profile_v1(),
     );
+    let gc_recovery_started = Instant::now();
     let online_gc_recovery = online_maintenance.finalize_recovered_online_gc()?;
+    eprintln!(
+        "recovery_phase=online_gc_finalization state=complete elapsed_ms={} retiring_containers={} containers_removed={} bytes_removed={} locations_finalized={}",
+        gc_recovery_started.elapsed().as_millis(),
+        online_gc_recovery.retiring_containers(),
+        online_gc_recovery.containers_removed(),
+        online_gc_recovery.bytes_removed(),
+        online_gc_recovery.retiring_locations_finalized()
+    );
     let gc_catalog = GcCandidateCatalogRepository::new(
         FsStorageIo::open(metadata_root)?.with_metadata_read_telemetry(),
     );
@@ -816,7 +893,9 @@ async fn handle_online_gc_control(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_online_gc_runtime(
+    namespace: Arc<Namespace>,
     maintenance: FsOnlineMaintenance,
     catalog: FsGcCatalog,
     frontend_storage: TelemetryStorageIo,
@@ -831,6 +910,7 @@ fn start_online_gc_runtime(
     let (shutdown, shutdown_rx) = watch::channel(false);
     let cancellation = MaintenanceCancellation::new();
     let worker = tokio::spawn(run_online_gc_runtime(
+        namespace,
         maintenance,
         catalog,
         frontend_storage,
@@ -854,6 +934,7 @@ fn start_online_gc_runtime(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_online_gc_runtime(
+    namespace: Arc<Namespace>,
     maintenance: FsOnlineMaintenance,
     catalog: FsGcCatalog,
     frontend_storage: TelemetryStorageIo,
@@ -908,9 +989,11 @@ async fn run_online_gc_runtime(
                     catalog.clone(),
                     data_pool_usage(&container_root).map_err(|error| error.to_string()),
                     OnlineGcRunMode::Urgent,
+                    GcPhaseRequest::both(),
+                    true,
                     relocation_workers,
                     "control",
-                    scheduler.status(),
+                    &mut scheduler,
                     cancellation.clone(),
                 ).await;
                 let Some(response) = response else {
@@ -919,7 +1002,11 @@ async fn run_online_gc_runtime(
                 let _ = request.response.send(response);
             }
             _ = ticks.tick() => {
-                if !enabled || !scrub_gate.permits_gc() {
+                if !enabled
+                    || !scrub_gate.permits_gc()
+                    || !namespace.mutation_admission_open()
+                    || cancellation.check().is_err()
+                {
                     continue;
                 }
                 let usage = match data_pool_usage(&container_root) {
@@ -930,16 +1017,21 @@ async fn run_online_gc_runtime(
                     }
                 };
                 let operations = frontend_storage.inner.status().submitted_operations();
-                if let Some(mode) = scheduler.poll(Instant::now(), operations, usage) {
-                    let relocation_workers = scheduler.relocation_workers(mode);
+                let deletes = namespace.frontend_delete_count();
+                if let Some(quantum) =
+                    scheduler.poll(Instant::now(), operations, deletes, usage)
+                {
+                    let relocation_workers = scheduler.relocation_workers(quantum.mode);
                     let status = run_online_gc_quantum(
                         maintenance.clone(),
                         catalog.clone(),
                         Ok(usage),
-                        mode,
+                        quantum.mode,
+                        quantum.phases,
+                        false,
                         relocation_workers,
                         "scheduler",
-                        scheduler.status(),
+                        &mut scheduler,
                         cancellation.clone(),
                     ).await;
                     let Some(status) = status else {
@@ -958,20 +1050,24 @@ async fn run_online_gc_quantum(
     catalog: FsGcCatalog,
     usage: Result<DataPoolUsage, String>,
     mode: OnlineGcRunMode,
+    phases: GcPhaseRequest,
+    forced: bool,
     relocation_workers: std::num::NonZeroUsize,
     source: &'static str,
-    scheduler: OnlineGcSchedulerStatus,
+    scheduler: &mut OnlineGcScheduler,
     cancellation: MaintenanceCancellation,
 ) -> Option<String> {
     runtime_telemetry::gc_started();
+    let worker_cancellation = cancellation.clone();
     let result = match usage {
         Ok(usage) => match tokio::task::spawn_blocking(move || {
-            maintenance.run_adaptive_online_gc_cycle_cancellable(
+            maintenance.run_adaptive_online_gc_cycle_cancellable_with_phases(
                 &catalog,
                 usage,
                 mode,
+                phases,
                 relocation_workers,
-                &cancellation,
+                &worker_cancellation,
             )
         })
         .await
@@ -979,7 +1075,18 @@ async fn run_online_gc_quantum(
             Ok(Ok(report)) => Ok(report),
             Ok(Err(error)) if error.is_cancelled() => {
                 runtime_telemetry::gc_cancelled();
-                return None;
+                if cancellation.is_shutdown() {
+                    return None;
+                }
+                if phases.metadata {
+                    scheduler.record_metadata_run(Instant::now(), 0, forced);
+                }
+                if phases.data {
+                    scheduler.record_data_run(Instant::now(), 0, forced);
+                }
+                return Some(format!(
+                    "online_gc_ok=false source={source} mode={mode:?} relocation_workers={relocation_workers} error=contention_cancelled\n"
+                ));
             }
             Ok(Err(error)) => Err(format!("{error}")),
             Err(error) => Err(format!("worker_join_failed:{error}")),
@@ -987,14 +1094,42 @@ async fn run_online_gc_quantum(
         Err(error) => Err(error),
     };
     runtime_telemetry::gc_finished(&result);
+    let now = Instant::now();
+    if let Ok(report) = &result {
+        if phases.metadata {
+            scheduler.record_metadata_run(now, metadata_saved_basis_points(report), forced);
+        }
+        if phases.data {
+            scheduler.record_data_run(now, report.metrics().unlinked_bytes(), forced);
+        }
+    }
     Some(match result {
-        Ok(report) => online_gc_status_line(source, mode, relocation_workers, &report, scheduler),
+        Ok(report) => online_gc_status_line(
+            source,
+            mode,
+            relocation_workers,
+            &report,
+            scheduler.status(),
+        ),
         Err(error) => format!(
             "online_gc_ok=false source={source} mode={mode:?} relocation_workers={} error={}\n",
             relocation_workers,
             error.replace(['\n', '\r'], " ")
         ),
     })
+}
+
+#[allow(clippy::too_many_lines)]
+/// Metadata savings basis points of the bytes the run inspected: removed
+/// object bytes over the sum of inspected reachable and candidate bytes.
+fn metadata_saved_basis_points(report: &OnlineGcCycleReport) -> u64 {
+    let metadata = report.metadata_gc();
+    let removed = metadata.bytes_removed();
+    let touched = removed.saturating_add(metadata.metrics().object_graph_read_bytes());
+    if touched == 0 {
+        return 0;
+    }
+    removed.saturating_mul(10_000) / touched
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1005,7 +1140,10 @@ fn online_gc_status_line(
     report: &OnlineGcCycleReport,
     scheduler: OnlineGcSchedulerStatus,
 ) -> String {
-    let catalog_generation = report.catalog().generation();
+    let catalog_generation = report.catalog().map_or_else(
+        || "none".to_owned(),
+        |descriptor| descriptor.generation().to_string(),
+    );
     let metadata = report.metadata_gc();
     let metrics = report.metrics();
     let metadata_status = format!(" {}", metadata_gc_status_fields(metadata, "metadata_"));
@@ -1016,14 +1154,20 @@ fn online_gc_status_line(
             "retiring_activation_wall_us={} pin_drain_wall_us={} victim_verify_wall_us={} ",
             "unlink_wall_us={} data_sync_wall_us={} removed_activation_wall_us={} ",
             "post_catalog_wall_us={} ",
-            "catalog_examined_bytes={} catalog_write_bytes={} candidate_proof_read_bytes={} ",
+            "catalog_examined_bytes={} catalog_write_bytes={} catalog_files_retired={} ",
+            "exact_retirement_wall_us={} exact_runs_retired={} exact_run_sets_retired={} ",
+            "candidate_proof_read_bytes={} ",
             "relocation_read_bytes={} relocation_write_bytes={} unlinked_bytes={} ",
             "shortlisted_candidates={} proved_victims={} aborted_candidates={} ",
+            "candidate_queue_retained={} candidate_queue_scanned_rows={} catalog_pending_updates={} ",
             "reverse_dependency_edges={} reverse_dependency_required_chunks={} ",
             "scheduler_polls={} scheduler_deferred_polls={} scheduler_frontend_activity_changes={} ",
             "scheduler_background_admissions={} scheduler_idle_admissions={} ",
             "scheduler_urgent_admissions={} scheduler_scheduled_admissions={} ",
-            "scheduler_immediate_requests={} relocation_workers={}"
+            "scheduler_immediate_requests={} relocation_workers={} ",
+            "scheduler_metadata_wait_seconds={} scheduler_data_wait_seconds={} ",
+            "scheduler_metadata_saved_basis_points={} scheduler_data_saved_basis_points={} ",
+            "scheduler_data_delete_resets={}"
         ),
         metrics.total_wall().as_micros(),
         metrics.recovery_wall().as_micros(),
@@ -1040,6 +1184,10 @@ fn online_gc_status_line(
         metrics.post_collection_catalog_wall().as_micros(),
         metrics.catalog_examined_bytes(),
         metrics.catalog_write_bytes(),
+        metrics.catalog_files_retired(),
+        metrics.exact_retirement_wall().as_micros(),
+        metrics.exact_runs_retired(),
+        metrics.exact_run_sets_retired(),
         metrics.candidate_proof_read_bytes(),
         metrics.relocation_read_bytes(),
         metrics.relocation_write_bytes(),
@@ -1047,6 +1195,9 @@ fn online_gc_status_line(
         metrics.shortlisted_candidates(),
         metrics.proved_victims(),
         metrics.aborted_candidates(),
+        metrics.candidate_queue_retained(),
+        metrics.candidate_queue_scanned_rows(),
+        metrics.catalog_pending_updates(),
         metrics.reverse_dependency_edges(),
         metrics.reverse_dependency_required_chunks(),
         scheduler.polls(),
@@ -1058,8 +1209,19 @@ fn online_gc_status_line(
         scheduler.scheduled_admissions(),
         scheduler.immediate_requests(),
         relocation_workers,
+        scheduler.metadata_wait_seconds(),
+        scheduler.data_wait_seconds(),
+        scheduler.metadata_saved_basis_points(),
+        scheduler.data_saved_basis_points(),
+        scheduler.data_delete_resets(),
     );
     match report.outcome() {
+        OnlineGcCycleOutcome::MetadataOnly => format!(
+            "online_gc_ok=true source={source} mode={mode:?} outcome=metadata_only phases=metadata catalog_generation={catalog_generation}{work_status}{metadata_status}\n"
+        ),
+        OnlineGcCycleOutcome::DataOnly => format!(
+            "online_gc_ok=true source={source} mode={mode:?} outcome=data_only catalog_generation={catalog_generation}{work_status}{metadata_status}\n"
+        ),
         OnlineGcCycleOutcome::NoCandidates => format!(
             "online_gc_ok=true source={source} mode={mode:?} outcome=no_candidates catalog_generation={catalog_generation}{work_status}{metadata_status}\n"
         ),
@@ -1344,8 +1506,23 @@ fn record_checkpoint_attempt(
     );
 }
 
-async fn checkpoint_cycle(appliance: Arc<FsAppliance>) -> Result<(), String> {
+struct CheckpointContentionGuard(MaintenanceCancellation);
+
+impl Drop for CheckpointContentionGuard {
+    fn drop(&mut self) {
+        self.0.clear_contention();
+    }
+}
+
+async fn checkpoint_cycle(
+    appliance: Arc<FsAppliance>,
+    gc_cancellation: MaintenanceCancellation,
+) -> Result<(), String> {
     let already_paused = !appliance.namespace().mutation_admission_open();
+    if already_paused {
+        gc_cancellation.cancel_contention();
+    }
+    let _contention_guard = CheckpointContentionGuard(gc_cancellation.clone());
     let worker_appliance = Arc::clone(&appliance);
     let mut worker = tokio::task::spawn_blocking(move || worker_appliance.checkpoint_profiled());
     let result = if already_paused {
@@ -1354,12 +1531,13 @@ async fn checkpoint_cycle(appliance: Arc<FsAppliance>) -> Result<(), String> {
         tokio::select! {
             result = &mut worker => map_worker_result(result)?,
             () = sleep(CHECKPOINT_WARNING) => {
+                gc_cancellation.cancel_contention();
                 if DurabilitySupervisor::checkpoint_progress(CHECKPOINT_WARNING)
                     == CheckpointProgressAction::CloseAdmission
                 {
                     appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::CheckpointTimeout);
                     eprintln!(
-                        "CRITICAL: checkpoint exceeded five seconds; mutation admission is closed"
+                        "CRITICAL: checkpoint exceeded five seconds; mutation admission is closed; online GC contention is cancelled"
                     );
                 }
                 await_worker(worker).await?
@@ -1399,6 +1577,7 @@ async fn catch_up(appliance: Arc<FsAppliance>) -> Result<(), String> {
     }
 }
 
+#[allow(clippy::too_many_lines, reason = "read cache status projection")]
 fn emit_verified_read_cache(appliance: &FsAppliance) {
     emit_write_through_cpu_state(appliance);
     emit_memory_budget_governor();
@@ -1408,6 +1587,7 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
             "exact_run_membership leased_runs={} positional_runs={} leased_page_bounds_bytes={} ",
             "filters={} allocated_bytes={} ",
             "huge_page_advised_filters={} huge_page_advised_bytes={} probes={} ",
+            "constructed_filters={} missing_filters={} missing_page_bounds={} ",
             "definitely_absent={} requires_exact_lookup={}"
         ),
         membership.leased_run_count(),
@@ -1418,6 +1598,9 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         membership.huge_page_advised_filter_count(),
         membership.huge_page_advised_bytes(),
         membership.probes(),
+        membership.constructed_filter_count(),
+        membership.missing_filter_count(),
+        membership.missing_page_bounds_count(),
         membership.definitely_absent(),
         membership.requires_exact_lookup(),
     );
@@ -1426,8 +1609,8 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         concat!(
             "exact_index_page_cache hits={} misses={} hit_rate_basis_points={} ",
             "resident_pages={} target_pages={} capacity_pages={} evictions={} ",
-            "pressure_rejections={} reserve_bytes={} effective_limit_bytes={} ",
-            "available_bytes={} swap_used_bytes={}"
+            "pressure_rejections={} protected_limit_bytes={} protected_resident_bytes={} ",
+            "reserve_bytes={} effective_limit_bytes={} available_bytes={} swap_used_bytes={}"
         ),
         exact.hits(),
         exact.misses(),
@@ -1437,6 +1620,8 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         exact.capacity_pages(),
         exact.evictions(),
         exact.pressure_rejections(),
+        exact.protected_limit_bytes(),
+        exact.protected_resident_bytes(),
         exact.reserve_bytes(),
         exact.effective_limit_bytes(),
         exact.available_bytes(),
@@ -1476,7 +1661,8 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         concat!(
             "verified_read_cache hits={} misses={} admissions={} evictions={} ",
             "pressure_rejections={} oversized_rejections={} entries={} resident_bytes={} ",
-            "target_bytes={} metadata_bytes={} hard_limit_bytes={} reserve_bytes={} ",
+            "target_bytes={} verified_share_limit_bytes={} metadata_bytes={} ",
+            "hard_limit_bytes={} reserve_bytes={} ",
             "effective_limit_bytes={} available_bytes={} swap_used_bytes={}"
         ),
         cache.hits(),
@@ -1488,6 +1674,7 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         cache.entry_count(),
         cache.resident_bytes(),
         cache.target_bytes(),
+        cache.verified_share_limit_bytes(),
         cache.metadata_bytes(),
         cache.hard_limit_bytes(),
         cache.reserve_bytes(),

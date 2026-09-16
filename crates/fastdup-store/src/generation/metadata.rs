@@ -43,8 +43,8 @@ impl<I: StorageIo> GenerationRepository<I> {
 
         let temporary_name = format!(".{}.building", encode_object_id(object_id));
         self.storage.create_new(&temporary_name)?;
-        crate::immutable_write::write_image(&self.storage, &temporary_name, encoded)?;
-        self.storage.set_len(
+        crate::immutable_write::write_image_unpublished(&self.storage, &temporary_name, encoded)?;
+        self.storage.set_len_unpublished(
             &temporary_name,
             u64::try_from(encoded.len()).map_err(|_| GenerationError::MetadataTooLarge)?,
         )?;

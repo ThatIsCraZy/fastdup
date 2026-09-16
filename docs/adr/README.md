@@ -19,11 +19,11 @@ records verified drift, source evidence, and remaining gaps. The
 | Manifest and Namespace graphs | 0011, 0036, 0042, 0043, 0085: Manifest Leaf/Inner v2, authenticated successors, one sharded Namespace Root. |
 | User-DATA chunking | 0054: SeqCDC-v1. Namespace sharding uses its separate FastCDC profile in 0085. |
 | Advanced Reduction | 0010, 0018, 0088, 0089: depth-one Prefix/Sparse-XOR, bounded online Similarity; 0062 retains the offline rebuild contract. |
-| Exact Index | 0035, 0044, 0045, 0079: immutable generations, activation, compaction, leased mappings; 0035 remains proposed with scale/performance gates. |
+| Exact Index | 0035, 0044, 0045, 0079: immutable generations, activation, compaction, leased mappings; 0046's dated 2026-09-16 section bounds protected warming; 0035 remains proposed with scale/performance gates. |
 | Read and publication paths | 0046, 0051, 0058, 0073, 0077: one unified application cache, Direct I/O, direct FUSE handles, io_uring DATA publication and restore locality. Userspace prefetch from 0030 remains open. |
 | Recovery and GC | 0020, 0037, 0064–0072: DATA-tier checkpoints, graph proof, local victim proofs, Metadata marks, lease and recovery latch. |
 | Capacity and placement | 0080–0084: pool identity, distinct XFS filesystems, Small-File project quota, physical admission and cached capacity reporting. |
-| Management and Share policy | 0086, 0087, 0089: separate Control Plane, logical quota at Namespace admission, live per-Share dependent-encoding policy. |
+| Management and Share policy | 0086, 0087, 0089: separate Control Plane, logical quota at Namespace admission, live per-Share dependent-encoding policy; 0086's dated 2026-09-16 section makes SMB a stop-propagated, mount-conditioned Runtime frontend. |
 
 Dictionary activation (0017/0047), Veeam qualification (0043), and device-loss
 protection (0001) remain distinct open work. ADR 0089 is implemented and has

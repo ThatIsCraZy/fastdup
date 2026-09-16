@@ -19,13 +19,13 @@ use fastdup_format::{
 };
 use fastdup_posix::{
     CommitInode, CommitRange, CommittedFile, CommittedFileInstall, InodeId, NamespaceCommit,
-    PreparedCommitExtent, PreparedDataRecipe,
+    PosixError, PreparedCommitExtent, PreparedDataRecipe,
 };
 use fastdup_store::{
     AdaptiveContainerPublishMetrics, ContainerGenerationAllocator, ContainerPlacement,
     ContainerRepository, GenerationRepository, ManifestSuccessorProof, ManifestTreeSummary,
-    PersistentChunkPlan, StorageIo, SuccessorPredecessor, VerifiedCommittedFile, seqcdc_cut,
-    seqcdc_cut_scalar,
+    PersistentChunkPlan, ReadIntent, ReadIntentScope, StorageIo, SuccessorPredecessor,
+    VerifiedCommittedFile, seqcdc_cut, seqcdc_cut_scalar,
 };
 
 use crate::ManifestCommittedFile;
@@ -953,17 +953,12 @@ fn plan_allocated_range<C: StorageIo>(
         .checkpoint_rechunk_bytes
         .checked_add(length)
         .expect("ASSERT: checkpoint rechunk bytes cannot overflow u64");
-    let reader = CommitRangeReader {
-        inode,
-        start: offset,
-        consumed: 0,
-        length,
-    };
+    let reader = CommitRangeReader::new(inode, offset, length);
     let mut chunks = SeqCdcStream::new(reader)?;
     let mut expected_offset = 0_u64;
     loop {
         let cdc_started = PhaseStarted::now();
-        let chunk = chunks.next_chunk()?;
+        let chunk = read_next_rechunk_chunk(&mut chunks)?;
         cdc_started.finish_into(&mut writer.metrics.cdc);
         let Some(chunk) = chunk else {
             break;
@@ -1108,11 +1103,39 @@ impl<R: Read> SeqCdcStream<R> {
     }
 }
 
+trait FrozenCommitRangeSource {
+    fn read_frozen_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError>;
+}
+
+impl FrozenCommitRangeSource for CommitInode {
+    fn read_frozen_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+        self.read_at(offset, length)
+    }
+}
+
+fn read_next_rechunk_chunk<R: Read>(
+    stream: &mut SeqCdcStream<R>,
+) -> Result<Option<Vec<u8>>, DurableNamespaceError> {
+    let _scan = ReadIntentScope::enter(ReadIntent::Scan);
+    stream.next_chunk()
+}
+
 struct CommitRangeReader<'a> {
-    inode: &'a CommitInode,
+    source: &'a dyn FrozenCommitRangeSource,
     start: u64,
     consumed: u64,
     length: u64,
+}
+
+impl<'a> CommitRangeReader<'a> {
+    fn new(source: &'a dyn FrozenCommitRangeSource, start: u64, length: u64) -> Self {
+        Self {
+            source,
+            start,
+            consumed: 0,
+            length,
+        }
+    }
 }
 
 impl Read for CommitRangeReader<'_> {
@@ -1135,8 +1158,8 @@ impl Read for CommitRangeReader<'_> {
             .checked_add(self.consumed)
             .ok_or_else(|| io::Error::other("commit range read offset overflow"))?;
         let bytes = self
-            .inode
-            .read_at(read_offset, requested_u32)
+            .source
+            .read_frozen_at(read_offset, requested_u32)
             .map_err(|error| io::Error::other(format!("commit range read failed: {error:?}")))?;
         if bytes.len() != requested {
             return Err(io::Error::new(
@@ -1610,5 +1633,54 @@ pub(super) fn random_container_id() -> Result<ContainerId, DurableNamespaceError
         if bytes != [0; 16] {
             return ContainerId::new(bytes).map_err(|_| DurableNamespaceError::FrozenViewMismatch);
         }
+    }
+}
+
+#[cfg(test)]
+mod rechunk_intent_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct RecordingSource {
+        data: Vec<u8>,
+        intent: Mutex<Option<ReadIntent>>,
+    }
+
+    impl FrozenCommitRangeSource for RecordingSource {
+        fn read_frozen_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+            *self
+                .intent
+                .lock()
+                .expect("ASSERT: recording source intent lock poisoned") =
+                Some(ReadIntentScope::current());
+            let start = usize::try_from(offset).expect("ASSERT: test source offset fits usize");
+            let length = usize::try_from(length).expect("ASSERT: test source length fits usize");
+            Ok(self.data[start..start + length].to_vec())
+        }
+    }
+
+    #[test]
+    fn checkpoint_rechunk_reads_enter_scan_intent() {
+        let source = RecordingSource {
+            data: vec![0xA5; CDC_MAXIMUM_BYTES + 1],
+            intent: Mutex::new(None),
+        };
+        let reader = CommitRangeReader::new(&source, 0, (CDC_MAXIMUM_BYTES + 1) as u64);
+        let mut stream = SeqCdcStream::new(reader).expect("construct SeqCDC test stream");
+
+        let chunk = read_next_rechunk_chunk(&mut stream)
+            .expect("read first SeqCDC Chunk")
+            .expect("nonempty test range must yield a Chunk");
+
+        assert!(!chunk.is_empty());
+        assert_eq!(
+            *source
+                .intent
+                .lock()
+                .expect("ASSERT: recording source intent lock poisoned"),
+            Some(ReadIntent::Scan)
+        );
+        assert_eq!(ReadIntentScope::current(), ReadIntent::Demand);
     }
 }

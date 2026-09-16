@@ -16,6 +16,7 @@ pub use operation_timing::{OperationTimer, OperationTiming, OperationTimingSnaps
 
 mod container_descriptor_cache;
 mod container_generation_allocator;
+mod container_image_cache;
 mod exact_activation_log;
 mod exact_index_read;
 mod exact_index_repository;
@@ -83,11 +84,16 @@ pub use container_generation_allocator::{
     CONTAINER_GENERATION_RESERVATION_SPAN_V1, ContainerGenerationAllocator,
 };
 pub use exact_index_repository::{
-    ActivatedExactIndex, EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES, ExactIndexGenerationDrain,
-    ExactIndexGenerationPin, ExactIndexGenerationSnapshot, ExactIndexGenerationTransition,
-    ExactIndexLocationAudit, ExactIndexLookup, ExactIndexPageCacheStatus, ExactIndexRunFamily,
-    ExactIndexRunReader, ExactIndexRunRepository, ExactIndexStoreError, ExactRunMembershipStatus,
+    ActivatedExactIndex, EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES, ExactCacheWarmPolicy,
+    ExactCacheWarmProgress, ExactIndexGenerationDrain, ExactIndexGenerationPin,
+    ExactIndexGenerationSnapshot, ExactIndexGenerationTransition, ExactIndexLocationAudit,
+    ExactIndexLookup, ExactIndexPageCacheStatus, ExactIndexRunFamily, ExactIndexRunReader,
+    ExactIndexRunRepository, ExactIndexStoreError, ExactRunMembershipStatus,
     MAX_ACTIVE_EXACT_INDEX_FAMILIES, MAX_ACTIVE_EXACT_INDEX_RUNS, MAX_EXACT_LOOKUP_CANDIDATES,
+};
+pub(crate) use gc_candidate_catalog::{
+    GC_CANDIDATE_QUEUE_CAPACITY, GC_CATALOG_SCAN_BATCH_ROWS, GC_PENDING_CATALOG_UPDATE_LIMIT,
+    GcCandidateSelectionQueue,
 };
 pub use gc_candidate_catalog::{
     GcCandidateCatalogRepository, GcCandidateCatalogSnapshot, GcCandidateCatalogStoreError,
@@ -103,10 +109,11 @@ pub use generation::{
 pub use maintenance::{
     BackgroundMaintenanceJob, BackgroundMaintenanceReport, DataPoolUsage, DataPoolUsageError,
     EndToEndScrubReport, ExactIndexRebuildReport, GarbageCollectionPlan, GarbageCollectionReport,
-    GcCandidateProof, MaintenanceError, MaintenanceExecutionMode, MaintenancePriority,
-    MaintenanceRepository, MetadataGarbageCollectionReport, OnlineGcCycleOutcome,
-    OnlineGcCycleReport, OnlineGcMetrics, OnlineGcRecoveryReport, OnlineGcRetirement,
-    OnlineGcRunMode, PoolIndexRebuildReport, ReverseDependencyGeneration,
+    GcCandidateProof, GcPhaseRequest, MaintenanceError, MaintenanceExecutionMode,
+    MaintenancePriority, MaintenanceRepository, MetadataGarbageCollectionReport,
+    OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcMetrics, OnlineGcQuantum,
+    OnlineGcRecoveryReport, OnlineGcRetirement, OnlineGcRunMode, PoolIndexRebuildReport,
+    ReverseDependencyGeneration,
 };
 pub use manifest_reader::{MAX_MANIFEST_READ_BYTES, ManifestReadError, VerifiedManifestFile};
 pub use manifest_tree::ManifestTreeError;
@@ -175,10 +182,11 @@ use crate::read_cache::VerifiedChunkRead;
 use fastdup_format::{
     AlignedContainerBytes, BuildingContainerHeader, ChunkId, ContainerId,
     ContainerIntrinsicSummary, ContainerRecoveryEnvelope, ExactIndexEntry, ExactIndexLocation,
-    ExactLocationTransition, FOOTER_BYTES, FormatError, HEADER_BYTES, IncompressibilityGateMetrics,
-    IncompressibilityGatePolicy, MAX_CONTAINER_BYTES, PrehashedAdaptiveRegion, PrehashedChunk,
-    PrehashedContiguousRegion, PreparedEncodedRecord, SealedContainer, SealedContainerDescriptor,
-    VerifiedChunkPayload, VerifiedContainerImage, VerifiedContainerPublication,
+    ExactLocationTransition, FOOTER_BYTES, FormatError, GC_FILL_COMPACTION_PHYSICAL_MAX_BYTES,
+    HEADER_BYTES, IncompressibilityGateMetrics, IncompressibilityGatePolicy, MAX_CONTAINER_BYTES,
+    PrehashedAdaptiveRegion, PrehashedChunk, PrehashedContiguousRegion, PreparedEncodedRecord,
+    SealedContainer, SealedContainerDescriptor, VerifiedChunkPayload, VerifiedContainerImage,
+    VerifiedContainerPublication,
 };
 use rayon::prelude::*;
 
@@ -733,6 +741,26 @@ pub trait StorageIo {
     ///
     /// Returns the backend's lookup, range, or truncation error.
     fn set_len(&self, name: &str, length: u64) -> io::Result<()>;
+    /// Writes one batch of a temporary immutable object that has not been
+    /// published. Backends may defer intermediate length-head durability; the
+    /// caller must finish with [`Self::set_len_unpublished`] followed by
+    /// [`Self::sync_file`] before publishing the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's seek, capacity, or write error.
+    fn write_unpublished_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.write_at(name, offset, bytes)
+    }
+    /// Fixes the exact logical length of an unpublished immutable temporary
+    /// object. The final [`Self::sync_file`] is its durability barrier.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's lookup, range, or truncation error.
+    fn set_len_unpublished(&self, name: &str, length: u64) -> io::Result<()> {
+        self.set_len(name, length)
+    }
     /// Makes all object bytes stable before publication.
     ///
     /// # Errors
@@ -1029,6 +1057,7 @@ impl Drop for ImmutableFileLease {
 #[derive(Clone, Debug)]
 pub struct ContainerRepository<I> {
     storage: I,
+    container_images: Arc<container_image_cache::ContainerImageCache>,
     descriptors: Arc<container_descriptor_cache::ContainerDescriptorCache>,
     record_reads: Arc<RecordReadCoordinator>,
     cpu_admission: Arc<OnceLock<Arc<WorkerPermits>>>,
@@ -1345,6 +1374,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     pub fn new(storage: I) -> Self {
         Self {
             storage,
+            container_images: Arc::new(container_image_cache::ContainerImageCache::system()),
             descriptors: Arc::new(
                 container_descriptor_cache::ContainerDescriptorCache::new_system(),
             ),
@@ -1426,6 +1456,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     pub fn with_maintenance_storage<J: StorageIo>(&self, storage: J) -> ContainerRepository<J> {
         ContainerRepository {
             storage,
+            container_images: Arc::clone(&self.container_images),
             descriptors: Arc::clone(&self.descriptors),
             record_reads: Arc::clone(&self.record_reads),
             cpu_admission: Arc::clone(&self.cpu_admission),
@@ -1448,6 +1479,7 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Self {
         Self {
             storage,
+            container_images: Arc::new(container_image_cache::ContainerImageCache::system()),
             descriptors: Arc::new(
                 container_descriptor_cache::ContainerDescriptorCache::new_with_snapshot(snapshot),
             ),
@@ -2132,8 +2164,12 @@ impl<I: StorageIo> ContainerRepository<I> {
             sealed_length <= MAX_CONTAINER_BYTES,
             "ASSERT: the format writer returned an oversized container"
         );
+        let retained_image = (ReadIntentScope::current() == ReadIntent::Demand
+            && sealed_length <= GC_FILL_COMPACTION_PHYSICAL_MAX_BYTES)
+            .then(|| sealed.as_ref().to_vec());
 
-        self.storage
+        let published = self
+            .storage
             .publish_owned_container(OwnedContainerPublication {
                 container_id,
                 container_generation,
@@ -2147,7 +2183,11 @@ impl<I: StorageIo> ContainerRepository<I> {
                 temporary_name,
                 published_name,
                 placement,
-            })
+            })?;
+        if let Some(image) = retained_image {
+            self.container_images.admit_validated(container_id, image);
+        }
+        Ok(published)
     }
 
     fn publish_sealed_resumable(
@@ -2220,7 +2260,18 @@ impl<I: StorageIo> ContainerRepository<I> {
         &self,
         container_id: ContainerId,
     ) -> Result<VerifiedContainerImage, StoreError> {
+        if let Some(bytes) = self.container_images.get(container_id) {
+            return self.verify_image_bytes(container_id, Arc::unwrap_or_clone(bytes));
+        }
         let bytes = self.storage.read(&published_name(container_id))?;
+        self.verify_image_bytes(container_id, bytes)
+    }
+
+    fn verify_image_bytes(
+        &self,
+        container_id: ContainerId,
+        bytes: Vec<u8>,
+    ) -> Result<VerifiedContainerImage, StoreError> {
         let mut base_resolver = ContainerBaseResolver::new(self);
         let mut resolver_error = None;
         let mut resolve = |dependency: fastdup_format::DependentDependency| match base_resolver
@@ -3230,6 +3281,42 @@ impl<I: StorageIo> ContainerRepository<I> {
             let (chunk_id, logical_length) = requests[ordinal];
             (chunk_id, logical_length, ordinal)
         });
+        // One ascending batch pre-resolves every request that the caller
+        // cannot answer from its own Locations, merging each Run's leaf page
+        // reads into spans. Per-key results and fallback behavior are unchanged.
+        let mut batch_keys: Vec<(fastdup_format::ChunkId, u32)> = Vec::new();
+        if index.is_some() {
+            let mut last_key = None::<(fastdup_format::ChunkId, u32)>;
+            for &request_ordinal in &lookup_order {
+                let (chunk_id, logical_length) = requests[request_ordinal];
+                let Ok(index_length) = u32::try_from(logical_length) else {
+                    continue;
+                };
+                if locations
+                    .binary_search_by_key(&chunk_id, ExactIndexEntry::chunk_id)
+                    .is_ok_and(|ordinal| locations[ordinal].logical_length() == index_length)
+                {
+                    continue;
+                }
+                let key = (chunk_id, index_length);
+                if last_key == Some(key) {
+                    continue;
+                }
+                last_key = Some(key);
+                batch_keys.push(key);
+            }
+        }
+        let prefetched_lookups: std::collections::HashMap<
+            (fastdup_format::ChunkId, u32),
+            ExactIndexLookup,
+        > = match index {
+            Some(index) if !batch_keys.is_empty() => index
+                .lookup_transitions_batch(&batch_keys)
+                .ok()
+                .map(|lookups| batch_keys.iter().copied().zip(lookups).collect())
+                .unwrap_or_default(),
+            _ => std::collections::HashMap::new(),
+        };
         let mut lookup_scratch = Vec::new();
         let mut last_lookup = None::<(fastdup_format::ChunkId, u32, [Option<ExactIndexEntry>; 2])>;
 
@@ -3258,7 +3345,9 @@ impl<I: StorageIo> ContainerRepository<I> {
                 let Some(index) = index else {
                     continue;
                 };
-                if index
+                if let Some(prefetched) = prefetched_lookups.get(&(chunk_id, index_length)) {
+                    lookup_scratch.extend_from_slice(prefetched.candidates());
+                } else if index
                     .lookup_transitions_into(chunk_id, index_length, &mut lookup_scratch)
                     .is_err()
                 {
@@ -3861,6 +3950,55 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(())
     }
 
+    pub(crate) fn visit_candidate_chunk_ids<E, F>(
+        &self,
+        rows: &[fastdup_format::GcCandidateCatalogRow],
+        mut visitor: F,
+    ) -> Result<(), E>
+    where
+        E: From<StoreError>,
+        F: FnMut(fastdup_format::GcCandidateCatalogRow, ChunkId, u64) -> Result<(), E>,
+    {
+        let _scan = ReadIntentScope::enter(ReadIntent::Scan);
+        for &row in rows {
+            let name = published_name(row.container_id());
+            let actual_length = match self.storage.object_len(&name) {
+                Ok(actual_length) => actual_length,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.container_images.forget(row.container_id());
+                    continue;
+                }
+                Err(error) => return Err(E::from(StoreError::Io(error))),
+            };
+            let envelope = match self.read_recovery_envelope(&name, row.container_id()) {
+                Ok(envelope) => envelope,
+                Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(E::from(error)),
+            };
+            if envelope.container_generation() != row.container_generation()
+                || actual_length != row.physical_bytes()
+            {
+                return Err(E::from(StoreError::PublishedIdentityMismatch {
+                    name: row.container_id(),
+                    header: envelope.container_id(),
+                }));
+            }
+            let range = envelope.recovery_index_range().map_err(StoreError::from)?;
+            let bytes = self.read_storage_range_chunked(&name, range.offset(), range.length())?;
+            let index = envelope
+                .verify_recovery_index(&bytes)
+                .map_err(StoreError::from)?;
+            for candidate in index.candidates() {
+                visitor(
+                    row,
+                    candidate.chunk_id(),
+                    u64::from(candidate.logical_length()),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Fully verifies published objects one at a time and retains no payloads.
     ///
     /// # Errors
@@ -3905,29 +4043,95 @@ impl<I: StorageIo> ContainerRepository<I> {
         self.visit_verified_publications_pipelined::<StoreError, _>(|_| Ok(()))
     }
 
+    /// Removes proven RETIRING victims behind one envelope-identity re-read.
+    ///
+    /// Before any unlink, every victim name is re-read independently of all
+    /// application caches as its sealed Header/Footer envelope and must still
+    /// pair to exactly one sealed Container carrying the expected identity and
+    /// immutable physical length. Content truth was already established by
+    /// the single independent verification read of candidate proof, and a
+    /// RETIRING victim is referenced by no live Location after the pin drain.
+    /// Payload re-verification at deletion would therefore verify bytes only
+    /// to destroy them and — through dependent Base resolution — read live
+    /// Containers unrelated to this victim; both are excluded deliberately.
+    /// Byte-level body corruption of the dying Container must not block
+    /// reclamation; Scrub remains the independent content auditor.
+    ///
+    /// After the DATA directory sync, every removed identity is purged from
+    /// the process-local caches: Container descriptors, verified Location
+    /// proof of the retired Locations, and — via the storage mutation path —
+    /// cached file layouts, handles, and immutable ranges.
     pub(crate) fn remove_verified_published(
         &self,
         container_ids: &BTreeMap<[u8; 16], ContainerId>,
-    ) -> Result<(u64, ContainerRemovalMetrics), StoreError> {
-        let _independent = ReadIntentScope::enter(ReadIntent::Independent);
+        retired_locations: &[ExactIndexEntry],
+        identity_workers: NonZeroUsize,
+    ) -> Result<(u64, ContainerRemovalMetrics), StoreError>
+    where
+        I: Sync,
+    {
         let verify_started = Instant::now();
+        let ids = container_ids.values().copied().collect::<Vec<_>>();
+        let ids_ref = ids.as_slice();
+        let header_bytes = u64::try_from(HEADER_BYTES)
+            .map_err(|_| StoreError::Format(FormatError::ArithmeticOverflow))?;
+        let job_bytes = vec![header_bytes * 2 + 8_192; ids.len()];
+        let mut lengths = vec![0_u64; ids.len()];
+        let storage_reads = &self.storage;
+        crate::maintenance::run_ordered_maintenance_reads(
+            &job_bytes,
+            identity_workers,
+            MAINTENANCE_VERIFY_WINDOW_BYTES,
+            true,
+            ReadIntent::Independent,
+            "fastdup-gc-identity",
+            move |job| -> Result<u64, StoreError> {
+                let name = published_name(ids_ref[job]);
+                let actual_length = storage_reads.object_len(&name)?;
+                let minimum_length = u64::try_from(HEADER_BYTES)
+                    .map_err(|_| StoreError::Format(FormatError::ArithmeticOverflow))?
+                    .checked_add(FOOTER_BYTES)
+                    .ok_or(StoreError::Format(FormatError::ArithmeticOverflow))?;
+                if actual_length < minimum_length || actual_length > MAX_CONTAINER_BYTES {
+                    return Err(StoreError::Format(FormatError::InvalidContainerLength(
+                        usize::try_from(actual_length).unwrap_or(usize::MAX),
+                    )));
+                }
+                let header = storage_reads.read_exact_at(&name, 0, HEADER_BYTES)?;
+                let footer_offset = actual_length
+                    .checked_sub(FOOTER_BYTES)
+                    .ok_or(StoreError::Format(FormatError::ArithmeticOverflow))?;
+                let footer = storage_reads.read_exact_at(
+                    &name,
+                    footer_offset,
+                    usize::try_from(FOOTER_BYTES)
+                        .map_err(|_| StoreError::Format(FormatError::ArithmeticOverflow))?,
+                )?;
+                let descriptor =
+                    SealedContainerDescriptor::decode(&header, &footer, actual_length)?;
+                if descriptor.container_id() != ids_ref[job] {
+                    return Err(StoreError::PublishedIdentityMismatch {
+                        name: ids_ref[job],
+                        header: descriptor.container_id(),
+                    });
+                }
+                Ok(actual_length)
+            },
+            |job, length| {
+                lengths[job] = length;
+                Ok(())
+            },
+        )?;
         let mut removed_bytes = 0_u64;
-        let mut verified_removals = Vec::new();
-        verified_removals
-            .try_reserve_exact(container_ids.len())
-            .map_err(|_| StoreError::Io(io::Error::from(io::ErrorKind::OutOfMemory)))?;
-        for container_id in container_ids.values().copied() {
-            let name = published_name(container_id);
-            let bytes = self.storage.read(&name)?;
-            let container = self.decode_published_bytes(container_id, &bytes)?;
+        for length in lengths {
             removed_bytes = removed_bytes
-                .checked_add(container.header().layout().file_length)
+                .checked_add(length)
                 .ok_or_else(audit_counter_overflow)?;
-            verified_removals.push(name);
         }
         let verify_wall = verify_started.elapsed();
         let unlink_started = Instant::now();
-        for name in verified_removals {
+        for container_id in ids {
+            let name = published_name(container_id);
             self.storage.remove_file(&name)?;
         }
         let unlink_wall = unlink_started.elapsed();
@@ -3936,6 +4140,11 @@ impl<I: StorageIo> ContainerRepository<I> {
             self.storage.sync_root()?;
         }
         let sync_wall = sync_started.elapsed();
+        for container_id in container_ids.values().copied() {
+            self.descriptors.forget(container_id);
+            self.container_images.forget(container_id);
+        }
+        crate::read_cache::forget_retired_location_proofs(retired_locations);
         Ok((
             removed_bytes,
             ContainerRemovalMetrics {
@@ -4006,10 +4215,11 @@ impl<I: StorageIo> ContainerRepository<I> {
             if observed != expected {
                 return Err(StoreError::ExactLocationMismatch);
             }
-            verified_removals.push((name, container.header().layout().file_length));
+            verified_removals.push((container_id, name, container.header().layout().file_length));
         }
-        for (name, file_length) in verified_removals {
+        for (container_id, name, file_length) in verified_removals {
             self.storage.remove_file(&name)?;
+            self.container_images.forget(container_id);
             report.bytes_removed = report
                 .bytes_removed
                 .checked_add(file_length)
@@ -4812,6 +5022,17 @@ impl StorageIo for FsStorageIo {
         })
     }
 
+    fn write_unpublished_at(&self, name: &str, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.mutate_direct_file(name, false, |file, previous| {
+            direct_io::write_temp_with_layout(
+                file,
+                previous.expect("ASSERT: an existing writer has a layout"),
+                offset,
+                bytes,
+            )
+        })
+    }
+
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
         let file = direct_io::open(&self.path(name)?, false)?;
         let layout = cached_file_layout(&file, name, &self.immutable_leases)?;
@@ -4880,6 +5101,16 @@ impl StorageIo for FsStorageIo {
     fn set_len(&self, name: &str, length: u64) -> io::Result<()> {
         self.mutate_direct_file(name, false, |file, previous| {
             direct_io::set_len_with_layout(
+                file,
+                previous.expect("ASSERT: an existing writer has a layout"),
+                length,
+            )
+        })
+    }
+
+    fn set_len_unpublished(&self, name: &str, length: u64) -> io::Result<()> {
+        self.mutate_direct_file(name, false, |file, previous| {
+            direct_io::set_len_temp_with_layout(
                 file,
                 previous.expect("ASSERT: an existing writer has a layout"),
                 length,
@@ -5016,6 +5247,9 @@ pub enum StoreError {
         reserved_through: u64,
         observed: u64,
     },
+    CandidateChunkLimitExceeded {
+        limit: usize,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -5064,6 +5298,9 @@ impl fmt::Display for StoreError {
                 formatter,
                 "Container generation high-water {reserved_through} is below observed generation {observed}"
             ),
+            Self::CandidateChunkLimitExceeded { limit } => {
+                write!(formatter, "GC candidate proof exceeds its Chunk limit {limit}")
+            }
         }
     }
 }
@@ -5083,7 +5320,8 @@ impl std::error::Error for StoreError {
             | Self::ContainerGenerationExhausted
             | Self::ContainerGenerationHighWaterMissing
             | Self::ContainerGenerationHighWaterChain
-            | Self::ContainerGenerationHighWaterBehind { .. } => None,
+            | Self::ContainerGenerationHighWaterBehind { .. }
+            | Self::CandidateChunkLimitExceeded { .. } => None,
         }
     }
 }

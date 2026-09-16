@@ -393,6 +393,15 @@ pub(super) struct WriteCapacityPlan {
     append_metadata_covered_end: Option<u64>,
 }
 
+/// A write's byte-range and its overwritten live allocation, evaluated once
+/// under the owning inode lock and shared by quota admission and mutation.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WritePlan {
+    pub(super) offset: u64,
+    pub(super) end: u64,
+    pub(super) overwritten: u64,
+}
+
 impl WriteCapacityPlan {
     pub(super) const fn metadata_bytes(self) -> u64 {
         self.metadata_bytes
@@ -1059,7 +1068,7 @@ impl VersionedFile {
     }
 
     pub(super) fn active_resident_payload_bytes(&self) -> u64 {
-        self.active.data.resident_bytes()
+        self.active.data.resident_bytes
     }
 
     pub(super) fn externalize_many(
@@ -1168,24 +1177,49 @@ impl VersionedFile {
         frozen.attach_late_prepared(offset, length, recipe)
     }
 
-    pub(super) fn write_payload(
+    /// Builds the overwrite accounting for one future write exactly once.
+    /// Quota admission and the later mutation share the returned plan under
+    /// the same inode lock, so the overwritten allocation is never evaluated
+    /// twice.
+    pub(super) fn plan_write(&self, offset: u64, length: u64) -> Result<WritePlan, PosixError> {
+        let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
+        let overwritten_end = end.min(self.logical_size());
+        let overwritten = if offset < overwritten_end {
+            self.allocated_bytes_in_live_range(offset, overwritten_end)?
+        } else {
+            0
+        };
+        Ok(WritePlan {
+            offset,
+            end,
+            overwritten,
+        })
+    }
+
+    /// Applies a write against a plan built by `plan_write` under the same
+    /// inode lock. The plan's overwritten allocation replaces the live
+    /// allocation without a second extent evaluation.
+    pub(super) fn write_payload_planned(
         &mut self,
         offset: u64,
         bytes: MutationPayload,
         sequence: u64,
+        plan: WritePlan,
     ) -> Result<(), PosixError> {
+        assert_eq!(
+            plan.offset, offset,
+            "ASSERT: write plan must belong to its offset"
+        );
         let length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64");
-        let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
-        let overwritten_end = end.min(self.logical_size());
-        let overwritten = if offset < overwritten_end {
-            self.allocated_bytes_in_range(offset, overwritten_end)?
-        } else {
-            0
-        };
+        assert_eq!(
+            plan.end,
+            offset.checked_add(length).ok_or(PosixError::FileTooLarge)?,
+            "ASSERT: write plan must match its payload length"
+        );
         self.active.write(offset, bytes, sequence)?;
         self.live_allocated_bytes = self
             .live_allocated_bytes
-            .checked_sub(overwritten)
+            .checked_sub(plan.overwritten)
             .and_then(|remaining| remaining.checked_add(length))
             .expect("ASSERT: allocated-byte replacement must remain bounded by logical size");
         assert!(
@@ -1193,6 +1227,18 @@ impl VersionedFile {
             "ASSERT: allocated bytes must not exceed logical size"
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn write_payload(
+        &mut self,
+        offset: u64,
+        bytes: MutationPayload,
+        sequence: u64,
+    ) -> Result<(), PosixError> {
+        let length = u64::try_from(bytes.len()).expect("ASSERT: usize must fit u64");
+        let plan = self.plan_write(offset, length)?;
+        self.write_payload_planned(offset, bytes, sequence, plan)
     }
 
     pub(super) fn plan_write_capacity(
@@ -2881,5 +2927,48 @@ mod tests {
             file.plan_read(0, 8).expect("read plan").execute(),
             Err(PosixError::Io)
         );
+    }
+
+    #[test]
+    fn the_resident_dirty_counter_matches_full_recomputation_across_mutations() {
+        fn assert_counter(file: &VersionedFile, expected: u64) {
+            assert_eq!(
+                file.active.data.resident_bytes,
+                file.active.data.resident_bytes_recomputed(),
+                "the running resident byte counter must equal the full extent recomputation"
+            );
+            assert_eq!(file.active_resident_payload_bytes(), expected);
+        }
+        let mut file = VersionedFile::from_committed(bytes_reader(vec![7; 4_096]), 0);
+        assert_counter(&file, 0);
+        file.write(0, &[1; 1_024], 1).unwrap();
+        assert_counter(&file, 1_024);
+        file.write(2_048, &[2; 1_024], 2).unwrap();
+        assert_counter(&file, 2_048);
+        // An interior overwrite splits the first extent around the new one.
+        file.write(1_000, &[3; 100], 3).unwrap();
+        assert_counter(&file, 2_124);
+        // A punch that straddles one resident extent keeps only its fragments.
+        file.punch_hole(512, 600, 4).unwrap();
+        assert_counter(&file, 2_036);
+        // A write that splits a trailing resident extent replaces only its
+        // overlapped tail while the left fragment keeps the remaining bytes.
+        file.write(3_000, &[4; 128], 5).unwrap();
+        assert_counter(&file, 2_092);
+        // Externalizing a resident run drops it from the active resident total.
+        file.externalize_many(vec![(3_000, 5, bytes_reader(vec![4; 128]))])
+            .unwrap();
+        assert_counter(&file, 1_964);
+        // Shrinking truncates the crossing extent and removes the tail.
+        file.truncate(1_050, 6).unwrap();
+        assert_counter(&file, 962);
+        // Growing back only re-adds hole coverage, not resident bytes.
+        file.truncate(2_048, 7).unwrap();
+        assert_counter(&file, 962);
+        // A freeze moves the whole accounted epoch out; the new one starts empty.
+        let _frozen = file.freeze_active(CommitToken::new(9).unwrap()).unwrap();
+        assert_counter(&file, 0);
+        file.write(64, &[5; 64], 8).unwrap();
+        assert_counter(&file, 64);
     }
 }

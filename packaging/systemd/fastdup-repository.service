@@ -1,6 +1,7 @@
 [Unit]
 Description=FastDup Repository Runtime
 After=local-fs.target
+Before=smb.service
 ConditionPathIsMountPoint=/var/lib/fastdup/repository/metadata
 ConditionPathIsMountPoint=/var/lib/fastdup/repository/data
 

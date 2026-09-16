@@ -20,6 +20,19 @@ impl ImmutableGcCandidateCatalog {
         lease: ImmutableFileLease,
         expected: GcCandidateCatalogDescriptor,
     ) -> Result<Self, GcCandidateCatalogStoreError> {
+        let catalog = Self::open_verified(lease, expected)?;
+        audit_source(&catalog.lease, catalog.descriptor)?;
+        Ok(catalog)
+    }
+
+    /// Opens a lease whose Header/Footer descriptor matches a prior complete
+    /// row audit in this process. The immutable lease keeps the same physical
+    /// bytes frozen for the reader; the caller must treat the retained row audit
+    /// as process-local hint state rather than fresh recovery proof.
+    pub(crate) fn open_verified(
+        lease: ImmutableFileLease,
+        expected: GcCandidateCatalogDescriptor,
+    ) -> Result<Self, GcCandidateCatalogStoreError> {
         let _read_reason =
             crate::MetadataReadScope::enter(crate::MetadataReadReason::GarbageCollection);
         let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
@@ -38,7 +51,6 @@ impl ImmutableGcCandidateCatalog {
         if descriptor != expected {
             return Err(GcCandidateCatalogStoreError::IdentityMismatch);
         }
-        audit_source(&lease, descriptor)?;
         Ok(Self { lease, descriptor })
     }
 
@@ -62,6 +74,37 @@ impl ImmutableGcCandidateCatalog {
             ordinal,
             &exact_range(&self.lease, offset, GC_CANDIDATE_CATALOG_ROW_BYTES)?,
         )?)
+    }
+
+    pub(crate) fn visit_range(
+        &self,
+        start: u64,
+        rows: u64,
+        mut visit: impl FnMut(GcCandidateCatalogRow) -> Result<(), GcCandidateCatalogStoreError>,
+    ) -> Result<u64, GcCandidateCatalogStoreError> {
+        let _read_reason =
+            crate::MetadataReadScope::enter(crate::MetadataReadReason::GarbageCollection);
+        let start = start.min(self.descriptor.row_count());
+        let rows = rows.min(self.descriptor.row_count().saturating_sub(start));
+        let mut ordinal = start;
+        let mut scanned = 0_u64;
+        while scanned < rows {
+            let batch = (rows - scanned).min(4_096);
+            let offset = self
+                .descriptor
+                .row_offset(ordinal)
+                .ok_or(GcCandidateCatalogStoreError::IndexCorruption)?;
+            let length = usize::try_from(batch)
+                .map_err(|_| GcCandidateCatalogStoreError::CounterOverflow)?
+                * GC_CANDIDATE_CATALOG_ROW_BYTES;
+            let bytes = self.lease.read_at(offset, length)?;
+            for row in bytes.chunks_exact(GC_CANDIDATE_CATALOG_ROW_BYTES) {
+                visit(self.descriptor.decode_row(ordinal, row)?)?;
+                ordinal += 1;
+                scanned += 1;
+            }
+        }
+        Ok(scanned)
     }
 
     pub(crate) fn visit_rows(

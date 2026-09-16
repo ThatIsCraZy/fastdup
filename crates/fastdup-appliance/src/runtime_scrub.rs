@@ -7,6 +7,8 @@ use fastdup_store::{
 };
 use std::fmt::Write as _;
 use std::io;
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,6 +25,37 @@ struct Control {
     progress: Mutex<Progress>,
     activity: Box<dyn Fn() -> u64 + Send + Sync>,
     pace: Mutex<Pace>,
+    #[cfg(test)]
+    test_record_gate: Mutex<Option<Arc<TestRecordGate>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestRecordGate {
+    allowed: Mutex<usize>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl TestRecordGate {
+    fn new(allowed: usize) -> Self {
+        Self {
+            allowed: Mutex::new(allowed),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn allow_all(&self) {
+        *self.allowed.lock().expect("scrub test record lock") = usize::MAX;
+        let _changed = self.changed.notify_all();
+    }
+
+    fn wait_until_allowed(&self, record: usize) {
+        let mut allowed = self.allowed.lock().expect("scrub test record lock");
+        while *allowed < record {
+            allowed = self.changed.wait(allowed).expect("scrub test record lock");
+        }
+    }
 }
 
 struct Pace {
@@ -83,6 +116,26 @@ pub fn start(
     read_cache: Arc<fastdup_store::VerifiedReadCache>,
 ) -> io::Result<ScrubHandle> {
     let control = Arc::new(Control::new(frontend));
+    start_with_control(
+        required,
+        containers,
+        indexes,
+        control,
+        namespace,
+        progress_storage,
+        read_cache,
+    )
+}
+
+fn start_with_control(
+    required: fastdup_store::PendingDataVerification,
+    containers: ContainerRepository<MaintenanceContainerStorage>,
+    indexes: ExactIndexRunRepository<FsStorageIo>,
+    control: Arc<Control>,
+    namespace: Arc<Namespace>,
+    progress_storage: (FsStorageIo, [u8; 32]),
+    read_cache: Arc<fastdup_store::VerifiedReadCache>,
+) -> io::Result<ScrubHandle> {
     control.report("running", None);
     let gate = ScrubGate(Arc::clone(&control));
     let worker = std::thread::Builder::new()
@@ -218,6 +271,11 @@ fn record_verified_batch(
 ) -> io::Result<()> {
     let mut verified = verified.into_iter();
     for (&id, resumed_bytes) in batch.iter().zip(resumed) {
+        let next_verified = {
+            let progress = control.progress.lock().expect("scrub progress lock");
+            progress.verified + 1
+        };
+        control.wait_for_record_permit(next_verified);
         control.check_cancelled()?;
         control.set_current(id);
         let resumed = resumed_bytes.is_some();
@@ -334,6 +392,8 @@ impl Control {
                 structure_bytes: 0,
                 structure_elapsed: Duration::ZERO,
             }),
+            #[cfg(test)]
+            test_record_gate: Mutex::new(None),
         }
     }
 
@@ -353,6 +413,42 @@ impl Control {
         progress.resumed += usize::from(resumed);
         progress.verified_bytes += bytes;
     }
+
+    #[cfg(test)]
+    fn set_test_record_gate(&self, allowed: usize) {
+        *self
+            .test_record_gate
+            .lock()
+            .expect("scrub test record lock") = Some(Arc::new(TestRecordGate::new(allowed)));
+    }
+
+    #[cfg(test)]
+    fn allow_all_test_records(&self) {
+        if let Some(gate) = self
+            .test_record_gate
+            .lock()
+            .expect("scrub test record lock")
+            .as_ref()
+        {
+            gate.allow_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_record_permit(&self, record: usize) {
+        let gate = self
+            .test_record_gate
+            .lock()
+            .expect("scrub test record lock")
+            .clone();
+        if let Some(gate) = gate {
+            gate.wait_until_allowed(record);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)]
+    fn wait_for_record_permit(&self, _: usize) {}
 
     fn finish(&self, result: io::Result<()>, namespace: &Namespace) {
         let cancelled = self.cancelled.load(Ordering::Acquire);
@@ -611,6 +707,7 @@ mod tests {
                     structure_bytes: 0,
                     structure_elapsed: Duration::ZERO,
                 }),
+                test_record_gate: Mutex::new(None),
             }
         })
     }
@@ -798,7 +895,7 @@ mod resume_tests {
             .commit_namespace(&NamespaceRoot::new(1024, 2, 0, vec![], vec![]).unwrap())
             .unwrap();
         let frontend = super::super::TelemetryStorageIo::open(&root.join("data"), false).unwrap();
-        let launch = || {
+        let launch = |test_record_gate: Option<usize>| {
             let (_, required) = generation.recover_committed_for_mount(&repository).unwrap();
             let snapshot = fastdup_store::MemoryPressureSnapshot::new(1 << 30, 1 << 29, 0);
             let cache = Arc::new(
@@ -808,11 +905,15 @@ mod resume_tests {
                 )
                 .unwrap(),
             );
-            let worker = start(
+            let control = Arc::new(Control::new(frontend.clone()));
+            if let Some(allowed) = test_record_gate {
+                control.set_test_record_gate(allowed);
+            }
+            let worker = start_with_control(
                 required,
                 repository.clone(),
                 ExactIndexRunRepository::new(metadata.clone()),
-                frontend.clone(),
+                control.clone(),
                 Arc::new(Namespace::new_volatile(
                     fastdup_posix::NamespaceConfig::default(),
                 )),
@@ -820,9 +921,9 @@ mod resume_tests {
                 Arc::clone(&cache),
             )
             .unwrap();
-            (worker, cache)
+            (worker, control, cache)
         };
-        let (first, first_cache) = launch();
+        let (first, first_control, first_cache) = launch(Some(1));
         let first_gate = first.gate.clone();
         tokio::time::timeout(Duration::from_secs(10), async {
             while first_gate.0.progress.lock().unwrap().verified == 0 {
@@ -831,12 +932,14 @@ mod resume_tests {
         })
         .await
         .unwrap();
+        first.request_stop();
+        first_control.allow_all_test_records();
         first.stop().await.unwrap();
         let saved = first_gate.0.progress.lock().unwrap().verified;
-        assert!((1..3).contains(&saved));
+        assert_eq!(saved, 1);
         assert!(!first_gate.permits_gc());
         assert!(first_cache.status().location_proofs().entries > 0);
-        let (second, second_cache) = launch();
+        let (second, _, second_cache) = launch(None);
         let second_gate = second.gate.clone();
         tokio::time::timeout(Duration::from_secs(10), async {
             while !second_gate.permits_gc() {
@@ -849,7 +952,7 @@ mod resume_tests {
         assert_eq!(second_gate.0.progress.lock().unwrap().resumed, saved);
         assert_eq!(second_gate.0.progress.lock().unwrap().verified, 3);
         assert!(second_cache.status().location_proofs().entries > 0);
-        let (third, third_cache) = launch();
+        let (third, _, third_cache) = launch(None);
         let third_gate = third.gate.clone();
         tokio::time::timeout(Duration::from_secs(10), async {
             while !third_gate.permits_gc() {

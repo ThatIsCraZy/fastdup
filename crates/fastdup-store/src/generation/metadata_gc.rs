@@ -357,6 +357,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         let mut reachable = BTreeSet::new();
         let mut bytes_read = 0_u64;
         for record in records {
+            self.check_maintenance()?;
             reachable.insert(record.namespace_root());
             let (root, namespace_objects, namespace_bytes) =
                 self.read_namespace_root_graph(record.namespace_root())?;
@@ -368,20 +369,10 @@ impl<I: StorageIo> GenerationRepository<I> {
                 return Err(GenerationError::PreviousGenerationRecordMismatch);
             }
             for inode in root.file_inodes() {
-                scan_manifest_tree(
+                self.scan_metadata_gc_manifest_root(
                     inode.manifest_root(),
-                    |node_id| {
-                        reachable.insert(node_id);
-                        let bytes = self.read_manifest_node(node_id)?;
-                        bytes_read = bytes_read
-                            .checked_add(
-                                u64::try_from(bytes.len())
-                                    .map_err(|_| ManifestTreeError::ArithmeticOverflow)?,
-                            )
-                            .ok_or(ManifestTreeError::ArithmeticOverflow)?;
-                        Ok(bytes)
-                    },
-                    |_logical_offset, _extent| Ok(()),
+                    &mut reachable,
+                    &mut bytes_read,
                 )?;
             }
         }
@@ -394,21 +385,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .collect::<Vec<_>>();
         for root in pinned_roots {
             if reachable.insert(root) {
-                scan_manifest_tree(
-                    root,
-                    |node_id| {
-                        reachable.insert(node_id);
-                        let bytes = self.read_manifest_node(node_id)?;
-                        bytes_read = bytes_read
-                            .checked_add(
-                                u64::try_from(bytes.len())
-                                    .map_err(|_| ManifestTreeError::ArithmeticOverflow)?,
-                            )
-                            .ok_or(ManifestTreeError::ArithmeticOverflow)?;
-                        Ok(bytes)
-                    },
-                    |_logical_offset, _extent| Ok(()),
-                )?;
+                self.scan_metadata_gc_manifest_root(root, &mut reachable, &mut bytes_read)?;
             }
         }
         let recovery_roots = self
@@ -429,24 +406,49 @@ impl<I: StorageIo> GenerationRepository<I> {
                 .checked_add(namespace_bytes)
                 .ok_or(GenerationError::MetadataTooLarge)?;
             for inode in root.file_inodes() {
-                scan_manifest_tree(
+                self.scan_metadata_gc_manifest_root(
                     inode.manifest_root(),
-                    |node_id| {
-                        reachable.insert(node_id);
-                        let bytes = self.read_manifest_node(node_id)?;
-                        bytes_read = bytes_read
-                            .checked_add(
-                                u64::try_from(bytes.len())
-                                    .map_err(|_| ManifestTreeError::ArithmeticOverflow)?,
-                            )
-                            .ok_or(ManifestTreeError::ArithmeticOverflow)?;
-                        Ok(bytes)
-                    },
-                    |_logical_offset, _extent| Ok(()),
+                    &mut reachable,
+                    &mut bytes_read,
                 )?;
             }
         }
         Ok((reachable, bytes_read))
+    }
+
+    fn scan_metadata_gc_manifest_root(
+        &self,
+        root: MetadataObjectId,
+        reachable: &mut BTreeSet<MetadataObjectId>,
+        bytes_read: &mut u64,
+    ) -> Result<(), GenerationError> {
+        let traversal_probes = std::cell::Cell::new(0_u64);
+        scan_manifest_tree(
+            root,
+            |node_id| {
+                traversal_probes.set(traversal_probes.get() + 1);
+                if traversal_probes.get().is_multiple_of(256) {
+                    self.check_manifest_maintenance()?;
+                }
+                reachable.insert(node_id);
+                let bytes = self.read_manifest_node(node_id)?;
+                *bytes_read = bytes_read
+                    .checked_add(
+                        u64::try_from(bytes.len())
+                            .map_err(|_| ManifestTreeError::ArithmeticOverflow)?,
+                    )
+                    .ok_or(ManifestTreeError::ArithmeticOverflow)?;
+                Ok(bytes)
+            },
+            |_logical_offset, _extent| {
+                traversal_probes.set(traversal_probes.get() + 1);
+                if traversal_probes.get().is_multiple_of(256) {
+                    self.check_manifest_maintenance()?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
     }
 
     fn check_metadata_gc_unlink_stop(&self) -> Result<(), GenerationError> {

@@ -19,6 +19,11 @@ const ADMISSION_STEPS: usize = 4096;
 // maps are released; nonempty maps are shrunk whenever ownership is removed.
 const ENTRY_BYTES: u64 = 512;
 const MAX_FLIGHTS: usize = 128;
+const STALE_CLOCK_SCAN_THRESHOLD: usize = 1024;
+const VERIFIED_DATA_SHARE_BASIS_POINTS: u64 = 2_000;
+const VERIFIED_DATA_MINIMUM_BYTES: u64 = 4096 + ENTRY_BYTES;
+const PROTECTED_EXACT_SHARE_BASIS_POINTS: u64 = 7_000;
+const PROTECTED_EXACT_MINIMUM_BYTES: u64 = 4096 + ENTRY_BYTES;
 
 type SharedLoad = Result<Arc<dyn Any + Send + Sync>, Arc<io::Error>>;
 pub(crate) type AdmissionGroup<T> = (Vec<(ReadCacheKey, Arc<T>, u64)>, u64);
@@ -59,6 +64,7 @@ pub enum ReadCacheClass {
     LocationProof,
     HistoricalProof,
     ContainerDescriptor,
+    ContainerImage,
     ExactPage,
     SimilarityPage,
     MetadataObject,
@@ -80,6 +86,37 @@ impl ReadCacheClass {
             _ => 1,
         }
     }
+
+    #[must_use]
+    pub(crate) const fn budget_group(self) -> ReadCacheBudgetGroup {
+        match self {
+            Self::Data => ReadCacheBudgetGroup::VerifiedData,
+            Self::ExactPage | Self::ExactMembership | Self::ExactPageBounds => {
+                ReadCacheBudgetGroup::ProtectedExact
+            }
+            _ => ReadCacheBudgetGroup::Other,
+        }
+    }
+
+    const fn pinned(self) -> bool {
+        matches!(self, Self::ExactMembership)
+    }
+}
+
+/// Resident classes governed by the common displacement and Verified DATA rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadCacheBudgetGroup {
+    VerifiedData,
+    ProtectedExact,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvictionScope {
+    VerifiedData,
+    ProtectedExact,
+    Unprotected,
+    All,
 }
 
 /// An identity within an immutable repository namespace. Both fields are
@@ -152,18 +189,129 @@ struct Entry {
 #[derive(Default)]
 struct Entries {
     map: HashMap<Key, Entry>,
-    clock: VecDeque<Key>,
+    verified_clock: VecDeque<Key>,
+    protected_clock: VecDeque<Key>,
+    other_clock: VecDeque<Key>,
+    pinned_clock: VecDeque<Key>,
+    stale_keys: usize,
 }
 
 impl Entries {
+    fn clock(&mut self, group: ReadCacheBudgetGroup) -> &mut VecDeque<Key> {
+        match group {
+            ReadCacheBudgetGroup::VerifiedData => &mut self.verified_clock,
+            ReadCacheBudgetGroup::ProtectedExact => &mut self.protected_clock,
+            ReadCacheBudgetGroup::Other => &mut self.other_clock,
+        }
+    }
+
+    fn pop(&mut self, scope: EvictionScope) -> Option<Key> {
+        match scope {
+            EvictionScope::VerifiedData => self.verified_clock.pop_front(),
+            EvictionScope::ProtectedExact => self.protected_clock.pop_front(),
+            EvictionScope::Unprotected => self
+                .verified_clock
+                .pop_front()
+                .or_else(|| self.other_clock.pop_front()),
+            EvictionScope::All => self
+                .verified_clock
+                .pop_front()
+                .or_else(|| self.other_clock.pop_front())
+                .or_else(|| self.protected_clock.pop_front()),
+        }
+    }
+
+    fn push(&mut self, class: ReadCacheClass, key: Key) {
+        if class.pinned() {
+            self.pinned_clock.push_back(key);
+        } else {
+            self.clock(class.budget_group()).push_back(key);
+        }
+    }
+
+    fn reserve(&mut self, class: ReadCacheClass) -> Result<(), ()> {
+        if class.pinned() {
+            self.pinned_clock.try_reserve(1).map_err(|_| ())
+        } else {
+            self.clock(class.budget_group())
+                .try_reserve(1)
+                .map_err(|_| ())
+        }
+    }
+
+    fn clocks_len(&self) -> usize {
+        self.verified_clock.len()
+            + self.protected_clock.len()
+            + self.other_clock.len()
+            + self.pinned_clock.len()
+    }
+
+    fn reclaim_clocks(&mut self) {
+        if self.stale_keys == 0
+            || self.stale_keys < STALE_CLOCK_SCAN_THRESHOLD
+            || self.stale_keys.saturating_mul(2) <= self.clocks_len()
+        {
+            return;
+        }
+        let Self {
+            map,
+            verified_clock,
+            protected_clock,
+            other_clock,
+            pinned_clock,
+            stale_keys,
+        } = self;
+        for clock in [verified_clock, protected_clock, other_clock, pinned_clock] {
+            clock.retain(|key| map.contains_key(key));
+        }
+        *stale_keys = 0;
+    }
+
+    fn purge_namespace(&mut self, namespace: u64) -> Vec<Entry> {
+        let Self {
+            map,
+            verified_clock,
+            protected_clock,
+            other_clock,
+            pinned_clock,
+            stale_keys,
+        } = self;
+        let mut removed = Vec::new();
+        for clock in [verified_clock, protected_clock, other_clock, pinned_clock] {
+            let mut retained = VecDeque::new();
+            while let Some(key) = clock.pop_front() {
+                if key.namespace == namespace {
+                    if let Some(entry) = map.remove(&key) {
+                        removed.push(entry);
+                    } else {
+                        *stale_keys = stale_keys.saturating_sub(1);
+                    }
+                } else if map.contains_key(&key) {
+                    retained.push_back(key);
+                } else {
+                    *stale_keys = stale_keys.saturating_sub(1);
+                }
+            }
+            *clock = retained;
+        }
+        removed
+    }
+
     fn compact(&mut self) {
         // The per-entry charge includes up to 2x spare capacity. Reallocating
         // a VecDeque after every eviction would turn replacement quadratic.
         if self.map.capacity() > self.map.len().saturating_mul(2) {
             self.map.shrink_to_fit();
         }
-        if self.clock.capacity() > self.clock.len().saturating_mul(2) {
-            self.clock.shrink_to_fit();
+        for clock in [
+            &mut self.verified_clock,
+            &mut self.protected_clock,
+            &mut self.other_clock,
+            &mut self.pinned_clock,
+        ] {
+            if clock.capacity() > clock.len().saturating_mul(2) {
+                clock.shrink_to_fit();
+            }
         }
     }
 }
@@ -174,8 +322,60 @@ struct Shard(Mutex<Entries>);
 #[derive(Default)]
 struct Admission {
     resident: u64,
+    pinned_bytes: u64,
     target: u64,
     cursor: usize,
+    verified_bytes: u64,
+    protected_bytes: u64,
+    other_bytes: u64,
+}
+
+impl Admission {
+    fn charge(&mut self, class: ReadCacheClass, bytes: u64) {
+        if class.pinned() {
+            self.pinned_bytes = self.pinned_bytes.saturating_add(bytes);
+            return;
+        }
+        self.resident = self.resident.saturating_add(bytes);
+        match class.budget_group() {
+            ReadCacheBudgetGroup::VerifiedData => {
+                self.verified_bytes = self.verified_bytes.saturating_add(bytes);
+            }
+            ReadCacheBudgetGroup::ProtectedExact => {
+                self.protected_bytes = self.protected_bytes.saturating_add(bytes);
+            }
+            ReadCacheBudgetGroup::Other => {
+                self.other_bytes = self.other_bytes.saturating_add(bytes);
+            }
+        }
+    }
+
+    fn uncharge(&mut self, class: ReadCacheClass, bytes: u64) {
+        if class.pinned() {
+            self.pinned_bytes = self.pinned_bytes.saturating_sub(bytes);
+            return;
+        }
+        self.resident = self.resident.saturating_sub(bytes);
+        match class.budget_group() {
+            ReadCacheBudgetGroup::VerifiedData => {
+                self.verified_bytes = self.verified_bytes.saturating_sub(bytes);
+            }
+            ReadCacheBudgetGroup::ProtectedExact => {
+                self.protected_bytes = self.protected_bytes.saturating_sub(bytes);
+            }
+            ReadCacheBudgetGroup::Other => {
+                self.other_bytes = self.other_bytes.saturating_sub(bytes);
+            }
+        }
+    }
+
+    const fn total_resident(&self) -> u64 {
+        self.resident.saturating_add(self.pinned_bytes)
+    }
+
+    fn unprotected_bytes(&self) -> u64 {
+        self.verified_bytes.saturating_add(self.other_bytes)
+    }
 }
 
 struct Core {
@@ -188,6 +388,33 @@ struct Core {
     snapshot: Mutex<MemoryPressureSnapshot>,
     // Resident owners precede the one broker lease in drop order.
     pool: Option<CachePool>,
+}
+
+fn stable_capacity_target(target: u64) -> u64 {
+    const MIB: u64 = 1 << 20;
+    let granularity = (2 * MIB).min(target);
+    target
+        .checked_div(granularity)
+        .unwrap_or_default()
+        .saturating_mul(granularity)
+}
+
+fn verified_data_limit(target: u64) -> u64 {
+    let target = stable_capacity_target(target);
+    if target == 0 {
+        return 0;
+    }
+    let share = target.saturating_mul(VERIFIED_DATA_SHARE_BASIS_POINTS) / 10_000;
+    share.max(VERIFIED_DATA_MINIMUM_BYTES).min(target)
+}
+
+fn protected_exact_limit(target: u64) -> u64 {
+    let target = stable_capacity_target(target);
+    if target == 0 {
+        return 0;
+    }
+    let share = target.saturating_mul(PROTECTED_EXACT_SHARE_BASIS_POINTS) / 10_000;
+    share.max(PROTECTED_EXACT_MINIMUM_BYTES).min(target)
 }
 
 impl Core {
@@ -231,6 +458,9 @@ impl Core {
 
     fn refresh(&self) {
         let Some(pool) = &self.pool else { return };
+        // The shared CAS window is the only throttle. A per-thread memo would
+        // freeze sampling once every live thread has seen one sample, because
+        // no later thread ever reaches the window again.
         let now = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let next = self.next_refresh.load(Ordering::Relaxed);
         if now < next
@@ -257,26 +487,35 @@ impl Core {
             .lock()
             .expect("ASSERT: cache admission poisoned");
         let observed = self.counters.snapshot();
-        let target = pool.target(
+        let target = pool.target_with_pinned_floor(
             snapshot,
             CacheObservation {
                 hits: observed.hits,
                 misses: observed.misses,
                 hit_bytes: observed.hit_bytes,
                 evictions: observed.evictions,
-                resident_bytes: Self::fixed_bytes().saturating_add(state.resident),
+                resident_bytes: Self::fixed_bytes().saturating_add(state.total_resident()),
             },
+            state.pinned_bytes,
         );
         state.target = target.saturating_sub(Self::fixed_bytes());
-        // Pressure eviction does not grant second chances. All cache owners
-        // leave before the common lease is returned to the memory broker.
-        while state.resident > state.target {
-            assert!(
-                self.evict(&mut state, false),
-                "ASSERT: charged cache has an owner"
+        // Class ceilings are common-owner placement rules, not private caches.
+        // A lowered target must immediately reclaim an over-large protected
+        // Exact working set before the ordinary pressure pass considers all
+        // residents.
+        let ceilings = self.reclaim_class_ceilings(&mut state);
+        // Pressure eviction does not grant second chances. Unprotected classes
+        // yield before protected Exact acceleration; all cache owners leave
+        // before the common lease is returned to the memory broker.
+        let reached = ceilings && self.reclaim_pressure(&mut state);
+        debug_assert!(reached, "ASSERT: charged cache has an owner");
+        if reached {
+            pool.applied_with_pinned_floor(
+                target,
+                Self::fixed_bytes().saturating_add(state.resident),
+                state.pinned_bytes,
             );
         }
-        pool.applied(target, Self::fixed_bytes().saturating_add(state.resident));
     }
 
     fn get<T: Any + Send + Sync>(&self, key: Key, counters: &Counters) -> Option<Arc<T>> {
@@ -307,6 +546,29 @@ impl Core {
         None
     }
 
+    fn reclaim_pressure(&self, state: &mut Admission) -> bool {
+        while state.resident > state.target {
+            if state.unprotected_bytes() > 0 && self.evict(state, false, EvictionScope::Unprotected)
+            {
+                continue;
+            }
+            if !self.evict(state, false, EvictionScope::All) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn reclaim_class_ceilings(&self, state: &mut Admission) -> bool {
+        let limit = protected_exact_limit(state.target);
+        while state.protected_bytes > limit {
+            if !self.evict(state, false, EvictionScope::ProtectedExact) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn uncharge(&self, state: &mut Admission, entry: Entry) {
         let counters = &entry.allocation.counters;
         let payload = if Arc::strong_count(&entry.allocation) == 1 {
@@ -315,7 +577,7 @@ impl Core {
             0
         };
         let charge = ENTRY_BYTES + payload;
-        state.resident -= charge;
+        state.uncharge(entry.class, charge);
         for observation in [counters.as_ref(), &self.counters] {
             observation.resident.fetch_sub(charge, Ordering::Relaxed);
             observation.entries.fetch_sub(1, Ordering::Relaxed);
@@ -326,7 +588,7 @@ impl Core {
         drop(entry);
     }
 
-    fn evict(&self, state: &mut Admission, second_chance: bool) -> bool {
+    fn evict(&self, state: &mut Admission, second_chance: bool, scope: EvictionScope) -> bool {
         for _ in 0..SHARDS {
             let index = state.cursor % SHARDS;
             state.cursor = state.cursor.wrapping_add(1);
@@ -334,25 +596,28 @@ impl Core {
                 .0
                 .lock()
                 .expect("ASSERT: cache shard poisoned");
-            let Some(key) = shard.clock.pop_front() else {
-                continue;
-            };
-            let entry = shard
-                .map
-                .get_mut(&key)
-                .expect("ASSERT: cache clock covers owners");
-            if second_chance && entry.credit != 0 {
-                entry.credit -= 1;
-                shard.clock.push_back(key);
+            // Stale heads must not mask live owners behind them: consume this
+            // shard's scoped queue until it yields a victim or runs empty.
+            while let Some(key) = shard.pop(scope) {
+                let Some(entry) = shard.map.get_mut(&key) else {
+                    shard.stale_keys = shard.stale_keys.saturating_sub(1);
+                    shard.reclaim_clocks();
+                    continue;
+                };
+                let class = entry.class;
+                if second_chance && entry.credit != 0 {
+                    entry.credit -= 1;
+                    shard.push(class, key);
+                    return true;
+                }
+                let entry = shard
+                    .map
+                    .remove(&key)
+                    .expect("ASSERT: cache clock covers owners");
+                shard.compact();
+                self.uncharge(state, entry);
                 return true;
             }
-            let entry = shard
-                .map
-                .remove(&key)
-                .expect("ASSERT: selected cache entry exists");
-            shard.compact();
-            self.uncharge(state, entry);
-            return true;
         }
         false
     }
@@ -367,9 +632,32 @@ impl Core {
             .lock()
             .expect("ASSERT: cache shard poisoned");
         if let Some(entry) = shard.map.remove(&key) {
-            shard.clock.retain(|candidate| *candidate != key);
+            shard.stale_keys += 1;
+            shard.reclaim_clocks();
             shard.compact();
             self.uncharge(&mut state, entry);
+        }
+    }
+
+    fn purge_tracked_namespace(&self, keys: Vec<Key>) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut state = self
+            .admission
+            .lock()
+            .expect("ASSERT: cache admission poisoned");
+        for key in keys {
+            let mut shard = self.shards[Self::shard(key)]
+                .0
+                .lock()
+                .expect("ASSERT: cache shard poisoned");
+            if let Some(entry) = shard.map.remove(&key) {
+                shard.stale_keys += 1;
+                shard.reclaim_clocks();
+                shard.compact();
+                self.uncharge(&mut state, entry);
+            }
         }
     }
 
@@ -380,20 +668,10 @@ impl Core {
             .expect("ASSERT: cache admission poisoned");
         for slot in &self.shards {
             let mut shard = slot.0.lock().expect("ASSERT: cache shard poisoned");
-            let mut remaining = VecDeque::new();
-            while let Some(key) = shard.clock.pop_front() {
-                if key.namespace == namespace {
-                    let entry = shard
-                        .map
-                        .remove(&key)
-                        .expect("ASSERT: cache clock entry exists");
-                    self.uncharge(&mut state, entry);
-                } else {
-                    remaining.push_back(key);
-                }
+            for entry in shard.purge_namespace(namespace) {
+                self.uncharge(&mut state, entry);
             }
-            shard.clock = remaining;
-            shard.map.shrink_to_fit();
+            shard.compact();
         }
     }
 }
@@ -403,11 +681,24 @@ struct Namespace {
     id: u64,
     class: ReadCacheClass,
     counters: Arc<Counters>,
+    owned: Option<Mutex<Vec<Key>>>,
+}
+
+impl Namespace {
+    fn purge_ownership(&self) {
+        if let Some(owned) = &self.owned {
+            let keys =
+                std::mem::take(&mut *owned.lock().expect("ASSERT: cache owner list poisoned"));
+            self.core.purge_tracked_namespace(keys);
+        } else {
+            self.core.purge_namespace(self.id);
+        }
+    }
 }
 
 impl Drop for Namespace {
     fn drop(&mut self) {
-        self.core.purge_namespace(self.id);
+        self.purge_ownership();
     }
 }
 
@@ -429,21 +720,22 @@ impl ReadCacheNamespace {
     /// Joins the process cache without reserving a representation-specific share.
     #[must_use]
     pub fn system(class: ReadCacheClass) -> Self {
-        static CORE: OnceLock<Arc<Core>> = OnceLock::new();
-        Self::attach(
-            Arc::clone(CORE.get_or_init(|| Arc::new(Core::new(0, true)))),
-            class,
-        )
+        Self::attach(Self::system_core(), class, false)
     }
 
     /// Uses the same implementation with a deterministic budget for tests or
     /// an externally governed embedded repository.
     #[must_use]
     pub fn isolated(class: ReadCacheClass, capacity: u64) -> Self {
-        Self::attach(Arc::new(Core::new(capacity, false)), class)
+        Self::attach(Arc::new(Core::new(capacity, false)), class, false)
     }
 
-    fn attach(core: Arc<Core>, class: ReadCacheClass) -> Self {
+    fn system_core() -> Arc<Core> {
+        static CORE: OnceLock<Arc<Core>> = OnceLock::new();
+        Arc::clone(CORE.get_or_init(|| Arc::new(Core::new(0, true))))
+    }
+
+    fn attach(core: Arc<Core>, class: ReadCacheClass, tracked: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         assert_ne!(id, u64::MAX, "ASSERT: cache namespace identities exhausted");
@@ -452,13 +744,19 @@ impl ReadCacheNamespace {
             id,
             class,
             counters: Arc::new(Counters::default()),
+            owned: tracked.then(|| Mutex::new(Vec::new())),
         }))
     }
 
     /// Creates another representation in the same cache and memory budget.
     #[must_use]
     pub fn sibling(&self, class: ReadCacheClass) -> Self {
-        Self::attach(Arc::clone(&self.0.core), class)
+        Self::attach(Arc::clone(&self.0.core), class, false)
+    }
+
+    #[must_use]
+    pub(crate) fn ephemeral_sibling(&self, class: ReadCacheClass) -> Self {
+        Self::attach(Arc::clone(&self.0.core), class, true)
     }
 
     fn key(&self, object: ReadCacheKey) -> Key {
@@ -592,7 +890,7 @@ impl ReadCacheNamespace {
         &self,
         groups: Vec<AdmissionGroup<T>>,
     ) -> u64 {
-        if groups.is_empty() || crate::read_intent::bypass_admission() {
+        if groups.is_empty() || (crate::read_intent::bypass_admission() && !self.0.class.pinned()) {
             return 0;
         }
         let core = &self.0.core;
@@ -635,20 +933,70 @@ impl ReadCacheNamespace {
         let reject = || {
             self.0.counters.rejections.fetch_add(1, Ordering::Relaxed);
         };
-        if added > state.target {
+        let pinned = self.0.class.pinned();
+        if !pinned && added > state.target {
             reject();
             return 0;
         }
-        let mut steps = ADMISSION_STEPS;
-        while state.resident.saturating_add(added) > state.target && steps != 0 {
-            core.evict(&mut state, true);
-            steps -= 1;
-        }
-        if state.resident.saturating_add(added) > state.target {
-            reject();
-            return 0;
+        let group = self.0.class.budget_group();
+        let mut steps = if pinned { 0 } else { ADMISSION_STEPS };
+        if !pinned {
+            if group == ReadCacheBudgetGroup::VerifiedData {
+                let limit = verified_data_limit(state.target);
+                while state.verified_bytes.saturating_add(added) > limit && steps != 0 {
+                    if !core.evict(&mut state, true, EvictionScope::VerifiedData) {
+                        break;
+                    }
+                    steps -= 1;
+                }
+                if state.verified_bytes.saturating_add(added) > limit {
+                    reject();
+                    return 0;
+                }
+            }
+            if group == ReadCacheBudgetGroup::ProtectedExact {
+                let limit = protected_exact_limit(state.target);
+                while state.protected_bytes.saturating_add(added) > limit && steps != 0 {
+                    if !core.evict(&mut state, true, EvictionScope::ProtectedExact) {
+                        break;
+                    }
+                    steps -= 1;
+                }
+                if state.protected_bytes.saturating_add(added) > limit {
+                    reject();
+                    return 0;
+                }
+            }
+            while state.resident.saturating_add(added) > state.target && steps != 0 {
+                let scope = if group == ReadCacheBudgetGroup::ProtectedExact {
+                    EvictionScope::ProtectedExact
+                } else {
+                    EvictionScope::Unprotected
+                };
+                if core.evict(&mut state, true, scope) {
+                    steps -= 1;
+                    continue;
+                }
+                if group == ReadCacheBudgetGroup::ProtectedExact
+                    && core.evict(&mut state, true, EvictionScope::Unprotected)
+                {
+                    steps -= 1;
+                    continue;
+                }
+                break;
+            }
+            if state.resident.saturating_add(added) > state.target {
+                reject();
+                return 0;
+            }
         }
         let mut admitted = 0;
+        let tracked = self.0.owned.is_some();
+        let mut owned_keys = if tracked {
+            Vec::with_capacity(groups.iter().map(|(values, _)| values.len()).sum())
+        } else {
+            Vec::new()
+        };
         for (values, bytes) in groups {
             let allocation = Arc::new(Allocation {
                 bytes,
@@ -664,7 +1012,7 @@ impl ReadCacheNamespace {
                 if shard.map.contains_key(&key) {
                     continue;
                 }
-                if shard.map.try_reserve(1).is_err() || shard.clock.try_reserve(1).is_err() {
+                if shard.map.try_reserve(1).is_err() || shard.reserve(self.0.class).is_err() {
                     shard.compact();
                     reject();
                     continue;
@@ -679,17 +1027,28 @@ impl ReadCacheNamespace {
                         credit: 0,
                     },
                 );
-                shard.clock.push_back(key);
+                shard.push(self.0.class, key);
+                if tracked {
+                    owned_keys.push(key);
+                }
                 let charge = ENTRY_BYTES + if charged { 0 } else { bytes };
                 charged = true;
                 admitted += 1;
-                state.resident += charge;
+                state.charge(self.0.class, charge);
                 for observation in [self.0.counters.as_ref(), &core.counters] {
                     observation.resident.fetch_add(charge, Ordering::Relaxed);
                     observation.entries.fetch_add(1, Ordering::Relaxed);
                     observation.admissions.fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+        if !owned_keys.is_empty()
+            && let Some(owned) = &self.0.owned
+        {
+            owned
+                .lock()
+                .expect("ASSERT: cache owner list poisoned")
+                .extend(owned_keys);
         }
         admitted
     }
@@ -699,13 +1058,23 @@ impl ReadCacheNamespace {
     }
 
     pub fn clear(&self) {
-        self.0.core.purge_namespace(self.0.id);
+        self.0.purge_ownership();
     }
 
     #[must_use]
     pub fn stats(&self) -> ReadCacheStats {
         self.0.core.refresh();
         self.0.counters.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn common_resident_bytes(&self) -> u64 {
+        self.0
+            .core
+            .admission
+            .lock()
+            .expect("ASSERT: cache admission poisoned")
+            .resident
     }
 
     /// Common capacity, not a quota assigned to this representation.
@@ -721,6 +1090,68 @@ impl ReadCacheNamespace {
             .lock()
             .expect("ASSERT: cache admission poisoned")
             .target
+    }
+
+    /// Current 20% ceiling for Verified DATA within this common cache target.
+    ///
+    /// # Panics
+    /// Panics if cache ownership locks have been poisoned.
+    #[must_use]
+    pub fn verified_data_limit(&self) -> u64 {
+        self.0.core.refresh();
+        let state = self
+            .0
+            .core
+            .admission
+            .lock()
+            .expect("ASSERT: cache admission poisoned");
+        verified_data_limit(state.target)
+    }
+
+    /// Current 70% ceiling for protected Exact acceleration.
+    ///
+    /// # Panics
+    /// Panics if cache ownership locks have been poisoned.
+    #[must_use]
+    pub fn protected_exact_limit(&self) -> u64 {
+        self.0.core.refresh();
+        let state = self
+            .0
+            .core
+            .admission
+            .lock()
+            .expect("ASSERT: cache admission poisoned");
+        protected_exact_limit(state.target)
+    }
+
+    /// Common-cache bytes currently charged to protected Exact acceleration.
+    ///
+    /// # Panics
+    /// Panics if cache ownership locks have been poisoned.
+    #[must_use]
+    pub fn protected_resident_bytes(&self) -> u64 {
+        self.0.core.refresh();
+        self.0
+            .core
+            .admission
+            .lock()
+            .expect("ASSERT: cache admission poisoned")
+            .protected_bytes
+    }
+
+    /// Bytes charged to read-cache classes that must never be evicted.
+    ///
+    /// # Panics
+    /// Panics if cache ownership locks have been poisoned.
+    #[must_use]
+    pub fn pinned_resident_bytes(&self) -> u64 {
+        self.0.core.refresh();
+        self.0
+            .core
+            .admission
+            .lock()
+            .expect("ASSERT: cache admission poisoned")
+            .pinned_bytes
     }
 
     /// Last pressure sample from the common memory governor.
@@ -802,7 +1233,8 @@ impl ReadCacheNamespace {
                 .map
                 .remove(&key)
                 .expect("ASSERT: selected cache entry exists");
-            shard.clock.retain(|candidate| *candidate != key);
+            shard.stale_keys += 1;
+            shard.reclaim_clocks();
             shard.compact();
             core.uncharge(&mut state, entry);
         }
@@ -823,12 +1255,8 @@ impl ReadCacheNamespace {
             .lock()
             .expect("ASSERT: cache admission poisoned");
         state.target = capacity;
-        while state.resident > capacity {
-            assert!(
-                core.evict(&mut state, false),
-                "ASSERT: cache residency has an owner"
-            );
-        }
+        let reached = core.reclaim_class_ceilings(&mut state) && core.reclaim_pressure(&mut state);
+        debug_assert!(reached, "ASSERT: charged cache has an owner");
     }
 }
 
@@ -1001,5 +1429,196 @@ mod tests {
         assert_eq!(cache.stats().resident_bytes, 8 + ENTRY_BYTES);
         let other = cache.sibling(ReadCacheClass::ExactPage);
         assert!(other.get::<u64>(key(1)).is_none());
+    }
+
+    #[test]
+    fn verified_data_ceiling_preserves_exact_pages_it_cannot_displace() {
+        let charge = 4096 + ENTRY_BYTES;
+        let data = ReadCacheNamespace::isolated(ReadCacheClass::Data, 100 * charge);
+        let exact = data.sibling(ReadCacheClass::ExactPage);
+        exact.insert(key(0), Arc::new(vec![9_u8; 4096]), 4096, 4096);
+        for ordinal in 1..100 {
+            data.insert(key(ordinal), Arc::new(vec![7_u8; 4096]), 4096, 4096);
+        }
+        let limit = data.verified_data_limit();
+        assert!(limit > 0);
+        assert!(data.stats().resident_bytes <= limit);
+        assert_eq!(*exact.get::<Vec<u8>>(key(0)).unwrap(), vec![9; 4096]);
+    }
+
+    #[test]
+    fn protected_exact_admission_leaves_room_for_other_acceleration() {
+        let charge = 4096 + ENTRY_BYTES;
+        let common = ReadCacheNamespace::isolated(ReadCacheClass::Data, 100 * charge);
+        let exact = common.sibling(ReadCacheClass::ExactPage);
+        let other = common.sibling(ReadCacheClass::StorageRange);
+
+        for ordinal in 0..100 {
+            exact.insert(key(ordinal), Arc::new(vec![9_u8; 4096]), 4096, 4096);
+        }
+        let limit = common.protected_exact_limit();
+        assert_eq!(limit, 70 * charge);
+        assert_eq!(common.protected_resident_bytes(), limit);
+
+        for ordinal in 200..230 {
+            other.insert(key(ordinal), Arc::new(vec![3_u8; 4096]), 4096, 4096);
+        }
+        assert!(common.common_resident_bytes() <= 100 * charge);
+        assert_eq!(common.protected_resident_bytes(), limit);
+        assert_eq!(common.common_resident_bytes(), 100 * charge);
+        assert_eq!(other.stats().resident_bytes, 30 * charge);
+    }
+
+    #[test]
+    fn lowered_target_reclaims_protected_exact_to_its_ceiling() {
+        let charge = 4096 + ENTRY_BYTES;
+        let common = ReadCacheNamespace::isolated(ReadCacheClass::Data, 100 * charge);
+        let exact = common.sibling(ReadCacheClass::ExactPage);
+        for ordinal in 0..70 {
+            exact.insert(key(ordinal), Arc::new(vec![9_u8; 4096]), 4096, 4096);
+        }
+        assert_eq!(common.protected_resident_bytes(), 70 * charge);
+        common.set_capacity(50 * charge);
+        assert_eq!(common.protected_resident_bytes(), 35 * charge);
+        assert_eq!(common.common_resident_bytes(), 35 * charge);
+    }
+
+    #[test]
+    fn pressure_reclaims_verified_data_before_protected_exact() {
+        let charge = 4096 + ENTRY_BYTES;
+        let data = ReadCacheNamespace::isolated(ReadCacheClass::Data, 40 * charge);
+        let exact = data.sibling(ReadCacheClass::ExactPage);
+        exact.insert(key(0), Arc::new(vec![9_u8; 4096]), 4096, 4096);
+        for ordinal in 1..40 {
+            data.insert(key(ordinal), Arc::new(vec![7_u8; 4096]), 4096, 4096);
+        }
+        data.set_capacity(charge);
+        assert_eq!(exact.stats().resident_bytes, charge);
+        assert_eq!(data.stats().resident_bytes, 0);
+    }
+
+    #[test]
+    fn pressure_reclamation_consumes_stale_heads_before_reporting_no_victim() {
+        let charge = 4096 + ENTRY_BYTES;
+        let cache = ReadCacheNamespace::isolated(ReadCacheClass::ExactPage, 200 * charge);
+        let mut stale_heads = Vec::new();
+        let mut survivors = Vec::new();
+        let mut seen = [false; SHARDS];
+        let mut ordinal = 0_u64;
+        while stale_heads.len() < SHARDS && ordinal < 1_048_576 {
+            let slot = Core::shard(cache.key(key(ordinal)));
+            if !seen[slot] {
+                seen[slot] = true;
+                stale_heads.push(ordinal);
+            }
+            ordinal += 1;
+        }
+        assert_eq!(
+            stale_heads.len(),
+            SHARDS,
+            "ASSERT: ordinals cover every shard"
+        );
+        seen = [false; SHARDS];
+        while survivors.len() < SHARDS && ordinal < 2_097_152 {
+            let slot = Core::shard(cache.key(key(ordinal)));
+            if !seen[slot] {
+                seen[slot] = true;
+                survivors.push(ordinal);
+            }
+            ordinal += 1;
+        }
+        assert_eq!(
+            survivors.len(),
+            SHARDS,
+            "ASSERT: ordinals cover every shard"
+        );
+        for ordinal in stale_heads.iter().chain(survivors.iter()) {
+            cache.insert(key(*ordinal), Arc::new(vec![9_u8; 4096]), 4096, 4096);
+        }
+        for ordinal in &stale_heads {
+            cache.remove(key(*ordinal));
+        }
+        // Each shard clock now begins with one stale key hiding one live owner.
+        cache.set_capacity(2 * charge);
+        assert!(
+            cache.protected_resident_bytes() <= cache.protected_exact_limit(),
+            "stale heads must not stop ceiling reclamation"
+        );
+        assert!(cache.common_resident_bytes() <= 2 * charge);
+        assert_eq!(cache.stats().resident_bytes, cache.common_resident_bytes());
+    }
+
+    #[test]
+    fn pinned_exact_membership_survives_capacity_and_pressure() {
+        let charge = 4096 + ENTRY_BYTES;
+        let membership = ReadCacheNamespace::isolated(ReadCacheClass::ExactMembership, 20 * charge);
+        let exact = membership.sibling(ReadCacheClass::ExactPage);
+        membership.insert(key(9), Arc::new(vec![9_u8; 4096]), 4096, 4096);
+        let pinned = membership.pinned_resident_bytes();
+        assert_eq!(pinned, charge);
+        assert_eq!(membership.common_resident_bytes(), 0);
+        assert_eq!(membership.protected_resident_bytes(), 0);
+
+        membership.set_capacity(0);
+        assert_eq!(*membership.get::<Vec<u8>>(key(9)).unwrap(), vec![9; 4096]);
+        assert_eq!(membership.pinned_resident_bytes(), pinned);
+
+        membership.set_capacity(20 * charge);
+        for ordinal in 0..25 {
+            exact.insert(key(ordinal), Arc::new(vec![7_u8; 4096]), 4096, 4096);
+        }
+        assert_eq!(*membership.get::<Vec<u8>>(key(9)).unwrap(), vec![9; 4096]);
+        assert_eq!(membership.pinned_resident_bytes(), pinned);
+        assert!(membership.protected_resident_bytes() <= membership.protected_exact_limit());
+        assert!(membership.common_resident_bytes() <= 20 * charge);
+    }
+
+    #[test]
+    fn pinned_exact_membership_admits_during_independent_recovery() {
+        let charge = 4096 + ENTRY_BYTES;
+        let membership = ReadCacheNamespace::isolated(ReadCacheClass::ExactMembership, charge);
+        let independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        membership.insert(key(1), Arc::new(vec![9_u8; 4096]), 4096, 4096);
+        drop(independent);
+        assert_eq!(*membership.peek::<Vec<u8>>(key(1)).unwrap(), vec![9; 4096]);
+        assert_eq!(membership.pinned_resident_bytes(), charge);
+        assert_eq!(membership.common_resident_bytes(), 0);
+    }
+
+    #[test]
+    fn tracked_namespace_drop_releases_the_common_ownership() {
+        let parent = ReadCacheNamespace::isolated(ReadCacheClass::ExactPage, 100_000);
+        let tracked = parent.ephemeral_sibling(ReadCacheClass::ExactPage);
+        let value = Arc::new(vec![1_u8; 100]);
+        tracked.insert_group(
+            (0..10)
+                .map(|ordinal| (key(ordinal), Arc::clone(&value), 100))
+                .collect(),
+            100,
+        );
+        assert_eq!(parent.common_resident_bytes(), 100 + 10 * ENTRY_BYTES);
+        drop(tracked);
+        assert_eq!(parent.common_resident_bytes(), 0);
+    }
+
+    #[test]
+    fn pressure_sampling_resamples_from_a_reused_thread_after_the_window() {
+        let charge = 4096 + ENTRY_BYTES;
+        let core = Core::new(charge, true);
+        core.refresh();
+        let armed = core.next_refresh.load(Ordering::Relaxed);
+        assert!(armed > 0, "ASSERT: the first sample arms the window");
+        core.refresh();
+        assert_eq!(
+            core.next_refresh.load(Ordering::Relaxed),
+            armed,
+            "one shared sample must rate-limit every caller within its window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        core.refresh();
+        assert!(
+            core.next_refresh.load(Ordering::Relaxed) > armed,
+            "a surviving thread must resample pressure once the window expires"
+        );
     }
 }

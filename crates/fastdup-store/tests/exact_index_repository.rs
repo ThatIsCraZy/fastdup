@@ -9,7 +9,9 @@ use fastdup_format::{
     ChunkId, ContainerId, ExactIndexEntry, ExactIndexLocation, ExactIndexProfileId, ExactIndexRun,
     ExactIndexRunRef, ExactIndexRunSet,
 };
-use fastdup_store::{ExactIndexRunRepository, ExactIndexStoreError, FsStorageIo, StorageIo};
+use fastdup_store::{
+    ExactIndexRunRepository, ExactIndexStoreError, FsStorageIo, MaintenanceCancellation, StorageIo,
+};
 
 fn test_root(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -746,4 +748,184 @@ fn compaction_streams_more_than_the_legacy_262_144_entry_limit() {
         assert!(lookup.complete());
         assert_eq!(lookup.candidates(), &[expected]);
     }
+}
+
+#[test]
+fn generation_drain_stop_is_distinct_from_integrity_failure() {
+    let root = test_root("retiring-generation-cancel");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xE5; 32]).expect("profile identity is nonzero");
+    let repository = ExactIndexRunRepository::new(
+        FsStorageIo::open(&root).expect("open workspace-local transition repository"),
+    );
+    repository
+        .append_level_zero(profile, vec![entry(9)])
+        .expect("activate the first exact generation");
+    let old_pin = repository
+        .pin_active_generation()
+        .expect("the first generation is installed");
+    repository
+        .append_level_zero(profile, vec![entry(11)])
+        .expect("activate the second exact generation");
+    let active_entry = entry(9);
+    let retiring = ExactIndexEntry::retiring(active_entry).expect("ACTIVE may retire");
+    let transition = repository
+        .append_level_zero(profile, vec![retiring])
+        .expect("activate the RETIRING barrier");
+    let drain = transition
+        .into_retired()
+        .expect("the first generation was displaced");
+    assert!(!drain.is_drained());
+
+    let cancellation = MaintenanceCancellation::new();
+    let waiter_cancellation = cancellation.clone();
+    let waiter = std::thread::spawn(move || drain.wait_cancellable(&waiter_cancellation));
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    cancellation.cancel();
+    let result = waiter.join().expect("drain worker does not panic");
+    assert!(result.is_err());
+    drop(old_pin);
+}
+
+#[test]
+fn retirement_cancellation_stops_before_any_exact_unlink() {
+    let root = test_root("retirement-cancel");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xEB; 32]).expect("profile identity is nonzero");
+    let storage = FsStorageIo::open(&root).expect("open workspace-local Exact repository");
+    let repository = ExactIndexRunRepository::new(storage.clone());
+    for ordinal in 1_u8..=250 {
+        let transition = repository
+            .append_level_zero(profile, vec![entry(ordinal)])
+            .expect("append one Exact Level-Zero Run");
+        if let Some(drain) = transition.into_retired() {
+            drain.wait();
+        }
+    }
+    let runs_before = storage
+        .list_names()
+        .expect("list Exact repository")
+        .into_iter()
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("fdx"))
+                && !name.starts_with('.')
+        })
+        .count();
+    assert!(runs_before > 100, "fixture leaves a historical Run tail");
+
+    let cancellation = MaintenanceCancellation::new();
+    cancellation.cancel();
+    let error = repository
+        .retire_unreferenced_cancellable(Some(&cancellation))
+        .expect_err("a cancelled sweep cannot consume deletion authority");
+    assert!(
+        error.is_cancelled(),
+        "stop is not integrity corruption: {error:?}"
+    );
+    let runs_after = storage
+        .list_names()
+        .expect("list Exact repository")
+        .into_iter()
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("fdx"))
+                && !name.starts_with('.')
+        })
+        .count();
+    assert_eq!(runs_before, runs_after, "cancellation unlinks nothing");
+}
+
+#[test]
+fn retirement_reclaims_out_of_window_runs_and_a_new_owner_still_recovers() {
+    let root = test_root("retirement-window");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove only this test's prior artifact");
+    }
+    let profile = ExactIndexProfileId::new([0xEA; 32]).expect("profile identity is nonzero");
+    let storage = FsStorageIo::open(&root).expect("open workspace-local Exact repository");
+    let repository = ExactIndexRunRepository::new(storage.clone());
+    for ordinal in 1_u8..=250 {
+        let transition = repository
+            .append_level_zero(profile, vec![entry(ordinal)])
+            .expect("append one Exact Level-Zero Run");
+        if let Some(drain) = transition.into_retired() {
+            drain.wait();
+        }
+    }
+    let exact_name_count = |suffix: &str| -> usize {
+        storage
+            .list_names()
+            .expect("list Exact repository")
+            .into_iter()
+            .filter(|name| name.ends_with(suffix) && !name.starts_with('.'))
+            .count()
+    };
+    let runs_before = exact_name_count(".fdx");
+    let sets_before = exact_name_count(".fdxset");
+    assert!(runs_before > 100, "fixture leaves a historical Run tail");
+
+    let report = repository
+        .retire_unreferenced()
+        .expect("retire out-of-window Exact objects");
+    assert!(
+        report.runs_removed() > 0 && report.run_sets_removed() > 0,
+        "the window tail retires: {report:?}"
+    );
+    assert_eq!(
+        exact_name_count(".fdx"),
+        runs_before - usize::try_from(report.runs_removed()).expect("count fits usize"),
+        "every reported unlink removed exactly one canonical Run"
+    );
+
+    let survivors = storage
+        .list_names()
+        .expect("list after retirement")
+        .into_iter()
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("fdx"))
+                && !name.starts_with('.')
+        })
+        .collect::<Vec<_>>();
+    for name in survivors {
+        let generation =
+            u64::from_str_radix(&name[65..81], 16).expect("canonical canonical Run generation");
+        repository
+            .audit(profile, generation)
+            .expect("every surviving Run remains fully auditable");
+    }
+
+    for expected in [entry(1), entry(250)] {
+        let fresh_owner = ExactIndexRunRepository::new(storage.clone());
+        let active = fresh_owner
+            .recover_active_generation()
+            .expect("recover after retirement")
+            .expect("selection survived retirement");
+        let lookup = active
+            .lookup_transitions(expected.chunk_id(), expected.logical_length())
+            .expect("post-retirement lookup succeeds");
+        assert!(lookup.complete());
+        assert_eq!(lookup.candidates(), &[expected]);
+    }
+
+    let repeat = repository
+        .retire_unreferenced()
+        .expect("retirement is replay-idempotent");
+    assert_eq!(
+        (repeat.runs_removed(), repeat.run_sets_removed()),
+        (0, 0),
+        "a second sweep with unchanged references removes nothing"
+    );
+    assert_eq!(
+        exact_name_count(".fdxset"),
+        sets_before - usize::try_from(report.run_sets_removed()).expect("count fits usize")
+    );
 }

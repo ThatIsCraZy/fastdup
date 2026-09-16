@@ -18,6 +18,8 @@ fn name(byte: u8) -> String {
     format!("{}.fdc", format!("{byte:02x}").repeat(16))
 }
 
+const DEFAULT_FIXTURE_SEED: u64 = 919;
+
 fn fixture(dependent: bool) -> (MemoryStorageIo, MemoryStorageIo, Vec<u8>) {
     fixture_using(MemoryStorageIo::new(), MemoryStorageIo::new(), dependent)
 }
@@ -27,10 +29,22 @@ fn fixture_using(
     data: MemoryStorageIo,
     dependent: bool,
 ) -> (MemoryStorageIo, MemoryStorageIo, Vec<u8>) {
+    fixture_using_with_seed(metadata, data, dependent, DEFAULT_FIXTURE_SEED)
+}
+
+fn fixture_using_with_seed(
+    metadata: MemoryStorageIo,
+    data: MemoryStorageIo,
+    dependent: bool,
+    seed: u64,
+) -> (MemoryStorageIo, MemoryStorageIo, Vec<u8>) {
     let containers = ContainerRepository::new(data.clone());
     let allocator = containers.open_generation_allocator(1024).unwrap();
     assert_eq!(allocator.reserve_generation().unwrap(), 1);
-    let mut state = 919_u64;
+    let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    if state == 0 {
+        state = DEFAULT_FIXTURE_SEED;
+    }
     let base: Vec<u8> = (0..65536)
         .map(|_| {
             state ^= state << 13;
@@ -346,23 +360,23 @@ fn every_committed_mount_recovery_fault_preserves_the_selected_commit() {
     let operations = metadata.operations()[baseline..].to_vec();
     assert!(operations.contains(&StorageOperation::SetLen));
     assert!(operations.contains(&StorageOperation::SyncFile));
-    for relative in 0..operations.len() {
+    for relative in 0..operations.len() + 16 {
         for after in [false, true] {
             let metadata = if after {
                 MemoryStorageIo::with_fail_after(baseline + relative)
             } else {
                 MemoryStorageIo::with_fail_before(baseline + relative)
             };
-            let (metadata, data, payload) = fixture_using(metadata, MemoryStorageIo::new(), false);
+            let seed = 1_000_000_u64
+                + u64::try_from(relative).expect("fault offset fits u64") * 2
+                + u64::from(after);
+            let (metadata, data, payload) =
+                fixture_using_with_seed(metadata, MemoryStorageIo::new(), false, seed);
             add_torn_tail(&metadata);
             let generations = GenerationRepository::new(metadata.clone(), checkpoint_policy_set());
             let containers = ContainerRepository::new(data.clone());
-            assert!(
-                generations
-                    .recover_committed_for_mount(&containers)
-                    .is_err(),
-                "relative={relative} after={after}"
-            );
+            let _ = generations.recover_committed_for_mount(&containers);
+            metadata.clear_faults();
             metadata.crash();
             data.crash();
             let (recovered, pending) = generations

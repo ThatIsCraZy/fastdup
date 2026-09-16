@@ -1590,7 +1590,7 @@ fn partial_update_rechunks_only_the_affected_recipe_and_recovers_byte_exact() {
     assert_eq!(read_named_all(&recovered, b"recipe-boundary"), expected);
 }
 
-/// A tiny overwrite keeps the old DATA edges as DATA_SLICE recipes. The
+/// A tiny overwrite keeps the old DATA edges as `DATA_SLICE` recipes. The
 /// checkpoint therefore does not reread the untouched predecessor bytes.
 #[test]
 fn partial_overwrite_preserves_cold_data_edges_without_reads() {
@@ -2009,6 +2009,7 @@ fn lane_reset_keeps_frozen_recipes_without_replacing_a_later_overwrite() {
     let replacement = vec![19; 1024 * 1024];
     write_at(&appliance, inode, handle, 12 * 1024 * 1024, &replacement);
     let committed = appliance.checkpoint_profiled().unwrap().unwrap();
+    eprintln!("temporary metrics: {:?}", committed.metrics());
     assert!(committed.metrics().checkpoint_rechunk_bytes() <= 1024 * 1024);
     assert_recovered_indexed_prefix(
         metadata.clone(),
@@ -2431,4 +2432,50 @@ fn partial_publication_failure_preserves_the_frozen_token_and_retry_bytes() {
     metadata.crash();
     data.crash();
     assert_recovered_prefix(metadata, data, inode, &block.repeat(16));
+}
+
+#[test]
+fn commit_cut_batches_stable_partial_lanes_into_one_container() {
+    let metadata = MemoryStorageIo::new();
+    let data = MemoryStorageIo::new();
+    let indexes = MemoryStorageIo::new();
+    let appliance = open_appliance_on(metadata.clone(), data.clone(), indexes.clone());
+    let names = [b"batch-a.iso", b"batch-b.iso", b"batch-c.iso"];
+    let source = pseudo_random_bytes(3 * 4 * 1024 * 1024);
+    for (file_index, name) in names.iter().enumerate() {
+        let (inode, handle) = create_file(&appliance, name.as_slice());
+        for ordinal in 0..4_u64 {
+            let start = (file_index * 4 + usize::try_from(ordinal).unwrap()) * 1024 * 1024;
+            write_one_mebibyte(
+                &appliance,
+                inode,
+                handle,
+                ordinal,
+                &source[start..start + 1024 * 1024],
+            );
+        }
+        fence_ingest(&appliance, inode, handle);
+    }
+    let committed = appliance
+        .checkpoint_profiled()
+        .expect("checkpoint partial write-through lanes")
+        .expect("the partial lanes are dirty");
+    let mut container_lengths = data
+        .list_names()
+        .expect("list DATA tier")
+        .into_iter()
+        .filter(|name| std::path::Path::new(name).extension() == Some(std::ffi::OsStr::new("fdc")))
+        .map(|name| data.object_len(&name).expect("Container length"))
+        .collect::<Vec<_>>();
+    container_lengths.sort_unstable();
+    assert!(
+        container_lengths.len() <= 2,
+        "partial Lanes may add at most the bounded cut Container: {container_lengths:?} metrics: {:?}",
+        committed.metrics()
+    );
+    assert!(
+        container_lengths.last().copied().unwrap_or_default() >= 8 * 1024 * 1024,
+        "distinct partial Lanes must share one large Container: {container_lengths:?} metrics: {:?}",
+        committed.metrics()
+    );
 }

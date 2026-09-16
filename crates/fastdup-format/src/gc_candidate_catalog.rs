@@ -4,6 +4,7 @@ use crate::{ContainerId, ContainerIntrinsicSummary, crc32c_with_zeroed_u32};
 
 pub const GC_CANDIDATE_CATALOG_HEADER_BYTES: usize = 4_096;
 pub const GC_CANDIDATE_CATALOG_ROW_BYTES: usize = 96;
+pub const GC_FILL_COMPACTION_PHYSICAL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 const HEADER_MAGIC: [u8; 8] = *b"FDGCC001";
 const FOOTER_MAGIC: [u8; 8] = *b"FDGCF001";

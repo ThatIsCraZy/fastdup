@@ -179,7 +179,7 @@ impl GenerationMetadataGcSummary {
 pub(crate) struct GenerationLivenessProof {
     pub(super) summary: GenerationScrubSummary,
     pub(super) online_records: Vec<CommitRecord>,
-    pub(super) online_chunks: BTreeMap<fastdup_format::ChunkId, u64>,
+    pub(super) protected_chunks: BTreeMap<fastdup_format::ChunkId, u64>,
     pub(super) pinned_roots: BTreeSet<MetadataObjectId>,
     pub(super) recovery_checkpoint_roots: BTreeSet<MetadataObjectId>,
 }
@@ -227,8 +227,8 @@ impl GenerationLivenessProof {
         self.summary
     }
 
-    pub(crate) fn online_chunks(&self) -> &BTreeMap<fastdup_format::ChunkId, u64> {
-        &self.online_chunks
+    pub(crate) fn protected_chunks(&self) -> &BTreeMap<fastdup_format::ChunkId, u64> {
+        &self.protected_chunks
     }
 
     pub(crate) fn extend_protected_chunks(
@@ -236,7 +236,7 @@ impl GenerationLivenessProof {
         additional: BTreeMap<fastdup_format::ChunkId, u64>,
     ) -> Result<(), GenerationError> {
         for (chunk_id, logical_length) in additional {
-            if let Some(previous) = self.online_chunks.insert(chunk_id, logical_length)
+            if let Some(previous) = self.protected_chunks.insert(chunk_id, logical_length)
                 && previous != logical_length
             {
                 return Err(GenerationError::ManifestChunkLengthConflict {

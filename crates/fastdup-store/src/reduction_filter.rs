@@ -94,14 +94,12 @@ pub struct BlockedBloomHint {
 }
 
 impl BlockedBloomHint {
-    /// Creates a power-of-two block table within an explicit byte budget.
+    /// Returns the block-payload bytes one filter requires.
     ///
     /// # Errors
     ///
-    /// Returns an error for zero capacity, arithmetic overflow, insufficient
-    /// budget, or allocation failure. The budget accounts for block payloads;
-    /// the small owning `Box` descriptor is not included.
-    pub fn new(expected_keys: usize, maximum_bytes: usize) -> Result<Self, HintStructureError> {
+    /// Returns an error for zero capacity or arithmetic overflow.
+    pub fn required_bytes(expected_keys: usize) -> Result<usize, HintStructureError> {
         if expected_keys == 0 {
             return Err(HintStructureError::ZeroCapacity);
         }
@@ -112,10 +110,21 @@ impl BlockedBloomHint {
         let block_count = minimum_blocks
             .checked_next_power_of_two()
             .ok_or(HintStructureError::CapacityOverflow)?;
-        let required_bytes = block_count
+        block_count
             .checked_mul(BLOOM_BYTES_PER_BLOCK)
-            .ok_or(HintStructureError::CapacityOverflow)?;
-        ensure_budget(required_bytes, maximum_bytes)?;
+            .ok_or(HintStructureError::CapacityOverflow)
+    }
+
+    /// Creates a power-of-two block table within an explicit byte budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero capacity, arithmetic overflow, insufficient
+    /// budget, or allocation failure. The budget accounts for block payloads;
+    /// the small owning `Box` descriptor is not included.
+    pub fn new(expected_keys: usize, maximum_bytes: usize) -> Result<Self, HintStructureError> {
+        let block_count = Self::required_bytes(expected_keys)? / BLOOM_BYTES_PER_BLOCK;
+        ensure_budget(block_count * BLOOM_BYTES_PER_BLOCK, maximum_bytes)?;
         let blocks = LongLivedArena::try_filled(block_count, BloomBlock::default())
             .map_err(|_| HintStructureError::AllocationFailed)?;
         Ok(Self {

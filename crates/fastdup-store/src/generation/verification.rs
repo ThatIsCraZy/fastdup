@@ -43,6 +43,26 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
         &self,
         required: &BTreeMap<fastdup_format::ChunkId, u64>,
     ) -> Result<(), StoreError> {
+        // One ascending batch resolves every selectable Exact hint with
+        // merged page-span reads; per-key semantics and fallbacks are intact
+        // when bounds are absent or the batch fails.
+        let keys: Vec<(fastdup_format::ChunkId, u32)> = required
+            .iter()
+            .filter_map(|(chunk_id, logical_length)| {
+                u32::try_from(*logical_length)
+                    .ok()
+                    .map(|length| (*chunk_id, length))
+            })
+            .collect();
+        let prefetched: Option<std::collections::HashMap<_, crate::ExactIndexLookup>> =
+            if keys.is_empty() {
+                None
+            } else {
+                self.index
+                    .lookup_transitions_batch(&keys)
+                    .ok()
+                    .map(|lookups| keys.iter().copied().zip(lookups).collect())
+            };
         // A missing hint must not restart already verified Records or bypass
         // later valid hints. Retain failed identities, not another full graph.
         let mut missing = BTreeMap::new();
@@ -52,10 +72,15 @@ impl<C: StorageIo, X: StorageIo> RequiredChunkVerifier for IndexedRequiredChunkV
                 continue;
             }
             let lookup = u32::try_from(*logical_length).ok().and_then(|length| {
-                self.index
-                    .lookup_transitions(*chunk_id, length)
-                    .ok()
-                    .map(|lookup| (length, lookup))
+                let prefetched = prefetched
+                    .as_ref()
+                    .and_then(|resolved| resolved.get(&(*chunk_id, length)).cloned());
+                prefetched.map(|lookup| (length, lookup)).or_else(|| {
+                    self.index
+                        .lookup_transitions(*chunk_id, length)
+                        .ok()
+                        .map(|lookup| (length, lookup))
+                })
             });
             let Some((index_length, lookup)) = lookup else {
                 missing.insert(*chunk_id, *logical_length);

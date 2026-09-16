@@ -250,7 +250,9 @@ fn online_gc_reuses_warm_graph_bytes_but_keeps_current_generation_binding() {
             .sum::<u64>()
     };
     let before = reads();
-    let proof = repo.scan_online_liveness().unwrap();
+    let proof = repo
+        .scan_online_liveness_for_candidates(&std::collections::BTreeSet::new())
+        .unwrap();
     assert_eq!(reads(), before, "Online GC must reuse the admitted graph");
     assert!(repo.gc_proof_is_current(&proof).unwrap());
     repo.commit_namespace(&namespace).unwrap();

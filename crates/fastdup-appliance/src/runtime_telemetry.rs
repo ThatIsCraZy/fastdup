@@ -104,6 +104,8 @@ pub fn gc_finished(result: &Result<OnlineGcCycleReport, String>) {
         Ok(report) => {
             let m = report.metrics();
             let state = match report.outcome() {
+                OnlineGcCycleOutcome::MetadataOnly => "metadataOnly",
+                OnlineGcCycleOutcome::DataOnly => "dataOnly",
                 OnlineGcCycleOutcome::NoCandidates => "noCandidates",
                 OnlineGcCycleOutcome::NoProfitableCandidates => "noProfitableCandidates",
                 OnlineGcCycleOutcome::CatalogRebuilt => "catalogRebuilt",
@@ -128,6 +130,15 @@ pub fn gc_cancelled() {
     }
 }
 
+static EXACT_WARM: Mutex<Option<Value>> = Mutex::new(None);
+
+pub fn record_exact_warm(value: Value) {
+    if let Ok(mut last) = EXACT_WARM.lock() {
+        *last = Some(value);
+    }
+}
+
+#[allow(clippy::too_many_lines, reason = "management snapshot projection")]
 pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value {
     let admission = appliance.namespace().admission_status();
     let pipeline: Vec<_> = appliance
@@ -145,6 +156,7 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
     let io = storage.inner.status();
     let read = appliance.verified_read_cache_status();
     let exact = appliance.exact_index_page_cache_status();
+    let membership = appliance.exact_run_membership_status();
     let similarity = appliance.similarity_index_page_cache_status();
     let descriptors = appliance.container_descriptor_cache_status();
     let reduction = appliance.advanced_reduction_status();
@@ -201,6 +213,17 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
             "maxWorkingBytes":read.codec_max_working_bytes()
         },
         "scrub": SCRUB.lock().ok().and_then(|status| status.clone()),
+        "exactCache": {"protectedLimitBytes":exact.protected_limit_bytes(),
+            "protectedResidentBytes":exact.protected_resident_bytes()},
+        "exactMembership": {"leasedRuns":membership.leased_run_count(),
+            "filters":membership.filter_count(),"constructedFilters":membership.constructed_filter_count(),
+            "missingFilters":membership.missing_filter_count(),
+            "pageBoundsRuns":membership.leased_run_count_with_bounds(),
+            "missingPageBounds":membership.missing_page_bounds_count(),
+            "pageBoundsBytes":membership.leased_page_bounds_bytes(),
+            "probes":membership.probes(),"definitelyAbsent":membership.definitely_absent(),
+            "requiresExactLookup":membership.requires_exact_lookup()},
+        "exactWarm": EXACT_WARM.lock().ok().and_then(|status| status.clone()),
         "runtimeId": format!("{}", std::process::id()),
         "ioUring": {"ringEntries":io.ring_entries(), "inflightBytes":io.inflight_bytes(),
             "maxInflightBytes":io.max_inflight_bytes(), "peakInflightBytes":io.peak_inflight_bytes(),
@@ -208,7 +231,7 @@ pub fn snapshot(appliance: &FsAppliance, storage: &TelemetryStorageIo) -> Value 
         "caches": [
             {"id":"locationProofs", "hits":read.location_proofs().hits, "misses":read.location_proofs().misses, "evictions":read.location_proofs().evictions, "residentBytes":read.location_proofs().resident_bytes},
             {"id":"verifiedRead", "hits":read.hits(), "misses":read.misses(), "evictions":read.evictions(), "residentBytes":read.resident_bytes()},
-            {"id":"exactIndex", "hits":exact.hits(), "misses":exact.misses(), "evictions":exact.evictions(), "residentPages":exact.resident_pages()},
+            {"id":"exactIndex", "hits":exact.hits(), "misses":exact.misses(), "evictions":exact.evictions(), "residentPages":exact.resident_pages(), "protectedLimitBytes":exact.protected_limit_bytes(), "protectedResidentBytes":exact.protected_resident_bytes()},
             {"id":"similarityIndex", "hits":similarity.hits(), "misses":similarity.misses(), "evictions":similarity.evictions(), "residentPages":similarity.resident_pages()},
             {"id":"containerDescriptors", "hits":descriptors.hits(), "misses":descriptors.misses(), "evictions":descriptors.evictions(), "residentBytes":descriptors.resident_bytes()},
             {"id":"historicalProofs", "hits":history.hits(), "misses":history.misses(), "evictions":history.evictions(), "residentBytes":history.resident_bytes()}

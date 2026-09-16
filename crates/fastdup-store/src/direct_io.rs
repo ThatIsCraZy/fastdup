@@ -1,10 +1,12 @@
 //! Alignment-safe repository I/O. No buffered fallback, file mapping, or
 //! page-cache advice. The aligned v1 storage envelope keeps logical length
 //! separate from physical EOF, avoiding XFS buffered truncate-tail zeroing.
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 const QUANTUM: usize = 1024 * 1024;
 const BLOCK: usize = 4096;
@@ -16,6 +18,8 @@ thread_local! {
     pub(crate) static READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static WRITE_EDGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static LENGTH_HEAD_SYNC_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -143,7 +147,7 @@ pub(crate) fn read_with_layout(
     read_physical(file, physical, length)
 }
 
-fn set_head(file: &File, previous: Layout, length: u64) -> io::Result<Layout> {
+fn set_head(file: &File, previous: Layout, length: u64, sync_head: bool) -> io::Result<Layout> {
     let generation = previous
         .generation
         .checked_add(1)
@@ -154,10 +158,15 @@ fn set_head(file: &File, previous: Layout, length: u64) -> io::Result<Layout> {
         slot as u64 * BLOCK as u64,
         &header(generation, length),
     )?;
-    // Make this body/head pair durable before a following mutation may reuse
-    // its predecessor slot. Multiple writes between outer sync_file calls
-    // must never overwrite both previously durable length heads.
-    file.sync_data()?;
+    // Published objects must make this body/head pair durable before another
+    // mutation may reuse its predecessor slot. Unpublished temporary objects
+    // defer this barrier: they are untrusted until the final sync_file and
+    // directory-synchronized rename.
+    if sync_head {
+        file.sync_data()?;
+        #[cfg(test)]
+        LENGTH_HEAD_SYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
     Ok(Layout {
         length,
         generation,
@@ -189,6 +198,41 @@ pub(crate) fn write_with_layout(
     offset: u64,
     bytes: &[u8],
 ) -> io::Result<Layout> {
+    write_with_layout_and_head(file, previous, offset, bytes, true)
+}
+
+pub(crate) fn write_temp_with_layout(
+    file: &File,
+    previous: Layout,
+    offset: u64,
+    bytes: &[u8],
+) -> io::Result<Layout> {
+    write_with_layout_and_head(file, previous, offset, bytes, false)
+}
+
+pub(crate) fn set_len_with_layout(
+    file: &File,
+    previous: Layout,
+    length: u64,
+) -> io::Result<Layout> {
+    set_len_with_layout_and_head(file, previous, length, true)
+}
+
+pub(crate) fn set_len_temp_with_layout(
+    file: &File,
+    previous: Layout,
+    length: u64,
+) -> io::Result<Layout> {
+    set_len_with_layout_and_head(file, previous, length, false)
+}
+
+fn write_with_layout_and_head(
+    file: &File,
+    previous: Layout,
+    offset: u64,
+    bytes: &[u8],
+    sync_head: bool,
+) -> io::Result<Layout> {
     if bytes.is_empty() {
         return Ok(previous);
     }
@@ -212,15 +256,16 @@ pub(crate) fn write_with_layout(
         bytes,
     )?;
     if end > previous.length {
-        return set_head(file, previous, end);
+        return set_head(file, previous, end, sync_head);
     }
     Ok(previous)
 }
 
-pub(crate) fn set_len_with_layout(
+fn set_len_with_layout_and_head(
     file: &File,
     previous: Layout,
     length: u64,
+    sync_head: bool,
 ) -> io::Result<Layout> {
     if !previous.wrapped {
         return Err(io::Error::new(
@@ -244,7 +289,7 @@ pub(crate) fn set_len_with_layout(
     if length < previous.length && length < rounded {
         zero(file, length, rounded)?;
     }
-    let next = set_head(file, previous, length)?;
+    let next = set_head(file, previous, length, sync_head)?;
     file.set_len(
         PAYLOAD_OFFSET
             .checked_add(rounded)
@@ -314,6 +359,29 @@ impl Alignment {
         }
         Ok(Self { memory, offset })
     }
+
+    /// DIOALIGN and the 4-KiB XFS block requirement are per-filesystem facts that
+    /// never change while one of its files is open here. Verify each device
+    /// once and reuse the result instead of paying a statx plus fstatfs syscall
+    /// pair on every read or write. The caller supplies `dev` from a metadata
+    /// call it performs anyway.
+    fn cached(file: &File, dev: u64) -> io::Result<Self> {
+        static ALIGNMENTS: OnceLock<Mutex<HashMap<u64, Alignment>>> = OnceLock::new();
+        let alignments = ALIGNMENTS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(alignment) = alignments
+            .lock()
+            .expect("ASSERT: Direct I/O alignment cache lock poisoned")
+            .get(&dev)
+        {
+            return Ok(*alignment);
+        }
+        let alignment = Self::read(file)?;
+        alignments
+            .lock()
+            .expect("ASSERT: Direct I/O alignment cache lock poisoned")
+            .insert(dev, alignment);
+        Ok(alignment)
+    }
 }
 
 struct Buffer {
@@ -380,10 +448,11 @@ fn read_aligned(
 }
 
 fn read_physical(file: &File, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+    let metadata = file.metadata()?;
     let end = offset
         .checked_add(length as u64)
         .ok_or(io::ErrorKind::InvalidInput)?;
-    if end > file.metadata()?.len() {
+    if end > metadata.len() {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     let mut output = Vec::new();
@@ -393,7 +462,7 @@ fn read_physical(file: &File, offset: u64, length: usize) -> io::Result<Vec<u8>>
     if length == 0 {
         return Ok(output);
     }
-    let alignment = Alignment::read(file)?;
+    let alignment = Alignment::cached(file, metadata.dev())?;
     let mut position = offset;
     while position < end {
         let amount = usize::try_from((end - position).min(QUANTUM as u64))
@@ -421,8 +490,9 @@ fn write_physical(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
     offset
         .checked_add(bytes.len() as u64)
         .ok_or(io::ErrorKind::InvalidInput)?;
-    let original_length = file.metadata()?.len();
-    let mut alignment = Alignment::read(file)?;
+    let metadata = file.metadata()?;
+    let original_length = metadata.len();
+    let mut alignment = Alignment::cached(file, metadata.dev())?;
     alignment.offset = alignment.offset.max(BLOCK);
     let mut position = offset;
     let mut source = bytes;
@@ -584,6 +654,47 @@ mod tests {
     }
 
     #[test]
+    fn unpublished_temp_length_heads_defer_storage_sync_until_publish() {
+        let fixture = Fixture::new();
+        let file = fixture.file();
+        let first = vec![11; QUANTUM];
+        let second = vec![22; QUANTUM];
+        let tail = vec![33; BLOCK];
+        let expected_length = 2 * QUANTUM as u64 + BLOCK as u64;
+
+        let syncs = || LENGTH_HEAD_SYNC_CALLS.with(std::cell::Cell::get);
+        let before_unpublished = syncs();
+        let layout = write_temp_with_layout(&file, layout(&file).unwrap(), 0, &first).unwrap();
+        let layout = write_temp_with_layout(&file, layout, QUANTUM as u64, &second).unwrap();
+        let layout = write_temp_with_layout(&file, layout, 2 * QUANTUM as u64, &tail).unwrap();
+        let layout = set_len_temp_with_layout(&file, layout, expected_length).unwrap();
+        assert_eq!(layout.length, expected_length);
+        assert_eq!(
+            syncs() - before_unpublished,
+            0,
+            "an unpublished temporary object must not synchronize each intermediate length head"
+        );
+        assert_eq!(read_with_layout(&file, layout, 0, QUANTUM).unwrap(), first);
+        assert_eq!(
+            read_with_layout(&file, layout, QUANTUM as u64, QUANTUM).unwrap(),
+            second
+        );
+        assert_eq!(
+            read_with_layout(&file, layout, 2 * QUANTUM as u64, BLOCK).unwrap(),
+            tail
+        );
+
+        let before_published = syncs();
+        let layout = write_with_layout(&file, layout, expected_length, b"published").unwrap();
+        assert_eq!(layout.length, expected_length + 9);
+        assert_eq!(
+            syncs() - before_published,
+            1,
+            "a published mutation must synchronize its body and length head as one durable update"
+        );
+    }
+
+    #[test]
     fn independent_reads_obtain_storage_heads_once_per_operation() {
         let fixture = Fixture::new();
         fixture
@@ -652,7 +763,7 @@ mod tests {
         write_physical(&file, (1 - previous.slot) as u64 * BLOCK as u64, &torn).unwrap();
         file.sync_data().unwrap();
         assert_eq!(object_len(&file).unwrap(), previous.length);
-        set_head(&file, previous, previous.length + 11).unwrap();
+        set_head(&file, previous, previous.length + 11, true).unwrap();
         assert_eq!(read(&file, 0, 23).unwrap(), b"acknowledgeduncommitted");
     }
 

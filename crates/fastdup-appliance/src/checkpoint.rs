@@ -1787,7 +1787,8 @@ where
         X: Clone + Send + Sync + StorageIo + 'static,
     {
         let read_cache = Arc::new(VerifiedReadCache::new_system()?);
-        let recovered = indexes.recover_active_generation().and_then(|active| {
+        let exact_started = Instant::now();
+        let recovered = indexes.pin_recovered_generation().and_then(|active| {
             if let Some(index) = &active {
                 let retiring = indexes.retiring_containers(index)?;
                 containers.install_retiring_selection_barrier(&retiring);
@@ -1796,6 +1797,12 @@ where
         });
         let initially_degraded = recovered.is_err();
         let active = recovered.ok().flatten();
+        eprintln!(
+            "recovery_phase=exact_active state=complete elapsed_ms={} runs={} degraded={}",
+            exact_started.elapsed().as_millis(),
+            active.as_ref().map_or(0, |active| active.run_count()),
+            initially_degraded
+        );
         let online =
             similarities.and_then(
                 |repository| match fastdup_store::OnlineSimilarityRepository::open(
@@ -2163,6 +2170,15 @@ where
         let mut result = self.checkpoint_timings.snapshots();
         result.extend(self.manifest_readers.publication_timings());
         result
+    }
+
+    /// Returns whether a checkpoint currently owns the serialization lock.
+    ///
+    /// The result is transient. Callers may use it only to avoid admitting new
+    /// maintenance work; it never replaces a lock or a durable state decision.
+    #[must_use]
+    pub fn checkpoint_lock_is_held(&self) -> bool {
+        self.checkpoint_lock.try_lock().is_err()
     }
 
     /// Commits the same durable prefix as [`Self::checkpoint`] and returns

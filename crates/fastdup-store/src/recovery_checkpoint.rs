@@ -218,8 +218,9 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         Ok((summary, protected))
     }
 
-    pub(crate) fn protected_chunks(
+    pub(crate) fn protected_chunks_matching(
         &self,
+        selected_chunks: &BTreeSet<ChunkId>,
     ) -> Result<BTreeMap<ChunkId, u64>, RecoveryCheckpointError> {
         let mut protected = BTreeMap::new();
         let mut complete = 0_usize;
@@ -229,7 +230,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
                 Err(error) if error.is_candidate_corruption() => continue,
                 Err(error) => return Err(error),
             };
-            let (_, required) = match self.scan_graph(&audited) {
+            let (_, required) = match self.scan_graph_matching(&audited, selected_chunks) {
                 Ok(scanned) => scanned,
                 Err(error) if error.is_candidate_corruption() => continue,
                 Err(error) => return Err(error),
@@ -819,6 +820,76 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
                         } => (chunk_id, u64::from(chunk_length)),
                         ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => return Ok(()),
                     };
+                    if let Some(previous) = required.insert(chunk_id, logical_length)
+                        && previous != logical_length
+                    {
+                        length_conflict = Some((chunk_id, previous, logical_length));
+                    }
+                    Ok(())
+                },
+            )?;
+            if summary.logical_size() != inode.logical_size() {
+                return Err(RecoveryCheckpointError::IdentityMismatch);
+            }
+        }
+        if length_conflict.is_some() || !reachable.iter().eq(checkpoint.objects.keys()) {
+            return Err(RecoveryCheckpointError::IdentityMismatch);
+        }
+        Ok((root, required))
+    }
+
+    fn scan_graph_matching(
+        &self,
+        checkpoint: &AuditedCheckpoint,
+        selected_chunks: &BTreeSet<ChunkId>,
+    ) -> Result<(NamespaceRoot, BTreeMap<ChunkId, u64>), RecoveryCheckpointError> {
+        let encoded_root = self.read_object(checkpoint, checkpoint.record.namespace_root())?;
+        let descriptor = NamespaceGraphRoot::decode(&encoded_root)?;
+        let mut encoded_shards = BTreeMap::new();
+        for reference in descriptor.shards() {
+            let shard_id = reference.object_id();
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                encoded_shards.entry(shard_id)
+            {
+                entry.insert(self.read_object(checkpoint, shard_id)?);
+            }
+        }
+        let root = NamespaceRoot::decode_graph(&encoded_root, &encoded_shards)?;
+        if root.namespace_mutation_sequence() != checkpoint.record.namespace_mutation_cutoff()
+            || root.inode_reservation_end() != checkpoint.record.inode_reservation_end()
+            || root.inode_allocation_cursor() != checkpoint.record.inode_allocation_cursor()
+        {
+            return Err(RecoveryCheckpointError::IdentityMismatch);
+        }
+        let mut reachable = BTreeSet::new();
+        reachable.insert(checkpoint.record.namespace_root());
+        reachable.extend(encoded_shards.keys().copied());
+        let mut required = BTreeMap::new();
+        let mut length_conflict = None;
+        for inode in root.file_inodes() {
+            let summary = scan_manifest_tree(
+                inode.manifest_root(),
+                |object_id| {
+                    reachable.insert(object_id);
+                    self.read_object(checkpoint, object_id)
+                        .map_err(map_checkpoint_manifest_error)
+                },
+                |_logical_offset, extent| {
+                    let (chunk_id, logical_length) = match *extent {
+                        ManifestExtent::Data {
+                            logical_length,
+                            chunk_id,
+                        } => (chunk_id, logical_length),
+                        ManifestExtent::DataSlice {
+                            chunk_id,
+                            chunk_length,
+                            ..
+                        } => (chunk_id, u64::from(chunk_length)),
+                        ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => return Ok(()),
+                    };
+                    if !selected_chunks.contains(&chunk_id) {
+                        return Ok(());
+                    }
                     if let Some(previous) = required.insert(chunk_id, logical_length)
                         && previous != logical_length
                     {

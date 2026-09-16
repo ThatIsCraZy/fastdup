@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.7.4
-Release:        18%{?dist}
+Release: 50%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -40,7 +40,7 @@ install -d \
     %{buildroot}%{_libexecdir}/fastdup \
     %{buildroot}%{_libdir}/samba/vfs \
     %{buildroot}%{_bindir} \
-    %{buildroot}%{_unitdir} \
+    %{buildroot}%{_unitdir}/smb.service.d \
     %{buildroot}%{_sysusersdir} \
     %{buildroot}%{_tmpfilesdir} \
     %{buildroot}%{_sysctldir} \
@@ -52,7 +52,8 @@ install -m 0755 bin/fastdup-control %{buildroot}%{_libexecdir}/fastdup/
 install -m 0755 bin/fastdup-agent %{buildroot}%{_libexecdir}/fastdup/
 install -m 0755 bin/fastdup-maintenance %{buildroot}%{_bindir}/
 install -m 0755 samba-vfs/fastdup.so %{buildroot}%{_libdir}/samba/vfs/
-install -m 0644 systemd/* %{buildroot}%{_unitdir}/
+install -m 0644 systemd/fastdup-agent.service systemd/fastdup-control.service systemd/fastdup-maintenance@.service systemd/fastdup-management.slice systemd/fastdup-repository.service systemd/fastdup-storage.slice %{buildroot}%{_unitdir}/
+install -m 0644 systemd/smb.service.d/20-fastdup.conf %{buildroot}%{_unitdir}/smb.service.d/
 install -m 0644 sysusers.d/fastdup-control.conf %{buildroot}%{_sysusersdir}/
 install -m 0644 tmpfiles.d/fastdup.conf %{buildroot}%{_tmpfilesdir}/
 install -m 0644 sysctl.d/90-fastdup-io-uring.conf %{buildroot}%{_sysctldir}/
@@ -100,6 +101,7 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %{_unitdir}/fastdup-repository.service
 %{_unitdir}/fastdup-management.slice
 %{_unitdir}/fastdup-storage.slice
+%{_unitdir}/smb.service.d/20-fastdup.conf
 %{_sysusersdir}/fastdup-control.conf
 %{_tmpfilesdir}/fastdup.conf
 %{_sysctldir}/90-fastdup-io-uring.conf
@@ -108,6 +110,167 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-50
+- Treat a missing Container in the advisory GC candidate queue as an absent hint
+  instead of a proof failure, so fill-compaction shortlists cannot block Online-GC
+  behind stale catalog rows.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-49
+- Rank aged, active, sub-4 MiB Containers as fill-compaction candidates and retain
+  their Demand-published images in the unified cache. Independent maintenance proof
+  reads remain independent of the image pool.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-48
+- Cancel Online-GC contention only when durable progress is stalled or
+  mutation admission is closed, so healthy background GC is not aborted by every
+  short checkpoint cycle.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-47
+- Give each shared-publication member its own retirement fence. A shared group
+  now blocks only through its group barrier; members no longer wait for the
+  highest ordinal among unrelated group participants.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-46
+- Cancel Online-GC contention while checkpoint work owns durable progress and
+  back off canceled quanta, while reporting repeated publication-retirement
+  waits with bounded queue-state diagnostics.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-43
+- Charge pinned ExactMembership against shared cache headroom without counting
+  it toward the evictable unified-cache target, preventing the recovery lease
+  assertion introduced by Build 41.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-42
+- Populate pinned ExactMembership during Independent and Scan recovery by
+  exempting only that class from ordinary admission bypass; all other cache
+  intents remain unchanged.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-41
+- Keep active-Run ExactMembership filters pinned in the unified read cache:
+  pressure, swap and class ceilings cannot evict them, while Exact pages and
+  page bounds remain reclaimable. Construct missing filters during publication
+  and audit without waiting for an evictable-budget window.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-40
+- Let bounded Exact-cache warming overlap Online GC without waiting for GC
+  quiescence, and base its frontend-idle gate on POSIX read/write activity.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-39
+- Deploy the latest metadata-read cache, Exact-index read, and Unified Cache
+  changes together with the validated repository/SMB lifecycle.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-38
+- Replace the unsupported repository stop hook with a supported SMB dependency
+  drop-in. The Runtime now bounds every systemctl request externally, rechecks
+  activation after a timed-out request, repeats forced termination while needed,
+  and uses lazy unmount only after confirming a remaining FUSE mount.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-37
+- Coordinate the SMB frontend with the repository mount: stop and, if necessary,
+  force-close SMB before orderly unmount, retry mount release after clients
+  exit, and restore an enabled SMB unit only after a new Runtime has mounted.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-36
+- Add a bounded, pressure-aware Exact-Index warm worker behind the single
+  verified-cache owner, enforce a protected 70% Exact acceleration ceiling, and
+  expose adaptive Exact-cache status and configuration through appliance telemetry.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-35
+- Serialize tracked cache ownership release with admission accounting so an
+  ephemeral namespace drop cannot expose charged entries without a clock owner;
+  keep production cache pressure graceful instead of aborting if that invariant
+  is ever violated again.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-34
+- Set the controller deadband below the demand-growth step so a cache can expand
+  from its cold target while alternating live-memory candidates still remain
+  suppressed by the consecutive-period streak.
+
+* Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-33
+- Damp the shared cache-budget target and its candidate headroom so alternating
+  live-memory samples stay inside a hysteretic deadband instead of producing
+  one-sample GiB target swings; sustained trends and safety pressure still move
+  admission immediately.
+- Round Verified DATA, Exact membership, and Historical Proof class targets to
+  a stable granularity, and suppress repeated cache-pressure refresh atomics on
+  the read hot path.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-32
+- Release short-lived Exact writer and bounds cache namespaces by the keys they
+  actually admitted, instead of scanning every shard clock at namespace drop.
+- Defer stale FIFO-key compaction until enough removals can pay for the scan,
+  removing repeated exact publication and recovery cache-ownership stalls.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-31
+- Buffer scrub-progress frames in a bounded pending writer and flush them at the
+  1 MiB limit or the existing batch-sync boundary, removing one storage write and
+  writer readback from every scrub certificate.
+- Preserve crash-safe scrub resume by validating only complete durable frames on
+  load, making unflushed suffixes repeatable, and covering buffer visibility,
+  partial-flush loss, and cooperative-stop behavior with structural tests.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-30
+- Defer intermediate Direct-I/O length-head synchronization for unpublished
+  immutable temporary objects, including Exact Runs, Run Sets, streamed partitions,
+  and staged metadata. The final file synchronization before rename remains the
+  publication barrier.
+- Keep authoritative WAL and published-object length-head barriers synchronous,
+  and cover the deferred temporary path with a Direct-I/O regression test.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-29
+- Reuse the independently recovered Exact Run Set when deriving startup RETIRING
+  entries, and let that immutable Run Set seed the bounded RETIRING projection.
+- Rebind namespace startup to the prepared Exact generation without reloading its
+  Activation Log when the recovery writer snapshot is still synchronized.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-28
+- Reuse an already installed Exact generation for repeated in-process recovery,
+  avoiding a redundant complete audit of unchanged immutable Runs.
+- Report startup timings for Exact activation recovery and Online-GC finalization.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-27
+- Make Online-GC manifest, Metadata-GC, liveness, Exact-retirement and generation-drain
+  waits honor cooperative shutdown cancellation, allowing a long maintenance cycle to
+  stop promptly without SIGKILL.
+- Preserve durable RETIRING recovery points when a stop interrupts retirement.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-26
+- Bound Verified DATA read-cache share to 20 percent of the Unified Read Cache and
+  protect Exact cache pages from ordinary Verified-DATA displacement.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-24
+- Track Recovery Checkpoint protection by root identity instead of transient
+  refcount, so unchanged checkpoint pins no longer invalidate the clean Metadata
+  mark and force an exact scan every maintenance quantum.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-23
+- Reuse the process-local audit proof for an unchanged immutable GC candidate
+  catalog, avoiding its complete row-hash reread every online GC quantum while
+  preserving a fresh lease and a full audit after publication or restart.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-22
+- Cache a converged Exact Run-reference window while the Activation Log and
+  installed/retired generation set are unchanged; deferred unlinks still force
+  the next idle sweep to retry from durable references.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-21
+- Carry a bounded process-local Exact RETIRING projection across normal L0
+  appends, so idle Online-GC quanta no longer merge every active Exact Run.
+- Rebuild RETIRING authority independently after fresh recovery or audit, and
+  force full durable scans whenever compaction invalidates the projection.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-20
+- Drive Online-GC through a bounded candidate queue and collect each proven
+  victim set once, publishing retired candidates without a pool-sized rebuild.
+- Bound victim proof by candidate Chunk and dependent-target budgets; remove
+  the process-wide reverse-dependency cache and its pool-sized full scans.
+
+* Tue Sep 15 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-19
+- Retire superseded GC candidate catalog generations every Online-GC quantum.
+- Retire Exact Runs and Run Sets outside the paired Activation-Log window and
+  live generation pins; an idle repository now converges to bounded on-disk
+  Exact and hint-object counts.
+
 * Sat Sep 12 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-1
 - Bound missing-Exact-index fallback to required Records and dependencies.
 - Separate mount health from telemetry gaps and ordinary write backpressure.

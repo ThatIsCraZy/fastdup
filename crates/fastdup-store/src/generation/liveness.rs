@@ -42,17 +42,21 @@ impl<I: StorageIo> GenerationRepository<I> {
     ) -> Result<GenerationLivenessProof, GenerationError> {
         let _independent = crate::metadata_object_cache::IndependentRead::enter();
         let proof = self.scan_generation_liveness(true)?;
-        containers.verify_required_chunks(proof.online_chunks())?;
+        containers.verify_required_chunks(proof.protected_chunks())?;
         Ok(proof)
     }
 
-    /// Proves the current logical liveness set from Metadata only.
-    ///
-    /// This deliberately performs no DATA-Container scan. Online GC can use
-    /// the opaque result to shortlist and locally verify a bounded victim set;
-    /// the complete scrub path above additionally verifies every required
-    /// Chunk before returning the same generation binding.
-    pub(crate) fn scan_online_liveness(&self) -> Result<GenerationLivenessProof, GenerationError> {
+    pub(crate) fn scan_online_liveness_for_candidates(
+        &self,
+        selected_chunks: &BTreeSet<fastdup_format::ChunkId>,
+    ) -> Result<GenerationLivenessProof, GenerationError> {
+        self.scan_online_liveness_selected(Some(selected_chunks))
+    }
+
+    fn scan_online_liveness_selected(
+        &self,
+        selected_chunks: Option<&BTreeSet<fastdup_format::ChunkId>>,
+    ) -> Result<GenerationLivenessProof, GenerationError> {
         let _cache_read = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
         let _publication_guard = self
             .metadata_gc_barrier
@@ -63,7 +67,8 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: Online-GC liveness lock poisoned");
         let records = self.load_complete_commit_records_unlocked()?;
-        let mut proof = self.scan_generation_liveness_from_records(&records, false)?;
+        let mut proof =
+            self.scan_generation_liveness_from_records(&records, false, selected_chunks)?;
         proof.pinned_roots = self
             .metadata_root_pins
             .lock()
@@ -72,7 +77,11 @@ impl<I: StorageIo> GenerationRepository<I> {
             .copied()
             .collect();
         for root in proof.pinned_roots.iter().copied() {
-            self.scan_manifest_root_required_chunks(root, &mut proof.online_chunks)?;
+            self.scan_manifest_root_required_chunks(
+                root,
+                selected_chunks,
+                &mut proof.protected_chunks,
+            )?;
         }
         proof.recovery_checkpoint_roots = self
             .recovery_checkpoint_root_pins
@@ -88,7 +97,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .collect::<Vec<_>>();
         for root_id in recovery_checkpoint_roots {
             let root = self.read_namespace_root(root_id)?;
-            let (_, required) = self.scan_manifest_graph_with_required(&root)?;
+            let (_, required) = self.scan_manifest_graph_with_required(&root, selected_chunks)?;
             proof.extend_protected_chunks(required)?;
         }
         Ok(proof)
@@ -100,20 +109,21 @@ impl<I: StorageIo> GenerationRepository<I> {
     ) -> Result<GenerationLivenessProof, GenerationError> {
         let _independent = crate::metadata_object_cache::IndependentRead::enter();
         let records = self.load_complete_commit_records()?;
-        self.scan_generation_liveness_from_records(&records, audit_retained_history)
+        self.scan_generation_liveness_from_records(&records, audit_retained_history, None)
     }
 
     fn scan_generation_liveness_from_records(
         &self,
         records: &[CommitRecord],
         audit_retained_history: bool,
+        selected_chunks: Option<&BTreeSet<fastdup_format::ChunkId>>,
     ) -> Result<GenerationLivenessProof, GenerationError> {
         if records.is_empty() {
             return Ok(GenerationLivenessProof::default());
         }
         let mut latest_namespace_inodes = 0_usize;
         let mut latest_manifest_files = 0_usize;
-        let mut online_chunks = BTreeMap::new();
+        let mut protected_chunks = BTreeMap::new();
         let first_online = records.len().saturating_sub(2);
         let scan_start = if audit_retained_history {
             0
@@ -121,15 +131,17 @@ impl<I: StorageIo> GenerationRepository<I> {
             first_online
         };
         for (ordinal, record) in records.iter().copied().enumerate().skip(scan_start) {
+            self.check_maintenance()?;
             let root = self.read_namespace_root(record.namespace_root())?;
             if !record_matches_namespace_root(record, &root) {
                 return Err(GenerationError::PreviousGenerationRecordMismatch);
             }
-            let (manifests, required) = self.scan_manifest_graph_with_required(&root)?;
+            let (manifests, required) =
+                self.scan_manifest_graph_with_required(&root, selected_chunks)?;
             if ordinal >= first_online {
                 for (chunk_id, logical_length) in required {
                     self.check_maintenance()?;
-                    if let Some(previous) = online_chunks.insert(chunk_id, logical_length)
+                    if let Some(previous) = protected_chunks.insert(chunk_id, logical_length)
                         && previous != logical_length
                     {
                         return Err(GenerationError::ManifestChunkLengthConflict {
@@ -156,7 +168,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         Ok(GenerationLivenessProof {
             summary,
             online_records,
-            online_chunks,
+            protected_chunks,
             pinned_roots: BTreeSet::new(),
             recovery_checkpoint_roots: BTreeSet::new(),
         })
@@ -213,7 +225,12 @@ impl<I: StorageIo> GenerationRepository<I> {
         };
         let mut added = BTreeMap::new();
         let mut removed = BTreeMap::new();
+        let mut probes = 0_u64;
         for (chunk_id, logical_length) in &current_chunks {
+            probes = probes.wrapping_add(1);
+            if probes.is_multiple_of(4096) {
+                self.check_maintenance()?;
+            }
             match base_chunks.get(chunk_id) {
                 None => {
                     added.insert(*chunk_id, *logical_length);
@@ -229,6 +246,10 @@ impl<I: StorageIo> GenerationRepository<I> {
             }
         }
         for (chunk_id, logical_length) in base_chunks {
+            probes = probes.wrapping_add(1);
+            if probes.is_multiple_of(4096) {
+                self.check_maintenance()?;
+            }
             if !current_chunks.contains_key(&chunk_id) {
                 removed.insert(chunk_id, logical_length);
             }
@@ -275,11 +296,12 @@ impl<I: StorageIo> GenerationRepository<I> {
     ) -> Result<BTreeMap<fastdup_format::ChunkId, u64>, GenerationError> {
         let mut chunks = BTreeMap::new();
         for record in records.iter().copied() {
+            self.check_maintenance()?;
             let root = self.read_namespace_root(record.namespace_root())?;
             if !record_matches_namespace_root(record, &root) {
                 return Err(GenerationError::PreviousGenerationRecordMismatch);
             }
-            let (_, required) = self.scan_manifest_graph_with_required(&root)?;
+            let (_, required) = self.scan_manifest_graph_with_required(&root, None)?;
             for (chunk_id, logical_length) in required {
                 if let Some(previous) = chunks.insert(chunk_id, logical_length)
                     && previous != logical_length

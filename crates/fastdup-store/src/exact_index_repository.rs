@@ -1,12 +1,17 @@
-use crate::immutable_write::{ImmutableWriteBuffer, write_image};
+use crate::immutable_write::{ImmutableWriteBuffer, write_image, write_image_unpublished};
 use crate::page_cache::ACCOUNTED_PAGE_BYTES;
-use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BinaryHeap};
-use std::fmt;
-use std::io;
-use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    fmt, io,
+    mem::size_of,
+    ops::Deref,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+    sync::{Arc, Condvar, Mutex, RwLock, Weak},
+    time::Duration,
+};
+
+use crate::{MaintenanceCancellation, MaintenanceCancelled};
 
 use fastdup_format::{
     ChunkId, ContainerId, EXACT_INDEX_ENTRIES_PER_PAGE, EXACT_INDEX_HEADER_BYTES,
@@ -20,7 +25,9 @@ use fastdup_format::{
 use crate::exact_activation_log::{
     ActivationLogSnapshot, ExactActivationLog, ExactActivationLogError,
 };
-use crate::exact_index_read::ImmutableExactIndexRun;
+use crate::exact_index_read::{
+    EXACT_SCAN_PAGES_PER_IO, ExactPageKeyBounds, ImmutableExactIndexRun, visit_page_spans,
+};
 use crate::read_cache::{MemoryPressureSnapshot, shared_cache_reserve_bytes};
 use crate::reduction_filter::{BlockedBloomHint, BloomLookupHint};
 use crate::{ContainerRepository, StorageIo, StoreError};
@@ -28,6 +35,12 @@ use crate::{ContainerRepository, StorageIo, StoreError};
 pub const MAX_EXACT_LOOKUP_CANDIDATES: usize = 64;
 pub const MAX_ACTIVE_EXACT_INDEX_FAMILIES: usize = 64;
 const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
+/// Prefetched pages per compaction input cursor. One span read replaces this
+/// many per-page 4-KiB Direct I/Os while keeping per-page AUDIT order intact.
+const EXACT_COMPACTION_PAGES_PER_IO: usize = 64;
+/// Keys resolved per batched Exact lookup window. Bounds searches and merged
+/// page-span reads stay bounded by this window in candidates and span bytes.
+pub const EXACT_LOOKUP_BATCH_WINDOW_KEYS: usize = 1024;
 const EXACT_INDEX_PAGE_CACHE_FALLBACK_SLOTS: usize = 256;
 const EXACT_INDEX_PAGE_CACHE_MINIMUM_BYTES: u64 = 1_024 * 1_024;
 const EXACT_INDEX_PAGE_CACHE_MAXIMUM_BYTES: u64 = 256 * 1_024 * 1_024;
@@ -38,6 +51,11 @@ const EXACT_INDEX_PAGE_CACHE_RAM_DIVISOR: u64 = 128;
 /// partitions within one family do not consume additional lookup precedence.
 pub const MAX_ACTIVE_EXACT_INDEX_RUNS: usize = MAX_ACTIVE_EXACT_INDEX_FAMILIES;
 pub const EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES: usize = 262_144;
+const MAX_TRACKED_EXACT_RETIRING_ENTRIES: usize = EXACT_INDEX_RUN_PARTITION_TARGET_ENTRIES;
+const EXACT_WARM_PAGE_BUDGET: usize = 4096;
+const EXACT_WARM_STRUCTURE_BUDGET: usize = 4;
+const EXACT_WARM_MAX_RUN_PAGES: usize = 32_768;
+const EXACT_WARM_SCAN_CANCELLATION_INTERVAL: usize = 128;
 
 /// One complete, key-disjoint output generation of Exact Index compaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,8 +120,11 @@ pub struct ExactIndexRunRepository<I> {
     run_generations: Arc<Mutex<RunGenerationAllocator>>,
     active_generation: Arc<RwLock<Option<Arc<ExactIndexGenerationState<I>>>>>,
     retired_generations: Arc<Mutex<Vec<Weak<ExactIndexGenerationState<I>>>>>,
+    retirement_projection: Arc<RwLock<ExactRetirementProjection>>,
+    retirement_references: Arc<Mutex<Option<ExactRetirementReferenceWindow>>>,
     page_cache: Arc<ExactIndexPageCache>,
     membership_counters: Arc<ExactRunMembershipCounters>,
+    warm_cursor: Arc<AtomicUsize>,
     publication_timings: ExactPublicationTimings,
 }
 
@@ -114,6 +135,53 @@ pub struct ExactIndexRunRepository<I> {
 struct RunGenerationAllocator {
     discovered: bool,
     high_water: u64,
+}
+
+/// Process-local effective RETIRING projection for one immutable installed
+/// generation.
+///
+/// Recovery and independent audits rebuild the projection from durable Runs.
+/// Normal L0 appends may update a previously known projection when no
+/// compaction replaces input families; any uncertainty leaves it unknown and
+/// preserves the full merge as the authority.
+type ExactRetirementKey = (ChunkId, u32, [u8; 16], u64, u32);
+
+#[derive(Clone, Debug, Default)]
+struct ExactRetirementProjection {
+    generation: Option<ExactIndexActivationRecord>,
+    entries: Option<BTreeMap<ExactRetirementKey, ExactIndexEntry>>,
+}
+
+/// Process-local resolved Run-reference window for one unchanged Activation-Log
+/// snapshot and installed/retired generation set.
+///
+/// The durable Activation Log remains recovery authority. Fresh recovery starts
+/// without this cache; an unchanged writer snapshot may reuse it only after a
+/// full sweep reported no permission-deferred unlink.
+#[derive(Clone, Debug)]
+struct ExactRetirementReferenceWindow {
+    activation: Option<ExactIndexActivationRecord>,
+    installed: Vec<ExactIndexRunSetId>,
+    retired: Vec<ExactIndexRunSetId>,
+    keep_sets: Vec<String>,
+    keep_runs: Vec<u64>,
+    keep_profiles: BTreeSet<[u8; 32]>,
+    deletion_floor: u64,
+    converged: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactRetirementRemoval {
+    Removed,
+    Absent,
+    Deferred,
+}
+
+#[derive(Clone, Debug)]
+struct ExactRetirementProcessState {
+    activation: Option<ExactIndexActivationRecord>,
+    installed: Vec<ExactIndexRunSetId>,
+    retired: Vec<ExactIndexRunSetId>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -309,6 +377,39 @@ impl<I> ExactIndexGenerationDrain<I> {
             }
         }
     }
+
+    /// Waits until displaced pins release or a cooperative maintenance stop is
+    /// requested. Interrupting leaves the durable RETIRING generation intact.
+    ///
+    /// # Errors
+    /// Returns after cancellation, before every displaced pin has drained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another thread poisoned the generation-drain wait lock.
+    pub fn wait_cancellable(
+        self,
+        cancellation: &MaintenanceCancellation,
+    ) -> Result<(), MaintenanceCancelled> {
+        cancellation.check()?;
+        for state in self.states {
+            let mut wait = state
+                .pins
+                .wait
+                .lock()
+                .expect("ASSERT: Exact generation drain lock poisoned while waiting");
+            while state.pins.active.load(AtomicOrdering::Acquire) != 0 {
+                let (released, _timeout) = state
+                    .pins
+                    .drained
+                    .wait_timeout(wait, Duration::from_millis(100))
+                    .expect("ASSERT: Exact generation drain lock poisoned after wake");
+                wait = released;
+                cancellation.check()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Result of one atomic Exact generation activation.
@@ -327,6 +428,26 @@ impl<I> ExactIndexGenerationTransition<I> {
     #[must_use]
     pub fn into_retired(self) -> Option<ExactIndexGenerationDrain<I>> {
         self.retired
+    }
+}
+
+/// Counts unlinked immutable objects in one [`ExactIndexRunRepository`]
+/// reference-retirement sweep.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExactIndexRunRetirement {
+    runs_removed: u64,
+    run_sets_removed: u64,
+}
+
+impl ExactIndexRunRetirement {
+    #[must_use]
+    pub const fn runs_removed(&self) -> u64 {
+        self.runs_removed
+    }
+
+    #[must_use]
+    pub const fn run_sets_removed(&self) -> u64 {
+        self.run_sets_removed
     }
 }
 
@@ -359,6 +480,8 @@ pub struct ExactIndexPageCacheStatus {
     pressure_rejections: u64,
     target_pages: u64,
     capacity_pages: u64,
+    protected_limit_bytes: u64,
+    protected_resident_bytes: u64,
     reserve_bytes: u64,
     effective_limit_bytes: u64,
     available_bytes: u64,
@@ -402,6 +525,16 @@ impl ExactIndexPageCacheStatus {
     }
 
     #[must_use]
+    pub const fn protected_limit_bytes(self) -> u64 {
+        self.protected_limit_bytes
+    }
+
+    #[must_use]
+    pub const fn protected_resident_bytes(self) -> u64 {
+        self.protected_resident_bytes
+    }
+
+    #[must_use]
     pub const fn reserve_bytes(self) -> u64 {
         self.reserve_bytes
     }
@@ -439,9 +572,13 @@ pub struct ExactRunMembershipStatus {
     positional_run_count: u64,
     leased_page_bounds_bytes: u64,
     filter_count: u64,
+    constructed_filter_count: u64,
+    missing_filter_count: u64,
     allocated_bytes: u64,
     huge_page_advised_filter_count: u64,
     huge_page_advised_bytes: u64,
+    leased_run_count_with_bounds: u64,
+    missing_page_bounds_count: u64,
     probes: u64,
     definitely_absent: u64,
     requires_exact_lookup: u64,
@@ -464,8 +601,28 @@ impl ExactRunMembershipStatus {
     }
 
     #[must_use]
+    pub const fn leased_run_count_with_bounds(self) -> u64 {
+        self.leased_run_count_with_bounds
+    }
+
+    #[must_use]
+    pub const fn missing_page_bounds_count(self) -> u64 {
+        self.missing_page_bounds_count
+    }
+
+    #[must_use]
     pub const fn filter_count(self) -> u64 {
         self.filter_count
+    }
+
+    #[must_use]
+    pub const fn constructed_filter_count(self) -> u64 {
+        self.constructed_filter_count
+    }
+
+    #[must_use]
+    pub const fn missing_filter_count(self) -> u64 {
+        self.missing_filter_count
     }
 
     #[must_use]
@@ -497,6 +654,54 @@ impl ExactRunMembershipStatus {
     pub const fn requires_exact_lookup(self) -> u64 {
         self.requires_exact_lookup
     }
+}
+
+/// Bounded work accepted by one proactive Exact-acceleration warm cycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactCacheWarmPolicy {
+    pub maximum_pages: usize,
+    pub maximum_structures: usize,
+    pub maximum_run_pages: usize,
+}
+
+impl Default for ExactCacheWarmPolicy {
+    fn default() -> Self {
+        Self {
+            maximum_pages: EXACT_WARM_PAGE_BUDGET,
+            maximum_structures: EXACT_WARM_STRUCTURE_BUDGET,
+            maximum_run_pages: EXACT_WARM_MAX_RUN_PAGES,
+        }
+    }
+}
+
+impl ExactCacheWarmPolicy {
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            maximum_pages: 0,
+            maximum_structures: 0,
+            maximum_run_pages: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_page_budget(mut self, maximum_pages: usize) -> Self {
+        self.maximum_pages = maximum_pages;
+        self
+    }
+}
+
+/// Bounded result of one proactive Exact-acceleration warm cycle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExactCacheWarmProgress {
+    pub active_runs: usize,
+    pub total_pages: usize,
+    pub structures_requested: usize,
+    pub structures_built: usize,
+    pub pages_skipped_resident: usize,
+    pub pages_warmed: usize,
+    pub pages_rejected: usize,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -539,8 +744,11 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             run_generations: Arc::new(Mutex::new(RunGenerationAllocator::default())),
             active_generation: Arc::new(RwLock::new(None)),
             retired_generations: Arc::new(Mutex::new(Vec::new())),
+            retirement_projection: Arc::new(RwLock::new(ExactRetirementProjection::default())),
+            retirement_references: Arc::new(Mutex::new(None)),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, true)),
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
+            warm_cursor: Arc::new(AtomicUsize::new(0)),
             publication_timings: ExactPublicationTimings::default(),
         }
     }
@@ -561,8 +769,11 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             run_generations: Arc::new(Mutex::new(RunGenerationAllocator::default())),
             active_generation: Arc::new(RwLock::new(None)),
             retired_generations: Arc::new(Mutex::new(Vec::new())),
+            retirement_projection: Arc::new(RwLock::new(ExactRetirementProjection::default())),
+            retirement_references: Arc::new(Mutex::new(None)),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, false)),
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
+            warm_cursor: Arc::new(AtomicUsize::new(0)),
             publication_timings: ExactPublicationTimings::default(),
         }
     }
@@ -589,6 +800,31 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     #[must_use]
     pub fn page_cache_status(&self) -> ExactIndexPageCacheStatus {
         self.page_cache.status()
+    }
+
+    /// Proactively warms reclaimable acceleration for the installed generation.
+    ///
+    /// The common cache still owns admission and replacement, so this neither
+    /// creates another cache nor changes Exact or DATA authority. It performs
+    /// Demand-intent verified reads only and stops on cancellation or pressure
+    /// rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns cancellation or an error from one verified Acceleration read.
+    /// Admission rejection is reported in `pages_rejected`, not as an error.
+    pub fn warm_active_generation(
+        &self,
+        policy: &ExactCacheWarmPolicy,
+        cancellation: Option<&MaintenanceCancellation>,
+    ) -> Result<ExactCacheWarmProgress, ExactIndexStoreError> {
+        let Some(generation) = self.pin_active_generation() else {
+            return Ok(ExactCacheWarmProgress::default());
+        };
+        let mut cursor = self.warm_cursor.load(AtomicOrdering::Relaxed);
+        let result = generation.warm_cycle(policy, cancellation, &mut cursor);
+        self.warm_cursor.store(cursor, AtomicOrdering::Relaxed);
+        result
     }
 
     /// Durably publishes one immutable run without activating it.
@@ -657,12 +893,21 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 evidence.observe(entries, &encoded[offset..offset + EXACT_INDEX_PAGE_BYTES])?;
             }
         }
-        write_image(&self.storage, &temporary_name, &encoded)?;
-        self.storage.set_len(
-            &temporary_name,
-            u64::try_from(encoded.len())
-                .expect("ASSERT: a bounded Exact Index run length fits u64"),
-        )?;
+        if owned_writer {
+            write_image_unpublished(&self.storage, &temporary_name, &encoded)?;
+            self.storage.set_len_unpublished(
+                &temporary_name,
+                u64::try_from(encoded.len())
+                    .expect("ASSERT: a bounded Exact Index run length fits u64"),
+            )?;
+        } else {
+            write_image(&self.storage, &temporary_name, &encoded)?;
+            self.storage.set_len(
+                &temporary_name,
+                u64::try_from(encoded.len())
+                    .expect("ASSERT: a bounded Exact Index run length fits u64"),
+            )?;
+        }
         let observed = if owned_writer {
             expected
         } else {
@@ -708,7 +953,11 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             descriptor,
             page_cache: Arc::clone(&self.page_cache),
             mapping: None,
-            membership: None,
+            membership: Some(Arc::new(CachedRunMembership::dormant(
+                &self.page_cache.membership,
+                descriptor.run_hash(),
+                CachedRunMembership::required_bytes(descriptor.entry_count()),
+            ))),
             membership_counters: Arc::clone(&self.membership_counters),
         })
     }
@@ -1036,12 +1285,29 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .generation_publish_lock
             .lock()
             .expect("ASSERT: Exact generation publication lock poisoned");
-        let Some(active) = self.recover_active_locked()? else {
+        let mut writer = self
+            .activation_writer
+            .lock()
+            .expect("ASSERT: Exact activation writer lock poisoned");
+        *writer = None;
+        let Some(snapshot) = ({
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+            ExactActivationLog::new(&self.storage)
+                .load_for_recovery()
+                .map_err(map_activation_log_error)?
+        }) else {
             return Ok(None);
         };
-        if let Some(current) = self.pin_matching_generation(active.record()) {
+        let Some(record) = snapshot.last_record() else {
+            return Ok(None);
+        };
+        if let Some(current) = self.pin_matching_generation(record) {
+            *writer = Some(snapshot);
             return Ok(Some(current));
         }
+        let active = self.open_activated_record(record)?;
+        *writer = Some(snapshot);
+        self.invalidate_retirement_projection(record);
         let transition = self.install_active_generation(active);
         Ok(Some(transition.current))
     }
@@ -1092,7 +1358,30 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         if let Some(current) = self.pin_matching_generation(active.record()) {
             return Ok(Some(current));
         }
+        self.invalidate_retirement_projection(active.record());
         Ok(Some(self.install_active_generation(active).current))
+    }
+
+    /// Returns a generation prepared by recovery without reloading durable
+    /// selector state when the synchronized writer snapshot is known.
+    ///
+    /// Startup finalization performs the mandatory independent audit and
+    /// installs the resulting generation. The namespace may then bind that same
+    /// immutable Run Set. A missing or revoked snapshot still forces the normal
+    /// independent recovery path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same recovery and dependency errors as
+    /// [`Self::recover_active_generation`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shared Exact publication or writer lock is poisoned.
+    pub fn pin_recovered_generation(
+        &self,
+    ) -> Result<Option<ExactIndexGenerationPin<I>>, ExactIndexStoreError> {
+        self.pin_online_generation()
     }
 
     /// Derives the effective RETIRING Container set from one fully opened
@@ -1119,18 +1408,55 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     ///
     /// The result is recovery authority rather than a candidate hint: the
     /// generation merge shadows older ACTIVE and already-REMOVED occurrences
-    /// of the same physical Location before returning entries.
+    /// of the same physical Location before returning entries. A previously
+    /// observed installed generation may answer from the bounded process-local
+    /// projection. Independent recovery always rebuilds the durable projection
+    /// and may seed that projection for the same immutable generation.
     ///
     /// # Errors
     ///
     /// Returns touched-page integrity, I/O, allocation, or merge failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shared retirement-projection or active-generation lock is
+    /// poisoned.
     pub fn retiring_entries(
         &self,
         generation: &ExactIndexGenerationPin<I>,
     ) -> Result<Vec<ExactIndexEntry>, ExactIndexStoreError> {
+        let independent = crate::read_intent::independent();
+        if !independent {
+            let cached = {
+                let projection = self
+                    .retirement_projection
+                    .read()
+                    .expect("ASSERT: Exact retirement projection lock poisoned during lookup");
+                if projection.generation == Some(generation.record()) {
+                    projection.entries.as_ref().map(|entries| {
+                        let mut cached = Vec::new();
+                        cached
+                            .try_reserve_exact(entries.len())
+                            .map(|()| {
+                                for entry in entries.values() {
+                                    cached.push(*entry);
+                                }
+                            })
+                            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+                        Ok(cached)
+                    })
+                } else {
+                    None
+                }
+            };
+            if let Some(entries) = cached {
+                return entries;
+            }
+        }
+
         let families = compaction_families_from_run_set(generation.run_set())?;
         let mut entries = Vec::new();
-        self.merge_compaction_families(&families, |entry| {
+        self.merge_compaction_families_using(&families, generation.run_readers(), |entry| {
             if entry.transition() == fastdup_format::ExactLocationTransition::Retiring {
                 entries
                     .try_reserve(1)
@@ -1139,7 +1465,69 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             }
             Ok(())
         })?;
+
+        if entries.len() <= MAX_TRACKED_EXACT_RETIRING_ENTRIES {
+            let installed_record = self
+                .active_generation
+                .read()
+                .expect("ASSERT: active Exact generation lock poisoned during projection cache")
+                .as_ref()
+                .map(|state| state.index.record());
+            if installed_record == Some(generation.record()) {
+                let mut projection_entries = BTreeMap::new();
+                for entry in &entries {
+                    projection_entries.insert(compaction_location_key(*entry), *entry);
+                }
+                let mut projection = self
+                    .retirement_projection
+                    .write()
+                    .expect("ASSERT: Exact retirement projection lock poisoned during cache");
+                if projection.generation == Some(generation.record())
+                    && (!independent || projection.entries.is_none())
+                {
+                    projection.entries = Some(projection_entries);
+                }
+            }
+        }
         Ok(entries)
+    }
+
+    pub(crate) fn visit_active_locations_matching<F>(
+        &self,
+        generation: &ExactIndexGenerationPin<I>,
+        candidate_chunk_ids: &BTreeSet<ChunkId>,
+        cancellation: Option<&crate::MaintenanceCancellation>,
+        mut consume: F,
+    ) -> Result<(), ExactIndexStoreError>
+    where
+        F: FnMut(ExactIndexEntry) -> Result<(), ExactIndexStoreError>,
+    {
+        if candidate_chunk_ids.is_empty() {
+            return Ok(());
+        }
+        let families = compaction_families_from_run_set(generation.run_set())?;
+        let mut visited = 0_u64;
+        self.merge_compaction_families(&families, |entry| {
+            if visited.is_multiple_of(256) {
+                crate::maintenance_cancellation::check_io(cancellation)?;
+            }
+            visited = visited
+                .checked_add(1)
+                .ok_or(ExactIndexStoreError::CounterOverflow)?;
+            if entry.transition() != ExactLocationTransition::Active {
+                return Ok(());
+            }
+            let target = entry.chunk_id();
+            let dependency = ChunkId::from_bytes(entry.location().dependency_id());
+            if candidate_chunk_ids.contains(&target)
+                || (entry.location().dependency_id() != [0; 32]
+                    && candidate_chunk_ids.contains(&dependency))
+            {
+                consume(entry)?;
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Publishes one immutable level-zero transition family and atomically
@@ -1229,6 +1617,8 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         let validation_timer = self.publication_timings.validate.begin();
         validate_level_zero_transitions(previous, &entries)?;
         drop(validation_timer);
+        let previous_record = previous.map(ActivatedExactIndex::record);
+        let transition_entries = collect_exact_transition_entries(&entries)?;
         let run_timer = self.publication_timings.run_publish.begin();
         let generation = {
             let _publication = self
@@ -1248,12 +1638,13 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
         run_refs.push(ExactIndexRunRef::new(0, descriptor)?);
         drop(run_timer);
+        let mut compacted = false;
         while let Some((source_level, inputs)) = select_level_zero_compaction(&run_refs) {
             let _compaction_timer = self.publication_timings.compaction.begin();
             let target_level = source_level
                 .checked_add(1)
                 .ok_or(ExactIndexStoreError::InvalidCompactionInput)?;
-            let compacted =
+            let compacted_runs =
                 self.compact_family_using(&inputs, target_level, None, &mut readers, owned_writer)?;
             run_refs.retain(|run| {
                 !inputs
@@ -1261,9 +1652,10 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                     .any(|input| input.generation() == run.generation())
             });
             run_refs
-                .try_reserve(compacted.runs().len())
+                .try_reserve(compacted_runs.runs().len())
                 .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
-            run_refs.extend_from_slice(compacted.runs());
+            run_refs.extend_from_slice(compacted_runs.runs());
+            compacted = true;
         }
         let run_set_generation = previous.map_or(Ok(1), |active| {
             active
@@ -1275,7 +1667,14 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         let _activation_timer = self.publication_timings.activation.begin();
         let run_set = ExactIndexRunSet::new(profile, run_set_generation, run_refs)?;
         let active = self.activate_with_readers(&run_set, &readers, owned_writer)?;
-        Ok(self.install_active_generation(active))
+        let transition = self.install_active_generation(active);
+        self.observe_appended_exact_generation(
+            transition.current().record(),
+            previous_record,
+            &transition_entries,
+            compacted,
+        );
+        Ok(transition)
     }
 
     // Both methods are called under publish_lock. Reservations precede any
@@ -1393,6 +1792,52 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         });
         *installed = Some(state);
         ExactIndexGenerationTransition { current, retired }
+    }
+
+    fn invalidate_retirement_projection(&self, generation: ExactIndexActivationRecord) {
+        let mut projection = self
+            .retirement_projection
+            .write()
+            .expect("ASSERT: Exact retirement projection lock poisoned during recovery");
+        *projection = ExactRetirementProjection {
+            generation: Some(generation),
+            entries: None,
+        };
+    }
+
+    fn observe_appended_exact_generation(
+        &self,
+        installed: ExactIndexActivationRecord,
+        previous: Option<ExactIndexActivationRecord>,
+        transitions: &[ExactIndexEntry],
+        compacted: bool,
+    ) {
+        let mut projection = self
+            .retirement_projection
+            .write()
+            .expect("ASSERT: Exact retirement projection lock poisoned after append");
+        if projection.generation == Some(installed) && projection.entries.is_some() {
+            return;
+        }
+        let extended = if !compacted && projection.generation == previous {
+            projection.entries.take().and_then(|mut entries| {
+                for transition in transitions {
+                    let key = compaction_location_key(*transition);
+                    if transition.transition() == ExactLocationTransition::Retiring {
+                        entries.insert(key, *transition);
+                    } else {
+                        entries.remove(&key);
+                    }
+                }
+                (entries.len() <= MAX_TRACKED_EXACT_RETIRING_ENTRIES).then_some(entries)
+            })
+        } else {
+            None
+        };
+        *projection = ExactRetirementProjection {
+            generation: Some(installed),
+            entries: extended,
+        };
     }
 
     /// Audits both bounded Activation-Log slots and the selected immutable
@@ -1559,6 +2004,249 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         Ok(high_water)
     }
 
+    /// Unlinks immutable Runs and Run Sets that no recoverable selection can
+    /// reference again.
+    ///
+    /// A Run Set survives while either paired Activation-Log slot wholly
+    /// names it, and a Run survives while any wholly slot-named Run Set or
+    /// any installed or not-yet-disposed Exact generation still references
+    /// it. The greatest surviving Run generation is additionally a deletion
+    /// floor: publishers reserve strictly greater generations before they
+    /// publish and activate, so an in-flight publication is never a sweep
+    /// candidate even though its Run Set is not durable yet. Because the
+    /// allocator discovers its high-water from the maximum surviving
+    /// canonical name, unlinking strictly older names cannot recycle the
+    /// name of any durable object, and a crash between an unlink and the
+    /// root sync leaves only files that the next sweep removes again. A
+    /// slot whose chain fails validation, or a wholly named Run Set whose
+    /// object is missing, aborts the sweep conservatively before any
+    /// unlink.
+    ///
+    /// Removals refused by a live immutable lease or already performed by a
+    /// previous interrupted sweep are benign and retried by a later sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns Activation-Log chain, Run Set, directory, or unexpected
+    /// unlink failures. No unlink precedes full reference resolution.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the installed or retired Exact generation registry lock is
+    /// poisoned. Contended publication locks are skipped, not waited on.
+    pub fn retire_unreferenced(&self) -> Result<ExactIndexRunRetirement, ExactIndexStoreError> {
+        self.retire_unreferenced_cancellable(None)
+    }
+
+    /// Sweeps stale Exact objects with cooperative maintenance cancellation.
+    ///
+    /// # Errors
+    /// Returns cancellation or the same retirement failures as
+    /// [`Self::retire_unreferenced`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the installed or retired Exact generation registry lock is
+    /// poisoned. Contended publication locks are skipped, not waited on.
+    pub fn retire_unreferenced_cancellable(
+        &self,
+        cancellation: Option<&MaintenanceCancellation>,
+    ) -> Result<ExactIndexRunRetirement, ExactIndexStoreError> {
+        crate::maintenance_cancellation::check_io(cancellation)?;
+        let Ok(_generation) = self.generation_publish_lock.try_lock() else {
+            // An activation or rebuild owns the publication seam; retirement
+            // is opportunistic and returns to the idle zero-skip state.
+            return Ok(ExactIndexRunRetirement::default());
+        };
+        let Ok(_publication) = self.publish_lock.try_lock() else {
+            return Ok(ExactIndexRunRetirement::default());
+        };
+
+        let state = self.exact_retirement_process_state();
+        let cached = self
+            .retirement_references
+            .lock()
+            .expect("ASSERT: Exact retirement reference window lock poisoned")
+            .clone();
+        if cached.as_ref().is_some_and(|window| {
+            window.converged && Self::exact_retirement_window_matches(window, &state)
+        }) {
+            return Ok(ExactIndexRunRetirement::default());
+        }
+        let mut window =
+            cached.filter(|window| Self::exact_retirement_window_matches(window, &state));
+        if window.is_none() {
+            window = Some(self.resolve_exact_retirement_reference_window(&state, cancellation)?);
+        }
+        let window = window.expect("ASSERT: retirement reference window is resolved");
+        let (report, deferred) =
+            self.sweep_exact_retirement_reference_window(&window, cancellation)?;
+        *self
+            .retirement_references
+            .lock()
+            .expect("ASSERT: Exact retirement reference window lock poisoned after sweep") =
+            Some(ExactRetirementReferenceWindow {
+                converged: !deferred,
+                ..window
+            });
+        Ok(report)
+    }
+
+    fn exact_retirement_process_state(&self) -> ExactRetirementProcessState {
+        let installed = self
+            .active_generation
+            .read()
+            .expect("ASSERT: active Exact generation lock poisoned")
+            .clone();
+        let retired = self
+            .retired_generations
+            .lock()
+            .expect("ASSERT: retired Exact generation registry lock poisoned")
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        let mut installed_ids = installed
+            .into_iter()
+            .map(|state| state.index.record().run_set_id())
+            .collect::<Vec<_>>();
+        let mut retired_ids = retired
+            .into_iter()
+            .map(|state| state.index.record().run_set_id())
+            .collect::<Vec<_>>();
+        installed_ids.sort_unstable();
+        installed_ids.dedup();
+        retired_ids.sort_unstable();
+        retired_ids.dedup();
+        ExactRetirementProcessState {
+            activation: self
+                .activation_writer
+                .lock()
+                .expect("ASSERT: Exact activation writer lock poisoned during retirement")
+                .as_ref()
+                .and_then(ActivationLogSnapshot::last_record),
+            installed: installed_ids,
+            retired: retired_ids,
+        }
+    }
+
+    fn exact_retirement_window_matches(
+        window: &ExactRetirementReferenceWindow,
+        state: &ExactRetirementProcessState,
+    ) -> bool {
+        window.activation == state.activation
+            && window.installed == state.installed
+            && window.retired == state.retired
+    }
+
+    fn resolve_exact_retirement_reference_window(
+        &self,
+        state: &ExactRetirementProcessState,
+        cancellation: Option<&MaintenanceCancellation>,
+    ) -> Result<ExactRetirementReferenceWindow, ExactIndexStoreError> {
+        let records = ExactActivationLog::new(&self.storage)
+            .load_retirement_reference_records()
+            .map_err(map_activation_log_error)?;
+        let mut keep = records
+            .iter()
+            .map(|record| record.run_set_id())
+            .chain(state.installed.iter().copied())
+            .chain(state.retired.iter().copied())
+            .map(|id| (id, run_set_name(id)))
+            .collect::<Vec<_>>();
+        keep.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        keep.dedup_by(|left, right| left.1 == right.1);
+
+        let mut keep_runs = Vec::new();
+        let mut probes = 0_u64;
+        for (id, _) in &keep {
+            probes = probes.wrapping_add(1);
+            if probes.is_multiple_of(256) {
+                crate::maintenance_cancellation::check_io(cancellation)?;
+            }
+            // Wholly slot-named sets must exist and stay whole: resolve every
+            // Run identity before unlinking anything.
+            let run_set = self.read_run_set(*id)?;
+            keep_runs.extend(run_set.runs().iter().map(|run_ref| run_ref.generation()));
+        }
+        keep_runs.sort_unstable();
+        keep_runs.dedup();
+        let deletion_floor = keep_runs.last().copied().unwrap_or(0);
+        Ok(ExactRetirementReferenceWindow {
+            activation: state.activation,
+            installed: state.installed.clone(),
+            retired: state.retired.clone(),
+            keep_sets: keep.into_iter().map(|(_, name)| name).collect(),
+            keep_runs,
+            keep_profiles: records
+                .iter()
+                .map(|record| record.profile().bytes())
+                .collect(),
+            deletion_floor,
+            converged: false,
+        })
+    }
+
+    fn sweep_exact_retirement_reference_window(
+        &self,
+        window: &ExactRetirementReferenceWindow,
+        cancellation: Option<&MaintenanceCancellation>,
+    ) -> Result<(ExactIndexRunRetirement, bool), ExactIndexStoreError> {
+        let mut report = ExactIndexRunRetirement::default();
+        let mut deferred = false;
+        let mut probes = 0_u64;
+        for name in self.storage.list_names()? {
+            probes = probes.wrapping_add(1);
+            if probes.is_multiple_of(256) {
+                crate::maintenance_cancellation::check_io(cancellation)?;
+            }
+            if let Some((run_profile, generation)) = parse_run_name(&name)? {
+                if generation >= window.deletion_floor
+                    || window.keep_runs.binary_search(&generation).is_ok()
+                    || !window.keep_profiles.contains(&run_profile.bytes())
+                {
+                    continue;
+                }
+                match self.remove_if_unreferenced(&name)? {
+                    ExactRetirementRemoval::Removed => {
+                        report.runs_removed = report.runs_removed.saturating_add(1);
+                    }
+                    ExactRetirementRemoval::Absent => {}
+                    ExactRetirementRemoval::Deferred => deferred = true,
+                }
+                continue;
+            }
+            if is_canonical_run_set_name(&name) && window.keep_sets.binary_search(&name).is_err() {
+                match self.remove_if_unreferenced(&name)? {
+                    ExactRetirementRemoval::Removed => {
+                        report.run_sets_removed = report.run_sets_removed.saturating_add(1);
+                    }
+                    ExactRetirementRemoval::Absent => {}
+                    ExactRetirementRemoval::Deferred => deferred = true,
+                }
+            }
+        }
+        if report.runs_removed != 0 || report.run_sets_removed != 0 {
+            self.storage.sync_root()?;
+        }
+        Ok((report, deferred))
+    }
+
+    fn remove_if_unreferenced(
+        &self,
+        name: &str,
+    ) -> Result<ExactRetirementRemoval, ExactIndexStoreError> {
+        match self.storage.remove_file(name) {
+            Ok(()) => Ok(ExactRetirementRemoval::Removed),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(ExactRetirementRemoval::Absent)
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                Ok(ExactRetirementRemoval::Deferred)
+            }
+            Err(error) => Err(ExactIndexStoreError::Io(error)),
+        }
+    }
+
     fn read_activated_run_set(
         &self,
         record: ExactIndexActivationRecord,
@@ -1652,7 +2340,10 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         let mapping =
             if let Some(lease) = self.storage.lease_immutable_file(name, expected_length)? {
                 Some(Arc::new(ImmutableExactIndexRun::open(
-                    lease, descriptor, &mut visit,
+                    lease,
+                    descriptor,
+                    &self.page_cache.membership,
+                    &mut visit,
                 )?))
             } else {
                 self.audit_opened_run(name, &envelope, &mut visit)?;
@@ -1684,20 +2375,30 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         let descriptor = envelope.descriptor;
         let mut audit = descriptor.begin_hash_audit();
         audit.update(0, &envelope.header)?;
-        for page_ordinal in 0..descriptor.page_count() {
-            let offset = descriptor
-                .page_offset(page_ordinal)
-                .expect("ASSERT: descriptor page ordinal was prevalidated");
-            let bytes = self
-                .storage
-                .read_exact_at(name, offset, EXACT_INDEX_PAGE_BYTES)?;
-            let page = descriptor.decode_page(page_ordinal, &bytes)?;
-            audit.verify_page(&page)?;
-            for entry in page.entries() {
-                visit(entry);
-            }
-            audit.update(offset, &bytes)?;
-        }
+        visit_page_spans(
+            &descriptor,
+            descriptor.page_count(),
+            |offset, length| {
+                self.storage
+                    .read_exact_at(name, offset, length)
+                    .map_err(ExactIndexStoreError::Io)
+            },
+            |first, span| {
+                for (index, page_bytes) in span.chunks_exact(EXACT_INDEX_PAGE_BYTES).enumerate() {
+                    let page_ordinal = first + index;
+                    let offset = descriptor
+                        .page_offset(page_ordinal)
+                        .expect("ASSERT: descriptor page ordinal was prevalidated");
+                    let page = descriptor.decode_page(page_ordinal, page_bytes)?;
+                    audit.verify_page(&page)?;
+                    for entry in page.entries() {
+                        visit(entry);
+                    }
+                    audit.update(offset, page_bytes)?;
+                }
+                Ok(())
+            },
+        )?;
         audit.update(envelope.footer_offset, &envelope.footer)?;
         audit.finish()?;
         Ok(())
@@ -2105,20 +2806,19 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 AuditedExactRun {
                     descriptor: reader.descriptor,
                     mapping: reader.mapping.clone(),
-                    membership: reader
-                        .membership
-                        .as_ref()
-                        .filter(|filter| {
-                            filter.allocated_bytes() != 0
-                                && filter.allocated_bytes() <= membership_bytes_remaining
-                        })
-                        .map(Arc::clone),
+                    membership: reader.membership.clone(),
                 }
             } else {
                 self.audit_named_with_membership(&name, membership_bytes_remaining)?
             };
             let descriptor = audited.descriptor;
-            let membership = audited.membership;
+            let membership = audited.membership.or_else(|| {
+                Some(Arc::new(CachedRunMembership::dormant(
+                    &self.page_cache.membership,
+                    descriptor.run_hash(),
+                    CachedRunMembership::required_bytes(descriptor.entry_count()),
+                )))
+            });
             let mapping = audited.mapping;
             let is_mapped = mapping.is_some();
             if mapped_mode
@@ -2129,10 +2829,11 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             }
             verify_requested_identity(run_ref.profile(), run_ref.generation(), descriptor)?;
             verify_run_reference(run_ref, descriptor)?;
-            if let Some(filter) = &membership {
-                membership_bytes_remaining = membership_bytes_remaining
-                    .checked_sub(filter.allocated_bytes())
-                    .expect("ASSERT: admitted Run membership fits its remaining budget");
+            if let Some(membership) = &membership
+                && membership.allocated_bytes() != 0
+            {
+                membership_bytes_remaining =
+                    membership_bytes_remaining.saturating_sub(membership.required_charge_bytes());
             }
             readers.push(ExactIndexRunReader {
                 storage: self.storage.clone(),
@@ -2148,7 +2849,9 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     }
 
     fn membership_budget_bytes_now(&self) -> usize {
-        usize::try_from(self.page_cache.cache.capacity()).unwrap_or(usize::MAX)
+        stable_capacity_budget(
+            u64::try_from(self.page_cache.protected_budget_bytes()).unwrap_or(u64::MAX),
+        )
     }
 
     fn reader_from_writer(
@@ -2183,13 +2886,20 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         } else {
             self.audit_named_with_membership(&name, self.membership_budget_bytes_now())?
         };
+        let membership = audited.membership.or_else(|| {
+            Some(Arc::new(CachedRunMembership::dormant(
+                &self.page_cache.membership,
+                audited.descriptor.run_hash(),
+                CachedRunMembership::required_bytes(audited.descriptor.entry_count()),
+            )))
+        });
         Ok(ExactIndexRunReader {
             storage: self.storage.clone(),
             name,
             descriptor: audited.descriptor,
             page_cache: Arc::clone(&self.page_cache),
             mapping: audited.mapping,
-            membership: audited.membership,
+            membership,
             membership_counters: Arc::clone(&self.membership_counters),
         })
     }
@@ -2215,11 +2925,19 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        write_image(&self.storage, &temporary_name, encoded)?;
-        self.storage.set_len(
-            &temporary_name,
-            u64::try_from(encoded.len()).expect("ASSERT: Metadata-v1 length fits u64"),
-        )?;
+        if owned_writer {
+            write_image_unpublished(&self.storage, &temporary_name, encoded)?;
+            self.storage.set_len_unpublished(
+                &temporary_name,
+                u64::try_from(encoded.len()).expect("ASSERT: Metadata-v1 length fits u64"),
+            )?;
+        } else {
+            write_image(&self.storage, &temporary_name, encoded)?;
+            self.storage.set_len(
+                &temporary_name,
+                u64::try_from(encoded.len()).expect("ASSERT: Metadata-v1 length fits u64"),
+            )?;
+        }
         if !owned_writer {
             let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
             let reread = self.storage.read(&temporary_name)?;
@@ -2347,6 +3065,10 @@ impl<I> ActivatedExactIndex<I> {
         self.readers.len()
     }
 
+    pub(crate) fn run_readers(&self) -> &[ExactIndexRunReader<I>] {
+        &self.readers
+    }
+
     #[must_use]
     pub fn family_count(&self) -> usize {
         self.lookup_families.len()
@@ -2359,6 +3081,7 @@ impl<I> ActivatedExactIndex<I> {
     /// Panics if the bounded active reader set violates shared-counter or
     /// memory-accounting invariants.
     #[must_use]
+    #[allow(clippy::too_many_lines, reason = "fixed status projection")]
     pub fn membership_status(&self) -> ExactRunMembershipStatus {
         let leased_run_count = self
             .readers
@@ -2385,6 +3108,26 @@ impl<I> ActivatedExactIndex<I> {
                     .as_ref()
                     .is_some_and(|filter| filter.resident().is_some())
             })
+            .count();
+        let constructed_filter_count = self
+            .readers
+            .iter()
+            .filter(|reader| reader.membership_constructed())
+            .count();
+        let missing_filter_count = self
+            .readers
+            .iter()
+            .filter(|reader| reader.needs_membership())
+            .count();
+        let leased_run_count_with_bounds = self
+            .readers
+            .iter()
+            .filter(|reader| reader.mapping.is_some() && reader.page_bounds_resident())
+            .count();
+        let missing_page_bounds_count = self
+            .readers
+            .iter()
+            .filter(|reader| reader.needs_page_bounds())
             .count();
         let allocated_bytes = self.readers.iter().fold(0_usize, |total, reader| {
             total
@@ -2428,22 +3171,153 @@ impl<I> ActivatedExactIndex<I> {
             leased_run_count: u64::try_from(leased_run_count)
                 .expect("ASSERT: active mapped Exact Run count fits u64"),
             positional_run_count: u64::try_from(positional_run_count)
-                .expect("ASSERT: active positional Exact Run count fits u64"),
+                .expect("ASSERT: active mapped Exact Run count fits u64"),
             leased_page_bounds_bytes: u64::try_from(leased_page_bounds_bytes)
-                .expect("ASSERT: active mapped Exact page-bound bytes fit u64"),
+                .expect("ASSERT: active mapped Exact page-bound bytes fit usize"),
             filter_count: u64::try_from(filter_count)
                 .expect("ASSERT: active membership filter count fits u64"),
+            constructed_filter_count: u64::try_from(constructed_filter_count)
+                .expect("ASSERT: constructed membership filter count fits u64"),
+            missing_filter_count: u64::try_from(missing_filter_count)
+                .expect("ASSERT: missing membership filter count fits u64"),
             allocated_bytes: u64::try_from(allocated_bytes)
                 .expect("ASSERT: active membership bytes fit u64"),
             huge_page_advised_filter_count: u64::try_from(huge_page_advised_filter_count)
                 .expect("ASSERT: active THP membership count fits u64"),
             huge_page_advised_bytes: u64::try_from(huge_page_advised_bytes)
                 .expect("ASSERT: active THP membership bytes fit u64"),
+            leased_run_count_with_bounds: u64::try_from(leased_run_count_with_bounds)
+                .expect("ASSERT: active mapped Run bound count fits u64"),
+            missing_page_bounds_count: u64::try_from(missing_page_bounds_count)
+                .expect("ASSERT: missing Exact page-bound count fits u64"),
             probes: counters.probes.load(AtomicOrdering::Relaxed),
             definitely_absent: counters.definitely_absent.load(AtomicOrdering::Relaxed),
             requires_exact_lookup: counters.requires_exact_lookup.load(AtomicOrdering::Relaxed),
         }
     }
+}
+
+impl<I: StorageIo> ActivatedExactIndex<I> {
+    pub(crate) fn warm_page_count(&self) -> usize {
+        self.readers
+            .iter()
+            .map(|reader| reader.descriptor.page_count())
+            .sum()
+    }
+
+    pub(crate) fn warm_cycle(
+        &self,
+        policy: &ExactCacheWarmPolicy,
+        cancellation: Option<&MaintenanceCancellation>,
+        page_cursor: &mut usize,
+    ) -> Result<ExactCacheWarmProgress, ExactIndexStoreError> {
+        let mut progress = ExactCacheWarmProgress {
+            active_runs: self.readers.len(),
+            total_pages: self.warm_page_count(),
+            ..ExactCacheWarmProgress::default()
+        };
+        let readers = self.run_readers();
+        self.warm_structures(policy, cancellation, readers, &mut progress)?;
+        self.warm_pages(policy, cancellation, page_cursor, readers, &mut progress)?;
+        Ok(progress)
+    }
+
+    fn warm_structures(
+        &self,
+        policy: &ExactCacheWarmPolicy,
+        cancellation: Option<&MaintenanceCancellation>,
+        readers: &[ExactIndexRunReader<I>],
+        progress: &mut ExactCacheWarmProgress,
+    ) -> Result<(), ExactIndexStoreError> {
+        if policy.maximum_structures == 0 {
+            return Ok(());
+        }
+        let mut candidates = readers
+            .iter()
+            .enumerate()
+            .filter(|(_, reader)| reader.needs_structure())
+            .filter(|(_, reader)| reader.descriptor().page_count() <= policy.maximum_run_pages)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|index| readers[*index].descriptor().page_count());
+        for index in candidates.into_iter().take(policy.maximum_structures) {
+            let remaining = self.readers[index].page_cache.protected_budget_bytes();
+            progress.structures_requested += 1;
+            if self.readers[index].warm_structure(remaining, cancellation)? {
+                progress.structures_built += 1;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn warm_pages(
+        &self,
+        policy: &ExactCacheWarmPolicy,
+        cancellation: Option<&MaintenanceCancellation>,
+        page_cursor: &mut usize,
+        readers: &[ExactIndexRunReader<I>],
+        progress: &mut ExactCacheWarmProgress,
+    ) -> Result<(), ExactIndexStoreError> {
+        if policy.maximum_pages == 0 || progress.total_pages == 0 {
+            return Ok(());
+        }
+        let mut scanned = 0_usize;
+        while scanned < policy.maximum_pages {
+            if scanned.is_multiple_of(EXACT_WARM_SCAN_CANCELLATION_INTERVAL) {
+                crate::maintenance_cancellation::check_io(cancellation)
+                    .map_err(ExactIndexStoreError::Io)?;
+            }
+            let global_page = *page_cursor % progress.total_pages;
+            *page_cursor = page_cursor.wrapping_add(1);
+            scanned += 1;
+            let Some((run_index, page_ordinal)) = select_warm_page(readers, global_page) else {
+                continue;
+            };
+            if self.readers[run_index]
+                .page_cache
+                .peek(readers[run_index].descriptor().run_hash(), page_ordinal)
+                .is_some()
+            {
+                progress.pages_skipped_resident += 1;
+                continue;
+            }
+            match self.readers[run_index].warm_page(page_ordinal) {
+                Ok(true) => {
+                    progress.pages_warmed += 1;
+                    if progress.pages_warmed >= policy.maximum_pages {
+                        break;
+                    }
+                }
+                Ok(false) => {
+                    progress.pages_rejected += 1;
+                    break;
+                }
+                Err(error) if error.is_cancelled() => {
+                    progress.cancelled = true;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn select_warm_page<I: StorageIo>(
+    readers: &[ExactIndexRunReader<I>],
+    global_page: usize,
+) -> Option<(usize, usize)> {
+    let mut remaining = global_page;
+    readers.iter().enumerate().find_map(|(run_index, reader)| {
+        let page_count = reader.descriptor().page_count();
+        if remaining < page_count {
+            Some((run_index, remaining))
+        } else {
+            remaining -= page_count;
+            None
+        }
+    })
 }
 
 impl<I: StorageIo> ActivatedExactIndex<I> {
@@ -2573,6 +3447,121 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
         }
         Ok(complete)
     }
+
+    /// Resolves a strictly ascending, duplicate-free key set with the same
+    /// family precedence, merge, and candidate-cap semantics as one
+    /// `lookup_transitions` call per key, but with the touched leaf pages of
+    /// each Run deduplicated, merged into ascending Direct-I/O spans, and
+    /// split in RAM. Keys are resolved in bounded windows.
+    ///
+    /// A batch negative is no more authoritative than a per-key negative.
+    ///
+    /// # Errors
+    /// Returns touched-page I/O, integrity, or bounded-allocation failures.
+    ///
+    /// # Panics
+    /// In debug builds if the keys are not strictly ascending.
+    pub fn lookup_transitions_batch(
+        &self,
+        keys: &[(ChunkId, u32)],
+    ) -> Result<Vec<ExactIndexLookup>, ExactIndexStoreError> {
+        debug_assert!(
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "ASSERT: batched Exact lookup keys are strictly ascending"
+        );
+        let mut candidates: Vec<Vec<ExactIndexEntry>> = vec![Vec::new(); keys.len()];
+        let mut complete = vec![true; keys.len()];
+        for (window_ordinal, window) in keys.chunks(EXACT_LOOKUP_BATCH_WINDOW_KEYS).enumerate() {
+            self.lookup_window_into(
+                window_ordinal * EXACT_LOOKUP_BATCH_WINDOW_KEYS,
+                window,
+                &mut candidates,
+                &mut complete,
+            )?;
+        }
+        keys.iter()
+            .zip(candidates)
+            .zip(complete)
+            .map(|((_, candidates), complete)| {
+                Ok(ExactIndexLookup {
+                    candidates,
+                    complete,
+                })
+            })
+            .collect()
+    }
+
+    fn lookup_window_into(
+        &self,
+        base: usize,
+        window: &[(ChunkId, u32)],
+        candidates: &mut [Vec<ExactIndexEntry>],
+        complete: &mut [bool],
+    ) -> Result<(), ExactIndexStoreError> {
+        for family in &self.lookup_families {
+            // One ascending window visits each key-disjoint Run partition as
+            // one contiguous ascending key group.
+            let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+            for (local, &(chunk_id, _)) in window.iter().enumerate() {
+                let global = base + local;
+                if !complete[global] || candidates[global].len() >= MAX_EXACT_LOOKUP_CANDIDATES {
+                    continue;
+                }
+                let partition_ordinal = family.reader_indices.partition_point(|index| {
+                    self.run_set.runs()[*index].maximum_chunk_id() < chunk_id
+                });
+                let Some(&index) = family.reader_indices.get(partition_ordinal) else {
+                    continue;
+                };
+                if chunk_id < self.run_set.runs()[index].minimum_chunk_id() {
+                    continue;
+                }
+                match groups.last_mut() {
+                    Some((last, ordinals)) if *last == index => ordinals.push(local),
+                    _ => groups.push((index, vec![local])),
+                }
+            }
+            for (index, ordinals) in groups {
+                let reader = &self.readers[index];
+                let group_keys: Vec<(ChunkId, u32)> =
+                    ordinals.iter().map(|local| window[*local]).collect();
+                let mut group_candidates: Vec<Vec<ExactIndexEntry>> =
+                    vec![Vec::new(); group_keys.len()];
+                let mut group_complete = vec![true; group_keys.len()];
+                if !reader.try_lookup_batch_into(
+                    &group_keys,
+                    &mut group_candidates,
+                    &mut group_complete,
+                )? {
+                    // Runs without resident page-key bounds retain the exact
+                    // serial descent, byte for byte as before.
+                    for local in &ordinals {
+                        let global = base + local;
+                        let run_complete = reader.lookup_into(
+                            window[*local].0,
+                            window[*local].1,
+                            &mut candidates[global],
+                            MAX_EXACT_LOOKUP_CANDIDATES,
+                        )?;
+                        complete[global] &= run_complete;
+                        if candidates[global].len() >= MAX_EXACT_LOOKUP_CANDIDATES {
+                            complete[global] = false;
+                        }
+                    }
+                    continue;
+                }
+                for (position, local) in ordinals.iter().enumerate() {
+                    let global = base + local;
+                    candidates[global].extend(std::mem::take(&mut group_candidates[position]));
+                    complete[global] &= group_complete[position];
+                    if candidates[global].len() >= MAX_EXACT_LOOKUP_CANDIDATES {
+                        complete[global] = false;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2603,12 +3592,13 @@ impl RunWriterEvidence {
         bounds
             .try_reserve_exact(entries.div_ceil(EXACT_INDEX_ENTRIES_PER_PAGE))
             .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
-        let capacity = usize::try_from(cache.cache.capacity()).unwrap_or(usize::MAX);
-        let membership = (capacity != 0)
-            .then(|| BlockedBloomHint::new(entries, capacity).ok())
-            .flatten();
+        let membership = BlockedBloomHint::required_bytes(entries)
+            .ok()
+            .and_then(|required_bytes| BlockedBloomHint::new(entries, required_bytes).ok());
         Ok(Self {
-            pages: cache.cache.sibling(crate::ReadCacheClass::StorageRange),
+            pages: cache
+                .cache
+                .ephemeral_sibling(crate::ReadCacheClass::StorageRange),
             bounds,
             membership,
         })
@@ -2689,7 +3679,11 @@ impl StreamedPartitionOutput {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        let mut output = ImmutableWriteBuffer::new()?;
+        let mut output = if owned_writer {
+            ImmutableWriteBuffer::new_unpublished()?
+        } else {
+            ImmutableWriteBuffer::new()?
+        };
         output.append(&repository.storage, &temporary_name, encoder.header())?;
         let mut page_entries = Vec::new();
         page_entries
@@ -2750,11 +3744,19 @@ impl StreamedPartitionOutput {
             .append(&repository.storage, &self.temporary_name, &footer)?;
         self.output
             .finish(&repository.storage, &self.temporary_name)?;
-        repository.storage.set_len(
-            &self.temporary_name,
-            u64::try_from(expected.file_length())
-                .map_err(|_| ExactIndexStoreError::DependencyMismatch)?,
-        )?;
+        if self.evidence.is_some() {
+            repository.storage.set_len_unpublished(
+                &self.temporary_name,
+                u64::try_from(expected.file_length())
+                    .map_err(|_| ExactIndexStoreError::DependencyMismatch)?,
+            )?;
+        } else {
+            repository.storage.set_len(
+                &self.temporary_name,
+                u64::try_from(expected.file_length())
+                    .map_err(|_| ExactIndexStoreError::DependencyMismatch)?,
+            )?;
+        }
         let observed = if self.evidence.is_some() {
             expected
         } else {
@@ -2854,6 +3856,13 @@ struct CompactionSource<I> {
     next_page_ordinal: usize,
     finished: bool,
     reader: Option<ExactIndexRunReader<I>>,
+    // One Direct-I/O span replaces per-page fetches for the next
+    // EXACT_COMPACTION_PAGES_PER_IO ordinals. The unleased AUDIT path keeps
+    // raw page bytes; the leased path keeps verified cached-ready pages.
+    span_first: usize,
+    span_pages: usize,
+    span_raw: Vec<u8>,
+    span_verified: Vec<Arc<ExactIndexPage>>,
 }
 
 struct CompactionFamilySource<I> {
@@ -2945,6 +3954,10 @@ impl<I: Clone + StorageIo> CompactionSource<I> {
                 next_page_ordinal: 0,
                 finished: false,
                 reader: Some(reader.clone()),
+                span_first: 0,
+                span_pages: 0,
+                span_raw: Vec::new(),
+                span_verified: Vec::new(),
             };
             source.load_next_page()?;
             return Ok(source);
@@ -2967,6 +3980,10 @@ impl<I: Clone + StorageIo> CompactionSource<I> {
             next_page_ordinal: 0,
             finished: false,
             reader: None,
+            span_first: 0,
+            span_pages: 0,
+            span_raw: Vec::new(),
+            span_verified: Vec::new(),
         };
         source.load_next_page()?;
         if source.page.is_none() {
@@ -3015,26 +4032,56 @@ impl<I: Clone + StorageIo> CompactionSource<I> {
             return Ok(());
         }
         let page_ordinal = self.next_page_ordinal;
-        if let Some(reader) = &self.reader {
-            self.page = Some((*reader.read_page(page_ordinal)?).clone());
+        let page_count = self.descriptor.page_count();
+        let covered = self.span_pages != 0
+            && page_ordinal >= self.span_first
+            && page_ordinal < self.span_first + self.span_pages;
+        if !covered {
+            self.span_first = page_ordinal;
+            self.span_pages = (page_count - page_ordinal).min(EXACT_COMPACTION_PAGES_PER_IO);
+            if let Some(reader) = &self.reader {
+                // Leased input: one span read replaces the per-page fetches;
+                // verified pages are admitted like demand reads.
+                self.span_raw.clear();
+                self.span_verified = reader.decoded_page_span(self.span_first, self.span_pages)?;
+            } else {
+                // Unleased AUDIT input: keep raw span bytes so per-page AUDIT
+                // order and hashing remain exactly page sequential.
+                self.span_verified.clear();
+                let span_offset = self
+                    .descriptor
+                    .page_offset(self.span_first)
+                    .expect("ASSERT: verified compaction page ordinal is in range");
+                self.span_raw = self
+                    .storage
+                    .read_exact_at(
+                        &self.name,
+                        span_offset,
+                        self.span_pages * EXACT_INDEX_PAGE_BYTES,
+                    )
+                    .map_err(ExactIndexStoreError::Io)?;
+                self.span_pages = self.span_raw.len() / EXACT_INDEX_PAGE_BYTES;
+            }
+        }
+        if self.reader.is_some() {
+            self.page = Some((*self.span_verified[page_ordinal - self.span_first]).clone());
             self.page_entry_ordinal = 0;
             self.next_page_ordinal += 1;
             return Ok(());
         }
+        let skip = (page_ordinal - self.span_first) * EXACT_INDEX_PAGE_BYTES;
         let offset = self
             .descriptor
             .page_offset(page_ordinal)
             .expect("ASSERT: verified compaction page ordinal is in range");
-        let bytes = self
-            .storage
-            .read_exact_at(&self.name, offset, EXACT_INDEX_PAGE_BYTES)?;
-        let page = self.descriptor.decode_page(page_ordinal, &bytes)?;
+        let page_bytes = &self.span_raw[skip..skip + EXACT_INDEX_PAGE_BYTES];
+        let page = self.descriptor.decode_page(page_ordinal, page_bytes)?;
         let audit = self
             .audit
             .as_mut()
             .expect("ASSERT: active compaction source retains its hash audit");
         audit.verify_page(&page)?;
-        audit.update(offset, &bytes)?;
+        audit.update(offset, page_bytes)?;
         self.page = Some(page);
         self.page_entry_ordinal = 0;
         self.next_page_ordinal = self
@@ -3224,6 +4271,12 @@ impl ExactIndexPageCache {
             ordinal: page_ordinal as u64,
         })
     }
+    fn peek(&self, run_hash: [u8; 32], page_ordinal: usize) -> Option<Arc<ExactIndexPage>> {
+        self.cache.peek(crate::ReadCacheKey {
+            identity: run_hash,
+            ordinal: page_ordinal as u64,
+        })
+    }
     fn insert(&self, run_hash: [u8; 32], page_ordinal: usize, page: Arc<ExactIndexPage>) {
         assert_eq!(
             page.ordinal(),
@@ -3240,9 +4293,32 @@ impl ExactIndexPageCache {
             EXACT_INDEX_PAGE_BYTES as u64,
         );
     }
+    fn protected_limit_bytes(&self) -> usize {
+        usize::try_from(self.cache.protected_exact_limit()).unwrap_or(usize::MAX)
+    }
+    fn protected_budget_bytes(&self) -> usize {
+        // Swap pressure zeroes the effective cache capacity. Optional
+        // acceleration (membership filters, page bounds) must stay disabled
+        // while the shared cache runs at zero capacity.
+        if self.cache.capacity() == 0 {
+            return 0;
+        }
+        self.protected_limit_bytes()
+            .saturating_sub(self.protected_resident_bytes())
+    }
+    fn protected_resident_bytes(&self) -> usize {
+        usize::try_from(
+            self.cache
+                .protected_resident_bytes()
+                .saturating_add(self.cache.pinned_resident_bytes()),
+        )
+        .unwrap_or(usize::MAX)
+    }
     fn status(&self) -> ExactIndexPageCacheStatus {
         let stats = self.cache.stats();
         let pressure = self.cache.pressure();
+        let protected_limit_bytes = self.protected_limit_bytes();
+        let protected_resident_bytes = self.protected_resident_bytes();
         ExactIndexPageCacheStatus {
             hits: stats.hits,
             misses: stats.misses,
@@ -3251,6 +4327,8 @@ impl ExactIndexPageCache {
             pressure_rejections: stats.rejections,
             target_pages: self.cache.capacity() / ACCOUNTED_PAGE_BYTES,
             capacity_pages: self.capacity_pages,
+            protected_limit_bytes: u64::try_from(protected_limit_bytes).unwrap_or(u64::MAX),
+            protected_resident_bytes: u64::try_from(protected_resident_bytes).unwrap_or(u64::MAX),
             reserve_bytes: shared_cache_reserve_bytes(pressure.effective_limit_bytes()),
             effective_limit_bytes: pressure.effective_limit_bytes(),
             available_bytes: pressure.available_bytes(),
@@ -3286,6 +4364,16 @@ fn exact_page_cache_accounted_page_bytes() -> u64 {
     ACCOUNTED_PAGE_BYTES
 }
 
+fn stable_capacity_budget(capacity: u64) -> usize {
+    const MIB: u64 = 1 << 20;
+    let granularity = (2 * MIB).min(capacity);
+    let stable = capacity
+        .checked_div(granularity)
+        .unwrap_or_default()
+        .saturating_mul(granularity);
+    usize::try_from(stable).unwrap_or(usize::MAX)
+}
+
 fn floor_power_of_two(value: usize) -> usize {
     let next = value
         .checked_next_power_of_two()
@@ -3297,34 +4385,82 @@ fn floor_power_of_two(value: usize) -> usize {
 struct CachedRunMembership {
     cache: crate::ReadCacheNamespace,
     key: crate::ReadCacheKey,
+    constructed: AtomicBool,
+    required_bytes: usize,
 }
+
 impl CachedRunMembership {
+    fn key(identity: [u8; 32]) -> crate::ReadCacheKey {
+        crate::ReadCacheKey {
+            identity,
+            ordinal: 0,
+        }
+    }
+
+    fn required_bytes(entry_count: usize) -> usize {
+        BlockedBloomHint::required_bytes(entry_count).map_or(usize::MAX, |required| {
+            required + size_of::<BlockedBloomHint>()
+        })
+    }
+
+    fn dormant(
+        cache: &crate::ReadCacheNamespace,
+        identity: [u8; 32],
+        required_bytes: usize,
+    ) -> Self {
+        Self {
+            cache: cache.clone(),
+            key: Self::key(identity),
+            constructed: AtomicBool::new(false),
+            required_bytes,
+        }
+    }
+
     fn new(
         cache: &crate::ReadCacheNamespace,
         identity: [u8; 32],
         filter: BlockedBloomHint,
     ) -> Self {
-        let key = crate::ReadCacheKey {
-            identity,
-            ordinal: 0,
-        };
-        let bytes = filter.allocated_bytes() as u64 + size_of::<BlockedBloomHint>() as u64;
-        cache.insert(key, Arc::new(filter), bytes, EXACT_INDEX_PAGE_BYTES as u64);
-        Self {
-            cache: cache.clone(),
-            key,
-        }
+        let required_bytes = filter.allocated_bytes() + size_of::<BlockedBloomHint>();
+        let membership = Self::dormant(cache, identity, required_bytes);
+        membership.install(filter);
+        membership
     }
+
+    fn install(&self, filter: BlockedBloomHint) -> bool {
+        let bytes = filter.allocated_bytes() as u64 + size_of::<BlockedBloomHint>() as u64;
+        self.cache.insert(
+            self.key,
+            Arc::new(filter),
+            bytes,
+            EXACT_INDEX_PAGE_BYTES as u64,
+        );
+        let resident = self.resident().is_some();
+        self.constructed.store(resident, AtomicOrdering::Release);
+        resident
+    }
+
     fn resident(&self) -> Option<Arc<BlockedBloomHint>> {
         self.cache.peek(self.key)
     }
+
+    fn constructed(&self) -> bool {
+        self.constructed.load(AtomicOrdering::Acquire)
+    }
+
+    const fn required_charge_bytes(&self) -> usize {
+        self.required_bytes
+    }
+
     fn allocated_bytes(&self) -> usize {
         self.resident().map_or(0, |filter| filter.allocated_bytes())
     }
+
     fn huge_page_advised(&self) -> bool {
         self.resident()
             .is_some_and(|filter| filter.huge_page_advised())
     }
+
     fn probe_for_exact_lookup(&self, chunk: ChunkId, length: usize) -> BloomLookupHint {
         self.cache
             .get::<BlockedBloomHint>(self.key)
@@ -3344,6 +4480,43 @@ pub struct ExactIndexRunReader<I> {
     mapping: Option<Arc<ImmutableExactIndexRun>>,
     membership: Option<Arc<CachedRunMembership>>,
     membership_counters: Arc<ExactRunMembershipCounters>,
+}
+
+impl<I> ExactIndexRunReader<I> {
+    pub(crate) const fn descriptor(&self) -> ExactIndexRunDescriptor {
+        self.descriptor
+    }
+
+    fn membership_constructed(&self) -> bool {
+        self.membership
+            .as_ref()
+            .is_some_and(|membership| membership.constructed())
+    }
+
+    fn membership_resident(&self) -> bool {
+        self.membership
+            .as_ref()
+            .is_some_and(|membership| membership.resident().is_some())
+    }
+
+    fn needs_membership(&self) -> bool {
+        self.descriptor.entry_count() != 0 && !self.membership_resident()
+    }
+
+    fn page_bounds_resident(&self) -> bool {
+        self.mapping.as_ref().is_some_and(|mapping| {
+            mapping.page_bounds_bytes()
+                >= self.descriptor.page_count() * size_of::<ExactPageKeyBounds>()
+        })
+    }
+
+    fn needs_page_bounds(&self) -> bool {
+        self.mapping.is_some() && self.descriptor.page_count() != 0 && !self.page_bounds_resident()
+    }
+
+    fn needs_structure(&self) -> bool {
+        self.needs_membership() || self.needs_page_bounds()
+    }
 }
 
 impl<I: StorageIo> ExactIndexRunReader<I> {
@@ -3390,7 +4563,11 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         maximum_candidates: usize,
     ) -> Result<bool, ExactIndexStoreError> {
         let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
-        if let Some(membership) = &self.membership {
+        if self.membership_resident() {
+            let membership = self
+                .membership
+                .as_ref()
+                .expect("ASSERT: a resident membership wrapper exists");
             self.membership_counters
                 .probes
                 .fetch_add(1, AtomicOrdering::Relaxed);
@@ -3454,30 +4631,462 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         Ok(true)
     }
 
-    fn read_page(&self, page_ordinal: usize) -> Result<Arc<ExactIndexPage>, ExactIndexStoreError> {
+    fn warm_structure(
+        &self,
+        remaining_bytes: usize,
+        cancellation: Option<&MaintenanceCancellation>,
+    ) -> Result<bool, ExactIndexStoreError> {
+        let page_count = self.descriptor.page_count();
+        let entry_count = self.descriptor.entry_count();
+        let want_membership = self.needs_membership() && self.membership.is_some();
+        let want_bounds = self.needs_page_bounds();
+        if !want_membership && !want_bounds {
+            return Ok(false);
+        }
+
+        let Some((build_membership, build_bounds, membership_bytes, _bounds_bytes)) =
+            warm_structure_budget(
+                want_membership,
+                want_bounds,
+                entry_count,
+                page_count,
+                remaining_bytes,
+            )
+        else {
+            return Ok(false);
+        };
+
+        let mut membership = build_membership
+            .then(|| BlockedBloomHint::new(entry_count, membership_bytes).ok())
+            .flatten();
+        let mut bounds = build_bounds
+            .then(|| {
+                let mut bounds = Vec::new();
+                bounds.try_reserve_exact(page_count).ok()?;
+                Some(bounds)
+            })
+            .flatten();
+        if membership.is_some() != build_membership || bounds.is_some() != build_bounds {
+            return Ok(false);
+        }
+
+        let mut observe = |page: &ExactIndexPage| -> Result<(), ExactIndexStoreError> {
+            if let Some(filter) = &mut membership {
+                for entry in page.entries() {
+                    let logical_length = usize::try_from(entry.logical_length())
+                        .expect("ASSERT: Exact logical length fits usize");
+                    filter.insert_hint(entry.chunk_id(), logical_length);
+                    assert_eq!(
+                        filter.probe_for_exact_lookup(entry.chunk_id(), logical_length),
+                        BloomLookupHint::RequiresExactLookup,
+                        "ASSERT: warming an Exact Run membership cannot create a Bloom false negative"
+                    );
+                }
+            }
+            if let Some(bounds) = &mut bounds {
+                bounds.push(ExactPageKeyBounds::from_page(page));
+            }
+            Ok(())
+        };
         let run_hash = self.descriptor.run_hash();
-        if let Some(page) = self.page_cache.get(run_hash, page_ordinal) {
+        let mut first = 0_usize;
+        while first < page_count {
+            let pages = (page_count - first).min(EXACT_SCAN_PAGES_PER_IO);
+            // Serve the span from verified cached pages only while fully
+            // resident; any miss replaces per-page I/O with one span read.
+            let mut resident: Vec<Arc<ExactIndexPage>> = Vec::new();
+            for page_ordinal in first..first + pages {
+                if page_ordinal.is_multiple_of(EXACT_WARM_SCAN_CANCELLATION_INTERVAL) {
+                    crate::maintenance_cancellation::check_io(cancellation)
+                        .map_err(ExactIndexStoreError::Io)?;
+                }
+                if let Some(page) = self.page_cache.peek(run_hash, page_ordinal) {
+                    resident.push(page);
+                } else {
+                    break;
+                }
+            }
+            for page in &resident {
+                observe(page)?;
+            }
+            let skipped = resident.len();
+            drop(resident);
+            if skipped == pages {
+                first += pages;
+                continue;
+            }
+            self.warm_span_pages(first + skipped, pages - skipped, cancellation, &mut observe)?;
+            first += pages;
+        }
+
+        let bounds_installed = bounds.is_some_and(|value| {
+            self.mapping
+                .as_ref()
+                .is_some_and(|mapping| mapping.insert_page_bounds(value.into_boxed_slice()))
+        });
+        let filter_installed = membership.is_some_and(|filter| {
+            self.membership
+                .as_ref()
+                .is_some_and(|wrapper| wrapper.install(filter))
+        });
+        Ok(filter_installed || bounds_installed)
+    }
+
+    /// Reads one warm span of `missing` pages starting at `start` and hands
+    /// each verified page to `observe`; resident pages answer from cache.
+    fn warm_span_pages<F>(
+        &self,
+        start: usize,
+        missing: usize,
+        cancellation: Option<&MaintenanceCancellation>,
+        mut observe: F,
+    ) -> Result<(), ExactIndexStoreError>
+    where
+        F: FnMut(&ExactIndexPage) -> Result<(), ExactIndexStoreError>,
+    {
+        let run_hash = self.descriptor.run_hash();
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
+        let offset = self
+            .descriptor
+            .page_offset(start)
+            .ok_or(ExactIndexFormatError::InvalidPage)?;
+        let span = if let Some(mapping) = &self.mapping {
+            mapping.page_span(offset, missing * EXACT_INDEX_PAGE_BYTES)?
+        } else {
+            self.storage
+                .read_exact_at(&self.name, offset, missing * EXACT_INDEX_PAGE_BYTES)
+                .map_err(ExactIndexStoreError::Io)?
+        };
+        for (index, page_bytes) in span.chunks_exact(EXACT_INDEX_PAGE_BYTES).enumerate() {
+            let page_ordinal = start + index;
+            if page_ordinal.is_multiple_of(EXACT_WARM_SCAN_CANCELLATION_INTERVAL) {
+                crate::maintenance_cancellation::check_io(cancellation)
+                    .map_err(ExactIndexStoreError::Io)?;
+            }
+            let page = if let Some(page) = self.page_cache.peek(run_hash, page_ordinal) {
+                page
+            } else {
+                Arc::new(self.descriptor.decode_page(page_ordinal, page_bytes)?)
+            };
+            observe(&page)?;
+        }
+        Ok(())
+    }
+
+    fn warm_page(&self, page_ordinal: usize) -> Result<bool, ExactIndexStoreError> {
+        let run_hash = self.descriptor.run_hash();
+        if self.page_cache.peek(run_hash, page_ordinal).is_some() {
+            return Ok(true);
+        }
+        self.read_page(page_ordinal)?;
+        Ok(self.page_cache.peek(run_hash, page_ordinal).is_some())
+    }
+
+    fn read_page(&self, page_ordinal: usize) -> Result<Arc<ExactIndexPage>, ExactIndexStoreError> {
+        self.load_page(page_ordinal, true)
+    }
+
+    /// Resolves one ascending, duplicate-free key window against this Run.
+    ///
+    /// Cached page-key bounds turn the descent into pure RAM work; the touched
+    /// leaf pages are then deduplicated, merged into ascending Direct-I/O spans
+    /// of at most one adapter range read each, and split in RAM. Candidates are
+    /// appended per key exactly as a per-key `lookup_into` would append them,
+    /// including the candidate-cap transition to `complete=false`. Returns
+    /// `Ok(false)` without touching the outputs when this Run has no resident
+    /// page-key bounds, leaving the caller's per-key fallback unchanged.
+    ///
+    /// # Errors
+    /// Returns touched-page I/O or touched-page integrity failures.
+    ///
+    /// # Panics
+    /// Panics if a format-v1 logical length does not fit the host address
+    /// space. Supported production targets have at least 32-bit `usize`.
+    fn batch_pending_keys(
+        &self,
+        keys: &[(ChunkId, u32)],
+        candidates: &[Vec<ExactIndexEntry>],
+        complete: &[bool],
+    ) -> Vec<usize> {
+        let mut pending: Vec<usize> = Vec::new();
+        for (ordinal, &(chunk_id, logical_length)) in keys.iter().enumerate() {
+            if !complete[ordinal] || candidates[ordinal].len() >= MAX_EXACT_LOOKUP_CANDIDATES {
+                continue;
+            }
+            if self.membership_resident() {
+                let membership = self
+                    .membership
+                    .as_ref()
+                    .expect("ASSERT: a resident membership wrapper exists");
+                self.membership_counters
+                    .probes
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                let hint = membership.probe_for_exact_lookup(
+                    chunk_id,
+                    usize::try_from(logical_length)
+                        .expect("ASSERT: Exact logical length fits usize"),
+                );
+                match hint {
+                    BloomLookupHint::DefinitelyAbsent => {
+                        self.membership_counters
+                            .definitely_absent
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                        continue;
+                    }
+                    BloomLookupHint::RequiresExactLookup => {
+                        self.membership_counters
+                            .requires_exact_lookup
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                }
+            }
+            pending.push(ordinal);
+        }
+        pending
+    }
+
+    /// One span read replaces the per-page fetches of a batched lookup round;
+    /// decoded pages are admitted exactly like demand reads.
+    fn batch_span_pages(
+        &self,
+        first: usize,
+        count: usize,
+        run_hash: [u8; 32],
+        resident: &mut std::collections::BTreeMap<usize, Arc<ExactIndexPage>>,
+    ) -> Result<(), ExactIndexStoreError> {
+        let offset = self
+            .descriptor
+            .page_offset(first)
+            .ok_or(ExactIndexFormatError::InvalidPage)?;
+        let span = if let Some(mapping) = &self.mapping {
+            mapping.page_span(offset, count * EXACT_INDEX_PAGE_BYTES)?
+        } else {
+            self.storage
+                .read_exact_at(&self.name, offset, count * EXACT_INDEX_PAGE_BYTES)
+                .map_err(ExactIndexStoreError::Io)?
+        };
+        for (index, page_bytes) in span.chunks_exact(EXACT_INDEX_PAGE_BYTES).enumerate() {
+            let ordinal = first + index;
+            let page = Arc::new(self.descriptor.decode_page(ordinal, page_bytes)?);
+            self.page_cache.insert(run_hash, ordinal, Arc::clone(&page));
+            resident.insert(ordinal, page);
+        }
+        Ok(())
+    }
+
+    fn try_lookup_batch_into(
+        &self,
+        keys: &[(ChunkId, u32)],
+        candidates: &mut [Vec<ExactIndexEntry>],
+        complete: &mut [bool],
+    ) -> Result<bool, ExactIndexStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
+        let Some(bounds) = self
+            .mapping
+            .as_ref()
+            .and_then(|mapping| mapping.peek_page_bounds())
+            .filter(|bounds| bounds.len() == self.descriptor.page_count())
+        else {
+            return Ok(false);
+        };
+        let run_hash = self.descriptor.run_hash();
+        let mut pending = self.batch_pending_keys(keys, candidates, complete);
+        let page_count = self.descriptor.page_count();
+        let mut leaf: Vec<usize> = vec![usize::MAX; keys.len()];
+        for &ordinal in &pending {
+            let (chunk_id, logical_length) = keys[ordinal];
+            leaf[ordinal] =
+                bounds.partition_point(|bounds| bounds.is_after(chunk_id, logical_length));
+        }
+        let mut resident: std::collections::BTreeMap<usize, Arc<ExactIndexPage>> =
+            std::collections::BTreeMap::new();
+        while !pending.is_empty() {
+            let mut missing: Vec<usize> = pending
+                .iter()
+                .map(|ordinal| leaf[*ordinal])
+                .filter(|ordinal| {
+                    *ordinal < page_count
+                        && !resident.contains_key(ordinal)
+                        && self.page_cache.peek(run_hash, *ordinal).is_none()
+                })
+                .collect();
+            missing.sort_unstable();
+            missing.dedup();
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for ordinal in missing {
+                if let Some((first, count)) = spans.last_mut()
+                    && ordinal == *first + *count
+                    && *count < EXACT_SCAN_PAGES_PER_IO
+                {
+                    *count += 1;
+                } else {
+                    spans.push((ordinal, 1));
+                }
+            }
+            for (first, count) in spans {
+                self.batch_span_pages(first, count, run_hash, &mut resident)?;
+            }
+            let mut next_pending = Vec::new();
+            for ordinal in pending {
+                let page_ordinal = leaf[ordinal];
+                if page_ordinal >= page_count {
+                    continue;
+                }
+                let page = match resident.get(&page_ordinal).cloned() {
+                    Some(page) => page,
+                    None => self
+                        .page_cache
+                        .peek(run_hash, page_ordinal)
+                        .expect("ASSERT: a batched lookup page is resident or was just span-read"),
+                };
+                let (chunk_id, logical_length) = keys[ordinal];
+                let matches = page.candidates(chunk_id, logical_length);
+                if matches.is_empty() {
+                    continue;
+                }
+                let remaining =
+                    MAX_EXACT_LOOKUP_CANDIDATES.saturating_sub(candidates[ordinal].len());
+                let accepted = matches.len().min(remaining);
+                candidates[ordinal].extend_from_slice(&matches[..accepted]);
+                if matches.len() > remaining {
+                    complete[ordinal] = false;
+                    continue;
+                }
+                let key_reaches_page_end = page.entries().last().is_some_and(|entry| {
+                    entry.chunk_id() == chunk_id && entry.logical_length() == logical_length
+                });
+                if !key_reaches_page_end || page_ordinal + 1 == page_count {
+                    continue;
+                }
+                if candidates[ordinal].len() == MAX_EXACT_LOOKUP_CANDIDATES {
+                    complete[ordinal] = false;
+                    continue;
+                }
+                leaf[ordinal] = page_ordinal + 1;
+                next_pending.push(ordinal);
+            }
+            pending = next_pending;
+        }
+        Ok(true)
+    }
+
+    fn load_page(
+        &self,
+        page_ordinal: usize,
+        admit: bool,
+    ) -> Result<Arc<ExactIndexPage>, ExactIndexStoreError> {
+        let run_hash = self.descriptor.run_hash();
+        if admit {
+            if let Some(page) = self.page_cache.get(run_hash, page_ordinal) {
+                return Ok(page);
+            }
+        } else if let Some(page) = self.page_cache.peek(run_hash, page_ordinal) {
             return Ok(page);
         }
         let offset = self
             .descriptor
             .page_offset(page_ordinal)
             .ok_or(ExactIndexFormatError::InvalidPage)?;
-        let page = if let Some(mapping) = &self.mapping {
-            Arc::new(
-                self.descriptor
-                    .decode_page(page_ordinal, &mapping.page(offset)?)?,
-            )
+        let page = Arc::new(if let Some(mapping) = &self.mapping {
+            self.descriptor
+                .decode_page(page_ordinal, &mapping.page(offset)?)?
         } else {
             let bytes = self
                 .storage
                 .read_exact_at(&self.name, offset, EXACT_INDEX_PAGE_BYTES)?;
-            Arc::new(self.descriptor.decode_page(page_ordinal, &bytes)?)
-        };
-        self.page_cache
-            .insert(run_hash, page_ordinal, Arc::clone(&page));
+            self.descriptor.decode_page(page_ordinal, &bytes)?
+        });
+        if admit {
+            self.page_cache
+                .insert(run_hash, page_ordinal, Arc::clone(&page));
+        }
         Ok(page)
     }
+
+    /// Fetches and independently decodes `count` consecutive pages in at most
+    /// one adapter-range read, admitting each verified page exactly like a
+    /// demand `load_page`. Only the I/O granularity differs.
+    ///
+    /// # Errors
+    /// Returns span I/O or per-page integrity failures.
+    fn decoded_page_span(
+        &self,
+        first: usize,
+        count: usize,
+    ) -> Result<Vec<Arc<ExactIndexPage>>, ExactIndexStoreError> {
+        let run_hash = self.descriptor.run_hash();
+        let mut pages = Vec::with_capacity(count);
+        for page_ordinal in first..first + count {
+            match self.page_cache.peek(run_hash, page_ordinal) {
+                Some(page) => pages.push(page),
+                None => break,
+            }
+        }
+        if pages.len() == count {
+            return Ok(pages);
+        }
+        let skipped = pages.len();
+        let missing = count - skipped;
+        let start = first + skipped;
+        let start_offset = self
+            .descriptor
+            .page_offset(start)
+            .ok_or(ExactIndexFormatError::InvalidPage)?;
+        let span = if let Some(mapping) = &self.mapping {
+            mapping.page_span(start_offset, missing * EXACT_INDEX_PAGE_BYTES)?
+        } else {
+            self.storage
+                .read_exact_at(&self.name, start_offset, missing * EXACT_INDEX_PAGE_BYTES)
+                .map_err(ExactIndexStoreError::Io)?
+        };
+        if span.len() != missing * EXACT_INDEX_PAGE_BYTES {
+            return Err(ExactIndexStoreError::PublishVerificationMismatch);
+        }
+        for (index, page_bytes) in span.chunks_exact(EXACT_INDEX_PAGE_BYTES).enumerate() {
+            let page_ordinal = start + index;
+            let page = if let Some(page) = self.page_cache.peek(run_hash, page_ordinal) {
+                page
+            } else {
+                let page = Arc::new(self.descriptor.decode_page(page_ordinal, page_bytes)?);
+                self.page_cache
+                    .insert(run_hash, page_ordinal, Arc::clone(&page));
+                page
+            };
+            pages.push(page);
+        }
+        Ok(pages)
+    }
+}
+
+fn warm_structure_budget(
+    want_membership: bool,
+    want_bounds: bool,
+    entry_count: usize,
+    page_count: usize,
+    remaining_bytes: usize,
+) -> Option<(bool, bool, usize, usize)> {
+    let membership_bytes = if want_membership {
+        BlockedBloomHint::required_bytes(entry_count)
+            .map(|required| required + size_of::<BlockedBloomHint>())
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    let bounds_bytes = if want_bounds {
+        ImmutableExactIndexRun::page_bounds_charge_bytes(page_count)
+    } else {
+        0
+    };
+    let build_membership = want_membership && membership_bytes != 0;
+    let build_bounds = want_bounds
+        && bounds_bytes != 0
+        && membership_bytes.saturating_add(bounds_bytes) <= remaining_bytes;
+    (build_membership || build_bounds).then_some((
+        build_membership,
+        build_bounds,
+        membership_bytes,
+        bounds_bytes,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3518,6 +5127,18 @@ pub enum ExactIndexStoreError {
     ActivationChanged,
     CounterOverflow,
     MembershipFalseNegative,
+    ChunkLengthMismatch {
+        chunk_id: ChunkId,
+        expected: u64,
+        observed: u64,
+    },
+}
+
+impl ExactIndexStoreError {
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Io(error) if crate::maintenance_cancellation::is_cancelled_io(error))
+    }
 }
 
 fn validate_level_zero_transitions<I: StorageIo>(
@@ -3729,7 +5350,7 @@ fn verify_run_reference(
     Ok(())
 }
 
-fn compaction_location_key(entry: ExactIndexEntry) -> (ChunkId, u32, [u8; 16], u64, u32) {
+fn compaction_location_key(entry: ExactIndexEntry) -> ExactRetirementKey {
     let location = entry.location();
     (
         entry.chunk_id(),
@@ -3738,6 +5359,22 @@ fn compaction_location_key(entry: ExactIndexEntry) -> (ChunkId, u32, [u8; 16], u
         location.record_offset(),
         location.chunk_ordinal(),
     )
+}
+
+fn collect_exact_transition_entries(
+    entries: &[ExactIndexEntry],
+) -> Result<Vec<ExactIndexEntry>, ExactIndexStoreError> {
+    let mut transitions = Vec::new();
+    for entry in entries {
+        if entry.transition() == ExactLocationTransition::Active {
+            continue;
+        }
+        transitions
+            .try_reserve(1)
+            .map_err(|_| ExactIndexStoreError::OutOfMemory)?;
+        transitions.push(*entry);
+    }
+    Ok(transitions)
 }
 
 fn temporary_name(profile: ExactIndexProfileId, generation: u64) -> String {
@@ -3789,6 +5426,18 @@ const fn decode_hex_nibble(byte: u8) -> Option<u8> {
 
 fn run_set_name(run_set_id: ExactIndexRunSetId) -> String {
     format!("{}.fdxset", encode_hex(run_set_id.bytes()))
+}
+
+fn is_canonical_run_set_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() != 64 + ".fdxset".len()
+        || name.as_bytes().get(64) != Some(&b'.')
+        || !name.ends_with(".fdxset")
+    {
+        return false;
+    }
+    let mut id_bytes = [0_u8; 32];
+    decode_hex_into(&bytes[..64], &mut id_bytes).is_ok()
 }
 
 fn encode_hex<const N: usize>(bytes: [u8; N]) -> String {
@@ -3938,7 +5587,7 @@ mod tests {
     }
 
     #[test]
-    fn append_shares_audited_runs_but_recovery_reaudits_and_pressure_drops_hints() {
+    fn append_shares_audited_runs_but_recovery_reaudits_and_pressure_pins_membership() {
         let repository = reuse_repository("mapped");
         let profile = ExactIndexProfileId::new([61; 32]).unwrap();
         repository
@@ -3974,7 +5623,7 @@ mod tests {
             independent.mapping.as_ref().unwrap(),
             old_reader.mapping.as_ref().unwrap()
         ));
-        // Swap disables new membership admission, including reused hints.
+        // Swap cannot evict a resident membership filter.
         repository
             .page_cache
             .apply_pressure_snapshot(MemoryPressureSnapshot::new(8 << 30, 6 << 30, 1));
@@ -3986,7 +5635,7 @@ mod tests {
             pressured
                 .readers
                 .iter()
-                .all(|reader| reader.membership.is_none())
+                .all(super::ExactIndexRunReader::membership_resident)
         );
         let shared = pressured
             .readers
@@ -4052,6 +5701,49 @@ mod tests {
             "recovery must independently read the stored slots"
         );
         assert!(repository.audit_activation_log().unwrap().is_some());
+    }
+
+    #[test]
+    fn repeated_generation_recovery_reuses_installed_exact_runs() {
+        let mut repository = reuse_repository("generation-recovery-reuse");
+        let counters = Arc::new(crate::metadata_read_telemetry::MetadataReadCounters::default());
+        repository.storage.metadata_reads = Some(Arc::clone(&counters));
+        let profile = ExactIndexProfileId::new([97; 32]).unwrap();
+        repository
+            .append_level_zero(profile, (0..1024).map(reuse_fixture).collect())
+            .unwrap();
+
+        let first = repository
+            .recover_active_generation()
+            .unwrap()
+            .expect("installed generation recovers");
+        let audit_before = counters
+            .rows()
+            .iter()
+            .filter(|row| row.reason == "indexAudit")
+            .map(|row| row.operations)
+            .sum::<u64>();
+
+        let second = repository
+            .recover_active_generation()
+            .unwrap()
+            .expect("the installed generation remains recoverable");
+
+        assert_eq!(first.record(), second.record());
+        assert!(Arc::ptr_eq(
+            first.readers[0].mapping.as_ref().unwrap(),
+            second.readers[0].mapping.as_ref().unwrap()
+        ));
+        assert_eq!(
+            counters
+                .rows()
+                .iter()
+                .filter(|row| row.reason == "indexAudit")
+                .map(|row| row.operations)
+                .sum::<u64>(),
+            audit_before,
+            "recovery of the already installed selector must not re-audit its Runs"
+        );
     }
 
     #[test]
@@ -4446,23 +6138,468 @@ mod tests {
     }
 
     #[test]
-    fn membership_residency_reclaims_with_the_common_cache() {
+    fn membership_residency_is_pinned_against_common_pressure() {
         let cache =
             crate::ReadCacheNamespace::isolated(crate::ReadCacheClass::ExactMembership, 1 << 20);
         let mut filter = BlockedBloomHint::new(1000, 1 << 20).unwrap();
         let chunk = ChunkId::of(b"cached membership");
         filter.insert_hint(chunk, 17);
+        let expected_allocated_bytes = filter.allocated_bytes();
         let hint = CachedRunMembership::new(&cache, [4; 32], filter);
-        assert!(hint.allocated_bytes() > 0);
+        assert_eq!(hint.allocated_bytes(), expected_allocated_bytes);
+        assert!(cache.pinned_resident_bytes() > 0);
         assert_eq!(
             hint.probe_for_exact_lookup(chunk, 17),
             BloomLookupHint::RequiresExactLookup
         );
         cache.set_capacity(0);
-        assert_eq!(hint.allocated_bytes(), 0);
+        assert_eq!(hint.allocated_bytes(), expected_allocated_bytes);
+        let resident = cache.stats().resident_bytes;
+        let expected_resident = u64::try_from(expected_allocated_bytes).unwrap_or(u64::MAX);
+        assert!(resident > expected_resident);
+        assert_eq!(cache.pinned_resident_bytes(), resident);
         assert_eq!(
-            hint.probe_for_exact_lookup(ChunkId::of(b"missing"), 17),
+            hint.probe_for_exact_lookup(chunk, 17),
             BloomLookupHint::RequiresExactLookup
         );
+        assert_eq!(
+            hint.probe_for_exact_lookup(ChunkId::of(b"missing"), 17),
+            BloomLookupHint::DefinitelyAbsent
+        );
+    }
+
+    #[test]
+    fn independent_recovery_installs_pinned_membership() {
+        let repository = reuse_repository("independent-membership");
+        let profile = ExactIndexProfileId::new([104; 32]).unwrap();
+        repository
+            .append_level_zero(profile, vec![reuse_fixture(1)])
+            .unwrap();
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        let pin = repository
+            .pin_recovered_generation()
+            .unwrap()
+            .expect("ASSERT: recovered Exact generation");
+        let status = pin.membership_status();
+        assert_eq!(status.filter_count(), 1);
+        assert_eq!(status.missing_filter_count(), 0);
+    }
+
+    fn projection_snapshot() -> MemoryPressureSnapshot {
+        MemoryPressureSnapshot::new(8 << 30, 6 << 30, 0)
+    }
+
+    fn open_projection_repository(
+        root: &std::path::Path,
+    ) -> ExactIndexRunRepository<crate::FsStorageIo> {
+        let repository = ExactIndexRunRepository::new_with_memory_snapshot(
+            crate::FsStorageIo::open(root).unwrap(),
+            projection_snapshot(),
+        );
+        if repository
+            .storage
+            .immutable_leases
+            .range_cache
+            .get()
+            .is_none()
+        {
+            repository
+                .storage
+                .immutable_leases
+                .range_cache
+                .set(
+                    repository
+                        .page_cache
+                        .cache
+                        .sibling(crate::ReadCacheClass::StorageRange),
+                )
+                .ok();
+        }
+        repository
+    }
+
+    #[test]
+    fn retirement_projection_tracks_appends_and_survives_fresh_recovery() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/tests")
+            .join(format!(
+                "exact-retirement-projection-{}",
+                std::process::id()
+            ));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        let repository = open_projection_repository(&root);
+        let profile = ExactIndexProfileId::new([97; 32]).unwrap();
+        let active = reuse_fixture(1);
+
+        repository
+            .append_level_zero(profile, vec![active])
+            .expect("ASSERT: first ACTIVE L0 publishes");
+        let generation = repository.pin_active_generation().unwrap();
+        assert!(
+            repository
+                .retirement_projection
+                .read()
+                .unwrap()
+                .entries
+                .is_none(),
+            "recovery installation must not claim a known RETIRING projection before its first merge"
+        );
+        assert!(repository.retiring_entries(&generation).unwrap().is_empty());
+
+        let active = reuse_fixture(1);
+        let projection = repository.retirement_projection.read().unwrap();
+        assert_eq!(projection.generation, Some(generation.record()));
+        assert!(projection.entries.as_ref().is_some_and(BTreeMap::is_empty));
+        drop(projection);
+
+        let retiring = ExactIndexEntry::retiring(active).unwrap();
+        repository
+            .append_level_zero(profile, vec![retiring])
+            .expect("ASSERT: RETIRING L0 publishes");
+        let generation = repository.pin_active_generation().unwrap();
+        let projection = repository.retirement_projection.read().unwrap();
+        assert_eq!(projection.generation, Some(generation.record()));
+        assert_eq!(
+            projection
+                .entries
+                .as_ref()
+                .map(|entries| entries.values().copied().collect::<Vec<_>>()),
+            Some(vec![retiring]),
+            "a known ACTIVE projection must advance durably with its RETIRING append"
+        );
+        drop(projection);
+        assert_eq!(
+            repository.retiring_entries(&generation).unwrap(),
+            vec![retiring]
+        );
+
+        repository
+            .append_level_zero(profile, vec![ExactIndexEntry::removed(retiring).unwrap()])
+            .expect("ASSERT: REMOVED L0 publishes");
+        let generation = repository.pin_active_generation().unwrap();
+        let projection = repository.retirement_projection.read().unwrap();
+        assert_eq!(projection.generation, Some(generation.record()));
+        assert!(projection.entries.as_ref().is_some_and(BTreeMap::is_empty));
+        drop(projection);
+        assert!(repository.retiring_entries(&generation).unwrap().is_empty());
+
+        let recovered = open_projection_repository(&root);
+        assert!(
+            recovered
+                .retirement_projection
+                .read()
+                .unwrap()
+                .entries
+                .is_none(),
+            "fresh recovery must start without a process-local RETIRING projection"
+        );
+        let recovered_generation = recovered.recover_active_generation().unwrap().unwrap();
+        let independent_entries = {
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+            recovered.retiring_entries(&recovered_generation).unwrap()
+        };
+        assert!(
+            independent_entries.is_empty(),
+            "a fresh independent recovery scan must rediscover durable REMOVED finality"
+        );
+        let projection = recovered.retirement_projection.read().unwrap();
+        assert_eq!(projection.generation, Some(recovered_generation.record()));
+        assert!(projection.entries.as_ref().is_some_and(BTreeMap::is_empty));
+        drop(projection);
+        assert!(
+            recovered
+                .retiring_entries(&recovered_generation)
+                .unwrap()
+                .is_empty(),
+            "the independent scan must seed the ordinary projection for its immutable generation"
+        );
+    }
+
+    fn counted_repository(
+        label: &str,
+        fresh: bool,
+    ) -> (
+        ExactIndexRunRepository<crate::FsStorageIo>,
+        Arc<crate::metadata_read_telemetry::MetadataReadCounters>,
+    ) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/tests")
+            .join(format!("exact-span-{label}-{}", std::process::id()));
+        if fresh {
+            if root.exists() {
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+        } else {
+            assert!(root.exists(), "shared fixture root must exist");
+        }
+        let counters = Arc::new(crate::metadata_read_telemetry::MetadataReadCounters::default());
+        let mut storage = crate::FsStorageIo::open(&root).unwrap();
+        storage.metadata_reads = Some(Arc::clone(&counters));
+        let repository = ExactIndexRunRepository::new_with_memory_snapshot(
+            storage,
+            MemoryPressureSnapshot::new(8 << 30, 6 << 30, 0),
+        );
+        (repository, counters)
+    }
+
+    fn reason_totals(
+        counters: &crate::metadata_read_telemetry::MetadataReadCounters,
+        reason: &str,
+    ) -> (u64, u64) {
+        counters
+            .rows()
+            .iter()
+            .filter(|row| row.reason == reason)
+            .fold((0_u64, 0_u64), |(operations, bytes), row| {
+                (operations + row.operations, bytes + row.requested_bytes)
+            })
+    }
+
+    fn transition_fixture(chunk: ChunkId, ordinal: u64) -> ExactIndexEntry {
+        let marker =
+            u8::try_from(ordinal + 1).expect("ASSERT: fixture transition container byte fits u8");
+        let location = fastdup_format::ExactIndexLocation::raw(
+            ContainerId::new([marker; 16]).unwrap(),
+            1,
+            4096,
+            256,
+            0,
+        )
+        .unwrap();
+        ExactIndexEntry::active(chunk, 32, location).unwrap()
+    }
+
+    #[test]
+    fn full_run_audits_read_page_spans_instead_of_per_page_io() {
+        let (repository, counters) = counted_repository("audit-spans", true);
+        let profile = ExactIndexProfileId::new([211; 32]).unwrap();
+        let page_count = 259_usize;
+        let entries: Vec<_> = (0..(page_count * EXACT_INDEX_ENTRIES_PER_PAGE) as u64)
+            .map(reuse_fixture)
+            .collect();
+        let run = ExactIndexRun::new(profile, 42, entries).unwrap();
+        let descriptor = repository.publish(&run).unwrap();
+        assert_eq!(descriptor.page_count(), page_count);
+
+        let entries: Vec<_> = (0..(page_count * EXACT_INDEX_ENTRIES_PER_PAGE) as u64)
+            .map(reuse_fixture)
+            .collect();
+        repository.append_level_zero(profile, entries).unwrap();
+        let before = reason_totals(&counters, "indexAudit");
+        repository.audit(profile, 42).unwrap();
+        let after = reason_totals(&counters, "indexAudit");
+        assert_eq!(
+            after.0 - before.0,
+            2,
+            "a 259-page Run must audit in one 1 MiB span plus one tail span"
+        );
+        assert_eq!(
+            after.1 - before.1,
+            page_count as u64 * EXACT_INDEX_PAGE_BYTES as u64
+        );
+
+        let (cold, cold_counters) = counted_repository("audit-spans", false);
+        let active = cold.recover_active().unwrap().expect("run set is present");
+        drop(active);
+        let lease = reason_totals(&cold_counters, "indexAudit");
+        // The cold recovery pass reads the Run once: one 1 MiB page span plus
+        // the tail span, and the two envelope pages inside the audit scope.
+        assert_eq!(lease.0, 4);
+        assert_eq!(
+            lease.1,
+            (page_count as u64 + 2) * EXACT_INDEX_PAGE_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn compaction_inputs_are_prefetched_in_page_spans() {
+        let (repository, _counters) = counted_repository("compaction-spans", true);
+        let profile = ExactIndexProfileId::new([212; 32]).unwrap();
+        let entries_per_run = 65 * EXACT_INDEX_ENTRIES_PER_PAGE;
+        let all: Vec<_> = (0..(4 * entries_per_run) as u64)
+            .map(reuse_fixture)
+            .collect();
+        let mut inputs = Vec::new();
+        for (index, part) in all.chunks(entries_per_run).enumerate() {
+            let run = ExactIndexRun::new(profile, index as u64 + 1, part.to_vec()).unwrap();
+            let descriptor = repository.publish(&run).unwrap();
+            inputs.push(ExactIndexRunRef::new(0, descriptor).unwrap());
+        }
+        drop(repository);
+
+        let (cold, cold_counters) = counted_repository("compaction-spans", false);
+        let before = reason_totals(&cold_counters, "indexCompaction");
+        cold.compact(&inputs, 5).unwrap();
+        let after = reason_totals(&cold_counters, "indexCompaction");
+        assert_eq!(
+            after.1 - before.1,
+            2 * 4 * 65 * EXACT_INDEX_PAGE_BYTES as u64,
+            "cold compaction must stream every input byte exactly once per merge pass"
+        );
+        assert_eq!(
+            after.0 - before.0,
+            16,
+            "two merge passes over four 65-page Runs must cost 2 spans per Run per pass, \
+             not 65 single-page fetches"
+        );
+    }
+
+    #[test]
+    fn batched_transition_lookup_equals_serial_lookup() {
+        let repository = reuse_repository("batch-equivalence");
+        let profile = ExactIndexProfileId::new([213; 32]).unwrap();
+        let target = ChunkId::of(b"batch-transition-target");
+        let mut entries: Vec<_> = (0..(40 * EXACT_INDEX_ENTRIES_PER_PAGE) as u64)
+            .map(reuse_fixture)
+            .collect();
+        entries.extend((0..70).map(|ordinal| transition_fixture(target, ordinal)));
+        let transition = repository.append_level_zero(profile, entries).unwrap();
+        let active = transition.current();
+
+        let mut keys: Vec<(ChunkId, u32)> = (0..40 * EXACT_INDEX_ENTRIES_PER_PAGE)
+            .map(|ordinal| (ChunkId::of(&(ordinal as u64).to_le_bytes()), 32_u32))
+            .collect();
+        keys.push((target, 32));
+        keys.push((ChunkId::of(&u64::MAX.to_le_bytes()), 32));
+        keys.sort_unstable();
+        keys.dedup();
+        assert!(
+            keys.len() > 1024,
+            "fixture must cross the batch window boundary"
+        );
+        let batched = active.lookup_transitions_batch(&keys).unwrap();
+        assert_eq!(batched.len(), keys.len());
+        for (position, key) in keys.iter().enumerate() {
+            let serial = active.lookup_transitions(key.0, key.1).unwrap();
+            assert_eq!(
+                batched[position].candidates(),
+                serial.candidates(),
+                "key {key:?} candidates differ"
+            );
+            assert_eq!(batched[position].complete(), serial.complete());
+        }
+        let position = keys.iter().position(|key| key.0 == target).unwrap();
+        assert_eq!(
+            batched[position].candidates().len(),
+            MAX_EXACT_LOOKUP_CANDIDATES
+        );
+        assert!(
+            !batched[position].complete(),
+            "the 70-location key must report the same bounded result as the serial path"
+        );
+    }
+
+    #[test]
+    fn warm_active_generation_reclaims_only_its_bounded_page_budget() {
+        let repository = reuse_repository("warm-page-budget");
+        let profile = ExactIndexProfileId::new([101; 32]).unwrap();
+        repository
+            .append_level_zero(profile, (0..1_984).map(reuse_fixture).collect())
+            .unwrap();
+        repository
+            .page_cache
+            .apply_pressure_snapshot(MemoryPressureSnapshot::new(8 << 30, 6 << 30, 1));
+        repository
+            .page_cache
+            .apply_pressure_snapshot(projection_snapshot());
+        assert_eq!(repository.page_cache_status().resident_pages, 0);
+
+        let progress = repository
+            .warm_active_generation(
+                &ExactCacheWarmPolicy {
+                    maximum_pages: 10,
+                    maximum_structures: 0,
+                    maximum_run_pages: 0,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(progress.total_pages, 64);
+        assert_eq!(progress.pages_warmed, 10);
+        assert_eq!(repository.page_cache_status().resident_pages, 10);
+    }
+
+    #[test]
+    fn warm_active_generation_rebuilds_membership_and_page_bounds_from_verified_pages() {
+        let repository = reuse_repository("warm-acceleration");
+        let profile = ExactIndexProfileId::new([102; 32]).unwrap();
+        for ordinal in 1..=3 {
+            repository
+                .append_level_zero(profile, vec![reuse_fixture(ordinal)])
+                .unwrap();
+        }
+        let before = repository
+            .pin_active_generation()
+            .unwrap()
+            .membership_status();
+        assert!(before.filter_count() > 0);
+
+        repository
+            .page_cache
+            .apply_pressure_snapshot(MemoryPressureSnapshot::new(8 << 30, 6 << 30, 1));
+        let evicted = repository
+            .pin_active_generation()
+            .unwrap()
+            .membership_status();
+        assert_eq!(evicted.filter_count(), 3);
+        assert_eq!(evicted.missing_filter_count(), 0);
+        assert_eq!(evicted.missing_page_bounds_count(), 3);
+        repository
+            .page_cache
+            .apply_pressure_snapshot(projection_snapshot());
+
+        let progress = repository
+            .warm_active_generation(&ExactCacheWarmPolicy::default(), None)
+            .unwrap();
+        assert!(progress.structures_built >= 3);
+        let warmed = repository
+            .pin_active_generation()
+            .unwrap()
+            .membership_status();
+        assert_eq!(warmed.filter_count(), 3);
+        assert_eq!(warmed.missing_filter_count(), 0);
+        assert_eq!(warmed.missing_page_bounds_count(), 0);
+        assert!(warmed.leased_page_bounds_bytes() > 0);
+        for ordinal in 1..=3 {
+            assert_eq!(
+                repository
+                    .pin_active_generation()
+                    .unwrap()
+                    .lookup_transitions(reuse_fixture(ordinal).chunk_id(), 32)
+                    .unwrap()
+                    .candidates()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn closed_page_budget_keeps_pinned_membership_and_skips_evictable_bounds() {
+        let repository = reuse_repository("warm-closed-budget");
+        let profile = ExactIndexProfileId::new([103; 32]).unwrap();
+        repository
+            .append_level_zero(profile, vec![reuse_fixture(1)])
+            .unwrap();
+        repository
+            .page_cache
+            .apply_pressure_snapshot(MemoryPressureSnapshot::new(8 << 30, 6 << 30, 1));
+        repository.page_cache.cache.set_capacity(0);
+
+        let progress = repository
+            .warm_active_generation(&ExactCacheWarmPolicy::default(), None)
+            .unwrap();
+        assert_eq!(progress.structures_requested, 1);
+        assert_eq!(progress.structures_built, 0);
+        assert_eq!(progress.pages_warmed, 0);
+        let status = repository
+            .pin_active_generation()
+            .unwrap()
+            .membership_status();
+        assert_eq!(status.filter_count(), 1);
+        assert_eq!(status.missing_filter_count(), 0);
+        assert_eq!(status.missing_page_bounds_count(), 1);
     }
 }

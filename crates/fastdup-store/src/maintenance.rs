@@ -1,5 +1,6 @@
 //! Offline integrity audit and rebuild orchestration.
 
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
@@ -11,20 +12,23 @@ use std::time::{Duration, Instant};
 use fastdup_format::{
     ChunkId, ContainerId, ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError,
     ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError,
-    ExactIndexRunSetId, GcCandidateCatalogDescriptor, GcCandidateCatalogRow,
-    MAX_LOGICAL_CHUNK_BYTES, PrehashedChunk, PreparedEncodedRecord, SealedContainer,
-    VerifiedChunkPayload, VerifiedContainerImage,
+    ExactIndexRunSetId, GC_CANDIDATE_CATALOG_ROW_BYTES, GcCandidateCatalogDescriptor,
+    GcCandidateCatalogRow, MAX_LOGICAL_CHUNK_BYTES, PrehashedChunk, PreparedEncodedRecord,
+    SealedContainer, VerifiedChunkPayload, VerifiedContainerImage,
 };
 
 use crate::generation::GenerationLivenessProof;
 use crate::maintenance_ioprio;
+use crate::read_intent::{ReadIntent, ReadIntentScope};
 use crate::similarity_index_repository::similarity_index_entry_v1_from_verified;
 use crate::{
     CONTAINER_GENERATION_RESERVATION_SPAN_V1, ContainerAuditSummary, ContainerRepository,
     ExactIndexGenerationDrain, ExactIndexRunRepository, ExactIndexStoreError,
-    GcCandidateCatalogRepository, GcCandidateCatalogStoreError, GcCandidateSelectionMode,
-    GcCandidateShortlist, GenerationError, GenerationRepository, RecoveryCheckpointRepository,
-    SimilarityIndexRepository, SimilarityIndexStoreError, StorageIo, StoreError,
+    GC_CANDIDATE_QUEUE_CAPACITY, GC_CATALOG_SCAN_BATCH_ROWS, GC_PENDING_CATALOG_UPDATE_LIMIT,
+    GcCandidateCatalogRepository, GcCandidateCatalogSnapshot, GcCandidateCatalogStoreError,
+    GcCandidateSelectionMode, GcCandidateSelectionQueue, GcCandidateShortlist, GenerationError,
+    GenerationRepository, RecoveryCheckpointRepository, SimilarityIndexRepository,
+    SimilarityIndexStoreError, StorageIo, StoreError,
 };
 
 const EXACT_INDEX_COMPACTION_FANIN: usize = 4;
@@ -38,11 +42,18 @@ const GC_RAW_CHUNK_PHYSICAL_OVERHEAD_UPPER_BYTES: u64 = 383;
 // Includes the generic adapter's two storage length heads. Native owned
 // io_uring publication needs less, so this remains a conservative upper bound.
 const GC_CONTAINER_FIXED_PHYSICAL_OVERHEAD_UPPER_BYTES: u64 = 12_351 + 8_192;
-const GC_CANDIDATE_PROOF_MAX_VICTIMS: usize = 64;
+const GC_CANDIDATE_PROOF_MAX_VICTIMS: usize = 4_096;
+const GC_CANDIDATE_PROOF_MAX_CHUNK_IDS: usize = 262_144;
+const GC_CANDIDATE_PROOF_MAX_PROJECTION_CHUNK_IDS: usize = 524_288;
 const GC_CANDIDATE_PROOF_MAX_RAW_REPLACEMENT_BYTES: u64 = 64 * 1_024 * 1_024;
-const ONLINE_GC_BACKGROUND_SHORTLIST: usize = 16;
-const ONLINE_GC_URGENT_SHORTLIST: usize = 64;
+const ONLINE_GC_BACKGROUND_SHORTLIST: usize = 64;
+const ONLINE_GC_URGENT_SHORTLIST: usize = 4_096;
+/// Cap for victim images concurrently resident during candidate proof.
+/// Fan-out readers never admit more than this many bytes of whole Container
+/// images beyond the Container the consumer currently classifies.
+const GC_PROOF_MAX_INFLIGHT_IMAGE_BYTES: u64 = 128 * 1_024 * 1_024;
 
+#[derive(Debug)]
 enum GcReplacementItem {
     Chunk(VerifiedChunkPayload),
     Transplanted {
@@ -96,6 +107,48 @@ pub enum MaintenanceExecutionMode {
     FullSpeed,
 }
 
+/// Selects which Online-GC phases one quantum executes. Metadata collection
+/// is cheap and bounded, so its own adaptive interval admits it frequently;
+/// destructive DATA relocation keeps a much longer adaptive interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GcPhaseRequest {
+    pub metadata: bool,
+    pub data: bool,
+}
+
+impl GcPhaseRequest {
+    #[must_use]
+    pub const fn both() -> Self {
+        Self {
+            metadata: true,
+            data: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn metadata_only() -> Self {
+        Self {
+            metadata: true,
+            data: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn data_only() -> Self {
+        Self {
+            metadata: false,
+            data: true,
+        }
+    }
+}
+
+/// A scheduled quantum: run-mode resources plus the due phases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnlineGcQuantum {
+    pub mode: OnlineGcRunMode,
+    pub phases: GcPhaseRequest,
+}
+
 /// Bounded work quantum selected by the operational Online-GC scheduler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnlineGcRunMode {
@@ -119,6 +172,20 @@ impl OnlineGcRunMode {
         match self {
             Self::Background | Self::Idle => GcCandidateSelectionMode::Background,
             Self::Urgent => GcCandidateSelectionMode::Urgent,
+        }
+    }
+
+    const fn candidate_queue_capacity(self) -> usize {
+        match self {
+            Self::Background => GC_CANDIDATE_QUEUE_CAPACITY / 16,
+            Self::Idle | Self::Urgent => GC_CANDIDATE_QUEUE_CAPACITY,
+        }
+    }
+
+    const fn candidate_scan_rows(self) -> u64 {
+        match self {
+            Self::Background => GC_CATALOG_SCAN_BATCH_ROWS / 4,
+            Self::Idle | Self::Urgent => GC_CATALOG_SCAN_BATCH_ROWS,
         }
     }
 
@@ -219,104 +286,6 @@ fn percentage_greater_than(numerator: u64, denominator: u64, percent: u64) -> bo
     u128::from(numerator) * 100 > u128::from(denominator) * u128::from(percent)
 }
 
-fn build_reverse_dependency_generation<X: StorageIo>(
-    exact: &crate::ActivatedExactIndex<X>,
-    liveness: &GenerationLivenessProof,
-    cancellation: Option<&crate::MaintenanceCancellation>,
-) -> Result<ReverseDependencyGeneration, MaintenanceError> {
-    let mut required_chunks = liveness.online_chunks().clone();
-    let mut dependents_by_base = BTreeMap::<ChunkId, BTreeSet<ChunkId>>::new();
-    let mut dependency_edges = 0_u64;
-    for (chunk_id, logical_length) in liveness.online_chunks() {
-        cancellation.map_or(Ok(()), crate::MaintenanceCancellation::check)?;
-        let logical_length_u32 =
-            u32::try_from(*logical_length).map_err(|_| MaintenanceError::ArithmeticOverflow)?;
-        let lookup = exact.lookup_transitions(*chunk_id, logical_length_u32)?;
-        if !lookup.complete() {
-            return Err(MaintenanceError::IncompleteReverseDependencyGeneration {
-                chunk_id: *chunk_id,
-            });
-        }
-        let mut seen_locations = Vec::new();
-        seen_locations
-            .try_reserve_exact(lookup.candidates().len())
-            .map_err(|_| MaintenanceError::OutOfMemory)?;
-        let mut active_location_seen = false;
-        for entry in lookup.candidates() {
-            assert_eq!(
-                entry.chunk_id(),
-                *chunk_id,
-                "ASSERT: Exact lookup returned another target while building reverse dependencies"
-            );
-            assert_eq!(
-                entry.logical_length(),
-                logical_length_u32,
-                "ASSERT: Exact lookup returned another length while building reverse dependencies"
-            );
-            let location = entry.location();
-            if seen_locations.contains(&location) {
-                continue;
-            }
-            seen_locations.push(location);
-            if entry.transition() != fastdup_format::ExactLocationTransition::Active {
-                continue;
-            }
-            active_location_seen = true;
-            if location.dependency_id() == [0; 32] {
-                continue;
-            }
-            let base_id = ChunkId::from_bytes(location.dependency_id());
-            if let Some(previous) = required_chunks.insert(base_id, *logical_length)
-                && previous != *logical_length
-            {
-                return Err(MaintenanceError::OnlineChunkLengthMismatch {
-                    chunk_id: base_id,
-                    expected: previous,
-                    observed: *logical_length,
-                });
-            }
-            if dependents_by_base
-                .entry(base_id)
-                .or_default()
-                .insert(*chunk_id)
-            {
-                dependency_edges = dependency_edges
-                    .checked_add(1)
-                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
-            }
-        }
-        if !active_location_seen {
-            return Err(MaintenanceError::MissingLiveExactLocation {
-                chunk_id: *chunk_id,
-            });
-        }
-    }
-    let mapped_edges = dependents_by_base
-        .values()
-        .map(BTreeSet::len)
-        .map(|count| u64::try_from(count).expect("ASSERT: reverse edge count fits u64"))
-        .try_fold(0_u64, u64::checked_add)
-        .expect("ASSERT: checked Reverse Dependency Generation edge count cannot overflow");
-    assert_eq!(
-        dependency_edges, mapped_edges,
-        "ASSERT: Reverse Dependency Generation edge count matches its Base map"
-    );
-    assert!(
-        dependents_by_base
-            .keys()
-            .all(|base_id| required_chunks.contains_key(base_id)),
-        "ASSERT: every reverse Base edge contributes replacement liveness"
-    );
-    Ok(ReverseDependencyGeneration {
-        exact_activation: exact.record(),
-        protected_commit_generation: liveness.summary().latest_generation(),
-        protected_targets: liveness.online_chunks().keys().copied().collect(),
-        required_chunks,
-        dependents_by_base,
-        dependency_edges,
-    })
-}
-
 fn next_gc_catalog_generation<G: Clone + StorageIo>(
     catalog: &GcCandidateCatalogRepository<G>,
 ) -> Result<u64, MaintenanceError> {
@@ -328,11 +297,11 @@ fn next_gc_catalog_generation<G: Clone + StorageIo>(
 }
 
 fn gc_candidate_catalog_is_stale(error: &MaintenanceError) -> bool {
-    match error {
-        MaintenanceError::GcCandidateIdentityMismatch => true,
-        MaintenanceError::Store(StoreError::Io(error)) => error.kind() == io::ErrorKind::NotFound,
-        _ => false,
-    }
+    matches!(error, MaintenanceError::GcCandidateIdentityMismatch)
+}
+
+fn is_missing_container_error(error: &StoreError) -> bool {
+    matches!(error, StoreError::Io(error) if error.kind() == io::ErrorKind::NotFound)
 }
 
 /// One maintenance owner over the Namespace, DATA, and Exact-Index stores.
@@ -346,7 +315,7 @@ pub struct MaintenanceRepository<M, C, X> {
     indexes: ExactIndexRunRepository<X>,
     exact_profile: ExactIndexProfileId,
     rebuild_lock: Arc<Mutex<()>>,
-    reverse_dependencies: crate::ReadCacheNamespace,
+    candidate_queue: Arc<Mutex<GcCandidateSelectionQueue>>,
     cancellation: Option<crate::MaintenanceCancellation>,
 }
 
@@ -364,11 +333,30 @@ impl<M, C, X> MaintenanceRepository<M, C, X> {
             indexes,
             exact_profile,
             rebuild_lock: Arc::new(Mutex::new(())),
-            reverse_dependencies: crate::ReadCacheNamespace::system(
-                crate::ReadCacheClass::ReverseDependencies,
-            ),
+            candidate_queue: Arc::new(Mutex::new(GcCandidateSelectionQueue::default())),
             cancellation: None,
         }
+    }
+
+    /// Returns a detached maintenance view that cooperatively stops long scans
+    /// when `cancellation` is requested. The original maintenance view and the
+    /// frontend's repository views are unaffected.
+    #[must_use]
+    pub fn with_maintenance_cancellation(
+        &self,
+        cancellation: crate::MaintenanceCancellation,
+    ) -> Self
+    where
+        M: Clone + StorageIo,
+        C: Clone,
+        X: Clone,
+    {
+        let mut repository = self.clone();
+        repository.generations = repository
+            .generations
+            .with_maintenance_cancellation(cancellation.clone());
+        repository.cancellation = Some(cancellation);
+        repository
     }
 }
 
@@ -535,7 +523,7 @@ where
             RecoveryCheckpointRepository::new(self.containers.storage().clone())
                 .scrub_with_protected_chunks(&self.containers)?;
         generation_proof.extend_protected_chunks(checkpoint_chunks)?;
-        let online_chunks = generation_proof.online_chunks();
+        let online_chunks = generation_proof.protected_chunks();
         let inventory = self.plan_container_gc(online_chunks)?;
         self.containers
             .audit_generation_high_water(inventory.containers.generation_high_water())?;
@@ -601,6 +589,108 @@ where
         shortlist: &GcCandidateShortlist,
         pool_usage: DataPoolUsage,
     ) -> Result<GcCandidateProof, MaintenanceError> {
+        self.prove_gc_candidates_with_workers(shortlist, pool_usage, NonZeroUsize::MIN)
+    }
+
+    /// Proves one bounded shortlist and collects its complete replacement plan
+    /// from one independent verification read per victim.
+    ///
+    /// Whole-Container verification may run on idle-class reader threads, but
+    /// every accounting-sensitive decision — victim acceptance, Chunk
+    /// claiming, replacement-Item ownership, the RAW proof budget, and the
+    /// profitability comparison — executes sequentially in canonical shortlist
+    /// order on the calling maintenance worker. The result therefore cannot
+    /// depend on the reader thread count, while in-flight victim images stay
+    /// bounded by [`GC_PROOF_MAX_INFLIGHT_IMAGE_BYTES`]. The collected Items
+    /// and `RETIRING` entries make replacement publication and retirement
+    /// rereads of the same DATA impossible.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::prove_gc_candidates`].
+    fn collect_bounded_candidate_chunks(
+        &self,
+        rows: &[GcCandidateCatalogRow],
+    ) -> Result<(Vec<GcCandidateCatalogRow>, BTreeSet<ChunkId>), MaintenanceError> {
+        if rows.is_empty() {
+            return Ok((Vec::new(), BTreeSet::new()));
+        }
+        let mut selected_count = rows.len().min(GC_CANDIDATE_PROOF_MAX_VICTIMS);
+        loop {
+            let candidates = &rows[..selected_count];
+            let mut selected_rows = Vec::new();
+            let mut chunk_ids = BTreeSet::new();
+            let result = self.containers.visit_candidate_chunk_ids::<StoreError, _>(
+                candidates,
+                |row, chunk_id, _| {
+                    crate::maintenance_cancellation::check_io(self.cancellation.as_ref())?;
+                    if selected_rows
+                        .last()
+                        .is_none_or(|previous: &GcCandidateCatalogRow| {
+                            previous.container_id() != row.container_id()
+                        })
+                    {
+                        selected_rows.try_reserve(1).map_err(|_| {
+                            StoreError::CandidateChunkLimitExceeded {
+                                limit: GC_CANDIDATE_PROOF_MAX_CHUNK_IDS,
+                            }
+                        })?;
+                        selected_rows.push(row);
+                    }
+                    if chunk_ids.contains(&chunk_id) {
+                        return Ok(());
+                    }
+                    if chunk_ids.len() >= GC_CANDIDATE_PROOF_MAX_CHUNK_IDS {
+                        return Err(StoreError::CandidateChunkLimitExceeded {
+                            limit: GC_CANDIDATE_PROOF_MAX_CHUNK_IDS,
+                        });
+                    }
+                    chunk_ids.insert(chunk_id);
+                    Ok(())
+                },
+            );
+            match result {
+                Ok(()) => return Ok((selected_rows, chunk_ids)),
+                Err(StoreError::CandidateChunkLimitExceeded { .. }) if selected_count > 1 => {
+                    selected_count = selected_count.div_ceil(2);
+                }
+                Err(StoreError::CandidateChunkLimitExceeded { .. }) => {
+                    return Err(MaintenanceError::GcCandidateProofBudgetExceeded);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Proves one bounded victim shortlist and collects its replacement Items.
+    ///
+    /// The shortlist is advisory; proof independently checks the active Exact
+    /// generation, bounded Metadata/Checkpoint protection, and every selected
+    /// Container before yielding removal authority. The selected victim set and
+    /// projection Chunk IDs remain within the fixed proof budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns missing active Exact state, profile mismatch, proof-budget,
+    /// empty or unprofitable candidate, exact-index length conflict, recovery
+    /// index, generation, or storage failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the independently verified Container or proof bookkeeping
+    /// violates its invariants: one Location per Record, Record order matches
+    /// Locations, a canonical shortlist contains each Container once, and every
+    /// proof-budget rollback removes each newly claimed Chunk.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded victim proof keeps its bounded state local"
+    )]
+    pub fn prove_gc_candidates_with_workers(
+        &self,
+        shortlist: &GcCandidateShortlist,
+        pool_usage: DataPoolUsage,
+        relocation_workers: NonZeroUsize,
+    ) -> Result<GcCandidateProof, MaintenanceError> {
         let exact = self
             .indexes
             .pin_online_generation()?
@@ -608,105 +698,315 @@ where
         if exact.record().profile() != self.exact_profile {
             return Err(MaintenanceError::ExactProfileMismatch);
         }
-        let mut generation_proof = self.generations.scan_online_liveness()?;
-        let checkpoint_chunks =
-            RecoveryCheckpointRepository::new(self.containers.storage().clone())
-                .protected_chunks()?;
-        generation_proof.extend_protected_chunks(checkpoint_chunks)?;
-        let reverse_dependencies = self.reverse_dependency_generation(&exact, &generation_proof)?;
-        let mut victims = BTreeMap::new();
-        let mut replacement_chunks = BTreeMap::new();
-        let mut victim_bytes = 0_u64;
-        let mut reachable_victim_chunks = BTreeSet::new();
-
-        for row in shortlist
+        let rows = shortlist
             .rows()
             .iter()
             .copied()
             .take(GC_CANDIDATE_PROOF_MAX_VICTIMS)
-        {
-            self.check_cancellation()?;
-            let container = self
-                .containers
-                .read_with_index(row.container_id(), &exact)?;
-            if container.header().container_generation() != row.container_generation()
-                || container.header().layout().file_length != row.physical_bytes()
-            {
-                return Err(MaintenanceError::GcCandidateIdentityMismatch);
-            }
-            let mut newly_required = Vec::new();
-            for record in container.records() {
-                let logical_length = u64::try_from(record.payload().len())
-                    .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
-                let Some(expected_length) = reverse_dependencies
-                    .required_chunks
-                    .get(&record.chunk_id())
-                    .copied()
-                else {
-                    continue;
+            .collect::<Vec<_>>();
+        let (rows, candidate_chunk_ids) = self.collect_bounded_candidate_chunks(&rows)?;
+        if rows.is_empty() {
+            return Err(MaintenanceError::EmptyGcCandidateProof);
+        }
+        let mut projection_chunk_ids = candidate_chunk_ids.clone();
+        if let Err(error) = self.indexes.visit_active_locations_matching(
+            &exact,
+            &candidate_chunk_ids,
+            self.cancellation.as_ref(),
+            |entry| {
+                if entry.location().dependency_id() == [0; 32]
+                    || !candidate_chunk_ids
+                        .contains(&ChunkId::from_bytes(entry.location().dependency_id()))
+                {
+                    return Ok(());
+                }
+                if projection_chunk_ids.contains(&entry.chunk_id()) {
+                    return Ok(());
+                }
+                if projection_chunk_ids.len() >= GC_CANDIDATE_PROOF_MAX_PROJECTION_CHUNK_IDS {
+                    return Err(ExactIndexStoreError::CounterOverflow);
+                }
+                projection_chunk_ids.insert(entry.chunk_id());
+                Ok(())
+            },
+        ) {
+            return Err(match error {
+                ExactIndexStoreError::CounterOverflow => {
+                    MaintenanceError::GcCandidateProofBudgetExceeded
+                }
+                error => error.into(),
+            });
+        }
+        let mut generation_proof = self
+            .generations
+            .scan_online_liveness_for_candidates(&projection_chunk_ids)?;
+        let checkpoint_chunks =
+            RecoveryCheckpointRepository::new(self.containers.storage().clone())
+                .protected_chunks_matching(&projection_chunk_ids)?;
+        generation_proof.extend_protected_chunks(checkpoint_chunks)?;
+
+        let mut required_chunks = BTreeMap::new();
+        let mut dependency_edges = 0_u64;
+        let protected_chunks = generation_proof.protected_chunks().clone();
+        self.indexes.visit_active_locations_matching(
+            &exact,
+            &candidate_chunk_ids,
+            self.cancellation.as_ref(),
+            |entry| {
+                let target = entry.chunk_id();
+                let Some(expected_length) = protected_chunks.get(&target).copied() else {
+                    return Ok(());
                 };
-                if expected_length != logical_length {
-                    return Err(MaintenanceError::OnlineChunkLengthMismatch {
-                        chunk_id: record.chunk_id(),
+                let logical_length = u64::from(entry.logical_length());
+                if logical_length != expected_length {
+                    return Err(ExactIndexStoreError::ChunkLengthMismatch {
+                        chunk_id: target,
                         expected: expected_length,
                         observed: logical_length,
                     });
                 }
-                if let Some(previous) = replacement_chunks.insert(record.chunk_id(), logical_length)
+                if let Some(previous) = required_chunks.insert(target, logical_length)
+                    && previous != logical_length
                 {
-                    if previous != logical_length {
-                        return Err(MaintenanceError::OnlineChunkLengthMismatch {
-                            chunk_id: record.chunk_id(),
-                            expected: previous,
-                            observed: logical_length,
-                        });
+                    return Err(ExactIndexStoreError::ChunkLengthMismatch {
+                        chunk_id: target,
+                        expected: previous,
+                        observed: logical_length,
+                    });
+                }
+                if entry.location().dependency_id() != [0; 32] {
+                    let base = ChunkId::from_bytes(entry.location().dependency_id());
+                    if candidate_chunk_ids.contains(&base) {
+                        if let Some(previous) = required_chunks.insert(base, logical_length)
+                            && previous != logical_length
+                        {
+                            return Err(ExactIndexStoreError::ChunkLengthMismatch {
+                                chunk_id: base,
+                                expected: previous,
+                                observed: logical_length,
+                            });
+                        }
+                        dependency_edges = dependency_edges
+                            .checked_add(1)
+                            .ok_or(ExactIndexStoreError::CounterOverflow)?;
                     }
-                } else {
-                    newly_required.push(record.chunk_id());
                 }
-                reachable_victim_chunks.insert(record.chunk_id());
+                Ok(())
+            },
+        )?;
+        for (chunk_id, logical_length) in &protected_chunks {
+            if required_chunks.get(chunk_id) != Some(logical_length) {
+                return Err(MaintenanceError::MissingLiveExactLocation {
+                    chunk_id: *chunk_id,
+                });
             }
-            let projected = replacement_file_bytes_upper_bound(&replacement_chunks)?;
-            if projected > GC_CANDIDATE_PROOF_MAX_RAW_REPLACEMENT_BYTES {
-                for chunk_id in newly_required {
-                    let removed = replacement_chunks.remove(&chunk_id);
-                    assert!(
-                        removed.is_some(),
-                        "ASSERT: proof-budget rollback removes every newly required Chunk"
-                    );
-                    reachable_victim_chunks.remove(&chunk_id);
-                }
-                if victims.is_empty() {
-                    return Err(MaintenanceError::GcCandidateProofBudgetExceeded);
-                }
-                break;
-            }
-            let previous = victims.insert(row.container_id().bytes(), row.container_id());
-            assert!(
-                previous.is_none(),
-                "ASSERT: a canonical catalog shortlist contains each Container once"
-            );
-            victim_bytes = victim_bytes
-                .checked_add(row.physical_bytes())
-                .ok_or(MaintenanceError::ArithmeticOverflow)?;
         }
+        let reverse_dependencies = Arc::new(ReverseDependencyGeneration {
+            exact_activation: exact.record(),
+            protected_commit_generation: generation_proof.summary().latest_generation(),
+            required_chunks,
+            dependents_by_base: BTreeMap::new(),
+            dependency_edges,
+        });
+        let job_bytes = rows
+            .iter()
+            .map(|row| row.physical_bytes())
+            .collect::<Vec<_>>();
+        let mut victims = BTreeMap::new();
+        let mut replacement_chunks = BTreeMap::new();
+        let mut victim_bytes = 0_u64;
+        let mut reachable_victim_chunks = BTreeSet::new();
+        let mut items = Vec::new();
+        let mut retiring_entries = Vec::new();
+        let mut replacement_estimate = 0_u64;
+        let mut budget_exceeded = false;
+
+        let readers = NonZeroUsize::new(relocation_workers.get().min(rows.len().max(1)))
+            .unwrap_or(NonZeroUsize::MIN);
+        let containers = &self.containers;
+        let rows_ref = rows.as_slice();
+        let reader_cancellation = self.cancellation.clone();
+        run_ordered_maintenance_reads(
+            &job_bytes,
+            readers,
+            GC_PROOF_MAX_INFLIGHT_IMAGE_BYTES,
+            true,
+            crate::ReadIntent::Scan,
+            "fastdup-online-gc-read",
+            move |job| -> Result<Option<VerifiedContainerImage>, MaintenanceError> {
+                reader_cancellation
+                    .as_ref()
+                    .map_or(Ok(()), crate::MaintenanceCancellation::check)?;
+                match containers.read_verified_image(rows_ref[job].container_id()) {
+                    Ok(image) => Ok(Some(image)),
+                    Err(error) if is_missing_container_error(&error) => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            |job, image| -> Result<(), MaintenanceError> {
+                self.check_cancellation()?;
+                if budget_exceeded {
+                    return Ok(());
+                }
+                let Some(image) = image else {
+                    return Ok(());
+                };
+                let row = rows[job];
+                let container = image.container();
+                if container.header().container_generation() != row.container_generation()
+                    || container.header().layout().file_length != row.physical_bytes()
+                {
+                    return Err(MaintenanceError::GcCandidateIdentityMismatch);
+                }
+                assert_eq!(
+                    container.records().len(),
+                    container.locations().len(),
+                    "ASSERT: verified Container has one Location per logical Chunk"
+                );
+                let mut victim_items = Vec::new();
+                let mut victim_retiring = Vec::new();
+                let mut newly_required = Vec::new();
+                let mut victim_claims = BTreeSet::new();
+                let mut victim_estimate = 0_u64;
+                let mut group_start = 0_usize;
+                while group_start < container.locations().len() {
+                    let record_offset = container.locations()[group_start].record_offset();
+                    let group_end = group_start
+                        + container.locations()[group_start..]
+                            .iter()
+                            .take_while(|location| location.record_offset() == record_offset)
+                            .count();
+                    let locations = &container.locations()[group_start..group_end];
+                    let records = &container.records()[group_start..group_end];
+                    let mut identities = Vec::new();
+                    let mut full_live = true;
+                    let mut group_estimated = 0_u64;
+                    for (location, record) in locations.iter().zip(records) {
+                        let chunk_id = record.chunk_id();
+                        assert_eq!(
+                            location.chunk_id(),
+                            chunk_id,
+                            "ASSERT: verified Record order matches verified Locations"
+                        );
+                        let logical_length = u64::try_from(record.payload().len())
+                            .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+                        let required_here = if let Some(expected_length) =
+                            reverse_dependencies.required_chunks.get(&chunk_id).copied()
+                        {
+                            if expected_length != logical_length {
+                                return Err(MaintenanceError::OnlineChunkLengthMismatch {
+                                    chunk_id,
+                                    expected: expected_length,
+                                    observed: logical_length,
+                                });
+                            }
+                            true
+                        } else {
+                            false
+                        };
+                        if required_here {
+                            reachable_victim_chunks.insert(chunk_id);
+                        }
+                        let claimed = required_here
+                            && replacement_chunks
+                                .insert(chunk_id, logical_length)
+                                .is_none();
+                        if claimed {
+                            newly_required.push(chunk_id);
+                            victim_claims.insert(chunk_id);
+                        }
+                        full_live &= claimed;
+                        identities.push((chunk_id, logical_length));
+                        if claimed {
+                            group_estimated = group_estimated
+                                .checked_add(estimated_relocated_chunk_bytes(
+                                    location,
+                                    logical_length,
+                                )?)
+                                .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                        }
+                    }
+                    let transplanted = if full_live && records.len() <= GC_REPLACEMENT_CHUNK_LIMIT {
+                        image.prepare_encoded_record(record_offset).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(record) = transplanted {
+                        debug_assert!(full_live);
+                        group_estimated = group_estimated.max(
+                            u64::try_from(record.encoded_bytes())
+                                .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
+                        );
+                        victim_items.push(GcReplacementItem::Transplanted { record, identities });
+                    } else {
+                        for ((chunk_id, _), record) in identities.iter().zip(records) {
+                            if !victim_claims.contains(chunk_id) {
+                                continue;
+                            }
+                            victim_items.push(GcReplacementItem::Chunk(record.verified_payload()));
+                        }
+                    }
+                    victim_estimate = victim_estimate
+                        .checked_add(group_estimated)
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                    group_start = group_end;
+                }
+                let projected = replacement_file_bytes_upper_bound(&replacement_chunks)?;
+                if projected > GC_CANDIDATE_PROOF_MAX_RAW_REPLACEMENT_BYTES {
+                    for chunk_id in newly_required {
+                        let removed = replacement_chunks.remove(&chunk_id);
+                        assert!(
+                            removed.is_some(),
+                            "ASSERT: proof-budget rollback removes every newly required Chunk"
+                        );
+                        reachable_victim_chunks.remove(&chunk_id);
+                    }
+                    budget_exceeded = true;
+                    return Ok(());
+                }
+                for location in container.locations().iter().copied() {
+                    let active = ExactIndexEntry::from_verified(location)?;
+                    let retiring = ExactIndexEntry::retiring(active)?;
+                    victim_retiring.push(retiring);
+                }
+                retiring_entries.append(&mut victim_retiring);
+                items.append(&mut victim_items);
+                replacement_estimate = replacement_estimate
+                    .checked_add(victim_estimate)
+                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                let previous = victims.insert(row.container_id().bytes(), row.container_id());
+                assert!(
+                    previous.is_none(),
+                    "ASSERT: a canonical catalog shortlist contains each Container once"
+                );
+                victim_bytes = victim_bytes
+                    .checked_add(row.physical_bytes())
+                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                Ok(())
+            },
+        )?;
         if victims.is_empty() {
+            if budget_exceeded {
+                return Err(MaintenanceError::GcCandidateProofBudgetExceeded);
+            }
             return Err(MaintenanceError::EmptyGcCandidateProof);
         }
-        if generation_proof.online_chunks().is_empty() {
+        if generation_proof.protected_chunks().is_empty() {
             assert!(
                 replacement_chunks.is_empty() && reachable_victim_chunks.is_empty(),
                 "ASSERT: an empty protected DATA set cannot require GC replacement coverage"
             );
         }
         let replacement_upper = replacement_file_bytes_upper_bound(&replacement_chunks)?;
-        if replacement_upper >= victim_bytes {
+        let replacement_estimated_bytes =
+            bounded_replacement_estimate(replacement_estimate, replacement_chunks.len())?;
+        if replacement_estimated_bytes >= victim_bytes {
             return Err(MaintenanceError::UnprofitableGcCandidateProof {
                 victim_bytes,
                 replacement_upper,
             });
         }
-        let estimated_reclaimable_bytes = victim_bytes - replacement_upper;
+        let estimated_reclaimable_bytes = victim_bytes - replacement_estimated_bytes;
         let priority = pool_usage.gc_priority(estimated_reclaimable_bytes, victim_bytes);
         Ok(GcCandidateProof {
             catalog: shortlist.descriptor(),
@@ -717,58 +1017,23 @@ where
             victim_bytes,
             replacement_chunks,
             replacement_upper,
+            replacement_estimated_bytes,
             reachable_victim_chunks: reachable_victim_chunks.len(),
             priority,
+            items,
+            retiring_entries,
         })
     }
 
-    fn reverse_dependency_generation(
-        &self,
-        exact: &crate::ActivatedExactIndex<X>,
-        liveness: &GenerationLivenessProof,
-    ) -> Result<Arc<ReverseDependencyGeneration>, MaintenanceError> {
-        let exact_activation = exact.record();
-        let protected_commit_generation = liveness.summary().latest_generation();
-        let key = crate::ReadCacheKey {
-            identity: [0; 32],
-            ordinal: 0,
-        };
-        if let Some(cached) = self
-            .reverse_dependencies
-            .get::<ReverseDependencyGeneration>(key)
-            && cached.exact_activation == exact_activation
-            && cached.protected_commit_generation == protected_commit_generation
-            && cached.protected_targets.len() == liveness.online_chunks().len()
-            && cached
-                .protected_targets
-                .iter()
-                .copied()
-                .eq(liveness.online_chunks().keys().copied())
-            && liveness
-                .online_chunks()
-                .iter()
-                .all(|(chunk_id, length)| cached.required_chunks.get(chunk_id) == Some(length))
-        {
-            return Ok(cached);
-        }
-        self.reverse_dependencies.remove(key);
-        let built = Arc::new(build_reverse_dependency_generation(
-            exact,
-            liveness,
-            self.cancellation.as_ref(),
-        )?);
-        self.reverse_dependencies
-            .insert(key, Arc::clone(&built), built.retained_bytes(), 0);
-        Ok(built)
-    }
-
-    /// Advances an existing publication-seeded GC catalog to the current
-    /// protected Commit pair in one generation-bound operation.
+    /// Advances one already-opened catalog generation by the liveness delta
+    /// since its incorporated Commit generation.
     ///
-    /// The module derives the Metadata delta, pins the current Exact
-    /// generation for physical attribution, applies only affected Container
-    /// rows, and publishes one immutable successor. Callers need not assemble
-    /// or interpret the delta themselves.
+    /// Callers that recovered or published the previous generation pass their
+    /// open snapshot so one quantum performs one complete catalog audit instead
+    /// of one audit per phase. The module derives the Metadata delta, pins the
+    /// current Exact generation for physical attribution, applies only affected
+    /// Container rows, and publishes one immutable successor. Callers need not
+    /// assemble or interpret the delta themselves.
     ///
     /// # Errors
     ///
@@ -777,11 +1042,9 @@ where
     pub fn refresh_gc_candidate_catalog<G: Clone + StorageIo>(
         &self,
         catalog: &GcCandidateCatalogRepository<G>,
+        previous: &GcCandidateCatalogSnapshot<G>,
         catalog_generation: u64,
     ) -> Result<GcCandidateCatalogDescriptor, MaintenanceError> {
-        let previous = catalog
-            .recover_latest()?
-            .ok_or(MaintenanceError::MissingGcCandidateCatalog)?;
         let incorporated = previous.descriptor().incorporated_commit_generation();
         let delta = self
             .generations
@@ -796,7 +1059,7 @@ where
         if exact.record().profile() != self.exact_profile {
             return Err(MaintenanceError::ExactProfileMismatch);
         }
-        Ok(catalog.publish_liveness_delta(&previous, catalog_generation, &delta, &exact)?)
+        Ok(catalog.publish_liveness_delta(previous, catalog_generation, &delta, &exact)?)
     }
 
     /// Bootstraps one complete GC candidate hint generation from immutable
@@ -873,6 +1136,33 @@ where
         )
     }
 
+    /// Runs one adaptive quantum restricted to the requested phases.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::run_adaptive_online_gc_cycle`].
+    pub fn run_adaptive_online_gc_cycle_with_phases<G>(
+        &self,
+        catalog: &GcCandidateCatalogRepository<G>,
+        pool_usage: DataPoolUsage,
+        mode: OnlineGcRunMode,
+        phases: GcPhaseRequest,
+    ) -> Result<OnlineGcCycleReport, MaintenanceError>
+    where
+        M: Send + 'static,
+        C: Send + 'static,
+        X: Send + Sync + 'static,
+        G: Clone + Send + Sync + StorageIo + 'static,
+    {
+        self.run_adaptive_online_gc_cycle_with_workers_and_phases(
+            catalog,
+            pool_usage,
+            mode,
+            phases,
+            thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+        )
+    }
+
     /// Runs one adaptive quantum while capping relocation encoding workers.
     /// Candidate proof, Exact transitions, and unlink remain serialized; only
     /// the existing bounded replacement encoder uses this CPU limit.
@@ -893,13 +1183,50 @@ where
         X: Send + Sync + 'static,
         G: Clone + Send + Sync + StorageIo + 'static,
     {
+        self.run_adaptive_online_gc_cycle_with_workers_and_phases(
+            catalog,
+            pool_usage,
+            mode,
+            GcPhaseRequest::both(),
+            relocation_workers,
+        )
+    }
+
+    /// Adaptive quantum with explicit phase selection; the destructive DATA
+    /// relocation phases run only when `phases.data` requests them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::run_adaptive_online_gc_cycle`].
+    pub fn run_adaptive_online_gc_cycle_with_workers_and_phases<G>(
+        &self,
+        catalog: &GcCandidateCatalogRepository<G>,
+        pool_usage: DataPoolUsage,
+        mode: OnlineGcRunMode,
+        phases: GcPhaseRequest,
+        relocation_workers: NonZeroUsize,
+    ) -> Result<OnlineGcCycleReport, MaintenanceError>
+    where
+        M: Send + 'static,
+        C: Send + 'static,
+        X: Send + Sync + 'static,
+        G: Clone + Send + Sync + StorageIo + 'static,
+    {
         let repository = self.clone();
         let catalog = catalog.clone();
         run_at_priority(
             mode.priority(),
             MaintenanceExecutionMode::Adaptive,
             "fastdup-online-gc",
-            move || repository.run_online_gc_cycle(&catalog, pool_usage, mode, relocation_workers),
+            move || {
+                repository.run_online_gc_cycle(
+                    &catalog,
+                    pool_usage,
+                    mode,
+                    relocation_workers,
+                    phases,
+                )
+            },
         )
     }
 
@@ -922,16 +1249,49 @@ where
         X: Send + Sync + 'static,
         G: Clone + Send + Sync + StorageIo + 'static,
     {
+        self.run_adaptive_online_gc_cycle_cancellable_with_phases(
+            catalog,
+            pool_usage,
+            mode,
+            GcPhaseRequest::both(),
+            relocation_workers,
+            cancellation,
+        )
+    }
+
+    /// Cancellable adaptive quantum with explicit phase selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified cancellation or the same failures as the
+    /// uncancellable cycle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_adaptive_online_gc_cycle_cancellable_with_phases<G>(
+        &self,
+        catalog: &GcCandidateCatalogRepository<G>,
+        pool_usage: DataPoolUsage,
+        mode: OnlineGcRunMode,
+        phases: GcPhaseRequest,
+        relocation_workers: NonZeroUsize,
+        cancellation: &crate::MaintenanceCancellation,
+    ) -> Result<OnlineGcCycleReport, MaintenanceError>
+    where
+        M: Send + 'static,
+        C: Send + 'static,
+        X: Send + Sync + 'static,
+        G: Clone + Send + Sync + StorageIo + 'static,
+    {
         cancellation.check()?;
         let mut repository = self.clone();
         repository.generations = repository
             .generations
             .with_maintenance_cancellation(cancellation.clone());
         repository.cancellation = Some(cancellation.clone());
-        repository.run_adaptive_online_gc_cycle_with_workers(
+        repository.run_adaptive_online_gc_cycle_with_workers_and_phases(
             catalog,
             pool_usage,
             mode,
+            phases,
             relocation_workers,
         )
     }
@@ -944,12 +1304,14 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     fn run_online_gc_cycle<G: Clone + StorageIo>(
         &self,
         catalog: &GcCandidateCatalogRepository<G>,
         pool_usage: DataPoolUsage,
         mode: OnlineGcRunMode,
         relocation_workers: NonZeroUsize,
+        phases: GcPhaseRequest,
     ) -> Result<OnlineGcCycleReport, MaintenanceError>
     where
         X: Send + Sync + 'static,
@@ -969,59 +1331,193 @@ where
         self.check_cancellation()?;
         self.finalize_online_gc(false)?;
         metrics.recovery_wall = phase_started.elapsed();
+        let mut metadata_gc = MetadataGarbageCollectionReport::default();
+        if phases.metadata {
+            let phase_started = Instant::now();
+            self.check_cancellation()?;
+            metadata_gc = self.garbage_collect_metadata()?;
+            metrics.metadata_gc_wall = phase_started.elapsed();
+            // Exact object retirement runs every Metadata quantum regardless
+            // of candidate availability: compaction and activation drain
+            // release references long after the producing commit, and an idle
+            // Namespace must still converge to the bounded WAL retention.
+            let phase_started = Instant::now();
+            self.check_cancellation()?;
+            let exact_retirement = self
+                .indexes
+                .retire_unreferenced_cancellable(self.cancellation.as_ref())?;
+            metrics.exact_retirement_wall = phase_started.elapsed();
+            metrics.exact_runs_retired = exact_retirement.runs_removed();
+            metrics.exact_run_sets_retired = exact_retirement.run_sets_removed();
+        }
+        if !phases.data {
+            metrics.total_wall = started.elapsed();
+            return Ok(OnlineGcCycleReport {
+                outcome: if phases.metadata {
+                    OnlineGcCycleOutcome::MetadataOnly
+                } else {
+                    OnlineGcCycleOutcome::DataOnly
+                },
+                catalog: catalog.recover_latest()?.map(|opened| opened.descriptor()),
+                metadata_gc,
+                metrics,
+            });
+        }
         let phase_started = Instant::now();
         self.check_cancellation()?;
-        let metadata_gc = self.garbage_collect_metadata()?;
-        metrics.metadata_gc_wall = phase_started.elapsed();
-        let phase_started = Instant::now();
-        self.check_cancellation()?;
-        if catalog.recover_latest()?.is_none() {
-            let rebuilt =
-                self.rebuild_gc_candidate_catalog(catalog, next_gc_catalog_generation(catalog)?)?;
+        let mut opened = catalog.recover_latest()?;
+        // Retirement precedes every publication in this quantum: the newest
+        // canonical name alone carries the pool view and preserves the
+        // allocator high-water, so each strictly older file is inert and a
+        // crash between the previous successor rename and this sweep leaves
+        // exactly this retry. A still-leased predecessor is retained here
+        // and collected once its last reader drops.
+        metrics.catalog_files_retired = catalog.retire_superseded()?;
+        if opened.is_none() {
+            self.rebuild_gc_candidate_catalog(catalog, next_gc_catalog_generation(catalog)?)?;
+            let rebuilt = catalog
+                .recover_latest()?
+                .ok_or(MaintenanceError::MissingGcCandidateCatalog)?;
             metrics.catalog_write_bytes = metrics
                 .catalog_write_bytes
-                .checked_add(rebuilt.file_length())
+                .checked_add(rebuilt.descriptor().file_length())
                 .ok_or(MaintenanceError::ArithmeticOverflow)?;
+            opened = Some(rebuilt);
         }
+        let mut snapshot = opened.expect("ASSERT: bootstrapped catalog is open");
         let mut next_generation = next_gc_catalog_generation(catalog)?;
-        let before_refresh = catalog
-            .recover_latest()?
-            .ok_or(MaintenanceError::MissingGcCandidateCatalog)?
-            .descriptor();
-        match self.refresh_gc_candidate_catalog(catalog, next_generation) {
-            Ok(refreshed) => {
-                if refreshed.generation() != before_refresh.generation() {
-                    metrics.catalog_write_bytes = metrics
-                        .catalog_write_bytes
-                        .checked_add(refreshed.file_length())
-                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
-                }
-            }
-            Err(MaintenanceError::Generation(GenerationError::LivenessDeltaBaseUnavailable {
-                ..
-            })) => {
-                let rebuilt = self.rebuild_gc_candidate_catalog(catalog, next_generation)?;
+        let queue_capacity = mode
+            .candidate_queue_capacity()
+            .min(GC_CANDIDATE_QUEUE_CAPACITY);
+        let shortlist_limit = mode.shortlist_limit().min(GC_CANDIDATE_QUEUE_CAPACITY);
+        let mut scanned_rows = 0_u64;
+        let shortlist = {
+            let mut queue = self
+                .candidate_queue
+                .lock()
+                .expect("ASSERT: Online-GC candidate queue lock poisoned");
+            queue.sync_catalog_generation(snapshot.descriptor(), GC_PENDING_CATALOG_UPDATE_LIMIT);
+            if queue.requires_rebuild() {
+                let descriptor = self.rebuild_gc_candidate_catalog(catalog, next_generation)?;
                 metrics.catalog_write_bytes = metrics
                     .catalog_write_bytes
-                    .checked_add(rebuilt.file_length())
+                    .checked_add(descriptor.file_length())
                     .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                snapshot = catalog
+                    .recover_latest()?
+                    .ok_or(MaintenanceError::MissingGcCandidateCatalog)?;
                 next_generation = next_gc_catalog_generation(catalog)?;
-                let refreshed = self.refresh_gc_candidate_catalog(catalog, next_generation)?;
-                if refreshed.generation() != rebuilt.generation() {
-                    metrics.catalog_write_bytes = metrics
-                        .catalog_write_bytes
-                        .checked_add(refreshed.file_length())
-                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                queue.sync_catalog_generation(
+                    snapshot.descriptor(),
+                    GC_PENDING_CATALOG_UPDATE_LIMIT,
+                );
+            }
+            let incorporated = queue.incorporated_commit_generation();
+            if queue.retained() < shortlist_limit && !queue.needs_flush() {
+                match self
+                    .generations
+                    .liveness_delta_since((incorporated != 0).then_some(incorporated))
+                {
+                    Ok(delta) => {
+                        let latest = delta.latest_generation().unwrap_or(0);
+                        if latest != incorporated {
+                            let exact = self
+                                .indexes
+                                .pin_online_generation()?
+                                .ok_or(MaintenanceError::GcProofRequiresActiveExactIndex)?;
+                            if exact.record().profile() != self.exact_profile {
+                                return Err(MaintenanceError::ExactProfileMismatch);
+                            }
+                            let updates =
+                                GcCandidateCatalogRepository::<G>::candidate_updates_from_liveness_delta(
+                                    &snapshot,
+                                    &delta,
+                                    &exact,
+                                )?;
+                            queue.apply_liveness_updates(updates, latest, queue_capacity);
+                        }
+                    }
+                    Err(GenerationError::LivenessDeltaBaseUnavailable { .. }) => {
+                        queue.request_rebuild();
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
-            Err(error) => return Err(error),
-        }
-        let snapshot = catalog
-            .recover_latest()?
-            .ok_or(MaintenanceError::MissingGcCandidateCatalog)?;
-        let shortlist =
-            snapshot.shortlist(mode.selection_mode(), mode.shortlist_limit(), u64::MAX)?;
-        metrics.catalog_examined_bytes = snapshot.descriptor().file_length();
+            if queue.needs_flush() {
+                let updates = queue.take_successor_updates();
+                if !updates.is_empty() {
+                    let exact = self
+                        .indexes
+                        .pin_online_generation()?
+                        .ok_or(MaintenanceError::GcProofRequiresActiveExactIndex)?;
+                    let descriptor = catalog.publish_successor(
+                        &snapshot,
+                        next_generation,
+                        queue.incorporated_commit_generation(),
+                        exact.record().generation(),
+                        &updates,
+                    )?;
+                    metrics.catalog_write_bytes = metrics
+                        .catalog_write_bytes
+                        .checked_add(descriptor.file_length())
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                    next_generation = next_gc_catalog_generation(catalog)?;
+                    snapshot = catalog
+                        .recover_latest()?
+                        .ok_or(MaintenanceError::MissingGcCandidateCatalog)?;
+                    queue.sync_catalog_generation(
+                        snapshot.descriptor(),
+                        GC_PENDING_CATALOG_UPDATE_LIMIT,
+                    );
+                }
+            }
+            let mut fill = queue.fill(
+                &snapshot,
+                mode.selection_mode(),
+                queue_capacity,
+                mode.candidate_scan_rows(),
+            )?;
+            scanned_rows = scanned_rows.saturating_add(fill.scanned_rows);
+            while queue.retained() < shortlist_limit
+                && !fill.scan_complete
+                && scanned_rows < GC_CATALOG_SCAN_BATCH_ROWS.saturating_mul(64)
+            {
+                fill = queue.fill(
+                    &snapshot,
+                    mode.selection_mode(),
+                    queue_capacity,
+                    mode.candidate_scan_rows(),
+                )?;
+                scanned_rows = scanned_rows.saturating_add(fill.scanned_rows);
+            }
+            let rows = queue.take(shortlist_limit);
+            metrics.candidate_queue_retained = u64::try_from(queue.retained())
+                .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+            metrics.candidate_queue_scanned_rows = scanned_rows;
+            metrics.catalog_pending_updates = u64::try_from(queue.pending_updates())
+                .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+            if rows.is_empty() {
+                metrics.catalog_examined_bytes =
+                    scanned_rows.saturating_mul(GC_CANDIDATE_CATALOG_ROW_BYTES as u64);
+                metrics.shortlisted_candidates = 0;
+                metrics.candidate_catalog_wall = phase_started.elapsed();
+                metrics.total_wall = started.elapsed();
+                return Ok(OnlineGcCycleReport {
+                    outcome: OnlineGcCycleOutcome::NoCandidates,
+                    catalog: Some(snapshot.descriptor()),
+                    metadata_gc,
+                    metrics,
+                });
+            }
+            GcCandidateShortlist::from_rows(
+                snapshot.descriptor(),
+                rows,
+                mode.selection_mode(),
+                u64::MAX,
+            )
+        };
+        metrics.catalog_examined_bytes =
+            scanned_rows.saturating_mul(GC_CANDIDATE_CATALOG_ROW_BYTES as u64);
         metrics.shortlisted_candidates = u64::try_from(shortlist.rows().len())
             .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
         metrics.candidate_catalog_wall = phase_started.elapsed();
@@ -1029,63 +1525,85 @@ where
             metrics.total_wall = started.elapsed();
             return Ok(OnlineGcCycleReport {
                 outcome: OnlineGcCycleOutcome::NoCandidates,
-                catalog: snapshot.descriptor(),
+                catalog: Some(snapshot.descriptor()),
                 metadata_gc,
                 metrics,
             });
         }
+        let mut catalog_descriptor = snapshot.descriptor();
+        let candidate_rows = shortlist
+            .rows()
+            .iter()
+            .map(|row| (row.container_id().bytes(), *row))
+            .collect::<HashMap<_, _>>();
         let phase_started = Instant::now();
         self.check_cancellation()?;
-        let proof = match self.prove_gc_candidates(&shortlist, pool_usage) {
-            Ok(proof) => {
-                metrics.proved_victims = u64::try_from(proof.victim_containers())
-                    .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
-                metrics.reverse_dependency_edges = proof.reverse_dependency_edges();
-                metrics.reverse_dependency_required_chunks =
-                    u64::try_from(proof.reverse_dependency_required_chunks())
+        let proof =
+            match self.prove_gc_candidates_with_workers(&shortlist, pool_usage, relocation_workers)
+            {
+                Ok(proof) => {
+                    metrics.proved_victims = u64::try_from(proof.victim_containers())
                         .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
-                metrics.candidate_proof_read_bytes = proof.victim_bytes();
-                metrics.candidate_proof_wall = phase_started.elapsed();
-                proof
-            }
-            Err(
-                MaintenanceError::EmptyGcCandidateProof
-                | MaintenanceError::GcCandidateProofBudgetExceeded
-                | MaintenanceError::UnprofitableGcCandidateProof { .. },
-            ) => {
-                metrics.candidate_proof_wall = phase_started.elapsed();
-                metrics.aborted_candidates = metrics.shortlisted_candidates;
-                metrics.total_wall = started.elapsed();
-                return Ok(OnlineGcCycleReport {
-                    outcome: OnlineGcCycleOutcome::NoProfitableCandidates,
-                    catalog: snapshot.descriptor(),
-                    metadata_gc,
-                    metrics,
-                });
-            }
-            Err(error) if gc_candidate_catalog_is_stale(&error) => {
-                let generation = next_gc_catalog_generation(catalog)?;
-                let catalog = self.rebuild_gc_candidate_catalog(catalog, generation)?;
-                metrics.candidate_proof_wall = phase_started.elapsed();
-                metrics.aborted_candidates = metrics.shortlisted_candidates;
-                metrics.catalog_write_bytes = metrics
-                    .catalog_write_bytes
-                    .checked_add(catalog.file_length())
-                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
-                metrics.total_wall = started.elapsed();
-                return Ok(OnlineGcCycleReport {
-                    outcome: OnlineGcCycleOutcome::CatalogRebuilt,
-                    catalog,
-                    metadata_gc,
-                    metrics,
-                });
-            }
-            Err(error) => return Err(error),
-        };
+                    metrics.reverse_dependency_edges = proof.reverse_dependency_edges();
+                    metrics.reverse_dependency_required_chunks =
+                        u64::try_from(proof.reverse_dependency_required_chunks())
+                            .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+                    metrics.candidate_proof_read_bytes = proof.victim_bytes();
+                    metrics.candidate_proof_wall = phase_started.elapsed();
+                    proof
+                }
+                Err(
+                    MaintenanceError::EmptyGcCandidateProof
+                    | MaintenanceError::GcCandidateProofBudgetExceeded
+                    | MaintenanceError::UnprofitableGcCandidateProof { .. },
+                ) => {
+                    metrics.candidate_proof_wall = phase_started.elapsed();
+                    metrics.aborted_candidates = metrics.shortlisted_candidates;
+                    self.candidate_queue
+                        .lock()
+                        .expect("ASSERT: Online-GC candidate queue lock poisoned")
+                        .invalidate();
+                    metrics.total_wall = started.elapsed();
+                    return Ok(OnlineGcCycleReport {
+                        outcome: OnlineGcCycleOutcome::NoProfitableCandidates,
+                        catalog: Some(snapshot.descriptor()),
+                        metadata_gc,
+                        metrics,
+                    });
+                }
+                Err(error) if gc_candidate_catalog_is_stale(&error) => {
+                    let generation = next_gc_catalog_generation(catalog)?;
+                    let catalog_descriptor =
+                        self.rebuild_gc_candidate_catalog(catalog, generation)?;
+                    metrics.candidate_proof_wall = phase_started.elapsed();
+                    metrics.aborted_candidates = metrics.shortlisted_candidates;
+                    metrics.catalog_write_bytes = metrics
+                        .catalog_write_bytes
+                        .checked_add(catalog_descriptor.file_length())
+                        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                    metrics.post_collection_catalog_wall = phase_started.elapsed();
+                    self.candidate_queue
+                        .lock()
+                        .expect("ASSERT: Online-GC candidate queue lock poisoned")
+                        .sync_catalog_generation(
+                            catalog_descriptor,
+                            GC_PENDING_CATALOG_UPDATE_LIMIT,
+                        );
+                    metrics.total_wall = started.elapsed();
+                    return Ok(OnlineGcCycleReport {
+                        outcome: OnlineGcCycleOutcome::CatalogRebuilt,
+                        catalog: Some(catalog_descriptor),
+                        metadata_gc,
+                        metrics,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
         let victim_bytes = proof.victim_bytes();
         let phase_started = Instant::now();
         self.check_cancellation()?;
         let retirement = self.begin_online_gc_retirement_with_workers(proof, relocation_workers)?;
+        let retired_victims = retirement.retired_victim_keys();
         let collected = self.finish_online_gc_retirement(retirement)?;
         metrics.relocation_wall = phase_started.elapsed();
         metrics.relocation_read_bytes = victim_bytes;
@@ -1099,17 +1617,57 @@ where
         metrics.removed_activation_wall = collected.removed_activation_wall();
         let phase_started = Instant::now();
         self.check_cancellation()?;
-        let generation = next_gc_catalog_generation(catalog)?;
-        let catalog = self.rebuild_gc_candidate_catalog(catalog, generation)?;
-        metrics.catalog_write_bytes = metrics
-            .catalog_write_bytes
-            .checked_add(catalog.file_length())
-            .ok_or(MaintenanceError::ArithmeticOverflow)?;
-        metrics.post_collection_catalog_wall = phase_started.elapsed();
+        {
+            let mut queue = self
+                .candidate_queue
+                .lock()
+                .expect("ASSERT: Online-GC candidate queue lock poisoned");
+            queue.sync_catalog_generation(snapshot.descriptor(), GC_PENDING_CATALOG_UPDATE_LIMIT);
+            queue.note_collection(
+                retired_victims
+                    .iter()
+                    .filter_map(|id| candidate_rows.get(id).copied()),
+                queue_capacity,
+            )?;
+            let descriptor = if queue.requires_rebuild() {
+                Some(self.rebuild_gc_candidate_catalog(catalog, next_generation)?)
+            } else {
+                let updates = queue.take_successor_updates();
+                if updates.is_empty() {
+                    None
+                } else {
+                    let exact = self
+                        .indexes
+                        .pin_online_generation()?
+                        .ok_or(MaintenanceError::GcProofRequiresActiveExactIndex)?;
+                    Some(catalog.publish_successor(
+                        &snapshot,
+                        next_generation,
+                        queue.incorporated_commit_generation(),
+                        exact.record().generation(),
+                        &updates,
+                    )?)
+                }
+            };
+            if let Some(descriptor) = descriptor {
+                metrics.catalog_write_bytes = metrics
+                    .catalog_write_bytes
+                    .checked_add(descriptor.file_length())
+                    .ok_or(MaintenanceError::ArithmeticOverflow)?;
+                catalog_descriptor = descriptor;
+                queue.sync_catalog_generation(catalog_descriptor, GC_PENDING_CATALOG_UPDATE_LIMIT);
+                metrics.post_collection_catalog_wall = phase_started.elapsed();
+            }
+            metrics.candidate_queue_retained = u64::try_from(queue.retained())
+                .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+            metrics.candidate_queue_scanned_rows = scanned_rows;
+            metrics.catalog_pending_updates = u64::try_from(queue.pending_updates())
+                .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+        }
         metrics.total_wall = started.elapsed();
         Ok(OnlineGcCycleReport {
             outcome: OnlineGcCycleOutcome::Collected(collected),
-            catalog,
+            catalog: Some(catalog_descriptor),
             metadata_gc,
             metrics,
         })
@@ -1146,6 +1704,8 @@ where
             victim_bytes,
             replacement_chunks,
             priority,
+            items,
+            retiring_entries,
             ..
         } = proof;
         let exact_activation = reverse_dependencies.exact_activation;
@@ -1169,11 +1729,10 @@ where
             .pin_online_generation()?
             .filter(|active| active.record() == exact_activation)
             .ok_or(MaintenanceError::StaleGcPlan)?;
-        let replacements = self.publish_gc_replacements_using(
-            &victims,
+        let replacements = self.publish_collected_items(
+            items,
             &replacement_chunks,
             thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
-            |container_id| Ok(self.containers.read_verified_image(container_id)?),
         )?;
         if !self.generations.gc_proof_is_current(&generation_proof)?
             || !self.gc_exact_binding_is_current(exact_activation)?
@@ -1184,8 +1743,11 @@ where
         if !self.generations.gc_proof_is_current(&generation_proof)? {
             return Err(MaintenanceError::StaleGcPlan);
         }
-        let (bytes_removed, removal_metrics) =
-            self.containers.remove_verified_published(&victims)?;
+        let (bytes_removed, removal_metrics) = self.containers.remove_verified_published(
+            &victims,
+            &retiring_entries,
+            thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+        )?;
         assert_eq!(
             bytes_removed, victim_bytes,
             "ASSERT: proved victim identities retain their immutable lengths"
@@ -1266,6 +1828,8 @@ where
             victim_bytes,
             replacement_chunks,
             priority,
+            items,
+            retiring_entries,
             ..
         } = proof;
         let exact_activation = reverse_dependencies.exact_activation;
@@ -1289,26 +1853,8 @@ where
             .pin_online_generation()?
             .filter(|active| active.record() == exact_activation)
             .ok_or(MaintenanceError::StaleGcPlan)?;
-        let mut retiring_entries = Vec::new();
-        let mut replacements = self.publish_gc_replacements_using(
-            &victims,
-            &replacement_chunks,
-            relocation_workers,
-            |container_id| {
-                self.check_cancellation()?;
-                let image = self.containers.read_verified_image(container_id)?;
-                let container = image.container();
-                retiring_entries
-                    .try_reserve(container.locations().len())
-                    .map_err(|_| MaintenanceError::OutOfMemory)?;
-                for location in container.locations().iter().copied() {
-                    let active = ExactIndexEntry::from_verified(location)?;
-                    let retiring = ExactIndexEntry::retiring(active)?;
-                    retiring_entries.push(retiring);
-                }
-                Ok(image)
-            },
-        )?;
+        let mut replacements =
+            self.publish_collected_items(items, &replacement_chunks, relocation_workers)?;
         let transition = self
             .generations
             .apply_if_gc_proof_current(&generation_proof, || {
@@ -1349,6 +1895,7 @@ where
             drain,
             priority,
             retiring_activation_wall: retirement_started.elapsed(),
+            relocation_workers,
         })
     }
 
@@ -1380,6 +1927,7 @@ where
             drain,
             priority,
             retiring_activation_wall,
+            relocation_workers,
         } = retirement;
         assert!(
             !victims.is_empty(),
@@ -1390,10 +1938,16 @@ where
             "ASSERT: victim unlink follows durable RETIRING location activation"
         );
         let drain_started = Instant::now();
-        drain.wait();
+        match self.cancellation.as_ref() {
+            Some(cancellation) => drain.wait_cancellable(cancellation)?,
+            None => drain.wait(),
+        }
         let pin_drain_wall = drain_started.elapsed();
-        let (bytes_removed, removal_metrics) =
-            self.containers.remove_verified_published(&victims)?;
+        let (bytes_removed, removal_metrics) = self.containers.remove_verified_published(
+            &victims,
+            &retiring_entries,
+            relocation_workers,
+        )?;
         assert_eq!(
             bytes_removed, victim_bytes,
             "ASSERT: online GC victim identities retain their immutable lengths"
@@ -1430,7 +1984,9 @@ where
     /// Finalizes durable RETIRING work left by a terminated process.
     ///
     /// Restart has no surviving predecessor-generation pins. The active Exact
-    /// generation is therefore sufficient recovery authority: effective
+    /// generation is independently recovered and fully audited first; its
+    /// immutable Run Set then supplies the RETIRING selection evidence to the
+    /// same-process finalizer. Effective
     /// RETIRING entries install the scan-selection barrier, every still-present
     /// victim must reproduce its complete Location set before unlink, and an
     /// already-absent victim is treated as an interrupted post-sync attempt.
@@ -1459,6 +2015,7 @@ where
         X: Send + Sync + 'static,
     {
         let active = if independent {
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
             self.indexes.recover_active_generation()?
         } else {
             self.indexes.pin_online_generation()?
@@ -1647,9 +2204,11 @@ where
         if !self.generations.gc_proof_is_current(&generation_proof)? {
             return Err(MaintenanceError::StaleGcPlan);
         }
-        let (bytes_removed, removal_metrics) = self
-            .containers
-            .remove_verified_published(&removal_candidates)?;
+        let (bytes_removed, removal_metrics) = self.containers.remove_verified_published(
+            &removal_candidates,
+            &[],
+            thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+        )?;
         let expected_removed = reclaimable_bytes
             .checked_add(compaction_victim_bytes)
             .ok_or(MaintenanceError::ArithmeticOverflow)?;
@@ -1683,6 +2242,124 @@ where
         self.publish_gc_replacements_using(victims, required, relocation_workers, |container_id| {
             Ok(self.containers.read_verified_image(container_id)?)
         })
+    }
+
+    /// Publishes one complete replacement Container set from Items already
+    /// collected by the single independent proof read.
+    ///
+    /// No victim DATA is read here: each Item carries either an independently
+    /// verified Chunk payload or a byte-exact encoded Record transplanted from
+    /// the proven image. Batch geometry matches [`Self::publish_gc_replacements_using`]
+    /// and every required Chunk is published exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns publication, generation allocation, coverage, or checked-
+    /// accounting failures. A stale-plan caller discards the result; published
+    /// objects remain harmless future GC candidates.
+    ///
+    /// # Panics
+    ///
+    /// Panics if collected Items violate the proof's coverage or count
+    /// invariants, or if the replacement writer reread disagrees.
+    fn publish_collected_items(
+        &self,
+        items: Vec<GcReplacementItem>,
+        required: &BTreeMap<ChunkId, u64>,
+        relocation_workers: NonZeroUsize,
+    ) -> Result<ReplacementPublication, MaintenanceError> {
+        let mut seen = BTreeSet::new();
+        let mut published = ReplacementPublication::default();
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0_u64;
+        let mut batch_chunks = 0_usize;
+        let mut generations = None;
+        let mut reserve_generation = || -> Result<u64, MaintenanceError> {
+            if generations.is_none() {
+                generations = Some(
+                    self.containers
+                        .open_generation_allocator(CONTAINER_GENERATION_RESERVATION_SPAN_V1)?,
+                );
+            }
+            generations
+                .as_ref()
+                .expect("ASSERT: GC generation allocator was just initialized")
+                .reserve_generation()
+                .map_err(Into::into)
+        };
+        for item in items {
+            let item_bytes = item.logical_bytes()?;
+            let item_chunks = item.chunk_count();
+            match &item {
+                GcReplacementItem::Chunk(payload) => {
+                    assert!(
+                        seen.insert(payload.chunk_id()),
+                        "ASSERT: proof collection publishes each replacement Chunk once"
+                    );
+                }
+                GcReplacementItem::Transplanted { identities, .. } => {
+                    for (chunk_id, _) in identities {
+                        assert!(
+                            seen.insert(*chunk_id),
+                            "ASSERT: proof collection publishes each replacement Chunk once"
+                        );
+                    }
+                }
+            }
+            let would_exceed_bytes = batch_bytes
+                .checked_add(item_bytes)
+                .ok_or(MaintenanceError::ArithmeticOverflow)?
+                > GC_REPLACEMENT_LOGICAL_TARGET_BYTES;
+            let would_exceed_chunks = batch_chunks
+                .checked_add(item_chunks)
+                .ok_or(MaintenanceError::ArithmeticOverflow)?
+                > GC_REPLACEMENT_CHUNK_LIMIT;
+            if !batch.is_empty() && (would_exceed_bytes || would_exceed_chunks) {
+                self.check_cancellation()?;
+                let generation = reserve_generation()?;
+                published.add(self.publish_gc_replacement_batch(
+                    generation,
+                    std::mem::take(&mut batch),
+                    relocation_workers,
+                )?)?;
+                batch_bytes = 0;
+                batch_chunks = 0;
+            }
+            batch_bytes = batch_bytes
+                .checked_add(item_bytes)
+                .ok_or(MaintenanceError::ArithmeticOverflow)?;
+            batch_chunks = batch_chunks
+                .checked_add(item_chunks)
+                .ok_or(MaintenanceError::ArithmeticOverflow)?;
+            batch.push(item);
+        }
+        if !batch.is_empty() {
+            self.check_cancellation()?;
+            let generation = reserve_generation()?;
+            published.add(self.publish_gc_replacement_batch(
+                generation,
+                batch,
+                relocation_workers,
+            )?)?;
+        }
+        assert!(
+            seen.iter().all(|chunk_id| required.contains_key(chunk_id)),
+            "ASSERT: replacement collection never publishes an unclaimed Chunk"
+        );
+        if seen.len() != required.len() {
+            return Err(MaintenanceError::MissingReplacementChunk);
+        }
+        assert_eq!(
+            published.chunks,
+            u64::try_from(required.len()).expect("ASSERT: replacement Chunk count fits u64"),
+            "ASSERT: every required replacement Chunk is published exactly once"
+        );
+        let planned_upper = replacement_container_count_upper_bound(required)?;
+        assert!(
+            usize::try_from(published.containers).is_ok_and(|count| count <= planned_upper),
+            "ASSERT: replacement publication cannot exceed the scrub planner's order-independent bound"
+        );
+        Ok(published)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1849,6 +2526,10 @@ where
                 relocation_workers,
             )?)?;
         }
+        assert!(
+            seen.iter().all(|chunk_id| required.contains_key(chunk_id)),
+            "ASSERT: replacement collection never publishes an unclaimed Chunk"
+        );
         if seen.len() != required.len() {
             return Err(MaintenanceError::MissingReplacementChunk);
         }
@@ -1871,6 +2552,7 @@ where
         items: Vec<GcReplacementItem>,
         relocation_workers: NonZeroUsize,
     ) -> Result<ReplacementPublication, MaintenanceError> {
+        self.check_cancellation()?;
         assert!(
             !items.is_empty(),
             "ASSERT: GC never publishes an empty Container"
@@ -2397,6 +3079,52 @@ fn replacement_file_bytes_upper_bound(
         .ok_or(MaintenanceError::ArithmeticOverflow)
 }
 
+/// Estimates one relocated Chunk's future physical footprint from the proven
+/// Record geometry of the current encoding.
+///
+/// Independent (RAW/Zstd) Records apportion their measured encoded length
+/// across the decoded Chunk bytes of the same Record. Dependent Records use
+/// the RAW per-Chunk upper bound because retirement relocates them away from
+/// their Base and forces independent re-encoding. The estimate never claims
+/// less than a byte-exact Record transplant would cost and never exceeds the
+/// conservative RAW bound used for proof admission.
+fn estimated_relocated_chunk_bytes(
+    location: &fastdup_format::VerifiedChunkLocation,
+    logical_length: u64,
+) -> Result<u64, MaintenanceError> {
+    let raw_bound = logical_length
+        .checked_add(GC_RAW_CHUNK_PHYSICAL_OVERHEAD_UPPER_BYTES)
+        .ok_or(MaintenanceError::ArithmeticOverflow)?;
+    if location.dependency_id() != [0; 32] {
+        return Ok(raw_bound);
+    }
+    let encoded = u64::from(location.record_length());
+    let decoded = u64::from(location.record_decoded_length()).max(1);
+    let share = encoded.saturating_mul(logical_length) / decoded;
+    Ok(share.min(raw_bound).max(1))
+}
+
+/// Converts collected per-Chunk relocation estimates into a whole-Container
+/// physical byte estimate by adding the fixed per-Container overhead for the
+/// container count implied by the logical replacement target geometry.
+fn bounded_replacement_estimate(
+    estimated_chunk_bytes: u64,
+    chunk_count: usize,
+) -> Result<u64, MaintenanceError> {
+    let chunk_count =
+        u64::try_from(chunk_count).map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+    let container_count = estimated_chunk_bytes
+        .div_ceil(GC_REPLACEMENT_LOGICAL_TARGET_BYTES)
+        .max(u64::from(chunk_count != 0));
+    estimated_chunk_bytes
+        .checked_add(
+            container_count
+                .checked_mul(GC_CONTAINER_FIXED_PHYSICAL_OVERHEAD_UPPER_BYTES)
+                .ok_or(MaintenanceError::ArithmeticOverflow)?,
+        )
+        .ok_or(MaintenanceError::ArithmeticOverflow)
+}
+
 fn gc_replacement_container_id(
     generation: u64,
     items: &[GcReplacementItem],
@@ -2494,6 +3222,185 @@ where
         .map_err(MaintenanceError::MaintenanceThread)?
         .join()
         .map_err(|_| MaintenanceError::MaintenanceThreadPanicked)?
+}
+
+/// Runs ordered maintenance work with a byte-bounded, item-local read fan-out.
+///
+/// Reader threads pull jobs in dispatch order, perform only the item-local
+/// `read` (whole-object verification belongs here), and hand results back in
+/// the original job order. The caller performs every accounting-sensitive
+/// classification step (`consume`) sequentially on the calling maintenance
+/// worker, so budgeting, deduplication, and error order remain canonical and
+/// independent of the reader thread count. At most `readers + 1` jobs are
+/// dispatched ahead of consumption and at most `max_inflight_bytes` of read
+/// job estimates may be outstanding; consumption releases the budget.
+///
+/// Every reader thread enters the given read intent per item and, in adaptive
+/// mode, places itself in the idle I/O class before its first read, mirroring
+/// [`run_at_priority`]. A consume failure stops dispatch; reader threads
+/// finish at most the one item already in progress.
+///
+/// Panics propagate from reader threads through the thread scope, matching
+/// `MaintenanceThreadPanicked` semantics of the joining phase worker.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn run_ordered_maintenance_reads<R, E>(
+    job_bytes: &[u64],
+    readers: NonZeroUsize,
+    max_inflight_bytes: u64,
+    idle_io: bool,
+    intent: ReadIntent,
+    thread_name: &str,
+    read: impl Fn(usize) -> Result<R, E> + Sync,
+    mut consume: impl FnMut(usize, R) -> Result<(), E>,
+) -> Result<(), E>
+where
+    R: Send,
+    E: Send + From<std::io::Error>,
+{
+    use std::sync::Mutex;
+
+    struct Pipeline<R, E> {
+        next_dispatch: usize,
+        next_consume: usize,
+        inflight_bytes: u64,
+        stopped: bool,
+        failure: Option<E>,
+        results: Vec<Option<Result<R, E>>>,
+    }
+
+    let pipeline = Mutex::new(Pipeline {
+        next_dispatch: 0,
+        next_consume: 0,
+        inflight_bytes: 0,
+        stopped: false,
+        failure: None,
+        results: (0..job_bytes.len()).map(|_| None).collect(),
+    });
+    let ready = std::sync::Condvar::new();
+    let dispatch_window = readers.get().saturating_add(1);
+    let mut outcome: Result<(), E> = Ok(());
+    std::thread::scope(|scope| {
+        let pipeline = &pipeline;
+        let ready = &ready;
+        let read = &read;
+        let mut spawn_result: Option<Result<(), E>> = None;
+        for _ in 0..readers.get() {
+            if spawn_result.is_some() {
+                break;
+            }
+            let built = std::thread::Builder::new()
+                .name(thread_name.to_owned())
+                .spawn_scoped(scope, move || {
+                    if idle_io && let Err(error) = maintenance_ioprio::set_current_thread_idle() {
+                        let mut state = pipeline
+                            .lock()
+                            .expect("ASSERT: maintenance read pipeline lock not poisoned");
+                        state.stopped = true;
+                        state.failure.get_or_insert_with(|| error.into());
+                        ready.notify_all();
+                        return;
+                    }
+                    loop {
+                        let job = {
+                            let mut state = pipeline
+                                .lock()
+                                .expect("ASSERT: maintenance read pipeline lock not poisoned");
+                            loop {
+                                if state.stopped || state.next_dispatch >= job_bytes.len() {
+                                    return;
+                                }
+                                let outstanding = state.next_dispatch - state.next_consume;
+                                let next_bytes = job_bytes[state.next_dispatch];
+                                if outstanding < dispatch_window
+                                    && state.inflight_bytes.saturating_add(next_bytes)
+                                        <= max_inflight_bytes
+                                {
+                                    state.inflight_bytes += next_bytes;
+                                    let job = state.next_dispatch;
+                                    state.next_dispatch += 1;
+                                    break job;
+                                }
+                                state = ready
+                                    .wait_timeout(state, Duration::from_millis(5))
+                                    .expect("ASSERT: maintenance read pipeline lock not poisoned")
+                                    .0;
+                            }
+                        };
+                        let result = {
+                            let _intent = ReadIntentScope::enter(intent);
+                            read(job)
+                        };
+                        let mut state = pipeline
+                            .lock()
+                            .expect("ASSERT: maintenance read pipeline lock not poisoned");
+                        state.results[job] = Some(result);
+                        ready.notify_all();
+                    }
+                });
+            if let Err(error) = built {
+                let mut state = pipeline
+                    .lock()
+                    .expect("ASSERT: maintenance read pipeline lock not poisoned");
+                state.stopped = true;
+                state.failure.get_or_insert_with(|| error.into());
+                ready.notify_all();
+                spawn_result = Some(Err(state
+                    .failure
+                    .take()
+                    .expect("ASSERT: pipeline failure was just recorded")));
+            }
+        }
+        if let Some(result) = spawn_result {
+            outcome = result;
+            return;
+        }
+        let mut consumed = Ok(());
+        for (job, byte_estimate) in job_bytes.iter().enumerate() {
+            let result = loop {
+                let mut state = pipeline
+                    .lock()
+                    .expect("ASSERT: maintenance read pipeline lock not poisoned");
+                if let Some(result) = state.results[job].take() {
+                    break result;
+                }
+                if state.stopped {
+                    break Err(state.failure.take().unwrap_or_else(|| {
+                        io::Error::other("maintenance read pipeline stopped").into()
+                    }));
+                }
+                state = ready
+                    .wait_timeout(state, Duration::from_millis(5))
+                    .expect("ASSERT: maintenance read pipeline lock not poisoned")
+                    .0;
+            };
+            let mut state = pipeline
+                .lock()
+                .expect("ASSERT: maintenance read pipeline lock not poisoned");
+            state.inflight_bytes = state.inflight_bytes.saturating_sub(*byte_estimate);
+            state.next_consume += 1;
+            ready.notify_all();
+            drop(state);
+            match result {
+                Ok(value) => {
+                    consumed = consume(job, value);
+                    if consumed.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    consumed = Err(error);
+                    break;
+                }
+            }
+        }
+        let mut state = pipeline
+            .lock()
+            .expect("ASSERT: maintenance read pipeline lock not poisoned");
+        state.stopped = true;
+        ready.notify_all();
+        outcome = consumed;
+    });
+    outcome
 }
 
 fn select_compaction_inputs(runs: &[ExactIndexRunRef]) -> Option<(u16, Vec<ExactIndexRunRef>)> {
@@ -2690,26 +3597,12 @@ pub struct GarbageCollectionPlan {
 pub struct ReverseDependencyGeneration {
     exact_activation: ExactIndexActivationRecord,
     protected_commit_generation: Option<u64>,
-    protected_targets: BTreeSet<ChunkId>,
     required_chunks: BTreeMap<ChunkId, u64>,
     dependents_by_base: BTreeMap<ChunkId, BTreeSet<ChunkId>>,
     dependency_edges: u64,
 }
 
 impl ReverseDependencyGeneration {
-    fn retained_bytes(&self) -> u64 {
-        // Conservative BTree node/allocator allowance: each collection keeps
-        // one spare root allowance, plus partially filled nodes per entry.
-        let collections = 3 + self.dependents_by_base.len() as u64;
-        let entries = (self.protected_targets.len() as u64)
-            .saturating_add(self.required_chunks.len() as u64)
-            .saturating_add(self.dependents_by_base.len() as u64)
-            .saturating_add(self.dependency_edges);
-        (size_of::<Self>() as u64)
-            .saturating_add(collections.saturating_mul(1024))
-            .saturating_add(entries.saturating_mul(256))
-    }
-
     #[must_use]
     pub fn exact_activation(&self) -> ExactIndexActivationRecord {
         self.exact_activation
@@ -2749,8 +3642,11 @@ pub struct GcCandidateProof {
     victim_bytes: u64,
     replacement_chunks: BTreeMap<ChunkId, u64>,
     replacement_upper: u64,
+    replacement_estimated_bytes: u64,
     reachable_victim_chunks: usize,
     priority: MaintenancePriority,
+    items: Vec<GcReplacementItem>,
+    retiring_entries: Vec<ExactIndexEntry>,
 }
 
 /// Opaque post-activation authority for one online GC victim set.
@@ -2767,6 +3663,7 @@ pub struct OnlineGcRetirement<X> {
     drain: ExactIndexGenerationDrain<X>,
     priority: MaintenancePriority,
     retiring_activation_wall: Duration,
+    relocation_workers: NonZeroUsize,
 }
 
 impl<X> OnlineGcRetirement<X> {
@@ -2783,6 +3680,11 @@ impl<X> OnlineGcRetirement<X> {
     #[must_use]
     pub fn pins_drained(&self) -> bool {
         self.drain.is_drained()
+    }
+
+    #[must_use]
+    pub(crate) fn retired_victim_keys(&self) -> Vec<[u8; 16]> {
+        self.victims.keys().copied().collect()
     }
 }
 
@@ -2810,6 +3712,11 @@ impl GcCandidateProof {
     #[must_use]
     pub const fn replacement_upper_bound(&self) -> u64 {
         self.replacement_upper
+    }
+
+    #[must_use]
+    pub const fn replacement_estimated_bytes(&self) -> u64 {
+        self.replacement_estimated_bytes
     }
 
     #[must_use]
@@ -3091,7 +3998,7 @@ pub struct OnlineGcRecoveryReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OnlineGcCycleReport {
     outcome: OnlineGcCycleOutcome,
-    catalog: GcCandidateCatalogDescriptor,
+    catalog: Option<GcCandidateCatalogDescriptor>,
     metadata_gc: MetadataGarbageCollectionReport,
     metrics: OnlineGcMetrics,
 }
@@ -3103,7 +4010,7 @@ impl OnlineGcCycleReport {
     }
 
     #[must_use]
-    pub const fn catalog(self) -> GcCandidateCatalogDescriptor {
+    pub const fn catalog(self) -> Option<GcCandidateCatalogDescriptor> {
         self.catalog
     }
 
@@ -3138,6 +4045,10 @@ pub struct OnlineGcMetrics {
     total_wall: Duration,
     catalog_examined_bytes: u64,
     catalog_write_bytes: u64,
+    catalog_files_retired: u64,
+    exact_retirement_wall: Duration,
+    exact_runs_retired: u64,
+    exact_run_sets_retired: u64,
     candidate_proof_read_bytes: u64,
     relocation_read_bytes: u64,
     relocation_write_bytes: u64,
@@ -3148,6 +4059,9 @@ pub struct OnlineGcMetrics {
     reverse_dependency_edges: u64,
     reverse_dependency_required_chunks: u64,
     relocation_workers: u64,
+    candidate_queue_retained: u64,
+    candidate_queue_scanned_rows: u64,
+    catalog_pending_updates: u64,
 }
 
 macro_rules! online_gc_metric_getter {
@@ -3179,6 +4093,10 @@ impl OnlineGcMetrics {
     online_gc_metric_getter!(total_wall, total_wall, Duration);
     online_gc_metric_getter!(catalog_examined_bytes, catalog_examined_bytes, u64);
     online_gc_metric_getter!(catalog_write_bytes, catalog_write_bytes, u64);
+    online_gc_metric_getter!(catalog_files_retired, catalog_files_retired, u64);
+    online_gc_metric_getter!(exact_retirement_wall, exact_retirement_wall, Duration);
+    online_gc_metric_getter!(exact_runs_retired, exact_runs_retired, u64);
+    online_gc_metric_getter!(exact_run_sets_retired, exact_run_sets_retired, u64);
     online_gc_metric_getter!(candidate_proof_read_bytes, candidate_proof_read_bytes, u64);
     online_gc_metric_getter!(relocation_read_bytes, relocation_read_bytes, u64);
     online_gc_metric_getter!(relocation_write_bytes, relocation_write_bytes, u64);
@@ -3193,10 +4111,21 @@ impl OnlineGcMetrics {
         u64
     );
     online_gc_metric_getter!(relocation_workers, relocation_workers, u64);
+    online_gc_metric_getter!(candidate_queue_retained, candidate_queue_retained, u64);
+    online_gc_metric_getter!(
+        candidate_queue_scanned_rows,
+        candidate_queue_scanned_rows,
+        u64
+    );
+    online_gc_metric_getter!(catalog_pending_updates, catalog_pending_updates, u64);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnlineGcCycleOutcome {
+    /// Only the Metadata phase was due; DATA relocation was not requested.
+    MetadataOnly,
+    /// Only the DATA phase was due; Metadata collection was not requested.
+    DataOnly,
     NoCandidates,
     NoProfitableCandidates,
     CatalogRebuilt,
@@ -3273,9 +4202,6 @@ pub enum MaintenanceError {
     MissingGcCandidateCatalog,
     GcCandidateProofBudgetExceeded,
     GcCandidateIdentityMismatch,
-    IncompleteReverseDependencyGeneration {
-        chunk_id: ChunkId,
-    },
     MissingLiveExactLocation {
         chunk_id: ChunkId,
     },
@@ -3308,10 +4234,12 @@ impl MaintenanceError {
         use crate::maintenance_cancellation::is_cancelled_io;
         match self {
             Self::Cancelled(_) => true,
-            Self::Generation(
+            Self::Store(StoreError::Io(error))
+            | Self::Generation(
                 GenerationError::Io(error)
                 | GenerationError::ManifestTree(crate::manifest_tree::ManifestTreeError::Io(error)),
             )
+            | Self::ExactIndex(ExactIndexStoreError::Io(error))
             | Self::GcCandidateCatalog(GcCandidateCatalogStoreError::Io(error)) => {
                 is_cancelled_io(error)
             }
@@ -3337,6 +4265,12 @@ impl std::error::Error for MaintenanceError {}
 impl From<StoreError> for MaintenanceError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
+    }
+}
+
+impl From<std::io::Error> for MaintenanceError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Store(StoreError::from(error))
     }
 }
 
@@ -3379,70 +4313,5 @@ impl From<ExactIndexFormatError> for MaintenanceError {
 impl From<ExactIndexRunSetError> for MaintenanceError {
     fn from(error: ExactIndexRunSetError) -> Self {
         Self::ExactIndex(ExactIndexStoreError::from(error))
-    }
-}
-
-#[cfg(test)]
-mod cache_tests {
-    use super::*;
-
-    #[test]
-    fn reverse_dependencies_share_reclamation_and_preserve_a_running_proof() {
-        let path = std::env::temp_dir().join(format!("gc-projection-cache-{}", std::process::id()));
-        let storage = crate::FsStorageIo::open(&path).unwrap();
-        let profile = ExactIndexProfileId::new([7; 32]).unwrap();
-        let generations = GenerationRepository::new(
-            storage.clone(),
-            fastdup_format::PolicySetId::new([8; 32]).unwrap(),
-        );
-        let empty = fastdup_format::NamespaceRoot::new(4096, 2, 0, vec![], vec![]).unwrap();
-        generations.commit_namespace(&empty).unwrap();
-        let indexes = ExactIndexRunRepository::new(storage.clone());
-        indexes
-            .activate(&ExactIndexRunSet::new(profile, 1, vec![]).unwrap())
-            .unwrap();
-        let exact = indexes.recover_active_generation().unwrap().unwrap();
-        let mut maintenance = MaintenanceRepository::new(
-            generations,
-            ContainerRepository::new(storage),
-            indexes,
-            profile,
-        );
-        maintenance.reverse_dependencies = crate::ReadCacheNamespace::isolated(
-            crate::ReadCacheClass::ReverseDependencies,
-            16 * 1024,
-        );
-        let liveness = maintenance.generations.scan_online_liveness().unwrap();
-        let first = maintenance
-            .reverse_dependency_generation(&exact, &liveness)
-            .unwrap();
-        let reused = maintenance
-            .reverse_dependency_generation(&exact, &liveness)
-            .unwrap();
-        assert!(Arc::ptr_eq(&first, &reused));
-        assert!(maintenance.reverse_dependencies.stats().resident_bytes >= first.retained_bytes());
-        maintenance.reverse_dependencies.set_capacity(0);
-        assert_eq!(maintenance.reverse_dependencies.stats().entries, 0);
-        let rebuilt = maintenance
-            .reverse_dependency_generation(&exact, &liveness)
-            .unwrap();
-        assert!(!Arc::ptr_eq(&first, &rebuilt));
-        assert_eq!(first.exact_activation(), rebuilt.exact_activation());
-        assert_eq!(first.required_chunks(), 0);
-        maintenance.reverse_dependencies.set_capacity(16 * 1024);
-        let before = maintenance
-            .reverse_dependency_generation(&exact, &liveness)
-            .unwrap();
-        maintenance.generations.commit_namespace(&empty).unwrap();
-        let changed = maintenance.generations.scan_online_liveness().unwrap();
-        let after = maintenance
-            .reverse_dependency_generation(&exact, &changed)
-            .unwrap();
-        assert!(!Arc::ptr_eq(&before, &after));
-        assert_ne!(
-            before.protected_commit_generation(),
-            after.protected_commit_generation()
-        );
-        std::fs::remove_dir_all(path).unwrap();
     }
 }

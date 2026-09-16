@@ -9,11 +9,20 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fastdup_store::{DataPoolUsage, OnlineGcRunMode};
+use fastdup_store::{DataPoolUsage, GcPhaseRequest, OnlineGcQuantum, OnlineGcRunMode};
 
-pub const ONLINE_GC_ACTIVE_INTERVAL_SECONDS_ENV: &str = "FASTDUP_ONLINE_GC_ACTIVE_INTERVAL_SECONDS";
+pub const ONLINE_GC_METADATA_INTERVAL_SECONDS_ENV: &str =
+    "FASTDUP_ONLINE_GC_METADATA_INTERVAL_SECONDS";
+pub const ONLINE_GC_METADATA_MAX_INTERVAL_SECONDS_ENV: &str =
+    "FASTDUP_ONLINE_GC_METADATA_MAX_INTERVAL_SECONDS";
+pub const ONLINE_GC_DATA_INTERVAL_SECONDS_ENV: &str = "FASTDUP_ONLINE_GC_DATA_INTERVAL_SECONDS";
+pub const ONLINE_GC_DATA_MAX_INTERVAL_SECONDS_ENV: &str =
+    "FASTDUP_ONLINE_GC_DATA_MAX_INTERVAL_SECONDS";
+pub const ONLINE_GC_DATA_DELETE_INTERVAL_SECONDS_ENV: &str =
+    "FASTDUP_ONLINE_GC_DATA_DELETE_INTERVAL_SECONDS";
+pub const ONLINE_GC_MIN_SAVINGS_BASIS_POINTS_ENV: &str =
+    "FASTDUP_ONLINE_GC_MIN_SAVINGS_BASIS_POINTS";
 pub const ONLINE_GC_IDLE_AFTER_SECONDS_ENV: &str = "FASTDUP_ONLINE_GC_IDLE_AFTER_SECONDS";
-pub const ONLINE_GC_IDLE_INTERVAL_SECONDS_ENV: &str = "FASTDUP_ONLINE_GC_IDLE_INTERVAL_SECONDS";
 pub const ONLINE_GC_URGENT_INTERVAL_SECONDS_ENV: &str = "FASTDUP_ONLINE_GC_URGENT_INTERVAL_SECONDS";
 pub const ONLINE_GC_PRESSURE_LOW_BASIS_POINTS_ENV: &str =
     "FASTDUP_ONLINE_GC_PRESSURE_LOW_BASIS_POINTS";
@@ -27,9 +36,13 @@ pub const ONLINE_GC_CONTROL_SOCKET_NAME: &str = ".fastdup-online-gc.sock";
 pub const ONLINE_GC_CONTROL_REQUEST: &[u8] = b"GC NOW\n";
 
 const FRONTEND_IDLE_AFTER: Duration = Duration::from_secs(30);
-const ACTIVE_INTERVAL: Duration = Duration::from_mins(15);
-const IDLE_INTERVAL: Duration = Duration::from_mins(1);
+const METADATA_BASE_INTERVAL: Duration = Duration::from_mins(1);
+const METADATA_MAX_INTERVAL: Duration = Duration::from_mins(15);
+const DATA_BASE_INTERVAL: Duration = Duration::from_hours(1);
+const DATA_MAX_INTERVAL: Duration = Duration::from_hours(24 * 7);
+const DATA_DELETE_INTERVAL: Duration = Duration::from_hours(1);
 const PRESSURE_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_MINIMUM_SAVINGS_BASIS_POINTS: u64 = 100;
 const DEFAULT_PRESSURE_LOW_BASIS_POINTS: u16 = 8_500;
 const DEFAULT_PRESSURE_HIGH_BASIS_POINTS: u16 = 9_000;
 
@@ -103,9 +116,13 @@ fn parse_utc_minute(value: &str, allow_day_end: bool) -> Result<u16, OnlineGcPol
 /// Operator policy for adaptive Online-GC admission and relocation CPU use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OnlineGcPolicy {
-    active_interval: Duration,
+    metadata_base_interval: Duration,
+    metadata_max_interval: Duration,
+    data_base_interval: Duration,
+    data_max_interval: Duration,
+    data_delete_interval: Duration,
+    minimum_savings_basis_points: u64,
     idle_after: Duration,
-    idle_interval: Duration,
     urgent_interval: Duration,
     pressure_low_basis_points: u16,
     pressure_high_basis_points: u16,
@@ -116,9 +133,13 @@ pub struct OnlineGcPolicy {
 impl Default for OnlineGcPolicy {
     fn default() -> Self {
         Self {
-            active_interval: ACTIVE_INTERVAL,
+            metadata_base_interval: METADATA_BASE_INTERVAL,
+            metadata_max_interval: METADATA_MAX_INTERVAL,
+            data_base_interval: DATA_BASE_INTERVAL,
+            data_max_interval: DATA_MAX_INTERVAL,
+            data_delete_interval: DATA_DELETE_INTERVAL,
+            minimum_savings_basis_points: DEFAULT_MINIMUM_SAVINGS_BASIS_POINTS,
             idle_after: FRONTEND_IDLE_AFTER,
-            idle_interval: IDLE_INTERVAL,
             urgent_interval: PRESSURE_INTERVAL,
             pressure_low_basis_points: DEFAULT_PRESSURE_LOW_BASIS_POINTS,
             pressure_high_basis_points: DEFAULT_PRESSURE_HIGH_BASIS_POINTS,
@@ -138,17 +159,40 @@ impl OnlineGcPolicy {
     /// window, or zero-worker configuration before the daemon opens storage.
     pub fn from_environment() -> Result<Self, OnlineGcPolicyConfigurationError> {
         let mut policy = Self::default();
-        let active = environment_seconds(ONLINE_GC_ACTIVE_INTERVAL_SECONDS_ENV)?
-            .unwrap_or(policy.active_interval);
         let idle_after =
             environment_seconds(ONLINE_GC_IDLE_AFTER_SECONDS_ENV)?.unwrap_or(policy.idle_after);
-        let idle = environment_seconds(ONLINE_GC_IDLE_INTERVAL_SECONDS_ENV)?
-            .unwrap_or(policy.idle_interval);
         let urgent = environment_seconds(ONLINE_GC_URGENT_INTERVAL_SECONDS_ENV)?
             .unwrap_or(policy.urgent_interval);
+        let metadata_base = environment_seconds(ONLINE_GC_METADATA_INTERVAL_SECONDS_ENV)?
+            .unwrap_or(policy.metadata_base_interval);
+        let metadata_max = environment_seconds(ONLINE_GC_METADATA_MAX_INTERVAL_SECONDS_ENV)?
+            .unwrap_or(policy.metadata_max_interval);
+        let data_base = environment_seconds(ONLINE_GC_DATA_INTERVAL_SECONDS_ENV)?
+            .unwrap_or(policy.data_base_interval);
+        let data_max = environment_seconds(ONLINE_GC_DATA_MAX_INTERVAL_SECONDS_ENV)?
+            .unwrap_or(policy.data_max_interval);
+        let data_delete = environment_seconds(ONLINE_GC_DATA_DELETE_INTERVAL_SECONDS_ENV)?
+            .unwrap_or(policy.data_delete_interval);
+        let minimum_savings = environment_number::<u64>(ONLINE_GC_MIN_SAVINGS_BASIS_POINTS_ENV)?
+            .unwrap_or(policy.minimum_savings_basis_points);
         policy = policy
-            .with_intervals(active, idle_after, idle, urgent)
+            .with_intervals(idle_after, urgent)
+            .and_then(|policy| {
+                policy.with_adaptive_intervals(
+                    metadata_base,
+                    metadata_max,
+                    data_base,
+                    data_max,
+                    data_delete,
+                )
+            })
             .map_err(OnlineGcPolicyConfigurationError::Policy)?;
+        if minimum_savings > 10_000 {
+            return Err(OnlineGcPolicyConfigurationError::InvalidEnvironmentValue(
+                ONLINE_GC_MIN_SAVINGS_BASIS_POINTS_ENV,
+            ));
+        }
+        policy.minimum_savings_basis_points = minimum_savings;
 
         let low = environment_number::<u16>(ONLINE_GC_PRESSURE_LOW_BASIS_POINTS_ENV)?
             .unwrap_or(policy.pressure_low_basis_points);
@@ -166,7 +210,7 @@ impl OnlineGcPolicy {
                     .with_daily_utc_window(
                         DailyGcWindow::parse_utc(&window)
                             .map_err(OnlineGcPolicyConfigurationError::Policy)?,
-                        interval.unwrap_or(policy.idle_interval),
+                        interval.unwrap_or(policy.metadata_base_interval),
                     )
                     .map_err(OnlineGcPolicyConfigurationError::Policy)?;
             }
@@ -186,29 +230,52 @@ impl OnlineGcPolicy {
         Ok(policy)
     }
 
-    /// Replaces the active, quiet threshold, idle, and pressure intervals.
+    /// Replaces the quiet threshold and the pressure admission interval.
     ///
     /// # Errors
     ///
     /// Rejects any zero duration.
     pub const fn with_intervals(
         mut self,
-        active_interval: Duration,
         idle_after: Duration,
-        idle_interval: Duration,
         urgent_interval: Duration,
     ) -> Result<Self, OnlineGcPolicyError> {
-        if active_interval.is_zero()
-            || idle_after.is_zero()
-            || idle_interval.is_zero()
-            || urgent_interval.is_zero()
+        if idle_after.is_zero() || urgent_interval.is_zero() {
+            return Err(OnlineGcPolicyError::ZeroDuration);
+        }
+        self.idle_after = idle_after;
+        self.urgent_interval = urgent_interval;
+        Ok(self)
+    }
+
+    /// Replaces the two adaptive phase intervals. A phase starts at its base
+    /// interval and doubles its wait after a quantum that saved less than the
+    /// minimum savings, capped at the phase maximum.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero durations or a maximum below the base.
+    pub fn with_adaptive_intervals(
+        mut self,
+        metadata_base_interval: Duration,
+        metadata_max_interval: Duration,
+        data_base_interval: Duration,
+        data_max_interval: Duration,
+        data_delete_interval: Duration,
+    ) -> Result<Self, OnlineGcPolicyError> {
+        if metadata_base_interval.is_zero()
+            || metadata_max_interval < metadata_base_interval
+            || data_base_interval.is_zero()
+            || data_max_interval < data_base_interval
+            || data_delete_interval.is_zero()
         {
             return Err(OnlineGcPolicyError::ZeroDuration);
         }
-        self.active_interval = active_interval;
-        self.idle_after = idle_after;
-        self.idle_interval = idle_interval;
-        self.urgent_interval = urgent_interval;
+        self.metadata_base_interval = metadata_base_interval;
+        self.metadata_max_interval = metadata_max_interval;
+        self.data_base_interval = data_base_interval;
+        self.data_max_interval = data_max_interval;
+        self.data_delete_interval = data_delete_interval;
         Ok(self)
     }
 
@@ -477,12 +544,57 @@ pub fn remove_stale_online_gc_socket(path: &Path) -> io::Result<()> {
     }
 }
 
+/// One adaptive interval: doubles its wait after an unprofitable quantum and
+/// resets to the base interval after a quantum that saved enough.
+#[derive(Clone, Copy, Debug)]
+struct AdaptivePhase {
+    base: Duration,
+    maximum: Duration,
+    wait: Duration,
+    next_due: Instant,
+    last_saved_basis_points: u64,
+}
+
+impl AdaptivePhase {
+    fn new(now: Instant, base: Duration, maximum: Duration) -> Self {
+        Self {
+            base,
+            maximum,
+            wait: base,
+            next_due: now.checked_add(base).unwrap_or(now),
+            last_saved_basis_points: 0,
+        }
+    }
+
+    fn record(
+        &mut self,
+        now: Instant,
+        saved_basis_points: u64,
+        minimum_savings_basis_points: u64,
+        forced: bool,
+    ) {
+        self.last_saved_basis_points = saved_basis_points;
+        if saved_basis_points >= minimum_savings_basis_points {
+            self.wait = self.base;
+        } else if !forced {
+            self.wait = self.wait.saturating_mul(2).min(self.maximum);
+        }
+        self.next_due = now.checked_add(self.wait).unwrap_or(now);
+    }
+}
+
 /// Pure admission policy for bounded adaptive Online-GC quanta.
 #[derive(Clone, Debug)]
 pub struct OnlineGcScheduler {
     frontend_operations: u64,
+    frontend_deletes: u64,
     frontend_activity_at: Instant,
-    started_at: Instant,
+    last_usage: DataPoolUsage,
+    metadata_phase: AdaptivePhase,
+    data_phase: AdaptivePhase,
+    data_delete_since_run: bool,
+    urgent_started_at: Instant,
+    window_next_due: Option<Instant>,
     policy: OnlineGcPolicy,
     pressure_latched: bool,
     status: OnlineGcSchedulerStatus,
@@ -498,6 +610,11 @@ pub struct OnlineGcSchedulerStatus {
     urgent_admissions: u64,
     scheduled_admissions: u64,
     immediate_requests: u64,
+    metadata_wait_seconds: u64,
+    data_wait_seconds: u64,
+    metadata_saved_basis_points: u64,
+    data_saved_basis_points: u64,
+    data_delete_resets: u64,
 }
 
 impl OnlineGcSchedulerStatus {
@@ -533,42 +650,117 @@ impl OnlineGcSchedulerStatus {
     pub const fn immediate_requests(self) -> u64 {
         self.immediate_requests
     }
+    #[must_use]
+    pub const fn metadata_wait_seconds(self) -> u64 {
+        self.metadata_wait_seconds
+    }
+    #[must_use]
+    pub const fn data_wait_seconds(self) -> u64 {
+        self.data_wait_seconds
+    }
+    #[must_use]
+    pub const fn metadata_saved_basis_points(self) -> u64 {
+        self.metadata_saved_basis_points
+    }
+    #[must_use]
+    pub const fn data_saved_basis_points(self) -> u64 {
+        self.data_saved_basis_points
+    }
+    #[must_use]
+    pub const fn data_delete_resets(self) -> u64 {
+        self.data_delete_resets
+    }
 }
 
 impl OnlineGcScheduler {
+    /// Errors for a zero-usage pool only during tests; production callers pass
+    /// a measured pool view.
+    fn new_with_usage(
+        now: Instant,
+        frontend_operations: u64,
+        usage: DataPoolUsage,
+        policy: OnlineGcPolicy,
+    ) -> Self {
+        let metadata_phase = AdaptivePhase::new(
+            now,
+            policy.metadata_base_interval,
+            policy.metadata_max_interval,
+        );
+        let data_phase =
+            AdaptivePhase::new(now, policy.data_base_interval, policy.data_max_interval);
+        let status = OnlineGcSchedulerStatus {
+            metadata_wait_seconds: whole_seconds(policy.metadata_base_interval),
+            data_wait_seconds: whole_seconds(policy.data_base_interval),
+            ..OnlineGcSchedulerStatus::default()
+        };
+        Self {
+            frontend_operations,
+            frontend_deletes: 0,
+            frontend_activity_at: now,
+            last_usage: usage,
+            metadata_phase,
+            data_phase,
+            data_delete_since_run: false,
+            urgent_started_at: now,
+            window_next_due: None,
+            policy,
+            pressure_latched: false,
+            status,
+        }
+    }
+
     #[must_use]
     pub fn new(now: Instant, frontend_operations: u64) -> Self {
         Self::with_policy(now, frontend_operations, OnlineGcPolicy::default())
     }
 
+    /// # Panics
+    ///
+    /// Never; the placeholder pool usage is a checked constant.
     #[must_use]
     pub fn with_policy(now: Instant, frontend_operations: u64, policy: OnlineGcPolicy) -> Self {
-        Self {
-            frontend_operations,
-            frontend_activity_at: now,
-            started_at: now,
-            policy,
-            pressure_latched: false,
-            status: OnlineGcSchedulerStatus::default(),
-        }
+        // A neutral placeholder usage until the first poll observes the pool.
+        let usage = DataPoolUsage::new(1, 100).expect("ASSERT: 1 of 100 is a valid usage");
+        Self::new_with_usage(now, frontend_operations, usage, policy)
     }
 
     /// Selects at most one quantum without performing I/O or mutating frontend
     /// accounting. A changed pre-existing `io_uring` submission counter is the
-    /// only frontend activity signal.
+    /// frontend activity signal; a changed frontend delete counter clamps the
+    /// DATA phase back to the delete interval.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn poll(
         &mut self,
         now: Instant,
         frontend_operations: u64,
+        frontend_deletes: u64,
         usage: DataPoolUsage,
-    ) -> Option<OnlineGcRunMode> {
+    ) -> Option<OnlineGcQuantum> {
         self.status.polls = self.status.polls.saturating_add(1);
+        self.last_usage = usage;
         if frontend_operations != self.frontend_operations {
             self.frontend_operations = frontend_operations;
             self.frontend_activity_at = now;
             self.status.frontend_activity_changes =
                 self.status.frontend_activity_changes.saturating_add(1);
+        }
+        if frontend_deletes > self.frontend_deletes {
+            self.frontend_deletes = frontend_deletes;
+            self.data_delete_since_run = true;
+            if self.data_phase.wait > self.policy.data_delete_interval {
+                self.data_phase.wait = self.policy.data_delete_interval;
+                let due = now
+                    .checked_add(self.data_phase.wait)
+                    .unwrap_or(self.data_phase.next_due);
+                if due < self.data_phase.next_due {
+                    self.data_phase.next_due = due;
+                }
+                self.status.data_wait_seconds = whole_seconds(self.data_phase.wait);
+                self.status.data_delete_resets = self.status.data_delete_resets.saturating_add(1);
+            }
+        } else {
+            self.frontend_deletes = frontend_deletes;
         }
         if usage_at_least(usage, self.policy.pressure_high_basis_points) {
             self.pressure_latched = true;
@@ -578,29 +770,37 @@ impl OnlineGcScheduler {
         let pressure = self.pressure_latched;
         let quiet =
             now.saturating_duration_since(self.frontend_activity_at) >= self.policy.idle_after;
-        let scheduled_interval = self
+        let window = self
             .policy
             .daily_window
-            .filter(|(window, _)| window.contains(utc_minute_of_day()))
-            .map(|(_, interval)| interval);
-        let scheduled = !pressure && scheduled_interval.is_some();
-        let interval = if pressure {
-            self.policy.urgent_interval
-        } else if let Some(interval) = scheduled_interval {
-            interval
-        } else if quiet {
-            self.policy.idle_interval
-        } else {
-            self.policy.active_interval
-        };
-        if now.saturating_duration_since(self.started_at) < interval {
+            .filter(|(window, _)| window.contains(utc_minute_of_day()));
+        if pressure {
+            if now.saturating_duration_since(self.urgent_started_at) < self.policy.urgent_interval {
+                self.status.deferred_polls = self.status.deferred_polls.saturating_add(1);
+                return None;
+            }
+            self.urgent_started_at = now;
+            let mode = OnlineGcRunMode::Urgent;
+            self.status.urgent_admissions = self.status.urgent_admissions.saturating_add(1);
+            return Some(OnlineGcQuantum {
+                mode,
+                phases: GcPhaseRequest::both(),
+            });
+        }
+        let window_allows_data = window.is_some() || self.policy.daily_window.is_none();
+        let mut data_due = now >= self.data_phase.next_due && window_allows_data;
+        if window.is_some() {
+            // The window interval caps how often the DATA phase may start
+            // while the window is open.
+            let capped = self.window_next_due.unwrap_or(now);
+            data_due &= now >= capped;
+        }
+        let metadata_due = now >= self.metadata_phase.next_due;
+        if !metadata_due && !data_due {
             self.status.deferred_polls = self.status.deferred_polls.saturating_add(1);
             return None;
         }
-        self.started_at = now;
-        let mode = if pressure {
-            OnlineGcRunMode::Urgent
-        } else if scheduled || quiet {
+        let mode = if quiet {
             OnlineGcRunMode::Idle
         } else {
             OnlineGcRunMode::Background
@@ -612,20 +812,56 @@ impl OnlineGcScheduler {
             }
             OnlineGcRunMode::Idle => {
                 self.status.idle_admissions = self.status.idle_admissions.saturating_add(1);
-                if scheduled {
+                if window.is_some() {
                     self.status.scheduled_admissions =
                         self.status.scheduled_admissions.saturating_add(1);
                 }
             }
             OnlineGcRunMode::Urgent => {
-                self.status.urgent_admissions = self.status.urgent_admissions.saturating_add(1);
+                unreachable!("ASSERT: pressure admission returned above; only quiet selects Idle")
             }
         }
-        Some(mode)
+        if data_due && let Some((_, interval)) = window {
+            self.window_next_due = Some(now.checked_add(interval).unwrap_or(now));
+        }
+        Some(OnlineGcQuantum {
+            mode,
+            phases: GcPhaseRequest {
+                metadata: metadata_due,
+                data: data_due,
+            },
+        })
+    }
+
+    /// Applies the Metadata-phase outcome measured in basis points of the
+    /// bytes the run actually inspected.
+    pub fn record_metadata_run(&mut self, now: Instant, saved_basis_points: u64, forced: bool) {
+        self.metadata_phase.record(
+            now,
+            saved_basis_points,
+            self.policy.minimum_savings_basis_points,
+            forced,
+        );
+        self.status.metadata_wait_seconds = whole_seconds(self.metadata_phase.wait);
+        self.status.metadata_saved_basis_points = saved_basis_points;
+    }
+
+    /// Applies the DATA-phase outcome from bytes freed against the pool's
+    /// used bytes observed at admission.
+    pub fn record_data_run(&mut self, now: Instant, freed_bytes: u64, forced: bool) {
+        let total = self.last_usage.used_bytes().max(1);
+        let saved =
+            u64::try_from(u128::from(freed_bytes.saturating_mul(10_000)) / u128::from(total))
+                .unwrap_or(u64::MAX);
+        self.data_phase
+            .record(now, saved, self.policy.minimum_savings_basis_points, forced);
+        self.data_delete_since_run = false;
+        self.status.data_wait_seconds = whole_seconds(self.data_phase.wait);
+        self.status.data_saved_basis_points = saved;
     }
 
     pub fn record_immediate_start(&mut self, now: Instant) {
-        self.started_at = now;
+        self.urgent_started_at = now;
         self.status.immediate_requests = self.status.immediate_requests.saturating_add(1);
     }
 
@@ -646,6 +882,10 @@ impl OnlineGcScheduler {
     }
 }
 
+fn whole_seconds(duration: Duration) -> u64 {
+    duration.as_secs()
+}
+
 fn usage_at_least(usage: DataPoolUsage, basis_points: u16) -> bool {
     u128::from(usage.used_bytes()) * 10_000
         >= u128::from(usage.capacity_bytes()) * u128::from(basis_points)
@@ -660,89 +900,183 @@ fn usage_at_most(usage: DataPoolUsage, basis_points: u16) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn scheduler_is_slow_under_load_fast_when_idle_and_urgent_under_pressure() {
-        let started = Instant::now();
-        let low = DataPoolUsage::new(50, 100).expect("low pressure is valid");
-        let high = DataPoolUsage::new(90, 100).expect("high pressure is valid");
-        let mut scheduler = OnlineGcScheduler::new(started, 10);
-
-        assert_eq!(
-            scheduler.poll(started + Duration::from_secs(31), 11, low),
-            None,
-            "new frontend I/O restarts the quiet interval"
-        );
-        assert_eq!(
-            scheduler.poll(started + ACTIVE_INTERVAL, 12, low),
-            Some(OnlineGcRunMode::Background)
-        );
-        assert_eq!(
-            scheduler.poll(started + ACTIVE_INTERVAL + IDLE_INTERVAL, 12, low),
-            Some(OnlineGcRunMode::Idle)
-        );
-        assert_eq!(
-            scheduler.poll(
-                started + ACTIVE_INTERVAL + IDLE_INTERVAL + PRESSURE_INTERVAL,
-                12,
-                high,
-            ),
-            Some(OnlineGcRunMode::Urgent)
-        );
-        let status = scheduler.status();
-        assert_eq!(status.polls(), 4);
-        assert_eq!(status.deferred_polls(), 1);
-        assert_eq!(status.frontend_activity_changes(), 2);
-        assert_eq!(status.background_admissions(), 1);
-        assert_eq!(status.idle_admissions(), 1);
-        assert_eq!(status.urgent_admissions(), 1);
-        assert_eq!(status.immediate_requests(), 0);
-    }
-
-    #[test]
-    fn policy_hysteresis_does_not_oscillate_between_pressure_samples() {
-        let started = Instant::now();
-        let policy = OnlineGcPolicy::default()
-            .with_intervals(
+    fn adaptive_policy() -> OnlineGcPolicy {
+        OnlineGcPolicy::default()
+            .with_intervals(Duration::from_secs(30), Duration::from_secs(2))
+            .expect("nonzero intervals are valid")
+            .with_adaptive_intervals(
                 Duration::from_secs(10),
-                Duration::from_secs(30),
-                Duration::from_secs(5),
-                Duration::from_secs(2),
+                Duration::from_secs(80),
+                Duration::from_hours(1),
+                Duration::from_hours(16),
+                Duration::from_mins(10),
             )
-            .expect("nonzero intervals are valid")
+            .expect("ordered adaptive intervals are valid")
             .with_pressure_watermarks(8_000, 9_000)
-            .expect("ordered basis-point watermarks are valid");
-        let mut scheduler = OnlineGcScheduler::with_policy(started, 1, policy);
-        let high = DataPoolUsage::new(90, 100).expect("high usage is valid");
-        let between = DataPoolUsage::new(85, 100).expect("middle usage is valid");
-        let low = DataPoolUsage::new(80, 100).expect("low usage is valid");
+            .expect("ordered basis-point watermarks are valid")
+    }
+
+    #[test]
+    fn metadata_phase_adapts_independently_from_the_data_phase() {
+        let started = Instant::now();
+        let low = DataPoolUsage::new(100, 1_000).expect("low usage is valid");
+        let mut scheduler = OnlineGcScheduler::with_policy(started, 10, adaptive_policy());
 
         assert_eq!(
-            scheduler.poll(started + Duration::from_secs(2), 2, high),
-            Some(OnlineGcRunMode::Urgent)
-        );
-        assert_eq!(
-            scheduler.poll(started + Duration::from_secs(4), 3, between),
-            Some(OnlineGcRunMode::Urgent),
-            "pressure remains latched above the low watermark"
-        );
-        assert_eq!(
-            scheduler.poll(started + Duration::from_secs(6), 4, low),
+            scheduler.poll(started + Duration::from_secs(9), 10, 0, low),
             None,
-            "reaching the low watermark exits pressure and restores the active interval"
+            "neither phase timer is due at its base interval yet"
+        );
+        assert_eq!(
+            scheduler.poll(started + Duration::from_secs(10), 10, 0, low),
+            Some(OnlineGcQuantum {
+                mode: OnlineGcRunMode::Background,
+                phases: GcPhaseRequest {
+                    metadata: true,
+                    data: false,
+                },
+            }),
+            "the Metadata phase admits alone at its short base interval"
+        );
+        let mut now = started + Duration::from_secs(10);
+        for expected_wait in [20_u64, 40, 80, 80] {
+            scheduler.record_metadata_run(now, 0, false);
+            now += Duration::from_secs(expected_wait);
+            assert_eq!(
+                scheduler.poll(now, 10, 0, low),
+                Some(OnlineGcQuantum {
+                    mode: OnlineGcRunMode::Idle,
+                    phases: GcPhaseRequest {
+                        metadata: true,
+                        data: false,
+                    },
+                }),
+                "unprofitable Metadata quanta double the wait up to the maximum"
+            );
+            assert_eq!(scheduler.status().metadata_wait_seconds(), expected_wait);
+        }
+        scheduler.record_metadata_run(now, 150, false);
+        assert_eq!(scheduler.status().metadata_wait_seconds(), 10);
+        assert_eq!(
+            scheduler.poll(started + Duration::from_hours(1), 10, 0, low),
+            Some(OnlineGcQuantum {
+                mode: OnlineGcRunMode::Idle,
+                phases: GcPhaseRequest {
+                    metadata: true,
+                    data: true,
+                },
+            }),
+            "a profitable Metadata run returns to the base and the Data hour arrived"
         );
     }
 
     #[test]
-    fn scheduled_window_admits_bounded_idle_work_despite_frontend_activity() {
+    fn unprofitable_data_quanta_back_off_doubling_to_their_maximum() {
         let started = Instant::now();
-        let policy = OnlineGcPolicy::default()
-            .with_intervals(
-                Duration::from_mins(1),
-                Duration::from_secs(30),
-                Duration::from_secs(30),
-                Duration::from_secs(5),
-            )
-            .expect("nonzero intervals are valid")
+        let low = DataPoolUsage::new(500, 1_000).expect("low usage is valid");
+        let mut scheduler = OnlineGcScheduler::with_policy(started, 1, adaptive_policy());
+        assert!(
+            scheduler
+                .poll(started + Duration::from_hours(1), 1, 0, low)
+                .is_some_and(|quantum| quantum.phases.data)
+        );
+        let mut now = started + Duration::from_hours(1);
+        for expected_wait in [2 * 3600_u64, 4 * 3600, 8 * 3600] {
+            scheduler.record_data_run(now, 0, false);
+            assert_eq!(scheduler.status().data_wait_seconds(), expected_wait);
+            now += Duration::from_secs(expected_wait);
+            assert!(
+                scheduler
+                    .poll(now, 1, 0, low)
+                    .is_none_or(|quantum| !quantum.phases.data
+                        || now >= started + Duration::from_secs(expected_wait)),
+                "the Data phase stays quiet until its doubled wait elapsed"
+            );
+        }
+        scheduler.record_data_run(now, 999, false);
+        assert_eq!(scheduler.status().data_wait_seconds(), 3600);
+        assert_eq!(scheduler.status().data_saved_basis_points(), 19_980);
+    }
+
+    #[test]
+    fn fuse_delete_clamps_data_backoff_to_the_delete_interval() {
+        let started = Instant::now();
+        let low = DataPoolUsage::new(500, 1_000).expect("low usage is valid");
+        let mut scheduler = OnlineGcScheduler::with_policy(started, 1, adaptive_policy());
+        let mut now = started + Duration::from_hours(1);
+        assert!(scheduler.poll(now, 1, 0, low).is_some());
+        scheduler.record_data_run(now, 0, false);
+        now += Duration::from_hours(2);
+        assert!(scheduler.poll(now, 1, 0, low).is_some());
+        scheduler.record_data_run(now, 0, false);
+        assert_eq!(scheduler.status().data_wait_seconds(), 4 * 3600);
+
+        now += Duration::from_mins(1);
+        assert!(
+            scheduler
+                .poll(now, 1, 7, low)
+                .is_some_and(|quantum| !quantum.phases.data),
+            "the delete signal admits Metadata only"
+        );
+        assert_eq!(scheduler.status().data_wait_seconds(), 600);
+        assert_eq!(scheduler.status().data_delete_resets(), 1);
+        scheduler.record_metadata_run(now, 100, false);
+        assert!(
+            scheduler
+                .poll(now + Duration::from_mins(10), 1, 7, low)
+                .is_some_and(|quantum| quantum.phases.data),
+            "the clamped Data timer fires one delete interval later"
+        );
+    }
+
+    #[test]
+    fn pressure_latches_urgent_both_phase_quanta_until_the_low_watermark() {
+        let started = Instant::now();
+        let mut scheduler = OnlineGcScheduler::with_policy(started, 1, adaptive_policy());
+        let high = DataPoolUsage::new(900, 1_000).expect("high usage is valid");
+        let between = DataPoolUsage::new(850, 1_000).expect("middle usage is valid");
+        let low = DataPoolUsage::new(800, 1_000).expect("low usage is valid");
+
+        let urgent = scheduler
+            .poll(started + Duration::from_secs(2), 2, 0, high)
+            .expect("pressure admits after the urgent interval");
+        assert_eq!(urgent.mode, OnlineGcRunMode::Urgent);
+        assert!(urgent.phases.metadata && urgent.phases.data);
+        assert_eq!(
+            scheduler.poll(started + Duration::from_secs(3), 3, 0, between),
+            None,
+            "urgent admission is capped by the urgent interval"
+        );
+        assert_eq!(
+            scheduler
+                .poll(started + Duration::from_secs(4), 4, 0, between)
+                .expect("pressure stays latched above the low watermark")
+                .mode,
+            OnlineGcRunMode::Urgent
+        );
+        scheduler.record_metadata_run(started + Duration::from_secs(4), 0, true);
+        scheduler.record_data_run(started + Duration::from_secs(4), 0, true);
+        assert_eq!(
+            scheduler.status().metadata_wait_seconds(),
+            10,
+            "forced pressure quanta never extend the adaptive chain"
+        );
+        assert_eq!(
+            scheduler
+                .poll(started + Duration::from_secs(15), 5, 0, low)
+                .expect("exiting pressure falls back to the Metadata base interval")
+                .phases,
+            GcPhaseRequest {
+                metadata: true,
+                data: false,
+            }
+        );
+    }
+
+    #[test]
+    fn scheduled_window_caps_only_the_data_phase_start_frequency() {
+        let started = Instant::now();
+        let policy = adaptive_policy()
             .with_daily_utc_window(
                 DailyGcWindow::new(0, 1_440).expect("all-day window is valid"),
                 Duration::from_secs(5),
@@ -751,12 +1085,29 @@ mod tests {
             .with_maximum_relocation_workers(
                 std::num::NonZeroUsize::new(2).expect("two is nonzero"),
             );
-        let mut scheduler = OnlineGcScheduler::with_policy(started, 1, policy);
         let low = DataPoolUsage::new(50, 100).expect("low usage is valid");
-
+        let mut scheduler = OnlineGcScheduler::with_policy(started, 1, policy);
         assert_eq!(
-            scheduler.poll(started + Duration::from_secs(5), 2, low),
-            Some(OnlineGcRunMode::Idle)
+            scheduler.poll(started + Duration::from_secs(10), 2, 0, low),
+            Some(OnlineGcQuantum {
+                mode: OnlineGcRunMode::Background,
+                phases: GcPhaseRequest {
+                    metadata: true,
+                    data: false,
+                },
+            })
+        );
+        assert_eq!(scheduler.status().scheduled_admissions(), 0);
+        scheduler.record_metadata_run(started + Duration::from_secs(10), 100, false);
+        assert_eq!(
+            scheduler
+                .poll(started + Duration::from_hours(1), 2, 0, low)
+                .expect("the data base interval arrived inside the open window")
+                .phases,
+            GcPhaseRequest {
+                metadata: true,
+                data: true,
+            }
         );
         assert_eq!(scheduler.status().scheduled_admissions(), 1);
         assert_eq!(

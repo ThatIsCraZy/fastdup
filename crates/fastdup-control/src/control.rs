@@ -678,6 +678,7 @@ impl AgentRuntime {
             }
             Command::Unmount => {
                 self.set_state(RepositoryState::Unmounting)?;
+                stop_share_backend_best_effort();
                 if let Err(error) = systemctl("stop", REPOSITORY_UNIT) {
                     let _ = self.set_state(RepositoryState::Error);
                     return Err(error);
@@ -1021,6 +1022,7 @@ impl AgentRuntime {
             .map_err(problem("binding_failed"))?
             .is_some_and(|binding| binding.state == RepositoryState::Online);
         if was_online {
+            stop_share_backend_best_effort();
             systemctl("stop", REPOSITORY_UNIT)?;
         }
         self.set_state(RepositoryState::Scrubbing)?;
@@ -1181,6 +1183,15 @@ fn systemctl(action: &str, unit: &str) -> Result<(), ControlProblem> {
         return Ok(());
     }
     run_process("systemctl", &[action, unit]).map(|_| ())
+}
+
+fn stop_share_backend_best_effort() {
+    if dry_run() {
+        return;
+    }
+    if let Err(error) = SambaConfig::stop_service() {
+        eprintln!("warning=smb_backend_stop_failed error={error}");
+    }
 }
 
 fn maintenance(operation: &str) -> Result<(), ControlProblem> {
@@ -1823,6 +1834,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn repository_stop_releases_smb_before_the_runtime_unmounts() {
+        const REPOSITORY_UNIT: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/fastdup-repository.service"
+        ));
+        const SMB_DEPENDENCY: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/smb.service.d/20-fastdup.conf"
+        ));
+        assert!(
+            REPOSITORY_UNIT
+                .lines()
+                .any(|line| line == "Before=smb.service")
+        );
+        assert!(
+            !REPOSITORY_UNIT
+                .lines()
+                .any(|line| line.starts_with("ExecStopPre=")),
+            "this systemd release does not recognize ExecStopPre"
+        );
+        assert!(
+            SMB_DEPENDENCY
+                .lines()
+                .any(|line| line == "PartOf=fastdup-repository.service")
+        );
+        assert!(
+            SMB_DEPENDENCY
+                .lines()
+                .any(|line| line == "After=fastdup-repository.service")
+        );
+        assert!(
+            SMB_DEPENDENCY
+                .lines()
+                .any(|line| line == "ConditionPathIsMountPoint=/srv/fastdup/repository")
+        );
+        assert!(
+            SMB_DEPENDENCY
+                .lines()
+                .any(|line| line == "TimeoutStopSec=30s")
+        );
     }
 
     #[test]

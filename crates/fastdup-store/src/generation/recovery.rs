@@ -384,12 +384,12 @@ impl<I: StorageIo> GenerationRepository<I> {
             if !record_matches_namespace_root(*record, &root) {
                 continue;
             }
-            let manifests = match self.scan_manifest_graph_with_required(&root).and_then(
-                |(manifests, required)| {
+            let manifests = match self
+                .scan_manifest_graph_with_required(&root, None)
+                .and_then(|(manifests, required)| {
                     verify(required)?;
                     Ok(manifests)
-                },
-            ) {
+                }) {
                 Ok(manifests) => manifests,
                 Err(error) if error.allows_generation_fallback() => continue,
                 Err(error) => return Err(error),

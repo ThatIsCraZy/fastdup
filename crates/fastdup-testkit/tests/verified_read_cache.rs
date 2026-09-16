@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use fastdup_format::{ChunkId, ContainerId, ManifestExtent, ManifestLeaf};
 use fastdup_store::{
-    ContainerRepository, MemoryPressureSnapshot, VerifiedManifestFile, VerifiedReadCache,
-    VerifiedReadCacheConfig,
+    ContainerRepository, MemoryPressureSnapshot, ReadIntent, ReadIntentScope, VerifiedManifestFile,
+    VerifiedReadCache, VerifiedReadCacheConfig,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
@@ -72,6 +72,64 @@ fn verified_manifest_reads_share_one_bounded_cache_without_second_storage_read()
     assert_eq!(status.admissions(), 1);
     assert_eq!(status.entry_count(), 1);
     assert!(status.resident_bytes() <= status.target_bytes());
+}
+
+#[test]
+fn scan_read_supplies_verified_bytes_without_displacing_demand_cache() {
+    let storage = MemoryStorageIo::new();
+    let containers = ContainerRepository::new(storage.clone());
+    let payload = vec![0x5C; 64 * 1_024];
+    containers
+        .publish_raw(
+            ContainerId::new([0x73; 16]).expect("scan fixture container ID is nonzero"),
+            3,
+            &[&payload],
+        )
+        .expect("publish scan fixture");
+    let cache = Arc::new(
+        VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(
+                512 * 1_024,
+                128 * 1_024,
+                NonZeroUsize::new(4).expect("four shards"),
+            )
+            .expect("valid cache geometry"),
+            MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 4 * 1_024 * 1_024, 0),
+        )
+        .expect("construct bounded cache"),
+    );
+    let logical_length = u64::try_from(payload.len()).expect("fixture length fits u64");
+    let manifest = ManifestLeaf::new(
+        logical_length,
+        vec![ManifestExtent::Data {
+            logical_length,
+            chunk_id: ChunkId::of(&payload),
+        }],
+    )
+    .expect("construct scan fixture Manifest");
+    let file = VerifiedManifestFile::new(manifest, containers)
+        .expect("verify scan fixture")
+        .with_verified_read_cache(Arc::clone(&cache));
+    let baseline = storage.operation_count();
+
+    assert_eq!(
+        {
+            let _scan = ReadIntentScope::enter(ReadIntent::Scan);
+            file.read_at(
+                0,
+                u32::try_from(payload.len()).expect("fixture length fits u32"),
+            )
+        }
+        .expect("scan read verifies DATA"),
+        payload
+    );
+
+    assert!(storage.operation_count() > baseline);
+    let status = cache.status();
+    assert_eq!(status.admissions(), 0);
+    assert_eq!(status.entry_count(), 0);
+    assert_eq!(status.resident_bytes(), 0);
+    assert_eq!(status.compressed_admissions(), 0);
 }
 
 #[test]

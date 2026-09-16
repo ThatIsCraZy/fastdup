@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::ops::Bound::Excluded;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -1788,6 +1788,10 @@ impl ResidentDirtyData {
 struct SparseData {
     logical_size: u64,
     allocated_bytes: u64,
+    /// Running sum of the lengths of the resident `extents`, maintained
+    /// alongside `allocated_bytes` so checkpointable dirty DATA accounting
+    /// does not rescan the extent map on every mutation.
+    resident_bytes: u64,
     extents: BTreeMap<u64, ResidentDirtyData>,
     external_extents: BTreeMap<u64, ExternalDirtyData>,
 }
@@ -1874,12 +1878,20 @@ impl SparseData {
                 .allocated_bytes
                 .checked_sub(u64::try_from(removed.len()).expect("ASSERT: usize must fit in u64"))
                 .expect("ASSERT: removed extent bytes must be accounted");
+            self.resident_bytes = self
+                .resident_bytes
+                .checked_sub(u64::try_from(removed.len()).expect("ASSERT: usize must fit in u64"))
+                .expect("ASSERT: removed extent bytes must be accounted");
         }
         for (start, fragment) in fragments {
             self.allocated_bytes = self
                 .allocated_bytes
                 .checked_add(u64::try_from(fragment.len()).expect("ASSERT: usize must fit in u64"))
                 .expect("ASSERT: allocated extent bytes must not overflow");
+            self.resident_bytes = self
+                .resident_bytes
+                .checked_add(u64::try_from(fragment.len()).expect("ASSERT: usize must fit in u64"))
+                .expect("ASSERT: resident extent bytes must not overflow");
             assert!(
                 self.extents.insert(start, fragment).is_none(),
                 "ASSERT: split extent must not overlap a surviving extent"
@@ -1889,6 +1901,10 @@ impl SparseData {
             .allocated_bytes
             .checked_add(data_length)
             .expect("ASSERT: allocated extent bytes must not overflow");
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_add(data_length)
+            .expect("ASSERT: resident extent bytes must not overflow");
         assert!(
             self.extents
                 .insert(offset, ResidentDirtyData::new(data, mutation_sequence))
@@ -1997,12 +2013,20 @@ impl SparseData {
                 .allocated_bytes
                 .checked_sub(u64::try_from(removed.len()).expect("ASSERT: usize must fit in u64"))
                 .expect("ASSERT: removed extent bytes must be accounted");
+            self.resident_bytes = self
+                .resident_bytes
+                .checked_sub(u64::try_from(removed.len()).expect("ASSERT: usize must fit in u64"))
+                .expect("ASSERT: removed extent bytes must be accounted");
         }
         if let Some((start, bytes)) = crossing {
             self.allocated_bytes = self
                 .allocated_bytes
                 .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize must fit in u64"))
                 .expect("ASSERT: allocated extent bytes must not overflow");
+            self.resident_bytes = self
+                .resident_bytes
+                .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize must fit in u64"))
+                .expect("ASSERT: resident extent bytes must not overflow");
             assert!(
                 self.extents.insert(start, bytes).is_none(),
                 "ASSERT: truncated extent must not overlap a survivor"
@@ -2034,7 +2058,8 @@ impl SparseData {
         self.allocated_bytes
     }
 
-    fn resident_bytes(&self) -> u64 {
+    #[cfg(test)]
+    fn resident_bytes_recomputed(&self) -> u64 {
         self.extents.values().fold(0_u64, |total, bytes| {
             total
                 .checked_add(u64::try_from(bytes.len()).expect("ASSERT: usize fits u64"))
@@ -2160,12 +2185,17 @@ impl SparseData {
                 .remove(&extent_start)
                 .expect("ASSERT: resident overlap vanished");
             self.allocated_bytes -= u64::try_from(removed.len()).expect("ASSERT: usize fits u64");
+            self.resident_bytes -= u64::try_from(removed.len()).expect("ASSERT: usize fits u64");
         }
         for (fragment_start, fragment) in fragments {
             self.allocated_bytes = self
                 .allocated_bytes
                 .checked_add(u64::try_from(fragment.len()).expect("ASSERT: usize fits u64"))
                 .expect("ASSERT: fragment allocation cannot overflow");
+            self.resident_bytes = self
+                .resident_bytes
+                .checked_add(u64::try_from(fragment.len()).expect("ASSERT: usize fits u64"))
+                .expect("ASSERT: resident fragment bytes cannot overflow");
             assert!(self.extents.insert(fragment_start, fragment).is_none());
         }
         Ok(())
@@ -2278,6 +2308,7 @@ impl SparseData {
     fn audit_valid(&self) {
         let mut ranges = Vec::with_capacity(self.extents.len() + self.external_extents.len());
         let mut allocated_bytes = 0_u64;
+        let mut resident_bytes = 0_u64;
         for (&start, bytes) in &self.extents {
             assert!(
                 !bytes.is_empty(),
@@ -2295,6 +2326,9 @@ impl SparseData {
             allocated_bytes = allocated_bytes
                 .checked_add(length)
                 .expect("AUDIT: allocated extent bytes must not overflow");
+            resident_bytes = resident_bytes
+                .checked_add(length)
+                .expect("AUDIT: resident extent bytes must not overflow");
         }
         for (&start, external) in &self.external_extents {
             assert!(
@@ -2330,6 +2364,10 @@ impl SparseData {
         assert_eq!(
             allocated_bytes, self.allocated_bytes,
             "AUDIT: cached allocated extent bytes must match the extent map"
+        );
+        assert_eq!(
+            resident_bytes, self.resident_bytes,
+            "AUDIT: cached resident extent bytes must match the extent map"
         );
     }
 }
@@ -2446,6 +2484,11 @@ fn plan_overlap(
 struct Inode {
     observer_order: Mutex<()>,
     kernel_data_cache_exposed: AtomicBool,
+    /// Number of live namespace entries naming this inode that match the
+    /// active Small-File suffix policy. Maintained under the catalog write
+    /// lock by create, link, symlink, mkdir, unlink, rmdir, rename and policy
+    /// replacement; observed without the catalog lock on the write path.
+    policy_name_matches: AtomicU32,
     state: RwLock<InodeState>,
 }
 
@@ -2614,6 +2657,7 @@ pub struct Namespace {
     commit_capacity_admission: OnceLock<Arc<dyn CommitCapacityAdmission>>,
     logical_quotas: LogicalQuotaTable,
     logical_usage: Mutex<logical_usage::LogicalUsageSampler>,
+    frontend_deletes: AtomicU64,
     reduction_policy: RwLock<ShareReductionPolicy>,
     catalog: RwLock<Catalog>,
     locks: Mutex<LockTable>,
@@ -2637,6 +2681,14 @@ impl Default for ShareReductionPolicy {
 }
 
 impl Namespace {
+    /// Count of frontend deletions (Unlink/Rmdir) committed since process
+    /// start. The Online-GC scheduler resets its data-tier backoff when this
+    /// counter advances between quanta.
+    #[must_use]
+    pub fn frontend_delete_count(&self) -> u64 {
+        self.frontend_deletes.load(Ordering::Relaxed)
+    }
+
     /// Creates the explicitly non-durable namespace checkpoint.
     ///
     /// # Panics
@@ -2651,6 +2703,7 @@ impl Namespace {
         let root = Arc::new(Inode {
             observer_order: Mutex::new(()),
             kernel_data_cache_exposed: AtomicBool::new(false),
+            policy_name_matches: AtomicU32::new(0),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
                 mode: 0o755,
@@ -2676,6 +2729,7 @@ impl Namespace {
             integrity_failed: AtomicBool::new(false),
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
+            frontend_deletes: AtomicU64::new(0),
             mutation_observer: RwLock::new(None),
             commit_capacity_admission: OnceLock::new(),
             logical_quotas: LogicalQuotaTable::default(),
@@ -2760,6 +2814,7 @@ impl Namespace {
         let root = Arc::new(Inode {
             observer_order: Mutex::new(()),
             kernel_data_cache_exposed: AtomicBool::new(false),
+            policy_name_matches: AtomicU32::new(0),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
                 mode: snapshot.root_mode,
@@ -2786,6 +2841,7 @@ impl Namespace {
             let object = Arc::new(Inode {
                 observer_order: Mutex::new(()),
                 kernel_data_cache_exposed: AtomicBool::new(false),
+                policy_name_matches: AtomicU32::new(0),
                 state: RwLock::new(InodeState {
                     kind: FileKind::Regular,
                     mode: committed.mode,
@@ -2814,6 +2870,7 @@ impl Namespace {
             let object = Arc::new(Inode {
                 observer_order: Mutex::new(()),
                 kernel_data_cache_exposed: AtomicBool::new(false),
+                policy_name_matches: AtomicU32::new(0),
                 state: RwLock::new(InodeState {
                     kind: FileKind::Directory,
                     mode: committed.mode,
@@ -2839,6 +2896,7 @@ impl Namespace {
             let object = Arc::new(Inode {
                 observer_order: Mutex::new(()),
                 kernel_data_cache_exposed: AtomicBool::new(false),
+                policy_name_matches: AtomicU32::new(0),
                 state: RwLock::new(InodeState {
                     kind: FileKind::Symlink,
                     mode: 0o777,
@@ -2857,6 +2915,7 @@ impl Namespace {
             }
         }
 
+        let small_file_policy = Arc::new(small_file_policy::SmallFileExtensionPolicy::default());
         let mut entries = BTreeMap::new();
         let mut observed_links = BTreeMap::<InodeId, u32>::new();
         let mut directory_children = BTreeMap::<InodeId, u32>::new();
@@ -2876,9 +2935,17 @@ impl Namespace {
             {
                 return Err(PosixError::InvalidArgument);
             }
+            let name_matches = small_file_policy.matches_name(&entry.name);
             let key = (entry.parent, entry.name);
             if entries.insert(key, entry.target).is_some() {
                 return Err(PosixError::InvalidArgument);
+            }
+            if name_matches {
+                inodes
+                    .get(&entry.target)
+                    .expect("ASSERT: validated committed target exists")
+                    .policy_name_matches
+                    .fetch_add(1, Ordering::Release);
             }
             let count = observed_links.entry(entry.target).or_default();
             *count = count.checked_add(1).ok_or(PosixError::NoSpace)?;
@@ -2944,6 +3011,7 @@ impl Namespace {
             integrity_failed: AtomicBool::new(false),
             admission_changed: Notify::new(),
             dirty_payload: DirtyPayloadTracker::default(),
+            frontend_deletes: AtomicU64::new(0),
             mutation_observer: RwLock::new(None),
             commit_capacity_admission: OnceLock::new(),
             logical_quotas: LogicalQuotaTable::default(),
@@ -2961,7 +3029,7 @@ impl Namespace {
                 handles: BTreeMap::new(),
                 lookup_counts: BTreeMap::new(),
                 active_create_metadata_bytes: BTreeMap::new(),
-                small_file_policy: Arc::new(small_file_policy::SmallFileExtensionPolicy::default()),
+                small_file_policy,
             }),
             locks: Mutex::new(LockTable::default()),
             lock_change_sequence: AtomicU64::new(0),
@@ -3418,15 +3486,10 @@ impl Namespace {
         if state.kind != FileKind::Regular {
             return false;
         }
-        small_file_policy(
+        small_file_policy_with_name_match(
             state.data.logical_size(),
             &state.metadata,
-            catalog
-                .entries
-                .iter()
-                .filter(|(_, target)| **target == inode)
-                .map(|((_, name), _)| name.as_slice()),
-            &catalog.small_file_policy,
+            object.policy_name_matches.load(Ordering::Acquire) > 0,
         )
     }
 
@@ -3453,10 +3516,24 @@ impl Namespace {
             revision, extensions,
         )?);
         let snapshot = policy.snapshot();
-        self.catalog
+        let mut catalog = self
+            .catalog
             .write()
-            .expect("ASSERT: namespace catalog lock poisoned")
-            .small_file_policy = policy;
+            .expect("ASSERT: namespace catalog lock poisoned");
+        let mut match_counts = BTreeMap::<InodeId, u32>::new();
+        for ((_, name), target) in &catalog.entries {
+            if policy.matches_name(name) {
+                *match_counts.entry(*target).or_default() += 1;
+            }
+        }
+        for (inode, object) in &catalog.inodes {
+            object.policy_name_matches.store(
+                match_counts.get(inode).copied().unwrap_or(0),
+                Ordering::Release,
+            );
+        }
+        catalog.small_file_policy = policy;
+        drop(catalog);
         Ok(snapshot)
     }
 
@@ -4378,6 +4455,8 @@ impl Namespace {
         let attr = state.attributes(inode);
         drop(state);
         assert!(catalog.entries.insert(key, inode).is_none());
+        let name_matches = catalog.small_file_policy.matches_name(new_name);
+        adjust_policy_name_matches(&catalog, inode, name_matches, true);
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
         acquire_lookup(&mut catalog, inode, 1)?;
         Ok(Reply::Entry(Entry { attr }))
@@ -4415,6 +4494,7 @@ impl Namespace {
         let object = Arc::new(Inode {
             observer_order: Mutex::new(()),
             kernel_data_cache_exposed: AtomicBool::new(false),
+            policy_name_matches: AtomicU32::new(0),
             state: RwLock::new(InodeState {
                 kind: FileKind::Symlink,
                 mode: 0o777,
@@ -4436,6 +4516,8 @@ impl Namespace {
         assert!(catalog.inodes.insert(inode, object).is_none());
         assert!(catalog.lookup_counts.insert(inode, 1).is_none());
         assert!(catalog.entries.insert(key, inode).is_none());
+        let name_matches = catalog.small_file_policy.matches_name(name);
+        adjust_policy_name_matches(&catalog, inode, name_matches, true);
         self.logical_quotas.associate_child(parent, inode);
         self.associate_reduction_child(parent, inode);
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
@@ -4645,6 +4727,7 @@ impl Namespace {
         let object = Arc::new(Inode {
             observer_order: Mutex::new(()),
             kernel_data_cache_exposed: AtomicBool::new(false),
+            policy_name_matches: AtomicU32::new(0),
             state: RwLock::new(InodeState {
                 kind: FileKind::Directory,
                 mode,
@@ -4675,6 +4758,8 @@ impl Namespace {
             catalog.entries.insert(key, inode).is_none(),
             "ASSERT: mkdir replaced an existing directory entry"
         );
+        let name_matches = catalog.small_file_policy.matches_name(name);
+        adjust_policy_name_matches(&catalog, inode, name_matches, true);
         self.logical_quotas.associate_child(parent, inode);
         self.associate_reduction_child(parent, inode);
         parent_state.link_count = next_parent_links;
@@ -4827,15 +4912,7 @@ impl Namespace {
     ) -> Result<WriteResult, PosixError> {
         let written = u32::try_from(payload.len()).map_err(|_| PosixError::FileTooLarge)?;
         let (object, open) = self.resolve_open_file(inode, handle)?;
-        let policy_name_matches = {
-            let catalog = self
-                .catalog
-                .read()
-                .expect("ASSERT: namespace catalog lock poisoned");
-            catalog.entries.iter().any(|((_, name), target)| {
-                *target == inode && catalog.small_file_policy.matches_name(name)
-            })
-        };
+        let policy_name_matches = object.policy_name_matches.load(Ordering::Acquire) > 0;
         if open.options.access == AccessMode::ReadOnly {
             return Err(PosixError::BadHandle);
         }
@@ -4886,16 +4963,9 @@ impl Namespace {
             small_file,
         )?)?;
         let logical_before = state.data.allocated_bytes();
-        let overwritten_end = end.min(state.data.logical_size());
-        let overwritten = if offset < overwritten_end {
-            state
-                .data
-                .allocated_bytes_in_live_range(offset, overwritten_end)?
-        } else {
-            0
-        };
+        let write_plan = state.data.plan_write(offset, data_length)?;
         let logical_after = logical_before
-            .checked_sub(overwritten)
+            .checked_sub(write_plan.overwritten)
             .and_then(|remaining| remaining.checked_add(data_length))
             .ok_or(PosixError::NoSpace)?;
         let logical_quota =
@@ -4909,7 +4979,7 @@ impl Namespace {
         let dirty_before = state.data.active_resident_payload_bytes();
         state
             .data
-            .write_payload(offset, payload.clone(), next_sequence)?;
+            .write_payload_planned(offset, payload.clone(), next_sequence, write_plan)?;
         assert_eq!(
             state.data.allocated_bytes(),
             logical_after,
@@ -5643,6 +5713,8 @@ impl Namespace {
         drop(state);
         let removed = catalog.entries.remove(&key);
         assert_eq!(removed, Some(inode), "ASSERT: validated name disappeared");
+        let name_matches = catalog.small_file_policy.matches_name(name);
+        adjust_policy_name_matches(&catalog, inode, name_matches, false);
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
         let reversed_create_claim = final_link
             .then(|| catalog.active_create_metadata_bytes.remove(&inode))
@@ -5680,6 +5752,7 @@ impl Namespace {
             self.observe_truncate(inode, next_sequence, 0);
         }
         drop(observer_order);
+        self.frontend_deletes.fetch_add(1, Ordering::Relaxed);
         Ok(Reply::Empty)
     }
 
@@ -5752,6 +5825,8 @@ impl Namespace {
             Some(inode),
             "ASSERT: validated rmdir name disappeared"
         );
+        let name_matches = catalog.small_file_policy.matches_name(name);
+        adjust_policy_name_matches(&catalog, inode, name_matches, false);
         if parent != ROOT_INODE {
             install_root_mutation_sequence(&catalog, next_namespace_sequence);
         }
@@ -5771,6 +5846,7 @@ impl Namespace {
         {
             admission.release_active_metadata(bytes);
         }
+        self.frontend_deletes.fetch_add(1, Ordering::Relaxed);
         Ok(Reply::Empty)
     }
 
@@ -5938,6 +6014,13 @@ impl Namespace {
             previous, replaced_inode,
             "ASSERT: rename target changed under the catalog write lock"
         );
+        let old_matches = catalog.small_file_policy.matches_name(name);
+        let new_matches = catalog.small_file_policy.matches_name(new_name);
+        adjust_policy_name_matches(&catalog, source_inode, old_matches, false);
+        adjust_policy_name_matches(&catalog, source_inode, new_matches, true);
+        if let Some(target_inode) = replaced_inode {
+            adjust_policy_name_matches(&catalog, target_inode, new_matches, false);
+        }
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
         let mut reversed_create_claim = None;
         if let Some(target_inode) = replaced_inode {
@@ -6344,6 +6427,33 @@ fn small_file_policy_with_name_match(
     policy_name_matches
 }
 
+/// Books one directory entry added to or removed from the catalog against the
+/// target inode's maintained Small-File name-match counter. `name_matches`
+/// must be the active policy's `matches_name` result for the entry's name.
+/// Call only while the catalog write lock is held and the target inode is
+/// still live.
+fn adjust_policy_name_matches(catalog: &Catalog, target: InodeId, name_matches: bool, added: bool) {
+    if !name_matches {
+        return;
+    }
+    let object = catalog
+        .inodes
+        .get(&target)
+        .expect("ASSERT: validated namespace entry references a live inode");
+    if added {
+        object.policy_name_matches.fetch_add(1, Ordering::Release);
+    } else {
+        assert!(
+            object
+                .policy_name_matches
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count
+                    .checked_sub(1))
+                .is_ok(),
+            "ASSERT: policy name match counts must remain balanced"
+        );
+    }
+}
+
 fn authorize_xattr_mutation(
     context: RequestContext,
     state: &InodeState,
@@ -6599,6 +6709,8 @@ fn rename_directory(
                 .ok_or(PosixError::NoSpace)
         })
         .transpose()?;
+    let old_matches = catalog.small_file_policy.matches_name(&old_key.1);
+    let new_matches = catalog.small_file_policy.matches_name(&new_key.1);
     let removed = catalog.entries.remove(old_key);
     assert_eq!(
         removed,
@@ -6610,6 +6722,11 @@ fn rename_directory(
         previous, replaced_inode,
         "ASSERT: directory rename target changed under catalog lock"
     );
+    adjust_policy_name_matches(catalog, source_inode, old_matches, false);
+    adjust_policy_name_matches(catalog, source_inode, new_matches, true);
+    if let Some(target_inode) = replaced_inode {
+        adjust_policy_name_matches(catalog, target_inode, new_matches, false);
+    }
     for (object, links, sequence) in parent_updates {
         let mut state = object
             .state
@@ -6818,6 +6935,7 @@ fn create_new_file(
     let object = Arc::new(Inode {
         observer_order: Mutex::new(()),
         kernel_data_cache_exposed: AtomicBool::new(false),
+        policy_name_matches: AtomicU32::new(0),
         state: RwLock::new(InodeState {
             kind: FileKind::Regular,
             mode,
@@ -6845,6 +6963,7 @@ fn create_new_file(
         catalog.lookup_counts.insert(inode, 1).is_none(),
         "ASSERT: new inode must not have lookup references"
     );
+    let name_matches = catalog.small_file_policy.matches_name(&key.1);
     assert!(
         catalog.entries.insert(key, inode).is_none(),
         "ASSERT: create replaced an existing directory entry"
@@ -6863,6 +6982,7 @@ fn create_new_file(
         "ASSERT: monotonic handle allocator returned a live ID"
     );
     install_root_mutation_sequence(catalog, next_namespace_sequence);
+    adjust_policy_name_matches(catalog, inode, name_matches, true);
 
     Ok(Reply::Created {
         entry: Entry { attr },

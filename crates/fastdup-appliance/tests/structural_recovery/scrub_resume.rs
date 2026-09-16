@@ -254,6 +254,23 @@ fn saved(entries: &[ScrubCertificate]) -> MemoryStorageIo {
 }
 
 #[test]
+fn unflushed_scrub_entries_are_visible_to_lookup_but_lost_on_crash() {
+    let (metadata, data, _) = fixture(true);
+    let entry = certificates(&metadata, &data, &[31]).remove(0);
+    let disk = MemoryStorageIo::new();
+    {
+        let mut journal = ScrubProgress::open(disk.clone(), BINDING, 100).unwrap();
+        let header_len = disk.object_len(JOURNAL).unwrap();
+        journal.record(&entry).unwrap();
+        assert_eq!(disk.object_len(JOURNAL).unwrap(), header_len);
+        assert!(journal.lookup(id(31), 101).unwrap().is_some());
+    }
+    disk.crash();
+    let journal = ScrubProgress::open(disk, BINDING, 101).unwrap();
+    assert!(journal.lookup(id(31), 101).unwrap().is_none());
+}
+
+#[test]
 fn clean_stop_and_crash_resume_without_reading_payloads() {
     let (metadata, data, _) = fixture(true);
     let entries = certificates(&metadata, &data, &[31, 32]);

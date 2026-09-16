@@ -227,6 +227,11 @@ impl<I: StorageIo> GenerationRepository<I> {
         crate::maintenance_cancellation::check_io(self.maintenance_cancellation.as_ref())
     }
 
+    fn check_manifest_maintenance(&self) -> Result<(), crate::manifest_tree::ManifestTreeError> {
+        self.check_maintenance()
+            .map_err(crate::manifest_tree::ManifestTreeError::Io)
+    }
+
     /// Reports whether the paired Commit WAL selects at least one Commit
     /// record without traversing its Metadata or DATA graph.
     ///

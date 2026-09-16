@@ -40,11 +40,13 @@ use super::{
 use super::{CpuPhaseStatus, WriteThroughStatus};
 
 const CONTAINER_PAYLOAD_FLUSH_BYTES: usize = CONTAINER_PAYLOAD_TARGET_BYTES - CDC_MAXIMUM_BYTES;
+const PARTIAL_BATCH_BUDGET_BYTES_V1: usize = CONTAINER_PAYLOAD_TARGET_BYTES;
 const MAX_CHUNK_FRAGMENTS_V1: usize = 1_024;
 const WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1: usize = 400 * 1_024 * 1_024;
 const WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1: usize = 32 * 1_024 * 1_024;
 const MULTI_STREAM_QUEUE_BUDGET_BYTES_V1: usize = 16 * 1_024 * 1_024;
 const DETACHED_CONTAINER_BUDGET_BYTES_V1: usize = 2 * CONTAINER_PAYLOAD_TARGET_BYTES;
+const PUBLICATION_WAIT_DIAGNOSTIC_INTERVAL_V1: Duration = Duration::from_secs(5);
 const SINGLE_STREAM_PUBLICATION_WINDOW_V1: usize = 2;
 const WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1: usize = 1_024 * 1_024;
 // Owned request fragments remain separate allocations. The Ingest Ring groups
@@ -965,6 +967,7 @@ pub(super) struct WriteThroughIngest<C> {
     worker_budget: NonZeroUsize,
     worker_permits: Arc<WorkerPermits>,
     active_writers: AtomicUsize,
+    shared_batch_bytes: Arc<AtomicUsize>,
     hash_batches: AtomicUsize,
     maximum_hash_workers: AtomicUsize,
     hash_cpu: CpuPhaseTelemetry,
@@ -1090,11 +1093,38 @@ struct IngestQueue {
     completed: Condvar,
 }
 
+type SharedPublicationError = Arc<DurableNamespaceError>;
+type PublicationResult = Result<(), SharedPublicationError>;
+type PublicationCompletions = Vec<std::sync::mpsc::Receiver<PublicationResult>>;
+
+struct PublicationFences {
+    retirement_targets: BTreeMap<InodeId, u64>,
+    barriers: BTreeMap<InodeId, u64>,
+    receivers: PublicationCompletions,
+}
+
+fn unwrap_shared_publication_error(error: SharedPublicationError) -> DurableNamespaceError {
+    Arc::try_unwrap(error).unwrap_or_else(|error| {
+        DurableNamespaceError::Io(std::io::Error::other(format!(
+            "shared publication failure: {error:?}"
+        )))
+    })
+}
+
+fn recv_publication_completion(
+    completion: &std::sync::mpsc::Receiver<PublicationResult>,
+) -> Result<(), DurableNamespaceError> {
+    completion
+        .recv()
+        .map_err(|_| DurableNamespaceError::FrozenViewMismatch)?
+        .map_err(unwrap_shared_publication_error)
+}
+
 #[derive(Debug)]
 struct DetachedContainerWork {
     inode: InodeId,
     first_chunk_sequence: u64,
-    completion: Option<std::sync::mpsc::SyncSender<Result<(), DurableNamespaceError>>>,
+    completion: Option<std::sync::mpsc::SyncSender<PublicationResult>>,
     through_sequence: u64,
     publication_ordinal: u64,
     chunks: Vec<PendingWriteThroughChunk>,
@@ -1134,54 +1164,330 @@ impl DetachedContainerWork {
     }
 }
 
+#[derive(Debug)]
+struct PublicationMember {
+    inode: InodeId,
+    through_sequence: u64,
+    first_chunk_sequence: u64,
+    completion: Option<std::sync::mpsc::SyncSender<PublicationResult>>,
+    chunks: Vec<PendingWriteThroughChunk>,
+    payload_bytes: usize,
+    advanced: bool,
+}
+
+#[derive(Debug)]
+struct PublicationGroup {
+    id: u64,
+    members: Vec<PublicationMember>,
+    payload_bytes: usize,
+}
+
+#[derive(Debug)]
+enum PublicationPendingItem {
+    Single(DetachedContainerWork),
+    GroupMember {
+        group_id: u64,
+        first_chunk_sequence: u64,
+    },
+}
+
+impl PublicationPendingItem {
+    fn as_single(&self) -> Option<&DetachedContainerWork> {
+        match self {
+            Self::Single(work) => Some(work),
+            Self::GroupMember { .. } => None,
+        }
+    }
+
+    fn is_single(&self) -> bool {
+        matches!(self, Self::Single(_))
+    }
+}
+
+#[derive(Debug)]
+enum PublicationUnit {
+    Single(DetachedContainerWork),
+    Group(PublicationGroup),
+}
+
+#[derive(Debug)]
+struct PartialCandidate {
+    inode: InodeId,
+    through_sequence: u64,
+    first_chunk_sequence: u64,
+    chunks: Vec<PendingWriteThroughChunk>,
+    payload_bytes: usize,
+    placement: ContainerPlacement,
+    advanced: bool,
+    sender: Option<std::sync::mpsc::SyncSender<PublicationResult>>,
+    receiver: Option<std::sync::mpsc::Receiver<PublicationResult>>,
+}
+
+fn partial_placement_bucket(placement: ContainerPlacement) -> u8 {
+    match placement {
+        ContainerPlacement::Data => 0,
+        ContainerPlacement::SmallFile => 1,
+    }
+}
+
+impl PartialCandidate {
+    fn new(
+        inode: InodeId,
+        through_sequence: u64,
+        chunks: Vec<PendingWriteThroughChunk>,
+        payload_bytes: usize,
+        placement: ContainerPlacement,
+        advanced: bool,
+    ) -> Self {
+        let (actual, first_chunk_sequence) = validate_pending_chunks(&chunks);
+        assert_eq!(
+            actual, payload_bytes,
+            "ASSERT: partial publication byte accounting must be exact"
+        );
+        assert!(
+            payload_bytes <= PARTIAL_BATCH_BUDGET_BYTES_V1,
+            "ASSERT: one partial publication candidate fits its local batch budget"
+        );
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        Self {
+            inode,
+            through_sequence,
+            first_chunk_sequence: first_chunk_sequence
+                .expect("ASSERT: partial publication candidate contains Chunks"),
+            chunks,
+            payload_bytes,
+            placement,
+            advanced,
+            sender: Some(sender),
+            receiver: Some(receiver),
+        }
+    }
+
+    fn into_member(self) -> PublicationMember {
+        PublicationMember {
+            inode: self.inode,
+            through_sequence: self.through_sequence,
+            first_chunk_sequence: self.first_chunk_sequence,
+            completion: self.sender,
+            chunks: self.chunks,
+            payload_bytes: self.payload_bytes,
+            advanced: self.advanced,
+        }
+    }
+
+    fn into_single(self) -> DetachedContainerWork {
+        let mut work = DetachedContainerWork::new(
+            self.inode,
+            self.through_sequence,
+            self.chunks,
+            self.payload_bytes,
+        );
+        work.completion = self.sender;
+        work
+    }
+}
+
 #[derive(Debug, Default)]
 struct InodePublicationQueue {
-    pending: VecDeque<DetachedContainerWork>,
+    pending: VecDeque<PublicationPendingItem>,
     in_flight: BTreeMap<u64, u64>,
+    barrier: Option<u64>,
     next_publication_ordinal: u64,
     next_retirement_ordinal: u64,
     last_enqueued_sequence: u64,
+    drain_candidates: usize,
     ready: bool,
 }
 
 #[derive(Debug, Default)]
 struct PublicationQueueState {
     inodes: BTreeMap<InodeId, InodePublicationQueue>,
-    ready: VecDeque<InodeId>,
+    ready_inodes: VecDeque<InodeId>,
+    groups: BTreeMap<u64, PublicationGroup>,
+    active_groups: BTreeMap<u64, u64>,
+    ready_groups: VecDeque<u64>,
+    next_group_id: u64,
     buffered_bytes: usize,
+    direct_drain_waiters: usize,
     shutdown: bool,
 }
 
 #[derive(Debug)]
 struct PublicationQueue {
+    shared_batch_bytes: Arc<AtomicUsize>,
     state: Mutex<PublicationQueueState>,
     work_available: Condvar,
     space_available: Condvar,
     completed: Condvar,
+    drain_available: Condvar,
 }
 
 impl PublicationQueue {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_shared_batch_bytes(Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn with_shared_batch_bytes(shared_batch_bytes: Arc<AtomicUsize>) -> Self {
         Self {
+            shared_batch_bytes,
             state: Mutex::new(PublicationQueueState::default()),
             work_available: Condvar::new(),
             space_available: Condvar::new(),
             completed: Condvar::new(),
+            drain_available: Condvar::new(),
         }
     }
 
-    fn enqueue(&self, mut work: DetachedContainerWork) {
+    fn charged_bytes(state: &PublicationQueueState, shared_batch_bytes: usize) -> usize {
+        state
+            .buffered_bytes
+            .checked_add(shared_batch_bytes)
+            .expect("ASSERT: charged detached publication bytes cannot overflow")
+    }
+
+    fn release_local_bytes(&self, bytes: usize) {
+        let previous = self.shared_batch_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(
+            previous >= bytes,
+            "ASSERT: shared batch release cannot underflow its reservation"
+        );
+        self.space_available.notify_all();
+    }
+
+    fn shared_batch_bytes(&self) -> usize {
+        self.shared_batch_bytes.load(Ordering::Relaxed)
+    }
+
+    fn reserve_local_bytes(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: publication queue lock poisoned while reserving shared bytes");
+        loop {
+            let charged = Self::charged_bytes(&state, self.shared_batch_bytes());
+            if charged
+                .checked_add(bytes)
+                .is_some_and(|total| total <= DETACHED_CONTAINER_BUDGET_BYTES_V1)
+            {
+                break;
+            }
+            state = self.space_available.wait(state).expect(
+                "ASSERT: publication queue lock poisoned while applying shared backpressure",
+            );
+        }
+        assert!(
+            !state.shutdown,
+            "ASSERT: cannot reserve shared publication bytes after scheduler shutdown"
+        );
+        self.shared_batch_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn take_reserved_bytes(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let previous = self.shared_batch_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(
+            previous >= bytes,
+            "ASSERT: publication handoff cannot consume more reserved bytes than were held"
+        );
+    }
+
+    fn begin_drain_candidate(&self, inode: InodeId) {
+        let mut state = self.state.lock().expect(
+            "ASSERT: detached publication queue lock poisoned while reserving a drain slot",
+        );
+        let inode_queue = state.inodes.entry(inode).or_default();
+        inode_queue.drain_candidates = inode_queue
+            .drain_candidates
+            .checked_add(1)
+            .expect("ASSERT: commit-drain publication markers cannot overflow");
+    }
+
+    fn clear_drain_candidate(&self, inode: InodeId) {
+        let mut state = self.state.lock().expect(
+            "ASSERT: detached publication queue lock poisoned while releasing a drain slot",
+        );
+        let inode_queue = state
+            .inodes
+            .get_mut(&inode)
+            .expect("ASSERT: commit-drain publication marker must exist");
+        assert!(
+            inode_queue.drain_candidates > 0,
+            "ASSERT: commit-drain publication marker cannot be cleared without a candidate"
+        );
+        inode_queue.drain_candidates -= 1;
+        self.drain_available.notify_all();
+    }
+
+    fn enqueue(&self, work: DetachedContainerWork) {
+        let _ = self.enqueue_work(work, 0, false);
+    }
+
+    #[cfg(test)]
+    fn enqueue_with_reservation(&self, work: DetachedContainerWork, reserved_bytes: usize) -> u64 {
+        self.enqueue_work(work, reserved_bytes, false)
+    }
+
+    fn enqueue_drain_candidate(&self, work: DetachedContainerWork, reserved_bytes: usize) -> u64 {
+        self.enqueue_work(work, reserved_bytes, true)
+    }
+
+    fn enqueue_work(
+        &self,
+        mut work: DetachedContainerWork,
+        reserved_bytes: usize,
+        drain_candidate: bool,
+    ) -> u64 {
         let inode = work.inode;
         let work_bytes = work.payload_bytes;
+        assert!(
+            reserved_bytes <= work_bytes,
+            "ASSERT: enqueue cannot consume more reserved bytes than the handed-off work"
+        );
         let mut state = self
             .state
             .lock()
             .expect("ASSERT: detached publication queue lock poisoned");
-        while state
-            .buffered_bytes
-            .checked_add(work_bytes)
-            .is_none_or(|total| total > DETACHED_CONTAINER_BUDGET_BYTES_V1)
-        {
+        loop {
+            if !drain_candidate
+                && !state.shutdown
+                && state
+                    .inodes
+                    .get(&inode)
+                    .is_some_and(|queue| queue.drain_candidates > 0)
+            {
+                state.direct_drain_waiters = state
+                    .direct_drain_waiters
+                    .checked_add(1)
+                    .expect("ASSERT: direct publication drain waiters cannot overflow");
+                state = self.drain_available.wait(state).expect(
+                    "ASSERT: detached publication queue lock poisoned while waiting for a drain slot",
+                );
+                state.direct_drain_waiters = state
+                    .direct_drain_waiters
+                    .checked_sub(1)
+                    .expect("ASSERT: direct publication drain waiters cannot underflow");
+                continue;
+            }
+            let shared_batch_bytes = self.shared_batch_bytes();
+            assert!(
+                shared_batch_bytes >= reserved_bytes,
+                "ASSERT: shared publication reservation vanished before handoff"
+            );
+            let other_shared_batch_bytes = shared_batch_bytes
+                .checked_sub(reserved_bytes)
+                .expect("ASSERT: shared publication reservation cannot underflow");
+            if Self::charged_bytes(&state, other_shared_batch_bytes)
+                .checked_add(work_bytes)
+                .is_some_and(|total| total <= DETACHED_CONTAINER_BUDGET_BYTES_V1)
+            {
+                break;
+            }
             state = self.space_available.wait(state).expect(
                 "ASSERT: detached publication queue lock poisoned while applying backpressure",
             );
@@ -1190,6 +1496,7 @@ impl PublicationQueue {
             !state.shutdown,
             "ASSERT: cannot enqueue detached Container work after scheduler shutdown"
         );
+        self.take_reserved_bytes(reserved_bytes);
         state.buffered_bytes = state
             .buffered_bytes
             .checked_add(work_bytes)
@@ -1205,44 +1512,180 @@ impl PublicationQueue {
             .next_publication_ordinal
             .checked_add(1)
             .expect("ASSERT: detached publication ordinal cannot overflow");
-        inode_queue.pending.push_back(work);
+        inode_queue
+            .pending
+            .push_back(PublicationPendingItem::Single(work));
+        let retirement_target = inode_queue.next_publication_ordinal;
+        let drain_slot_released = if drain_candidate {
+            assert!(
+                inode_queue.drain_candidates > 0,
+                "ASSERT: commit-drain publication must consume its own marker"
+            );
+            inode_queue.drain_candidates -= 1;
+            inode_queue.drain_candidates == 0
+        } else {
+            false
+        };
         if schedule_publication_inodes(&mut state) {
             self.work_available.notify_one();
         }
+        if drain_slot_released {
+            self.drain_available.notify_all();
+        }
+        retirement_target
     }
 
-    fn next_work(&self) -> Option<DetachedContainerWork> {
+    fn try_enqueue_group(
+        &self,
+        mut group: PublicationGroup,
+        reserved_bytes: usize,
+    ) -> Result<(u64, BTreeMap<InodeId, u64>), PublicationGroup> {
+        let group_bytes = group.payload_bytes;
+        assert!(
+            group.members.len() > 1,
+            "ASSERT: grouped publication requires multiple members"
+        );
+        assert!(
+            reserved_bytes <= group_bytes,
+            "ASSERT: grouped publication cannot consume more reserved bytes than its members"
+        );
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: grouped publication queue lock poisoned");
+        loop {
+            let shared_batch_bytes = self.shared_batch_bytes();
+            assert!(
+                shared_batch_bytes >= reserved_bytes,
+                "ASSERT: grouped publication reservation vanished before handoff"
+            );
+            let other_shared_batch_bytes = shared_batch_bytes
+                .checked_sub(reserved_bytes)
+                .expect("ASSERT: grouped publication reservation cannot underflow");
+            if Self::charged_bytes(&state, other_shared_batch_bytes)
+                .checked_add(group_bytes)
+                .is_some_and(|total| total <= DETACHED_CONTAINER_BUDGET_BYTES_V1)
+            {
+                break;
+            }
+            state = self.space_available.wait(state).expect(
+                "ASSERT: grouped publication queue lock poisoned while applying backpressure",
+            );
+        }
+        assert!(
+            !state.shutdown,
+            "ASSERT: cannot enqueue grouped Container work after scheduler shutdown"
+        );
+        if group.members.iter().any(|member| {
+            state.inodes.get(&member.inode).is_some_and(|inode_queue| {
+                !inode_queue.pending.is_empty()
+                    || !inode_queue.in_flight.is_empty()
+                    || inode_queue.barrier.is_some()
+                    || member.through_sequence < inode_queue.last_enqueued_sequence
+            })
+        }) {
+            return Err(group);
+        }
+        let group_id = state.next_group_id;
+        state.next_group_id = state
+            .next_group_id
+            .checked_add(1)
+            .expect("ASSERT: publication group id cannot overflow");
+        group.id = group_id;
+        self.take_reserved_bytes(reserved_bytes);
+        state.buffered_bytes = state
+            .buffered_bytes
+            .checked_add(group_bytes)
+            .expect("ASSERT: grouped publication bytes cannot overflow");
+        let mut drain_slot_released = false;
+        let mut retirement_targets = BTreeMap::new();
+        for member in &group.members {
+            let inode_queue = state.inodes.entry(member.inode).or_default();
+            inode_queue.last_enqueued_sequence = member.through_sequence;
+            inode_queue.barrier = Some(group_id);
+            inode_queue
+                .pending
+                .push_back(PublicationPendingItem::GroupMember {
+                    group_id,
+                    first_chunk_sequence: member.first_chunk_sequence,
+                });
+            retirement_targets.insert(member.inode, inode_queue.next_publication_ordinal);
+            if inode_queue.drain_candidates > 0 {
+                inode_queue.drain_candidates -= 1;
+                drain_slot_released |= inode_queue.drain_candidates == 0;
+            }
+        }
+        let first_chunk_sequence = group
+            .members
+            .iter()
+            .map(|member| member.first_chunk_sequence)
+            .min()
+            .expect("ASSERT: grouped publication contains members");
+        state.active_groups.insert(group_id, first_chunk_sequence);
+        state.groups.insert(group_id, group);
+        state.ready_groups.push_back(group_id);
+        self.work_available.notify_one();
+        if drain_slot_released {
+            self.drain_available.notify_all();
+        }
+        Ok((group_id, retirement_targets))
+    }
+
+    fn next_unit(&self) -> Option<PublicationUnit> {
         let mut state = self
             .state
             .lock()
             .expect("ASSERT: detached publication queue lock poisoned");
         loop {
-            if let Some(inode) = state.ready.pop_front() {
+            if let Some(group_id) = state.ready_groups.pop_front() {
+                let group = state
+                    .groups
+                    .remove(&group_id)
+                    .expect("ASSERT: ready grouped publication remains pending");
+                assert!(
+                    state.active_groups.contains_key(&group_id),
+                    "ASSERT: grouped publication has an active barrier"
+                );
+                return Some(PublicationUnit::Group(group));
+            }
+            if let Some(inode) = state.ready_inodes.pop_front() {
                 let per_inode_limit = publication_window(&state);
                 let inode_queue = state
                     .inodes
                     .get_mut(&inode)
                     .expect("ASSERT: ready publication inode must own a queue");
                 inode_queue.ready = false;
-                if inode_queue.pending.is_empty() || inode_queue.in_flight.len() >= per_inode_limit
+                if inode_queue.barrier.is_some()
+                    || inode_queue.pending.is_empty()
+                    || inode_queue.in_flight.len() >= per_inode_limit
                 {
                     continue;
                 }
-                let work = inode_queue
-                    .pending
-                    .pop_front()
-                    .expect("ASSERT: ready publication inode must own pending work");
-                assert!(
-                    inode_queue
-                        .in_flight
-                        .insert(work.publication_ordinal, work.first_chunk_sequence)
-                        .is_none(),
-                    "ASSERT: detached publication ordinal is unique per inode"
-                );
-                if schedule_publication_inodes(&mut state) {
-                    self.work_available.notify_one();
+                match inode_queue.pending.pop_front() {
+                    Some(PublicationPendingItem::Single(work)) => {
+                        assert!(
+                            inode_queue
+                                .in_flight
+                                .insert(work.publication_ordinal, work.first_chunk_sequence)
+                                .is_none(),
+                            "ASSERT: detached publication ordinal is unique per inode"
+                        );
+                        if schedule_publication_inodes(&mut state) {
+                            self.work_available.notify_one();
+                        }
+                        return Some(PublicationUnit::Single(work));
+                    }
+                    Some(group_member) => {
+                        if let PublicationPendingItem::GroupMember { group_id, .. } = group_member
+                            && state.groups.contains_key(&group_id)
+                            && !state.ready_groups.contains(&group_id)
+                        {
+                            state.ready_groups.push_back(group_id);
+                        }
+                        continue;
+                    }
+                    None => continue,
                 }
-                return Some(work);
             }
             if state.shutdown {
                 return None;
@@ -1251,6 +1694,16 @@ impl PublicationQueue {
                 .work_available
                 .wait(state)
                 .expect("ASSERT: detached publication queue lock poisoned while waiting for work");
+        }
+    }
+
+    #[cfg(test)]
+    fn next_work(&self) -> Option<DetachedContainerWork> {
+        match self.next_unit()? {
+            PublicationUnit::Single(work) => Some(work),
+            PublicationUnit::Group(_) => {
+                panic!("ASSERT: next_work is only used by single-publication tests")
+            }
         }
     }
 
@@ -1306,36 +1759,89 @@ impl PublicationQueue {
         self.completed.notify_all();
     }
 
-    fn wait_through(&self, inode: InodeId, through_sequence: u64) {
-        let target = {
-            let state = self
-                .state
-                .lock()
-                .expect("ASSERT: publication queue lock poisoned");
-            state
+    fn finish_group(&self, group: &PublicationGroup) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: grouped publication queue lock poisoned");
+        state.buffered_bytes = state
+            .buffered_bytes
+            .checked_sub(group.payload_bytes)
+            .expect("ASSERT: completed grouped publication bytes must have been admitted");
+        assert!(
+            state.active_groups.remove(&group.id).is_some(),
+            "ASSERT: grouped publication retirement has an active barrier"
+        );
+        for member in &group.members {
+            let inode_queue = state
                 .inodes
-                .get(&inode)
-                .and_then(|queue| {
-                    // A later-ending batch may contain complete pre-cut Chunks.
-                    // Snapshot the required ordinal once: later arrivals cannot
-                    // extend a Sync/Release/checkpoint fence indefinitely.
-                    queue
-                        .in_flight
-                        .iter()
-                        .filter_map(|(&ordinal, &first)| {
-                            (first <= through_sequence).then_some(ordinal)
-                        })
-                        .chain(queue.pending.iter().filter_map(|work| {
-                            (work.first_chunk_sequence <= through_sequence)
-                                .then_some(work.publication_ordinal)
-                        }))
-                        .max()
-                })
-                .map_or(0, |ordinal| ordinal + 1)
-        };
+                .get_mut(&member.inode)
+                .expect("ASSERT: grouped publication inode retains queue state");
+            assert_eq!(inode_queue.barrier, Some(group.id));
+            inode_queue.barrier = None;
+            match inode_queue.pending.pop_front() {
+                Some(PublicationPendingItem::GroupMember {
+                    group_id,
+                    first_chunk_sequence,
+                }) => {
+                    assert_eq!(group_id, group.id);
+                    assert_eq!(first_chunk_sequence, member.first_chunk_sequence);
+                }
+                other => {
+                    panic!("ASSERT: grouped publication retirement must pop its member: {other:?}")
+                }
+            }
+        }
+        if schedule_publication_inodes(&mut state) {
+            self.work_available.notify_one();
+        }
+        self.space_available.notify_all();
+        self.completed.notify_all();
+    }
+
+    fn publication_fence(&self, inode: InodeId, through_sequence: u64) -> (Option<u64>, u64) {
+        let state = self
+            .state
+            .lock()
+            .expect("ASSERT: publication queue lock poisoned");
+        let inode_queue = state.inodes.get(&inode);
+        let barrier = inode_queue
+            .and_then(|queue| queue.barrier)
+            .filter(|group_id| {
+                state
+                    .active_groups
+                    .get(group_id)
+                    .is_some_and(|first| through_sequence >= *first)
+            });
+        let target = inode_queue
+            .and_then(|queue| {
+                // A later-ending batch may contain complete pre-cut Chunks.
+                // Snapshot the required ordinal once: later arrivals cannot
+                // extend a Sync/Release/checkpoint fence indefinitely.
+                queue
+                    .in_flight
+                    .iter()
+                    .filter_map(|(&ordinal, &first)| (first <= through_sequence).then_some(ordinal))
+                    .chain(queue.pending.iter().filter_map(|item| {
+                        item.as_single()
+                            .filter(|work| work.first_chunk_sequence <= through_sequence)
+                            .map(|work| work.publication_ordinal)
+                    }))
+                    .max()
+            })
+            .map_or(0, |ordinal| ordinal + 1);
+        (barrier, target)
+    }
+
+    fn wait_through(&self, inode: InodeId, through_sequence: u64) {
+        let (barrier, target) = self.publication_fence(inode, through_sequence);
+        if let Some(group_id) = barrier {
+            self.wait_for_group(group_id);
+        }
         self.wait_for_retirement(inode, target);
     }
 
+    #[cfg(test)]
     fn retirement_target(&self, inode: InodeId) -> u64 {
         self.state
             .lock()
@@ -1355,10 +1861,86 @@ impl PublicationQueue {
             .get(&inode)
             .is_some_and(|queue| queue.next_retirement_ordinal < target)
         {
-            state = self
+            let (waited, timeout) = self
                 .completed
-                .wait(state)
+                .wait_timeout(state, PUBLICATION_WAIT_DIAGNOSTIC_INTERVAL_V1)
                 .expect("ASSERT: publication queue lock poisoned while waiting for retirement");
+            state = waited;
+            if timeout.timed_out() {
+                self.diagnose_publication_wait_locked(&state, "retirement", Some((inode, target)));
+            }
+        }
+    }
+
+    fn wait_for_group(&self, group_id: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: grouped publication queue lock poisoned");
+        while state.active_groups.contains_key(&group_id) && !state.shutdown {
+            let (waited, timeout) = self
+                .completed
+                .wait_timeout(state, PUBLICATION_WAIT_DIAGNOSTIC_INTERVAL_V1)
+                .expect("ASSERT: publication queue lock poisoned while waiting");
+            state = waited;
+            if timeout.timed_out() {
+                self.diagnose_publication_wait_locked(&state, "group", None);
+            }
+        }
+    }
+
+    fn diagnose_publication_wait_locked(
+        &self,
+        state: &PublicationQueueState,
+        context: &str,
+        retirement_wait: Option<(InodeId, u64)>,
+    ) {
+        let (waiting_inode, retirement_target) =
+            retirement_wait.map_or((None, None), |(inode, target)| (Some(inode), Some(target)));
+        eprintln!(
+            concat!(
+                "publication_wait_stall context={} waiting_inode={:?} retirement_target={:?} ",
+                "ready_inodes={} ready_groups={} groups={} active_groups={} next_group_id={} ",
+                "buffered_bytes={} shared_batch_bytes={} direct_drain_waiters={}"
+            ),
+            context,
+            waiting_inode,
+            retirement_target,
+            state.ready_inodes.len(),
+            state.ready_groups.len(),
+            state.groups.len(),
+            state.active_groups.len(),
+            state.next_group_id,
+            state.buffered_bytes,
+            self.shared_batch_bytes(),
+            state.direct_drain_waiters,
+        );
+        for (index, (inode, queue)) in state.inodes.iter().enumerate().take(8) {
+            eprintln!(
+                concat!(
+                    "publication_wait_inode context={} index={} inode={:?} pending={} ",
+                    "in_flight={} barrier={:?} next_publication_ordinal={} ",
+                    "next_retirement_ordinal={} last_sequence={} drain_candidates={} ready={}"
+                ),
+                context,
+                index,
+                inode,
+                queue.pending.len(),
+                queue.in_flight.len(),
+                queue.barrier,
+                queue.next_publication_ordinal,
+                queue.next_retirement_ordinal,
+                queue.last_enqueued_sequence,
+                queue.drain_candidates,
+                queue.ready,
+            );
+        }
+        if state.inodes.len() > 8 {
+            eprintln!(
+                "publication_wait_inode context={} omitted_inodes={}",
+                context,
+                state.inodes.len() - 8
+            );
         }
     }
 
@@ -1367,6 +1949,14 @@ impl PublicationQueue {
             .lock()
             .expect("ASSERT: detached publication queue lock poisoned")
             .buffered_bytes
+    }
+
+    #[cfg(test)]
+    fn direct_drain_waiters(&self) -> usize {
+        self.state
+            .lock()
+            .expect("ASSERT: detached publication queue lock poisoned in test")
+            .direct_drain_waiters
     }
 
     fn shutdown(&self) {
@@ -1378,6 +1968,7 @@ impl PublicationQueue {
         self.work_available.notify_all();
         self.space_available.notify_all();
         self.completed.notify_all();
+        self.drain_available.notify_all();
     }
 }
 
@@ -1403,9 +1994,16 @@ fn schedule_publication_inodes(state: &mut PublicationQueueState) -> bool {
             .inodes
             .get_mut(&inode)
             .expect("ASSERT: enumerated publication inode remains present");
-        if !queue.ready && !queue.pending.is_empty() && queue.in_flight.len() < per_inode_limit {
+        if !queue.ready
+            && queue.barrier.is_none()
+            && queue
+                .pending
+                .front()
+                .is_some_and(PublicationPendingItem::is_single)
+            && queue.in_flight.len() < per_inode_limit
+        {
             queue.ready = true;
-            state.ready.push_back(inode);
+            state.ready_inodes.push_back(inode);
             scheduled = true;
         }
     }
@@ -2108,7 +2706,8 @@ impl<C> fmt::Debug for WriteThroughIngest<C> {
             .expect("ASSERT: write-through overflow lane lock poisoned");
         let ingest = self.queue.status();
         let buffered_bytes = buffered_bytes
-            .checked_add(overflow.tail.len())
+            .checked_add(self.shared_batch_bytes.load(Ordering::Relaxed))
+            .and_then(|sum| sum.checked_add(overflow.tail.len()))
             .and_then(|sum| sum.checked_add(overflow.pending.bytes))
             .and_then(|sum| sum.checked_add(ingest.buffered_bytes))
             .and_then(|sum| sum.checked_add(self.publication_queue.buffered_bytes()))
@@ -2180,20 +2779,39 @@ where
             let worker = std::thread::Builder::new()
                 .name(format!("fastdup-publish-{ordinal}"))
                 .spawn(move || {
-                    while let Some(work) = queue.next_work() {
-                        let result = if let Some(owner) = owner.upgrade() {
-                            let result = owner.publish_detached_container(&work);
-                            queue.wait_for_retirement_turn(&work);
-                            owner.retire_detached_container(&work, result)
-                        } else {
-                            queue.wait_for_retirement_turn(&work);
-                            Err(DurableNamespaceError::FrozenViewMismatch)
-                        };
-                        queue.finish(&work);
-                        if let Some(completion) = &work.completion {
-                            // One bounded reply; a canceled checkpoint may have
-                            // dropped its receiver, but retirement still finishes.
-                            let _ = completion.send(result);
+                    while let Some(unit) = queue.next_unit() {
+                        match unit {
+                            PublicationUnit::Single(work) => {
+                                let result = if let Some(owner) = owner.upgrade() {
+                                    let result = owner.publish_detached_container(&work);
+                                    queue.wait_for_retirement_turn(&work);
+                                    owner.retire_detached_container(&work, result)
+                                } else {
+                                    queue.wait_for_retirement_turn(&work);
+                                    Err(DurableNamespaceError::FrozenViewMismatch)
+                                };
+                                queue.finish(&work);
+                                if let Some(completion) = &work.completion {
+                                    // One bounded reply; a canceled checkpoint may have
+                                    // dropped its receiver, but retirement still finishes.
+                                    let _ = completion.send(result.map_err(Arc::new));
+                                }
+                            }
+                            PublicationUnit::Group(group) => {
+                                let result = if let Some(owner) = owner.upgrade() {
+                                    let result = owner.publish_shared_group(&group);
+                                    owner.retire_shared_group(&group, result)
+                                } else {
+                                    Err(DurableNamespaceError::FrozenViewMismatch)
+                                };
+                                queue.finish_group(&group);
+                                let completion = result.map_err(SharedPublicationError::from);
+                                for member in &group.members {
+                                    if let Some(sender) = &member.completion {
+                                        let _ = sender.send(completion.clone());
+                                    }
+                                }
+                            }
                         }
                     }
                 })
@@ -2283,6 +2901,43 @@ where
                 // failures use ordinary lane degradation.
                 if work.completion.is_none() {
                     self.degrade_inode(work.inode, work.through_sequence, &error);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn retire_shared_group(
+        &self,
+        group: &PublicationGroup,
+        result: Result<(Vec<Vec<ExternalizedExtent>>, bool), DurableNamespaceError>,
+    ) -> Result<(), DurableNamespaceError> {
+        match result {
+            Ok((externalized, sealed)) => {
+                assert_eq!(
+                    externalized.len(),
+                    group.members.len(),
+                    "ASSERT: shared publication has one extent batch per member"
+                );
+                if let Some(namespace) = self.namespace.get().and_then(Weak::upgrade) {
+                    for extents in externalized {
+                        namespace.externalize_verified_extents(extents);
+                    }
+                }
+                if sealed {
+                    let mut registry = self
+                        .registry
+                        .lock()
+                        .expect("ASSERT: write-through registry lock poisoned");
+                    registry.sealed.push_back(Instant::now());
+                }
+                Ok(())
+            }
+            Err(error) => {
+                for member in &group.members {
+                    if member.completion.is_none() {
+                        self.degrade_inode(member.inode, member.through_sequence, &error);
+                    }
                 }
                 Err(error)
             }
@@ -2602,6 +3257,206 @@ where
         Ok(externalized)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "partial drain owns batch formation, ordered enqueue, and shared reservations"
+    )]
+    fn enqueue_shared_partial_batch(
+        &self,
+        batch: &mut Vec<Option<PartialCandidate>>,
+    ) -> Result<PublicationFences, DurableNamespaceError> {
+        let mut receivers = Vec::new();
+        receivers
+            .try_reserve_exact(batch.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for candidate in batch.iter_mut().flatten() {
+            if let Some(receiver) = candidate.receiver.take() {
+                receivers.push(receiver);
+            }
+        }
+        let mut placements = BTreeMap::<(u8, bool), Vec<usize>>::new();
+        for (index, candidate) in batch.iter().enumerate() {
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            placements
+                .entry((
+                    partial_placement_bucket(candidate.placement),
+                    candidate.advanced,
+                ))
+                .or_default()
+                .push(index);
+        }
+        let mut retirement_targets: BTreeMap<InodeId, u64> = BTreeMap::new();
+        let mut barriers: BTreeMap<InodeId, u64> = BTreeMap::new();
+        for group_candidates in placements.into_values() {
+            let mut start = 0;
+            while start < group_candidates.len() {
+                let first = group_candidates[start];
+                start += 1;
+                if batch[first].is_none() {
+                    continue;
+                }
+                let mut selected = vec![first];
+                let mut payload = batch[first]
+                    .as_ref()
+                    .expect("ASSERT: selected candidate exists")
+                    .payload_bytes;
+                let placement = batch[first]
+                    .as_ref()
+                    .expect("ASSERT: selected candidate exists")
+                    .placement;
+                for &other in &group_candidates[start..] {
+                    let Some(candidate) = batch[other].as_ref() else {
+                        continue;
+                    };
+                    let Some(total) = payload.checked_add(candidate.payload_bytes) else {
+                        continue;
+                    };
+                    if total > PARTIAL_BATCH_BUDGET_BYTES_V1 || candidate.placement != placement {
+                        continue;
+                    }
+                    if selected.iter().any(|&selected| {
+                        batch[selected]
+                            .as_ref()
+                            .is_some_and(|selected| selected.inode == candidate.inode)
+                    }) {
+                        continue;
+                    }
+                    selected.push(other);
+                    payload = total;
+                }
+                if selected.len() == 1 {
+                    let Some(candidate) = batch[first].take() else {
+                        continue;
+                    };
+                    let inode = candidate.inode;
+                    let target = self
+                        .publication_queue
+                        .enqueue_drain_candidate(candidate.into_single(), payload);
+                    retirement_targets
+                        .entry(inode)
+                        .and_modify(|existing| *existing = (*existing).max(target))
+                        .or_insert(target);
+                    continue;
+                }
+                let members = selected
+                    .iter()
+                    .map(|&index| {
+                        batch[index]
+                            .take()
+                            .expect("ASSERT: grouped candidate exists")
+                            .into_member()
+                    })
+                    .collect::<Vec<_>>();
+                let member_inodes = members
+                    .iter()
+                    .map(|member| member.inode)
+                    .collect::<Vec<_>>();
+                let group = PublicationGroup {
+                    id: 0,
+                    members,
+                    payload_bytes: payload,
+                };
+                match self.publication_queue.try_enqueue_group(group, payload) {
+                    Ok((group_id, member_targets)) => {
+                        for inode in member_inodes {
+                            barriers.insert(inode, group_id);
+                        }
+                        Self::merge_publication_targets(&mut retirement_targets, member_targets);
+                    }
+                    Err(group) => {
+                        for member in group.members {
+                            let inode = member.inode;
+                            let reserved = member.payload_bytes;
+                            let mut work = DetachedContainerWork::new(
+                                member.inode,
+                                member.through_sequence,
+                                member.chunks,
+                                member.payload_bytes,
+                            );
+                            work.completion = member.completion;
+                            let target = self
+                                .publication_queue
+                                .enqueue_drain_candidate(work, reserved);
+                            retirement_targets
+                                .entry(inode)
+                                .and_modify(|existing| *existing = (*existing).max(target))
+                                .or_insert(target);
+                        }
+                    }
+                }
+            }
+        }
+        batch.clear();
+        Ok(PublicationFences {
+            retirement_targets,
+            barriers,
+            receivers,
+        })
+    }
+
+    fn release_shared_drain_batch(&self, batch: &mut Vec<Option<PartialCandidate>>) {
+        let mut drain_candidates = BTreeMap::new();
+        for candidate in batch.drain(..).flatten() {
+            self.publication_queue
+                .release_local_bytes(candidate.payload_bytes);
+            *drain_candidates
+                .entry(candidate.inode)
+                .or_insert_with(|| 0_usize) += 1;
+        }
+        for (inode, count) in drain_candidates {
+            for _ in 0..count {
+                self.publication_queue.clear_drain_candidate(inode);
+            }
+        }
+    }
+
+    fn flush_shared_partial_batch(
+        &self,
+        batch: &mut Vec<Option<PartialCandidate>>,
+    ) -> Result<PublicationFences, DurableNamespaceError> {
+        let result = self.enqueue_shared_partial_batch(batch);
+        if result.is_err() {
+            self.release_shared_drain_batch(batch);
+        }
+        result
+    }
+
+    fn merge_publication_targets(
+        targets: &mut BTreeMap<InodeId, u64>,
+        additions: BTreeMap<InodeId, u64>,
+    ) {
+        for (inode, target) in additions {
+            targets
+                .entry(inode)
+                .and_modify(|existing| *existing = (*existing).max(target))
+                .or_insert(target);
+        }
+    }
+
+    fn wait_for_shared_publication_fences(
+        &self,
+        retirement_targets: BTreeMap<InodeId, u64>,
+        barriers: &BTreeMap<InodeId, u64>,
+        receivers: &[std::sync::mpsc::Receiver<PublicationResult>],
+    ) -> Result<(), DurableNamespaceError> {
+        for (inode, target) in retirement_targets {
+            if let Some(group_id) = barriers.get(&inode) {
+                self.publication_queue.wait_for_group(*group_id);
+            }
+            self.publication_queue.wait_for_retirement(inode, target);
+        }
+        for receiver in receivers {
+            recv_publication_completion(receiver)?;
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "commit-cut drain owns lane extraction, bounded grouping, and cut fences"
+    )]
     pub(super) fn flush_stable_for_commit_cut(
         &self,
         timings: &CheckpointTimings,
@@ -2624,6 +3479,11 @@ where
         };
         registry_started.finish_into(&mut metrics.lane_lock);
         let mut externalized = Vec::new();
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0_usize;
+        let mut retirement_targets = BTreeMap::new();
+        let mut barriers = BTreeMap::new();
+        let mut receivers = Vec::new();
         for lane in lanes {
             let lane_started = timings.begin(CheckpointStage::LaneLock);
             let mut lane = lane
@@ -2635,41 +3495,66 @@ where
                 assert_pending_write_through_state(&lane);
                 continue;
             };
-            let mut completions = Vec::new();
+            let advanced = self.advanced_reduction_enabled_for(inode);
             loop {
                 let extract_started = timings.begin(CheckpointStage::StableExtract);
                 let previous_tail = lane.tail.len();
-                let extracted = self.extract_stable_chunks(
+                let extracted = match self.extract_stable_chunks(
                     &mut lane,
                     inode,
                     through_sequence,
                     StableExtraction::DrainStable,
-                )?;
-                externalized
+                ) {
+                    Ok(extracted) => extracted,
+                    Err(error) => {
+                        self.release_shared_drain_batch(&mut batch);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = externalized
                     .try_reserve(extracted.len())
-                    .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+                    .map_err(|_| DurableNamespaceError::OutOfMemory)
+                {
+                    self.release_shared_drain_batch(&mut batch);
+                    return Err(error);
+                }
                 externalized.extend(extracted);
                 extract_started.finish_into(&mut metrics.stable_extract);
                 let had_pending = !lane.pending.chunks.is_empty();
                 if had_pending {
-                    completions
-                        .try_reserve(1)
-                        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-                    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
                     let pending = std::mem::take(&mut lane.pending);
-                    let mut work = DetachedContainerWork::new(
+                    let placement = pending
+                        .chunks
+                        .first()
+                        .expect("ASSERT: pending work has one placement")
+                        .placement;
+                    let candidate = PartialCandidate::new(
                         inode,
                         through_sequence,
                         pending.chunks,
                         pending.bytes,
+                        placement,
+                        advanced,
                     );
-                    work.completion = Some(sender);
-                    // The same 64-MiB queue charges full and partial Containers.
-                    // Only bounded queue backpressure may retain this lane lock.
-                    let enqueue_started = timings.begin(CheckpointStage::PublicationEnqueue);
-                    self.publication_queue.enqueue(work);
-                    enqueue_started.finish_into(&mut metrics.publication_enqueue);
-                    completions.push(receiver);
+                    self.publication_queue
+                        .reserve_local_bytes(candidate.payload_bytes);
+                    self.publication_queue.begin_drain_candidate(inode);
+                    batch_bytes = batch_bytes
+                        .checked_add(candidate.payload_bytes)
+                        .expect("ASSERT: bounded partial batch bytes cannot overflow");
+                    batch.push(Some(candidate));
+                    if batch_bytes >= PARTIAL_BATCH_BUDGET_BYTES_V1 {
+                        let enqueue_started = timings.begin(CheckpointStage::PublicationEnqueue);
+                        let fences = self.flush_shared_partial_batch(&mut batch)?;
+                        enqueue_started.finish_into(&mut metrics.publication_enqueue);
+                        Self::merge_publication_targets(
+                            &mut retirement_targets,
+                            fences.retirement_targets,
+                        );
+                        barriers.extend(fences.barriers);
+                        receivers.extend(fences.receivers);
+                        batch_bytes = 0;
+                    }
                 }
                 if lane.tail.len() == previous_tail || !had_pending {
                     break;
@@ -2684,18 +3569,26 @@ where
                 "ASSERT: commit-cut drain retains only a boundary Chunk and CDC suffix"
             );
             assert_bounded_write_through_lane(&lane);
-            // Pin the finite publication prefix while this lane is stable.
-            let target = self.publication_queue.retirement_target(inode);
-            drop(lane);
-            let retire_started = timings.begin(CheckpointStage::PublicationRetire);
-            self.publication_queue.wait_for_retirement(inode, target);
-            for completion in completions {
-                completion
-                    .recv()
-                    .map_err(|_| DurableNamespaceError::FrozenViewMismatch)??;
+            let (base_barrier, base_target) = self
+                .publication_queue
+                .publication_fence(inode, through_sequence);
+            retirement_targets
+                .entry(inode)
+                .and_modify(|existing| *existing = (*existing).max(base_target))
+                .or_insert(base_target);
+            if let Some(group_id) = base_barrier {
+                barriers.insert(inode, group_id);
             }
-            retire_started.finish_into(&mut metrics.publication_retire);
         }
+        let enqueue_started = timings.begin(CheckpointStage::PublicationEnqueue);
+        let fences = self.flush_shared_partial_batch(&mut batch)?;
+        enqueue_started.finish_into(&mut metrics.publication_enqueue);
+        Self::merge_publication_targets(&mut retirement_targets, fences.retirement_targets);
+        barriers.extend(fences.barriers);
+        receivers.extend(fences.receivers);
+        let retire_started = timings.begin(CheckpointStage::PublicationRetire);
+        self.wait_for_shared_publication_fences(retirement_targets, &barriers, &receivers)?;
+        retire_started.finish_into(&mut metrics.publication_retire);
         Ok(externalized)
     }
 
@@ -2808,6 +3701,15 @@ where
         Ok(externalized)
     }
 
+    fn advanced_reduction_enabled_for(&self, inode: InodeId) -> bool {
+        self.index.advanced_reduction_available()
+            && self
+                .namespace
+                .get()
+                .and_then(Weak::upgrade)
+                .is_some_and(|namespace| namespace.advanced_reduction_enabled(inode))
+    }
+
     fn publish_chunks(
         &self,
         chunks: &[PendingWriteThroughChunk],
@@ -2865,12 +3767,7 @@ where
         }
         // Claims are acquired in key order; physical output follows file order.
         new_chunks.sort_unstable_by_key(|chunk| chunk.offset);
-        let advanced = self.index.advanced_reduction_available()
-            && self
-                .namespace
-                .get()
-                .and_then(Weak::upgrade)
-                .is_some_and(|namespace| namespace.advanced_reduction_enabled(inode));
+        let advanced = self.advanced_reduction_enabled_for(inode);
         let publication_guard = advanced
             .then(|| self.containers.try_pin_data_reference())
             .flatten();
@@ -2897,6 +3794,118 @@ where
             "ASSERT: detached work sequence covers every published Chunk"
         );
         let externalized = self.externalize_chunks(chunks, inode, &locations)?;
+        self.index
+            .publish_reduction_batch(entries, similarity_entries, publication_guard);
+        Ok((externalized, sealed))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one shared Container publication must keep per-member ordering and externalization"
+    )]
+    fn publish_shared_group(
+        &self,
+        group: &PublicationGroup,
+    ) -> Result<(Vec<Vec<ExternalizedExtent>>, bool), DurableNamespaceError> {
+        assert!(
+            group.members.len() > 1,
+            "ASSERT: shared Container publication requires multiple members"
+        );
+        let total_chunks = group.members.iter().fold(0_usize, |total, member| {
+            total
+                .checked_add(member.chunks.len())
+                .expect("ASSERT: shared Container chunk count cannot overflow")
+        });
+        let mut candidates = Vec::with_capacity(total_chunks);
+        candidates
+            .try_reserve_exact(total_chunks)
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for member in &group.members {
+            for chunk in &member.chunks {
+                let logical_length = u32::try_from(chunk.bytes.len())
+                    .map_err(|_| DurableNamespaceError::FrozenViewMismatch)?;
+                candidates.push((chunk.chunk_id, logical_length, chunk, member.inode));
+            }
+        }
+        candidates
+            .sort_unstable_by_key(|(chunk_id, _, chunk, owner)| (*chunk_id, *owner, chunk.offset));
+        let mut unique_candidates = Vec::with_capacity(candidates.len());
+        unique_candidates
+            .try_reserve_exact(candidates.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        for (chunk_id, logical_length, chunk, owner) in candidates {
+            if let Some((previous_id, previous_length, _, _)) = unique_candidates.last().copied()
+                && previous_id == chunk_id
+            {
+                if previous_length != logical_length {
+                    return Err(DurableNamespaceError::ChunkLengthConflict {
+                        chunk_id,
+                        first_length: u64::from(previous_length),
+                        second_length: u64::from(logical_length),
+                    });
+                }
+                continue;
+            }
+            unique_candidates.push((chunk_id, logical_length, chunk, owner));
+        }
+        let mut locations = Vec::new();
+        locations
+            .try_reserve(unique_candidates.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        let mut new_chunk_items = Vec::new();
+        new_chunk_items
+            .try_reserve(unique_candidates.len())
+            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        let mut claims =
+            PublicationClaims::new(&self.online_dependency_proofs, unique_candidates.len())?;
+        for (chunk_id, logical_length, chunk, owner) in unique_candidates {
+            match claims.claim(chunk_id, logical_length) {
+                PublicationClaim::Existing(entry) => locations.push(entry),
+                PublicationClaim::Acquired => new_chunk_items.push((owner, chunk)),
+            }
+        }
+        new_chunk_items.sort_unstable_by_key(|(owner, chunk)| (*owner, chunk.offset));
+        let new_chunks = new_chunk_items
+            .iter()
+            .map(|(_, chunk)| *chunk)
+            .collect::<Vec<_>>();
+        let advanced = group
+            .members
+            .iter()
+            .all(|member| member.advanced && self.advanced_reduction_enabled_for(member.inode));
+        let publication_guard = advanced
+            .then(|| self.containers.try_pin_data_reference())
+            .flatten();
+        let advanced = publication_guard.is_some();
+        let (mut entries, similarity_entries) = if new_chunks.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            self.publish_new_chunks(&new_chunks, advanced)?
+        };
+        locations.extend(entries.iter().copied());
+        locations.sort_unstable_by_key(ExactIndexEntry::chunk_id);
+        assert!(
+            locations
+                .windows(2)
+                .all(|pair| pair[0].chunk_id() < pair[1].chunk_id()),
+            "ASSERT: one unique candidate Chunk has exactly one publication result"
+        );
+        claims.finish(&mut entries);
+        let sealed = !entries.is_empty();
+        let mut externalized = Vec::with_capacity(group.members.len());
+        for member in &group.members {
+            assert!(
+                member
+                    .chunks
+                    .iter()
+                    .all(|chunk| chunk.bytes.through_sequence() <= member.through_sequence),
+                "ASSERT: shared publication member sequence covers every published Chunk"
+            );
+            externalized
+                .try_reserve(1)
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+            externalized.push(self.externalize_chunks(&member.chunks, member.inode, &locations)?);
+        }
         self.index
             .publish_reduction_batch(entries, similarity_entries, publication_guard);
         Ok((externalized, sealed))
@@ -3234,6 +4243,7 @@ where
 {
     let worker_permits = Arc::new(WorkerPermits::new(worker_budget));
     containers.install_cpu_admission(Arc::clone(&worker_permits));
+    let shared_batch_bytes = Arc::new(AtomicUsize::new(0));
     let write_through = Arc::new(WriteThroughIngest {
         containers,
         container_generations,
@@ -3241,6 +4251,7 @@ where
         worker_budget,
         worker_permits,
         active_writers: AtomicUsize::new(0),
+        shared_batch_bytes: Arc::clone(&shared_batch_bytes),
         hash_batches: AtomicUsize::new(0),
         maximum_hash_workers: AtomicUsize::new(0),
         hash_cpu: CpuPhaseTelemetry::default(),
@@ -3249,7 +4260,9 @@ where
         materialization_wall_ns: AtomicU64::new(0),
         registry: Mutex::new(WriteThroughRegistry::default()),
         queue: Arc::new(IngestQueue::new()),
-        publication_queue: Arc::new(PublicationQueue::new()),
+        publication_queue: Arc::new(PublicationQueue::with_shared_batch_bytes(Arc::clone(
+            &shared_batch_bytes,
+        ))),
         namespace: OnceLock::new(),
         #[cfg(test)]
         after_inline_stage: Mutex::new(None),

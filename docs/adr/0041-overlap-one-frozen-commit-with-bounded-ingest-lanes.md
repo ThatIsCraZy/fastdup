@@ -298,3 +298,44 @@ exclusive appliance owner and performs explicit discovery.
 
 The measured work reduction and recovery/fault checks are recorded in
 [the Exact publisher report](../testing/exact-publisher-2026-09-13.md).
+
+## Shared commit-cut drain batching (2026-09-16)
+
+Partial commit drains may combine already detached Pending Chunks from distinct
+inodes when they select the same Container placement and advanced-reduction
+policy. One shared group carries at most one 32-MiB Container target. It is
+charged to the existing 64-MiB detached-publication budget while the checkpoint
+still owns the local batch; enqueue transfers that reservation to the queue's
+buffered bytes without double counting. A group whose member queues are no
+longer quiesced falls back to individually charged single publications.
+
+One group publishes as one Container. Identical Chunks selected by more than one
+member are published once, and new Chunks are ordered by `(inode, offset)` before
+physical publication. Each member then externalizes its own Extent Recipes. One
+member may reuse a Chunk published for another member, while externalization
+failure degrades only that member's reduction evidence and preserves the existing
+resident retry state.
+
+A group does not consume a per-inode publication ordinal. Each member inode
+carries a barrier naming its active group, and a later single publication for
+that inode cannot become ready before the barrier clears. A commit fence
+snapshots the barrier and fixed retirement target for every active lane while
+holding the Lane lock, including work enqueued by a lane reset after the ordinary
+commit fence was sampled. It then waits through the group and that fixed
+retirement target before consuming bounded completion replies.
+
+A locally held batch reserves each contributing inode's next publication sequence
+before its Lane lock is released. Ordinary publications for a marked inode wait
+until that drain candidate is handed off to the publication queue or released by a
+failed drain, so post-cut staging cannot place a newer sequence ahead of an older
+batch member. The drain candidate itself bypasses only this drain reservation, and
+each successful single or group handoff clears one marker under the queue lock.
+
+This batching does not add a persistent staged Container, WAL, second durability
+path, or new memory headroom. Shared-local and queued bytes together remain at
+or below the existing two-detached-Container-payload bound. Queue pressure may
+still block the producer with its Lane lock held, as partial drain already does.
+Unit tests cover reservation handoff, drain-marker serialization, and the
+per-inode barrier; the public commit-cut integration test requires three distinct
+partial lanes to publish in at most two DATA Containers, with at least one
+Container at or above 8 MiB.

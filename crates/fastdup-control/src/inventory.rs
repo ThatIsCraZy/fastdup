@@ -4,10 +4,37 @@ use std::process::Command;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::{BackingDisk, BlockTarget};
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackingDisk {
+    pub stable_id: String,
+    pub kernel_name: String,
+    pub model: String,
+    pub serial: String,
+    pub hba_port: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockTarget {
+    pub stable_id: String,
+    pub path: String,
+    pub kernel_name: String,
+    pub model: String,
+    pub serial: String,
+    pub wwn: String,
+    pub target_type: String,
+    pub capacity_bytes: u64,
+    pub hba_port: String,
+    pub filesystem: Option<String>,
+    pub eligible: bool,
+    pub eligibility_reason: Option<String>,
+    pub backing_disks: Vec<BackingDisk>,
+    pub inventory_revision: String,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum InventoryError {

@@ -2,8 +2,18 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::sleep;
+use std::time::Duration;
 
 use crate::{ShareSettings, SmbEncryption};
+
+const SMB_UNIT: &str = "smb.service";
+const SYSTEMCTL: &str = "/usr/bin/systemctl";
+const TIMEOUT: &str = "/usr/bin/timeout";
+const STOP_TIMEOUT: &str = "30s";
+const STOP_KILL_AFTER: &str = "5s";
+const FORCE_ATTEMPTS: usize = 12;
+const FORCE_POLL: Duration = Duration::from_secs(5);
 
 const REPOSITORY_MOUNT: &str = "/srv/fastdup/repository";
 const MANAGED_SHARE_DIRECTORY: &str = ".fastdup-shares";
@@ -244,6 +254,16 @@ impl SambaConfig {
         Ok(())
     }
 
+    pub fn stop_service() -> Result<(), SambaError> {
+        if stop_service_with(&run_system_command) {
+            Ok(())
+        } else {
+            Err(SambaError::Reload(
+                "SMB did not release the repository mount".to_owned(),
+            ))
+        }
+    }
+
     pub fn close_share(name: &str) -> Result<(), SambaError> {
         validate_token(name, "Freigabename")?;
         let output = Command::new("smbcontrol")
@@ -257,6 +277,54 @@ impl SambaConfig {
             ))
         }
     }
+}
+
+fn bounded_systemctl<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+    let mut bounded = vec![
+        TIMEOUT,
+        "--foreground",
+        "--kill-after",
+        STOP_KILL_AFTER,
+        STOP_TIMEOUT,
+        SYSTEMCTL,
+    ];
+    bounded.extend_from_slice(args);
+    bounded
+}
+
+fn run_system_command(args: &[&str]) -> bool {
+    let Some((command, args)) = args.split_first() else {
+        return false;
+    };
+    Command::new(command)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn stop_service_with(runner: &dyn Fn(&[&str]) -> bool) -> bool {
+    if !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+        return true;
+    }
+    let _ = runner(&bounded_systemctl(&["stop", SMB_UNIT]));
+    if !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+        return true;
+    }
+    for attempt in 0..FORCE_ATTEMPTS {
+        if !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+            return true;
+        }
+        let _ = runner(&bounded_systemctl(&["kill", "--signal=SIGKILL", SMB_UNIT]));
+        if !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+            return true;
+        }
+        if attempt + 1 < FORCE_ATTEMPTS {
+            sleep(FORCE_POLL);
+        }
+    }
+    !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT])
 }
 
 fn validate_share(share: &ShareSettings) -> Result<(), SambaError> {
@@ -378,5 +446,58 @@ mod tests {
             SambaConfig::render(&[traversal]),
             Err(SambaError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn stopping_an_inactive_backend_does_not_touch_systemd() {
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let outcome = stop_service_with(&|args| {
+            calls
+                .borrow_mut()
+                .push(args.iter().map(|argument| (*argument).to_owned()).collect());
+            false
+        });
+        assert!(outcome);
+        assert_eq!(calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn stopping_an_uncooperative_backend_escalates_to_a_bounded_kill() {
+        let active = std::cell::RefCell::new(true);
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let outcome = stop_service_with(&|args| {
+            calls
+                .borrow_mut()
+                .push(args.iter().map(|argument| (*argument).to_owned()).collect());
+            let action = args
+                .iter()
+                .position(|argument| *argument == SYSTEMCTL)
+                .and_then(|index| args.get(index + 1))
+                .copied();
+            match action {
+                Some("is-active") => *active.borrow(),
+                Some("stop") => false,
+                Some("kill") => {
+                    *active.borrow_mut() = false;
+                    true
+                }
+                _ => false,
+            }
+        });
+        assert!(outcome);
+        assert_eq!(
+            calls.borrow()[1],
+            bounded_systemctl(&["stop", SMB_UNIT])
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            calls.borrow()[4],
+            bounded_systemctl(&["kill", "--signal=SIGKILL", SMB_UNIT])
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        );
     }
 }

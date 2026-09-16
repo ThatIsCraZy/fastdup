@@ -40,3 +40,22 @@ transitions are audited once; successful evidence clears the current issue
 without turning the control database into storage authority. The serialized
 legacy `write_blocked` issue remains readable for old telemetry, but new health
 samples do not emit it as a repository failure.
+
+## SMB follows the mount lifecycle (2026-09-16)
+
+SMB is the managed frontend for the repository mount, not an independent
+authority allowed to retain handles across a Repository Runtime restart.
+Orderly Runtime stop first closes mutation admission, stops SMB gracefully, and
+escalates to killing `smb.service` if a client keeps the FUSE mount busy.
+Each control request has its own bounded wait; a timed-out request is followed by
+an activation check and repeated forced termination, so an in-flight systemd
+client cannot be mistaken for an unreleased backend.
+Ordinary stop, restart and Control Plane unmount therefore cannot leave an
+already drained Namespace pinned by an old Samba share handle.
+An enabled SMB unit is restored only after the new Runtime has established its
+mount; a disabled unit remains disabled. A supported SMB unit drop-in propagates
+stop/restart from the repository Runtime and makes starting SMB conditional on
+the live repository mount, so direct systemd commands obey the same ordering as
+Control Plane requests. This changes availability and lifecycle ordering only;
+it grants neither Samba nor the Control Plane content, generation, liveness or
+recovery authority.
