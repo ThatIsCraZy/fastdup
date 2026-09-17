@@ -217,7 +217,18 @@ impl<I: StorageIo> GenerationRepository<I> {
         previous_record: CommitRecord,
         proposed_root: &NamespaceRoot,
     ) -> Result<(), GenerationError> {
-        let previous_root = self.read_namespace_root(previous_record.namespace_root())?;
+        // The predecessor Root is content-identified, so a repository-local
+        // copy keyed by its object ID is as authoritative as a fresh reread
+        // for this writer-side transition check. Recovery, mount, and offline
+        // scrub always reread and rehash the complete graph independently.
+        let object_id = previous_record.namespace_root();
+        let previous_root = if let Some(root) = self.cached_previous_namespace_root(object_id) {
+            root
+        } else {
+            let root = std::sync::Arc::new(self.read_namespace_root(object_id)?);
+            self.remember_previous_namespace_root(object_id, std::sync::Arc::clone(&root));
+            root
+        };
         if previous_root.namespace_mutation_sequence()
             != previous_record.namespace_mutation_cutoff()
             || previous_root.inode_reservation_end() != previous_record.inode_reservation_end()

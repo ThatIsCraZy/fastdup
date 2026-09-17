@@ -316,6 +316,7 @@ pub struct MaintenanceRepository<M, C, X> {
     exact_profile: ExactIndexProfileId,
     rebuild_lock: Arc<Mutex<()>>,
     candidate_queue: Arc<Mutex<GcCandidateSelectionQueue>>,
+    checkpoint_protection_cache: Arc<crate::CheckpointProtectedChunkCache>,
     cancellation: Option<crate::MaintenanceCancellation>,
 }
 
@@ -334,6 +335,7 @@ impl<M, C, X> MaintenanceRepository<M, C, X> {
             exact_profile,
             rebuild_lock: Arc::new(Mutex::new(())),
             candidate_queue: Arc::new(Mutex::new(GcCandidateSelectionQueue::default())),
+            checkpoint_protection_cache: Arc::new(crate::CheckpointProtectedChunkCache::default()),
             cancellation: None,
         }
     }
@@ -742,7 +744,10 @@ where
             .scan_online_liveness_for_candidates(&projection_chunk_ids)?;
         let checkpoint_chunks =
             RecoveryCheckpointRepository::new(self.containers.storage().clone())
-                .protected_chunks_matching(&projection_chunk_ids)?;
+                .protected_chunks_matching(
+                    &projection_chunk_ids,
+                    Some(&self.checkpoint_protection_cache),
+                )?;
         generation_proof.extend_protected_chunks(checkpoint_chunks)?;
 
         let mut required_chunks = BTreeMap::new();

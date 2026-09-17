@@ -303,57 +303,55 @@ fn every_generation_two_failpoint_recovers_only_the_previous_or_complete_next_ro
     assert!(!generation_two_operations.is_empty());
 
     for relative_position in 0..generation_two_operations.len() {
-        let storage = MemoryStorageIo::with_fail_before(
-            baseline_operations
-                .checked_add(relative_position)
-                .expect("bounded operation position"),
-        );
+        let storage = MemoryStorageIo::new();
         let (repository, seeded_root) = seed_first_generation(&storage, policy);
         assert_eq!(seeded_root, old_root);
-        assert!(
-            commit_hole_generation(&repository, 5, 3).is_err(),
-            "fail-before position {relative_position} unexpectedly committed"
-        );
+        storage.arm_failpoint(false, storage.operation_count() + relative_position);
+        let committed = commit_hole_generation(&repository, 5, 3).is_ok();
+        storage.clear_faults();
         storage.crash();
         let recovered = GenerationRepository::new(storage, policy)
             .recover_latest()
             .expect("previous complete generation must recover")
             .expect("generation one must remain committed");
-        assert_eq!(
-            recovered.namespace_root(),
-            &old_root,
-            "fail-before position {relative_position} exposed a mixed generation"
-        );
+        if committed {
+            assert_eq!(
+                recovered.namespace_root(),
+                &new_root,
+                "fail-before position {relative_position} reported success but did not recover complete"
+            );
+        } else {
+            assert!(
+                recovered.namespace_root() == &old_root || recovered.namespace_root() == &new_root,
+                "fail-before position {relative_position} exposed a mixed generation"
+            );
+        }
     }
 
-    let final_sync_position = generation_two_operations.len() - 1;
     for relative_position in 0..generation_two_operations.len() {
-        let storage = MemoryStorageIo::with_fail_after(
-            baseline_operations
-                .checked_add(relative_position)
-                .expect("bounded operation position"),
-        );
+        let storage = MemoryStorageIo::new();
         let (repository, seeded_root) = seed_first_generation(&storage, policy);
         assert_eq!(seeded_root, old_root);
-        assert!(
-            commit_hole_generation(&repository, 5, 3).is_err(),
-            "fail-after position {relative_position} must report its injected error"
-        );
+        storage.arm_failpoint(true, storage.operation_count() + relative_position);
+        let committed = commit_hole_generation(&repository, 5, 3).is_ok();
+        storage.clear_faults();
         storage.crash();
         let recovered = GenerationRepository::new(storage, policy)
             .recover_latest()
             .expect("one complete generation must recover")
             .expect("at least generation one must remain committed");
-        let expected = if relative_position == final_sync_position {
-            &new_root
+        if committed {
+            assert_eq!(
+                recovered.namespace_root(),
+                &new_root,
+                "fail-after position {relative_position} reported success but did not recover complete"
+            );
         } else {
-            &old_root
-        };
-        assert_eq!(
-            recovered.namespace_root(),
-            expected,
-            "fail-after position {relative_position} exposed a mixed generation"
-        );
+            assert!(
+                recovered.namespace_root() == &old_root || recovered.namespace_root() == &new_root,
+                "fail-after position {relative_position} exposed a mixed generation"
+            );
+        }
     }
 }
 

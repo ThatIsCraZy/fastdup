@@ -61,6 +61,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             )?;
             // Only the successful checkpoint/head durability boundary issues
             // this receipt. It is not reusable recovery or scrub evidence.
+            self.cleanup_recovery_checkpoint_root_pin_handles();
             *publication = Some((candidate.record, summary));
             return Ok(Some(summary));
         }
@@ -93,7 +94,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         for record in valid[start..].iter().rev().copied() {
             candidates.push(RecoveryCheckpointCandidate {
                 record,
-                _pin: self.pin_recovery_checkpoint_root(record.namespace_root()),
+                _pin: self.pin_recovery_checkpoint_root(record.namespace_root(), true),
             });
         }
         Ok(candidates)
@@ -225,6 +226,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         GenerationLog::new(&self.storage)
             .install_recovery_anchor(record)
             .map_err(map_log_error)?;
+        self.invalidate_wal_writer_cache();
         self.recover_latest_using(Some(verifier))?
             .map(|graph| graph.generation)
             .ok_or(GenerationError::NoRecoverableGeneration)

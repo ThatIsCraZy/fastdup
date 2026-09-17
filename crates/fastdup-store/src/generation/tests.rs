@@ -11,7 +11,7 @@ use std::sync::Arc;
 use fastdup_format::{DurableInode, NamespaceEntry};
 
 #[test]
-fn metadata_publication_does_not_sync_a_length_head_per_four_kib() {
+fn metadata_publication_bundles_heads_and_body_into_one_write() {
     let path = std::env::temp_dir().join(format!("metadata-batch-{}", std::process::id()));
     let storage = crate::FsStorageIo::open(&path).unwrap();
     let repo = GenerationRepository::new(storage, PolicySetId::new([1; 32]).unwrap());
@@ -29,8 +29,8 @@ fn metadata_publication_does_not_sync_a_length_head_per_four_kib() {
     let id = repo.stage_metadata(&bytes).unwrap();
     let writes = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get) - before;
     assert_eq!(
-        writes, 4,
-        "one immutable object needs one body and three heads"
+        writes, 1,
+        "one new immutable image bundles both redundant length heads and its body into one aligned write"
     );
     repo.storage.sync_root().unwrap();
     let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);

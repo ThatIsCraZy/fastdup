@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.7.4
-Release: 50%{?dist}
+Release: 55%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -110,6 +110,20 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Thu Sep 17 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-53
+- Close mutation admission atomically and notify the write-through observer so a
+  checkpoint timeout releases already admitted writers instead of deadlocking
+  against Ingest backpressure. Management and Online-GC state reads no longer
+  queue behind the draining admission fence.
+
+* Thu Sep 17 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-52
+- Rebuild from the current tree with checkpoint cut, generation, metadata cache,
+  and durable read-path updates.
+
+* Thu Sep 17 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-51
+- Rebuild from the current tree with the underfilled Container fill-compaction
+  ranking, bounded ContainerImage cache, and stale-candidate recovery changes.
+
 * Wed Sep 16 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-50
 - Treat a missing Container in the advisory GC candidate queue as an absent hint
   instead of a proof failure, so fill-compaction shortlists cannot block Online-GC

@@ -151,3 +151,20 @@ This authorizes bounded same-process online execution through the shared
 Container and Exact repositories, including restart completion. ADR 0065 adds
 automatic candidate scheduling and ADR 0069 requires one cross-process
 Appliance Lease before recovery or mutation.
+
+## Process-local recovery protection projection (17 September 2026)
+
+Candidate proof consumes both retained Recovery Checkpoint graphs required by
+ADR 0020. Their complete protected Chunk projection may now be retained in one
+process-local Online-GC cache, keyed by each retained head descriptor identity
+`(generation, file length, body hash)`. Recovery Checkpoints are immutable after
+publication, so the projection for that identity is immutable. Every proof still
+reads the two 4 KiB head records and checks the selected object length before a
+hit; a changed, missing, or mismatched descriptor invalidates the projection and
+repeats the complete independent byte audit and graph traversal.
+
+The cache is empty at process start, retains only active head identities, and is
+hard bounded by retained Chunk entries. It accelerates Online-GC proof only.
+Independent recovery and Scrub never consult it and continue to verify retained
+checkpoint bytes themselves. Retirement revalidation remains unchanged and
+continues to bind the durable Recovery Checkpoint root-pin set.

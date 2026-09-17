@@ -15,11 +15,11 @@ mod recovery;
 mod results;
 mod verification;
 
-use crate::generation_log::GenerationLog;
+use crate::generation_log::{GenerationLog, LogSnapshot};
 use crate::manifest_tree::ManifestTreeSummary;
 use crate::{ContainerRepository, StorageIo, StoreError};
 use error::map_log_error;
-use fastdup_format::{CommitRecord, MetadataObjectId, PolicySetId};
+use fastdup_format::{CommitRecord, MetadataObjectId, NamespaceRoot, PolicySetId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -96,13 +96,18 @@ pub struct GenerationRepository<I> {
     metadata_root_pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
     metadata_root_pin_handles: Arc<Mutex<Vec<Weak<MetadataRootPinInner>>>>,
     recovery_checkpoint_root_pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
+    recovery_checkpoint_root_pin_handles: Arc<Mutex<Vec<Weak<RecoveryCheckpointRootPinInner>>>>,
     metadata_gc_barrier: Arc<RwLock<()>>,
     metadata_gc_epoch: Arc<AtomicU64>,
     metadata_gc_clean: Arc<Mutex<Option<MetadataGcCleanState>>>,
     metadata_gc_delta: Arc<Mutex<MetadataGcDeltaJournal>>,
     metadata_gc_run_lock: Arc<Mutex<()>>,
+    wal_writer: Arc<Mutex<Option<Arc<LogSnapshot>>>>,
+    previous_namespace_root: Arc<Mutex<PreviousNamespaceRootCache>>,
     maintenance_cancellation: Option<crate::MaintenanceCancellation>,
 }
+
+type PreviousNamespaceRootCache = Option<(MetadataObjectId, Arc<NamespaceRoot>)>;
 
 #[derive(Clone)]
 pub(crate) struct MetadataRootPin {
@@ -118,10 +123,15 @@ struct MetadataRootPinInner {
 }
 
 struct RecoveryCheckpointRootPin {
+    inner: Arc<RecoveryCheckpointRootPinInner>,
+}
+
+struct RecoveryCheckpointRootPinInner {
     root: MetadataObjectId,
     pins: Arc<Mutex<BTreeMap<MetadataObjectId, usize>>>,
     metadata_gc_epoch: Arc<AtomicU64>,
     metadata_gc_delta: Arc<Mutex<MetadataGcDeltaJournal>>,
+    release_requires_exact: AtomicBool,
 }
 
 struct RecoveryCheckpointCandidate {
@@ -206,11 +216,14 @@ impl<I: StorageIo> GenerationRepository<I> {
             metadata_root_pins: Arc::new(Mutex::new(BTreeMap::new())),
             metadata_root_pin_handles: Arc::new(Mutex::new(Vec::new())),
             recovery_checkpoint_root_pins: Arc::new(Mutex::new(BTreeMap::new())),
+            recovery_checkpoint_root_pin_handles: Arc::new(Mutex::new(Vec::new())),
             metadata_gc_barrier: Arc::new(RwLock::new(())),
             metadata_gc_epoch: Arc::new(AtomicU64::new(0)),
             metadata_gc_clean: Arc::new(Mutex::new(None)),
             metadata_gc_delta: Arc::new(Mutex::new(MetadataGcDeltaJournal::default())),
             metadata_gc_run_lock: Arc::new(Mutex::new(())),
+            wal_writer: Arc::new(Mutex::new(None)),
+            previous_namespace_root: Arc::new(Mutex::new(None)),
             maintenance_cancellation: None,
         }
     }
@@ -221,6 +234,42 @@ impl<I: StorageIo> GenerationRepository<I> {
     ) -> Self {
         self.maintenance_cancellation = Some(token);
         self
+    }
+
+    pub(super) fn wal_writer_cache(&self) -> std::sync::MutexGuard<'_, Option<Arc<LogSnapshot>>> {
+        self.wal_writer
+            .lock()
+            .expect("ASSERT: Commit WAL writer snapshot lock poisoned")
+    }
+
+    pub(super) fn invalidate_wal_writer_cache(&self) {
+        *self.wal_writer_cache() = None;
+    }
+
+    pub(super) fn cached_previous_namespace_root(
+        &self,
+        object_id: MetadataObjectId,
+    ) -> Option<Arc<NamespaceRoot>> {
+        let cache = self
+            .previous_namespace_root
+            .lock()
+            .expect("ASSERT: previous Namespace Root cache lock poisoned");
+        cache
+            .as_ref()
+            .filter(|(cached, _)| *cached == object_id)
+            .map(|(_, root)| Arc::clone(root))
+    }
+
+    pub(super) fn remember_previous_namespace_root(
+        &self,
+        object_id: MetadataObjectId,
+        root: Arc<NamespaceRoot>,
+    ) {
+        let mut cache = self
+            .previous_namespace_root
+            .lock()
+            .expect("ASSERT: previous Namespace Root cache lock poisoned");
+        *cache = Some((object_id, root));
     }
 
     fn check_maintenance(&self) -> io::Result<()> {

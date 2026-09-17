@@ -4,8 +4,8 @@ use fastdup_appliance::{
 };
 use fastdup_format::ChunkId;
 use fastdup_posix::{
-    HandleId, InodeId, MutationPayload, Namespace, NamespaceConfig, OpenOptions, Operation,
-    ROOT_INODE, Reply, RequestContext,
+    AdmissionPauseReason, HandleId, InodeId, MutationPayload, Namespace, NamespaceConfig,
+    OpenOptions, Operation, PosixError, ROOT_INODE, Reply, RequestContext,
 };
 use fastdup_store::{
     ContainerRepository, ExactIndexRunRepository, GenerationRepository, MaintenanceRepository,
@@ -1184,6 +1184,91 @@ fn admission_blocks_only_after_the_bounded_ingest_queue_fills() {
 }
 
 #[test]
+fn checkpoint_pause_releases_writers_blocked_by_ingest_backpressure() {
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let (inode, handle) = create_file(&appliance, b"pause-under-ingest-pressure");
+    let block = fixture_block();
+    let written_block = block.clone();
+    let writer_appliance = Arc::clone(&appliance);
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let mut completed = 0_u64;
+        for ordinal in 0_u64..128 {
+            let result = writer_appliance.namespace().dispatch(
+                CALLER,
+                Operation::Write {
+                    inode,
+                    handle,
+                    offset: ordinal * 1_048_576,
+                    data: &written_block,
+                },
+            );
+            match result {
+                Ok(Reply::Written { .. }) => completed = ordinal + 1,
+                Err(PosixError::Again) => break,
+                Ok(reply) => panic!("unexpected write reply: {reply:?}"),
+                Err(error) => panic!("unexpected write error: {error:?}"),
+            }
+        }
+        finished_tx
+            .send(completed)
+            .expect("test receiver remains available");
+    });
+
+    assert!(
+        paused.wait_until_reached(STORAGE_REACH_TIMEOUT),
+        "stream reaches blocked Container durability"
+    );
+    assert!(
+        finished_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_err(),
+        "fixture must leave an admitted write waiting at ingest backpressure"
+    );
+    assert!(appliance.namespace().mutation_admission_open());
+
+    appliance
+        .namespace()
+        .pause_mutation_admission_for(AdmissionPauseReason::CheckpointTimeout);
+    let completed = finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("closing admission must release the blocked write and stop new admissions");
+    writer
+        .join()
+        .expect("admitted writer must finish after admission closes");
+    assert!(completed > 0);
+    assert!(completed < 128);
+    assert!(appliance.namespace().mutation_admission_closing());
+
+    let last_offset = (completed - 1) * 1_048_576;
+    let Reply::Data(suffix) = appliance
+        .namespace()
+        .dispatch(
+            CALLER,
+            Operation::Read {
+                inode,
+                handle,
+                offset: last_offset,
+                length: 4_096,
+            },
+        )
+        .expect("the last admitted write remains live while admission is closed")
+    else {
+        panic!("read returned the wrong reply");
+    };
+    assert_eq!(suffix, &block[..4_096]);
+
+    paused.resume();
+    appliance.namespace().resume_mutation_admission();
+    assert!(appliance.namespace().mutation_admission_open());
+}
+
+#[test]
 fn status_does_not_deadlock_a_full_single_stream_publication_queue() {
     let paused = PausedStorageIo::disarmed_before_name_prefix(
         MemoryStorageIo::new(),
@@ -1491,13 +1576,13 @@ fn sequential_writes_publish_reduced_data_before_the_namespace_commit() {
         appliance
             .write_through_status()
             .sealed_uncommitted_containers(),
-        1,
-        "the post-cut partial Container remains trigger evidence until an empty cut proves it stale"
+        0,
+        "the drained partial Lane merged into the committed Container instead of sealing one"
     );
     assert!(
         appliance
             .checkpoint_profiled()
-            .expect("clear stale post-cut Container evidence")
+            .expect("leave no stale post-cut Container evidence")
             .is_none()
     );
     assert_eq!(
@@ -1755,10 +1840,11 @@ fn parallel_lanes_publish_one_complete_exact_index_history() {
     fence_ingest(&appliance, inode_a, handle_a);
     fence_ingest(&appliance, inode_b, handle_b);
 
-    assert_eq!(
-        appliance.exact_index_run_count(),
-        2,
-        "both L0 publications must survive one serialized activation history"
+    let runs = appliance.exact_index_run_count();
+    assert!(
+        (1..=2).contains(&runs),
+        "coalesced L0 publications may share one durable Run, but both writers' entries must \
+         survive one serialized activation history: {runs} runs"
     );
     assert_eq!(read_fixture(&appliance, inode_a, handle_a), expected_a);
     assert_eq!(read_fixture(&appliance, inode_b, handle_b), expected_b);
@@ -1767,7 +1853,12 @@ fn parallel_lanes_publish_one_complete_exact_index_history() {
         .recover_active()
         .expect("recover the serialized activation history")
         .expect("parallel publishers activated one durable Run Set");
-    assert_eq!(recovered.run_count(), 2);
+    assert!(
+        (1..=2).contains(&recovered.run_count()),
+        "coalesced L0 publications may share one durable Run, but both writers' entries must \
+         survive recovery: {} runs",
+        recovered.run_count()
+    );
 }
 
 #[test]
@@ -1930,9 +2021,14 @@ fn checkpoint_flushes_stable_partial_lane_before_forming_the_frozen_cut() {
         .expect("checkpoint the partial Ingest Lane")
         .expect("the partial lane has one dirty generation");
     assert!(
-        committed.metrics().recipe_reuse_bytes() >= 15 * 1_024 * 1_024,
-        "stable partial-lane Chunks must become recipes before the cut: {:?}",
+        committed.metrics().drain_merged_bytes() >= 15 * 1_024 * 1_024,
+        "stable partial-lane Chunks must merge into the commit Writer before the cut: {:?}",
         committed.metrics()
+    );
+    assert_eq!(
+        committed.metrics().recipe_reuse_bytes(),
+        0,
+        "the drained Lane prefix is merged, not republished as a partial Container"
     );
     assert!(
         committed.metrics().checkpoint_rechunk_bytes() <= 1_024 * 1_024,

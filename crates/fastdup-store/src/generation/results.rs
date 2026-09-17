@@ -26,6 +26,7 @@ pub enum MetadataGcMarkMode {
     #[default]
     Reused,
     AdditionDelta,
+    CatalogCompaction,
     ExactSnapshot,
 }
 
@@ -124,6 +125,7 @@ impl MetadataGcMarkMode {
         match self {
             Self::Reused => "reused",
             Self::AdditionDelta => "addition_delta",
+            Self::CatalogCompaction => "catalog_compaction",
             Self::ExactSnapshot => "exact_snapshot",
         }
     }

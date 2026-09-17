@@ -180,3 +180,59 @@ fn validated_admission_obeys_intent_capacity_and_invalidation() {
     );
     assert_eq!(reads.get(), 4, "zero capacity must reject admission");
 }
+
+#[test]
+fn scan_miss_fills_headroom_so_the_next_scan_pass_skips_the_loader() {
+    let (id, bytes) = object(5);
+    let cache = MetadataObjectCache::limited(1 << 20);
+    let reads = std::cell::Cell::new(0);
+    for _pass in 0..2 {
+        let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
+        let value = cache
+            .read(id, || {
+                reads.set(reads.get() + 1);
+                Ok(bytes.clone())
+            })
+            .unwrap();
+        assert_eq!(*value, bytes);
+    }
+    assert_eq!(reads.get(), 1, "a Scan miss fills eviction-free headroom");
+    assert_eq!(
+        cache.cache.stats().resident_bytes,
+        bytes.capacity() as u64 + size_of::<Vec<u8>>() as u64 + 512
+    );
+}
+
+#[test]
+fn scan_fill_declines_at_the_target_and_never_displaces_demand_bytes() {
+    let (warm, warm_bytes) = object(6);
+    let charge = (warm_bytes.capacity() + size_of::<Vec<u8>>()) as u64;
+    let cache = MetadataObjectCache::limited(charge + 512);
+    assert_eq!(
+        *cache.read(warm, || Ok(warm_bytes.clone())).unwrap(),
+        warm_bytes
+    );
+    let mut cold_reads = 0;
+    {
+        let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
+        let (cold, cold_bytes) = object(7);
+        for _ in 0..2 {
+            cache
+                .read(cold, || {
+                    cold_reads += 1;
+                    Ok(cold_bytes.clone())
+                })
+                .unwrap();
+        }
+    }
+    assert_eq!(cold_reads, 2, "a full target declines the next Scan miss");
+    assert_eq!(cache.cache.stats().resident_bytes, charge + 512);
+    assert_eq!(
+        *cache
+            .read(warm, || panic!(
+                "Scan must not displace a demand resident entry"
+            ))
+            .unwrap(),
+        warm_bytes
+    );
+}

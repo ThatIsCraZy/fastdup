@@ -413,3 +413,40 @@ than cache acceleration: at roughly 10 bits per active key, it costs less than
 one percent of the active Exact page charge while preserving warm lookup and GC
 reuse without waiting for a cold filter rebuild. An out-of-memory filter
 construction remains false-negative-safe and is retried by later warm cycles.
+
+## Scan fills eviction-free headroom (2026-09-16)
+
+Both tiers are read through `O_DIRECT`, and this common cache is the only
+file-content reuse owner. The Linux page cache is not a fallback for any miss,
+so a Scan pass that categorically declined admission reread the same immutable
+Metadata graph, candidate/catalog pages, storage ranges and descriptors from the
+device on every GC quantum even while the common budget was empty. Keeping the
+right bytes resident is this owner's job; a cold Scan miss against free budget
+wasted the headroom it should have used.
+
+Scan intent now admits within eviction-free headroom only:
+
+- A Scan miss may be admitted only when the current common target and the
+  class ceilings are already satisfied. Its admission skips the victim search
+  entirely, so a Scan admission never evicts a resident entry, never grows a
+  class past its ceiling and never exceeds the common target. Rejection under
+  a full target is a reuse miss, never a correctness event.
+- Demand admission and reclamation are unchanged. A Scan-admitted entry starts
+  at zero reuse credit, so one-pass bytes that earn no later hit are reclaimed
+  before bytes that did. Governor-disabled admission (zero target, Process Swap
+  or sampling failure) leaves Scan filling nothing.
+- The Verified DATA payload rule and Location-evidence rule stand for
+  verification-only work: a verification-only Scan load retains no payload,
+  encoded storage range or Location evidence, and that evidence is handed off
+  only after the caller restores Demand intent. Only a content read whose
+  bytes actually return to the caller may retain verified DATA within the same
+  eviction-free headroom, so Online-GC relocation rereads hit instead of
+  refetching. Writer-provenance `admit_validated` offers remain Demand-only.
+
+This supersedes the Scan bullet of "Read intent and Online GC" above: Scan
+permits hits and fills eviction-free headroom, while Independent still bypasses
+everything and declines admission. GC, checkpoint planning and catalog passes
+keep Scan intent; their publication, deletion and verification duties never
+depend on residency, and an empty or full cache changes only latency, never
+outcome. Paired tests: the unified-engine headroom-fill/no-displace case and
+the Metadata-object scan-fill cases in `fastdup-store`.

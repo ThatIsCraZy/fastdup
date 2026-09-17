@@ -75,7 +75,7 @@ fn verified_manifest_reads_share_one_bounded_cache_without_second_storage_read()
 }
 
 #[test]
-fn scan_read_supplies_verified_bytes_without_displacing_demand_cache() {
+fn scan_read_supplies_verified_bytes_and_warms_the_next_pass() {
     let storage = MemoryStorageIo::new();
     let containers = ContainerRepository::new(storage.clone());
     let payload = vec![0x5C; 64 * 1_024];
@@ -126,10 +126,30 @@ fn scan_read_supplies_verified_bytes_without_displacing_demand_cache() {
 
     assert!(storage.operation_count() > baseline);
     let status = cache.status();
-    assert_eq!(status.admissions(), 0);
-    assert_eq!(status.entry_count(), 0);
-    assert_eq!(status.resident_bytes(), 0);
-    assert_eq!(status.compressed_admissions(), 0);
+    assert_eq!(
+        status.admissions(),
+        1,
+        "a Scan content read fills eviction-free headroom"
+    );
+    assert_eq!(status.entry_count(), 1);
+    assert!(status.resident_bytes() <= status.target_bytes());
+    let after_first = storage.operation_count();
+    assert_eq!(
+        {
+            let _scan = ReadIntentScope::enter(ReadIntent::Scan);
+            file.read_at(
+                0,
+                u32::try_from(payload.len()).expect("fixture length fits u32"),
+            )
+        }
+        .expect("resident verified bytes serve the second Scan pass"),
+        payload
+    );
+    assert_eq!(
+        storage.operation_count(),
+        after_first,
+        "a warm Scan pass must not reread the retained payload"
+    );
 }
 
 #[test]

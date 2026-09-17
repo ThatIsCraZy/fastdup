@@ -64,3 +64,43 @@ I/O failure. It never installs a partial mark as a clean state. The next owner
 or uncancelled pass derives a fresh exact mark from Commit and live-pin authority.
 The fault regression stops inside both candidate reading and deletion, simulates
 process loss, checks the committed graph with Scrub, and requires an exact retry.
+
+## WAL-covered Recovery Checkpoint root pins are release-exempt (17 September 2026)
+
+Recovery Checkpoint publication selects candidates only from the retained Commit
+segment and pins each selected Namespace Root before graph copying. Acquisition
+of such a WAL-covered root therefore protects graph bytes whose marking authority
+is already the retained Commit Record; it does not dirty a clean mark or force an
+exact Metadata pass. Its release is likewise release-exempt while that covering
+Commit Record remains in the segment.
+
+Before WAL rotation can evict a covering Record, the Commit writer re-arms every
+live WAL-covered Recovery Checkpoint root pin. A subsequent final release, or any
+release of an unarmored pin, changes protected-set authority and forces the same
+complete exact mark required by any other potential root removal. Duplicate
+acquisition and non-final release remain no-ops, and process start still performs
+the mandatory exact Commit/Pin refresh. Cleanup of dead weak pin handles is
+bookkeeping only and never changes armament or liveness.
+
+This refines the every-root-removal sentence of ADR 0067 without weakening exact
+deletion authority. Catalog reuse still never trusts the temporary Recovery
+Checkpoint pin registry as a graph scan; every exact pass re-scans live roots, and
+candidate verification remains byte-identical before unlink.
+
+## Chain-length compaction preserves authoritative marks (17 September 2026)
+
+Reaching the 32-run addition-chain limit alone no longer re-reads the durable
+Namespace and Manifest graphs. If the existing catalog chain is internally valid
+and the journal contains only classified additions, maintenance may acquire the
+same publication barrier and Commit lock used by an exact pass, reload the clean
+mark and journal, then materialize a new Snapshot run whose row set is the chain
+union plus those additions, replace the old catalog names with one directory sync,
+and continue from that clean tail. Compaction inherits deletion authority only from
+the earlier exact Snapshot that seeded the chain; it cannot authorize an unlink in
+the compacting quantum itself and grants no new reachability inference.
+
+Corruption, a noncontiguous chain, exact-required root/WAL events, unclassified
+publication, or any compaction race leaves the next pass exact-required. The new
+Snapshot still binds the current Commit segment and uses the existing v2 format;
+Scrub audits its chain and rows independently, and recovery never uses a catalog
+as authority.

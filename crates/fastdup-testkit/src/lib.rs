@@ -317,6 +317,15 @@ impl MemoryStorageIo {
         state.fail_after = None;
     }
 
+    /// Arms one fault position after fixture setup has finished. Cache-resident
+    /// reads can shorten an operation sequence, so a replay must arm against its
+    /// own baseline rather than a position recorded by another storage.
+    pub fn arm_failpoint(&self, fail_after: bool, operation_position: usize) {
+        let mut state = self.lock();
+        state.fail_before = (!fail_after).then_some(operation_position);
+        state.fail_after = fail_after.then_some(operation_position);
+    }
+
     #[must_use]
     pub fn operation_count(&self) -> usize {
         self.lock().operations.len()

@@ -10,9 +10,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
-#[cfg(test)]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use fastdup_format::ContainerId;
@@ -62,8 +60,14 @@ const SEQCDC_CONFIG_V1: SeqCdcConfig = SeqCdcConfig {
     maximum_bytes: CDC_MAXIMUM_BYTES,
 };
 const EXACT_PUBLICATION_QUEUE_BATCHES: usize = 8;
-// Opportunistic batches never wait for more work and never cross a flush.
+// ACTIVE additions join one bounded collection buffer and publish as one L0
+// family and one activation when the entry bound, the command bound, or the
+// collection window is reached. A Flush fence and every non-ACTIVE transition
+// force the buffer out first; activation history stays acceleration-only, so
+// the bounded window never delays durability, only exact-hit reuse which the
+// recent overlay already covers.
 const EXACT_PUBLICATION_BATCH_ENTRIES: usize = 16_384;
+const EXACT_PUBLICATION_COALESCE_WINDOW: Duration = Duration::from_millis(50);
 const MAX_RECENT_EXACT_LOCATIONS: usize = 8_192;
 // Shared admission cap for cached Active and Frozen dependency proofs.
 // Externalized DATA and short boundary Chunks are not bounded by resident bytes.
@@ -1188,6 +1192,19 @@ impl<X: Clone + StorageIo> IndexedManifestReaders<X> {
     }
 }
 
+/// One bounded collection of ACTIVE-addition publication commands waiting for
+/// a single combined L0 append and activation. Guards pin every included DATA
+/// reference until the combined activation, overlay retirement, and similarity
+/// handoff complete.
+struct CoalescedAdditions {
+    deadline: Instant,
+    entries: Vec<ExactIndexEntry>,
+    similarity_batches: Vec<Vec<fastdup_format::SimilarityIndexEntry>>,
+    guards: Vec<fastdup_store::DataReferenceGuard>,
+    publish_timers: Vec<fastdup_store::OperationTimer>,
+    commands: usize,
+}
+
 impl ExactPublicationQueue {
     fn start<X>(core: Arc<ExactPublisherCore<X>>) -> io::Result<Self>
     where
@@ -1206,6 +1223,71 @@ impl ExactPublicationQueue {
         })
     }
 
+    fn publish_collected<X>(
+        core: &ExactPublisherCore<X>,
+        timings: &ExactQueueTimings,
+        batch: &mut CoalescedAdditions,
+    ) where
+        X: Clone + Send + Sync + StorageIo + 'static,
+    {
+        let _batch = timings.batch.begin();
+        if batch.commands > 1 {
+            // Identical repeated additions are idempotent. Distinct
+            // Locations survive; conflicting physical identities
+            // still fail the Run writer's canonical validation.
+            batch.entries.sort_unstable_by_key(|entry| {
+                let location = entry.location();
+                (
+                    entry.chunk_id(),
+                    entry.logical_length(),
+                    location.container_id().bytes(),
+                    location.record_offset(),
+                    location.chunk_ordinal(),
+                )
+            });
+            batch.entries.dedup();
+        }
+        let entries = std::mem::take(&mut batch.entries);
+        let result = core
+            .repository
+            .append_level_zero(core.profile, entries.clone());
+        if result.is_err() {
+            core.degraded.store(true, Ordering::Release);
+            if let Some(guard) = batch.guards.pop() {
+                core.failed_reduction_guard
+                    .lock()
+                    .expect("failed reduction guard lock")
+                    .get_or_insert(guard);
+            }
+        } else {
+            if let Some(queue) = &core.similarity {
+                for similarities in batch.similarity_batches.drain(..) {
+                    queue.publish(similarities);
+                }
+            }
+            core.degraded.store(false, Ordering::Release);
+        }
+        core.forget_recent(&entries);
+        // All DATA admissions survive activation, similarity handoff
+        // and overlay retirement, including error handling above.
+        drop(std::mem::take(&mut batch.guards));
+        drop(std::mem::take(&mut batch.publish_timers));
+    }
+
+    fn flush_collected<X>(
+        core: &ExactPublisherCore<X>,
+        timings: &ExactQueueTimings,
+        buffer: &mut Option<CoalescedAdditions>,
+    ) where
+        X: Clone + Send + Sync + StorageIo + 'static,
+    {
+        if let Some(batch) = buffer.as_mut() {
+            Self::publish_collected(core, timings, batch);
+            *buffer = None;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn run<X>(
         core: &ExactPublisherCore<X>,
         receiver: &mpsc::Receiver<(
@@ -1217,94 +1299,99 @@ impl ExactPublicationQueue {
         X: Clone + Send + Sync + StorageIo + 'static,
     {
         let mut pending = None;
-        while let Some((command, queued)) = pending.take().or_else(|| receiver.recv().ok()) {
+        let mut buffer: Option<CoalescedAdditions> = None;
+        loop {
+            let (command, queued) = if let Some(pair) = pending.take() {
+                pair
+            } else {
+                let incoming = if let Some(batch) = &buffer {
+                    match receiver
+                        .recv_timeout(batch.deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(item) => Some(item),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            Self::flush_collected(core, timings, &mut buffer);
+                            continue;
+                        }
+                    }
+                } else {
+                    receiver.recv().ok()
+                };
+                if let Some(pair) = incoming {
+                    pair
+                } else {
+                    Self::flush_collected(core, timings, &mut buffer);
+                    break;
+                }
+            };
             drop(queued);
             match command {
-                ExactPublicationCommand::Publish(mut entries, similarities, guard) => {
-                    let _batch = timings.batch.begin();
-                    let mut publications = vec![timings.publish.begin()];
-                    let mut similarity_batches = vec![similarities];
-                    let mut guards: Vec<_> = guard.into_iter().collect();
-                    let mut commands = 1;
-                    let additions_only = entries.iter().all(|entry| {
+                ExactPublicationCommand::Publish(entries, similarities, guard)
+                    if entries.iter().all(|entry| {
                         entry.transition() == fastdup_format::ExactLocationTransition::Active
-                    });
+                    }) =>
+                {
                     // Only ordinary ACTIVE additions may share an activation.
-                    // A transition command retains its own precedence boundary.
-                    while commands < EXACT_PUBLICATION_QUEUE_BATCHES
-                        && entries.len() < EXACT_PUBLICATION_BATCH_ENTRIES
-                        && additions_only
-                    {
-                        let Ok((next, waiting)) = receiver.try_recv() else {
-                            break;
-                        };
-                        match next {
-                            ExactPublicationCommand::Publish(more, similarities, guard)
-                                if more.len()
-                                    <= EXACT_PUBLICATION_BATCH_ENTRIES - entries.len()
-                                    && more.iter().all(|entry| {
-                                        entry.transition()
-                                            == fastdup_format::ExactLocationTransition::Active
-                                    }) =>
-                            {
-                                drop(waiting);
-                                entries.extend(more);
-                                similarity_batches.push(similarities);
-                                guards.extend(guard);
-                                publications.push(timings.publish.begin());
-                                commands += 1;
-                            }
-                            other => {
-                                pending = Some((other, waiting));
-                                break;
-                            }
-                        }
+                    let exceeds = buffer.as_ref().is_some_and(|batch| {
+                        batch
+                            .entries
+                            .len()
+                            .checked_add(entries.len())
+                            .is_none_or(|total| total > EXACT_PUBLICATION_BATCH_ENTRIES)
+                            || batch.commands >= EXACT_PUBLICATION_QUEUE_BATCHES
+                    });
+                    if exceeds {
+                        Self::flush_collected(core, timings, &mut buffer);
                     }
-                    if commands > 1 {
-                        // Identical repeated additions are idempotent. Distinct
-                        // Locations survive; conflicting physical identities
-                        // still fail the Run writer's canonical validation.
-                        entries.sort_unstable_by_key(|entry| {
-                            let location = entry.location();
-                            (
-                                entry.chunk_id(),
-                                entry.logical_length(),
-                                location.container_id().bytes(),
-                                location.record_offset(),
-                                location.chunk_ordinal(),
-                            )
-                        });
-                        entries.dedup();
-                    }
-                    let result = core
-                        .repository
-                        .append_level_zero(core.profile, entries.clone());
-                    if result.is_err() {
-                        core.degraded.store(true, Ordering::Release);
-                        if let Some(guard) = guards.pop() {
-                            core.failed_reduction_guard
-                                .lock()
-                                .expect("failed reduction guard lock")
-                                .get_or_insert(guard);
-                        }
+                    if let Some(batch) = &mut buffer {
+                        batch.publish_timers.push(timings.publish.begin());
+                        batch.entries.extend(entries);
+                        batch.similarity_batches.push(similarities);
+                        batch.guards.extend(guard);
+                        batch.commands += 1;
                     } else {
-                        if let Some(queue) = &core.similarity {
-                            for similarities in similarity_batches {
-                                queue.publish(similarities);
-                            }
+                        let mut batch = CoalescedAdditions {
+                            deadline: Instant::now() + EXACT_PUBLICATION_COALESCE_WINDOW,
+                            entries,
+                            similarity_batches: vec![similarities],
+                            guards: guard.into_iter().collect(),
+                            publish_timers: vec![timings.publish.begin()],
+                            commands: 1,
+                        };
+                        // An individually bound-reaching command runs alone.
+                        if batch.entries.len() >= EXACT_PUBLICATION_BATCH_ENTRIES {
+                            Self::publish_collected(core, timings, &mut batch);
+                        } else {
+                            buffer = Some(batch);
                         }
-                        core.degraded.store(false, Ordering::Release);
                     }
-                    core.forget_recent(&entries);
-                    // All DATA admissions survive activation, similarity handoff
-                    // and overlay retirement, including error handling above.
-                    drop(guards);
-                    drop(publications);
+                }
+                ExactPublicationCommand::Publish(entries, similarities, guard) => {
+                    // A transition command retains its own precedence boundary:
+                    // everything collected earlier activates first.
+                    Self::flush_collected(core, timings, &mut buffer);
+                    let mut alone = CoalescedAdditions {
+                        deadline: Instant::now(),
+                        entries,
+                        similarity_batches: vec![similarities],
+                        guards: guard.into_iter().collect(),
+                        publish_timers: vec![timings.publish.begin()],
+                        commands: 1,
+                    };
+                    Self::publish_collected(core, timings, &mut alone);
                 }
                 ExactPublicationCommand::Flush(reply) => {
+                    // The commit fence forces the collected window out before
+                    // it acknowledges; no committed generation ever activates
+                    // behind an unprocessed collection.
+                    Self::flush_collected(core, timings, &mut buffer);
                     let _ = reply.send(());
                 }
-                ExactPublicationCommand::Shutdown => break,
+                ExactPublicationCommand::Shutdown => {
+                    Self::flush_collected(core, timings, &mut buffer);
+                    break;
+                }
             }
         }
     }
@@ -2238,9 +2325,9 @@ where
         freeze_started.finish_into(&mut metrics.freeze);
         self.write_through
             .wait_for_commit_cut(&commit, timings, &mut metrics);
-        let stable = self
-            .write_through
-            .flush_stable_for_commit_cut(timings, &mut metrics)?;
+        let (stable, residues) =
+            self.write_through
+                .flush_stable_for_commit_cut(&commit, timings, &mut metrics)?;
         let attach_started = timings.begin(CheckpointStage::RecipeAttach);
         self.namespace.externalize_verified_extents(stable);
         attach_started.finish_into(&mut metrics.recipe_attach);
@@ -2251,6 +2338,7 @@ where
             self.manifest_readers.as_ref(),
             self.checkpoint_workers,
             Arc::clone(&self.online_dependency_proofs),
+            residues,
         );
         setup_started.finish_into(&mut metrics.writer_setup);
         let manifest_plan_started = timings.begin(CheckpointStage::ManifestPlan);

@@ -301,6 +301,14 @@ The measured work reduction and recovery/fault checks are recorded in
 
 ## Shared commit-cut drain batching (2026-09-16)
 
+Superseded on 17 September 2026 by [ADR 0093](0093-merge-commit-cut-drain-residue-into-the-checkpoint-writer.md):
+at the commit cut, complete Pending Chunks are merged directly into the
+checkpoint Writer as DATA extents, and the group, barrier, and local-reservation
+mechanics below no longer exist. The 64-MiB detached-publication queue serves
+only staging-threshold flushes and Lane resets at discontinuities, and the
+paragraph above this section describing a partial commit drain through that
+queue is superseded with this section.
+
 Partial commit drains may combine already detached Pending Chunks from distinct
 inodes when they select the same Container placement and advanced-reduction
 policy. One shared group carries at most one 32-MiB Container target. It is

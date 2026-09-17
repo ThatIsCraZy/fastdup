@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,118 @@ use crate::{MAX_STORAGE_RANGE_BYTES, StorageIo, StoreError};
 const CHECKPOINT_PREFIX: &str = "recovery-checkpoint.";
 const CHECKPOINT_SUFFIX: &str = ".fdrc";
 const HEAD_NAMES: [&str; 2] = ["recovery-checkpoint.0.head", "recovery-checkpoint.1.head"];
+const CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT: usize = 8_388_608;
+
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+struct CheckpointProtectedIdentity {
+    generation: u64,
+    file_length: u64,
+    body_hash: [u8; 32],
+}
+
+struct ProtectedChunkEntry {
+    chunk_id: ChunkId,
+    logical_length: u32,
+}
+
+struct CheckpointProtectedChunkSet {
+    entries: Vec<ProtectedChunkEntry>,
+}
+
+impl CheckpointProtectedChunkSet {
+    fn matched(&self, selected: &BTreeSet<ChunkId>) -> BTreeMap<ChunkId, u64> {
+        let mut matched = BTreeMap::new();
+        for chunk_id in selected {
+            if let Ok(index) = self
+                .entries
+                .binary_search_by(|entry| entry.chunk_id.cmp(chunk_id))
+            {
+                matched.insert(*chunk_id, u64::from(self.entries[index].logical_length));
+            }
+        }
+        matched
+    }
+}
+
+#[derive(Default)]
+struct CheckpointProtectedChunkCacheState {
+    entries: HashMap<CheckpointProtectedIdentity, Arc<CheckpointProtectedChunkSet>>,
+    retained_chunks: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct CheckpointProtectedChunkCache {
+    state: Mutex<CheckpointProtectedChunkCacheState>,
+}
+
+impl CheckpointProtectedChunkCache {
+    fn retain_current(&self, active: &HashSet<CheckpointProtectedIdentity>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state
+            .entries
+            .retain(|identity, _| active.contains(identity));
+        state.retained_chunks = state
+            .entries
+            .values()
+            .map(|entry| entry.entries.len())
+            .sum::<usize>();
+    }
+
+    fn get(
+        &self,
+        identity: &CheckpointProtectedIdentity,
+    ) -> Option<Arc<CheckpointProtectedChunkSet>> {
+        self.state.lock().ok()?.entries.get(identity).cloned()
+    }
+
+    fn invalidate(&self, identity: &CheckpointProtectedIdentity) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(entry) = state.entries.remove(identity) {
+            state.retained_chunks = state.retained_chunks.saturating_sub(entry.entries.len());
+        }
+    }
+
+    fn insert(
+        &self,
+        identity: CheckpointProtectedIdentity,
+        entries: Vec<ProtectedChunkEntry>,
+    ) -> Option<Arc<CheckpointProtectedChunkSet>> {
+        if entries.len() > CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT {
+            return None;
+        }
+        let inserted = Arc::new(CheckpointProtectedChunkSet { entries });
+        let Ok(mut state) = self.state.lock() else {
+            return Some(inserted.clone());
+        };
+        if let Some(previous) = state.entries.remove(&identity) {
+            state.retained_chunks = state.retained_chunks.saturating_sub(previous.entries.len());
+        }
+        let retained = state.retained_chunks.saturating_add(inserted.entries.len());
+        if retained > CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT {
+            return Some(inserted);
+        }
+        state.retained_chunks = retained;
+        state.entries.insert(identity, inserted.clone());
+        Some(inserted)
+    }
+
+    #[cfg(test)]
+    fn cached_checkpoint_count_for_test(&self) -> usize {
+        self.state.lock().map_or(0, |state| state.entries.len())
+    }
+}
+
+impl fmt::Debug for CheckpointProtectedChunkCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CheckpointProtectedChunkCache")
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RecoveryCheckpointRepository<I> {
@@ -221,19 +333,28 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
     pub(crate) fn protected_chunks_matching(
         &self,
         selected_chunks: &BTreeSet<ChunkId>,
+        cache: Option<&CheckpointProtectedChunkCache>,
     ) -> Result<BTreeMap<ChunkId, u64>, RecoveryCheckpointError> {
+        let candidates = self.head_candidates(false)?;
+        if let Some(cache) = cache {
+            cache.retain_current(
+                &candidates
+                    .iter()
+                    .map(|(head, _)| Self::protected_identity(*head))
+                    .collect(),
+            );
+        }
         let mut protected = BTreeMap::new();
         let mut complete = 0_usize;
-        for (head, name) in self.head_candidates(false)? {
-            let audited = match self.audit_head_candidate(head, &name) {
-                Ok(audited) => audited,
-                Err(error) if error.is_candidate_corruption() => continue,
-                Err(error) => return Err(error),
+        for (head, name) in candidates {
+            let required = match cache {
+                Some(cache) => {
+                    self.matched_from_cached_head(head, &name, selected_chunks, cache)?
+                }
+                None => self.matched_from_audited_head(head, &name, selected_chunks)?,
             };
-            let (_, required) = match self.scan_graph_matching(&audited, selected_chunks) {
-                Ok(scanned) => scanned,
-                Err(error) if error.is_candidate_corruption() => continue,
-                Err(error) => return Err(error),
+            let Some(required) = required else {
+                continue;
             };
             for (chunk_id, logical_length) in required {
                 if let Some(previous) = protected.insert(chunk_id, logical_length)
@@ -248,6 +369,93 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
             }
         }
         Ok(protected)
+    }
+
+    fn protected_identity(head: RecoveryCheckpointHeadRecord) -> CheckpointProtectedIdentity {
+        CheckpointProtectedIdentity {
+            generation: head.generation(),
+            file_length: head.file_length(),
+            body_hash: head.checkpoint_body_hash(),
+        }
+    }
+
+    fn matched_from_cached_head(
+        &self,
+        head: RecoveryCheckpointHeadRecord,
+        name: &str,
+        selected_chunks: &BTreeSet<ChunkId>,
+        cache: &CheckpointProtectedChunkCache,
+    ) -> Result<Option<BTreeMap<ChunkId, u64>>, RecoveryCheckpointError> {
+        let identity = Self::protected_identity(head);
+        if let Some(cached) = cache.get(&identity).filter(|_| {
+            self.storage
+                .object_len(name)
+                .is_ok_and(|length| length == head.file_length())
+        }) {
+            return Ok(Some(cached.matched(selected_chunks)));
+        }
+        cache.invalidate(&identity);
+        let audited = match self.audit_head_candidate(head, name) {
+            Ok(audited) => audited,
+            Err(error) if error.is_candidate_corruption() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let all = match self.scan_graph_matching(&audited, None) {
+            Ok((_, all)) => all,
+            Err(RecoveryCheckpointError::Manifest(ManifestTreeError::InvalidReplacement)) => {
+                return Ok(Some(
+                    self.scan_graph_matching(&audited, Some(selected_chunks))?.1,
+                ));
+            }
+            Err(error) if error.is_candidate_corruption() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let required = all
+            .iter()
+            .filter(|(chunk_id, _)| selected_chunks.contains(chunk_id))
+            .map(|(chunk_id, logical_length)| (*chunk_id, *logical_length))
+            .collect();
+        if let Some(entries) = Self::cached_protected_entries(all) {
+            cache.insert(identity, entries);
+        }
+        Ok(Some(required))
+    }
+
+    fn matched_from_audited_head(
+        &self,
+        head: RecoveryCheckpointHeadRecord,
+        name: &str,
+        selected_chunks: &BTreeSet<ChunkId>,
+    ) -> Result<Option<BTreeMap<ChunkId, u64>>, RecoveryCheckpointError> {
+        let audited = match self.audit_head_candidate(head, name) {
+            Ok(audited) => audited,
+            Err(error) if error.is_candidate_corruption() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match self.scan_graph_matching(&audited, Some(selected_chunks)) {
+            Ok((_, required)) => Ok(Some(required)),
+            Err(error) if error.is_candidate_corruption() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn cached_protected_entries(
+        required: BTreeMap<ChunkId, u64>,
+    ) -> Option<Vec<ProtectedChunkEntry>> {
+        if required.len() > CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT {
+            return None;
+        }
+        required
+            .into_iter()
+            .map(|(chunk_id, logical_length)| {
+                u32::try_from(logical_length)
+                    .ok()
+                    .map(|logical_length| ProtectedChunkEntry {
+                        chunk_id,
+                        logical_length,
+                    })
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -841,11 +1049,11 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
     fn scan_graph_matching(
         &self,
         checkpoint: &AuditedCheckpoint,
-        selected_chunks: &BTreeSet<ChunkId>,
+        selected_chunks: Option<&BTreeSet<ChunkId>>,
     ) -> Result<(NamespaceRoot, BTreeMap<ChunkId, u64>), RecoveryCheckpointError> {
+        let mut encoded_shards = BTreeMap::new();
         let encoded_root = self.read_object(checkpoint, checkpoint.record.namespace_root())?;
         let descriptor = NamespaceGraphRoot::decode(&encoded_root)?;
-        let mut encoded_shards = BTreeMap::new();
         for reference in descriptor.shards() {
             let shard_id = reference.object_id();
             if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -866,6 +1074,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         reachable.extend(encoded_shards.keys().copied());
         let mut required = BTreeMap::new();
         let mut length_conflict = None;
+        let collect_all = selected_chunks.is_none();
         for inode in root.file_inodes() {
             let summary = scan_manifest_tree(
                 inode.manifest_root(),
@@ -887,8 +1096,14 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
                         } => (chunk_id, u64::from(chunk_length)),
                         ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => return Ok(()),
                     };
-                    if !selected_chunks.contains(&chunk_id) {
-                        return Ok(());
+                    if let Some(selected_chunks) = selected_chunks {
+                        if !selected_chunks.contains(&chunk_id) {
+                            return Ok(());
+                        }
+                    } else if collect_all
+                        && required.len() >= CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT
+                    {
+                        return Err(ManifestTreeError::InvalidReplacement);
                     }
                     if let Some(previous) = required.insert(chunk_id, logical_length)
                         && previous != logical_length
@@ -1242,6 +1457,70 @@ mod tests {
         assert_eq!(
             audited.objects.len() as u64,
             summary.metadata_object_count()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_protection_cache_answers_later_proofs_without_rereading_the_graph() {
+        let root = std::env::temp_dir().join(format!(
+            "checkpoint-protection-cache-{}",
+            std::process::id()
+        ));
+        let metadata = crate::FsStorageIo::open(root.join("metadata")).unwrap();
+        let data = crate::FsStorageIo::open(root.join("data")).unwrap();
+        let source = GenerationRepository::new(metadata, PolicySetId::new([1; 32]).unwrap());
+        source
+            .commit_namespace(&NamespaceRoot::new(1024, 2, 0, vec![], vec![]).unwrap())
+            .unwrap();
+        let manifest = ManifestLeaf::new(
+            8192,
+            vec![
+                ManifestExtent::Fill {
+                    logical_length: 4096,
+                    value: 0,
+                },
+                ManifestExtent::Fill {
+                    logical_length: 4096,
+                    value: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let manifest_id = source.publish_manifest(&manifest).unwrap();
+        let namespace = NamespaceRoot::new(
+            1024,
+            3,
+            1,
+            vec![DurableInode::new(2, 0o640, 1000, 1000, 1, 1, 8192, manifest_id).unwrap()],
+            vec![NamespaceEntry::new(1, 2, b"backup".to_vec()).unwrap()],
+        )
+        .unwrap();
+        source.commit_namespace(&namespace).unwrap();
+
+        let checkpoints = RecoveryCheckpointRepository::new(data);
+        checkpoints.publish_committed(&source).unwrap().unwrap();
+        let selected = BTreeSet::from([ChunkId::from_bytes([7; 32])]);
+        let cache = CheckpointProtectedChunkCache::default();
+
+        let first_before = crate::direct_io::READ_BYTES.with(std::cell::Cell::get);
+        let first = checkpoints
+            .protected_chunks_matching(&selected, Some(&cache))
+            .unwrap();
+        let first_reads = crate::direct_io::READ_BYTES.with(std::cell::Cell::get) - first_before;
+        assert!(first.is_empty());
+        assert_eq!(cache.cached_checkpoint_count_for_test(), 1);
+
+        let second_before = crate::direct_io::READ_BYTES.with(std::cell::Cell::get);
+        let second = checkpoints
+            .protected_chunks_matching(&selected, Some(&cache))
+            .unwrap();
+        let second_reads = crate::direct_io::READ_BYTES.with(std::cell::Cell::get) - second_before;
+        assert_eq!(second, first);
+        assert!(
+            second_reads < first_reads,
+            "cached protection must avoid a second checkpoint graph read: \
+             first={first_reads} second={second_reads}"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

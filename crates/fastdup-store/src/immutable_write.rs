@@ -17,7 +17,7 @@ pub(crate) fn write_image<I: StorageIo>(storage: &I, name: &str, bytes: &[u8]) -
 
 /// Writes an unpublished temporary image. Its caller must fix the final length
 /// and synchronize the file before publication.
-pub(crate) fn write_image_unpublished<I: StorageIo>(
+pub(crate) fn write_image_unpublished<I: StorageIo + ?Sized>(
     storage: &I,
     name: &str,
     bytes: &[u8],
@@ -26,6 +26,22 @@ pub(crate) fn write_image_unpublished<I: StorageIo>(
         storage.write_unpublished_at(name, (ordinal * WRITE_BATCH_BYTES) as u64, batch)?;
     }
     Ok(())
+}
+
+/// Default creation of one unpublished object whose complete image is already
+/// known. Backends that can bundle the storage envelope and payload into fewer
+/// aligned writes override the trait entry point and reuse this fallback for
+/// images above their batching bound.
+pub(crate) fn write_new_unpublished_image_default<I: StorageIo + ?Sized>(
+    storage: &I,
+    name: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    storage.create_new(name)?;
+    write_image_unpublished(storage, name, bytes)?;
+    let length =
+        u64::try_from(bytes.len()).map_err(|_| io::Error::other("image length must fit u64"))?;
+    storage.set_len_unpublished(name, length)
 }
 
 /// Sequential output starts at zero so intermediate writes end at aligned

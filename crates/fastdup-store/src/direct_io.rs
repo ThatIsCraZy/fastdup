@@ -11,6 +11,8 @@ use std::sync::{Mutex, OnceLock};
 const QUANTUM: usize = 1024 * 1024;
 const BLOCK: usize = 4096;
 const PAYLOAD_OFFSET: u64 = 2 * BLOCK as u64;
+const PAYLOAD_OFFSET_BYTES: usize = 2 * BLOCK;
+const _: () = assert!(PAYLOAD_OFFSET == PAYLOAD_OFFSET_BYTES as u64);
 const MAGIC: &[u8; 8] = b"FDIO0001";
 
 #[cfg(test)]
@@ -116,6 +118,62 @@ pub(crate) fn initialize(file: &File) -> io::Result<Layout> {
         length: 0,
         generation: 1,
         slot: 0,
+        wrapped: true,
+    })
+}
+
+/// Creates a fresh unpublished object from one complete, length-known image
+/// with a single aligned write. The result is byte-identical to `initialize`
+/// followed by an image write and its length head: slot 0 keeps the initial
+/// head, slot 1 carries the final length at the next generation. Physical EOF
+/// is the block-rounded envelope; the caller still owes the final file sync
+/// before publication.
+pub(crate) fn write_new_image(file: &File, payload: &[u8]) -> io::Result<Layout> {
+    if file.metadata()?.len() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "a new-image writer requires a freshly created object",
+        ));
+    }
+    let length = u64::try_from(payload.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
+    #[cfg(test)]
+    WRITE_CALLS.with(|total| total.set(total.get() + 1));
+    let rounded = payload
+        .len()
+        .checked_add(2 * BLOCK)
+        .and_then(|total| total.checked_add(BLOCK - 1))
+        .map(|total| total / BLOCK * BLOCK)
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let metadata = file.metadata()?;
+    let alignment = Alignment::cached(file, metadata.dev())?;
+    let alignment_offset = alignment.offset.max(BLOCK);
+    let mut buffer = Buffer::new(rounded, alignment.memory)?;
+    buffer.bytes_mut()[..BLOCK].copy_from_slice(&header(1, 0));
+    buffer.bytes_mut()[BLOCK..PAYLOAD_OFFSET_BYTES].copy_from_slice(&header(2, length));
+    buffer.bytes_mut()[PAYLOAD_OFFSET_BYTES..PAYLOAD_OFFSET_BYTES + payload.len()]
+        .copy_from_slice(payload);
+    let mut done = 0;
+    while done < rounded {
+        let count = match file.write_at(&buffer.bytes()[done..], done as u64) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        done += count;
+        if done < rounded
+            && (!done.is_multiple_of(alignment_offset) || !done.is_multiple_of(alignment.memory))
+        {
+            return Err(io::Error::other(
+                "unaligned short new-image Direct-I/O write",
+            ));
+        }
+    }
+    Ok(Layout {
+        length,
+        generation: 2,
+        slot: 1,
         wrapped: true,
     })
 }
@@ -628,6 +686,62 @@ mod tests {
         io.set_len("object.fdm", 0).unwrap();
         assert!(io.read("object.fdm").unwrap().is_empty());
         assert_eq!(fixture.file().metadata().unwrap().len(), PAYLOAD_OFFSET);
+    }
+
+    #[test]
+    fn new_image_writer_matches_heads_write_and_length_flow_byte_exactly() {
+        let fixture = Fixture::new();
+        let payload: Vec<u8> = (0..BLOCK + 71)
+            .map(|n| u8::try_from(n % 253).unwrap())
+            .collect();
+        fixture
+            .storage
+            .create_new_unpublished_image("image.fdm", &payload)
+            .unwrap();
+        fixture.storage.create_new("legacy.fdm").unwrap();
+        crate::immutable_write::write_image_unpublished(&fixture.storage, "legacy.fdm", &payload)
+            .unwrap();
+        fixture
+            .storage
+            .set_len_unpublished("legacy.fdm", u64::try_from(payload.len()).unwrap())
+            .unwrap();
+
+        assert_eq!(fixture.storage.read("image.fdm").unwrap(), payload);
+        assert_eq!(fixture.storage.object_len("image.fdm").unwrap(), 4167);
+        let fast = open(&fixture.root.join("image.fdm"), false).unwrap();
+        let legacy = open(&fixture.root.join("legacy.fdm"), false).unwrap();
+        assert_eq!(
+            fast.metadata().unwrap().len(),
+            legacy.metadata().unwrap().len()
+        );
+        let physical = usize::try_from(fast.metadata().unwrap().len()).unwrap();
+        assert_eq!(
+            read_physical(&fast, 0, physical).unwrap(),
+            read_physical(&legacy, 0, physical).unwrap(),
+            "the bundled new-image write must reproduce both redundant heads byte-exactly"
+        );
+        let layout = layout(&fast).unwrap();
+        assert_eq!(
+            (layout.length, layout.generation, layout.slot),
+            (4167, 2, 1)
+        );
+    }
+
+    #[test]
+    fn new_image_writer_rejects_a_nonempty_object() {
+        let fixture = Fixture::new();
+        let name = "image.fdm";
+        fixture
+            .storage
+            .create_new_unpublished_image(name, b"first")
+            .unwrap();
+        assert!(
+            fixture
+                .storage
+                .mutate_direct_file(name, false, |file, _| write_new_image(file, b"retry"))
+                .is_err()
+        );
+        assert_eq!(fixture.storage.read(name).unwrap(), b"first");
     }
 
     #[test]

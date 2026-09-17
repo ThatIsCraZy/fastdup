@@ -287,6 +287,9 @@ mod tests {
             );
             {
                 let _audit = MetadataReadScope::enter(MetadataReadReason::IndexAudit);
+                // Page 1 is already the shared storage-range cache's, so only
+                // the missing page 0 reaches the filesystem; the assembled
+                // 8-KiB result still returns in full.
                 assert_eq!(storage.read("sample.fdx").unwrap().len(), 8192);
             }
             assert!(storage.read_exact_at("sample.fdx", 8192, 4096).is_err());
@@ -310,7 +313,7 @@ mod tests {
         let audit = rows.iter().find(|row| row.reason == "indexAudit").unwrap();
         assert_eq!(
             (audit.mode, audit.operations, audit.returned_bytes),
-            ("directFile", 1, 8192)
+            ("directFile", 1, 4096)
         );
         assert!(
             rows.iter()

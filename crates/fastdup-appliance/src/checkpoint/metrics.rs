@@ -253,7 +253,7 @@ pub struct CheckpointMetrics {
     pub(super) publication_wait: CheckpointPhaseMetrics,
     pub(super) lane_lock: CheckpointPhaseMetrics,
     pub(super) stable_extract: CheckpointPhaseMetrics,
-    pub(super) publication_enqueue: CheckpointPhaseMetrics,
+    pub(super) drain_residue: CheckpointPhaseMetrics,
     pub(super) publication_retire: CheckpointPhaseMetrics,
     pub(super) recipe_attach: CheckpointPhaseMetrics,
     pub(super) writer_setup: CheckpointPhaseMetrics,
@@ -285,6 +285,8 @@ pub struct CheckpointMetrics {
     pub(super) recipe_reuse_chunks: u64,
     pub(super) recipe_reuse_bytes: u64,
     pub(super) checkpoint_rechunk_bytes: u64,
+    pub(super) drain_merged_chunks: u64,
+    pub(super) drain_merged_bytes: u64,
 }
 
 macro_rules! phase_getter {
@@ -305,7 +307,7 @@ impl CheckpointMetrics {
     phase_getter!(publication_wait);
     phase_getter!(lane_lock);
     phase_getter!(stable_extract);
-    phase_getter!(publication_enqueue);
+    phase_getter!(drain_residue);
     phase_getter!(publication_retire);
     phase_getter!(recipe_attach);
     phase_getter!(writer_setup);
@@ -332,7 +334,7 @@ impl CheckpointMetrics {
                 self.publication_wait.wall,
                 self.lane_lock.wall,
                 self.stable_extract.wall,
-                self.publication_enqueue.wall,
+                self.drain_residue.wall,
                 self.publication_retire.wall,
                 self.recipe_attach.wall,
                 self.writer_setup.wall,
@@ -436,6 +438,16 @@ impl CheckpointMetrics {
         self.checkpoint_rechunk_bytes
     }
 
+    #[must_use]
+    pub const fn drain_merged_chunks(self) -> u64 {
+        self.drain_merged_chunks
+    }
+
+    #[must_use]
+    pub const fn drain_merged_bytes(self) -> u64 {
+        self.drain_merged_bytes
+    }
+
     pub(super) fn merge_reduction(&mut self, reduction: &CheckpointReductionMetrics) {
         self.cdc = reduction.cdc;
         self.hash_and_fill = reduction.hash_and_fill;
@@ -460,6 +472,8 @@ impl CheckpointMetrics {
         self.recipe_reuse_chunks = reduction.recipe_reuse_chunks;
         self.recipe_reuse_bytes = reduction.recipe_reuse_bytes;
         self.checkpoint_rechunk_bytes = reduction.checkpoint_rechunk_bytes;
+        self.drain_merged_chunks = reduction.drain_merged_chunks;
+        self.drain_merged_bytes = reduction.drain_merged_bytes;
     }
 }
 
@@ -506,6 +520,8 @@ pub(super) struct CheckpointReductionMetrics {
     pub(super) recipe_reuse_chunks: u64,
     pub(super) recipe_reuse_bytes: u64,
     pub(super) checkpoint_rechunk_bytes: u64,
+    pub(super) drain_merged_chunks: u64,
+    pub(super) drain_merged_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -545,7 +561,7 @@ pub(super) enum CheckpointStage {
     PublicationWait,
     LaneLock,
     StableExtract,
-    PublicationEnqueue,
+    DrainResidue,
     PublicationRetire,
     RecipeAttach,
     WriterSetup,
@@ -584,7 +600,7 @@ impl CheckpointTimings {
             "checkpointPublicationWait",
             "checkpointLaneLock",
             "checkpointStableExtract",
-            "checkpointPublicationEnqueue",
+            "checkpointDrainResidue",
             "checkpointPublicationRetire",
             "checkpointRecipeAttach",
             "checkpointWriterSetup",

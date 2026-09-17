@@ -160,6 +160,23 @@ pub(crate) fn audit_named<I: StorageIo>(
     storage: &I,
     name: &str,
 ) -> Result<MetadataMarkCatalogDescriptor, MetadataMarkCatalogError> {
+    audit_named_inner(storage, name, None)
+}
+
+pub(crate) fn audit_named_collect<I: StorageIo>(
+    storage: &I,
+    name: &str,
+) -> Result<(MetadataMarkCatalogDescriptor, Vec<MetadataObjectId>), MetadataMarkCatalogError> {
+    let mut rows = Vec::new();
+    let descriptor = audit_named_inner(storage, name, Some(&mut rows))?;
+    Ok((descriptor, rows))
+}
+
+fn audit_named_inner<I: StorageIo>(
+    storage: &I,
+    name: &str,
+    mut rows: Option<&mut Vec<MetadataObjectId>>,
+) -> Result<MetadataMarkCatalogDescriptor, MetadataMarkCatalogError> {
     let file_length = storage.object_len(name)?;
     if file_length
         < 2 * u64::try_from(METADATA_MARK_CATALOG_HEADER_BYTES)
@@ -178,6 +195,13 @@ pub(crate) fn audit_named<I: StorageIo>(
     let descriptor = MetadataMarkCatalogDescriptor::decode(&header, &footer, file_length)?;
     if descriptor.footer_offset() != footer_offset {
         return Err(MetadataMarkFormatError::InvalidEnvelope.into());
+    }
+    if let Some(rows) = rows.as_mut() {
+        rows.try_reserve_exact(
+            usize::try_from(descriptor.row_count())
+                .map_err(|_| MetadataMarkFormatError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| MetadataMarkFormatError::OutOfMemory)?;
     }
 
     let mut audit = descriptor.start_audit();
@@ -202,7 +226,10 @@ pub(crate) fn audit_named<I: StorageIo>(
             .ok_or(MetadataMarkFormatError::RowCountMismatch)?;
         let bytes = storage.read_exact_at(name, offset, length)?;
         for row in bytes.chunks_exact(METADATA_MARK_CATALOG_ROW_BYTES) {
-            audit.push(row)?;
+            let object_id = audit.push(row)?;
+            if let Some(rows) = rows.as_mut() {
+                rows.push(object_id);
+            }
             ordinal += 1;
         }
     }

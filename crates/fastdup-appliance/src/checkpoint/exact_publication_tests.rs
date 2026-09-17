@@ -34,7 +34,7 @@ fn publish(entries: Vec<ExactIndexEntry>) -> ExactPublicationCommand {
 }
 
 fn run(
-    core: Arc<ExactPublisherCore<MemoryStorageIo>>,
+    core: &Arc<ExactPublisherCore<MemoryStorageIo>>,
     commands: Vec<ExactPublicationCommand>,
 ) -> ExactQueueTimings {
     let (sender, receiver) = mpsc::sync_channel(commands.len() + 1);
@@ -45,7 +45,7 @@ fn run(
         .send((ExactPublicationCommand::Shutdown, None))
         .unwrap();
     let timings = ExactQueueTimings::default();
-    ExactPublicationQueue::run(&core, &receiver, &timings);
+    ExactPublicationQueue::run(core, &receiver, &timings);
     timings
 }
 
@@ -68,7 +68,7 @@ fn publisher_batches_additions_but_preserves_flush_and_transition_boundaries() {
     let timings = ExactQueueTimings::default();
     let worker_timings = timings.clone();
     let worker = std::thread::spawn(move || {
-        ExactPublicationQueue::run(&worker_core, &receiver, &worker_timings)
+        ExactPublicationQueue::run(&worker_core, &receiver, &worker_timings);
     });
     let deadline = Instant::now() + Duration::from_secs(3);
     while timings.batch.snapshot("batch").completed == 0 && Instant::now() < deadline {
@@ -109,10 +109,55 @@ fn publisher_batches_additions_but_preserves_flush_and_transition_boundaries() {
 }
 
 #[test]
+fn unfenced_additions_activate_within_the_bounded_collection_window() {
+    let core = core(MemoryStorageIo::new());
+    let (sender, receiver) = mpsc::sync_channel(8);
+    sender.send((publish(vec![entry(7)]), None)).unwrap();
+    let timings = ExactQueueTimings::default();
+    let worker_core = Arc::clone(&core);
+    let worker_timings = timings.clone();
+    let worker = std::thread::spawn(move || {
+        ExactPublicationQueue::run(&worker_core, &receiver, &worker_timings);
+    });
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(3);
+    while timings.batch.snapshot("batch").completed == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        timings.batch.snapshot("batch").completed >= 1,
+        "an unfenced addition must activate without waiting for another command or fence"
+    );
+    let activated_at = started.elapsed();
+    assert!(
+        activated_at <= Duration::from_millis(500),
+        "the collection window must bound activation delay, measured {activated_at:?}"
+    );
+    // The fence acknowledges immediately once the buffer is empty.
+    let (reply, flushed) = mpsc::sync_channel(0);
+    sender
+        .send((ExactPublicationCommand::Flush(reply), None))
+        .unwrap();
+    flushed.recv_timeout(Duration::from_secs(1)).unwrap();
+    sender
+        .send((ExactPublicationCommand::Shutdown, None))
+        .unwrap();
+    worker.join().unwrap();
+    let active = core.repository.recover_active().unwrap().unwrap();
+    assert_eq!(
+        active
+            .active_reference(entry(7).chunk_id(), 32, None)
+            .unwrap(),
+        Some(entry(7))
+    );
+    assert!(core.recent.read().unwrap().is_empty());
+}
+
+#[test]
 fn publisher_batch_entry_and_command_limits_leave_remaining_work_ordered() {
     let core = core(MemoryStorageIo::new());
     let timings = run(
-        Arc::clone(&core),
+        &core,
         vec![
             publish(
                 (0..EXACT_PUBLICATION_BATCH_ENTRIES as u64 - 1)
@@ -125,7 +170,7 @@ fn publisher_batch_entry_and_command_limits_leave_remaining_work_ordered() {
     assert_eq!(timings.batch.snapshot("batches").completed, 2);
     assert!(!core.degraded.load(Ordering::Acquire));
     let timings = run(
-        Arc::clone(&core),
+        &core,
         (30_000..30_017)
             .map(|ordinal| publish(vec![entry(ordinal)]))
             .collect(),
@@ -159,13 +204,13 @@ fn failed_combined_publication_keeps_gc_admission_and_flush_completes() {
     }
     let (reply, flushed) = mpsc::sync_channel(1);
     commands.push(ExactPublicationCommand::Flush(reply));
-    let timings = run(Arc::clone(&core), commands);
+    let timings = run(&core, commands);
     flushed.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(timings.batch.snapshot("batches").completed, 1);
     assert!(core.degraded.load(Ordering::Acquire));
     assert!(core.failed_reduction_guard.lock().unwrap().is_some());
     assert!(core.recent.read().unwrap().is_empty());
-    run(Arc::clone(&core), vec![publish(vec![entry(4)])]);
+    run(&core, vec![publish(vec![entry(4)])]);
     assert!(!core.degraded.load(Ordering::Acquire));
     assert!(core.failed_reduction_guard.lock().unwrap().is_some());
 }
@@ -184,7 +229,7 @@ fn batching_reduces_durable_operations_with_identical_recovered_entries() {
                 commands.push(ExactPublicationCommand::Flush(reply));
             }
         }
-        let timings = run(Arc::clone(&core), commands);
+        let timings = run(&core, commands);
         let operations = storage.operation_count();
         let count = |op| {
             storage

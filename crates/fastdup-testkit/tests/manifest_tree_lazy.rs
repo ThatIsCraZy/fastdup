@@ -591,16 +591,17 @@ fn every_middle_splice_fault_recovers_the_previous_or_complete_successor() {
 
     for fail_after in [false, true] {
         for relative_position in 0..operations.len() {
-            let fail_position = baseline + relative_position;
-            let storage = if fail_after {
-                MemoryStorageIo::with_fail_after(fail_position)
-            } else {
-                MemoryStorageIo::with_fail_before(fail_position)
-            };
+            let storage = MemoryStorageIo::new();
             let (repository, containers, predecessor, previous_summary) =
                 seed_splice_predecessor(&storage, policy);
+            // Cache-resident reads can absorb operations, so a replay's
+            // sequence may be shorter than the probe's. Arm against this
+            // replay's own publish baseline and clear a fault the publish did
+            // not consume instead of letting it strike a recovery read.
+            storage.arm_failpoint(fail_after, storage.operation_count() + relative_position);
             let _ =
                 publish_splice_generation(&repository, &containers, predecessor, previous_summary);
+            storage.clear_faults();
             drop(repository);
             storage.crash();
 

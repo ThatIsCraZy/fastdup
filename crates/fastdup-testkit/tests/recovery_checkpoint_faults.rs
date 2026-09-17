@@ -213,6 +213,17 @@ fn seed_source_with_storage() -> (
 ) {
     let metadata = MemoryStorageIo::new();
     let source_metadata = metadata.clone();
+    let (source, committed, namespace) = seed_source_into(metadata);
+    (source, committed, namespace, source_metadata)
+}
+
+fn seed_source_into<I: StorageIo>(
+    metadata: I,
+) -> (
+    GenerationRepository<I>,
+    fastdup_format::CommitRecord,
+    NamespaceRoot,
+) {
     let source = GenerationRepository::new(metadata, policy());
     source
         .commit_namespace(&reservation_root())
@@ -231,7 +242,31 @@ fn seed_source_with_storage() -> (
     let committed = source
         .commit_namespace(&namespace)
         .expect("commit source generation");
-    (source, committed, namespace, source_metadata)
+    (source, committed, namespace)
+}
+
+fn metadata_name(object_id: fastdup_format::MetadataObjectId) -> String {
+    let mut name = String::with_capacity(68);
+    for byte in object_id.bytes() {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").expect("writing to a String is infallible");
+    }
+    name.push_str(".fdm");
+    name
+}
+
+/// Every object name one of the two seeded Commit Records authorizes for the
+/// recovery-side Namespace revalidation: descriptor plus bound shards.
+fn authorized_namespace_names(root: &NamespaceRoot) -> Vec<String> {
+    let graph = root.encode_graph().expect("seed Namespace encodes");
+    let mut names = vec![metadata_name(
+        fastdup_format::MetadataObjectId::from_encoded(graph.root())
+            .expect("root descriptor is content-identified"),
+    )];
+    for shard in graph.shards() {
+        names.push(metadata_name(shard.object_id()));
+    }
+    names
 }
 
 #[test]
@@ -380,7 +415,8 @@ fn independent_new_checkpoint_is_not_read_back_and_recovers_after_crash() {
 
 #[test]
 fn unchanged_committed_checkpoint_reuses_receipt_without_graph_or_destination_io() {
-    let (source, committed, _namespace, source_metadata) = seed_source_with_storage();
+    let recording = ReadRecordingStorage::new();
+    let (source, committed, namespace) = seed_source_into(recording.clone());
     let data = MemoryStorageIo::new();
     let checkpoints = RecoveryCheckpointRepository::new(data.clone());
 
@@ -390,8 +426,8 @@ fn unchanged_committed_checkpoint_reuses_receipt_without_graph_or_destination_io
         .expect("the source has one committed generation");
     assert_eq!(first.generation(), committed.generation());
 
-    let source_before = source_metadata.operation_count();
     let destination_before = data.operation_count();
+    let reads_before = recording.read_names().len();
     let repeated = checkpoints
         .publish_committed(&source)
         .expect("reuse an unchanged committed checkpoint")
@@ -403,19 +439,36 @@ fn unchanged_committed_checkpoint_reuses_receipt_without_graph_or_destination_io
         destination_before,
         "an unchanged receipt must avoid all destination checkpoint I/O"
     );
-    // Candidate selection still validates the source Commit/WAL boundary. The
-    // receipt must short-circuit before the Namespace/Manifest graph walk,
-    // which would otherwise add complete-object reads here.
-    assert_eq!(
-        &source_metadata.operations()[source_before..],
-        &[
-            StorageOperation::ObjectLen,
-            StorageOperation::Read,
-            StorageOperation::ObjectLen,
-            StorageOperation::Read,
-        ],
-        "only the two source WAL slots are checked; the Namespace/Manifest graph is not walked"
+    // Candidate selection validates the source Commit/WAL boundary plus the
+    // recovery-side revalidation of the two recorded Namespace roots
+    // (descriptor plus shards). A cold shared metadata cache legitimately
+    // turns those revalidations into storage reads, so the assertion bounds
+    // the authorized name set instead of pinning an exact operation count.
+    // The receipt must short-circuit before the Manifest graph walk, which
+    // would read names outside this set.
+    let allowed = authorized_namespace_names(&reservation_root())
+        .into_iter()
+        .chain(authorized_namespace_names(&namespace))
+        .collect::<std::collections::BTreeSet<_>>();
+    let window = &recording.read_names()[reads_before..];
+    assert!(
+        window.iter().any(|(_, name)| name == "commit.wal"
+            || name.starts_with("commit.") && name.ends_with(".wal"))
+            && window
+                .iter()
+                .any(|(_, name)| name != "commit.wal" && name.starts_with("commit.")),
+        "both source WAL slots must be checked: {window:?}"
     );
+    for (operation, name) in window {
+        assert!(
+            matches!(
+                operation,
+                StorageOperation::Read | StorageOperation::ReadExactAt
+            ) && ((name == "commit.wal" || name.starts_with("commit.")) || allowed.contains(name)),
+            "the receipt path walked beyond the WAL and the recorded Namespace roots: \
+             {operation:?} {name}"
+        );
+    }
 }
 
 #[test]

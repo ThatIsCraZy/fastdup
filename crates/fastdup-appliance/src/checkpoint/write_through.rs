@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -40,12 +40,18 @@ use super::{
 use super::{CpuPhaseStatus, WriteThroughStatus};
 
 const CONTAINER_PAYLOAD_FLUSH_BYTES: usize = CONTAINER_PAYLOAD_TARGET_BYTES - CDC_MAXIMUM_BYTES;
-const PARTIAL_BATCH_BUDGET_BYTES_V1: usize = CONTAINER_PAYLOAD_TARGET_BYTES;
 const MAX_CHUNK_FRAGMENTS_V1: usize = 1_024;
 const WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1: usize = 400 * 1_024 * 1_024;
 const WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1: usize = 32 * 1_024 * 1_024;
 const MULTI_STREAM_QUEUE_BUDGET_BYTES_V1: usize = 16 * 1_024 * 1_024;
 const DETACHED_CONTAINER_BUDGET_BYTES_V1: usize = 2 * CONTAINER_PAYLOAD_TARGET_BYTES;
+// Ingest Lane payload plus commit-cut Drain Residues share this gate. Staging
+// admission blocks while the combined region would exceed it; only checkpoint
+// planning (Container absorption) or a queue handoff releases it. A commit-cut
+// drain itself never blocks: all Lanes can be drained while the region is empty.
+const INGEST_PENDING_GATE_BYTES_V1: usize = WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1
+    - WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1
+    - DETACHED_CONTAINER_BUDGET_BYTES_V1;
 const PUBLICATION_WAIT_DIAGNOSTIC_INTERVAL_V1: Duration = Duration::from_secs(5);
 const SINGLE_STREAM_PUBLICATION_WINDOW_V1: usize = 2;
 const WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1: usize = 1_024 * 1_024;
@@ -64,6 +70,11 @@ const _: () = assert!(
         >= WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1
             + DETACHED_CONTAINER_BUDGET_BYTES_V1
             + 2 * (CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES)
+);
+const _: () = assert!(
+    INGEST_PENDING_GATE_BYTES_V1
+        >= (MAX_ACTIVE_INGEST_LANES_V1 + 1) * (CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES),
+    "ASSERT: every Lane must be drainable into the empty Drain Residue region"
 );
 
 #[derive(Debug)]
@@ -192,7 +203,6 @@ impl ChunkFragments {
         ChunkId::from_bytes(*hasher.finalize().as_bytes())
     }
 
-    #[cfg(test)]
     fn materialize_new_chunk(&self) -> Result<Cow<'_, [u8]>, DurableNamespaceError> {
         if self.parts.as_slice().len() == 1 {
             return Ok(Cow::Borrowed(self.parts.as_slice()[0].as_bytes()));
@@ -852,6 +862,171 @@ impl PendingWriteThrough {
     }
 }
 
+/// Shared memory gate for the Ingest Lane payload plus commit-cut Drain
+/// Residues that have not yet been absorbed into the commit Writer.
+///
+/// Staging admission blocks here; the commit-cut drain never blocks (the drain
+/// is a Lane-to-Residue transfer of already-resident bytes), and absorption by
+/// checkpoint planning is the only path that frees the gate outside a queue
+/// handoff. A blocked staging worker therefore always has an independent
+/// release path through the active checkpoint.
+#[derive(Clone, Debug)]
+pub(super) struct PendingRegions {
+    lane_region_bytes: Arc<AtomicUsize>,
+    residue_bytes: Arc<AtomicUsize>,
+    space_available: Arc<(Mutex<()>, Condvar)>,
+}
+
+impl PendingRegions {
+    fn new() -> Self {
+        Self {
+            lane_region_bytes: Arc::new(AtomicUsize::new(0)),
+            residue_bytes: Arc::new(AtomicUsize::new(0)),
+            space_available: Arc::new((Mutex::new(()), Condvar::new())),
+        }
+    }
+
+    fn residue_bytes(&self) -> usize {
+        self.residue_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Reserves staging growth for one Ingest Batch, blocking while the
+    /// combined Lane payload plus Drain Residue region would overflow. The
+    /// reservation is converted to actual Lane bytes by `settle_staging`.
+    fn reserve_staging_growth(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let (lock, available) = &*self.space_available;
+        let mut guard = lock
+            .lock()
+            .expect("ASSERT: write-through pending-region lock poisoned while reserving");
+        loop {
+            let charged = self
+                .lane_region_bytes
+                .load(Ordering::Relaxed)
+                .checked_add(self.residue_bytes())
+                .expect("ASSERT: bounded pending-region bytes cannot overflow");
+            if charged
+                .checked_add(bytes)
+                .is_some_and(|total| total <= INGEST_PENDING_GATE_BYTES_V1)
+            {
+                break;
+            }
+            guard = available
+                .wait(guard)
+                .expect("ASSERT: write-through pending-region lock poisoned while waiting");
+        }
+        drop(guard);
+        self.lane_region_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Converts a staging reservation into the Lane's actual retained growth,
+    /// measured as the Lane's `(tail + pending)` region before and after the
+    /// batch, including bytes handed to the publication queue.
+    fn settle_staging(&self, reserved: usize, region_before: usize, region_after: usize) {
+        let released = if region_after >= region_before {
+            let retained = region_after - region_before;
+            assert!(
+                retained <= reserved,
+                "ASSERT: staged Chunks can only grow from this batch's reserved fragments"
+            );
+            reserved - retained
+        } else {
+            let discarded = region_before - region_after;
+            reserved
+                .checked_add(discarded)
+                .expect("ASSERT: bounded settlement release cannot overflow")
+        };
+        if released != 0 {
+            let previous = self
+                .lane_region_bytes
+                .fetch_sub(released, Ordering::Relaxed);
+            assert!(
+                previous >= released,
+                "ASSERT: pending-region settlement cannot underflow its reservation"
+            );
+        }
+        self.space_available.1.notify_all();
+    }
+
+    /// Detaches Lane payload without reservation, for example a Lane reset
+    /// that discards the incomplete CDC suffix and pending Chunks.
+    fn release_lane_bytes(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let previous = self.lane_region_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(
+            previous >= bytes,
+            "ASSERT: Lane release cannot underflow the pending-region ledger"
+        );
+        self.space_available.1.notify_all();
+    }
+
+    /// Moves drained Lane payload into the Drain Residue region. The bytes stay
+    /// resident, so the gated total is unchanged until planning absorbs them.
+    fn transfer_lane_to_residue(&self, bytes: usize) {
+        let previous = self.lane_region_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(
+            previous >= bytes,
+            "ASSERT: commit-cut drain cannot underflow the pending-region ledger"
+        );
+        self.residue_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn absorb_residue(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let previous = self.residue_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(
+            previous >= bytes,
+            "ASSERT: Container absorption cannot underflow the Drain Residue ledger"
+        );
+        self.space_available.1.notify_all();
+    }
+}
+
+/// One complete Chunk detached from an Ingest Lane at the commit cut.
+#[derive(Debug)]
+pub(super) struct MergedDrainChunk {
+    pub(super) offset: u64,
+    pub(super) chunk_id: ChunkId,
+    pub(super) bytes: Vec<u8>,
+}
+
+/// Complete Chunks an Ingest Lane still held at the commit cut. The checkpoint
+/// Writer seeds its adaptive Container buffer with these Chunks and the Manifest
+/// planner emits them as DATA extents at their staged Offsets, replacing the
+/// former shared partial-Container publication and externalization round trip.
+#[derive(Debug)]
+pub(super) struct DrainResidue {
+    pub(super) inode: InodeId,
+    pub(super) chunks: Vec<MergedDrainChunk>,
+    charged_bytes: usize,
+    regions: PendingRegions,
+}
+
+impl DrainResidue {
+    pub(super) fn absorb_chunk(&mut self, bytes: usize) {
+        self.charged_bytes = self
+            .charged_bytes
+            .checked_sub(bytes)
+            .expect("ASSERT: absorbed Drain Residue bytes were charged");
+        self.regions.absorb_residue(bytes);
+    }
+}
+
+impl Drop for DrainResidue {
+    fn drop(&mut self) {
+        // Unabsorbed residue (a canceled checkpoint or an inode excluded from
+        // the commit) releases its reservation; the bytes themselves vanish
+        // with the dropped buffers.
+        self.regions.absorb_residue(self.charged_bytes);
+    }
+}
+
 #[derive(Debug, Default)]
 #[repr(align(64))]
 pub(super) struct WriteThroughStream {
@@ -967,7 +1142,7 @@ pub(super) struct WriteThroughIngest<C> {
     worker_budget: NonZeroUsize,
     worker_permits: Arc<WorkerPermits>,
     active_writers: AtomicUsize,
-    shared_batch_bytes: Arc<AtomicUsize>,
+    pending_regions: PendingRegions,
     hash_batches: AtomicUsize,
     maximum_hash_workers: AtomicUsize,
     hash_cpu: CpuPhaseTelemetry,
@@ -1091,40 +1266,13 @@ struct IngestQueue {
     work_available: Condvar,
     space_available: Condvar,
     completed: Condvar,
-}
-
-type SharedPublicationError = Arc<DurableNamespaceError>;
-type PublicationResult = Result<(), SharedPublicationError>;
-type PublicationCompletions = Vec<std::sync::mpsc::Receiver<PublicationResult>>;
-
-struct PublicationFences {
-    retirement_targets: BTreeMap<InodeId, u64>,
-    barriers: BTreeMap<InodeId, u64>,
-    receivers: PublicationCompletions,
-}
-
-fn unwrap_shared_publication_error(error: SharedPublicationError) -> DurableNamespaceError {
-    Arc::try_unwrap(error).unwrap_or_else(|error| {
-        DurableNamespaceError::Io(std::io::Error::other(format!(
-            "shared publication failure: {error:?}"
-        )))
-    })
-}
-
-fn recv_publication_completion(
-    completion: &std::sync::mpsc::Receiver<PublicationResult>,
-) -> Result<(), DurableNamespaceError> {
-    completion
-        .recv()
-        .map_err(|_| DurableNamespaceError::FrozenViewMismatch)?
-        .map_err(unwrap_shared_publication_error)
+    admission_closing: AtomicBool,
 }
 
 #[derive(Debug)]
 struct DetachedContainerWork {
     inode: InodeId,
     first_chunk_sequence: u64,
-    completion: Option<std::sync::mpsc::SyncSender<PublicationResult>>,
     through_sequence: u64,
     publication_ordinal: u64,
     chunks: Vec<PendingWriteThroughChunk>,
@@ -1157,145 +1305,19 @@ impl DetachedContainerWork {
             publication_ordinal: 0,
             first_chunk_sequence: first_chunk_sequence
                 .expect("ASSERT: detached work contains Chunks"),
-            completion: None,
             chunks,
             payload_bytes,
         }
-    }
-}
-
-#[derive(Debug)]
-struct PublicationMember {
-    inode: InodeId,
-    through_sequence: u64,
-    first_chunk_sequence: u64,
-    completion: Option<std::sync::mpsc::SyncSender<PublicationResult>>,
-    chunks: Vec<PendingWriteThroughChunk>,
-    payload_bytes: usize,
-    advanced: bool,
-}
-
-#[derive(Debug)]
-struct PublicationGroup {
-    id: u64,
-    members: Vec<PublicationMember>,
-    payload_bytes: usize,
-}
-
-#[derive(Debug)]
-enum PublicationPendingItem {
-    Single(DetachedContainerWork),
-    GroupMember {
-        group_id: u64,
-        first_chunk_sequence: u64,
-    },
-}
-
-impl PublicationPendingItem {
-    fn as_single(&self) -> Option<&DetachedContainerWork> {
-        match self {
-            Self::Single(work) => Some(work),
-            Self::GroupMember { .. } => None,
-        }
-    }
-
-    fn is_single(&self) -> bool {
-        matches!(self, Self::Single(_))
-    }
-}
-
-#[derive(Debug)]
-enum PublicationUnit {
-    Single(DetachedContainerWork),
-    Group(PublicationGroup),
-}
-
-#[derive(Debug)]
-struct PartialCandidate {
-    inode: InodeId,
-    through_sequence: u64,
-    first_chunk_sequence: u64,
-    chunks: Vec<PendingWriteThroughChunk>,
-    payload_bytes: usize,
-    placement: ContainerPlacement,
-    advanced: bool,
-    sender: Option<std::sync::mpsc::SyncSender<PublicationResult>>,
-    receiver: Option<std::sync::mpsc::Receiver<PublicationResult>>,
-}
-
-fn partial_placement_bucket(placement: ContainerPlacement) -> u8 {
-    match placement {
-        ContainerPlacement::Data => 0,
-        ContainerPlacement::SmallFile => 1,
-    }
-}
-
-impl PartialCandidate {
-    fn new(
-        inode: InodeId,
-        through_sequence: u64,
-        chunks: Vec<PendingWriteThroughChunk>,
-        payload_bytes: usize,
-        placement: ContainerPlacement,
-        advanced: bool,
-    ) -> Self {
-        let (actual, first_chunk_sequence) = validate_pending_chunks(&chunks);
-        assert_eq!(
-            actual, payload_bytes,
-            "ASSERT: partial publication byte accounting must be exact"
-        );
-        assert!(
-            payload_bytes <= PARTIAL_BATCH_BUDGET_BYTES_V1,
-            "ASSERT: one partial publication candidate fits its local batch budget"
-        );
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        Self {
-            inode,
-            through_sequence,
-            first_chunk_sequence: first_chunk_sequence
-                .expect("ASSERT: partial publication candidate contains Chunks"),
-            chunks,
-            payload_bytes,
-            placement,
-            advanced,
-            sender: Some(sender),
-            receiver: Some(receiver),
-        }
-    }
-
-    fn into_member(self) -> PublicationMember {
-        PublicationMember {
-            inode: self.inode,
-            through_sequence: self.through_sequence,
-            first_chunk_sequence: self.first_chunk_sequence,
-            completion: self.sender,
-            chunks: self.chunks,
-            payload_bytes: self.payload_bytes,
-            advanced: self.advanced,
-        }
-    }
-
-    fn into_single(self) -> DetachedContainerWork {
-        let mut work = DetachedContainerWork::new(
-            self.inode,
-            self.through_sequence,
-            self.chunks,
-            self.payload_bytes,
-        );
-        work.completion = self.sender;
-        work
     }
 }
 
 #[derive(Debug, Default)]
 struct InodePublicationQueue {
-    pending: VecDeque<PublicationPendingItem>,
+    pending: VecDeque<DetachedContainerWork>,
     in_flight: BTreeMap<u64, u64>,
-    barrier: Option<u64>,
     next_publication_ordinal: u64,
     next_retirement_ordinal: u64,
     last_enqueued_sequence: u64,
-    drain_candidates: usize,
     ready: bool,
 }
 
@@ -1303,186 +1325,38 @@ struct InodePublicationQueue {
 struct PublicationQueueState {
     inodes: BTreeMap<InodeId, InodePublicationQueue>,
     ready_inodes: VecDeque<InodeId>,
-    groups: BTreeMap<u64, PublicationGroup>,
-    active_groups: BTreeMap<u64, u64>,
-    ready_groups: VecDeque<u64>,
-    next_group_id: u64,
     buffered_bytes: usize,
-    direct_drain_waiters: usize,
     shutdown: bool,
 }
 
 #[derive(Debug)]
 struct PublicationQueue {
-    shared_batch_bytes: Arc<AtomicUsize>,
     state: Mutex<PublicationQueueState>,
     work_available: Condvar,
     space_available: Condvar,
     completed: Condvar,
-    drain_available: Condvar,
 }
 
 impl PublicationQueue {
-    #[cfg(test)]
     fn new() -> Self {
-        Self::with_shared_batch_bytes(Arc::new(AtomicUsize::new(0)))
-    }
-
-    fn with_shared_batch_bytes(shared_batch_bytes: Arc<AtomicUsize>) -> Self {
         Self {
-            shared_batch_bytes,
             state: Mutex::new(PublicationQueueState::default()),
             work_available: Condvar::new(),
             space_available: Condvar::new(),
             completed: Condvar::new(),
-            drain_available: Condvar::new(),
         }
     }
 
-    fn charged_bytes(state: &PublicationQueueState, shared_batch_bytes: usize) -> usize {
-        state
-            .buffered_bytes
-            .checked_add(shared_batch_bytes)
-            .expect("ASSERT: charged detached publication bytes cannot overflow")
-    }
-
-    fn release_local_bytes(&self, bytes: usize) {
-        let previous = self.shared_batch_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        assert!(
-            previous >= bytes,
-            "ASSERT: shared batch release cannot underflow its reservation"
-        );
-        self.space_available.notify_all();
-    }
-
-    fn shared_batch_bytes(&self) -> usize {
-        self.shared_batch_bytes.load(Ordering::Relaxed)
-    }
-
-    fn reserve_local_bytes(&self, bytes: usize) {
-        if bytes == 0 {
-            return;
-        }
-        let mut state = self
-            .state
-            .lock()
-            .expect("ASSERT: publication queue lock poisoned while reserving shared bytes");
-        loop {
-            let charged = Self::charged_bytes(&state, self.shared_batch_bytes());
-            if charged
-                .checked_add(bytes)
-                .is_some_and(|total| total <= DETACHED_CONTAINER_BUDGET_BYTES_V1)
-            {
-                break;
-            }
-            state = self.space_available.wait(state).expect(
-                "ASSERT: publication queue lock poisoned while applying shared backpressure",
-            );
-        }
-        assert!(
-            !state.shutdown,
-            "ASSERT: cannot reserve shared publication bytes after scheduler shutdown"
-        );
-        self.shared_batch_bytes.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    fn take_reserved_bytes(&self, bytes: usize) {
-        if bytes == 0 {
-            return;
-        }
-        let previous = self.shared_batch_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        assert!(
-            previous >= bytes,
-            "ASSERT: publication handoff cannot consume more reserved bytes than were held"
-        );
-    }
-
-    fn begin_drain_candidate(&self, inode: InodeId) {
-        let mut state = self.state.lock().expect(
-            "ASSERT: detached publication queue lock poisoned while reserving a drain slot",
-        );
-        let inode_queue = state.inodes.entry(inode).or_default();
-        inode_queue.drain_candidates = inode_queue
-            .drain_candidates
-            .checked_add(1)
-            .expect("ASSERT: commit-drain publication markers cannot overflow");
-    }
-
-    fn clear_drain_candidate(&self, inode: InodeId) {
-        let mut state = self.state.lock().expect(
-            "ASSERT: detached publication queue lock poisoned while releasing a drain slot",
-        );
-        let inode_queue = state
-            .inodes
-            .get_mut(&inode)
-            .expect("ASSERT: commit-drain publication marker must exist");
-        assert!(
-            inode_queue.drain_candidates > 0,
-            "ASSERT: commit-drain publication marker cannot be cleared without a candidate"
-        );
-        inode_queue.drain_candidates -= 1;
-        self.drain_available.notify_all();
-    }
-
-    fn enqueue(&self, work: DetachedContainerWork) {
-        let _ = self.enqueue_work(work, 0, false);
-    }
-
-    #[cfg(test)]
-    fn enqueue_with_reservation(&self, work: DetachedContainerWork, reserved_bytes: usize) -> u64 {
-        self.enqueue_work(work, reserved_bytes, false)
-    }
-
-    fn enqueue_drain_candidate(&self, work: DetachedContainerWork, reserved_bytes: usize) -> u64 {
-        self.enqueue_work(work, reserved_bytes, true)
-    }
-
-    fn enqueue_work(
-        &self,
-        mut work: DetachedContainerWork,
-        reserved_bytes: usize,
-        drain_candidate: bool,
-    ) -> u64 {
+    fn enqueue(&self, mut work: DetachedContainerWork) -> u64 {
         let inode = work.inode;
         let work_bytes = work.payload_bytes;
-        assert!(
-            reserved_bytes <= work_bytes,
-            "ASSERT: enqueue cannot consume more reserved bytes than the handed-off work"
-        );
         let mut state = self
             .state
             .lock()
             .expect("ASSERT: detached publication queue lock poisoned");
         loop {
-            if !drain_candidate
-                && !state.shutdown
-                && state
-                    .inodes
-                    .get(&inode)
-                    .is_some_and(|queue| queue.drain_candidates > 0)
-            {
-                state.direct_drain_waiters = state
-                    .direct_drain_waiters
-                    .checked_add(1)
-                    .expect("ASSERT: direct publication drain waiters cannot overflow");
-                state = self.drain_available.wait(state).expect(
-                    "ASSERT: detached publication queue lock poisoned while waiting for a drain slot",
-                );
-                state.direct_drain_waiters = state
-                    .direct_drain_waiters
-                    .checked_sub(1)
-                    .expect("ASSERT: direct publication drain waiters cannot underflow");
-                continue;
-            }
-            let shared_batch_bytes = self.shared_batch_bytes();
-            assert!(
-                shared_batch_bytes >= reserved_bytes,
-                "ASSERT: shared publication reservation vanished before handoff"
-            );
-            let other_shared_batch_bytes = shared_batch_bytes
-                .checked_sub(reserved_bytes)
-                .expect("ASSERT: shared publication reservation cannot underflow");
-            if Self::charged_bytes(&state, other_shared_batch_bytes)
+            if state
+                .buffered_bytes
                 .checked_add(work_bytes)
                 .is_some_and(|total| total <= DETACHED_CONTAINER_BUDGET_BYTES_V1)
             {
@@ -1496,7 +1370,6 @@ impl PublicationQueue {
             !state.shutdown,
             "ASSERT: cannot enqueue detached Container work after scheduler shutdown"
         );
-        self.take_reserved_bytes(reserved_bytes);
         state.buffered_bytes = state
             .buffered_bytes
             .checked_add(work_bytes)
@@ -1512,142 +1385,20 @@ impl PublicationQueue {
             .next_publication_ordinal
             .checked_add(1)
             .expect("ASSERT: detached publication ordinal cannot overflow");
-        inode_queue
-            .pending
-            .push_back(PublicationPendingItem::Single(work));
+        inode_queue.pending.push_back(work);
         let retirement_target = inode_queue.next_publication_ordinal;
-        let drain_slot_released = if drain_candidate {
-            assert!(
-                inode_queue.drain_candidates > 0,
-                "ASSERT: commit-drain publication must consume its own marker"
-            );
-            inode_queue.drain_candidates -= 1;
-            inode_queue.drain_candidates == 0
-        } else {
-            false
-        };
         if schedule_publication_inodes(&mut state) {
             self.work_available.notify_one();
-        }
-        if drain_slot_released {
-            self.drain_available.notify_all();
         }
         retirement_target
     }
 
-    fn try_enqueue_group(
-        &self,
-        mut group: PublicationGroup,
-        reserved_bytes: usize,
-    ) -> Result<(u64, BTreeMap<InodeId, u64>), PublicationGroup> {
-        let group_bytes = group.payload_bytes;
-        assert!(
-            group.members.len() > 1,
-            "ASSERT: grouped publication requires multiple members"
-        );
-        assert!(
-            reserved_bytes <= group_bytes,
-            "ASSERT: grouped publication cannot consume more reserved bytes than its members"
-        );
-        let mut state = self
-            .state
-            .lock()
-            .expect("ASSERT: grouped publication queue lock poisoned");
-        loop {
-            let shared_batch_bytes = self.shared_batch_bytes();
-            assert!(
-                shared_batch_bytes >= reserved_bytes,
-                "ASSERT: grouped publication reservation vanished before handoff"
-            );
-            let other_shared_batch_bytes = shared_batch_bytes
-                .checked_sub(reserved_bytes)
-                .expect("ASSERT: grouped publication reservation cannot underflow");
-            if Self::charged_bytes(&state, other_shared_batch_bytes)
-                .checked_add(group_bytes)
-                .is_some_and(|total| total <= DETACHED_CONTAINER_BUDGET_BYTES_V1)
-            {
-                break;
-            }
-            state = self.space_available.wait(state).expect(
-                "ASSERT: grouped publication queue lock poisoned while applying backpressure",
-            );
-        }
-        assert!(
-            !state.shutdown,
-            "ASSERT: cannot enqueue grouped Container work after scheduler shutdown"
-        );
-        if group.members.iter().any(|member| {
-            state.inodes.get(&member.inode).is_some_and(|inode_queue| {
-                !inode_queue.pending.is_empty()
-                    || !inode_queue.in_flight.is_empty()
-                    || inode_queue.barrier.is_some()
-                    || member.through_sequence < inode_queue.last_enqueued_sequence
-            })
-        }) {
-            return Err(group);
-        }
-        let group_id = state.next_group_id;
-        state.next_group_id = state
-            .next_group_id
-            .checked_add(1)
-            .expect("ASSERT: publication group id cannot overflow");
-        group.id = group_id;
-        self.take_reserved_bytes(reserved_bytes);
-        state.buffered_bytes = state
-            .buffered_bytes
-            .checked_add(group_bytes)
-            .expect("ASSERT: grouped publication bytes cannot overflow");
-        let mut drain_slot_released = false;
-        let mut retirement_targets = BTreeMap::new();
-        for member in &group.members {
-            let inode_queue = state.inodes.entry(member.inode).or_default();
-            inode_queue.last_enqueued_sequence = member.through_sequence;
-            inode_queue.barrier = Some(group_id);
-            inode_queue
-                .pending
-                .push_back(PublicationPendingItem::GroupMember {
-                    group_id,
-                    first_chunk_sequence: member.first_chunk_sequence,
-                });
-            retirement_targets.insert(member.inode, inode_queue.next_publication_ordinal);
-            if inode_queue.drain_candidates > 0 {
-                inode_queue.drain_candidates -= 1;
-                drain_slot_released |= inode_queue.drain_candidates == 0;
-            }
-        }
-        let first_chunk_sequence = group
-            .members
-            .iter()
-            .map(|member| member.first_chunk_sequence)
-            .min()
-            .expect("ASSERT: grouped publication contains members");
-        state.active_groups.insert(group_id, first_chunk_sequence);
-        state.groups.insert(group_id, group);
-        state.ready_groups.push_back(group_id);
-        self.work_available.notify_one();
-        if drain_slot_released {
-            self.drain_available.notify_all();
-        }
-        Ok((group_id, retirement_targets))
-    }
-
-    fn next_unit(&self) -> Option<PublicationUnit> {
+    fn next_work(&self) -> Option<DetachedContainerWork> {
         let mut state = self
             .state
             .lock()
             .expect("ASSERT: detached publication queue lock poisoned");
         loop {
-            if let Some(group_id) = state.ready_groups.pop_front() {
-                let group = state
-                    .groups
-                    .remove(&group_id)
-                    .expect("ASSERT: ready grouped publication remains pending");
-                assert!(
-                    state.active_groups.contains_key(&group_id),
-                    "ASSERT: grouped publication has an active barrier"
-                );
-                return Some(PublicationUnit::Group(group));
-            }
             if let Some(inode) = state.ready_inodes.pop_front() {
                 let per_inode_limit = publication_window(&state);
                 let inode_queue = state
@@ -1655,14 +1406,12 @@ impl PublicationQueue {
                     .get_mut(&inode)
                     .expect("ASSERT: ready publication inode must own a queue");
                 inode_queue.ready = false;
-                if inode_queue.barrier.is_some()
-                    || inode_queue.pending.is_empty()
-                    || inode_queue.in_flight.len() >= per_inode_limit
+                if inode_queue.pending.is_empty() || inode_queue.in_flight.len() >= per_inode_limit
                 {
                     continue;
                 }
                 match inode_queue.pending.pop_front() {
-                    Some(PublicationPendingItem::Single(work)) => {
+                    Some(work) => {
                         assert!(
                             inode_queue
                                 .in_flight
@@ -1673,16 +1422,7 @@ impl PublicationQueue {
                         if schedule_publication_inodes(&mut state) {
                             self.work_available.notify_one();
                         }
-                        return Some(PublicationUnit::Single(work));
-                    }
-                    Some(group_member) => {
-                        if let PublicationPendingItem::GroupMember { group_id, .. } = group_member
-                            && state.groups.contains_key(&group_id)
-                            && !state.ready_groups.contains(&group_id)
-                        {
-                            state.ready_groups.push_back(group_id);
-                        }
-                        continue;
+                        return Some(work);
                     }
                     None => continue,
                 }
@@ -1694,16 +1434,6 @@ impl PublicationQueue {
                 .work_available
                 .wait(state)
                 .expect("ASSERT: detached publication queue lock poisoned while waiting for work");
-        }
-    }
-
-    #[cfg(test)]
-    fn next_work(&self) -> Option<DetachedContainerWork> {
-        match self.next_unit()? {
-            PublicationUnit::Single(work) => Some(work),
-            PublicationUnit::Group(_) => {
-                panic!("ASSERT: next_work is only used by single-publication tests")
-            }
         }
     }
 
@@ -1759,85 +1489,33 @@ impl PublicationQueue {
         self.completed.notify_all();
     }
 
-    fn finish_group(&self, group: &PublicationGroup) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("ASSERT: grouped publication queue lock poisoned");
-        state.buffered_bytes = state
-            .buffered_bytes
-            .checked_sub(group.payload_bytes)
-            .expect("ASSERT: completed grouped publication bytes must have been admitted");
-        assert!(
-            state.active_groups.remove(&group.id).is_some(),
-            "ASSERT: grouped publication retirement has an active barrier"
-        );
-        for member in &group.members {
-            let inode_queue = state
-                .inodes
-                .get_mut(&member.inode)
-                .expect("ASSERT: grouped publication inode retains queue state");
-            assert_eq!(inode_queue.barrier, Some(group.id));
-            inode_queue.barrier = None;
-            match inode_queue.pending.pop_front() {
-                Some(PublicationPendingItem::GroupMember {
-                    group_id,
-                    first_chunk_sequence,
-                }) => {
-                    assert_eq!(group_id, group.id);
-                    assert_eq!(first_chunk_sequence, member.first_chunk_sequence);
-                }
-                other => {
-                    panic!("ASSERT: grouped publication retirement must pop its member: {other:?}")
-                }
-            }
-        }
-        if schedule_publication_inodes(&mut state) {
-            self.work_available.notify_one();
-        }
-        self.space_available.notify_all();
-        self.completed.notify_all();
-    }
-
-    fn publication_fence(&self, inode: InodeId, through_sequence: u64) -> (Option<u64>, u64) {
+    fn publication_fence(&self, inode: InodeId, through_sequence: u64) -> u64 {
         let state = self
             .state
             .lock()
             .expect("ASSERT: publication queue lock poisoned");
-        let inode_queue = state.inodes.get(&inode);
-        let barrier = inode_queue
-            .and_then(|queue| queue.barrier)
-            .filter(|group_id| {
-                state
-                    .active_groups
-                    .get(group_id)
-                    .is_some_and(|first| through_sequence >= *first)
-            });
-        let target = inode_queue
-            .and_then(|queue| {
-                // A later-ending batch may contain complete pre-cut Chunks.
-                // Snapshot the required ordinal once: later arrivals cannot
-                // extend a Sync/Release/checkpoint fence indefinitely.
-                queue
-                    .in_flight
-                    .iter()
-                    .filter_map(|(&ordinal, &first)| (first <= through_sequence).then_some(ordinal))
-                    .chain(queue.pending.iter().filter_map(|item| {
-                        item.as_single()
-                            .filter(|work| work.first_chunk_sequence <= through_sequence)
-                            .map(|work| work.publication_ordinal)
-                    }))
-                    .max()
-            })
-            .map_or(0, |ordinal| ordinal + 1);
-        (barrier, target)
+        state.inodes.get(&inode).map_or(0, |queue| {
+            // A later-ending batch may contain complete pre-cut Chunks.
+            // Snapshot the required ordinal once: later arrivals cannot
+            // extend a Sync/Release/checkpoint fence indefinitely.
+            queue
+                .in_flight
+                .iter()
+                .filter_map(|(&ordinal, &first)| (first <= through_sequence).then_some(ordinal))
+                .chain(
+                    queue
+                        .pending
+                        .iter()
+                        .filter(|work| work.first_chunk_sequence <= through_sequence)
+                        .map(|work| work.publication_ordinal),
+                )
+                .max()
+                .map_or(0, |ordinal| ordinal + 1)
+        })
     }
 
     fn wait_through(&self, inode: InodeId, through_sequence: u64) {
-        let (barrier, target) = self.publication_fence(inode, through_sequence);
-        if let Some(group_id) = barrier {
-            self.wait_for_group(group_id);
-        }
+        let target = self.publication_fence(inode, through_sequence);
         self.wait_for_retirement(inode, target);
     }
 
@@ -1867,30 +1545,12 @@ impl PublicationQueue {
                 .expect("ASSERT: publication queue lock poisoned while waiting for retirement");
             state = waited;
             if timeout.timed_out() {
-                self.diagnose_publication_wait_locked(&state, "retirement", Some((inode, target)));
-            }
-        }
-    }
-
-    fn wait_for_group(&self, group_id: u64) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("ASSERT: grouped publication queue lock poisoned");
-        while state.active_groups.contains_key(&group_id) && !state.shutdown {
-            let (waited, timeout) = self
-                .completed
-                .wait_timeout(state, PUBLICATION_WAIT_DIAGNOSTIC_INTERVAL_V1)
-                .expect("ASSERT: publication queue lock poisoned while waiting");
-            state = waited;
-            if timeout.timed_out() {
-                self.diagnose_publication_wait_locked(&state, "group", None);
+                Self::diagnose_publication_wait_locked(&state, "retirement", Some((inode, target)));
             }
         }
     }
 
     fn diagnose_publication_wait_locked(
-        &self,
         state: &PublicationQueueState,
         context: &str,
         retirement_wait: Option<(InodeId, u64)>,
@@ -1900,38 +1560,29 @@ impl PublicationQueue {
         eprintln!(
             concat!(
                 "publication_wait_stall context={} waiting_inode={:?} retirement_target={:?} ",
-                "ready_inodes={} ready_groups={} groups={} active_groups={} next_group_id={} ",
-                "buffered_bytes={} shared_batch_bytes={} direct_drain_waiters={}"
+                "ready_inodes={} buffered_bytes={}"
             ),
             context,
             waiting_inode,
             retirement_target,
             state.ready_inodes.len(),
-            state.ready_groups.len(),
-            state.groups.len(),
-            state.active_groups.len(),
-            state.next_group_id,
             state.buffered_bytes,
-            self.shared_batch_bytes(),
-            state.direct_drain_waiters,
         );
         for (index, (inode, queue)) in state.inodes.iter().enumerate().take(8) {
             eprintln!(
                 concat!(
                     "publication_wait_inode context={} index={} inode={:?} pending={} ",
-                    "in_flight={} barrier={:?} next_publication_ordinal={} ",
-                    "next_retirement_ordinal={} last_sequence={} drain_candidates={} ready={}"
+                    "in_flight={} next_publication_ordinal={} next_retirement_ordinal={} ",
+                    "last_sequence={} ready={}"
                 ),
                 context,
                 index,
                 inode,
                 queue.pending.len(),
                 queue.in_flight.len(),
-                queue.barrier,
                 queue.next_publication_ordinal,
                 queue.next_retirement_ordinal,
                 queue.last_enqueued_sequence,
-                queue.drain_candidates,
                 queue.ready,
             );
         }
@@ -1951,14 +1602,6 @@ impl PublicationQueue {
             .buffered_bytes
     }
 
-    #[cfg(test)]
-    fn direct_drain_waiters(&self) -> usize {
-        self.state
-            .lock()
-            .expect("ASSERT: detached publication queue lock poisoned in test")
-            .direct_drain_waiters
-    }
-
     fn shutdown(&self) {
         let mut state = self
             .state
@@ -1968,7 +1611,6 @@ impl PublicationQueue {
         self.work_available.notify_all();
         self.space_available.notify_all();
         self.completed.notify_all();
-        self.drain_available.notify_all();
     }
 }
 
@@ -1995,11 +1637,7 @@ fn schedule_publication_inodes(state: &mut PublicationQueueState) -> bool {
             .get_mut(&inode)
             .expect("ASSERT: enumerated publication inode remains present");
         if !queue.ready
-            && queue.barrier.is_none()
-            && queue
-                .pending
-                .front()
-                .is_some_and(PublicationPendingItem::is_single)
+            && queue.pending.front().is_some()
             && queue.in_flight.len() < per_inode_limit
         {
             queue.ready = true;
@@ -2058,10 +1696,44 @@ impl IngestQueue {
             work_available: Condvar::new(),
             space_available: Condvar::new(),
             completed: Condvar::new(),
+            admission_closing: AtomicBool::new(false),
+        }
+    }
+
+    fn notify_admission_closing(&self) {
+        let _state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned while closing admission");
+        self.admission_closing.store(true, Ordering::SeqCst);
+        self.space_available.notify_all();
+        self.work_available.notify_all();
+        self.completed.notify_all();
+    }
+
+    fn notify_admission_opened(&self) {
+        let _state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned while reopening admission");
+        self.admission_closing.store(false, Ordering::SeqCst);
+    }
+
+    fn seal_inode_for_admission_backpressure(&self, inode: InodeId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned during admission backpressure");
+        if seal_open_ingest_batch(&mut state, inode) {
+            self.work_available.notify_all();
         }
     }
 
     fn enqueue_write_fragment(&self, inode: InodeId, fragment: IngestWriteFragment) {
+        if self.admission_closing.load(Ordering::Acquire) {
+            self.seal_inode_for_admission_backpressure(inode);
+            return;
+        }
         let fragment_bytes = fragment.bytes.len();
         assert!(
             fragment_bytes <= WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1,
@@ -2076,7 +1748,9 @@ impl IngestQueue {
             self.enqueue_unbatched_fragment(state, inode, fragment);
             return;
         }
-        state = self.wait_for_fragment_admission(state, inode, &fragment);
+        let Some(mut state) = self.wait_for_fragment_admission(state, inode, &fragment) else {
+            return;
+        };
         assert!(
             !state.shutdown,
             "ASSERT: cannot enqueue after scheduler shutdown"
@@ -2126,11 +1800,23 @@ impl IngestQueue {
             .checked_add(fragment.bytes.len())
             .is_none_or(|total| total > MULTI_STREAM_QUEUE_BUDGET_BYTES_V1)
         {
+            if self.admission_closing.load(Ordering::Acquire) {
+                if seal_open_ingest_batch(&mut state, inode) {
+                    self.work_available.notify_all();
+                }
+                return;
+            }
             waited = true;
             state = self
                 .space_available
                 .wait(state)
                 .expect("ASSERT: ingest queue lock poisoned while applying backpressure");
+        }
+        if self.admission_closing.load(Ordering::Acquire) {
+            if seal_open_ingest_batch(&mut state, inode) {
+                self.work_available.notify_all();
+            }
+            return;
         }
         if waited {
             state.ingest_ring_wait_ns = state.ingest_ring_wait_ns.saturating_add(
@@ -2175,10 +1861,16 @@ impl IngestQueue {
         mut state: std::sync::MutexGuard<'a, IngestQueueState>,
         inode: InodeId,
         fragment: &IngestWriteFragment,
-    ) -> std::sync::MutexGuard<'a, IngestQueueState> {
+    ) -> Option<std::sync::MutexGuard<'a, IngestQueueState>> {
         let wait_started = Instant::now();
         let mut waited = false;
         loop {
+            if self.admission_closing.load(Ordering::Acquire) {
+                if seal_open_ingest_batch(&mut state, inode) {
+                    self.work_available.notify_all();
+                }
+                return None;
+            }
             let active_inodes = active_ingest_inodes_with_candidate(&state, inode);
             let batch_target = ingest_batch_target_bytes(active_inodes);
             record_ingest_batch_target(&mut state, batch_target);
@@ -2211,7 +1903,7 @@ impl IngestQueue {
                         u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                     );
                 }
-                return state;
+                return Some(state);
             }
             waited = true;
             #[cfg(test)]
@@ -2706,11 +2398,11 @@ impl<C> fmt::Debug for WriteThroughIngest<C> {
             .expect("ASSERT: write-through overflow lane lock poisoned");
         let ingest = self.queue.status();
         let buffered_bytes = buffered_bytes
-            .checked_add(self.shared_batch_bytes.load(Ordering::Relaxed))
-            .and_then(|sum| sum.checked_add(overflow.tail.len()))
+            .checked_add(overflow.tail.len())
             .and_then(|sum| sum.checked_add(overflow.pending.bytes))
             .and_then(|sum| sum.checked_add(ingest.buffered_bytes))
             .and_then(|sum| sum.checked_add(self.publication_queue.buffered_bytes()))
+            .and_then(|sum| sum.checked_add(self.pending_regions.residue_bytes()))
             .expect("ASSERT: bounded write-through bytes cannot overflow");
         assert!(
             buffered_bytes <= WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1,
@@ -2779,39 +2471,20 @@ where
             let worker = std::thread::Builder::new()
                 .name(format!("fastdup-publish-{ordinal}"))
                 .spawn(move || {
-                    while let Some(unit) = queue.next_unit() {
-                        match unit {
-                            PublicationUnit::Single(work) => {
-                                let result = if let Some(owner) = owner.upgrade() {
-                                    let result = owner.publish_detached_container(&work);
-                                    queue.wait_for_retirement_turn(&work);
-                                    owner.retire_detached_container(&work, result)
-                                } else {
-                                    queue.wait_for_retirement_turn(&work);
-                                    Err(DurableNamespaceError::FrozenViewMismatch)
-                                };
-                                queue.finish(&work);
-                                if let Some(completion) = &work.completion {
-                                    // One bounded reply; a canceled checkpoint may have
-                                    // dropped its receiver, but retirement still finishes.
-                                    let _ = completion.send(result.map_err(Arc::new));
-                                }
-                            }
-                            PublicationUnit::Group(group) => {
-                                let result = if let Some(owner) = owner.upgrade() {
-                                    let result = owner.publish_shared_group(&group);
-                                    owner.retire_shared_group(&group, result)
-                                } else {
-                                    Err(DurableNamespaceError::FrozenViewMismatch)
-                                };
-                                queue.finish_group(&group);
-                                let completion = result.map_err(SharedPublicationError::from);
-                                for member in &group.members {
-                                    if let Some(sender) = &member.completion {
-                                        let _ = sender.send(completion.clone());
-                                    }
-                                }
-                            }
+                    while let Some(work) = queue.next_work() {
+                        let result = if let Some(owner) = owner.upgrade() {
+                            let result = owner.publish_detached_container(&work);
+                            queue.wait_for_retirement_turn(&work);
+                            owner.retire_detached_container(&work, result)
+                        } else {
+                            queue.wait_for_retirement_turn(&work);
+                            Err(DurableNamespaceError::FrozenViewMismatch)
+                        };
+                        queue.finish(&work);
+                        if let Err(error) = result {
+                            eprintln!(
+                                "detached Container retirement failed after finish: {error:?}"
+                            );
                         }
                     }
                 })
@@ -2830,6 +2503,10 @@ where
     ) {
         let mut consumed = 0_usize;
         while consumed < bytes.len() {
+            if self.queue.admission_closing.load(Ordering::Acquire) {
+                self.queue.seal_inode_for_admission_backpressure(inode);
+                return;
+            }
             let chunk_end = consumed
                 .saturating_add(WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1)
                 .min(bytes.len());
@@ -2896,49 +2573,10 @@ where
                 Ok(())
             }
             Err(error) => {
-                // Partial drains return the error to their checkpoint, which
-                // retains the Frozen view for retry. Only unobserved background
-                // failures use ordinary lane degradation.
-                if work.completion.is_none() {
-                    self.degrade_inode(work.inode, work.through_sequence, &error);
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn retire_shared_group(
-        &self,
-        group: &PublicationGroup,
-        result: Result<(Vec<Vec<ExternalizedExtent>>, bool), DurableNamespaceError>,
-    ) -> Result<(), DurableNamespaceError> {
-        match result {
-            Ok((externalized, sealed)) => {
-                assert_eq!(
-                    externalized.len(),
-                    group.members.len(),
-                    "ASSERT: shared publication has one extent batch per member"
-                );
-                if let Some(namespace) = self.namespace.get().and_then(Weak::upgrade) {
-                    for extents in externalized {
-                        namespace.externalize_verified_extents(extents);
-                    }
-                }
-                if sealed {
-                    let mut registry = self
-                        .registry
-                        .lock()
-                        .expect("ASSERT: write-through registry lock poisoned");
-                    registry.sealed.push_back(Instant::now());
-                }
-                Ok(())
-            }
-            Err(error) => {
-                for member in &group.members {
-                    if member.completion.is_none() {
-                        self.degrade_inode(member.inode, member.through_sequence, &error);
-                    }
-                }
+                // Ordinary detached work is unobserved background reduction.
+                // The commit-cut Drain Residue never enters this queue, so a
+                // failure degrades the inode instead of failing a checkpoint.
+                self.degrade_inode(work.inode, work.through_sequence, &error);
                 Err(error)
             }
         }
@@ -2999,6 +2637,8 @@ where
             .lock()
             .expect("ASSERT: write-through lane lock poisoned");
         if lane.inode == Some(inode) {
+            self.pending_regions
+                .release_lane_bytes(lane.tail.len() + lane.pending.bytes);
             *lane = WriteThroughStream::default();
         }
     }
@@ -3037,6 +2677,10 @@ where
         let buffered = buffered
             .checked_add(queued_bytes)
             .expect("ASSERT: bounded write-through plus queue bytes cannot overflow");
+        // Drain Residues are resident until the commit Writer absorbs them.
+        let buffered = buffered
+            .checked_add(self.pending_regions.residue_bytes())
+            .expect("ASSERT: bounded write-through plus Drain Residue bytes cannot overflow");
         assert!(
             buffered <= WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1,
             "ASSERT: write-through registry exceeded its process memory budget"
@@ -3131,60 +2775,32 @@ where
             "ASSERT: an Ingest Batch contains at least one fragment"
         );
         let _active_writer = ActiveWriteThrough::enter(&self.active_writers);
+        // Reserve the worst-case pending-region growth before acquiring the
+        // Lane lock so the commit-cut drain can always reach a blocked Lane.
+        // The complete SeqCDC suffix of at most two maximum Chunks may join
+        // the retained region from the pre-existing Tail.
+        let reserved = fragments
+            .iter()
+            .fold(0_usize, |total, fragment| {
+                total
+                    .checked_add(fragment.bytes.len())
+                    .expect("ASSERT: bounded Ingest Batch reservation cannot overflow")
+            })
+            .saturating_add(2 * CDC_MAXIMUM_BYTES);
+        self.pending_regions.reserve_staging_growth(reserved);
         let lane = self.lane_for(inode);
         let mut lane = lane
             .lock()
             .expect("ASSERT: write-through lane lock poisoned");
+        let region_before = lane.tail.len() + lane.pending.bytes;
         let mut externalized = Vec::new();
-        for fragment in fragments {
-            let discontinuous = lane.inode != Some(inode)
-                || lane.placement != Some(fragment.placement)
-                || lane.next_offset != fragment.offset
-                || lane
-                    .last_mutation_sequence
-                    .is_some_and(|previous| fragment.mutation_sequence <= previous);
-            if discontinuous {
-                externalized.extend(self.drain_before_lane_reset(&mut lane)?);
-                lane.inode = Some(inode);
-                lane.placement = Some(fragment.placement);
-                lane.tail_offset = fragment.offset;
-                lane.tail.clear();
-                lane.pending.clear();
-            }
-            assert_bounded_write_through_lane(&lane);
-            lane.last_mutation_sequence = Some(fragment.mutation_sequence);
-            lane.next_offset = fragment
-                .offset
-                .checked_add(u64::try_from(fragment.bytes.len()).expect("ASSERT: usize fits u64"))
-                .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
-            lane.tail
-                .push(fragment.bytes.clone(), fragment.mutation_sequence);
-            loop {
-                externalized.extend(self.extract_stable_chunks(
-                    &mut lane,
-                    inode,
-                    fragment.mutation_sequence,
-                    StableExtraction::FillContainer,
-                )?);
-                if lane.pending.bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
-                    break;
-                }
-                assert!(
-                    lane.pending.bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
-                    "ASSERT: write-through payload exceeded its pre-format Container bound"
-                );
-                let pending = std::mem::take(&mut lane.pending);
-                let work = DetachedContainerWork::new(
-                    inode,
-                    fragment.mutation_sequence,
-                    pending.chunks,
-                    pending.bytes,
-                );
-                assert_pending_write_through_state(&lane);
-                self.publication_queue.enqueue(work);
-            }
-            assert_bounded_write_through_lane(&lane);
-        }
+        let staged = self.stage_fragments(&mut lane, inode, fragments, &mut externalized);
+        self.pending_regions.settle_staging(
+            reserved,
+            region_before,
+            lane.tail.len() + lane.pending.bytes,
+        );
+        staged?;
         lane.tail.assert_valid();
         #[cfg(test)]
         let had_inline = !externalized.is_empty();
@@ -3207,6 +2823,66 @@ where
                 hook();
             }
         }
+        Ok(())
+    }
+
+    fn stage_fragments(
+        &self,
+        lane: &mut WriteThroughStream,
+        inode: InodeId,
+        fragments: &[IngestWriteFragment],
+        externalized: &mut Vec<ExternalizedExtent>,
+    ) -> Result<(), DurableNamespaceError> {
+        for fragment in fragments {
+            let discontinuous = lane.inode != Some(inode)
+                || lane.placement != Some(fragment.placement)
+                || lane.next_offset != fragment.offset
+                || lane
+                    .last_mutation_sequence
+                    .is_some_and(|previous| fragment.mutation_sequence <= previous);
+            if discontinuous {
+                externalized.extend(self.drain_before_lane_reset(lane)?);
+                lane.inode = Some(inode);
+                lane.placement = Some(fragment.placement);
+                lane.tail_offset = fragment.offset;
+                lane.tail.clear();
+                lane.pending.clear();
+            }
+            assert_bounded_write_through_lane(lane);
+            lane.last_mutation_sequence = Some(fragment.mutation_sequence);
+            lane.next_offset = fragment
+                .offset
+                .checked_add(u64::try_from(fragment.bytes.len()).expect("ASSERT: usize fits u64"))
+                .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
+            lane.tail
+                .push(fragment.bytes.clone(), fragment.mutation_sequence);
+            loop {
+                externalized.extend(self.extract_stable_chunks(
+                    lane,
+                    inode,
+                    fragment.mutation_sequence,
+                    StableExtraction::FillContainer,
+                )?);
+                if lane.pending.bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
+                    break;
+                }
+                assert!(
+                    lane.pending.bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
+                    "ASSERT: write-through payload exceeded its pre-format Container bound"
+                );
+                let pending = std::mem::take(&mut lane.pending);
+                let work = DetachedContainerWork::new(
+                    inode,
+                    fragment.mutation_sequence,
+                    pending.chunks,
+                    pending.bytes,
+                );
+                assert_pending_write_through_state(lane);
+                self.publication_queue.enqueue(work);
+            }
+            assert_bounded_write_through_lane(lane);
+        }
+        lane.tail.assert_valid();
         Ok(())
     }
 
@@ -3259,210 +2935,19 @@ where
 
     #[allow(
         clippy::too_many_lines,
-        reason = "partial drain owns batch formation, ordered enqueue, and shared reservations"
-    )]
-    fn enqueue_shared_partial_batch(
-        &self,
-        batch: &mut Vec<Option<PartialCandidate>>,
-    ) -> Result<PublicationFences, DurableNamespaceError> {
-        let mut receivers = Vec::new();
-        receivers
-            .try_reserve_exact(batch.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for candidate in batch.iter_mut().flatten() {
-            if let Some(receiver) = candidate.receiver.take() {
-                receivers.push(receiver);
-            }
-        }
-        let mut placements = BTreeMap::<(u8, bool), Vec<usize>>::new();
-        for (index, candidate) in batch.iter().enumerate() {
-            let Some(candidate) = candidate else {
-                continue;
-            };
-            placements
-                .entry((
-                    partial_placement_bucket(candidate.placement),
-                    candidate.advanced,
-                ))
-                .or_default()
-                .push(index);
-        }
-        let mut retirement_targets: BTreeMap<InodeId, u64> = BTreeMap::new();
-        let mut barriers: BTreeMap<InodeId, u64> = BTreeMap::new();
-        for group_candidates in placements.into_values() {
-            let mut start = 0;
-            while start < group_candidates.len() {
-                let first = group_candidates[start];
-                start += 1;
-                if batch[first].is_none() {
-                    continue;
-                }
-                let mut selected = vec![first];
-                let mut payload = batch[first]
-                    .as_ref()
-                    .expect("ASSERT: selected candidate exists")
-                    .payload_bytes;
-                let placement = batch[first]
-                    .as_ref()
-                    .expect("ASSERT: selected candidate exists")
-                    .placement;
-                for &other in &group_candidates[start..] {
-                    let Some(candidate) = batch[other].as_ref() else {
-                        continue;
-                    };
-                    let Some(total) = payload.checked_add(candidate.payload_bytes) else {
-                        continue;
-                    };
-                    if total > PARTIAL_BATCH_BUDGET_BYTES_V1 || candidate.placement != placement {
-                        continue;
-                    }
-                    if selected.iter().any(|&selected| {
-                        batch[selected]
-                            .as_ref()
-                            .is_some_and(|selected| selected.inode == candidate.inode)
-                    }) {
-                        continue;
-                    }
-                    selected.push(other);
-                    payload = total;
-                }
-                if selected.len() == 1 {
-                    let Some(candidate) = batch[first].take() else {
-                        continue;
-                    };
-                    let inode = candidate.inode;
-                    let target = self
-                        .publication_queue
-                        .enqueue_drain_candidate(candidate.into_single(), payload);
-                    retirement_targets
-                        .entry(inode)
-                        .and_modify(|existing| *existing = (*existing).max(target))
-                        .or_insert(target);
-                    continue;
-                }
-                let members = selected
-                    .iter()
-                    .map(|&index| {
-                        batch[index]
-                            .take()
-                            .expect("ASSERT: grouped candidate exists")
-                            .into_member()
-                    })
-                    .collect::<Vec<_>>();
-                let member_inodes = members
-                    .iter()
-                    .map(|member| member.inode)
-                    .collect::<Vec<_>>();
-                let group = PublicationGroup {
-                    id: 0,
-                    members,
-                    payload_bytes: payload,
-                };
-                match self.publication_queue.try_enqueue_group(group, payload) {
-                    Ok((group_id, member_targets)) => {
-                        for inode in member_inodes {
-                            barriers.insert(inode, group_id);
-                        }
-                        Self::merge_publication_targets(&mut retirement_targets, member_targets);
-                    }
-                    Err(group) => {
-                        for member in group.members {
-                            let inode = member.inode;
-                            let reserved = member.payload_bytes;
-                            let mut work = DetachedContainerWork::new(
-                                member.inode,
-                                member.through_sequence,
-                                member.chunks,
-                                member.payload_bytes,
-                            );
-                            work.completion = member.completion;
-                            let target = self
-                                .publication_queue
-                                .enqueue_drain_candidate(work, reserved);
-                            retirement_targets
-                                .entry(inode)
-                                .and_modify(|existing| *existing = (*existing).max(target))
-                                .or_insert(target);
-                        }
-                    }
-                }
-            }
-        }
-        batch.clear();
-        Ok(PublicationFences {
-            retirement_targets,
-            barriers,
-            receivers,
-        })
-    }
-
-    fn release_shared_drain_batch(&self, batch: &mut Vec<Option<PartialCandidate>>) {
-        let mut drain_candidates = BTreeMap::new();
-        for candidate in batch.drain(..).flatten() {
-            self.publication_queue
-                .release_local_bytes(candidate.payload_bytes);
-            *drain_candidates
-                .entry(candidate.inode)
-                .or_insert_with(|| 0_usize) += 1;
-        }
-        for (inode, count) in drain_candidates {
-            for _ in 0..count {
-                self.publication_queue.clear_drain_candidate(inode);
-            }
-        }
-    }
-
-    fn flush_shared_partial_batch(
-        &self,
-        batch: &mut Vec<Option<PartialCandidate>>,
-    ) -> Result<PublicationFences, DurableNamespaceError> {
-        let result = self.enqueue_shared_partial_batch(batch);
-        if result.is_err() {
-            self.release_shared_drain_batch(batch);
-        }
-        result
-    }
-
-    fn merge_publication_targets(
-        targets: &mut BTreeMap<InodeId, u64>,
-        additions: BTreeMap<InodeId, u64>,
-    ) {
-        for (inode, target) in additions {
-            targets
-                .entry(inode)
-                .and_modify(|existing| *existing = (*existing).max(target))
-                .or_insert(target);
-        }
-    }
-
-    fn wait_for_shared_publication_fences(
-        &self,
-        retirement_targets: BTreeMap<InodeId, u64>,
-        barriers: &BTreeMap<InodeId, u64>,
-        receivers: &[std::sync::mpsc::Receiver<PublicationResult>],
-    ) -> Result<(), DurableNamespaceError> {
-        for (inode, target) in retirement_targets {
-            if let Some(group_id) = barriers.get(&inode) {
-                self.publication_queue.wait_for_group(*group_id);
-            }
-            self.publication_queue.wait_for_retirement(inode, target);
-        }
-        for receiver in receivers {
-            recv_publication_completion(receiver)?;
-        }
-        Ok(())
-    }
-
-    #[allow(
-        clippy::too_many_lines,
-        reason = "commit-cut drain owns lane extraction, bounded grouping, and cut fences"
+        reason = "commit-cut drain owns lane extraction, residue materialization, and cut fences"
     )]
     pub(super) fn flush_stable_for_commit_cut(
         &self,
+        commit: &NamespaceCommit,
         timings: &CheckpointTimings,
         metrics: &mut CheckpointMetrics,
-    ) -> Result<Vec<ExternalizedExtent>, DurableNamespaceError> {
+    ) -> Result<(Vec<ExternalizedExtent>, Vec<DrainResidue>), DurableNamespaceError> {
         let _active_writer = ActiveWriteThrough::enter(&self.active_writers);
+        let mut commit_fences: BTreeMap<u64, u64> = BTreeMap::new();
+        for inode in commit.inodes() {
+            commit_fences.insert(inode.inode().get(), inode.mutation_sequence());
+        }
         let registry_started = timings.begin(CheckpointStage::LaneLock);
         let lanes = {
             let registry = self
@@ -3479,11 +2964,8 @@ where
         };
         registry_started.finish_into(&mut metrics.lane_lock);
         let mut externalized = Vec::new();
-        let mut batch = Vec::new();
-        let mut batch_bytes = 0_usize;
+        let mut residues = Vec::new();
         let mut retirement_targets = BTreeMap::new();
-        let mut barriers = BTreeMap::new();
-        let mut receivers = Vec::new();
         for lane in lanes {
             let lane_started = timings.begin(CheckpointStage::LaneLock);
             let mut lane = lane
@@ -3495,101 +2977,126 @@ where
                 assert_pending_write_through_state(&lane);
                 continue;
             };
-            let advanced = self.advanced_reduction_enabled_for(inode);
+            let fence = commit_fences.get(&inode.get()).copied().unwrap_or(u64::MIN);
             loop {
                 let extract_started = timings.begin(CheckpointStage::StableExtract);
                 let previous_tail = lane.tail.len();
-                let extracted = match self.extract_stable_chunks(
+                let extracted = self.extract_stable_chunks(
                     &mut lane,
                     inode,
                     through_sequence,
                     StableExtraction::DrainStable,
-                ) {
-                    Ok(extracted) => extracted,
-                    Err(error) => {
-                        self.release_shared_drain_batch(&mut batch);
-                        return Err(error);
-                    }
-                };
-                if let Err(error) = externalized
+                )?;
+                externalized
                     .try_reserve(extracted.len())
-                    .map_err(|_| DurableNamespaceError::OutOfMemory)
-                {
-                    self.release_shared_drain_batch(&mut batch);
-                    return Err(error);
-                }
+                    .map_err(|_| DurableNamespaceError::OutOfMemory)?;
                 externalized.extend(extracted);
                 extract_started.finish_into(&mut metrics.stable_extract);
                 let had_pending = !lane.pending.chunks.is_empty();
                 if had_pending {
-                    let pending = std::mem::take(&mut lane.pending);
-                    let placement = pending
-                        .chunks
-                        .first()
-                        .expect("ASSERT: pending work has one placement")
-                        .placement;
-                    let candidate = PartialCandidate::new(
-                        inode,
-                        through_sequence,
-                        pending.chunks,
-                        pending.bytes,
-                        placement,
-                        advanced,
-                    );
-                    self.publication_queue
-                        .reserve_local_bytes(candidate.payload_bytes);
-                    self.publication_queue.begin_drain_candidate(inode);
-                    batch_bytes = batch_bytes
-                        .checked_add(candidate.payload_bytes)
-                        .expect("ASSERT: bounded partial batch bytes cannot overflow");
-                    batch.push(Some(candidate));
-                    if batch_bytes >= PARTIAL_BATCH_BUDGET_BYTES_V1 {
-                        let enqueue_started = timings.begin(CheckpointStage::PublicationEnqueue);
-                        let fences = self.flush_shared_partial_batch(&mut batch)?;
-                        enqueue_started.finish_into(&mut metrics.publication_enqueue);
-                        Self::merge_publication_targets(
-                            &mut retirement_targets,
-                            fences.retirement_targets,
-                        );
-                        barriers.extend(fences.barriers);
-                        receivers.extend(fences.receivers);
-                        batch_bytes = 0;
+                    let residue_started = timings.begin(CheckpointStage::DrainResidue);
+                    let taken = std::mem::take(&mut lane.pending);
+                    let mut pre_chunks = Vec::new();
+                    let mut post_chunks = Vec::new();
+                    let mut pre_bytes = 0_usize;
+                    let mut post_bytes = 0_usize;
+                    for chunk in taken.chunks {
+                        if chunk.bytes.through_sequence() <= fence {
+                            pre_bytes = pre_bytes
+                                .checked_add(chunk.bytes.len())
+                                .expect("ASSERT: bounded pre-cut pending bytes fit usize");
+                            pre_chunks.push(chunk);
+                        } else {
+                            post_bytes = post_bytes
+                                .checked_add(chunk.bytes.len())
+                                .expect("ASSERT: bounded post-cut pending bytes fit usize");
+                            post_chunks.push(chunk);
+                        }
                     }
+                    assert_eq!(
+                        pre_bytes
+                            .checked_add(post_bytes)
+                            .expect("ASSERT: bounded pending bytes cannot overflow"),
+                        taken.bytes,
+                        "ASSERT: commit-cut Chunk split must preserve the pending byte ledger"
+                    );
+                    if !pre_chunks.is_empty() {
+                        let (actual, _first_chunk_sequence) = validate_pending_chunks(&pre_chunks);
+                        assert_eq!(
+                            actual, pre_bytes,
+                            "ASSERT: commit-cut Drain Residue byte accounting must be exact"
+                        );
+                        assert!(
+                            pre_bytes <= CONTAINER_PAYLOAD_TARGET_BYTES,
+                            "ASSERT: one commit-cut Drain Residue fits its Container bound"
+                        );
+                        let charged_bytes = pre_bytes;
+                        let mut chunks = Vec::new();
+                        chunks
+                            .try_reserve_exact(pre_chunks.len())
+                            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+                        for chunk in pre_chunks {
+                            let bytes = chunk.bytes.materialize_new_chunk()?.into_owned();
+                            assert_eq!(
+                                bytes.len(),
+                                chunk.bytes.len(),
+                                "ASSERT: materialized Drain Residue Chunk keeps its length"
+                            );
+                            chunks.push(MergedDrainChunk {
+                                offset: chunk.offset,
+                                chunk_id: chunk.chunk_id,
+                                bytes,
+                            });
+                        }
+                        // The Lane payload and its Drain Residue share one gated
+                        // region; this transfer never blocks a drain.
+                        self.pending_regions.transfer_lane_to_residue(charged_bytes);
+                        residues.push(DrainResidue {
+                            inode,
+                            chunks,
+                            charged_bytes,
+                            regions: self.pending_regions.clone(),
+                        });
+                    }
+                    if !post_chunks.is_empty() {
+                        // Post-Cut Chunks stage into the same Lane while the
+                        // drain runs. They cannot join this frozen cut: keep
+                        // them resident for the next commit cut.
+                        lane.pending.chunks = post_chunks;
+                        lane.pending.bytes = post_bytes;
+                    }
+                    residue_started.finish_into(&mut metrics.drain_residue);
                 }
                 if lane.tail.len() == previous_tail || !had_pending {
                     break;
                 }
             }
             assert!(
-                lane.pending.chunks.is_empty() && lane.pending.bytes == 0,
-                "ASSERT: commit-cut drain detaches every complete staged Chunk"
+                lane.pending
+                    .chunks
+                    .iter()
+                    .all(|chunk| chunk.bytes.through_sequence() > fence),
+                "ASSERT: commit-cut drain detaches every Chunk the frozen cut still needs"
             );
             assert!(
                 lane.tail.len() <= CDC_MAXIMUM_BYTES * 2,
                 "ASSERT: commit-cut drain retains only a boundary Chunk and CDC suffix"
             );
             assert_bounded_write_through_lane(&lane);
-            let (base_barrier, base_target) = self
+            let base_target = self
                 .publication_queue
                 .publication_fence(inode, through_sequence);
             retirement_targets
                 .entry(inode)
-                .and_modify(|existing| *existing = (*existing).max(base_target))
+                .and_modify(|existing: &mut u64| *existing = (*existing).max(base_target))
                 .or_insert(base_target);
-            if let Some(group_id) = base_barrier {
-                barriers.insert(inode, group_id);
-            }
         }
-        let enqueue_started = timings.begin(CheckpointStage::PublicationEnqueue);
-        let fences = self.flush_shared_partial_batch(&mut batch)?;
-        enqueue_started.finish_into(&mut metrics.publication_enqueue);
-        Self::merge_publication_targets(&mut retirement_targets, fences.retirement_targets);
-        barriers.extend(fences.barriers);
-        receivers.extend(fences.receivers);
         let retire_started = timings.begin(CheckpointStage::PublicationRetire);
-        self.wait_for_shared_publication_fences(retirement_targets, &barriers, &receivers)?;
+        for (inode, target) in retirement_targets {
+            self.publication_queue.wait_for_retirement(inode, target);
+        }
         retire_started.finish_into(&mut metrics.publication_retire);
-        Ok(externalized)
+        Ok((externalized, residues))
     }
 
     pub(super) fn lane_for(&self, inode: InodeId) -> Arc<Mutex<WriteThroughStream>> {
@@ -3794,118 +3301,6 @@ where
             "ASSERT: detached work sequence covers every published Chunk"
         );
         let externalized = self.externalize_chunks(chunks, inode, &locations)?;
-        self.index
-            .publish_reduction_batch(entries, similarity_entries, publication_guard);
-        Ok((externalized, sealed))
-    }
-
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one shared Container publication must keep per-member ordering and externalization"
-    )]
-    fn publish_shared_group(
-        &self,
-        group: &PublicationGroup,
-    ) -> Result<(Vec<Vec<ExternalizedExtent>>, bool), DurableNamespaceError> {
-        assert!(
-            group.members.len() > 1,
-            "ASSERT: shared Container publication requires multiple members"
-        );
-        let total_chunks = group.members.iter().fold(0_usize, |total, member| {
-            total
-                .checked_add(member.chunks.len())
-                .expect("ASSERT: shared Container chunk count cannot overflow")
-        });
-        let mut candidates = Vec::with_capacity(total_chunks);
-        candidates
-            .try_reserve_exact(total_chunks)
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for member in &group.members {
-            for chunk in &member.chunks {
-                let logical_length = u32::try_from(chunk.bytes.len())
-                    .map_err(|_| DurableNamespaceError::FrozenViewMismatch)?;
-                candidates.push((chunk.chunk_id, logical_length, chunk, member.inode));
-            }
-        }
-        candidates
-            .sort_unstable_by_key(|(chunk_id, _, chunk, owner)| (*chunk_id, *owner, chunk.offset));
-        let mut unique_candidates = Vec::with_capacity(candidates.len());
-        unique_candidates
-            .try_reserve_exact(candidates.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        for (chunk_id, logical_length, chunk, owner) in candidates {
-            if let Some((previous_id, previous_length, _, _)) = unique_candidates.last().copied()
-                && previous_id == chunk_id
-            {
-                if previous_length != logical_length {
-                    return Err(DurableNamespaceError::ChunkLengthConflict {
-                        chunk_id,
-                        first_length: u64::from(previous_length),
-                        second_length: u64::from(logical_length),
-                    });
-                }
-                continue;
-            }
-            unique_candidates.push((chunk_id, logical_length, chunk, owner));
-        }
-        let mut locations = Vec::new();
-        locations
-            .try_reserve(unique_candidates.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        let mut new_chunk_items = Vec::new();
-        new_chunk_items
-            .try_reserve(unique_candidates.len())
-            .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-        let mut claims =
-            PublicationClaims::new(&self.online_dependency_proofs, unique_candidates.len())?;
-        for (chunk_id, logical_length, chunk, owner) in unique_candidates {
-            match claims.claim(chunk_id, logical_length) {
-                PublicationClaim::Existing(entry) => locations.push(entry),
-                PublicationClaim::Acquired => new_chunk_items.push((owner, chunk)),
-            }
-        }
-        new_chunk_items.sort_unstable_by_key(|(owner, chunk)| (*owner, chunk.offset));
-        let new_chunks = new_chunk_items
-            .iter()
-            .map(|(_, chunk)| *chunk)
-            .collect::<Vec<_>>();
-        let advanced = group
-            .members
-            .iter()
-            .all(|member| member.advanced && self.advanced_reduction_enabled_for(member.inode));
-        let publication_guard = advanced
-            .then(|| self.containers.try_pin_data_reference())
-            .flatten();
-        let advanced = publication_guard.is_some();
-        let (mut entries, similarity_entries) = if new_chunks.is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            self.publish_new_chunks(&new_chunks, advanced)?
-        };
-        locations.extend(entries.iter().copied());
-        locations.sort_unstable_by_key(ExactIndexEntry::chunk_id);
-        assert!(
-            locations
-                .windows(2)
-                .all(|pair| pair[0].chunk_id() < pair[1].chunk_id()),
-            "ASSERT: one unique candidate Chunk has exactly one publication result"
-        );
-        claims.finish(&mut entries);
-        let sealed = !entries.is_empty();
-        let mut externalized = Vec::with_capacity(group.members.len());
-        for member in &group.members {
-            assert!(
-                member
-                    .chunks
-                    .iter()
-                    .all(|chunk| chunk.bytes.through_sequence() <= member.through_sequence),
-                "ASSERT: shared publication member sequence covers every published Chunk"
-            );
-            externalized
-                .try_reserve(1)
-                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
-            externalized.push(self.externalize_chunks(&member.chunks, member.inode, &locations)?);
-        }
         self.index
             .publish_reduction_batch(entries, similarity_entries, publication_guard);
         Ok((externalized, sealed))
@@ -4203,6 +3598,14 @@ where
         });
     }
 
+    fn admission_closing(&self) {
+        self.queue.notify_admission_closing();
+    }
+
+    fn admission_opened(&self) {
+        self.queue.notify_admission_opened();
+    }
+
     fn wait_through(&self, inode: InodeId, mutation_sequence: u64) {
         self.queue.wait_through(inode, mutation_sequence);
         self.publication_queue
@@ -4243,7 +3646,6 @@ where
 {
     let worker_permits = Arc::new(WorkerPermits::new(worker_budget));
     containers.install_cpu_admission(Arc::clone(&worker_permits));
-    let shared_batch_bytes = Arc::new(AtomicUsize::new(0));
     let write_through = Arc::new(WriteThroughIngest {
         containers,
         container_generations,
@@ -4251,7 +3653,7 @@ where
         worker_budget,
         worker_permits,
         active_writers: AtomicUsize::new(0),
-        shared_batch_bytes: Arc::clone(&shared_batch_bytes),
+        pending_regions: PendingRegions::new(),
         hash_batches: AtomicUsize::new(0),
         maximum_hash_workers: AtomicUsize::new(0),
         hash_cpu: CpuPhaseTelemetry::default(),
@@ -4260,9 +3662,7 @@ where
         materialization_wall_ns: AtomicU64::new(0),
         registry: Mutex::new(WriteThroughRegistry::default()),
         queue: Arc::new(IngestQueue::new()),
-        publication_queue: Arc::new(PublicationQueue::with_shared_batch_bytes(Arc::clone(
-            &shared_batch_bytes,
-        ))),
+        publication_queue: Arc::new(PublicationQueue::new()),
         namespace: OnceLock::new(),
         #[cfg(test)]
         after_inline_stage: Mutex::new(None),

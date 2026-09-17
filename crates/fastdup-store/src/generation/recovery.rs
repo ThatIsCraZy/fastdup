@@ -241,6 +241,7 @@ impl<I: StorageIo> GenerationRepository<I> {
                 GenerationLog::new(&self.storage)
                     .repair_tail(graph.generation.record)
                     .map_err(map_log_error)?;
+                self.invalidate_wal_writer_cache();
                 graph.generation.wal_tail = WalTail::Clean;
             }
             Some(RecoveredDataGeneration {

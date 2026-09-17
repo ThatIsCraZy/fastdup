@@ -7,7 +7,8 @@ use std::rc::Rc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadIntent {
     Demand,
-    /// May reuse immutable bytes but cannot displace useful resident entries.
+    /// May reuse immutable bytes and fill eviction-free cache headroom, but
+    /// cannot displace useful resident entries.
     Scan,
     /// Read current durable bytes, independently of every application cache.
     Independent,
@@ -49,6 +50,9 @@ impl Drop for ReadIntentScope {
 
 pub(crate) fn independent() -> bool {
     INTENT.with(|current| current.get() == ReadIntent::Independent)
+}
+pub(crate) fn scan() -> bool {
+    INTENT.with(|current| current.get() == ReadIntent::Scan)
 }
 pub(crate) fn bypass_admission() -> bool {
     INTENT.with(|current| current.get() != ReadIntent::Demand)

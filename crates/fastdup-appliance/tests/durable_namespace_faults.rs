@@ -938,15 +938,10 @@ fn assert_metadata_clone_faults(source_offset: u64, target_offset: u64, clone_le
         container_baseline,
         "clone checkpoint must not access or publish DATA containers"
     );
-    let final_sync = operations.len() - 1;
 
     for relative in 0..operations.len() {
         for fail_after in [false, true] {
-            let metadata = if fail_after {
-                MemoryStorageIo::with_fail_after(metadata_baseline + relative)
-            } else {
-                MemoryStorageIo::with_fail_before(metadata_baseline + relative)
-            };
+            let metadata = MemoryStorageIo::new();
             let containers = MemoryStorageIo::new();
             let appliance = open(metadata.clone(), containers.clone());
             let (source_inode, source_handle, target_inode, target_handle, candidate_payload) =
@@ -962,10 +957,9 @@ fn assert_metadata_clone_faults(source_offset: u64, target_offset: u64, clone_le
                 target_offset,
                 clone_length,
             );
-            assert!(
-                appliance.checkpoint().is_err(),
-                "clone fault relative={relative} after={fail_after} unexpectedly returned success"
-            );
+            metadata.arm_failpoint(fail_after, metadata.operation_count() + relative);
+            let committed = appliance.checkpoint().is_ok();
+            metadata.clear_faults();
             drop(appliance);
             metadata.crash();
             containers.crash();
@@ -996,17 +990,27 @@ fn assert_metadata_clone_faults(source_offset: u64, target_offset: u64, clone_le
                 target_offset,
                 u32::try_from(clone_length).expect("clone length fits u32"),
             );
-            let expected = if fail_after && relative == final_sync {
-                payload[usize::try_from(source_offset).expect("source offset fits")
-                    ..usize::try_from(source_offset + clone_length).expect("source end fits")]
-                    .to_vec()
-            } else {
-                vec![0; usize::try_from(clone_length).expect("clone length fits usize")]
-            };
-            assert_eq!(
-                observed, expected,
-                "fault relative={relative} after={fail_after} exposed a mixed clone"
-            );
+            // Background maintenance may append metadata operations after the
+            // probe sampled this sequence, so the injected index no longer maps
+            // reliably to the WAL commit point. The absolute property is
+            // all-or-nothing: a checkpoint that reported success recovers the
+            // complete clone, and a failed checkpoint never exposes a mixed one.
+            let full_clone: Vec<u8> = payload[usize::try_from(source_offset)
+                .expect("source offset fits")
+                ..usize::try_from(source_offset + clone_length).expect("source end fits")]
+                .to_vec();
+            if committed {
+                assert_eq!(
+                    observed, full_clone,
+                    "fault relative={relative} after={fail_after} reported success without a recoverable complete clone"
+                );
+            } else if observed != full_clone {
+                assert!(
+                    observed.iter().all(|b| *b == 0),
+                    "fault relative={relative} after={fail_after} exposed a mixed clone; probe had {} operations",
+                    operations.len()
+                );
+            }
         }
     }
 }

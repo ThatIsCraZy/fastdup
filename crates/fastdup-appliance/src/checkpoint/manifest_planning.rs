@@ -31,6 +31,7 @@ use fastdup_store::{
 use crate::ManifestCommittedFile;
 
 use super::metrics::{CheckpointReductionMetrics, PhaseStarted};
+use super::write_through::DrainResidue;
 use super::{
     CDC_MAXIMUM_BYTES, COMPRESSION_REGION_TARGET_BYTES, CONTAINER_PAYLOAD_TARGET_BYTES,
     DurableNamespace, DurableNamespaceError, InstalledManifest, ManifestReaderPolicy,
@@ -794,12 +795,32 @@ const fn extent_length(extent: &ManifestExtent) -> u64 {
     }
 }
 
+/// One unit of the Manifest planner work stack.
+///
+/// `Range` items cover logical bytes that still require hole classification
+/// and `SeqCDC` re-chunking. `Residue` items carry one complete commit-cut
+/// Drain Residue Chunk that must become a DATA extent at its staged offset
+/// without any reread or re-cut.
+#[derive(Clone, Copy, Debug)]
+enum PlanItem {
+    Range {
+        offset: u64,
+        length: u64,
+    },
+    Residue {
+        length: u64,
+        chunk_id: ChunkId,
+        chunk_length: u32,
+        chunk_offset: u32,
+    },
+}
+
 fn plan_manifest_range_with_prepared<C: StorageIo>(
     inode: &CommitInode,
     offset: u64,
     length: u64,
     writer: &mut AdaptiveCommitWriter<'_, C>,
-    stack: &mut Vec<(u64, u64)>,
+    stack: &mut Vec<PlanItem>,
     extents: &mut Vec<ManifestExtent>,
 ) -> Result<(), DurableNamespaceError> {
     assert!(length > 0, "ASSERT: manifest range must be nonempty");
@@ -821,7 +842,10 @@ fn plan_manifest_range_with_prepared<C: StorageIo>(
             return Err(DurableNamespaceError::FrozenViewMismatch);
         }
         if cursor < extent.offset() {
-            stack.push((cursor, extent.offset() - cursor));
+            stack.push(PlanItem::Range {
+                offset: cursor,
+                length: extent.offset() - cursor,
+            });
             plan_manifest_ranges(inode, writer, stack, extents)?;
             assert!(
                 stack.is_empty(),
@@ -880,7 +904,10 @@ fn plan_manifest_range_with_prepared<C: StorageIo>(
         cursor = prepared_end;
     }
     if cursor < end {
-        stack.push((cursor, end - cursor));
+        stack.push(PlanItem::Range {
+            offset: cursor,
+            length: end - cursor,
+        });
         plan_manifest_ranges(inode, writer, stack, extents)?;
     }
     assert!(
@@ -890,17 +917,96 @@ fn plan_manifest_range_with_prepared<C: StorageIo>(
     Ok(())
 }
 
+/// Interleaves taken Drain Residue emissions with the gap Ranges they do not
+/// cover, pushing them onto the work stack in pop order.
+fn push_residue_overlay(
+    stack: &mut Vec<PlanItem>,
+    offset: u64,
+    end: u64,
+    residues: Vec<ResidueEmission>,
+) -> Result<(), DurableNamespaceError> {
+    let mut sub = Vec::new();
+    sub.try_reserve(residues.len() * 2 + 1)
+        .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+    let mut cursor = offset;
+    for emission in residues {
+        if emission.logical_offset > cursor {
+            sub.push(PlanItem::Range {
+                offset: cursor,
+                length: emission.logical_offset - cursor,
+            });
+        }
+        sub.push(PlanItem::Residue {
+            length: emission.logical_length,
+            chunk_id: emission.chunk_id,
+            chunk_length: emission.chunk_length,
+            chunk_offset: emission.chunk_offset,
+        });
+        cursor = emission
+            .logical_offset
+            .checked_add(emission.logical_length)
+            .expect("ASSERT: consumed emission ends inside its Range");
+    }
+    if cursor < end {
+        sub.push(PlanItem::Range {
+            offset: cursor,
+            length: end - cursor,
+        });
+    }
+    for item in sub.into_iter().rev() {
+        stack.push(item);
+    }
+    Ok(())
+}
+
 fn plan_manifest_ranges<C: StorageIo>(
     inode: &CommitInode,
     writer: &mut AdaptiveCommitWriter<'_, C>,
-    stack: &mut Vec<(u64, u64)>,
+    stack: &mut Vec<PlanItem>,
     extents: &mut Vec<ManifestExtent>,
 ) -> Result<(), DurableNamespaceError> {
-    while let Some((offset, length)) = stack.pop() {
+    while let Some(item) = stack.pop() {
+        let (offset, length) = match item {
+            PlanItem::Residue {
+                length,
+                chunk_id,
+                chunk_length,
+                chunk_offset,
+            } => {
+                writer.record_residue_extent(chunk_id, u64::from(chunk_length));
+                let extent = if chunk_offset == 0 && u64::from(chunk_length) == length {
+                    ManifestExtent::Data {
+                        logical_length: length,
+                        chunk_id,
+                    }
+                } else {
+                    ManifestExtent::DataSlice {
+                        logical_length: length,
+                        chunk_id,
+                        chunk_length,
+                        chunk_offset,
+                    }
+                };
+                push_extent(extents, extent)?;
+                continue;
+            }
+            PlanItem::Range { offset, length } => (offset, length),
+        };
         assert!(
             length > 0,
             "ASSERT: manifest planner range must be nonempty"
         );
+        let end = offset
+            .checked_add(length)
+            .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
+        // Drain Residue Chunks first: complete commit-cut Chunks become DATA
+        // extents at their staged Offsets without reread or re-cut. Only the
+        // gaps between them fall through to hole classification and SeqCDC.
+        let residues = writer.take_residue_spans(inode.inode(), offset, end);
+        if !residues.is_empty() {
+            push_residue_overlay(stack, offset, end, residues)?;
+            continue;
+        }
         let allocated = inode.allocated_bytes_in_range(offset, length)?;
         if allocated > length {
             return Err(DurableNamespaceError::FrozenViewMismatch);
@@ -919,19 +1025,21 @@ fn plan_manifest_ranges<C: StorageIo>(
             continue;
         }
 
-        let left_length = if allocated == length {
-            (MAX_LOGICAL_CHUNK_BYTES as u64).min(length)
-        } else {
-            length / 2
-        };
+        let left_length = length / 2;
         if left_length == 0 || left_length == length {
             return Err(DurableNamespaceError::FrozenViewMismatch);
         }
         let right_offset = offset
             .checked_add(left_length)
             .ok_or(DurableNamespaceError::FrozenViewMismatch)?;
-        stack.push((right_offset, length - left_length));
-        stack.push((offset, left_length));
+        stack.push(PlanItem::Range {
+            offset: right_offset,
+            length: length - left_length,
+        });
+        stack.push(PlanItem::Range {
+            offset,
+            length: left_length,
+        });
     }
     Ok(())
 }
@@ -1237,6 +1345,30 @@ fn push_extent(
     Ok(())
 }
 
+/// One complete commit-cut Drain Residue Chunk pending Manifest extent
+/// emission at its staged file Offset.
+#[derive(Clone, Copy, Debug)]
+struct ResidueSpan {
+    offset: u64,
+    length: u64,
+    chunk_id: ChunkId,
+    consumed: bool,
+}
+
+/// One clipped emission of a seeded Drain Residue Chunk inside one planned
+/// Range. A Chunk staged from the retained `SeqCDC` suffix may begin below the
+/// Range's start: bytes outside the Range are already committed at these
+/// Offsets by an earlier Manifest, so the emission clips to the intersection
+/// and references the staged Chunk as a slice.
+#[derive(Clone, Copy)]
+struct ResidueEmission {
+    logical_offset: u64,
+    logical_length: u64,
+    chunk_id: ChunkId,
+    chunk_length: u32,
+    chunk_offset: u32,
+}
+
 pub(super) struct AdaptiveCommitWriter<'a, C> {
     containers: &'a ContainerRepository<C>,
     container_generations: &'a ContainerGenerationAllocator<C>,
@@ -1253,6 +1385,8 @@ pub(super) struct AdaptiveCommitWriter<'a, C> {
     placement: ContainerPlacement,
     retained_ranges: RetainedManifestRanges,
     online_dependency_proofs: Arc<OnlineDependencyProofs>,
+    residues: BTreeMap<u64, DrainResidue>,
+    residue_spans: Vec<ResidueSpan>,
 }
 
 impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
@@ -1262,7 +1396,15 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
         index: &'a dyn ManifestReaderPolicy<C>,
         workers: NonZeroUsize,
         online_dependency_proofs: Arc<OnlineDependencyProofs>,
+        residues: Vec<DrainResidue>,
     ) -> Self {
+        let mut residue_map = BTreeMap::new();
+        for residue in residues {
+            assert!(
+                residue_map.insert(residue.inode.get(), residue).is_none(),
+                "ASSERT: one Ingest Lane yields one Drain Residue per Inode"
+            );
+        }
         Self {
             containers,
             container_generations,
@@ -1279,6 +1421,8 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             placement: ContainerPlacement::Data,
             retained_ranges: BTreeMap::new(),
             online_dependency_proofs,
+            residues: residue_map,
+            residue_spans: Vec::new(),
         }
     }
 
@@ -1288,13 +1432,120 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
         placement: ContainerPlacement,
         advanced: bool,
     ) -> Result<(), DurableNamespaceError> {
+        // Spans the previous Inode's plan did not emit cover bytes already
+        // committed at their Offsets (suffix-anchored Chunks below the first
+        // changed Range). Their buffer entries deduplicate against the active
+        // Exact Index, so the clear below just drops redundant lookups.
         if self.placement != placement || self.advanced != advanced {
             self.flush()?;
             self.placement = placement;
             self.advanced = advanced;
         }
+        self.residue_spans.clear();
+        if let Some(mut residue) = self.residues.remove(&inode.get()) {
+            self.residue_spans
+                .try_reserve(residue.chunks.len())
+                .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+            for chunk in std::mem::take(&mut residue.chunks) {
+                let bytes_len = chunk.bytes.len();
+                let length = u64::try_from(bytes_len)
+                    .expect("ASSERT: a bounded Drain Residue Chunk length fits u64");
+                // Seed the adaptive buffer with the already-hashed staged
+                // Chunk. The planner then emits a DATA extent at the staged
+                // Offset instead of re-reading and re-cutting those bytes.
+                self.push(chunk.chunk_id, chunk.bytes)?;
+                self.residue_spans.push(ResidueSpan {
+                    offset: chunk.offset,
+                    length,
+                    chunk_id: chunk.chunk_id,
+                    consumed: false,
+                });
+                residue.absorb_chunk(bytes_len);
+            }
+        }
         self.current_inode = Some(inode.get());
         Ok(())
+    }
+
+    /// Drains the Drain Residue Spans overlapping `[offset, end)`, marking
+    /// them consumed. A Span that reaches past a Range edge is clipped to the
+    /// Range: the emission keeps its Chunk slice instead of failing, because a
+    /// suffix-anchored Chunk legitimately extends below a changed Range's
+    /// start (bytes outside the Range are committed by an earlier Manifest).
+    fn take_residue_spans(
+        &mut self,
+        inode: InodeId,
+        offset: u64,
+        end: u64,
+    ) -> Vec<ResidueEmission> {
+        if self.residue_spans.is_empty() {
+            return Vec::new();
+        }
+        assert_eq!(
+            self.current_inode,
+            Some(inode.get()),
+            "ASSERT: Drain Residue planning only serves its seeded Inode"
+        );
+        let mut taken = Vec::new();
+        for span in &mut self.residue_spans {
+            if span.consumed {
+                continue;
+            }
+            let span_end = span
+                .offset
+                .checked_add(span.length)
+                .expect("ASSERT: bounded Drain Residue Span end");
+            if span_end <= offset || span.offset >= end {
+                continue;
+            }
+            // The Chunk may reach outside this Range (it was staged from the
+            // retained SeqCDC suffix or a coalesced rewrite). Clip it: bytes
+            // outside the Range are already committed at their Offsets by an
+            // earlier Manifest or belong to a later Range that re-reads them.
+            span.consumed = true;
+            let slice_start = span.offset.max(offset);
+            let slice_end = span_end.min(end);
+            taken.push(ResidueEmission {
+                logical_offset: slice_start,
+                logical_length: slice_end
+                    .checked_sub(slice_start)
+                    .expect("ASSERT: an overlapping Span leaves a nonempty slice"),
+                chunk_id: span.chunk_id,
+                chunk_length: u32::try_from(span.length)
+                    .expect("ASSERT: a bounded Chunk length fits u32"),
+                chunk_offset: u32::try_from(slice_start - span.offset)
+                    .expect("ASSERT: a bounded Chunk offset fits u32"),
+            });
+        }
+        taken
+    }
+
+    fn record_residue_extent(&mut self, chunk_id: ChunkId, length: u64) {
+        assert_eq!(
+            self.seen.get(&chunk_id),
+            Some(&length),
+            "ASSERT: a Drain Residue Chunk is buffered and deduplicated once per checkpoint"
+        );
+        self.metrics.logical_chunks = self
+            .metrics
+            .logical_chunks
+            .checked_add(1)
+            .expect("ASSERT: checkpoint logical Chunk count cannot overflow");
+        self.metrics.logical_chunk_bytes = self
+            .metrics
+            .logical_chunk_bytes
+            .checked_add(length)
+            .expect("ASSERT: checkpoint logical Chunk bytes cannot overflow");
+        self.metrics.drain_merged_chunks = self
+            .metrics
+            .drain_merged_chunks
+            .checked_add(1)
+            .expect("ASSERT: checkpoint Drain Residue count cannot overflow");
+        self.metrics.drain_merged_bytes = self
+            .metrics
+            .drain_merged_bytes
+            .checked_add(length)
+            .expect("ASSERT: checkpoint Drain Residue bytes cannot overflow");
     }
 
     fn record_prepared_chunk(
@@ -1458,6 +1709,12 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
     }
 
     pub(super) fn finish(mut self) -> Result<AdaptiveCommitFinish, DurableNamespaceError> {
+        // Unconsumed Residue Spans cover bytes this commit never planned: a
+        // Chunk anchored in the retained SeqCDC suffix can lie entirely below
+        // the first changed Range, and those bytes are already committed at
+        // their Offsets. Their seeded buffer entries are deduplicated against
+        // the active Exact Index by push, so dropping the Spans is safe.
+        self.residue_spans.clear();
         self.flush()?;
         Ok((self.level_zero_entries, self.metrics, self.retained_ranges))
     }

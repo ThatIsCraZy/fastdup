@@ -29,18 +29,27 @@ impl<'a, I: StorageIo> GenerationLog<'a, I> {
         }
     }
 
+    /// Appends one Commit Record and returns the advanced writer snapshot.
+    ///
+    /// Only the newly written record range is read back and compared byte for
+    /// byte. The accepted prefix was verified when it was appended and is
+    /// audited independently by recovery; rewriting or rereading it here would
+    /// repeat work the durable chain already proves. A failure leaves the
+    /// caller's snapshot unusable: the caller must reload before the next
+    /// append because a failed attempt may still have reached storage.
     pub(crate) fn append(
         &self,
         snapshot: &LogSnapshot,
         record: CommitRecord,
-    ) -> Result<(), GenerationLogError> {
+    ) -> Result<LogSnapshot, GenerationLogError> {
         if snapshot.tail != LogTail::Clean {
             return Err(GenerationLogError::NeedsRepair(snapshot.tail.clone()));
         }
         verify_successor(snapshot, record)?;
 
         let encoded_record = record.encode();
-        let (target_slot, expected) = if snapshot.record_count() >= MAX_SEGMENT_RECORDS {
+        let rotating = snapshot.record_count() >= MAX_SEGMENT_RECORDS;
+        let (target_slot, expected) = if rotating {
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(2 * COMMIT_RECORD_BYTES)
@@ -62,11 +71,14 @@ impl<'a, I: StorageIo> GenerationLog<'a, I> {
         };
 
         let target_name = SLOT_NAMES[target_slot];
-        if target_slot == snapshot.active_slot {
-            let offset = u64::try_from(snapshot.bytes.len())
-                .map_err(|_| GenerationLogError::SegmentTooLarge)?;
-            self.storage
-                .write_at(target_name, offset, &encoded_record)?;
+        let (verify_offset, verify_bytes) = if target_slot == snapshot.active_slot {
+            let offset = snapshot.bytes.len();
+            self.storage.write_at(
+                target_name,
+                u64::try_from(offset).map_err(|_| GenerationLogError::SegmentTooLarge)?,
+                &encoded_record,
+            )?;
+            (offset, expected[offset..].to_vec())
         } else {
             self.storage.set_len(target_name, 0)?;
             self.storage
@@ -77,22 +89,26 @@ impl<'a, I: StorageIo> GenerationLog<'a, I> {
                     .expect("ASSERT: Commit Record byte count fits u64"),
                 &expected[COMMIT_RECORD_BYTES..],
             )?;
-        }
+            (0, expected.clone())
+        };
         self.storage.set_len(
             target_name,
             u64::try_from(expected.len()).map_err(|_| GenerationLogError::SegmentTooLarge)?,
         )?;
 
-        let reread = self.storage.read(target_name)?;
-        let verified = decode_segment(target_slot, reread)?;
-        if verified.tail != LogTail::Clean || verified.bytes != expected {
+        let reread = self.storage.read_exact_at(
+            target_name,
+            u64::try_from(verify_offset).map_err(|_| GenerationLogError::SegmentTooLarge)?,
+            verify_bytes.len(),
+        )?;
+        if reread != verify_bytes {
             return Err(GenerationLogError::PublishVerificationMismatch);
         }
 
         // The synchronized slot is the only commit point. Both fixed slot
         // names were made directory-durable before any record write.
         self.storage.sync_file(target_name)?;
-        Ok(())
+        Ok(snapshot.advanced(target_slot, rotating, record, expected))
     }
 
     pub(crate) fn install_recovery_anchor(
@@ -153,7 +169,7 @@ impl<'a, I: StorageIo> GenerationLog<'a, I> {
         Ok(())
     }
 
-    fn ensure_slots_exist(&self) -> Result<(), GenerationLogError> {
+    pub(crate) fn ensure_slots_exist(&self) -> Result<(), GenerationLogError> {
         for name in SLOT_NAMES {
             if self.storage.exists(name)? {
                 let length = self.storage.object_len(name)?;
@@ -212,6 +228,38 @@ impl LogSnapshot {
             active_slot,
             bytes: Vec::new(),
             records: Vec::new(),
+            tail: LogTail::Clean,
+        }
+    }
+
+    /// Builds the writer-visible snapshot after one successfully verified and
+    /// synchronized append. The chain successor was checked before the write
+    /// and the stored bytes were compared after it, so the advanced snapshot
+    /// needs no segment decode; rotation keeps only the bridge pair that the
+    /// new slot actually stores.
+    fn advanced(
+        &self,
+        target_slot: usize,
+        rotating: bool,
+        record: CommitRecord,
+        bytes: Vec<u8>,
+    ) -> Self {
+        let mut records = if rotating {
+            Vec::new()
+        } else {
+            self.records.clone()
+        };
+        if rotating {
+            records.push(
+                self.last_record()
+                    .expect("ASSERT: rotation appended after a last record"),
+            );
+        }
+        records.push(record);
+        Self {
+            active_slot: target_slot,
+            bytes,
+            records,
             tail: LogTail::Clean,
         }
     }

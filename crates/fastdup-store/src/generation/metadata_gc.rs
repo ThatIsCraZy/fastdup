@@ -9,7 +9,9 @@ use super::{
 use crate::StorageIo;
 use crate::manifest_tree::{ManifestTreeError, scan_manifest_tree};
 use crate::metadata_mark_catalog::{
-    audit_named as audit_metadata_mark_catalog, commit_binding as metadata_mark_commit_binding,
+    audit_named as audit_metadata_mark_catalog,
+    audit_named_collect as audit_metadata_mark_catalog_collect,
+    commit_binding as metadata_mark_commit_binding,
     is_published_name as is_metadata_mark_catalog_name,
     parse_generation as parse_metadata_mark_generation, prepare as prepare_metadata_mark_catalog,
     prepare_addition as prepare_metadata_mark_addition,
@@ -24,6 +26,11 @@ struct MetadataGcInventory {
     candidates: Vec<(MetadataObjectId, String)>,
     catalog_names: Vec<String>,
     catalog_generation_high_water: u64,
+}
+
+struct MetadataMarkCatalogInventory {
+    runs: Vec<(u64, String)>,
+    high_water: u64,
 }
 
 impl<I: StorageIo> GenerationRepository<I> {
@@ -111,6 +118,9 @@ impl<I: StorageIo> GenerationRepository<I> {
         if let Some(summary) =
             self.try_publish_metadata_mark_delta(clean_state, mark_epoch, started)?
         {
+            return Ok(summary);
+        }
+        if let Some(summary) = self.try_compact_metadata_mark_catalog(started)? {
             return Ok(summary);
         }
         let exact_reason = metadata_gc_exact_reason(clean_state, &self.metadata_gc_delta);
@@ -348,6 +358,209 @@ impl<I: StorageIo> GenerationRepository<I> {
                 ..MetadataGcMetrics::default()
             },
         }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn try_compact_metadata_mark_catalog(
+        &self,
+        started: Instant,
+    ) -> Result<Option<GenerationMetadataGcSummary>, GenerationError> {
+        let chain_candidate = self
+            .metadata_gc_clean
+            .lock()
+            .expect("ASSERT: Metadata GC clean-catalog state poisoned during compaction selection")
+            .is_some_and(|clean| clean.delta_run_count >= MAX_METADATA_MARK_DELTA_RUNS);
+        if !chain_candidate {
+            return Ok(None);
+        }
+        {
+            let journal = self
+                .metadata_gc_delta
+                .lock()
+                .expect("ASSERT: Metadata GC delta journal poisoned during compaction selection");
+            if journal.exact_required || !journal.unclassified.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        let barrier_started = Instant::now();
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .write()
+            .expect("ASSERT: Metadata GC publication barrier poisoned during catalog compaction");
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .expect("ASSERT: Metadata GC generation lock poisoned during catalog compaction");
+        let barrier_wait = barrier_started.elapsed();
+        let mark_epoch = self.metadata_gc_epoch.load(Ordering::Acquire);
+        let Some(clean) = self
+            .metadata_gc_clean
+            .lock()
+            .expect("ASSERT: Metadata GC clean-catalog state poisoned during catalog compaction")
+            .filter(|clean| clean.delta_run_count >= MAX_METADATA_MARK_DELTA_RUNS)
+        else {
+            return Ok(None);
+        };
+        let (journal_revision, additions) = {
+            let journal = self
+                .metadata_gc_delta
+                .lock()
+                .expect("ASSERT: Metadata GC delta journal poisoned during catalog compaction");
+            if journal.exact_required || !journal.unclassified.is_empty() {
+                return Ok(None);
+            }
+            (journal.revision, journal.additions.clone())
+        };
+        let Some(inventory) = self.metadata_mark_catalog_inventory()? else {
+            return Ok(None);
+        };
+        if inventory.high_water != clean.catalog_generation {
+            return Ok(None);
+        }
+        let mut reachable = BTreeSet::new();
+        let mut catalog_read_bytes = 0_u64;
+        let mut prior_generation = None;
+        for (generation, name) in &inventory.runs {
+            let Ok((descriptor, rows)) = audit_metadata_mark_catalog_collect(&self.storage, name)
+            else {
+                return Ok(None);
+            };
+            if descriptor.generation() != *generation {
+                return Ok(None);
+            }
+            catalog_read_bytes = catalog_read_bytes
+                .checked_add(descriptor.file_length())
+                .ok_or(GenerationError::MetadataTooLarge)?;
+            match descriptor.run_kind() {
+                MetadataMarkCatalogRunKind::Snapshot => {}
+                MetadataMarkCatalogRunKind::Addition
+                    if descriptor.base_generation() == prior_generation.unwrap_or(0) => {}
+                MetadataMarkCatalogRunKind::Addition => return Ok(None),
+            }
+            reachable.extend(rows);
+            prior_generation = Some(*generation);
+        }
+
+        let records = self.load_complete_commit_records_unlocked()?;
+        reachable.extend(additions.iter().copied());
+        let row_count =
+            u64::try_from(reachable.len()).map_err(|_| GenerationError::MetadataTooLarge)?;
+        let catalog_generation = inventory
+            .high_water
+            .checked_add(1)
+            .ok_or(GenerationError::GenerationExhausted)?;
+        self.check_maintenance()?;
+        *self
+            .metadata_gc_clean
+            .lock()
+            .expect("ASSERT: Metadata GC clean-catalog state poisoned during catalog compaction") =
+            None;
+        let prepared = prepare_metadata_mark_catalog(
+            &self.storage,
+            catalog_generation,
+            metadata_mark_commit_binding(&records),
+            reachable.iter().copied(),
+            row_count,
+        )?;
+        let published = prepared.publish(&self.storage)?;
+        assert_eq!(
+            published.generation(),
+            catalog_generation,
+            "ASSERT: compacted Metadata mark catalog publishes under its exact generation"
+        );
+        assert_eq!(
+            published.run_kind(),
+            MetadataMarkCatalogRunKind::Snapshot,
+            "ASSERT: compacted Metadata mark catalog is a new snapshot run"
+        );
+        assert_eq!(
+            published.row_count(),
+            row_count,
+            "ASSERT: compacted Metadata mark catalog covers its exact row set"
+        );
+        for (_, name) in &inventory.runs {
+            self.check_metadata_gc_unlink_stop()?;
+            self.storage.remove_file(name)?;
+        }
+        self.storage.sync_root()?;
+
+        let mut journal = self
+            .metadata_gc_delta
+            .lock()
+            .expect("ASSERT: Metadata GC delta journal poisoned after catalog compaction");
+        for object_id in &additions {
+            assert!(
+                journal.additions.remove(object_id),
+                "ASSERT: compacted Metadata addition identity remains journaled"
+            );
+        }
+        if journal.revision == journal_revision
+            && self.metadata_gc_epoch.load(Ordering::Acquire) == mark_epoch
+        {
+            *journal = MetadataGcDeltaJournal::default();
+            *self.metadata_gc_clean.lock().expect(
+                "ASSERT: Metadata GC clean-catalog state poisoned after catalog compaction",
+            ) = Some(MetadataGcCleanState {
+                epoch: mark_epoch,
+                objects_retained: row_count,
+                catalog_generation,
+                delta_run_count: 0,
+            });
+        } else {
+            journal.exact_required = true;
+            if journal.exact_reason.is_none() {
+                journal.exact_reason = Some(MetadataGcExactReason::DeltaChainLimit);
+            }
+        }
+        Ok(Some(GenerationMetadataGcSummary {
+            objects_removed: 0,
+            bytes_removed: 0,
+            objects_retained: row_count,
+            mark_mode: MetadataGcMarkMode::CatalogCompaction,
+            exact_reason: None,
+            catalog_generation: Some(catalog_generation),
+            metrics: MetadataGcMetrics {
+                wall: started.elapsed(),
+                barrier_wait,
+                catalog_read_bytes,
+                catalog_write_bytes: published.file_length(),
+                root_syncs: 1,
+                catalog_chain_runs: 1,
+                ..MetadataGcMetrics::default()
+            },
+        }))
+    }
+
+    fn metadata_mark_catalog_inventory(
+        &self,
+    ) -> Result<Option<MetadataMarkCatalogInventory>, GenerationError> {
+        let mut runs = Vec::new();
+        let mut invalid = false;
+        let mut inventory_error = None;
+        self.storage.visit_names(&mut |name| {
+            if inventory_error.is_some() || invalid || !is_metadata_mark_catalog_name(name) {
+                return;
+            }
+            let Some(generation) = parse_metadata_mark_generation(name) else {
+                invalid = true;
+                return;
+            };
+            if runs.try_reserve(1).is_err() {
+                inventory_error = Some(GenerationError::OutOfMemory);
+                return;
+            }
+            runs.push((generation, name.to_owned()));
+        })?;
+        if let Some(error) = inventory_error {
+            return Err(error);
+        }
+        if invalid {
+            return Ok(None);
+        }
+        runs.sort_unstable_by_key(|entry| entry.0);
+        let high_water = runs.last().map_or(0, |(generation, _)| *generation);
+        Ok(Some(MetadataMarkCatalogInventory { runs, high_water }))
     }
 
     fn mark_metadata_gc_roots(

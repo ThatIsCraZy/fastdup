@@ -885,12 +885,20 @@ impl ReadCacheNamespace {
     /// Each group shares one backing; independently compressed siblings use
     /// separate groups so eviction releases their exact ownership charges.
     /// New siblings cannot displace one another during this admission.
+    ///
+    /// Scan intent fills only eviction-free headroom: it reserves under the
+    /// same class ceilings but skips every victim search, so it can neither
+    /// displace a resident entry nor exceed the common target. Independent
+    /// intent still declines all admission except pinned working acceleration.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn insert_groups<T: Any + Send + Sync>(
         &self,
         groups: Vec<AdmissionGroup<T>>,
     ) -> u64 {
-        if groups.is_empty() || (crate::read_intent::bypass_admission() && !self.0.class.pinned()) {
+        let scan_fill = !self.0.class.pinned() && crate::read_intent::scan();
+        if groups.is_empty()
+            || (crate::read_intent::bypass_admission() && !self.0.class.pinned() && !scan_fill)
+        {
             return 0;
         }
         let core = &self.0.core;
@@ -939,7 +947,11 @@ impl ReadCacheNamespace {
             return 0;
         }
         let group = self.0.class.budget_group();
-        let mut steps = if pinned { 0 } else { ADMISSION_STEPS };
+        let mut steps = if pinned || scan_fill {
+            0
+        } else {
+            ADMISSION_STEPS
+        };
         if !pinned {
             if group == ReadCacheBudgetGroup::VerifiedData {
                 let limit = verified_data_limit(state.target);
@@ -1344,7 +1356,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_hits_do_not_admit_and_nested_independent_intent_cannot_be_downgraded() {
+    fn scan_fills_headroom_without_displacing_and_nested_independent_intent_cannot_be_downgraded() {
         let cache = ReadCacheNamespace::isolated(ReadCacheClass::MetadataObject, 2048);
         let warm = ReadCacheKey {
             identity: [1; 32],
@@ -1359,7 +1371,36 @@ mod tests {
             let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
             assert_eq!(*cache.get::<u64>(warm).unwrap(), 17);
             cache.insert(cold, Arc::new(19_u64), 8, 4096);
-            assert!(cache.get::<u64>(cold).is_none());
+            assert_eq!(
+                *cache.get::<u64>(cold).unwrap(),
+                19,
+                "a Scan miss fills eviction-free headroom"
+            );
+            let charge = 8 + ENTRY_BYTES;
+            let mut filled = 0_u64;
+            while cache.stats().resident_bytes + charge <= cache.capacity() {
+                cache.insert(
+                    ReadCacheKey {
+                        identity: [9; 32],
+                        ordinal: filled,
+                    },
+                    Arc::new(21_u64),
+                    8,
+                    4096,
+                );
+                filled += 1;
+                assert!(cache.stats().resident_bytes <= cache.capacity());
+            }
+            let at_capacity = ReadCacheKey {
+                identity: [3; 32],
+                ordinal: 0,
+            };
+            cache.insert(at_capacity, Arc::new(23_u64), 8, 4096);
+            assert!(
+                cache.get::<u64>(at_capacity).is_none(),
+                "a full Scan pass declines instead of displacing a resident entry"
+            );
+            assert_eq!(*cache.get::<u64>(warm).unwrap(), 17);
             let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
             let _demand = crate::ReadIntentScope::enter(crate::ReadIntent::Demand);
             assert!(cache.get::<u64>(warm).is_none());

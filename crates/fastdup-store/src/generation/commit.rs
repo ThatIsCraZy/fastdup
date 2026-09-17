@@ -13,6 +13,7 @@ use crate::generation_log::{GenerationLog, LogSnapshot};
 use crate::{ContainerRepository, StorageIo};
 use fastdup_format::{CommitRecord, CommitRecordHash, NamespaceRoot};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 impl<I: StorageIo> GenerationRepository<I> {
     /// Publishes a complete Namespace Root and appends its Commit Record last.
@@ -209,6 +210,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         let committed = self.commit_verified_namespace_from_snapshot_tracked(root, &snapshot)?;
         if committed.wal_rotated {
             self.mark_all_metadata_root_pin_releases_exact();
+            self.mark_all_recovery_checkpoint_root_releases_exact();
         }
         let mut introduced_metadata = BTreeSet::new();
         for proof in proofs {
@@ -251,11 +253,37 @@ impl<I: StorageIo> GenerationRepository<I> {
     fn load_append_snapshot(
         &self,
         expected_predecessor: Option<SuccessorPredecessor>,
-    ) -> Result<LogSnapshot, GenerationError> {
-        let snapshot = GenerationLog::new(&self.storage)
-            .load_for_append()
-            .map_err(map_log_error)?;
+    ) -> Result<Arc<LogSnapshot>, GenerationError> {
+        // Reuse the writer's last synchronized snapshot when present. Only
+        // this repository owns the WAL through append; an error, an external
+        // repair, or an independent read intent revokes the cache, so a
+        // cached snapshot always equals the durably synchronized slot.
+        let mut cached = self.wal_writer_cache();
+        if crate::read_intent::independent() {
+            *cached = None;
+        }
+        let snapshot = if let Some(snapshot) = cached.as_ref() {
+            // The per-append topology barrier is a durable invariant (it
+            // keeps the independently retryable slot topology honest), so
+            // a cache hit re-establishes it exactly like a cold reload.
+            GenerationLog::new(&self.storage)
+                .ensure_slots_exist()
+                .map_err(map_log_error)?;
+            Arc::clone(snapshot)
+        } else {
+            let loaded = Arc::new(
+                GenerationLog::new(&self.storage)
+                    .load_for_append()
+                    .map_err(map_log_error)?,
+            );
+            if loaded.tail() == &WalTail::Clean {
+                *cached = Some(Arc::clone(&loaded));
+            }
+            loaded
+        };
+        drop(cached);
         if snapshot.tail() != &WalTail::Clean {
+            self.invalidate_wal_writer_cache();
             return Err(GenerationError::WalNeedsRepair(snapshot.tail().clone()));
         }
         Self::validate_format_epoch_compatibility(snapshot.records())?;
@@ -335,18 +363,31 @@ impl<I: StorageIo> GenerationRepository<I> {
         let wal_rotated = snapshot.will_rotate();
         if wal_rotated {
             self.mark_all_metadata_root_pin_releases_exact();
+            self.mark_all_recovery_checkpoint_root_releases_exact();
         }
         // Invalidate a clean catalog before the WAL durability attempt. A
         // sync error may still have committed the exact record bytes.
         mark_metadata_gc_dirty(&self.metadata_gc_epoch);
-        if let Err(error) = GenerationLog::new(&self.storage).append(snapshot, record) {
-            mark_metadata_gc_exact_required(
-                &self.metadata_gc_epoch,
-                &self.metadata_gc_delta,
-                MetadataGcExactReason::UncertainWalDurability,
-            );
-            return Err(map_log_error(error));
-        }
+        let updated = match GenerationLog::new(&self.storage).append(snapshot, record) {
+            Ok(updated) => updated,
+            Err(error) => {
+                // A failed attempt may still have reached storage. Revoke the
+                // writer snapshot so the next append reloads the durable
+                // truth before extending the chain.
+                self.invalidate_wal_writer_cache();
+                mark_metadata_gc_exact_required(
+                    &self.metadata_gc_epoch,
+                    &self.metadata_gc_delta,
+                    MetadataGcExactReason::UncertainWalDurability,
+                );
+                return Err(map_log_error(error));
+            }
+        };
+        *self.wal_writer_cache() = Some(Arc::new(updated));
+        // This repository constructed and verified the committed root in this
+        // call. Keep it as the content-identified predecessor view so the next
+        // transition check does not reread and rehash the complete namespace.
+        self.remember_previous_namespace_root(root_id, Arc::new(root.clone()));
         Ok(CommittedMetadata {
             record,
             introduced_namespace_metadata,

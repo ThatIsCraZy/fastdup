@@ -141,6 +141,7 @@ pub use read_cache::{
     VerifiedReadCache, VerifiedReadCacheConfig, VerifiedReadCacheError, VerifiedReadCacheStatus,
     shared_cache_reserve_bytes,
 };
+pub(crate) use recovery_checkpoint::CheckpointProtectedChunkCache;
 pub use recovery_checkpoint::{
     RecoveryCheckpointError, RecoveryCheckpointRepository, RecoveryCheckpointScrubSummary,
     RecoveryCheckpointSummary,
@@ -760,6 +761,21 @@ pub trait StorageIo {
     /// Returns the backend's lookup, range, or truncation error.
     fn set_len_unpublished(&self, name: &str, length: u64) -> io::Result<()> {
         self.set_len(name, length)
+    }
+    /// Creates one unpublished immutable object and writes its complete,
+    /// length-known image. Backends may bundle the storage-envelope heads and
+    /// payload into fewer aligned writes than separate append batches; the
+    /// resulting bytes and layout match [`Self::create_new`] followed by
+    /// [`Self::write_unpublished_at`] from offset 0 and
+    /// [`Self::set_len_unpublished`]. The caller still owes the final
+    /// [`Self::sync_file`] before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's creation, seek, capacity, or write error. A name
+    /// collision is reported as the creation error without writing payload.
+    fn create_new_unpublished_image(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        crate::immutable_write::write_new_unpublished_image_default(self, name, bytes)
     }
     /// Makes all object bytes stable before publication.
     ///
@@ -4468,7 +4484,6 @@ static FS_IMMUTABLE_LEASE_REGISTRIES: OnceLock<
 struct StoragePage {
     owner: Arc<Vec<u8>>,
     start: usize,
-    length: usize,
     _access: FileAccess,
 }
 
@@ -4562,7 +4577,7 @@ fn remember_file_layout(
     access: &FileAccess,
     layout: direct_io::Layout,
 ) -> io::Result<()> {
-    if read_intent::bypass_admission() || name.starts_with("reduction-head.") {
+    if read_intent::independent() || name.starts_with("reduction-head.") {
         return Ok(());
     }
     let key = ReadCacheKey {
@@ -4594,6 +4609,7 @@ fn read_cached_file_range(
     mode: usize,
 ) -> io::Result<Vec<u8>> {
     const PAGE: u64 = 4096;
+    const MERGE_GAP_PAGES: u64 = 16;
     let access = registry.access(name)?;
     let revision = access.revision();
     let layout = cached_file_layout(file, name, registry)?;
@@ -4615,78 +4631,173 @@ fn read_cached_file_range(
         .get_or_init(|| ReadCacheNamespace::system(ReadCacheClass::StorageRange));
     let first = offset / PAGE;
     let last = end.div_ceil(PAGE);
-    let mut hits = Vec::new();
-    for ordinal in first..last {
-        let Some(page) = cache.get::<StoragePage>(ReadCacheKey { identity, ordinal }) else {
-            break;
-        };
-        hits.push(page);
+    // One lookup per page. Keep every hit even when a later page is missing:
+    // reading back already cached pages from storage is exactly the reread
+    // this cache exists to avoid.
+    let mut sources: Vec<Option<RangeSource>> = (first..last)
+        .map(|ordinal| {
+            cache
+                .get::<StoragePage>(ReadCacheKey { identity, ordinal })
+                .map(RangeSource::Page)
+        })
+        .collect();
+    if sources.iter().all(Option::is_some) {
+        return assemble_range(&sources, first, offset, end);
     }
-    if hits.len() as u64 == last - first {
-        let mut output = Vec::with_capacity(length);
-        for (ordinal, page) in (first..last).zip(hits) {
-            let from = usize::try_from(offset.saturating_sub(ordinal * PAGE))
-                .expect("ASSERT: bounded storage range fits usize");
-            let to = (usize::try_from(end - ordinal * PAGE)
-                .expect("ASSERT: bounded storage range fits usize"))
-            .min(page.length);
-            output.extend_from_slice(&page.owner[page.start + from..page.start + to]);
+    // Merge missing pages into spans, tolerating small hit gaps: one slightly
+    // larger aligned read beats several small reads on the HDD Data Tier.
+    let mut missing: Vec<(u64, u64)> = Vec::new();
+    for (index, ordinal) in (first..last).enumerate() {
+        if sources[index].is_some() {
+            continue;
         }
-        return Ok(output);
+        match missing.last_mut() {
+            Some(span) if ordinal <= span.1 + 1 + MERGE_GAP_PAGES => span.1 = ordinal,
+            _ => missing.push((ordinal, ordinal)),
+        }
     }
-    let start = first * PAGE;
-    let disk_end = last.saturating_mul(PAGE).min(layout.length);
-    let mut request = blake3::Hasher::new();
-    request.update(&identity);
-    request.update(&start.to_le_bytes());
-    request.update(&disk_end.to_le_bytes());
-    let request = ReadCacheKey {
-        identity: *request.finalize().as_bytes(),
-        ordinal: 0,
-    };
-    let owner = cache.coalesce(request, || {
-        let span = metadata_read_telemetry::ReadSpan::start(
-            counters,
-            name,
-            mode,
-            Some(
-                usize::try_from(disk_end - start)
-                    .expect("ASSERT: bounded storage range fits usize"),
-            ),
-        );
-        let result = direct_io::read_with_layout(
+    for (span_first, span_last) in missing {
+        let filler = RangeSpanFiller {
             file,
+            name,
+            counters,
+            mode,
             layout,
-            start,
-            usize::try_from(disk_end - start).expect("ASSERT: bounded storage range fits usize"),
-        );
-        span.finish(&result);
-        let owner = Arc::new(result?);
-        let values = (first..last)
-            .map(|ordinal| {
-                let start = usize::try_from((ordinal - first) * PAGE)
-                    .expect("ASSERT: bounded storage range fits usize");
-                let length = (owner.len() - start).min(4096);
-                (
-                    ReadCacheKey { identity, ordinal },
-                    Arc::new(StoragePage {
-                        owner: Arc::clone(&owner),
-                        start,
-                        length,
-                        _access: Arc::clone(&access),
-                    }),
-                    length as u64,
-                )
-            })
-            .collect();
-        cache.insert_group(
-            values,
-            owner.capacity() as u64 + size_of::<Vec<u8>>() as u64,
-        );
-        Ok(owner)
-    })?;
-    let from = usize::try_from(offset - start).expect("ASSERT: bounded storage range fits usize");
-    let output = owner[from..from + length].to_vec();
+            access: access.clone(),
+            cache,
+            identity,
+            first,
+        };
+        filler.fill(span_first, span_last, &mut sources)?;
+    }
+    if sources.iter().any(Option::is_none) {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    assemble_range(&sources, first, offset, end)
+}
+
+struct RangeSpanFiller<'a> {
+    file: &'a File,
+    name: &'a str,
+    counters: Option<&'a metadata_read_telemetry::MetadataReadCounters>,
+    mode: usize,
+    layout: direct_io::Layout,
+    access: FileAccess,
+    cache: &'a ReadCacheNamespace,
+    identity: [u8; 32],
+    first: u64,
+}
+
+impl RangeSpanFiller<'_> {
+    fn fill(
+        &self,
+        span_first: u64,
+        span_last: u64,
+        sources: &mut [Option<RangeSource>],
+    ) -> io::Result<()> {
+        const PAGE: u64 = 4096;
+        let start = span_first * PAGE;
+        let disk_end = (span_last + 1).saturating_mul(PAGE).min(self.layout.length);
+        let length =
+            usize::try_from(disk_end - start).expect("ASSERT: bounded storage range fits usize");
+        let mut request = blake3::Hasher::new();
+        request.update(&self.identity);
+        request.update(&start.to_le_bytes());
+        request.update(&disk_end.to_le_bytes());
+        let request = ReadCacheKey {
+            identity: *request.finalize().as_bytes(),
+            ordinal: 0,
+        };
+        let access = Arc::clone(&self.access);
+        let owner = self.cache.coalesce(request, || {
+            let span_guard = metadata_read_telemetry::ReadSpan::start(
+                self.counters,
+                self.name,
+                self.mode,
+                Some(length),
+            );
+            let result = direct_io::read_with_layout(self.file, self.layout, start, length);
+            span_guard.finish(&result);
+            let owner = Arc::new(result?);
+            let values = (span_first..=span_last)
+                .filter(|ordinal| {
+                    sources[usize::try_from(*ordinal - self.first).expect("bounded ordinal span")]
+                        .is_none()
+                })
+                .map(|ordinal| {
+                    let page_start =
+                        usize::try_from(ordinal * PAGE - start).expect("bounded storage range");
+                    let page_length = (owner.len() - page_start).min(4096);
+                    (
+                        ReadCacheKey {
+                            identity: self.identity,
+                            ordinal,
+                        },
+                        Arc::new(StoragePage {
+                            owner: Arc::clone(&owner),
+                            start: page_start,
+                            _access: access.clone(),
+                        }),
+                        page_length as u64,
+                    )
+                })
+                .collect();
+            self.cache.insert_group(
+                values,
+                owner.capacity() as u64 + size_of::<Vec<u8>>() as u64,
+            );
+            Ok(owner)
+        })?;
+        for ordinal in span_first..=span_last {
+            let index = usize::try_from(ordinal - self.first).expect("bounded ordinal span");
+            if sources[index].is_none() && ordinal * PAGE < disk_end {
+                sources[index] = Some(RangeSource::Image {
+                    owner: Arc::clone(&owner),
+                    base: start,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+enum RangeSource {
+    Page(Arc<StoragePage>),
+    Image { owner: Arc<Vec<u8>>, base: u64 },
+}
+
+fn assemble_range(
+    sources: &[Option<RangeSource>],
+    first: u64,
+    offset: u64,
+    end: u64,
+) -> io::Result<Vec<u8>> {
+    const PAGE: u64 = 4096;
+    let length = usize::try_from(end - offset).map_err(|_| io::ErrorKind::InvalidInput)?;
+    let mut output = Vec::with_capacity(length);
+    for (index, source) in sources.iter().enumerate() {
+        let ordinal = first + u64::try_from(index).expect("bounded ordinal span");
+        let page_base = ordinal * PAGE;
+        let from = offset.max(page_base);
+        let to = end.min(page_base + PAGE);
+        let Some(source) = source else {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        };
+        let (owner, owner_base) = match source {
+            RangeSource::Page(page) => {
+                // Page bytes live at owner[page.start .. page.start + length]
+                // while the page's absolute base is ordinal * PAGE.
+                let owner_base = page_base
+                    .checked_sub(u64::try_from(page.start).expect("bounded storage range"))
+                    .ok_or(io::ErrorKind::UnexpectedEof)?;
+                (&page.owner, owner_base)
+            }
+            RangeSource::Image { owner, base } => (owner, *base),
+        };
+        let start = usize::try_from(from - owner_base).map_err(|_| io::ErrorKind::UnexpectedEof)?;
+        let stop = usize::try_from(to - owner_base).map_err(|_| io::ErrorKind::UnexpectedEof)?;
+        output.extend_from_slice(owner.get(start..stop).ok_or(io::ErrorKind::UnexpectedEof)?);
+    }
     Ok(output)
 }
 
@@ -5115,6 +5226,15 @@ impl StorageIo for FsStorageIo {
                 previous.expect("ASSERT: an existing writer has a layout"),
                 length,
             )
+        })
+    }
+
+    fn create_new_unpublished_image(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() > crate::immutable_write::WRITE_BATCH_BYTES {
+            return crate::immutable_write::write_new_unpublished_image_default(self, name, bytes);
+        }
+        self.mutate_direct_file(name, true, |file, _| {
+            direct_io::write_new_image(file, bytes)
         })
     }
 

@@ -772,6 +772,12 @@ impl VerifiedReadCache {
     }
 
     pub(crate) fn admit_verified_location(&self, entry: fastdup_format::ExactIndexEntry) {
+        // Location evidence follows the caller's restored intent: a
+        // verification pass still inside its Scan/Independent scope retains no
+        // evidence merely because headroom is free.
+        if crate::read_intent::bypass_admission() {
+            return;
+        }
         if let Some(cache) = &self.location_proofs {
             cache.insert(
                 location_proof_key(entry),

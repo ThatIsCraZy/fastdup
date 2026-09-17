@@ -31,3 +31,13 @@ counts respectively. ADR 0068 allows classified additions from proof-bearing,
 nonrotating commits to advance this catalog with immutable delta runs. Every
 potential root removal still triggers a complete exact mark and cannot weaken
 the exact deletion proof.
+
+## WAL-covered Recovery Checkpoint pin refinement (17 September 2026)
+
+A Recovery Checkpoint root pin acquired from the retained Commit segment protects
+an already marked graph and its release is not itself a potential removal while
+that covering Commit Record remains. Potential removal occurs when the Commit
+writer re-arms live WAL-covered pins before rotation or when an unarmored pin
+drains. Those events still trigger the complete exact mark and cannot weaken exact
+deletion authority. ADR 0068 defines the acquisition, re-arming, and process-local
+handle rules.

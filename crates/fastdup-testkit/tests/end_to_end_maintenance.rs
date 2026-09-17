@@ -538,14 +538,14 @@ fn commit_log_rotation_forces_an_exact_metadata_mark_after_additive_deltas() {
                 .garbage_collect_metadata()
                 .expect("advance the bounded Metadata delta chain");
             if mutation_sequence == 34 {
-                assert!(
-                    catalog.exact_mark_performed(),
-                    "the 32-run delta chain limit starts a fresh exact Snapshot"
-                );
                 assert_eq!(
-                    catalog.exact_reason(),
-                    Some(MetadataGcExactReason::DeltaChainLimit)
+                    catalog.mark_mode(),
+                    MetadataGcMarkMode::CatalogCompaction,
+                    "the 32-run delta chain limit compacts the existing authoritative catalog"
                 );
+                assert!(!catalog.exact_mark_performed());
+                assert_eq!(catalog.exact_reason(), None);
+                assert_eq!(catalog.metrics().object_graph_read_bytes(), 0);
             } else {
                 assert!(!catalog.exact_mark_performed());
             }
@@ -816,6 +816,204 @@ fn every_metadata_mark_delta_publication_fault_retries_without_exact_rebuild() {
             maintenance
                 .scrub()
                 .expect("every additive delta publication interruption preserves authority");
+        }
+    }
+}
+
+fn metadata_mark_catalog_run_names(metadata: &MemoryStorageIo) -> Vec<String> {
+    let mut names = metadata
+        .list_names()
+        .expect("list Metadata mark catalog runs")
+        .into_iter()
+        .filter(|name| {
+            name.starts_with("metadata-mark-catalog-") && name.strip_suffix(".run").is_some()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[allow(clippy::type_complexity)]
+fn metadata_mark_catalog_chain_limit_fixture(
+    metadata: &MemoryStorageIo,
+) -> (
+    MaintenanceRepository<MemoryStorageIo, MemoryStorageIo, MemoryStorageIo>,
+    fastdup_store::ManifestSuccessorProof,
+) {
+    let (generations, containers, indexes, profile) =
+        seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
+    let maintenance =
+        MaintenanceRepository::new(generations.clone(), containers.clone(), indexes, profile);
+    let exact = maintenance
+        .garbage_collect_metadata()
+        .expect("establish the exact Metadata mark catalog");
+    assert_eq!(exact.catalog_generation(), Some(1));
+    assert_eq!(exact.metrics().catalog_chain_runs(), 1);
+
+    let installed = generations
+        .recover_latest_with_data(&containers)
+        .expect("recover the installed predecessor")
+        .expect("fixture has an installed predecessor");
+    let mut predecessor =
+        fastdup_store::SuccessorPredecessor::from_committed_record(installed.record());
+    let manifest = ManifestLeaf::new(
+        4_096,
+        vec![ManifestExtent::Fill {
+            logical_length: 4_096,
+            value: 0x72,
+        }],
+    )
+    .expect("chain-limit successor Manifest is valid");
+    let first_proof = generations
+        .publish_manifest_successor(predecessor, &manifest)
+        .expect("publish the first chain-limit successor");
+    let summary = first_proof.summary();
+
+    for mutation_sequence in 2_u64..=34 {
+        let proof = if mutation_sequence == 2 {
+            first_proof.clone()
+        } else {
+            generations.reuse_manifest_successor(predecessor, summary)
+        };
+        let namespace = NamespaceRoot::new(
+            1_024,
+            3,
+            mutation_sequence,
+            vec![
+                DurableInode::new(
+                    2,
+                    0o640,
+                    1_000,
+                    1_000,
+                    1,
+                    mutation_sequence,
+                    4_096,
+                    summary.root(),
+                )
+                .expect("chain-limit successor inode is valid"),
+            ],
+            vec![
+                NamespaceEntry::new(1, 2, b"backup.vbk".to_vec())
+                    .expect("chain-limit successor name is valid"),
+            ],
+        )
+        .expect("chain-limit successor Namespace is valid");
+        let committed = generations
+            .commit_namespace_with_successor_proofs_using(
+                &namespace,
+                &containers,
+                predecessor,
+                &[proof],
+                &containers,
+            )
+            .expect("commit a chain-limit successor");
+        predecessor =
+            fastdup_store::SuccessorPredecessor::from_committed_record(committed.record());
+
+        if mutation_sequence < 34 {
+            let delta = maintenance
+                .garbage_collect_metadata()
+                .expect("extend the bounded Metadata delta chain");
+            assert_eq!(delta.mark_mode(), MetadataGcMarkMode::AdditionDelta);
+            assert_eq!(delta.catalog_generation(), Some(mutation_sequence));
+        }
+    }
+    assert_eq!(metadata_mark_catalog_run_names(metadata).len(), 33);
+    (maintenance, first_proof)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn metadata_mark_catalog_compaction_faults_publish_only_absence_or_one_complete_snapshot() {
+    let probe_metadata = MemoryStorageIo::new();
+    let (probe, _first_proof) = metadata_mark_catalog_chain_limit_fixture(&probe_metadata);
+    let baseline = probe_metadata.operation_count();
+    let probe_compaction = probe
+        .garbage_collect_metadata()
+        .expect("probe chain-limit compaction succeeds");
+    assert_eq!(
+        probe_compaction.mark_mode(),
+        MetadataGcMarkMode::CatalogCompaction
+    );
+    assert!(!probe_compaction.exact_mark_performed());
+    assert_eq!(probe_compaction.catalog_generation(), Some(34));
+    assert_eq!(probe_compaction.metrics().catalog_chain_runs(), 1);
+    assert_eq!(probe_compaction.objects_removed(), 0);
+
+    let operations = probe_metadata.operations();
+    let window = &operations[baseline..];
+    let publish_position = window
+        .iter()
+        .position(|operation| *operation == StorageOperation::PublishNoreplace)
+        .expect("compaction publishes a new catalog snapshot");
+    let sync_position = window
+        .iter()
+        .rposition(|operation| *operation == StorageOperation::SyncRoot)
+        .expect("compaction synchronizes the Metadata directory once");
+    assert_eq!(sync_position + 1, window.len());
+    let retirement_position = sync_position
+        .checked_sub(1)
+        .expect("compaction retires old catalog runs before its final sync");
+    assert_eq!(
+        window[retirement_position],
+        StorageOperation::RemoveFile,
+        "the final catalog operation before SyncRoot is the last old-run retirement"
+    );
+    assert_eq!(metadata_mark_catalog_run_names(&probe_metadata).len(), 1);
+
+    for (relative, phase) in [
+        (publish_position, "new-snapshot publication"),
+        (retirement_position, "old-run retirement"),
+        (sync_position, "final directory sync"),
+    ] {
+        for fail_after_effect in [false, true] {
+            let metadata = MemoryStorageIo::new();
+            let (maintenance, _first_proof) = metadata_mark_catalog_chain_limit_fixture(&metadata);
+            let old_names = metadata_mark_catalog_run_names(&metadata);
+            assert_eq!(old_names.len(), 33);
+
+            metadata.arm_failpoint(fail_after_effect, metadata.operation_count() + relative);
+            let message = format!(
+                "fault {relative} at {phase} must interrupt chain-limit Metadata catalog compaction"
+            );
+            assert!(maintenance.garbage_collect_metadata().is_err(), "{message}");
+            metadata.clear_faults();
+            metadata.crash();
+
+            let durable_names = metadata_mark_catalog_run_names(&metadata);
+            let durable_compaction = relative == sync_position && fail_after_effect;
+            if durable_compaction {
+                assert_eq!(
+                    durable_names.len(),
+                    1,
+                    "only a successful final directory sync may retire the old chain"
+                );
+                assert!(
+                    durable_names.iter().all(|name| !old_names.contains(name)),
+                    "the durable post-sync chain must be the compacted successor"
+                );
+            } else {
+                assert_eq!(
+                    durable_names, old_names,
+                    "a compaction interrupted before its effective final sync must retain the prior durable chain"
+                );
+            }
+            maintenance
+                .scrub()
+                .expect("every interrupted chain-limit compaction preserves the committed graph");
+
+            let retried = maintenance.garbage_collect_metadata().expect(
+                "compaction retry must rebuild authority from the durable catalog high-water mark",
+            );
+            assert!(retried.exact_mark_performed());
+            assert_eq!(retried.mark_mode(), MetadataGcMarkMode::ExactSnapshot);
+            assert_eq!(
+                retried.catalog_generation(),
+                Some(if durable_compaction { 35 } else { 34 })
+            );
+            maintenance
+                .scrub()
+                .expect("the completed compaction retry preserves the committed graph");
         }
     }
 }
@@ -1175,6 +1373,42 @@ fn offline_scrub_rejects_a_corrupt_retained_recovery_checkpoint() {
         maintenance.scrub(),
         Err(MaintenanceError::RecoveryCheckpoint(_))
     ));
+}
+
+#[test]
+fn wal_covered_recovery_checkpoint_publication_does_not_reforce_exact_metadata_mark() {
+    let (generations, containers, indexes, profile) = seeded_repositories();
+    let checkpoints = RecoveryCheckpointRepository::new(containers.storage().clone());
+    let maintenance = MaintenanceRepository::new(
+        generations.clone(),
+        containers.clone(),
+        indexes.clone(),
+        profile,
+    );
+
+    let bootstrap = maintenance
+        .garbage_collect_metadata()
+        .expect("process start establishes one exact Metadata mark");
+    assert_eq!(bootstrap.mark_mode(), MetadataGcMarkMode::ExactSnapshot);
+    assert_eq!(
+        bootstrap.exact_reason(),
+        Some(MetadataGcExactReason::ProcessStart)
+    );
+
+    checkpoints
+        .publish(&generations, &containers)
+        .expect("publish Recovery Checkpoint")
+        .expect("fixture has a recoverable generation");
+
+    let reused = maintenance
+        .garbage_collect_metadata()
+        .expect("reuse the exact mark across a WAL-covered checkpoint publication");
+    assert_eq!(reused.mark_mode(), MetadataGcMarkMode::Reused);
+    assert_eq!(reused.exact_reason(), None);
+    assert_eq!(reused.metrics().object_graph_read_bytes(), 0);
+    maintenance
+        .scrub()
+        .expect("incremental Metadata mark retains the complete committed graph");
 }
 
 #[test]

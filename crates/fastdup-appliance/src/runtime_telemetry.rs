@@ -62,7 +62,7 @@ pub fn record_checkpoint(profiled: &ProfiledCheckpoint) {
         ("publicationWait", metrics.publication_wait()),
         ("laneLock", metrics.lane_lock()),
         ("stableExtract", metrics.stable_extract()),
-        ("publicationEnqueue", metrics.publication_enqueue()),
+        ("drainResidue", metrics.drain_residue()),
         ("publicationRetire", metrics.publication_retire()),
         ("recipeAttach", metrics.recipe_attach()),
         ("writerSetup", metrics.writer_setup()),
@@ -103,6 +103,11 @@ pub fn gc_finished(result: &Result<OnlineGcCycleReport, String>) {
     let value = match result {
         Ok(report) => {
             let m = report.metrics();
+            let metadata_summary = report.metadata_gc();
+            let metadata = metadata_summary.metrics();
+            let metadata_exact_reason = metadata_summary
+                .exact_reason()
+                .map(fastdup_store::MetadataGcExactReason::as_str);
             let state = match report.outcome() {
                 OnlineGcCycleOutcome::MetadataOnly => "metadataOnly",
                 OnlineGcCycleOutcome::DataOnly => "dataOnly",
@@ -113,9 +118,45 @@ pub fn gc_finished(result: &Result<OnlineGcCycleReport, String>) {
             };
             json!({"state":state, "observedAt":unix_seconds(),
                 "totalMs":m.total_wall().as_secs_f64() * 1000.0,
+                "phasesMs":{
+                    "recovery":m.recovery_wall().as_secs_f64()*1000.0,
+                    "metadataGc":m.metadata_gc_wall().as_secs_f64()*1000.0,
+                    "candidateCatalog":m.candidate_catalog_wall().as_secs_f64()*1000.0,
+                    "candidateProof":m.candidate_proof_wall().as_secs_f64()*1000.0,
+                    "relocation":m.relocation_wall().as_secs_f64()*1000.0,
+                    "retiringActivation":m.retiring_activation_wall().as_secs_f64()*1000.0,
+                    "pinDrain":m.pin_drain_wall().as_secs_f64()*1000.0,
+                    "victimVerify":m.victim_verify_wall().as_secs_f64()*1000.0,
+                    "unlink":m.unlink_wall().as_secs_f64()*1000.0,
+                    "dataSync":m.data_sync_wall().as_secs_f64()*1000.0,
+                    "removedActivation":m.removed_activation_wall().as_secs_f64()*1000.0,
+                    "postCollectionCatalog":m.post_collection_catalog_wall().as_secs_f64()*1000.0
+                },
+                "metadataGc":{"markMode":metadata_summary.mark_mode().as_str(),
+                    "exactReason":metadata_exact_reason,
+                    "wallMs":metadata.wall().as_secs_f64()*1000.0,
+                    "barrierWaitMs":metadata.barrier_wait().as_secs_f64()*1000.0,
+                    "objectGraphReadBytes":metadata.object_graph_read_bytes(),
+                    "candidateReadBytes":metadata.candidate_read_bytes(),
+                    "catalogReadBytes":metadata.catalog_read_bytes(),
+                    "catalogWriteBytes":metadata.catalog_write_bytes(),
+                    "unlinkedBytes":metadata.unlinked_bytes(),
+                    "rootSyncs":metadata.root_syncs(),
+                    "catalogChainRuns":metadata.catalog_chain_runs()},
                 "readBytes":m.relocation_read_bytes(), "writeBytes":m.relocation_write_bytes(),
                 "unlinkedBytes":m.unlinked_bytes(), "candidates":m.shortlisted_candidates(),
-                "victims":m.proved_victims(), "abortedCandidates":m.aborted_candidates()})
+                "victims":m.proved_victims(), "abortedCandidates":m.aborted_candidates(),
+                "catalogExaminedBytes":m.catalog_examined_bytes(),
+                "catalogWriteBytes":m.catalog_write_bytes(),
+                "candidateProofReadBytes":m.candidate_proof_read_bytes(),
+                "reverseDependencyEdges":m.reverse_dependency_edges(),
+                "reverseDependencyRequiredChunks":m.reverse_dependency_required_chunks(),
+                "candidateQueueRetained":m.candidate_queue_retained(),
+                "candidateQueueScannedRows":m.candidate_queue_scanned_rows(),
+                "catalogPendingUpdates":m.catalog_pending_updates(),
+                "exactRetirementMs":m.exact_retirement_wall().as_secs_f64()*1000.0,
+                "exactRunsRetired":m.exact_runs_retired(),
+                "exactRunSetsRetired":m.exact_run_sets_retired()})
         }
         Err(_) => json!({"state":"failed", "observedAt":unix_seconds()}),
     };

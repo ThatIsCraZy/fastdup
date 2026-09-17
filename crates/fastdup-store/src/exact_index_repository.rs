@@ -872,11 +872,6 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             return Ok((observed, None));
         }
 
-        match self.storage.create_new(&temporary_name) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
         let mut evidence = owned_writer
             .then(|| RunWriterEvidence::new(expected.entry_count(), &self.page_cache))
             .transpose()?;
@@ -894,13 +889,31 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             }
         }
         if owned_writer {
-            write_image_unpublished(&self.storage, &temporary_name, &encoded)?;
-            self.storage.set_len_unpublished(
-                &temporary_name,
-                u64::try_from(encoded.len())
-                    .expect("ASSERT: a bounded Exact Index run length fits u64"),
-            )?;
+            // A fresh name bundles envelope heads and payload into one write.
+            // A leftover temporary from an interrupted attempt keeps its exact
+            // resume path: batched overwrite plus the final unpublished length.
+            let resumable = match self
+                .storage
+                .create_new_unpublished_image(&temporary_name, &encoded)
+            {
+                Ok(()) => false,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => true,
+                Err(error) => return Err(error.into()),
+            };
+            if resumable {
+                write_image_unpublished(&self.storage, &temporary_name, &encoded)?;
+                self.storage.set_len_unpublished(
+                    &temporary_name,
+                    u64::try_from(encoded.len())
+                        .expect("ASSERT: a bounded Exact Index run length fits u64"),
+                )?;
+            }
         } else {
+            match self.storage.create_new(&temporary_name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
             write_image(&self.storage, &temporary_name, &encoded)?;
             self.storage.set_len(
                 &temporary_name,
@@ -1507,7 +1520,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         }
         let families = compaction_families_from_run_set(generation.run_set())?;
         let mut visited = 0_u64;
-        self.merge_compaction_families(&families, |entry| {
+        self.merge_compaction_families_using(&families, generation.run_readers(), |entry| {
             if visited.is_multiple_of(256) {
                 crate::maintenance_cancellation::check_io(cancellation)?;
             }
@@ -2920,18 +2933,30 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             return Ok(());
         }
         let temporary_name = format!(".{published_name}.building");
-        match self.storage.create_new(&temporary_name) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
         if owned_writer {
-            write_image_unpublished(&self.storage, &temporary_name, encoded)?;
-            self.storage.set_len_unpublished(
-                &temporary_name,
-                u64::try_from(encoded.len()).expect("ASSERT: Metadata-v1 length fits u64"),
-            )?;
+            // A fresh name bundles envelope heads and payload into one write;
+            // a leftover temporary resumes with batched overwrite and length.
+            let resumable = match self
+                .storage
+                .create_new_unpublished_image(&temporary_name, encoded)
+            {
+                Ok(()) => false,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => true,
+                Err(error) => return Err(error.into()),
+            };
+            if resumable {
+                write_image_unpublished(&self.storage, &temporary_name, encoded)?;
+                self.storage.set_len_unpublished(
+                    &temporary_name,
+                    u64::try_from(encoded.len()).expect("ASSERT: Metadata-v1 length fits u64"),
+                )?;
+            }
         } else {
+            match self.storage.create_new(&temporary_name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
             write_image(&self.storage, &temporary_name, encoded)?;
             self.storage.set_len(
                 &temporary_name,
@@ -6443,6 +6468,60 @@ mod tests {
             16,
             "two merge passes over four 65-page Runs must cost 2 spans per Run per pass, \
              not 65 single-page fetches"
+        );
+    }
+
+    #[test]
+    fn gc_candidate_visit_reuses_leased_pages_across_proofs() {
+        fn total_ops(counters: &crate::metadata_read_telemetry::MetadataReadCounters) -> u64 {
+            counters.rows().iter().map(|row| row.operations).sum()
+        }
+        let (repository, _counters) = counted_repository("gc-visit-reuse", true);
+        let profile = ExactIndexProfileId::new([214; 32]).unwrap();
+        let entries: Vec<_> = (0..(65 * EXACT_INDEX_ENTRIES_PER_PAGE) as u64)
+            .map(reuse_fixture)
+            .collect();
+        repository.append_level_zero(profile, entries).unwrap();
+        drop(repository);
+
+        let (cold, counters) = counted_repository("gc-visit-reuse", false);
+        let generation = cold.pin_online_generation().unwrap().unwrap();
+        let candidates = std::collections::BTreeSet::from([ChunkId::of(&0_u64.to_le_bytes())]);
+
+        let before = reason_totals(&counters, "indexCompaction");
+        let before_all = total_ops(&counters);
+        let mut first = 0_usize;
+        cold.visit_active_locations_matching(&generation, &candidates, None, |_| {
+            first += 1;
+            Ok(())
+        })
+        .unwrap();
+        let after_first = reason_totals(&counters, "indexCompaction");
+        let after_first_all = total_ops(&counters);
+        let mut second = 0_usize;
+        cold.visit_active_locations_matching(&generation, &candidates, None, |_| {
+            second += 1;
+            Ok(())
+        })
+        .unwrap();
+        let after_second_all = total_ops(&counters);
+        assert_eq!(first, 1, "the fixture candidate has one active Location");
+        assert_eq!(first, second);
+        assert_eq!(
+            after_first.0 - before.0,
+            2,
+            "a cold candidate visit over one 65-page Run must cost one 64-page span \
+             plus one tail span through the leased reader"
+        );
+        assert_eq!(
+            after_first_all - before_all,
+            after_first.0 - before.0,
+            "a leased candidate visit must not re-read Run envelopes for a per-proof audit"
+        );
+        assert_eq!(
+            after_second_all, after_first_all,
+            "a repeated candidate proof must replay leased pages from the shared \
+             Exact page cache instead of re-auditing the Run"
         );
     }
 
