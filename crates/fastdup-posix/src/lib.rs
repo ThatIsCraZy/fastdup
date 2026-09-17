@@ -6,9 +6,9 @@
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
-use std::ops::Bound::Excluded;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
+use std::ops::{Bound::Excluded, Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
@@ -904,6 +904,15 @@ pub trait MutationObserver: std::fmt::Debug + Send + Sync {
     ) -> Vec<ExternalizedExtent>;
 
     fn accepted_truncate(&self, inode: InodeId, mutation_sequence: u64, length: u64);
+
+    /// Signals that new POSIX admission is closing while already admitted
+    /// mutations continue to complete. Acceleration observers may release or
+    /// abandon queued advisory work so the admission fence can drain.
+    fn admission_closing(&self) {}
+
+    /// Signals that transient admission closure was lifted and normal queue
+    /// backpressure may resume.
+    fn admission_opened(&self) {}
 
     /// Waits until every accepted mutation through `mutation_sequence` has
     /// left the observer's asynchronous processing queue.
@@ -2649,6 +2658,8 @@ pub struct Namespace {
     config: NamespaceConfig,
     mutations_supported: bool,
     mutations_admitted: RwLock<bool>,
+    mutation_admission_closing: AtomicBool,
+    mutation_admission_fenced: AtomicUsize,
     admission_telemetry: AdmissionTelemetry,
     integrity_failed: AtomicBool,
     admission_changed: Notify,
@@ -2663,6 +2674,34 @@ pub struct Namespace {
     locks: Mutex<LockTable>,
     lock_change_sequence: AtomicU64,
     lock_changed: Notify,
+}
+
+struct MutationAdmissionFence<'a> {
+    admitted: RwLockWriteGuard<'a, bool>,
+    fence: &'a AtomicUsize,
+    changed: &'a Notify,
+}
+
+impl Drop for MutationAdmissionFence<'_> {
+    fn drop(&mut self) {
+        if self.fence.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.changed.notify_waiters();
+        }
+    }
+}
+
+impl Deref for MutationAdmissionFence<'_> {
+    type Target = bool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.admitted
+    }
+}
+
+impl DerefMut for MutationAdmissionFence<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.admitted
+    }
 }
 
 #[derive(Debug)]
@@ -2725,6 +2764,8 @@ impl Namespace {
             config,
             mutations_supported: true,
             mutations_admitted: RwLock::new(true),
+            mutation_admission_closing: AtomicBool::new(false),
+            mutation_admission_fenced: AtomicUsize::new(0),
             admission_telemetry: AdmissionTelemetry::new(true),
             integrity_failed: AtomicBool::new(false),
             admission_changed: Notify::new(),
@@ -3007,6 +3048,8 @@ impl Namespace {
             config,
             mutations_supported: mutations_enabled,
             mutations_admitted: RwLock::new(mutations_enabled),
+            mutation_admission_closing: AtomicBool::new(!mutations_enabled),
+            mutation_admission_fenced: AtomicUsize::new(0),
             admission_telemetry: AdmissionTelemetry::new(mutations_enabled),
             integrity_failed: AtomicBool::new(false),
             admission_changed: Notify::new(),
@@ -3052,12 +3095,35 @@ impl Namespace {
     /// # Panics
     /// Panics if an earlier invariant failure poisoned the admission lock.
     pub fn pause_mutation_admission_for(&self, reason: AdmissionPauseReason) {
-        let mut admitted = self
-            .mutations_admitted
-            .write()
-            .expect("ASSERT: mutation admission lock poisoned");
+        self.mutation_admission_closing
+            .store(true, Ordering::SeqCst);
+        self.notify_admission_observer_closing();
+        self.admission_changed.notify_waiters();
+        let mut admitted = self.mutation_admission_fence();
         *admitted = false;
         self.admission_telemetry.set(false, reason);
+    }
+
+    fn notify_admission_observer_closing(&self) {
+        let observer = self
+            .mutation_observer
+            .read()
+            .expect("ASSERT: mutation observer lock poisoned")
+            .clone();
+        if let Some(observer) = observer {
+            observer.admission_closing();
+        }
+    }
+
+    fn notify_admission_observer_opened(&self) {
+        let observer = self
+            .mutation_observer
+            .read()
+            .expect("ASSERT: mutation observer lock poisoned")
+            .clone();
+        if let Some(observer) = observer {
+            observer.admission_opened();
+        }
     }
 
     /// Reads transition counters without waiting for a Namespace commit fence.
@@ -3072,16 +3138,15 @@ impl Namespace {
     /// # Panics
     /// Panics if an invariant failure poisoned the admission lock.
     pub fn fail_integrity(&self) {
-        let mut admitted = self
-            .mutations_admitted
-            .write()
-            .expect("mutation admission lock");
         self.integrity_failed.store(true, Ordering::Release);
+        self.mutation_admission_closing
+            .store(true, Ordering::SeqCst);
+        self.notify_admission_observer_closing();
+        self.admission_changed.notify_waiters();
+        let mut admitted = self.mutation_admission_fence();
         *admitted = false;
         self.admission_telemetry
             .set(false, AdmissionPauseReason::IntegrityFailure);
-        drop(admitted);
-        self.admission_changed.notify_waiters();
     }
 
     #[must_use]
@@ -3099,15 +3164,16 @@ impl Namespace {
             self.mutations_supported,
             "ASSERT: a read-only namespace cannot resume mutation admission"
         );
-        let mut admitted = self
-            .mutations_admitted
-            .write()
-            .expect("ASSERT: mutation admission lock poisoned");
-        *admitted = !self.integrity_failed();
+        let mut admitted = self.mutation_admission_fence();
+        let opened = !self.integrity_failed();
+        *admitted = opened;
+        self.mutation_admission_closing
+            .store(!opened, Ordering::SeqCst);
         self.admission_telemetry
-            .set(*admitted, AdmissionPauseReason::IntegrityFailure);
+            .set(opened, AdmissionPauseReason::Unspecified);
         drop(admitted);
         self.admission_changed.notify_waiters();
+        self.notify_admission_observer_opened();
     }
 
     /// Waits until transient checkpoint backpressure permits a mutation.
@@ -3143,10 +3209,27 @@ impl Namespace {
     /// Panics when a prior impossible invariant poisoned the admission lock.
     pub fn mutation_admission_open(&self) -> bool {
         self.mutations_supported
-            && *self
+            && !self.integrity_failed()
+            && !self.mutation_admission_closing.load(Ordering::Acquire)
+            && self.mutation_admission_fenced.load(Ordering::Acquire) == 0
+    }
+
+    #[must_use]
+    pub fn mutation_admission_closing(&self) -> bool {
+        self.mutation_admission_closing.load(Ordering::Acquire)
+    }
+
+    fn mutation_admission_fence(&self) -> MutationAdmissionFence<'_> {
+        self.mutation_admission_fenced
+            .fetch_add(1, Ordering::SeqCst);
+        MutationAdmissionFence {
+            admitted: self
                 .mutations_admitted
-                .read()
-                .expect("ASSERT: mutation admission lock poisoned")
+                .write()
+                .expect("ASSERT: mutation admission lock poisoned"),
+            fence: &self.mutation_admission_fenced,
+            changed: &self.admission_changed,
+        }
     }
 
     /// Returns unique resident DATA bytes retained by active dirty extents.
@@ -3221,10 +3304,7 @@ impl Namespace {
         revision: String,
         rules: impl IntoIterator<Item = LogicalQuotaRule>,
     ) -> Result<(), PosixError> {
-        let _mutation_fence = self
-            .mutations_admitted
-            .write()
-            .expect("ASSERT: mutation admission lock poisoned");
+        let _mutation_fence = self.mutation_admission_fence();
         let catalog = self.catalog.read().expect("ASSERT: catalog lock poisoned");
         let mut limits = BTreeMap::new();
         for rule in rules {
@@ -3343,10 +3423,7 @@ impl Namespace {
         if rules.len() > 4096 {
             return Err(PosixError::InvalidArgument);
         }
-        let _fence = self
-            .mutations_admitted
-            .write()
-            .expect("mutation admission lock");
+        let _fence = self.mutation_admission_fence();
         let catalog = self.catalog.read().expect("catalog lock");
         let mut roots = BTreeMap::new();
         for (root, enabled) in rules {
@@ -3634,10 +3711,7 @@ impl Namespace {
     /// disagree while the catalog is exclusively locked.
     #[allow(clippy::too_many_lines)]
     pub fn begin_commit(&self) -> Result<Option<NamespaceCommit>, PosixError> {
-        let _mutation_fence = self
-            .mutations_admitted
-            .write()
-            .expect("ASSERT: mutation admission lock poisoned");
+        let _mutation_fence = self.mutation_admission_fence();
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         if let Some(inflight) = &catalog.inflight_commit {
             return Ok(Some(inflight.clone()));
@@ -6265,6 +6339,12 @@ impl Namespace {
         if !self.mutations_supported {
             return Err(PosixError::ReadOnly);
         }
+        if self.integrity_failed() {
+            return Err(PosixError::Io);
+        }
+        if !self.mutation_admission_open() {
+            return Err(PosixError::Again);
+        }
         let admitted = self
             .mutations_admitted
             .read()
@@ -6272,7 +6352,7 @@ impl Namespace {
         if self.integrity_failed() {
             return Err(PosixError::Io);
         }
-        if !*admitted {
+        if !self.mutation_admission_open() || !*admitted {
             return Err(PosixError::Again);
         }
         Ok(admitted)
@@ -7080,6 +7160,36 @@ mod tests {
         assert!(matches!(result, Err(super::PosixError::Io)));
         assert!(!namespace.mutation_admission_open());
     }
+    #[tokio::test]
+    async fn commit_cut_fence_release_wakes_admission_waiters() {
+        let namespace = std::sync::Arc::new(super::Namespace::new_volatile(
+            super::NamespaceConfig::default(),
+        ));
+        let fence = namespace.mutation_admission_fence();
+        assert!(
+            !namespace.mutation_admission_open(),
+            "ASSERT: an active mutation fence must reject admission"
+        );
+
+        let waiting = std::sync::Arc::clone(&namespace);
+        let waiter = tokio::spawn(async move { waiting.wait_for_mutation_admission().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "ASSERT: admission must remain closed while a fence is active"
+        );
+
+        drop(fence);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("ASSERT: releasing the final mutation fence must wake waiters")
+            .unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(namespace.mutation_admission_open());
+    }
+
     use super::{Inode, MutationPayload, SparseData};
 
     #[test]
