@@ -979,7 +979,9 @@ async fn run_online_gc_runtime(
                     return Ok(());
                 };
                 if !scrub_gate.permits_gc() {
-                    let _ = request.response.send("Online GC waits for successful background scrub".to_owned());
+                    let _ = request
+                        .response
+                        .send("online_gc_ok=false error=scrub_gate_pending\n".to_owned());
                     continue;
                 }
                 scheduler.record_immediate_start(Instant::now());

@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.7.4
-Release: 56%{?dist}
+Release: 57%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -110,6 +110,11 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Thu Sep 17 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-57
+- Add an online-GC run-now action to the Control Plane UI and agent command
+  surface, with machine-readable runtime gate responses and an online repository
+  precondition.
+
 * Thu Sep 17 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-56
 - Wake mutation-admission waiters when the final commit-cut or administrative
   fence releases, removing a rare FUSE direct-write stall.

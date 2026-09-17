@@ -3,7 +3,7 @@ import { ChevronDown, ListChecks } from "lucide-react";
 import { useI18n } from "./i18n";
 import type { JobStatus } from "./types";
 
-const labels: Record<string, string> = { provision:"Provisionierung",adopt:"Repository-Übernahme",mount:"Mount",unmount:"Unmount",offline_scrub:"Offline-Scrub",update_settings:"Einstellungen",upsert_share:"SMB-Freigabe",delete_share:"Share-Löschung" };
+const labels: Record<string, string> = { provision:"Provisionierung",adopt:"Repository-Übernahme",mount:"Mount",unmount:"Unmount",offline_scrub:"Offline-Scrub",gc_now:"Online-GC",update_settings:"Einstellungen",upsert_share:"SMB-Freigabe",delete_share:"Share-Löschung" };
 const states = { queued:"Wartet", running:"Läuft", succeeded:"Abgeschlossen", failed:"Fehlgeschlagen" };
 
 export function RecentJobs({ jobs }: { jobs: JobStatus[] }) {

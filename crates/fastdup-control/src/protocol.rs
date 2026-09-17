@@ -28,6 +28,7 @@ pub enum Command {
     Mount,
     Unmount,
     OfflineScrub,
+    GcNow,
     UpdateSettings {
         expected_revision: u64,
         settings: RepositorySettings,

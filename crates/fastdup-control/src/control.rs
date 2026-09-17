@@ -687,6 +687,7 @@ impl AgentRuntime {
                 Ok("Repository wurde sauber ausgehängt".to_owned())
             }
             Command::OfflineScrub => self.offline_scrub(),
+            Command::GcNow => self.online_gc_now(),
             Command::UpdateSettings {
                 expected_revision,
                 mut settings,
@@ -1042,6 +1043,28 @@ impl AgentRuntime {
         Ok("Offline-Scrub erfolgreich abgeschlossen".to_owned())
     }
 
+    fn online_gc_now(&self) -> Result<String, ControlProblem> {
+        let online = self
+            .store
+            .repository_binding()
+            .map_err(problem("binding_failed"))?
+            .is_some_and(|binding| binding.state == RepositoryState::Online);
+        if !online {
+            return Err(ControlProblem::new(
+                "repository_not_online",
+                "Online-GC benötigt ein online Repository",
+            ));
+        }
+        let response = fastdup_appliance::request_online_gc_now(Path::new(METADATA_ROOT))
+            .map_err(problem("online_gc_failed"))?
+            .trim_end()
+            .to_owned();
+        if response.contains("online_gc_ok=false") {
+            return Err(ControlProblem::new("online_gc_failed", response));
+        }
+        Ok(response)
+    }
+
     fn set_state(&self, state: RepositoryState) -> Result<(), ControlProblem> {
         let mut binding = self
             .store
@@ -1126,6 +1149,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Mount => "mount",
         Command::Unmount => "unmount",
         Command::OfflineScrub => "offline_scrub",
+        Command::GcNow => "gc_now",
         Command::UpdateSettings { .. } => "update_settings",
         Command::UpsertShare { .. } => "upsert_share",
         Command::DeleteShare { .. } => "delete_share",

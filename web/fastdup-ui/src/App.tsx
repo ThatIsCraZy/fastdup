@@ -45,6 +45,7 @@ import {
   Pencil,
   Play,
   Plus,
+  Recycle,
   RefreshCcw,
   Save,
   ServerCog,
@@ -104,6 +105,7 @@ const jobLabels: Record<string, string> = {
   mount: "Mount",
   unmount: "Unmount",
   offline_scrub: "Offline-Scrub",
+  gc_now: "Online-GC",
   update_settings: "Einstellungen",
   upsert_share: "SMB-Freigabe",
   delete_share: "Share-Löschung",
@@ -401,7 +403,7 @@ function RepositoryHero({
   busy,
 }: {
   telemetry: TelemetrySnapshot;
-  runCommand: (kind: "mount" | "unmount" | "offline_scrub") => void;
+  runCommand: (kind: "mount" | "unmount" | "offline_scrub" | "gc_now") => void;
   busy: boolean;
 }) {
   const { t, locale } = useI18n();
@@ -538,7 +540,7 @@ function Overview({
 }: {
   snapshot: TelemetrySnapshot;
   disks: DiskTelemetry[];
-  runCommand: (kind: "mount" | "unmount" | "offline_scrub") => void;
+  runCommand: (kind: "mount" | "unmount" | "offline_scrub" | "gc_now") => void;
   busy: boolean;
 }) {
   const { t, locale } = useI18n();
@@ -725,7 +727,7 @@ function RepositoryPage({
   busy,
 }: {
   snapshot: ApplianceSnapshot;
-  runCommand: (kind: "mount" | "unmount" | "offline_scrub") => void;
+  runCommand: (kind: "mount" | "unmount" | "offline_scrub" | "gc_now") => void;
   busy: boolean;
 }) {
   const { t, locale } = useI18n();
@@ -834,6 +836,18 @@ function RepositoryPage({
             >
               Unmount
             </Button>
+          </div>
+          <div className="action-span">
+            <Recycle />
+            <span>
+              <strong>{t("Online Garbage Collection")}</strong>
+              <small>{t("Erzwingt sofort einen vorrangigen GC-Durchlauf. Läuft online neben dem Betrieb, ohne SMB-Unterbrechung.")}</small>
+            </span>
+            <Button
+              variant="secondary"
+              onClick={() => runCommand("gc_now")}
+              disabled={!online || busy}
+            >{t("Jetzt starten")}</Button>
           </div>
         </CardContent>
       </Card>
@@ -2186,8 +2200,8 @@ function Application() {
       });
     }
   };
-  const runCommand = (kind: "mount" | "unmount" | "offline_scrub") =>
-    kind === "mount" ? void submit({ kind }) : setConfirmAction(kind);
+  const runCommand = (kind: "mount" | "unmount" | "offline_scrub" | "gc_now") =>
+    kind === "mount" || kind === "gc_now" ? void submit({ kind }) : setConfirmAction(kind);
   const saveShare = async (share: ShareSettings) => {
     if (!session) return;
     try {
