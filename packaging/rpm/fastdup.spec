@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.7.4
-Release: 55%{?dist}
+Release: 56%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -110,6 +110,15 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Thu Sep 17 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-56
+- Wake mutation-admission waiters when the final commit-cut or administrative
+  fence releases, removing a rare FUSE direct-write stall.
+- Compact Metadata Mark Catalogs at the 32-run chain limit from retained catalog
+  and Commit authority, covering publication, old-run retirement, and the final
+  directory sync with fault-injection regressions.
+- Merge frozen-cut drain residue into the checkpoint writer and refresh read and
+  cache telemetry boundaries.
+
 * Thu Sep 17 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-53
 - Close mutation admission atomically and notify the write-through observer so a
   checkpoint timeout releases already admitted writers instead of deadlocking
