@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use fastdup_format::{
     DurableInode, DurableInodeKind, DurableRootMetadata, DurableTimes, DurableTimestamp,
-    DurableXattr, MetadataFormatError, MetadataObjectId, NamespaceEntry, NamespaceRoot,
+    DurableXattr, MetadataFormatError, MetadataObjectId, NamespaceEntry, NamespaceGraphRoot,
+    NamespaceRoot,
 };
 
 fn object_id(byte: u8) -> MetadataObjectId {
@@ -76,6 +77,59 @@ fn sharded_graph_round_trips_beyond_object_bound_and_rejects_missing_or_corrupt_
     let mut corrupt = shards;
     corrupt.first_entry().expect("graph has a shard").get_mut()[0] ^= 1;
     assert!(NamespaceRoot::decode_graph(graph.root(), &corrupt).is_err());
+}
+
+#[test]
+fn gc_namespace_view_matches_full_graph_reachability_and_transition_inputs() {
+    let root = NamespaceRoot::new(
+        4,
+        4,
+        2,
+        vec![
+            DurableInode::new_directory(2, 0o750, 1_000, 1_000, 2, 1).expect("directory is valid"),
+            DurableInode::new(3, 0o600, 1_000, 1_000, 1, 2, 8, object_id(0x33))
+                .expect("file is valid"),
+        ],
+        vec![
+            NamespaceEntry::new(1, 2, b"directory".to_vec()).expect("directory entry"),
+            NamespaceEntry::new(2, 3, b"file".to_vec()).expect("file entry"),
+        ],
+    )
+    .expect("mixed namespace is valid");
+    let graph = root.encode_graph().expect("graph encodes");
+    let shards = graph
+        .shards()
+        .iter()
+        .map(|shard| (shard.object_id(), shard.bytes().to_vec()))
+        .collect::<BTreeMap<_, _>>();
+    let full = NamespaceRoot::decode_graph(graph.root(), &shards).expect("graph decodes fully");
+    let view = NamespaceGraphRoot::decode(graph.root())
+        .expect("descriptor decodes")
+        .decode_gc_graph_with_shards(&shards)
+        .expect("gc view decodes");
+    assert_eq!(
+        view.inode_transitions(),
+        full.inodes()
+            .iter()
+            .map(|inode| (inode.inode(), inode.mutation_sequence()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        view.manifest_roots(),
+        full.file_inodes()
+            .map(|inode| inode
+                .file_manifest_root()
+                .expect("regular inode has a manifest root"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        view.namespace_object_ids(),
+        graph
+            .shards()
+            .iter()
+            .map(fastdup_format::EncodedNamespaceShard::object_id)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

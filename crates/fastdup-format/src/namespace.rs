@@ -97,6 +97,57 @@ pub struct NamespaceGraphRoot {
     shards: Vec<NamespaceShardRef>,
 }
 
+/// Metadata reachability view of one authenticated Namespace graph.
+///
+/// It carries only durable graph object identities and regular-file Manifest
+/// roots. Directory entries, extended attributes, and POSIX metadata remain
+/// independently validated by full namespace decoding and offline scrub.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamespaceGcGraph {
+    inode_reservation_end: u64,
+    inode_allocation_cursor: u64,
+    namespace_mutation_sequence: u64,
+    namespace_object_ids: Vec<MetadataObjectId>,
+    inode_transitions: Vec<(u64, u64)>,
+    manifest_roots: Vec<MetadataObjectId>,
+}
+
+impl NamespaceGcGraph {
+    #[must_use]
+    pub const fn inode_reservation_end(&self) -> u64 {
+        self.inode_reservation_end
+    }
+
+    #[must_use]
+    pub const fn inode_allocation_cursor(&self) -> u64 {
+        self.inode_allocation_cursor
+    }
+
+    #[must_use]
+    pub const fn namespace_mutation_sequence(&self) -> u64 {
+        self.namespace_mutation_sequence
+    }
+
+    #[must_use]
+    pub fn namespace_object_ids(&self) -> &[MetadataObjectId] {
+        &self.namespace_object_ids
+    }
+
+    /// Returns every inode ID and mutation sequence in durable inode order.
+    ///
+    /// These values are sufficient to verify Commit-Record graph transitions
+    /// without materializing directory entries or extended attributes.
+    #[must_use]
+    pub fn inode_transitions(&self) -> &[(u64, u64)] {
+        &self.inode_transitions
+    }
+
+    #[must_use]
+    pub fn manifest_roots(&self) -> &[MetadataObjectId] {
+        &self.manifest_roots
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableInodeKind {
     Regular,
@@ -1019,42 +1070,7 @@ impl NamespaceRoot {
         encoded_shards: &BTreeMap<MetadataObjectId, Vec<u8>>,
     ) -> Result<Self, MetadataFormatError> {
         let root = NamespaceGraphRoot::decode(encoded_root)?;
-        let expected_ids = root
-            .shards
-            .iter()
-            .map(|reference| reference.object_id)
-            .collect::<BTreeSet<_>>();
-        if encoded_shards.keys().copied().collect::<BTreeSet<_>>() != expected_ids {
-            return Err(MetadataFormatError::InvalidPayload);
-        }
-        let expected_length = usize::try_from(root.payload_length)
-            .map_err(|_| MetadataFormatError::ArithmeticOverflow)?;
-        let mut payload = Vec::new();
-        let mut decoded_shards = BTreeMap::new();
-        for reference in root.shards.iter().copied() {
-            let bytes = if let Some(bytes) = decoded_shards.get(&reference.object_id) {
-                *bytes
-            } else {
-                let encoded = encoded_shards
-                    .get(&reference.object_id)
-                    .ok_or(MetadataFormatError::InvalidPayload)?;
-                let bytes = decode_namespace_shard(encoded, reference)?;
-                decoded_shards.insert(reference.object_id, bytes);
-                bytes
-            };
-            if bytes.len()
-                != usize::try_from(reference.length)
-                    .map_err(|_| MetadataFormatError::ArithmeticOverflow)?
-            {
-                return Err(MetadataFormatError::InvalidPayload);
-            }
-            payload.extend_from_slice(bytes);
-        }
-        if payload.len() != expected_length
-            || *blake3::hash(&payload).as_bytes() != root.payload_hash
-        {
-            return Err(MetadataFormatError::InvalidPayload);
-        }
+        let payload = reconstruct_namespace_payload(&root, encoded_shards)?;
         let decoded = Self::decode_canonical_state(&payload)?;
         if decoded.inode_reservation_end != root.inode_reservation_end
             || decoded.inode_allocation_cursor != root.inode_allocation_cursor
@@ -1156,6 +1172,193 @@ impl NamespaceGraphRoot {
     pub fn shards(&self) -> &[NamespaceShardRef] {
         &self.shards
     }
+
+    #[must_use]
+    pub const fn inode_reservation_end(&self) -> u64 {
+        self.inode_reservation_end
+    }
+
+    #[must_use]
+    pub const fn inode_allocation_cursor(&self) -> u64 {
+        self.inode_allocation_cursor
+    }
+
+    #[must_use]
+    pub const fn namespace_mutation_sequence(&self) -> u64 {
+        self.namespace_mutation_sequence
+    }
+
+    /// Reconstructs the bounded graph payload and extracts only the child
+    /// Metadata identities needed by exact Metadata marking.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing, extra, reordered, substituted, corrupt, or
+    /// non-contiguous shard, plus malformed inode records. This intentionally
+    /// does not decode directory, xattr, or POSIX records because they cannot
+    /// contain Metadata Object references.
+    ///
+    /// # Panics
+    ///
+    /// This method never panics.
+    pub fn decode_gc_graph_with_shards(
+        &self,
+        encoded_shards: &BTreeMap<MetadataObjectId, Vec<u8>>,
+    ) -> Result<NamespaceGcGraph, MetadataFormatError> {
+        let payload = reconstruct_namespace_payload(self, encoded_shards)?;
+        let (inode_transitions, manifest_roots) =
+            decode_gc_inode_state(&payload, self.inode_count)?;
+        Ok(NamespaceGcGraph {
+            inode_reservation_end: self.inode_reservation_end,
+            inode_allocation_cursor: self.inode_allocation_cursor,
+            namespace_mutation_sequence: self.namespace_mutation_sequence,
+            namespace_object_ids: self
+                .shards
+                .iter()
+                .map(|reference| reference.object_id)
+                .collect(),
+            inode_transitions,
+            manifest_roots,
+        })
+    }
+}
+
+fn reconstruct_namespace_payload(
+    root: &NamespaceGraphRoot,
+    encoded_shards: &BTreeMap<MetadataObjectId, Vec<u8>>,
+) -> Result<Vec<u8>, MetadataFormatError> {
+    let expected_ids = root
+        .shards
+        .iter()
+        .map(|reference| reference.object_id)
+        .collect::<BTreeSet<_>>();
+    if encoded_shards.keys().copied().collect::<BTreeSet<_>>() != expected_ids {
+        return Err(MetadataFormatError::InvalidPayload);
+    }
+    let expected_length = usize::try_from(root.payload_length)
+        .map_err(|_| MetadataFormatError::ArithmeticOverflow)?;
+    let mut payload = Vec::with_capacity(expected_length);
+    let mut decoded_shards = BTreeMap::new();
+    for reference in root.shards.iter().copied() {
+        let bytes = if let Some(bytes) = decoded_shards.get(&reference.object_id) {
+            *bytes
+        } else {
+            let encoded = encoded_shards
+                .get(&reference.object_id)
+                .ok_or(MetadataFormatError::InvalidPayload)?;
+            let bytes = decode_namespace_shard(encoded, reference)?;
+            decoded_shards.insert(reference.object_id, bytes);
+            bytes
+        };
+        if bytes.len()
+            != usize::try_from(reference.length)
+                .map_err(|_| MetadataFormatError::ArithmeticOverflow)?
+        {
+            return Err(MetadataFormatError::InvalidPayload);
+        }
+        payload.extend_from_slice(bytes);
+    }
+    if payload.len() != expected_length || *blake3::hash(&payload).as_bytes() != root.payload_hash {
+        return Err(MetadataFormatError::InvalidPayload);
+    }
+    Ok(payload)
+}
+
+type NamespaceGcInodeState = (Vec<(u64, u64)>, Vec<MetadataObjectId>);
+
+fn decode_gc_inode_state(
+    payload: &[u8],
+    inode_count: u32,
+) -> Result<NamespaceGcInodeState, MetadataFormatError> {
+    let inode_count =
+        usize::try_from(inode_count).map_err(|_| MetadataFormatError::ArithmeticOverflow)?;
+    if payload.len() < NAMESPACE_ROOT_HEADER_BYTES
+        || &payload[0..8] != NAMESPACE_ROOT_MAGIC
+        || get_u16(payload, 8) != FORMAT_VERSION
+        || usize::from(get_u16(payload, 10)) != NAMESPACE_ROOT_HEADER_BYTES
+        || usize::from(get_u16(payload, 12)) != DURABLE_INODE_BYTES
+        || usize::from(get_u16(payload, 14)) != NAMESPACE_ENTRY_HEADER_BYTES
+        || get_u64(payload, 32) != ROOT_INODE
+        || get_u16(payload, 18) != 0
+        || get_u16(payload, 102) != 0
+        || get_u16(payload, 118) != 0
+        || usize::try_from(get_u64(payload, 64)) != Ok(NAMESPACE_ROOT_HEADER_BYTES)
+        || usize::try_from(get_u64(payload, 80)) != Ok(payload.len())
+    {
+        return Err(MetadataFormatError::InvalidPayload);
+    }
+    if get_u32(payload, 56)
+        != u32::try_from(inode_count).map_err(|_| MetadataFormatError::ArithmeticOverflow)?
+    {
+        return Err(MetadataFormatError::InvalidPayload);
+    }
+    let inode_bytes = inode_count
+        .checked_mul(DURABLE_INODE_BYTES)
+        .ok_or(MetadataFormatError::ArithmeticOverflow)?;
+    let entries_offset = NAMESPACE_ROOT_HEADER_BYTES
+        .checked_add(inode_bytes)
+        .ok_or(MetadataFormatError::ArithmeticOverflow)?;
+    if usize::try_from(get_u64(payload, 72)) != Ok(entries_offset) || entries_offset > payload.len()
+    {
+        return Err(MetadataFormatError::InvalidPayload);
+    }
+    let mut inode_transitions = Vec::with_capacity(inode_count);
+    let mut manifest_roots = Vec::with_capacity(inode_count);
+    let mut previous_inode = 0_u64;
+    for ordinal in 0..inode_count {
+        let start = NAMESPACE_ROOT_HEADER_BYTES
+            .checked_add(
+                ordinal
+                    .checked_mul(DURABLE_INODE_BYTES)
+                    .ok_or(MetadataFormatError::ArithmeticOverflow)?,
+            )
+            .ok_or(MetadataFormatError::ArithmeticOverflow)?;
+        let record = &payload[start..start + DURABLE_INODE_BYTES];
+        let inode = get_u64(record, 0);
+        let mutation_sequence = get_u64(record, 24);
+        let logical_size = get_u64(record, 32);
+        let link_count = get_u32(record, 20);
+        let file_flags = get_u32(record, 72);
+        if inode <= previous_inode || record[76..].iter().any(|byte| *byte != 0) {
+            return Err(MetadataFormatError::InvalidPayload);
+        }
+        validate_file_flags(file_flags)?;
+        previous_inode = inode;
+        inode_transitions.push((inode, mutation_sequence));
+        let mut manifest_root = [0_u8; 32];
+        manifest_root.copy_from_slice(&record[40..72]);
+        match get_u16(record, 10) {
+            1 => {
+                if inode == ROOT_INODE || link_count == 0 || manifest_root == [0; 32] {
+                    return Err(MetadataFormatError::InvalidPayload);
+                }
+                let manifest_root = MetadataObjectId::new(manifest_root)
+                    .ok_or(MetadataFormatError::InvalidPayload)?;
+                manifest_roots.push(manifest_root);
+            }
+            2 => {
+                if inode == ROOT_INODE
+                    || link_count < 2
+                    || manifest_root != [0; 32]
+                    || logical_size != 0
+                {
+                    return Err(MetadataFormatError::InvalidPayload);
+                }
+            }
+            3 => {
+                if inode == ROOT_INODE
+                    || link_count == 0
+                    || logical_size == 0
+                    || file_flags != 0
+                    || manifest_root != [0; 32]
+                {
+                    return Err(MetadataFormatError::InvalidPayload);
+                }
+            }
+            _ => return Err(MetadataFormatError::InvalidPayload),
+        }
+    }
+    Ok((inode_transitions, manifest_roots))
 }
 
 fn encode_namespace_graph(

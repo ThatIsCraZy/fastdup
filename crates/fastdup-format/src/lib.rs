@@ -98,7 +98,7 @@ pub use metadata_mark_catalog::{
 pub use namespace::{
     DurableInode, DurableInodeKind, DurableRootMetadata, DurableTimes, DurableTimestamp,
     DurableXattr, EncodedNamespaceGraph, EncodedNamespaceShard, NAMESPACE_ROOT_HEADER_BYTES,
-    NamespaceEntry, NamespaceGraphRoot, NamespaceRoot, NamespaceShardRef,
+    NamespaceEntry, NamespaceGcGraph, NamespaceGraphRoot, NamespaceRoot, NamespaceShardRef,
 };
 pub use pool_identity::{
     ApplianceId, POOL_IDENTITY_RECORD_BYTES, PoolId, PoolIdentityFormatError, PoolIdentityRecord,

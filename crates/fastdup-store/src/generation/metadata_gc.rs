@@ -1,12 +1,14 @@
 //! Exact Metadata marking, candidate validation, catalog deltas and conservative invalidation.
-use super::graph::record_matches_namespace_root;
+use super::error::map_log_error;
+use super::graph::{record_matches_namespace_gc_graph, verify_generation_transition_pair_gc_graph};
 use super::metadata::parse_metadata_name;
 use super::{
     GenerationError, GenerationMetadataGcSummary, GenerationRepository,
     MAX_METADATA_MARK_DELTA_RUNS, MAX_METADATA_OBJECT_BYTES_U64, MetadataGcCleanState,
-    MetadataGcDeltaJournal, MetadataGcExactReason, MetadataGcMarkMode, MetadataGcMetrics,
+    MetadataGcDeltaJournal, MetadataGcExactReason, MetadataGcMarkMode, MetadataGcMetrics, WalTail,
 };
 use crate::StorageIo;
+use crate::generation_log::GenerationLog;
 use crate::manifest_tree::{ManifestTreeError, scan_manifest_tree};
 use crate::metadata_mark_catalog::{
     audit_named as audit_metadata_mark_catalog,
@@ -16,10 +18,12 @@ use crate::metadata_mark_catalog::{
     parse_generation as parse_metadata_mark_generation, prepare as prepare_metadata_mark_catalog,
     prepare_addition as prepare_metadata_mark_addition,
 };
-use fastdup_format::{CommitRecord, MetadataMarkCatalogRunKind, MetadataObjectId};
+use fastdup_format::{
+    CommitRecord, MetadataMarkCatalogRunKind, MetadataObjectId, NamespaceGcGraph,
+};
 use std::collections::BTreeSet;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 struct MetadataGcInventory {
@@ -157,9 +161,10 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: Metadata GC clean-catalog state poisoned") = None;
         self.check_maintenance()?;
-        let records = self.load_complete_commit_records_unlocked()?;
+        let (records, mut reachable, mut object_graph_read_bytes) =
+            self.load_and_mark_metadata_gc_records()?;
         let commit_binding = metadata_mark_commit_binding(&records);
-        let (reachable, object_graph_read_bytes) = self.mark_metadata_gc_roots(&records)?;
+        self.mark_metadata_gc_pins(&mut reachable, &mut object_graph_read_bytes)?;
         let inventory = self.inventory_metadata_gc(&reachable)?;
         let bytes_removed = self.verify_metadata_gc_candidates(&inventory.candidates)?;
         let catalog_generation = inventory
@@ -563,32 +568,83 @@ impl<I: StorageIo> GenerationRepository<I> {
         Ok(Some(MetadataMarkCatalogInventory { runs, high_water }))
     }
 
-    fn mark_metadata_gc_roots(
+    fn load_and_mark_metadata_gc_records(
         &self,
-        records: &[CommitRecord],
-    ) -> Result<(BTreeSet<MetadataObjectId>, u64), GenerationError> {
+    ) -> Result<(Vec<CommitRecord>, BTreeSet<MetadataObjectId>, u64), GenerationError> {
+        let Some(snapshot) = GenerationLog::new(&self.storage)
+            .load_for_recovery()
+            .map_err(map_log_error)?
+        else {
+            return Ok((Vec::new(), BTreeSet::new(), 0));
+        };
+        if snapshot.tail() != &WalTail::Clean {
+            return Err(GenerationError::WalNeedsRepair(snapshot.tail().clone()));
+        }
+        for record in snapshot.records() {
+            if record.policy_set() != self.supported_policy {
+                return Err(GenerationError::UnsupportedPolicySet {
+                    generation: record.generation(),
+                    policy_set: record.policy_set(),
+                });
+            }
+        }
+        Self::validate_format_epoch_compatibility(snapshot.records())?;
         let mut reachable = BTreeSet::new();
         let mut bytes_read = 0_u64;
-        for record in records {
+        let mut previous: Option<(CommitRecord, Arc<NamespaceGcGraph>)> = None;
+        for record in snapshot.records().iter().copied() {
             self.check_maintenance()?;
             reachable.insert(record.namespace_root());
-            let (root, namespace_objects, namespace_bytes) =
-                self.read_namespace_root_graph(record.namespace_root())?;
-            reachable.extend(namespace_objects);
-            bytes_read = bytes_read
-                .checked_add(namespace_bytes)
-                .ok_or(GenerationError::MetadataTooLarge)?;
-            if !record_matches_namespace_root(*record, &root) {
+            let reused = previous.as_ref().is_some_and(|(previous_record, _)| {
+                previous_record.namespace_root() == record.namespace_root()
+            });
+            let graph = if reused {
+                Arc::clone(&previous.as_ref().expect("ASSERT: reused graph exists").1)
+            } else {
+                let (graph, graph_bytes) =
+                    self.read_namespace_root_gc_graph(record.namespace_root())?;
+                bytes_read = bytes_read
+                    .checked_add(graph_bytes)
+                    .ok_or(GenerationError::MetadataTooLarge)?;
+                Arc::new(graph)
+            };
+            reachable.extend(graph.namespace_object_ids().iter().copied());
+            if !record_matches_namespace_gc_graph(record, &graph) {
                 return Err(GenerationError::PreviousGenerationRecordMismatch);
             }
-            for inode in root.file_inodes() {
+            match &previous {
+                Some((previous_record, previous_graph)) => {
+                    verify_generation_transition_pair_gc_graph(
+                        *previous_record,
+                        previous_graph,
+                        &graph,
+                    )?;
+                }
+                None if record.generation() == 1
+                    && (graph.inode_allocation_cursor() != 2
+                        || !graph.inode_transitions().is_empty()) =>
+                {
+                    return Err(GenerationError::PreviousGenerationRecordMismatch);
+                }
+                None => {}
+            }
+            for manifest_root in graph.manifest_roots() {
                 self.scan_metadata_gc_manifest_root(
-                    inode.manifest_root(),
+                    *manifest_root,
                     &mut reachable,
                     &mut bytes_read,
                 )?;
             }
+            previous = Some((record, graph));
         }
+        Ok((snapshot.records().to_vec(), reachable, bytes_read))
+    }
+
+    fn mark_metadata_gc_pins(
+        &self,
+        reachable: &mut BTreeSet<MetadataObjectId>,
+        bytes_read: &mut u64,
+    ) -> Result<(), GenerationError> {
         let pinned_roots = self
             .metadata_root_pins
             .lock()
@@ -598,7 +654,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .collect::<Vec<_>>();
         for root in pinned_roots {
             if reachable.insert(root) {
-                self.scan_metadata_gc_manifest_root(root, &mut reachable, &mut bytes_read)?;
+                self.scan_metadata_gc_manifest_root(root, reachable, bytes_read)?;
             }
         }
         let recovery_roots = self
@@ -612,21 +668,16 @@ impl<I: StorageIo> GenerationRepository<I> {
             if !reachable.insert(root_id) {
                 continue;
             }
-            let (root, namespace_objects, namespace_bytes) =
-                self.read_namespace_root_graph(root_id)?;
-            reachable.extend(namespace_objects);
-            bytes_read = bytes_read
+            let (graph, namespace_bytes) = self.read_namespace_root_gc_graph(root_id)?;
+            reachable.extend(graph.namespace_object_ids().iter().copied());
+            *bytes_read = bytes_read
                 .checked_add(namespace_bytes)
                 .ok_or(GenerationError::MetadataTooLarge)?;
-            for inode in root.file_inodes() {
-                self.scan_metadata_gc_manifest_root(
-                    inode.manifest_root(),
-                    &mut reachable,
-                    &mut bytes_read,
-                )?;
+            for manifest_root in graph.manifest_roots() {
+                self.scan_metadata_gc_manifest_root(*manifest_root, reachable, bytes_read)?;
             }
         }
-        Ok((reachable, bytes_read))
+        Ok(())
     }
 
     fn scan_metadata_gc_manifest_root(
@@ -635,6 +686,9 @@ impl<I: StorageIo> GenerationRepository<I> {
         reachable: &mut BTreeSet<MetadataObjectId>,
         bytes_read: &mut u64,
     ) -> Result<(), GenerationError> {
+        if reachable.contains(&root) {
+            return Ok(());
+        }
         let traversal_probes = std::cell::Cell::new(0_u64);
         scan_manifest_tree(
             root,

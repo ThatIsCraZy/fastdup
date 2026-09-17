@@ -3,7 +3,8 @@ use super::{GenerationError, GenerationRepository, RequiredChunkVerifier, Verifi
 use crate::StorageIo;
 use crate::manifest_tree::scan_manifest_tree;
 use fastdup_format::{
-    CommitRecord, ManifestExtent, MetadataObjectId, NamespaceGraphRoot, NamespaceRoot,
+    CommitRecord, ManifestExtent, MetadataObjectId, NamespaceGcGraph, NamespaceGraphRoot,
+    NamespaceRoot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -52,6 +53,35 @@ impl<I: StorageIo> GenerationRepository<I> {
         }
         let root = NamespaceRoot::decode_graph(&bytes, &shards)?;
         Ok((root, object_ids, byte_count))
+    }
+
+    pub(super) fn read_namespace_root_gc_graph(
+        &self,
+        object_id: MetadataObjectId,
+    ) -> Result<(NamespaceGcGraph, u64), GenerationError> {
+        let bytes = self.read_metadata(object_id)?;
+        let descriptor = NamespaceGraphRoot::decode(&bytes)?;
+        let mut byte_count =
+            u64::try_from(bytes.len()).map_err(|_| GenerationError::MetadataTooLarge)?;
+        let mut shards = BTreeMap::new();
+        for (ordinal, reference) in descriptor.shards().iter().copied().enumerate() {
+            if ordinal % 256 == 0 {
+                self.check_maintenance()?;
+            }
+            let shard_id = reference.object_id();
+            if let std::collections::btree_map::Entry::Vacant(entry) = shards.entry(shard_id) {
+                let shard = self.read_metadata(shard_id)?;
+                byte_count = byte_count
+                    .checked_add(
+                        u64::try_from(shard.len())
+                            .map_err(|_| GenerationError::MetadataTooLarge)?,
+                    )
+                    .ok_or(GenerationError::MetadataTooLarge)?;
+                entry.insert(shard);
+            }
+        }
+        let graph = descriptor.decode_gc_graph_with_shards(&shards)?;
+        Ok((graph, byte_count))
     }
 
     pub(super) fn verify_manifest_graph(
@@ -244,6 +274,74 @@ pub(super) fn record_matches_namespace_root(record: CommitRecord, root: &Namespa
     root.namespace_mutation_sequence() == record.namespace_mutation_cutoff()
         && root.inode_reservation_end() == record.inode_reservation_end()
         && root.inode_allocation_cursor() == record.inode_allocation_cursor()
+}
+
+pub(super) fn record_matches_namespace_gc_graph(
+    record: CommitRecord,
+    graph: &NamespaceGcGraph,
+) -> bool {
+    graph.namespace_mutation_sequence() == record.namespace_mutation_cutoff()
+        && graph.inode_reservation_end() == record.inode_reservation_end()
+        && graph.inode_allocation_cursor() == record.inode_allocation_cursor()
+}
+
+pub(super) fn verify_generation_transition_pair_gc_graph(
+    previous_record: CommitRecord,
+    previous_graph: &NamespaceGcGraph,
+    proposed_graph: &NamespaceGcGraph,
+) -> Result<(), GenerationError> {
+    if proposed_graph.namespace_mutation_sequence() < previous_record.namespace_mutation_cutoff() {
+        return Err(GenerationError::NonMonotonicNamespaceMutation {
+            previous: previous_record.namespace_mutation_cutoff(),
+            proposed: proposed_graph.namespace_mutation_sequence(),
+        });
+    }
+    if proposed_graph.inode_reservation_end() < previous_record.inode_reservation_end() {
+        return Err(GenerationError::NonMonotonicInodeReservation {
+            previous: previous_record.inode_reservation_end(),
+            proposed: proposed_graph.inode_reservation_end(),
+        });
+    }
+    if proposed_graph.inode_allocation_cursor() < previous_record.inode_allocation_cursor() {
+        return Err(GenerationError::NonMonotonicInodeAllocation {
+            previous: previous_record.inode_allocation_cursor(),
+            proposed: proposed_graph.inode_allocation_cursor(),
+        });
+    }
+    if proposed_graph.inode_allocation_cursor() > previous_record.inode_reservation_end() {
+        return Err(
+            GenerationError::AllocationExceededPreviouslyDurableReservation {
+                previous_reservation_end: previous_record.inode_reservation_end(),
+                proposed_allocation_cursor: proposed_graph.inode_allocation_cursor(),
+            },
+        );
+    }
+    for (inode, mutation_sequence) in proposed_graph.inode_transitions() {
+        match previous_graph
+            .inode_transitions()
+            .binary_search_by_key(inode, |entry| entry.0)
+        {
+            Ok(previous_index) => {
+                let (_, previous_mutation_sequence) =
+                    previous_graph.inode_transitions()[previous_index];
+                if *mutation_sequence < previous_mutation_sequence {
+                    return Err(GenerationError::NonMonotonicInodeMutation {
+                        inode: *inode,
+                        previous: previous_mutation_sequence,
+                        proposed: *mutation_sequence,
+                    });
+                }
+            }
+            Err(_) if *inode < previous_record.inode_allocation_cursor() => {
+                return Err(GenerationError::ReusedInodeId {
+                    inode: *inode,
+                    previous_allocation_cursor: previous_record.inode_allocation_cursor(),
+                });
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn verify_generation_transition_pair(
