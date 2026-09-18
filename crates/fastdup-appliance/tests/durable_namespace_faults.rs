@@ -582,6 +582,7 @@ fn every_mixed_shrink_fault_recovers_the_previous_or_complete_header_and_cut() {
 
 fn check_truncate_faults(rewrite_header: bool) {
     const PREVIOUS_SIZE: u64 = 1_048_576;
+    let _independent = ReadIntentScope::enter(ReadIntent::Independent);
     let truncated_size: u64 = if rewrite_header { 8 } else { 128 };
     let probe_metadata = MemoryStorageIo::new();
     let probe_containers = MemoryStorageIo::new();
@@ -723,6 +724,7 @@ fn check_truncate_faults(rewrite_header: bool) {
 
 #[test]
 fn every_sparse_splice_fault_recovers_the_previous_or_complete_layout() {
+    let _independent = ReadIntentScope::enter(ReadIntent::Independent);
     let probe_metadata = MemoryStorageIo::new();
     let probe_containers = MemoryStorageIo::new();
     let probe = open(probe_metadata.clone(), probe_containers.clone());
@@ -1845,6 +1847,46 @@ fn every_mixed_growth_checkpoint_fault_recovers_one_complete_layout() {
                     "tail_offset={tail_offset} fault={relative} after={after}"
                 );
             }
+        }
+    }
+}
+
+/// Every fault-injection sweep in this file indexes injected failures by the
+/// metadata operation ordinal observed in one probe checkpoint. That mapping is
+/// only meaningful while an identical checkpoint issues an identical metadata
+/// operation sequence, so guard the assumption directly.
+#[test]
+fn repeated_identical_truncate_checkpoints_issue_one_metadata_operation_sequence() {
+    const PREVIOUS_SIZE: u64 = 1_048_576;
+    let _independent = ReadIntentScope::enter(ReadIntent::Independent);
+    let mut reference: Option<Vec<StorageOperation>> = None;
+    for attempt in 0..24 {
+        let metadata = MemoryStorageIo::new();
+        let appliance = open(metadata.clone(), MemoryStorageIo::new());
+        let (inode, handle) = seed_truncate_predecessor(&appliance, PREVIOUS_SIZE);
+        appliance
+            .namespace()
+            .dispatch(
+                CALLER,
+                Operation::SetLength {
+                    inode,
+                    handle: Some(handle),
+                    length: 128,
+                },
+            )
+            .expect("truncate the probe predecessor");
+        let baseline = metadata.operation_count();
+        appliance
+            .checkpoint()
+            .expect("probe checkpoint succeeds")
+            .expect("a dirty probe needs one generation");
+        let operations = metadata.operations()[baseline..].to_vec();
+        match &reference {
+            None => reference = Some(operations),
+            Some(reference) => assert_eq!(
+                *reference, operations,
+                "attempt {attempt} changed the checkpoint metadata operation sequence"
+            ),
         }
     }
 }

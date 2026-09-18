@@ -107,6 +107,44 @@ fn pending_regions_gate_blocks_staging_until_a_release_path_frees_space() {
 }
 
 #[test]
+fn forced_checkpoint_gate_releases_a_saturated_staging_reservation() {
+    let regions = super::PendingRegions::new();
+    regions.reserve_staging_growth(super::INGEST_PENDING_GATE_BYTES_V1);
+    regions.settle_staging(
+        super::INGEST_PENDING_GATE_BYTES_V1,
+        0,
+        super::INGEST_PENDING_GATE_BYTES_V1,
+    );
+    let blocked = {
+        let regions = regions.clone();
+        std::thread::spawn(move || {
+            regions.reserve_staging_growth(4096);
+            regions.settle_staging(4096, 0, 0);
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !blocked.is_finished(),
+        "ASSERT: a transient checkpoint stall must not open the staging gate before the watchdog acts"
+    );
+    regions.force_checkpoint_staging();
+    blocked.join().unwrap();
+    assert_eq!(regions.forced_staging_batches(), 1);
+    assert!(
+        regions
+            .checkpoint_staging_open
+            .load(std::sync::atomic::Ordering::Acquire),
+        "ASSERT: the watchdog release survives until checkpoint absorption clears it"
+    );
+    regions.clear_checkpoint_staging();
+    assert!(
+        !regions
+            .checkpoint_staging_open
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+}
+
+#[test]
 fn drain_residue_absorption_and_drop_release_their_gate_charge() {
     let regions = super::PendingRegions::new();
     regions.reserve_staging_growth(8192);

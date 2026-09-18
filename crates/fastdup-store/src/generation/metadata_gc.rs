@@ -37,6 +37,29 @@ struct MetadataMarkCatalogInventory {
     high_water: u64,
 }
 
+/// Accumulator for one exact Metadata mark.
+///
+/// Traversal dedup uses `scanned_roots` rather than `reachable`. A Manifest
+/// root can enter `reachable` without its subtree, so inferring "already
+/// traversed" from `reachable` alone would silently drop every node below that
+/// root and authorize unlinking live Metadata.
+#[derive(Default)]
+struct MetadataMarkSet {
+    reachable: BTreeSet<MetadataObjectId>,
+    scanned_roots: BTreeSet<MetadataObjectId>,
+    bytes_read: u64,
+}
+
+impl MetadataMarkSet {
+    fn add_bytes(&mut self, bytes: u64) -> Result<(), GenerationError> {
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(bytes)
+            .ok_or(GenerationError::MetadataTooLarge)?;
+        Ok(())
+    }
+}
+
 impl<I: StorageIo> GenerationRepository<I> {
     pub(crate) fn audit_metadata_mark_catalogs(&self) -> Result<u64, GenerationError> {
         let _publication_guard = self
@@ -161,10 +184,14 @@ impl<I: StorageIo> GenerationRepository<I> {
             .lock()
             .expect("ASSERT: Metadata GC clean-catalog state poisoned") = None;
         self.check_maintenance()?;
-        let (records, mut reachable, mut object_graph_read_bytes) =
-            self.load_and_mark_metadata_gc_records()?;
+        let (records, mut mark) = self.load_and_mark_metadata_gc_records()?;
         let commit_binding = metadata_mark_commit_binding(&records);
-        self.mark_metadata_gc_pins(&mut reachable, &mut object_graph_read_bytes)?;
+        self.mark_metadata_gc_pins(&mut mark)?;
+        let MetadataMarkSet {
+            reachable,
+            bytes_read: object_graph_read_bytes,
+            ..
+        } = mark;
         let inventory = self.inventory_metadata_gc(&reachable)?;
         let bytes_removed = self.verify_metadata_gc_candidates(&inventory.candidates)?;
         let catalog_generation = inventory
@@ -570,12 +597,12 @@ impl<I: StorageIo> GenerationRepository<I> {
 
     fn load_and_mark_metadata_gc_records(
         &self,
-    ) -> Result<(Vec<CommitRecord>, BTreeSet<MetadataObjectId>, u64), GenerationError> {
+    ) -> Result<(Vec<CommitRecord>, MetadataMarkSet), GenerationError> {
         let Some(snapshot) = GenerationLog::new(&self.storage)
             .load_for_recovery()
             .map_err(map_log_error)?
         else {
-            return Ok((Vec::new(), BTreeSet::new(), 0));
+            return Ok((Vec::new(), MetadataMarkSet::default()));
         };
         if snapshot.tail() != &WalTail::Clean {
             return Err(GenerationError::WalNeedsRepair(snapshot.tail().clone()));
@@ -589,12 +616,11 @@ impl<I: StorageIo> GenerationRepository<I> {
             }
         }
         Self::validate_format_epoch_compatibility(snapshot.records())?;
-        let mut reachable = BTreeSet::new();
-        let mut bytes_read = 0_u64;
+        let mut mark = MetadataMarkSet::default();
         let mut previous: Option<(CommitRecord, Arc<NamespaceGcGraph>)> = None;
         for record in snapshot.records().iter().copied() {
             self.check_maintenance()?;
-            reachable.insert(record.namespace_root());
+            mark.reachable.insert(record.namespace_root());
             let reused = previous.as_ref().is_some_and(|(previous_record, _)| {
                 previous_record.namespace_root() == record.namespace_root()
             });
@@ -603,12 +629,11 @@ impl<I: StorageIo> GenerationRepository<I> {
             } else {
                 let (graph, graph_bytes) =
                     self.read_namespace_root_gc_graph(record.namespace_root())?;
-                bytes_read = bytes_read
-                    .checked_add(graph_bytes)
-                    .ok_or(GenerationError::MetadataTooLarge)?;
+                mark.add_bytes(graph_bytes)?;
                 Arc::new(graph)
             };
-            reachable.extend(graph.namespace_object_ids().iter().copied());
+            mark.reachable
+                .extend(graph.namespace_object_ids().iter().copied());
             if !record_matches_namespace_gc_graph(record, &graph) {
                 return Err(GenerationError::PreviousGenerationRecordMismatch);
             }
@@ -629,22 +654,14 @@ impl<I: StorageIo> GenerationRepository<I> {
                 None => {}
             }
             for manifest_root in graph.manifest_roots() {
-                self.scan_metadata_gc_manifest_root(
-                    *manifest_root,
-                    &mut reachable,
-                    &mut bytes_read,
-                )?;
+                self.scan_metadata_gc_manifest_root(*manifest_root, &mut mark)?;
             }
             previous = Some((record, graph));
         }
-        Ok((snapshot.records().to_vec(), reachable, bytes_read))
+        Ok((snapshot.records().to_vec(), mark))
     }
 
-    fn mark_metadata_gc_pins(
-        &self,
-        reachable: &mut BTreeSet<MetadataObjectId>,
-        bytes_read: &mut u64,
-    ) -> Result<(), GenerationError> {
+    fn mark_metadata_gc_pins(&self, mark: &mut MetadataMarkSet) -> Result<(), GenerationError> {
         let pinned_roots = self
             .metadata_root_pins
             .lock()
@@ -653,9 +670,7 @@ impl<I: StorageIo> GenerationRepository<I> {
             .copied()
             .collect::<Vec<_>>();
         for root in pinned_roots {
-            if reachable.insert(root) {
-                self.scan_metadata_gc_manifest_root(root, reachable, bytes_read)?;
-            }
+            self.scan_metadata_gc_manifest_root(root, mark)?;
         }
         let recovery_roots = self
             .recovery_checkpoint_root_pins
@@ -665,16 +680,15 @@ impl<I: StorageIo> GenerationRepository<I> {
             .copied()
             .collect::<Vec<_>>();
         for root_id in recovery_roots {
-            if !reachable.insert(root_id) {
+            if !mark.reachable.insert(root_id) {
                 continue;
             }
             let (graph, namespace_bytes) = self.read_namespace_root_gc_graph(root_id)?;
-            reachable.extend(graph.namespace_object_ids().iter().copied());
-            *bytes_read = bytes_read
-                .checked_add(namespace_bytes)
-                .ok_or(GenerationError::MetadataTooLarge)?;
+            mark.reachable
+                .extend(graph.namespace_object_ids().iter().copied());
+            mark.add_bytes(namespace_bytes)?;
             for manifest_root in graph.manifest_roots() {
-                self.scan_metadata_gc_manifest_root(*manifest_root, reachable, bytes_read)?;
+                self.scan_metadata_gc_manifest_root(*manifest_root, mark)?;
             }
         }
         Ok(())
@@ -683,10 +697,9 @@ impl<I: StorageIo> GenerationRepository<I> {
     fn scan_metadata_gc_manifest_root(
         &self,
         root: MetadataObjectId,
-        reachable: &mut BTreeSet<MetadataObjectId>,
-        bytes_read: &mut u64,
+        mark: &mut MetadataMarkSet,
     ) -> Result<(), GenerationError> {
-        if reachable.contains(&root) {
+        if !mark.scanned_roots.insert(root) {
             return Ok(());
         }
         let traversal_probes = std::cell::Cell::new(0_u64);
@@ -697,9 +710,10 @@ impl<I: StorageIo> GenerationRepository<I> {
                 if traversal_probes.get().is_multiple_of(256) {
                     self.check_manifest_maintenance()?;
                 }
-                reachable.insert(node_id);
+                mark.reachable.insert(node_id);
                 let bytes = self.read_manifest_node(node_id)?;
-                *bytes_read = bytes_read
+                mark.bytes_read = mark
+                    .bytes_read
                     .checked_add(
                         u64::try_from(bytes.len())
                             .map_err(|_| ManifestTreeError::ArithmeticOverflow)?,

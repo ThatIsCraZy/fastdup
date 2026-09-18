@@ -871,7 +871,7 @@ fn one_stream_reaches_two_container_durability_barriers_in_parallel() {
         }
     });
 
-    let two_publications_in_flight = paused.wait_until_reached_count(2, Duration::from_secs(5));
+    let two_publications_in_flight = paused.wait_until_reached_count(2, STORAGE_REACH_TIMEOUT);
     paused.resume();
     writer.join().expect("writer thread completes");
     fence_ingest(&appliance, inode, handle);
@@ -1156,11 +1156,11 @@ fn admission_blocks_only_after_the_bounded_ingest_queue_fills() {
     );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"queue-pressure");
-    let block = fixture_block();
     let writer_appliance = Arc::clone(&appliance);
     let (finished_tx, finished_rx) = mpsc::channel();
     let writer = std::thread::spawn(move || {
         for ordinal in 0_u64..128 {
+            let block = distinct_fixture_block(ordinal);
             write_one_mebibyte(&writer_appliance, inode, handle, ordinal, &block);
         }
         finished_tx
@@ -1192,13 +1192,12 @@ fn checkpoint_pause_releases_writers_blocked_by_ingest_backpressure() {
     );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"pause-under-ingest-pressure");
-    let block = fixture_block();
-    let written_block = block.clone();
     let writer_appliance = Arc::clone(&appliance);
     let (finished_tx, finished_rx) = mpsc::channel();
     let writer = std::thread::spawn(move || {
         let mut completed = 0_u64;
         for ordinal in 0_u64..128 {
+            let written_block = distinct_fixture_block(ordinal);
             let result = writer_appliance.namespace().dispatch(
                 CALLER,
                 Operation::Write {
@@ -1261,7 +1260,7 @@ fn checkpoint_pause_releases_writers_blocked_by_ingest_backpressure() {
     else {
         panic!("read returned the wrong reply");
     };
-    assert_eq!(suffix, &block[..4_096]);
+    assert_eq!(suffix, &distinct_fixture_block(completed - 1)[..4_096]);
 
     paused.resume();
     appliance.namespace().resume_mutation_admission();
@@ -1277,11 +1276,11 @@ fn status_does_not_deadlock_a_full_single_stream_publication_queue() {
     );
     let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
     let (inode, handle) = create_file(&appliance, b"status-under-queue-pressure");
-    let block = fixture_block();
     let writer_appliance = Arc::clone(&appliance);
     let (finished_tx, finished_rx) = mpsc::channel();
     let writer = std::thread::spawn(move || {
         for ordinal in 0_u64..128 {
+            let block = distinct_fixture_block(ordinal);
             write_one_mebibyte(&writer_appliance, inode, handle, ordinal, &block);
         }
         finished_tx
@@ -1397,6 +1396,24 @@ where
         panic!("create returned the wrong reply");
     };
     (entry.attr.inode, handle)
+}
+
+/// One mebibyte whose content is unique per `ordinal`.
+///
+/// The bounded-queue fixtures need real publication pressure. Repeating one
+/// block instead lets Exact Dedup answer every later write from the first
+/// block's chunks, so no new Container work reaches the paused durability
+/// barrier and the intended backpressure never appears.
+fn distinct_fixture_block(ordinal: u64) -> Vec<u8> {
+    let mut state = (0x8f31_a7c5_19d2_4e6b_u64 ^ ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15)) | 1;
+    (0..1_048_576)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
 }
 
 fn fixture_block() -> Vec<u8> {
@@ -2364,8 +2381,8 @@ fn partial_commit_drain_allows_same_inode_progress_and_recovers_only_the_cut() {
         }
         sender.send(()).unwrap();
     });
-    let progressed = receiver.recv_timeout(Duration::from_secs(5)).is_ok();
-    let second_publication = paused.wait_until_reached_count(2, Duration::from_secs(5));
+    let progressed = receiver.recv_timeout(STORAGE_REACH_TIMEOUT).is_ok();
+    let second_publication = paused.wait_until_reached_count(2, STORAGE_REACH_TIMEOUT);
     paused.resume();
     writer.join().unwrap();
     let committed = checkpoint.join().unwrap();

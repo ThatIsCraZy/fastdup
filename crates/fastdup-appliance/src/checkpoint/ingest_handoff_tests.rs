@@ -1,6 +1,8 @@
 //! Exercise the real queued writer while pausing its post-staging handoff.
 use super::*;
-use fastdup_posix::{HandleId, OpenOptions, Operation, ROOT_INODE, Reply, RequestContext};
+use fastdup_posix::{
+    AdmissionPauseReason, HandleId, OpenOptions, Operation, ROOT_INODE, Reply, RequestContext,
+};
 use fastdup_testkit::MemoryStorageIo;
 use std::sync::mpsc;
 
@@ -11,6 +13,19 @@ const CALLER: RequestContext = RequestContext {
     pid: 7,
 };
 type Appliance = DurableNamespace<MemoryStorageIo, MemoryStorageIo>;
+
+fn open_appliance() -> Arc<Appliance> {
+    Arc::new(
+        DurableNamespace::open_with_index(
+            NamespaceConfig::default(),
+            GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set()),
+            ContainerRepository::new(MemoryStorageIo::new()),
+            &ExactIndexRunRepository::new(MemoryStorageIo::new()),
+            32,
+        )
+        .unwrap(),
+    )
+}
 
 fn create(appliance: &Appliance, name: &[u8]) -> (InodeId, HandleId) {
     let Reply::Created { entry, handle } = appliance
@@ -201,4 +216,168 @@ fn frozen_cut_keeps_exact_recipes_before_post_cut_job_retirement() {
 #[test]
 fn frozen_cut_keeps_fill_recipes_before_post_cut_job_retirement() {
     check_handoff(true);
+}
+
+#[test]
+fn transient_checkpoint_pause_releases_a_saturated_staging_gate() {
+    let appliance = open_appliance();
+    let gate_bytes = appliance.write_through.saturate_pending_gate_for_tests();
+    let (inode, handle) = create(&appliance, b"staging");
+    write(&appliance, inode, handle, 0, &[91; MIB]);
+
+    let worker = Arc::clone(&appliance);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let checkpoint = std::thread::spawn(move || {
+        let _ = result_tx.send(worker.checkpoint_profiled());
+    });
+    while !appliance.checkpoint_lock_is_held() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !appliance.checkpoint_staging_gate_open(),
+        "a normal checkpoint must not bypass the staging gate"
+    );
+    let stuck_deadline = std::time::Instant::now() + Duration::from_millis(250);
+    while std::time::Instant::now() < stuck_deadline {
+        assert!(
+            result_rx.try_recv().is_err(),
+            "the Frozen cut must remain blocked while the staging gate is saturated"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    appliance
+        .namespace()
+        .pause_mutation_admission_for(AdmissionPauseReason::CheckpointTimeout);
+    assert!(appliance.force_checkpoint_staging_gate_for_transient_pause());
+    assert!(appliance.checkpoint_staging_gate_open());
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the forced staging gate must release the Frozen cut");
+    checkpoint.join().unwrap();
+    let metrics = result
+        .expect("forced staging must preserve checkpoint integrity")
+        .expect("a dirty checkpoint must commit")
+        .metrics();
+    assert!(
+        metrics.checkpoint_rechunk_bytes() <= u64::try_from(MIB).unwrap(),
+        "forced staging lost stable bytes: {} bytes",
+        metrics.checkpoint_rechunk_bytes()
+    );
+    assert_eq!(
+        appliance.forced_staging_batches(),
+        1,
+        "exactly one saturated staging batch may bypass the gate"
+    );
+    assert!(
+        !appliance.checkpoint_staging_gate_open(),
+        "a successful commit must clear the forced staging gate"
+    );
+    assert_file(appliance.namespace(), inode, &[91; MIB]);
+    appliance
+        .write_through
+        .release_pending_gate_for_tests(gate_bytes);
+    drop(appliance);
+}
+
+#[test]
+fn checkpoint_staging_force_policy_only_opens_for_transient_pauses() {
+    let appliance = open_appliance();
+    for reason in [
+        AdmissionPauseReason::CheckpointTimeout,
+        AdmissionPauseReason::DirtyPressure,
+        AdmissionPauseReason::DurabilityLag,
+        AdmissionPauseReason::ProgressFailure,
+    ] {
+        appliance.namespace().pause_mutation_admission_for(reason);
+        assert!(
+            appliance.force_checkpoint_staging_gate_for_transient_pause(),
+            "{reason:?} must permit one bounded staging batch"
+        );
+        assert!(appliance.checkpoint_staging_gate_open());
+        appliance.clear_checkpoint_staging_gate();
+    }
+
+    for reason in [
+        AdmissionPauseReason::Unspecified,
+        AdmissionPauseReason::IntegrityFailure,
+        AdmissionPauseReason::Shutdown,
+    ] {
+        appliance.namespace().pause_mutation_admission_for(reason);
+        assert!(
+            !appliance.force_checkpoint_staging_gate_for_transient_pause(),
+            "{reason:?} must not bypass the staging gate"
+        );
+        assert!(!appliance.checkpoint_staging_gate_open());
+    }
+}
+
+/// The staging escape hatch is scoped to one generation, so a supervisor that
+/// keeps checkpointing while admission stays closed has to re-apply the force
+/// policy for every attempt. A catch-up checkpoint that inherits the cleared
+/// gate freezes its commit cut and then waits in the Ingest Queue for a batch
+/// that only that same cut could release.
+#[test]
+fn a_committed_generation_closes_the_staging_gate_for_the_next_checkpoint() {
+    let appliance = open_appliance();
+    let gate_bytes = appliance.write_through.saturate_pending_gate_for_tests();
+    let first_block = vec![91_u8; MIB].into_boxed_slice();
+    let second_block = vec![92_u8; MIB].into_boxed_slice();
+    let (first, first_handle) = create(&appliance, b"catch-up-first");
+    write(&appliance, first, first_handle, 0, &first_block);
+    appliance
+        .namespace()
+        .pause_mutation_admission_for(AdmissionPauseReason::CheckpointTimeout);
+    assert!(appliance.force_checkpoint_staging_gate_for_transient_pause());
+    appliance
+        .checkpoint_profiled()
+        .expect("forced staging must preserve checkpoint integrity")
+        .expect("a dirty checkpoint must commit");
+    assert!(
+        !appliance.checkpoint_staging_gate_open(),
+        "a committed generation must clear the forced staging gate"
+    );
+
+    // Distinct content: repeating the first block would let Exact Dedup answer
+    // the write without new staging pressure, so the gate would never engage.
+    appliance.namespace().resume_mutation_admission();
+    let (second, second_handle) = create(&appliance, b"catch-up-second");
+    write(&appliance, second, second_handle, 0, &second_block);
+    appliance
+        .namespace()
+        .pause_mutation_admission_for(AdmissionPauseReason::CheckpointTimeout);
+
+    let worker = Arc::clone(&appliance);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let catch_up = std::thread::spawn(move || {
+        let _ = result_tx.send(worker.checkpoint_profiled());
+    });
+    let stuck_deadline = std::time::Instant::now() + Duration::from_millis(250);
+    while std::time::Instant::now() < stuck_deadline {
+        assert!(
+            result_rx.try_recv().is_err(),
+            "the catch-up cut must remain blocked until the gate is forced again"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(appliance.force_checkpoint_staging_gate_for_transient_pause());
+    result_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("re-forcing the staging gate must release the catch-up cut")
+        .expect("forced staging must preserve checkpoint integrity")
+        .expect("a dirty catch-up checkpoint must commit");
+    catch_up.join().unwrap();
+    assert_eq!(
+        appliance.forced_staging_batches(),
+        2,
+        "each generation may admit exactly one saturated staging batch"
+    );
+    assert_file(appliance.namespace(), first, &first_block);
+    assert_file(appliance.namespace(), second, &second_block);
+    appliance
+        .write_through
+        .release_pending_gate_for_tests(gate_bytes);
+    drop(appliance);
 }

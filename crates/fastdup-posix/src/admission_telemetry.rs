@@ -2,7 +2,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionPauseReason {
     Unspecified,
     CheckpointTimeout,

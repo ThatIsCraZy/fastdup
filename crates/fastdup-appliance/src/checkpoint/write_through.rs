@@ -865,16 +865,19 @@ impl PendingWriteThrough {
 /// Shared memory gate for the Ingest Lane payload plus commit-cut Drain
 /// Residues that have not yet been absorbed into the commit Writer.
 ///
-/// Staging admission blocks here; the commit-cut drain never blocks (the drain
-/// is a Lane-to-Residue transfer of already-resident bytes), and absorption by
-/// checkpoint planning is the only path that frees the gate outside a queue
-/// handoff. A blocked staging worker therefore always has an independent
-/// release path through the active checkpoint.
+/// Normal staging admission blocks while the Lane/Residue gate is full and waits
+/// for a queue handoff, Lane reset, or checkpoint absorption. The checkpoint
+/// watchdog can open a one-generation escape hatch when admission is already
+/// closed: only bytes already accounted in the Ingest Queue may then move into
+/// the pending region, so total write-through buffering remains bounded even if
+/// a frozen commit-cut wait and a full staging gate otherwise form a cycle.
 #[derive(Clone, Debug)]
 pub(super) struct PendingRegions {
     lane_region_bytes: Arc<AtomicUsize>,
     residue_bytes: Arc<AtomicUsize>,
     space_available: Arc<(Mutex<()>, Condvar)>,
+    checkpoint_staging_open: Arc<AtomicBool>,
+    forced_staging_batches: Arc<AtomicU64>,
 }
 
 impl PendingRegions {
@@ -883,6 +886,8 @@ impl PendingRegions {
             lane_region_bytes: Arc::new(AtomicUsize::new(0)),
             residue_bytes: Arc::new(AtomicUsize::new(0)),
             space_available: Arc::new((Mutex::new(()), Condvar::new())),
+            checkpoint_staging_open: Arc::new(AtomicBool::new(false)),
+            forced_staging_batches: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -913,12 +918,33 @@ impl PendingRegions {
             {
                 break;
             }
+            if self.checkpoint_staging_open.load(Ordering::Acquire) {
+                atomic_saturating_add(&self.forced_staging_batches, 1);
+                break;
+            }
             guard = available
                 .wait(guard)
                 .expect("ASSERT: write-through pending-region lock poisoned while waiting");
         }
         drop(guard);
         self.lane_region_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn force_checkpoint_staging(&self) {
+        self.checkpoint_staging_open.store(true, Ordering::Release);
+        self.space_available.1.notify_all();
+    }
+
+    fn clear_checkpoint_staging(&self) {
+        self.checkpoint_staging_open.store(false, Ordering::Release);
+    }
+
+    fn checkpoint_staging_open(&self) -> bool {
+        self.checkpoint_staging_open.load(Ordering::Acquire)
+    }
+
+    fn forced_staging_batches(&self) -> u64 {
+        self.forced_staging_batches.load(Ordering::Relaxed)
     }
 
     /// Converts a staging reservation into the Lane's actual retained growth,
@@ -2720,6 +2746,34 @@ where
             advanced_reduction: self.index.advanced_reduction_status(),
             degraded: snapshot.degraded,
         }
+    }
+
+    pub(super) fn force_checkpoint_staging_gate(&self) {
+        self.pending_regions.force_checkpoint_staging();
+    }
+
+    pub(super) fn clear_checkpoint_staging_gate(&self) {
+        self.pending_regions.clear_checkpoint_staging();
+    }
+
+    pub(super) fn checkpoint_staging_gate_open(&self) -> bool {
+        self.pending_regions.checkpoint_staging_open()
+    }
+
+    pub(super) fn forced_staging_batches(&self) -> u64 {
+        self.pending_regions.forced_staging_batches()
+    }
+
+    #[cfg(test)]
+    pub(super) fn saturate_pending_gate_for_tests(&self) -> usize {
+        self.pending_regions
+            .reserve_staging_growth(INGEST_PENDING_GATE_BYTES_V1);
+        INGEST_PENDING_GATE_BYTES_V1
+    }
+
+    #[cfg(test)]
+    pub(super) fn release_pending_gate_for_tests(&self, bytes: usize) {
+        self.pending_regions.release_lane_bytes(bytes);
     }
 
     pub(super) fn capture_cut(&self) -> usize {

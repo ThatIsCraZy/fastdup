@@ -11,7 +11,7 @@ use fastdup_store::{
     GcCandidateCatalogRepository, GcCandidateSelectionMode, GenerationRepository, MaintenanceError,
     MaintenanceExecutionMode, MaintenancePriority, MaintenanceRepository, MetadataGcExactReason,
     MetadataGcMarkMode, OnlineGcCycleOutcome, OnlineGcRunMode, RecoveryCheckpointRepository,
-    SimilarityIndexRepository, StorageIo, StoreError,
+    SimilarityIndexRepository, StorageIo, StoreError, SuccessorPredecessor,
 };
 use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
 use std::time::Duration;
@@ -4721,4 +4721,60 @@ fn republish_after_exact_gc(metadata: MemoryStorageIo, gc_fails: bool) -> usize 
         committed.record()
     );
     sync_position
+}
+
+/// A Metadata root pin protects the whole Manifest tree, not just its root
+/// object. Marking only the root leaves every inner node and leaf below it
+/// outside the reachability set, so the next exact mark unlinks live Metadata.
+#[test]
+fn metadata_gc_retains_every_node_below_a_pinned_multi_level_manifest_root() {
+    let (generations, containers, indexes, profile) = seeded_repositories();
+    let empty = NamespaceRoot::new(1_024, 3, 2, Vec::new(), Vec::new())
+        .expect("empty successor Namespace is valid");
+    let head = generations
+        .commit_namespace_with_data(&empty, &containers)
+        .expect("drop the fixture file from the committed graph");
+
+    let window = 64 * 1_024 * 1_024_u64;
+    let layout = ManifestLeaf::new(
+        window * 3,
+        vec![
+            ManifestExtent::Fill {
+                logical_length: window,
+                value: 0x5a,
+            },
+            ManifestExtent::Fill {
+                logical_length: window,
+                value: 0x5b,
+            },
+            ManifestExtent::Fill {
+                logical_length: window,
+                value: 0x5c,
+            },
+        ],
+    )
+    .expect("three bounded leaf windows are a valid layout");
+    let proof = generations
+        .publish_manifest_successor(SuccessorPredecessor::from_committed_record(head), &layout)
+        .expect("publish an uncommitted multi-level Manifest tree");
+    let pinned_root = proof.summary().root();
+    assert_eq!(
+        generations
+            .read_manifest(pinned_root)
+            .expect("the freshly published tree reads back")
+            .extents()
+            .len(),
+        3,
+        "fixture must publish a Manifest tree with more than one node"
+    );
+
+    let maintenance = MaintenanceRepository::new(generations.clone(), containers, indexes, profile);
+    maintenance
+        .garbage_collect_metadata()
+        .expect("collect Metadata while the successor root pin is live");
+
+    generations
+        .read_manifest(pinned_root)
+        .expect("Metadata GC must retain every node below a live pinned Manifest root");
+    drop(proof);
 }

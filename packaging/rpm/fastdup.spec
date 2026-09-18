@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.7.4
-Release: 57%{?dist}
+Release: 61%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -110,6 +110,26 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-61
+- Rebuild the repository runtime, checkpoint staging watchdog, and regression
+  tests from the current working tree.
+
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-60
+- Keep the checkpoint staging escape hatch policy centralized and cover the
+  frozen-cut staging deadlock, including its transient-pause restrictions,
+  with executable regression tests.
+
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-59
+- Break the checkpoint staging deadlock in which a full pending-region gate
+  blocked frozen commit-cut Ingest while drain absorption waited on that same
+  gate; transient admission closure now opens a bounded one-generation escape
+  hatch and clears it after successful commit or an empty checkpoint.
+
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-58
+- Decode exact Metadata-GC namespace graphs through a lightweight inode-transition
+  and Manifest-root view, reducing a 100k-file exact mark from 1469 ms to 132 ms.
+- Reuse one consecutive Namespace graph across exact metadata marks.
+
 * Thu Sep 17 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-57
 - Add an online-GC run-now action to the Control Plane UI and agent command
   surface, with machine-readable runtime gate responses and an online repository

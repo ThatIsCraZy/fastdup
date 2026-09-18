@@ -2208,6 +2208,58 @@ where
         self.write_through.status()
     }
 
+    /// Opens the checkpoint staging escape hatch for currently queued writes.
+    ///
+    /// Callers may use this only after mutation admission is closed for a
+    /// transient checkpoint condition. Already queued Ingest bytes are part of
+    /// the write-through queue budget and may then move into the pending Lane
+    /// region, preventing a frozen commit cut from waiting on staging bytes that
+    /// only that same commit can release.
+    pub fn force_checkpoint_staging_gate(&self) {
+        self.write_through.force_checkpoint_staging_gate();
+    }
+
+    /// Clears the staging escape hatch after checkpoint absorption or another
+    /// normal release path has had an opportunity to restore the gate.
+    pub fn clear_checkpoint_staging_gate(&self) {
+        self.write_through.clear_checkpoint_staging_gate();
+    }
+
+    /// Opens the staging gate only for a transient checkpoint admission pause.
+    ///
+    /// This policy keeps `IntegrityFailure` and Shutdown from bypassing normal
+    /// memory admission while allowing a checkpoint retry to drain Ingest bytes
+    /// that were already queued before the transient pause closed admission.
+    pub fn force_checkpoint_staging_gate_for_transient_pause(&self) -> bool {
+        let reason = self.namespace.admission_status().reason;
+        let transient = matches!(
+            reason,
+            Some(
+                fastdup_posix::AdmissionPauseReason::CheckpointTimeout
+                    | fastdup_posix::AdmissionPauseReason::DirtyPressure
+                    | fastdup_posix::AdmissionPauseReason::DurabilityLag
+                    | fastdup_posix::AdmissionPauseReason::ProgressFailure
+            )
+        );
+        if !transient {
+            return false;
+        }
+        self.write_through.force_checkpoint_staging_gate();
+        true
+    }
+
+    /// Reports whether the one-generation staging escape hatch is currently open.
+    #[must_use]
+    pub fn checkpoint_staging_gate_open(&self) -> bool {
+        self.write_through.checkpoint_staging_gate_open()
+    }
+
+    /// Cumulative staging batches admitted through the checkpoint escape hatch.
+    #[must_use]
+    pub fn forced_staging_batches(&self) -> u64 {
+        self.write_through.forced_staging_batches()
+    }
+
     /// Starts a bounded, payload-free trace of real online proof-cache events.
     ///
     /// Trace capture is benchmark instrumentation. It never changes cache
@@ -2311,6 +2363,7 @@ where
                 // committed history. Demote it so idle GC is not pinned forever;
                 // concurrent post-cut work retains its separate Active owner.
                 self.write_through.complete_cut(sealed_at_cut);
+                self.write_through.clear_checkpoint_staging_gate();
                 if newly_frozen_proofs {
                     self.online_dependency_proofs.complete_frozen();
                 }
@@ -2388,6 +2441,7 @@ where
         let metadata_started = timings.begin(CheckpointStage::MetadataCommit);
         let record = self.publish_generation(&commit, manifests, &retained_ranges)?;
         self.write_through.complete_cut(sealed_at_cut);
+        self.write_through.clear_checkpoint_staging_gate();
         self.online_dependency_proofs.complete_frozen();
         metadata_started.finish_into(&mut metrics.metadata_commit);
         total_started.finish_into(&mut metrics.total);

@@ -1516,6 +1516,19 @@ impl Drop for CheckpointContentionGuard {
     }
 }
 
+fn force_transient_checkpoint_staging_gate(appliance: &FsAppliance) -> bool {
+    let reason = appliance.namespace().admission_status().reason;
+    let forced = appliance.force_checkpoint_staging_gate_for_transient_pause();
+    if forced {
+        eprintln!(
+            "write_through_staging_gate_forced=true reason={} forced_staging_batches={}",
+            reason.map_or("none", |reason| reason.name()),
+            appliance.forced_staging_batches()
+        );
+    }
+    forced
+}
+
 async fn checkpoint_cycle(
     appliance: Arc<FsAppliance>,
     gc_cancellation: MaintenanceCancellation,
@@ -1523,6 +1536,7 @@ async fn checkpoint_cycle(
     let already_paused = !appliance.namespace().mutation_admission_open();
     if already_paused {
         gc_cancellation.cancel_contention();
+        force_transient_checkpoint_staging_gate(&appliance);
     }
     let _contention_guard = CheckpointContentionGuard(gc_cancellation.clone());
     let worker_appliance = Arc::clone(&appliance);
@@ -1541,6 +1555,7 @@ async fn checkpoint_cycle(
                     eprintln!(
                         "CRITICAL: checkpoint exceeded five seconds; mutation admission is closed; online GC contention is cancelled"
                     );
+                    force_transient_checkpoint_staging_gate(&appliance);
                 }
                 await_worker(worker).await?
             }
@@ -1549,6 +1564,7 @@ async fn checkpoint_cycle(
                 .wait_for_checkpointable_dirty_payload(CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1) => {
                 appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::DirtyPressure);
                 emit_checkpoint_pressure(&appliance, dirty_bytes, true);
+                force_transient_checkpoint_staging_gate(&appliance);
                 await_worker(worker).await?
             }
         }
@@ -1565,8 +1581,15 @@ async fn checkpoint_cycle(
     Ok(())
 }
 
+/// Drains the remaining durable backlog while mutation admission stays closed.
+///
+/// Every committed generation clears the staging escape hatch, so the policy has
+/// to be re-applied before each attempt. Otherwise a catch-up checkpoint freezes
+/// its commit cut and then waits in the Ingest Queue for a batch that is itself
+/// blocked on the closed pending-region gate, which only that same cut releases.
 async fn catch_up(appliance: Arc<FsAppliance>) -> Result<(), String> {
     loop {
+        force_transient_checkpoint_staging_gate(&appliance);
         let worker_appliance = Arc::clone(&appliance);
         let worker = tokio::task::spawn_blocking(move || worker_appliance.checkpoint_profiled());
         match await_worker(worker).await? {
