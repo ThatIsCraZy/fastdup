@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.7.4
-Release: 61%{?dist}
+Release: 63%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -110,6 +110,14 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-63
+- Share verified Container images across readers, reuse freshly sealed envelope
+  views, and keep maintenance scans from consuming resident Container images.
+
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-62
+- Reapply the transient checkpoint staging escape hatch before every catch-up
+  attempt and preserve metadata GC reachability.
+
 * Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-61
 - Rebuild the repository runtime, checkpoint staging watchdog, and regression
   tests from the current working tree.

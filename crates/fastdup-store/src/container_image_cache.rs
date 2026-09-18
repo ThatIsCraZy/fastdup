@@ -17,15 +17,22 @@ impl ContainerImageCache {
         }
     }
 
-    #[cfg(test)]
-    fn limited(target: u64) -> Self {
+    /// Builds a pool that is not governed by host memory pressure.
+    ///
+    /// Residency then depends only on this bound, which is what a test or an
+    /// externally governed runtime needs to reason about reuse.
+    pub(crate) fn isolated(target: u64) -> Self {
         Self {
             cache: ReadCacheNamespace::isolated(ReadCacheClass::ContainerImage, target),
         }
     }
 
-    /// Returns resident bytes only for Demand reads. Scan and Independent
-    /// reads must observe current durable bytes without consuming this cache.
+    /// Returns resident bytes only for Demand reads.
+    ///
+    /// Scan and Independent reads must observe current durable bytes: the
+    /// maintenance proof pass transplants Records out of the image it reads and
+    /// then retires the victim, so serving it a cached image would let Container
+    /// garbage collection act on bytes it never reread from the data tier.
     pub(crate) fn get(&self, container_id: ContainerId) -> Option<Arc<Vec<u8>>> {
         if ReadIntentScope::current() != ReadIntent::Demand {
             return None;
@@ -70,7 +77,7 @@ mod tests {
 
     #[test]
     fn validated_images_admit_get_and_forget() {
-        let cache = ContainerImageCache::limited(1024 * 1024);
+        let cache = ContainerImageCache::isolated(1024 * 1024);
         let id = container_id(7);
         assert!(cache.get(id).is_none());
         cache.admit_validated(id, b"container image".to_vec());
@@ -82,10 +89,34 @@ mod tests {
 
     #[test]
     fn scan_intent_does_not_admit_images() {
-        let cache = ContainerImageCache::limited(1024 * 1024);
+        let cache = ContainerImageCache::isolated(1024 * 1024);
         let id = container_id(8);
         let _scope = ReadIntentScope::enter(ReadIntent::Scan);
         cache.admit_validated(id, b"scan image".to_vec());
         assert!(cache.get(id).is_none());
+    }
+
+    /// Maintenance proves a victim Container and then retires it. Serving that
+    /// pass a resident image would let it act on bytes it never reread from the
+    /// data tier, so only Demand reads may consume this pool.
+    #[test]
+    fn only_demand_reads_consume_a_resident_image() {
+        let cache = ContainerImageCache::isolated(1024 * 1024);
+        let id = container_id(9);
+        cache.admit_validated(id, b"demand image".to_vec());
+        assert_eq!(
+            cache
+                .get(id)
+                .expect("a Demand read reuses the resident image")
+                .as_slice(),
+            b"demand image"
+        );
+        for intent in [ReadIntent::Scan, ReadIntent::Independent] {
+            let _scope = ReadIntentScope::enter(intent);
+            assert!(
+                cache.get(id).is_none(),
+                "{intent:?} must observe current durable bytes"
+            );
+        }
     }
 }

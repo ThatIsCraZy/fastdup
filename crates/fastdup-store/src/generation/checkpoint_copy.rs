@@ -176,7 +176,10 @@ impl<I: StorageIo> GenerationRepository<I> {
     where
         F: FnMut(
             MetadataObjectId,
-        ) -> Result<Vec<u8>, crate::recovery_checkpoint::RecoveryCheckpointError>,
+        ) -> Result<
+            std::sync::Arc<Vec<u8>>,
+            crate::recovery_checkpoint::RecoveryCheckpointError,
+        >,
     {
         let _independent = crate::metadata_object_cache::IndependentRead::enter();
         let _publication_guard = self

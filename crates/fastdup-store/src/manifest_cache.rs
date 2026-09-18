@@ -22,7 +22,7 @@ impl ManifestNodeCache {
         read: F,
     ) -> Result<Arc<DecodedManifestNode>, ManifestTreeError>
     where
-        F: FnOnce() -> Result<Vec<u8>, ManifestTreeError>,
+        F: FnOnce() -> Result<Arc<Vec<u8>>, ManifestTreeError>,
     {
         let key = ReadCacheKey {
             identity: id.bytes(),
@@ -92,7 +92,7 @@ mod tests {
         let mut load = |id| {
             cache.read(id, || {
                 reads.fetch_add(1, Ordering::Relaxed);
-                Ok(objects[&id].clone())
+                Ok(Arc::new(objects[&id].clone()))
             })
         };
         let first = read_manifest_tree_range_decoded(root, size, 65536, 4 * 1024 * 1024, &mut load)
@@ -130,7 +130,7 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 1;
         assert!(
-            cache.read(root, || Ok(corrupt)).is_err(),
+            cache.read(root, || Ok(Arc::new(corrupt))).is_err(),
             "evicted nodes must be independently verified again"
         );
         let isolated = ManifestNodeCache::limited(8 * 1024 * 1024);
@@ -148,7 +148,9 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     for _ in 0..50 {
-                        cache.read(root, || Ok(objects[&root].clone())).unwrap();
+                        cache
+                            .read(root, || Ok(Arc::new(objects[&root].clone())))
+                            .unwrap();
                     }
                 });
             }
@@ -171,7 +173,7 @@ mod tests {
                     read_manifest_tree_range_decoded(root, size, offset, 4 * 1024 * 1024, |id| {
                         cache.read(id, || {
                             reads.fetch_add(1, Ordering::Relaxed);
-                            Ok(objects[&id].clone())
+                            Ok(Arc::new(objects[&id].clone()))
                         })
                     })
                     .unwrap();

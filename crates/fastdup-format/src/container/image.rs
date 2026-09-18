@@ -15,6 +15,7 @@ use super::{
     VerifiedChunkLocation, VerifiedRawLocation, ZSTD_CODEC, ZSTD_PREFIX_CODEC, get_u16, get_u32,
 };
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedContainer {
@@ -38,7 +39,7 @@ pub struct SealedContainer {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedContainerImage {
     container: SealedContainer,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
 }
 
 /// Payload-free Location evidence produced by the Container writer or a full
@@ -736,7 +737,10 @@ impl VerifiedContainerImage {
     /// [`SealedContainer::decode`].
     pub fn decode(bytes: Vec<u8>) -> Result<Self, FormatError> {
         let container = SealedContainer::decode(&bytes)?;
-        Ok(Self { container, bytes })
+        Ok(Self {
+            container,
+            bytes: Arc::new(bytes),
+        })
     }
 
     /// Owns an image after complete verification with Depth-1 dependent Base
@@ -748,6 +752,22 @@ impl VerifiedContainerImage {
     /// [`SealedContainer::decode_with_dependent_resolver`].
     pub fn decode_with_dependent_resolver(
         bytes: Vec<u8>,
+        resolve: &mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>,
+    ) -> Result<Self, FormatError> {
+        Self::decode_shared_with_dependent_resolver(Arc::new(bytes), resolve)
+    }
+
+    /// Owns an image whose backing is already shared with a reader cache.
+    ///
+    /// Verification is identical to [`Self::decode_with_dependent_resolver`];
+    /// only the ownership of the incoming bytes differs, which lets a resident
+    /// image be verified without copying it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same envelope, layout, and dependent-resolution failures.
+    pub fn decode_shared_with_dependent_resolver(
+        bytes: Arc<Vec<u8>>,
         resolve: &mut dyn FnMut(ZstdPrefixDependency) -> Result<Vec<u8>, FormatError>,
     ) -> Result<Self, FormatError> {
         let container = SealedContainer::decode_with_dependent_resolver(&bytes, resolve)?;

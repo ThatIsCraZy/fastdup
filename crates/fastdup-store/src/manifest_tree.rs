@@ -172,7 +172,7 @@ pub(crate) fn rewrite_manifest_tree_range<F>(
     mut read: F,
 ) -> Result<EncodedManifestTree, ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     if replaced.start > replaced.end || replaced.end > expected_logical_size {
         return Err(ManifestTreeError::InvalidReplacement);
@@ -226,7 +226,7 @@ pub(crate) fn rewrite_manifest_tree_range_successor<F>(
     mut read: F,
 ) -> Result<(EncodedManifestTree, ManifestTreeSummary), ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     if replaced.start > replaced.end || replaced.end > previous.logical_size() {
         return Err(ManifestTreeError::InvalidReplacement);
@@ -291,7 +291,7 @@ pub(crate) fn append_manifest_tree<F>(
     mut read: F,
 ) -> Result<(EncodedManifestTree, ManifestTreeSummary), ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     let appended_length = appended.iter().try_fold(0_u64, |total, extent| {
         total
@@ -360,7 +360,7 @@ pub(crate) fn truncate_manifest_tree<F>(
     mut read: F,
 ) -> Result<(EncodedManifestTree, ManifestTreeSummary), ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     if logical_size >= previous.logical_size() {
         return Err(ManifestTreeError::InvalidReplacement);
@@ -405,7 +405,7 @@ pub(crate) fn splice_manifest_tree<F>(
     mut read: F,
 ) -> Result<(EncodedManifestTree, ManifestTreeSummary), ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     if replaced.start > replaced.end
         || replaced.end > previous.logical_size()
@@ -493,7 +493,7 @@ fn splice_node<F>(
     seen: &mut BTreeSet<MetadataObjectId>,
 ) -> Result<(u16, Vec<NodeRef>), ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     match decode_manifest_node(candidate.object_id, read)? {
         DecodedManifestNode::Leaf(leaf) => {
@@ -730,7 +730,7 @@ fn truncate_node<F>(
     seen: &mut BTreeSet<MetadataObjectId>,
 ) -> Result<NodeRef, ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     if retained_length == 0
         || candidate
@@ -849,7 +849,7 @@ fn append_leaves_to_right_spine<F>(
     seen: &mut BTreeSet<MetadataObjectId>,
 ) -> Result<(u16, Vec<NodeRef>), ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     match decode_manifest_node(candidate.object_id, read)? {
         DecodedManifestNode::Leaf(leaf) => {
@@ -1005,7 +1005,7 @@ fn rewrite_node<F>(
     seen: &mut BTreeSet<MetadataObjectId>,
 ) -> Result<NodeRef, ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     match decode_manifest_node(candidate.object_id, read)? {
         DecodedManifestNode::Leaf(leaf) => {
@@ -1333,7 +1333,7 @@ pub(crate) fn flatten_manifest_tree<F>(
     mut read: F,
 ) -> Result<ManifestLeaf, ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     let mut pending = vec![(root, None, None, None)];
     let mut extents = Vec::new();
@@ -1415,7 +1415,7 @@ pub(crate) fn scan_manifest_tree<F, V>(
     mut visit: V,
 ) -> Result<ManifestTreeSummary, ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
     V: FnMut(u64, &ManifestExtent) -> Result<(), ManifestTreeError>,
 {
     let mut allocated_bytes = 0_u64;
@@ -1442,7 +1442,7 @@ pub(crate) fn read_manifest_tree_range<F>(
     mut read: F,
 ) -> Result<Vec<ManifestRangeExtent>, ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     read_manifest_tree_range_decoded(root, expected_logical_size, offset, length, |id| {
         decode_manifest_node(id, &mut read).map(Arc::new)
@@ -1498,7 +1498,7 @@ pub(crate) fn allocated_bytes_in_manifest_tree_range<F>(
     mut read: F,
 ) -> Result<u64, ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     allocated_bytes_in_manifest_tree_range_decoded(
         root,
@@ -1648,7 +1648,7 @@ fn walk_manifest_tree<F, V>(
     visit: V,
 ) -> Result<u64, ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
     V: FnMut(u64, &ManifestExtent) -> Result<(), ManifestTreeError>,
 {
     walk_decoded_manifest_tree(
@@ -1772,7 +1772,7 @@ pub(crate) fn decode_manifest_node<F>(
     read: &mut F,
 ) -> Result<DecodedManifestNode, ManifestTreeError>
 where
-    F: FnMut(MetadataObjectId) -> Result<Vec<u8>, ManifestTreeError>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
 {
     let encoded = read(object_id)?;
     match metadata_object_kind(&encoded)? {

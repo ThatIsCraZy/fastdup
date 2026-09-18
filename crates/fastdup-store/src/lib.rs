@@ -1483,8 +1483,10 @@ impl<I: StorageIo> ContainerRepository<I> {
         }
     }
 
-    /// Constructs a repository with deterministic descriptor-cache pressure.
+    /// Constructs a repository with deterministic Container-cache pressure.
     ///
+    /// The envelope cache follows the supplied snapshot and the image pool is
+    /// bounded by one Container instead of the shared, host-governed budget.
     /// This is intended for tests and runtimes with an external memory
     /// governor. Normal appliances use [`Self::new`] and refresh host/cgroup
     /// pressure automatically.
@@ -1495,7 +1497,9 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Self {
         Self {
             storage,
-            container_images: Arc::new(container_image_cache::ContainerImageCache::system()),
+            container_images: Arc::new(container_image_cache::ContainerImageCache::isolated(
+                MAX_CONTAINER_BYTES,
+            )),
             descriptors: Arc::new(
                 container_descriptor_cache::ContainerDescriptorCache::new_with_snapshot(snapshot),
             ),
@@ -2183,6 +2187,8 @@ impl<I: StorageIo> ContainerRepository<I> {
         let retained_image = (ReadIntentScope::current() == ReadIntent::Demand
             && sealed_length <= GC_FILL_COMPACTION_PHYSICAL_MAX_BYTES)
             .then(|| sealed.as_ref().to_vec());
+        let retained_descriptor = sealed_descriptor(sealed.as_ref(), sealed_length)
+            .filter(|descriptor| descriptor.container_id() == container_id);
 
         let published = self
             .storage
@@ -2202,6 +2208,9 @@ impl<I: StorageIo> ContainerRepository<I> {
             })?;
         if let Some(image) = retained_image {
             self.container_images.admit_validated(container_id, image);
+        }
+        if let Some(descriptor) = retained_descriptor {
+            self.descriptors.insert(container_id, descriptor);
         }
         Ok(published)
     }
@@ -2277,16 +2286,16 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_id: ContainerId,
     ) -> Result<VerifiedContainerImage, StoreError> {
         if let Some(bytes) = self.container_images.get(container_id) {
-            return self.verify_image_bytes(container_id, Arc::unwrap_or_clone(bytes));
+            return self.verify_image_bytes(container_id, bytes);
         }
         let bytes = self.storage.read(&published_name(container_id))?;
-        self.verify_image_bytes(container_id, bytes)
+        self.verify_image_bytes(container_id, Arc::new(bytes))
     }
 
     fn verify_image_bytes(
         &self,
         container_id: ContainerId,
-        bytes: Vec<u8>,
+        bytes: Arc<Vec<u8>>,
     ) -> Result<VerifiedContainerImage, StoreError> {
         let mut base_resolver = ContainerBaseResolver::new(self);
         let mut resolver_error = None;
@@ -2299,7 +2308,8 @@ impl<I: StorageIo> ContainerRepository<I> {
                 Err(FormatError::DependentBaseRequired)
             }
         };
-        let decoded = VerifiedContainerImage::decode_with_dependent_resolver(bytes, &mut resolve);
+        let decoded =
+            VerifiedContainerImage::decode_shared_with_dependent_resolver(bytes, &mut resolve);
         if let Some(error) = resolver_error {
             return Err(error);
         }
@@ -2729,9 +2739,22 @@ impl<I: StorageIo> ContainerRepository<I> {
     ) -> Result<SealedContainerDescriptor, StoreError> {
         let location = candidate.location();
         let name = published_name(location.container_id());
-        let descriptor = if let Some(descriptor) = self.descriptors.get(location.container_id()) {
-            descriptor
-        } else {
+        if let Some(descriptor) = self.descriptors.get(location.container_id()) {
+            return Ok(descriptor);
+        }
+        // A resident image already carries the envelope this view is built
+        // from. Decoding it locally applies the same bounds and identity
+        // checks as the storage path without three backend operations.
+        if let Some(image) = self.container_images.get(location.container_id()) {
+            let length = u64::try_from(image.len()).unwrap_or(u64::MAX);
+            if let Some(descriptor) = sealed_descriptor(&image, length)
+                .filter(|descriptor| descriptor.container_id() == location.container_id())
+            {
+                self.descriptors.insert(location.container_id(), descriptor);
+                return Ok(descriptor);
+            }
+        }
+        let descriptor = {
             let actual_length = self.storage.object_len(&name)?;
             let minimum_length = u64::try_from(HEADER_BYTES)
                 .map_err(|_| FormatError::ArithmeticOverflow)?
@@ -5296,6 +5319,29 @@ impl StorageIo for FsStorageIo {
             registry: Arc::clone(&self.immutable_leases),
         }))
     }
+}
+
+/// Rebuilds the envelope view of an image the format writer has just sealed.
+///
+/// A reader otherwise derives the same view from an object length plus a footer
+/// and a header read. Retaining it removes those three operations from the first
+/// read of every new Container. Cache residency is an accelerator and never a
+/// publication gate, so a view that cannot be decoded is simply not retained.
+fn sealed_descriptor(sealed: &[u8], sealed_length: u64) -> Option<SealedContainerDescriptor> {
+    let minimum_length = u64::try_from(HEADER_BYTES)
+        .ok()?
+        .checked_add(FOOTER_BYTES)?;
+    if sealed_length < minimum_length
+        || sealed_length > MAX_CONTAINER_BYTES
+        || !sealed_length.is_multiple_of(FOOTER_BYTES)
+        || u64::try_from(sealed.len()) != Ok(sealed_length)
+    {
+        return None;
+    }
+    let footer_offset = usize::try_from(sealed_length.checked_sub(FOOTER_BYTES)?).ok()?;
+    let header = sealed.get(..HEADER_BYTES)?;
+    let footer = sealed.get(footer_offset..)?;
+    SealedContainerDescriptor::decode(header, footer, sealed_length).ok()
 }
 
 fn temporary_name(container_id: ContainerId) -> String {

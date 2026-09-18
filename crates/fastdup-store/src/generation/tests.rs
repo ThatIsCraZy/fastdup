@@ -34,7 +34,7 @@ fn metadata_publication_bundles_heads_and_body_into_one_write() {
     );
     repo.storage.sync_root().unwrap();
     let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
-    assert_eq!(repo.read_metadata(id).unwrap(), bytes);
+    assert_eq!(*repo.read_metadata(id).unwrap(), bytes);
     std::fs::remove_dir_all(path).unwrap();
 }
 
@@ -89,7 +89,7 @@ fn metadata_graph_reads_share_owned_bytes_across_read_paths() {
     );
     // Inject durable corruption after warming the cache. Both independent
     // scrub and publication verification must still reach storage and fail.
-    let mut damaged = expected.clone();
+    let mut damaged = expected.as_ref().clone();
     damaged[0] ^= 1;
     repo.storage
         .write_at(&metadata_name(id), 0, &damaged)
@@ -134,7 +134,7 @@ fn recovery_rechecks_a_warm_namespace_after_durable_corruption() {
     let record = repo.commit_namespace(&namespace).unwrap();
     let encoded = repo.read_metadata(record.namespace_root()).unwrap();
     assert!(repo.recover_latest().unwrap().is_some());
-    let mut damaged = encoded.clone();
+    let mut damaged = encoded.as_ref().clone();
     damaged[0] ^= 1;
     repo.storage
         .write_at(&metadata_name(record.namespace_root()), 0, &damaged)
@@ -363,4 +363,111 @@ fn transition_pair_rejects_consuming_a_reservation_first_enlarged_by_the_proposa
             }
         )
     ));
+}
+
+/// Restaging an object that is already published proves the durable image
+/// byte-identical to the caller's encoding. That is the same evidence a first
+/// publication carries forward, so the object must stay resident instead of
+/// being read from storage again on the next access.
+#[test]
+fn restaging_a_published_object_retains_its_verified_image() {
+    let root = std::env::temp_dir().join(format!("metadata-restage-{}", std::process::id()));
+    let mut storage = crate::FsStorageIo::open(&root).unwrap();
+    let counters = Arc::new(crate::metadata_read_telemetry::MetadataReadCounters::default());
+    storage.metadata_reads = Some(Arc::clone(&counters));
+    let mut repo = GenerationRepository::new(storage, PolicySetId::new([1; 32]).unwrap());
+    repo.metadata_cache = Arc::new(crate::metadata_object_cache::MetadataObjectCache::limited(
+        1 << 20,
+    ));
+    let metadata_reads = || {
+        counters
+            .rows()
+            .iter()
+            .map(|row| row.operations)
+            .sum::<u64>()
+    };
+    let bytes = ManifestLeaf::new(
+        4096,
+        vec![ManifestExtent::Fill {
+            logical_length: 4096,
+            value: 11,
+        }],
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    let id = repo.stage_metadata(&bytes).unwrap();
+    repo.storage.sync_root().unwrap();
+    repo.metadata_cache.invalidate(id);
+
+    let before_restage = metadata_reads();
+    assert_eq!(repo.stage_metadata(&bytes).unwrap(), id);
+    let after_restage = metadata_reads();
+    assert!(
+        after_restage > before_restage,
+        "restaging must verify the durable image independently"
+    );
+
+    let first = repo.read_metadata(id).unwrap();
+    assert_eq!(
+        metadata_reads(),
+        after_restage,
+        "the verified restaged image must serve the next read"
+    );
+    let second = repo.read_metadata(id).unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "cached reads must share one owned image instead of copying it"
+    );
+    assert_eq!(*first, bytes);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Flattening a whole Manifest tree reads the same Metadata Objects as every
+/// other tree traversal. Reaching past the object cache would make the one
+/// public whole-tree reader the only path that rereads published nodes.
+#[test]
+fn flattening_a_manifest_tree_reuses_published_nodes() {
+    let root = std::env::temp_dir().join(format!("metadata-flatten-{}", std::process::id()));
+    let mut storage = crate::FsStorageIo::open(&root).unwrap();
+    let counters = Arc::new(crate::metadata_read_telemetry::MetadataReadCounters::default());
+    storage.metadata_reads = Some(Arc::clone(&counters));
+    let mut repo = GenerationRepository::new(storage, PolicySetId::new([1; 32]).unwrap());
+    repo.metadata_cache = Arc::new(crate::metadata_object_cache::MetadataObjectCache::limited(
+        8 << 20,
+    ));
+    let metadata_reads = || {
+        counters
+            .rows()
+            .iter()
+            .map(|row| row.operations)
+            .sum::<u64>()
+    };
+    let window = 64 * 1_024 * 1_024_u64;
+    let layout = ManifestLeaf::new(
+        3 * window,
+        (0..3)
+            .map(|ordinal| ManifestExtent::Fill {
+                logical_length: window,
+                value: 0x50 + ordinal,
+            })
+            .collect(),
+    )
+    .unwrap();
+    let id = repo.publish_manifest(&layout).unwrap();
+    repo.storage.sync_root().unwrap();
+    assert!(
+        repo.scrub_manifest_tree_metadata(id).unwrap().root() == id,
+        "the fixture publishes a tree with inner nodes"
+    );
+
+    let before = metadata_reads();
+    let flattened = repo.read_manifest(id).unwrap();
+    assert_eq!(
+        metadata_reads(),
+        before,
+        "flattening must reuse the published Metadata Objects"
+    );
+    assert_eq!(flattened.extents(), layout.extents());
+    std::fs::remove_dir_all(root).unwrap();
 }

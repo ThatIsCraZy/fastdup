@@ -4,7 +4,8 @@ use fastdup_format::{
 };
 use fastdup_store::{
     CONTAINER_GENERATION_HIGH_WATER_SLOT_0, CONTAINER_GENERATION_HIGH_WATER_SLOT_1,
-    ContainerRepository, ExactIndexRunRepository, MemoryPressureSnapshot, StorageIo, StoreError,
+    ContainerRepository, ExactIndexRunRepository, MemoryPressureSnapshot, ReadIntent,
+    ReadIntentScope, StorageIo, StoreError,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
@@ -222,9 +223,14 @@ fn exact_location_read_uses_only_bounded_ranges_and_returns_verified_bytes() {
     let first = vec![0x11; 256 * 1_024];
     let requested = b"bounded reads still verify exact bytes";
     let third = vec![0x33; 256 * 1_024];
-    repository
-        .publish_raw(container_id, 9, &[&first, requested, &third])
-        .expect("publish one worked multi-record Container");
+    // Publication itself retains the envelope view of the new image, so this
+    // cold-path measurement has to publish without warming any reader cache.
+    {
+        let _cold = ReadIntentScope::enter(ReadIntent::Independent);
+        repository
+            .publish_raw(container_id, 9, &[&first, requested, &third])
+            .expect("publish one worked multi-record Container");
+    }
     let container = repository
         .read(container_id)
         .expect("obtain rebuild evidence before measuring the demand read");
@@ -267,9 +273,14 @@ fn repeated_location_reads_reuse_the_verified_container_envelope() {
     let container_id = ContainerId::new([0xB4; 16]).expect("container identity is nonzero");
     let first = b"first record in one immutable container";
     let second = b"second record reuses the verified envelope";
-    repository
-        .publish_raw(container_id, 19, &[first, second])
-        .expect("publish one worked Container");
+    // Publication itself retains the envelope view of the new image, so this
+    // cold-path measurement has to publish without warming any reader cache.
+    {
+        let _cold = ReadIntentScope::enter(ReadIntent::Independent);
+        repository
+            .publish_raw(container_id, 19, &[first, second])
+            .expect("publish one worked Container");
+    }
     let container = repository
         .read(container_id)
         .expect("obtain rebuild evidence before measuring bounded reads");
@@ -330,9 +341,14 @@ fn swap_pressure_disables_envelope_admission_without_changing_verified_reads() {
     );
     let container_id = ContainerId::new([0xB5; 16]).expect("container identity is nonzero");
     let payload = b"cache pressure may cost IO but cannot change verified bytes";
-    repository
-        .publish_raw(container_id, 20, &[payload])
-        .expect("publish fixture Container");
+    // Publication itself retains the envelope view of the new image, so this
+    // cold-path measurement has to publish without warming any reader cache.
+    {
+        let _cold = ReadIntentScope::enter(ReadIntent::Independent);
+        repository
+            .publish_raw(container_id, 20, &[payload])
+            .expect("publish fixture Container");
+    }
     let container = repository
         .read(container_id)
         .expect("obtain rebuild evidence");
@@ -578,4 +594,99 @@ fn corrupt_exact_index_page_cannot_make_verified_container_data_unreadable() {
         .expect("verified slow path preserves readable committed content");
 
     assert_eq!(bytes, payload);
+}
+
+/// Publication already holds the sealed image a reader would otherwise measure
+/// and reread in three backend operations, so the first bounded read of a new
+/// Container must not rebuild its envelope from storage.
+#[test]
+fn publication_retains_the_envelope_view_of_a_new_container() {
+    let storage = MemoryStorageIo::new();
+    let gib = 1_024_u64.pow(3);
+    let repository = ContainerRepository::new_with_descriptor_cache_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 * gib, 96 * gib, 0),
+    );
+    let container_id = ContainerId::new([0xB6; 16]).expect("container identity is nonzero");
+    let record = b"a published envelope needs no rebuild";
+    repository
+        .publish_raw(container_id, 21, &[record.as_slice()])
+        .expect("publish one worked Container");
+    let container = repository
+        .read(container_id)
+        .expect("obtain rebuild evidence before measuring the demand read");
+    let entry = ExactIndexEntry::from_verified_raw(container.raw_locations()[0])
+        .expect("construct one exact location");
+    let baseline = storage.operation_count();
+
+    assert_eq!(
+        repository
+            .read_verified_location(entry)
+            .expect("bounded demand verification succeeds"),
+        record
+    );
+
+    let operations = &storage.operations()[baseline..];
+    assert!(
+        !operations.contains(&StorageOperation::ObjectLen),
+        "a published envelope must not be measured again"
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ReadExactAt)
+            .count(),
+        1,
+        "only the Record itself remains to be read"
+    );
+    let cache = repository.descriptor_cache_status();
+    assert_eq!(cache.hits(), 1);
+    assert_eq!(cache.misses(), 0);
+}
+
+/// Memory pressure can refuse envelope admission while an underfilled image is
+/// still resident. That image carries the same Header and Footer, so rebuilding
+/// the view from it keeps the bounded read free of envelope operations.
+#[test]
+fn a_resident_image_rebuilds_an_unadmitted_envelope_view() {
+    let storage = MemoryStorageIo::new();
+    let gib = 1_024_u64.pow(3);
+    let repository = ContainerRepository::new_with_descriptor_cache_snapshot(
+        storage.clone(),
+        MemoryPressureSnapshot::new(128 * gib, 96 * gib, 1),
+    );
+    let container_id = ContainerId::new([0xB7; 16]).expect("container identity is nonzero");
+    let record = b"a resident image still carries its envelope";
+    repository
+        .publish_raw(container_id, 22, &[record.as_slice()])
+        .expect("publish one underfilled Container");
+    let container = repository
+        .read(container_id)
+        .expect("obtain rebuild evidence before measuring the demand read");
+    let entry = ExactIndexEntry::from_verified_raw(container.raw_locations()[0])
+        .expect("construct one exact location");
+    let baseline = storage.operation_count();
+
+    assert_eq!(
+        repository
+            .read_verified_location(entry)
+            .expect("bounded demand verification succeeds"),
+        record
+    );
+
+    let operations = &storage.operations()[baseline..];
+    assert!(
+        !operations.contains(&StorageOperation::ObjectLen),
+        "a resident image replaces the envelope rebuild"
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == StorageOperation::ReadExactAt)
+            .count(),
+        1
+    );
+    let cache = repository.descriptor_cache_status();
+    assert_eq!(cache.entry_count(), 0, "pressure still refuses admission");
+    assert_eq!(cache.hits(), 0);
 }

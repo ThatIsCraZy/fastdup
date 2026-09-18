@@ -1,8 +1,7 @@
 //! Complete/append Manifest publication and public read/structural-scrub operations.
-use super::metadata::metadata_name;
 use super::{
-    GenerationError, GenerationRepository, MAX_METADATA_OBJECT_BYTES_U64, ManifestSuccessorProof,
-    PublishedManifestProof, SuccessorPredecessor,
+    GenerationError, GenerationRepository, ManifestSuccessorProof, PublishedManifestProof,
+    SuccessorPredecessor,
 };
 use crate::StorageIo;
 use crate::manifest_tree::{
@@ -267,21 +266,8 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         object_id: MetadataObjectId,
     ) -> Result<ManifestLeaf, GenerationError> {
-        flatten_manifest_tree(object_id, |node_id| {
-            let name = metadata_name(node_id);
-            let length = self.storage.object_len(&name)?;
-            if length > MAX_METADATA_OBJECT_BYTES_U64 {
-                return Err(ManifestTreeError::IdentityMismatch(node_id));
-            }
-            let bytes = self.storage.read(&name)?;
-            if u64::try_from(bytes.len()) != Ok(length)
-                || MetadataObjectId::from_encoded(&bytes)? != node_id
-            {
-                return Err(ManifestTreeError::IdentityMismatch(node_id));
-            }
-            Ok(bytes)
-        })
-        .map_err(Into::into)
+        flatten_manifest_tree(object_id, |node_id| self.read_manifest_node(node_id))
+            .map_err(Into::into)
     }
 
     /// Reads and verifies only Manifest tree paths intersecting one range.

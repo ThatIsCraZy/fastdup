@@ -27,14 +27,20 @@ impl<I: StorageIo> GenerationRepository<I> {
         let object_id = MetadataObjectId::from_encoded(encoded)?;
         let published_name = metadata_name(object_id);
         if self.storage.exists(&published_name)? {
-            // An existing image is not evidence from this publication. Verify
-            // collisions independently, even when its object bytes are cached.
-            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
-            let existing = self.storage.read(&published_name)?;
-            let existing_id = MetadataObjectId::from_encoded(&existing)?;
-            if existing_id != object_id || existing != encoded {
-                return Err(GenerationError::MetadataIdentityCollision(object_id));
+            {
+                // An existing image is not evidence from this publication. Verify
+                // collisions independently, even when its object bytes are cached.
+                let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+                let existing = self.storage.read(&published_name)?;
+                let existing_id = MetadataObjectId::from_encoded(&existing)?;
+                if existing_id != object_id || existing != encoded {
+                    return Err(GenerationError::MetadataIdentityCollision(object_id));
+                }
             }
+            // The durable image was just proven byte-identical to this encoding,
+            // which is the same evidence the publishing branch carries forward.
+            // Discarding it would leave a repeatedly restaged object uncached.
+            self.metadata_cache.admit_validated(object_id, encoded);
             return Ok(StagedMetadata {
                 object_id,
                 published_new: false,
@@ -62,7 +68,7 @@ impl<I: StorageIo> GenerationRepository<I> {
     pub(super) fn read_metadata(
         &self,
         object_id: MetadataObjectId,
-    ) -> Result<Vec<u8>, GenerationError> {
+    ) -> Result<Arc<Vec<u8>>, GenerationError> {
         let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::Namespace);
         self.read_metadata_bytes(object_id)
             .map_err(|error| match error {
@@ -76,9 +82,9 @@ impl<I: StorageIo> GenerationRepository<I> {
     fn read_metadata_bytes(
         &self,
         object_id: MetadataObjectId,
-    ) -> Result<Vec<u8>, ManifestTreeError> {
+    ) -> Result<Arc<Vec<u8>>, ManifestTreeError> {
         self.check_maintenance()?;
-        let bytes = self.metadata_cache.read(object_id, || {
+        self.metadata_cache.read(object_id, || {
             let name = metadata_name(object_id);
             let length = self.storage.object_len(&name)?;
             if length > MAX_METADATA_OBJECT_BYTES_U64 {
@@ -89,14 +95,13 @@ impl<I: StorageIo> GenerationRepository<I> {
                 return Err(ManifestTreeError::IdentityMismatch(object_id));
             }
             Ok(bytes)
-        })?;
-        Ok(Arc::unwrap_or_clone(bytes))
+        })
     }
 
     pub(super) fn read_manifest_node(
         &self,
         object_id: MetadataObjectId,
-    ) -> Result<Vec<u8>, ManifestTreeError> {
+    ) -> Result<Arc<Vec<u8>>, ManifestTreeError> {
         let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::Manifest);
         self.read_metadata_bytes(object_id)
     }

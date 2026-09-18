@@ -207,7 +207,6 @@ where
                 self.cache.read(object_id, || {
                     self.metadata_cache
                         .read(object_id, || read_tree_metadata(&self.metadata, object_id))
-                        .map(Arc::unwrap_or_clone)
                 })
             },
         )
@@ -228,7 +227,6 @@ where
                 self.cache.read(object_id, || {
                     self.metadata_cache
                         .read(object_id, || read_tree_metadata(&self.metadata, object_id))
-                        .map(Arc::unwrap_or_clone)
                 })
             },
         )

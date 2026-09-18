@@ -468,7 +468,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         mut read_object: F,
     ) -> Result<RecoveryCheckpointSummary, RecoveryCheckpointError>
     where
-        F: FnMut(MetadataObjectId) -> Result<Vec<u8>, RecoveryCheckpointError>,
+        F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, RecoveryCheckpointError>,
     {
         if object_ids.is_empty() || !object_ids.contains(&record.namespace_root()) {
             return Err(RecoveryCheckpointError::IdentityMismatch);
@@ -1127,7 +1127,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         &self,
         checkpoint: &AuditedCheckpoint,
         object_id: MetadataObjectId,
-    ) -> Result<Vec<u8>, RecoveryCheckpointError> {
+    ) -> Result<Arc<Vec<u8>>, RecoveryCheckpointError> {
         let span = checkpoint
             .objects
             .get(&object_id)
@@ -1142,7 +1142,7 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         if MetadataObjectId::from_encoded(&encoded)? != object_id {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
-        Ok(encoded)
+        Ok(Arc::new(encoded))
     }
 }
 

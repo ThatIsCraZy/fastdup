@@ -73,7 +73,6 @@ pub enum ReadCacheClass {
     StorageHandle,
     ExactMembership,
     ExactPageBounds,
-    ReverseDependencies,
 }
 
 impl ReadCacheClass {

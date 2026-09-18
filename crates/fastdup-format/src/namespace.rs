@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::metadata::{
@@ -1065,9 +1066,9 @@ impl NamespaceRoot {
     ///
     /// Rejects a missing, extra, reordered, substituted, corrupt, or
     /// non-contiguous shard and any invalid reconstructed namespace state.
-    pub fn decode_graph(
+    pub fn decode_graph<B: Borrow<Vec<u8>>>(
         encoded_root: &[u8],
-        encoded_shards: &BTreeMap<MetadataObjectId, Vec<u8>>,
+        encoded_shards: &BTreeMap<MetadataObjectId, B>,
     ) -> Result<Self, MetadataFormatError> {
         let root = NamespaceGraphRoot::decode(encoded_root)?;
         let payload = reconstruct_namespace_payload(&root, encoded_shards)?;
@@ -1201,9 +1202,9 @@ impl NamespaceGraphRoot {
     /// # Panics
     ///
     /// This method never panics.
-    pub fn decode_gc_graph_with_shards(
+    pub fn decode_gc_graph_with_shards<B: Borrow<Vec<u8>>>(
         &self,
-        encoded_shards: &BTreeMap<MetadataObjectId, Vec<u8>>,
+        encoded_shards: &BTreeMap<MetadataObjectId, B>,
     ) -> Result<NamespaceGcGraph, MetadataFormatError> {
         let payload = reconstruct_namespace_payload(self, encoded_shards)?;
         let (inode_transitions, manifest_roots) =
@@ -1223,9 +1224,9 @@ impl NamespaceGraphRoot {
     }
 }
 
-fn reconstruct_namespace_payload(
+fn reconstruct_namespace_payload<B: Borrow<Vec<u8>>>(
     root: &NamespaceGraphRoot,
-    encoded_shards: &BTreeMap<MetadataObjectId, Vec<u8>>,
+    encoded_shards: &BTreeMap<MetadataObjectId, B>,
 ) -> Result<Vec<u8>, MetadataFormatError> {
     let expected_ids = root
         .shards
@@ -1246,7 +1247,7 @@ fn reconstruct_namespace_payload(
             let encoded = encoded_shards
                 .get(&reference.object_id)
                 .ok_or(MetadataFormatError::InvalidPayload)?;
-            let bytes = decode_namespace_shard(encoded, reference)?;
+            let bytes = decode_namespace_shard(encoded.borrow(), reference)?;
             decoded_shards.insert(reference.object_id, bytes);
             bytes
         };
