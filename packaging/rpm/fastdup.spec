@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           fastdup
-Version:        0.8.0
+Version:        0.8.1
 Release:        1%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
@@ -110,6 +110,14 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.8.1-1
+- Keep a warm disk-backed cache at its granted target while the shared memory
+  headroom is uncontested. The budget shrank a cache back toward residency
+  whenever hits and misses stopped between jobs, which discarded the next job's
+  warm working set and pushed class ceilings below what was already resident.
+- Real memory pressure and a competing pool still reclaim the payload, and an
+  idle target is never grown.
+
 * Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.8.0-1
 - Release the record-range Namespace, the Ingest gate accounting and the
   bounded mount audits as 0.8.0. Repository format epoch 3: pools written by

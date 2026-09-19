@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.1/fastdup-0.8.1-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Produktseite</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.8.0">Release-Informationen</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.8.1">Release-Informationen</a>
 </p>
 
 fastdup ist eine experimentelle, softwaredefinierte Single-Node-
@@ -31,6 +31,34 @@ HTTPS-WebUI hält die Administration einfach.
 > fastdup ist ein Forschungsprototyp und kein produktionsreifes Backup-Produkt.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
+
+## Neu in v0.8.1 · 19. September 2026
+
+- **Ein warmer Cache schrumpft nicht mehr zwischen zwei Jobs.** Das gemeinsame
+  Speicherbudget bewertete jeden Cache-Pool nach Treffern, Fehlzugriffen und
+  Verdrängungen. Zwischen zwei Backup-Jobs werden die Zähler still, die Bewertung
+  verfällt, und das Ziel fiel auf das zurück, was gerade resident war — der
+  nächste Job startete also gegen einen kalten Cache, den die Appliance bereits
+  verdient hatte und hätte halten können. Eine reine Trefferphase hatte denselben
+  Effekt: Klassenobergrenzen sanken unter die Residency, der Cache verdrängte
+  brauchbare Einträge und erzeugte damit genau die Fehlzugriffe, die die
+  Bewertung nicht gesehen hatte. Ein plattengestützter Pool behält sein
+  zugeteiltes Ziel jetzt aus Headroom, den kein anderer Pool will. Ein
+  ungenutztes Ziel wächst dadurch nie, bei echter Konkurrenz wird sofort
+  abgegeben, und unter harter Speicherknappheit entfällt die Rückhaltung ganz.
+- **Das Konzept für das Veeam Hardened Repository ist dokumentiert.**
+  [docs/research/veeam-hardened-repository-concept.md](docs/research/veeam-hardened-repository-concept.md)
+  beschreibt, die originalen Veeam-Repository-Dienste in einem lokalen
+  Linux-Systemcontainer gegen einen fastdup-gestützten, XFS-kompatiblen Pfad zu
+  betreiben statt über SMB. Das ist ein Request for Comments, keine Roadmap, und
+  benennt den ungelösten kritischen Pfad offen: Der FUSE-Mount beantwortet
+  `FICLONE`/`FICLONERANGE` heute mit `ENOTTY`, SMB bleibt damit der einzige
+  bewiesene Fast-Clone-Weg.
+
+Keine Formatänderung: v0.8.1 liest und schreibt dasselbe Epoch-3-Repository wie
+v0.8.0, ein Upgrade von v0.8.0 erfordert keine Repository-Arbeit.
+
+[Release-Details v0.8.1](docs/releases/v0.8.1.md) · RPM-Version **0.8.1-1**.
 
 ## Neu in v0.8.0 · 19. September 2026
 
@@ -288,11 +316,11 @@ Benötigt werden:
 Aktuelles Binärpaket herunterladen und installieren:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.1/fastdup-0.8.1-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.1/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.8.0-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.8.1-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

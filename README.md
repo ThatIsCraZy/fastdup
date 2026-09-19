@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm">Download the RPM</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.1/fastdup-0.8.1-1.el10.x86_64.rpm">Download the RPM</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Product page</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.8.0">Release notes</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.8.1">Release notes</a>
 </p>
 
 fastdup is an experimental, software-defined single-node storage appliance for
@@ -29,6 +29,32 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > [!WARNING]
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
+
+## New in v0.8.1 · 19 September 2026
+
+- **A warm cache no longer shrinks between jobs.** The shared memory budget
+  scored each cache pool from recent hits, misses and evictions. Between two
+  backup jobs the counters go quiet, the score decays, and the target fell back
+  toward whatever was resident — so the next job started against a cold cache
+  the appliance had already earned and had room to keep. A hit-only phase had
+  the same effect: class ceilings dropped below residency and the cache evicted
+  useful entries, manufacturing the misses the score had not seen. A disk-backed
+  pool now retains its granted target out of headroom no other pool wants. It
+  never grows an idle target, yields as soon as pools genuinely compete, and is
+  skipped entirely under hard memory pressure.
+- **A concept for the Veeam hardened repository is on record.**
+  [docs/research/veeam-hardened-repository-concept.md](docs/research/veeam-hardened-repository-concept.md)
+  describes running the original Veeam repository services in a local Linux
+  system container against a fastdup-backed XFS-compatible path instead of the
+  SMB route. It is a request for comments, not a roadmap, and it is explicit
+  about the unsolved critical path: the FUSE mount answers
+  `FICLONE`/`FICLONERANGE` with `ENOTTY` today, so SMB remains the only proven
+  Fast Clone path.
+
+No format change: v0.8.1 reads and writes the same epoch-3 repository as v0.8.0,
+and upgrading from v0.8.0 needs no repository work.
+
+[Release notes v0.8.1](docs/releases/v0.8.1.md) · RPM version **0.8.1-1**.
 
 ## New in v0.8.0 · 19 September 2026
 
@@ -280,11 +306,11 @@ You need:
 Download and install the current binary package:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.1/fastdup-0.8.1-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.1/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.8.0-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.8.1-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 

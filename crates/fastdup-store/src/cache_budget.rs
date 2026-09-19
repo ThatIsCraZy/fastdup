@@ -296,8 +296,8 @@ impl State {
                 .observed
                 .hit_bytes
                 .saturating_sub(pool.previous.hit_bytes);
-            // EWMA ages idle workloads out; a saturated hit rate alone is not
-            // evidence that allocating more RAM would produce further hits.
+            // EWMA ages idle workloads out of competition for memory; a
+            // saturated hit rate alone is not evidence for further growth.
             pool.benefit = pool.benefit.saturating_mul(3) / 4 + u128::from(bytes);
             pool.demand =
                 pool.demand.saturating_mul(3) / 4 + misses.saturating_add(evictions.min(misses));
@@ -330,11 +330,50 @@ impl State {
             scores.push((id, score, cap));
         }
         let remaining = self.water_fill_scores(&scores, distributable);
+        let remaining = self.retain_uncontested_disk_targets(&old, remaining);
         self.distribute_idle_buffers(remaining, probe);
         let step = bounded_share(distributable, 30, 8 * MIB, 128 * MIB);
         let deadband = bounded_share(distributable, 20, 8 * MIB, 32 * MIB);
         self.damp_targets(&old, step, deadband, hard_pressure);
         self.retain_target_budget(fixed, distributable);
+    }
+
+    fn retain_uncontested_disk_targets(&mut self, old: &BTreeMap<u64, u64>, mut free: u64) -> u64 {
+        if self.hard_pressure {
+            return free;
+        }
+        let retention = self.pools.iter().fold(0_u64, |total, (id, pool)| {
+            if pool.fallback == CacheFallback::Memory {
+                return total;
+            }
+            let previous = old.get(id).copied().unwrap_or(pool.fixed).min(pool.maximum);
+            total.saturating_add(previous.saturating_sub(pool.desired))
+        });
+        if retention > free {
+            // Targets now compete: keep the ordinary score-based allocation
+            // and damping, without bias toward a former workload's lease.
+            return free;
+        }
+        // Serve measured disk-saving demand first, then retain already granted
+        // disk-cache capacity from otherwise unused headroom. Shrinking merely
+        // because hits/misses stopped destroys the next job's warm working set;
+        // even a hit-only phase would shrink class ceilings below residency.
+        // This neither grows an idle target nor protects it from a competing
+        // pool or real memory pressure. Scratch buffers still receive leftovers.
+        for (&id, pool) in &mut self.pools {
+            if pool.fallback == CacheFallback::Memory {
+                continue;
+            }
+            let previous = old
+                .get(&id)
+                .copied()
+                .unwrap_or(pool.fixed)
+                .min(pool.maximum);
+            let retained = previous.saturating_sub(pool.desired).min(free);
+            pool.desired += retained;
+            free -= retained;
+        }
+        free
     }
 
     fn water_fill_scores(&mut self, scores: &[(u64, u128, u64)], distributable: u64) -> u64 {
@@ -615,6 +654,58 @@ mod tests {
     }
 
     #[test]
+    fn warm_disk_cache_keeps_its_target_while_headroom_is_uncontested() {
+        for active in [false, true] {
+            let broker = Arc::new(Broker::new());
+            let cache = CachePool::register(
+                Arc::clone(&broker),
+                "unified",
+                CacheFallback::Data,
+                MIB,
+                16_000 * MIB,
+            );
+            let snapshot = MemoryPressureSnapshot::new(24_000 * MIB, 20_000 * MIB, 0);
+            let warm_target = 512 * MIB;
+            let resident = 300 * MIB;
+            {
+                let mut state = broker.0.lock().unwrap();
+                let pool = state.pools.get_mut(&cache.id).unwrap();
+                pool.desired = warm_target;
+                pool.leased = warm_target;
+                pool.observed.resident_bytes = resident;
+                pool.observed.hits = 1_000;
+                pool.observed.hit_bytes = 100 * MIB;
+            }
+            // Status sampling continues between jobs. Hit-only phases also
+            // must not shrink the target down to residency: class ceilings
+            // would then evict useful entries and manufacture fresh misses.
+            for _ in 0..200 {
+                let mut observation = broker.0.lock().unwrap().pools[&cache.id].observed;
+                if active {
+                    observation.hits += 100;
+                    observation.hit_bytes += MIB;
+                }
+                let _ = cache.target(snapshot, observation);
+                tick(&broker, snapshot);
+                let target = cache.target(snapshot, observation);
+                assert!(
+                    target >= warm_target,
+                    "uncontested warm target shrank: {target}"
+                );
+                cache.applied(target, resident);
+            }
+            let target = cache.target(
+                MemoryPressureSnapshot::new(24_000 * MIB, 0, 0),
+                CacheObservation {
+                    resident_bytes: resident,
+                    ..CacheObservation::default()
+                },
+            );
+            assert_eq!(target, MIB, "real pressure must still reclaim the payload");
+        }
+    }
+
+    #[test]
     fn idle_buffers_lose_to_data_and_metadata_then_release_their_lease() {
         for fallback in [CacheFallback::Data, CacheFallback::Metadata] {
             let broker = Arc::new(Broker::new());
@@ -775,10 +866,12 @@ mod tests {
         let data = pool(&broker, CacheFallback::Data);
         let meta = pool(&broker, CacheFallback::Metadata);
         let mut first_data = 0;
-        for round in 0..120 {
+        // Fill the shared budget before turning the workload over. A short
+        // underfilled run has uncontested headroom and should retain idle data.
+        for round in 0..1600 {
             {
                 let mut state = broker.0.lock().unwrap();
-                for (id, active) in [(data.id, round < 40), (meta.id, round >= 40)] {
+                for (id, active) in [(data.id, round < 600), (meta.id, round >= 600)] {
                     let p = state.pools.get_mut(&id).unwrap();
                     if active {
                         p.observed.hits += 1000;
@@ -804,13 +897,18 @@ mod tests {
             }
             let state = broker.0.lock().unwrap();
             assert!(state.pools.values().map(|p| p.leased).sum::<u64>() <= 72_000);
-            if round == 39 {
+            if round == 599 {
                 first_data = state.pools[&data.id].leased;
                 assert!(first_data > state.pools[&meta.id].leased);
             }
-            if round == 119 {
+            if round == 1599 {
                 assert!(state.pools[&meta.id].leased > state.pools[&data.id].leased);
-                assert!(state.pools[&data.id].leased < first_data / 2);
+                assert!(
+                    state.pools[&data.id].leased < first_data / 2,
+                    "idle={} active={} initial={first_data}",
+                    state.pools[&data.id].leased,
+                    state.pools[&meta.id].leased,
+                );
             }
         }
     }
