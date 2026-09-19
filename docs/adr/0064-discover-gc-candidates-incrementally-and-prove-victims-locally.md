@@ -4,167 +4,86 @@ status: accepted
 
 # Discover GC candidates incrementally and prove victims locally
 
-Online GC separates cheap candidate discovery from destructive authority. An
-immutable Container summary and a rebuildable `GcCandidateCatalog` may identify
-likely zero-live or profitable partially-live Containers without a preceding
-complete End-to-End Scrub. Only a bounded, generation-bound
-`GcCandidateProof` may authorize `RETIRING`, Location-Set replacement, pin
-drain, and unlink.
+Online GC separates cheap candidate discovery from destructive authority.
+Immutable Container summaries and a rebuildable `GcCandidateCatalog` may rank
+likely victims without a preceding full Scrub. Only a generation-bound
+`GcCandidateProof` may authorize RETIRING, Location replacement, pin drain and
+unlink. This replaces ADR 0048's full-Scrub prerequisite, not its pressure,
+ordering, identity, revalidation or directory-sync invariants.
 
-This supersedes only ADR 0048's requirement that every DATA GC plan originate
-from one complete successful End-to-End Scrub. Its pressure thresholds,
-replacement-before-deletion ordering, generation revalidation, exact canonical
-identity check, and directory sync remain required. Full scrub becomes a
-periodic audit and catalog-repair source.
+## Hints and authority
 
-This advances the Container envelope from format version 1 to version 2.
+Container envelope version 2 mirrors a 96-byte, 64-byte-aligned intrinsic
+summary in Header and Footer: encoded/decoded bytes by codec, record and Chunk
+geometry, and dependency shape. Decoding validates both copies and their layout;
+recovery and scrub derive the facts again from authenticated records. Mutable
+liveness, pin state and victim scores never enter this summary.
 
-## Trust levels
+`GcCandidateCatalog` is immutable-run acceleration updated from publication,
+Metadata-liveness and Location-generation changes. Its v1 rows are 96-byte,
+Container-ID sorted, protected by paired 4-KiB envelopes, freshness bindings and
+a whole-stream BLAKE3 digest. Publication merge-joins bounded updates with the
+previous generation. Empty generations are durable tombstones. A stale,
+missing or approximate catalog may waste work or suppress a cycle, never
+authorize deletion.
 
-The Container Header and Footer mirror one 96-byte, 64-byte-aligned intrinsic
-summary field by field. It contains encoded and decoded bytes by codec, record
-and Chunk geometry, and outgoing dependency shape. Envelope decoding validates
-the duplicate and its layout equations; recovery and scrub derive it again from
-the authenticated records. It never contains mutable live-byte counts,
-reference counts, `RETIRING`, pin state, or a serialized victim score.
+Without a catalog, Online GC snapshots sorted published names, counts them and
+streams summaries without payload reads or a pool-sized map. Concurrent
+publication belongs to a later refresh. Liveness advances as a delta between
+the catalog's protected two-generation window and the current one. Exact
+lookups only attribute likely Containers; incomplete/negative results remain
+hints and count underflow clears the estimate.
 
-The `GcCandidateCatalog` is immutable-run acceleration built incrementally from
-Container publication, Metadata-liveness changes, and Location-generation
-changes. A stale or missing catalog can cause extra verification or suppress a
-cycle, but never data loss. Bloom/Xor filters, samples, and sketches are allowed
-only at this hint level and are not part of the first Container summary.
-The implemented v1 catalog uses Container-ID-sorted 96-byte rows, paired 4-KiB
-envelopes, generation freshness bindings, and a whole-row-stream BLAKE3 digest.
-Successor publication merge-joins a bounded update set with the previous
-immutable generation. Empty generations are durable tombstones, so recovery
-cannot fall back to candidates from an older nonempty pool view.
+A `GcCandidateProof` binds:
 
-If no catalog exists, adaptive Online GC bootstraps one by counting canonical
-published names and then streaming Container-ID-ordered rows from paired
-Header/Footer intrinsic summaries. The count and row stream use the same sorted
-name snapshot. Concurrently published Containers belong to a later hint
-refresh; a second directory listing must not change the declared row count. Bootstrap reads no record payload and keeps
-no pool-sized row map. These envelope facts remain hints; local proof fully
-verifies every shortlisted victim. A stale liveness base or a completed
-relocation may publish a fresh bootstrap generation before incremental deltas
-continue.
+- current and previous Commits, pinned Active/Frozen Manifest roots and open
+  orphan DATA dependencies;
+- Exact and paired Similarity generations;
+- victim identities and Recovery Indexes; and
+- the complete target/Base dependency closure and replacement coverage.
 
-Metadata liveness advances as a set delta between protected two-generation
-windows: the window ending at the catalog's incorporated Commit generation and
-the window ending at the current Commit generation. Exact lookups attribute
-changed logical targets to likely Containers, but incomplete or negative Exact
-results remain hints. Unknown-count underflow clears the estimate instead of
-creating a false zero-live row.
+The proof uses the same Metadata Root Pin registry that protects immutable
+graphs. A process-local Reverse Dependency Generation resolves every protected
+target through a complete effective ACTIVE Location prefix and authenticated
+Base edges. Missing or incomplete resolution fails closed. The projection is
+bound to the Commit pair and Exact activation, held during a running proof and
+otherwise evictable under ADR 0046.
 
-A `GcCandidateProof` binds the current and immediately previous Commit Records,
-the protected Active/Frozen roots and open-orphan DATA dependencies, the
-selected Location and Exact/Similarity generations, the exact victim identities
-and Recovery Indexes, and the complete target/Base dependency closure. It
-verifies replacement coverage for every reachable victim Chunk. Any changed
-binding invalidates the proof before the retirement barrier.
+Final revalidation holds the Metadata publication barrier and Commit lock until
+the selection barrier and RETIRING Exact generation are active. No new root or
+Namespace commit may enter that interval. The victim set must still fit the
+bounded replacement budget; ADR 0065 defines the current profitability estimate
+and keeps the independent-RAW bound as proof data rather than a collection gate.
+A protected graph with no DATA Chunks permits replacement-free retirement.
 
-The implementation derives Active/Frozen and open-orphan DATA from the same
-process-local Metadata Root Pin registry that protects their immutable Manifest
-graphs. Online liveness scans the durable Commit pair plus every pinned Manifest
-root. Final revalidation holds the Metadata publication barrier and Commit lock
-until the selection barrier is committed and the RETIRING Exact generation is
-active, so neither a new unpublished root nor a Namespace commit can enter
-between proof validation and retirement authority.
+## Retirement and recovery
 
-The local proof builds and caches a process-local Reverse Dependency Generation
-for the exact protected Commit pair and Exact activation. It looks up every
-protected target, requires a complete effective ACTIVE Location prefix, and
-records Base-to-dependent edges from authenticated Exact Location fields. An
-incomplete lookup or a live target without an ACTIVE Location fails closed. The
-bounded victim read then replaces only protected target Chunks and Base Chunks
-named by that generation. Catalog fanout estimates and Exact negatives remain
-non-authoritative. The projection is discarded after either binding changes
-and rebuilt after process start; it introduces no frontend write. Under
-ADR 0046 it is owned by the unified read cache and may be evicted even with
-unchanged bindings. A running candidate proof retains its immutable view.
+Replacement publication and RETIRING transitions activate atomically in one
+Exact L0 generation. New scan fallback closes before activation; displaced
+generation admission closes at activation. Unlink waits all reader, writer and
+reduction-operation pins, verifies victim identity, removes DATA, syncs its
+directory, then publishes REMOVED tombstones. Scrub authenticates all transition
+bytes but follows only effective ACTIVE dependencies.
 
-Paired Similarity families authenticate the selected Exact Run Set under ADR
-0062, and paired recovery refuses a family bound to any other Run Set. The
-proof's exact activation therefore transitively binds the only Similarity
-generation eligible for online selection; every paired rebuild activates a new
-Exact Run Set before publishing its Similarity family.
+Readers select and pin the current Exact generation per bounded DATA read.
+Dormant file objects do not pin predecessor generations; explicit old snapshots
+fall back to verified discovery after admission closes. Every path still checks
+Container identity, Record integrity and reconstructed Chunk identity.
 
-A victim set is rejected unless the independent-RAW replacement upper bound
-still proves positive physical gain and remains under the bounded replacement
-budget. When the authoritative protected proof contains no DATA Chunk at all,
-the Reverse Dependency Generation is empty and the proof retires verified
-victims without replacements.
+Before writable admission after restart, the recovery finalizer completes any
+effective RETIRING transition. Present victims must fully verify and reproduce
+the RETIRING Location set; already absent victims may reflect a completed,
+directory-synced unlink. Finalization is idempotent and failure blocks writable
+mount.
 
-## Consequences
+Candidate proof also consumes both Recovery Checkpoint graphs required by ADR
+0020. A process-local projection may cache their protected Chunks by immutable
+head identity `(generation, file length, body hash)`. Every hit rereads both
+4-KiB heads and checks object length. The cache starts empty, retains only active
+heads, is bounded by Chunk count, and never serves recovery or scrub.
 
-Likely victims may be examined and verified replacements may be published
-speculatively; these are harmless additional Locations. New Exact reuse and
-Similarity Base selection exclude a Container only after durable `RETIRING`.
-Physical deletion follows replacement activation and drain of reader, writer,
-and reduction-snapshot pins.
-
-Urgent GC prefers proved zero-live Containers and then the least relocation per
-net reclaimed byte. Background GC may incorporate Container age and codec or
-dependency cost. Merge sets use bounded similar-live-size packing and must beat
-a conservative independent-RAW replacement bound. No approximate value is a
-deletion invariant.
-
-Under ADR 0046, normal scans use bounded Direct-I/O reads held under the
-immutable-file lease and may reuse the common cache. Adapters without that
-lease use bounded positional reads and re-audit. Scan batches contain at most
-4,096 rows; neither path casts file bytes to Rust structs. Publication batches row writes and shortlist
-selection retains at most 4,096 rows in an `O(container_count * log(limit))`
-heap.
-
-Online execution publishes ACTIVE replacement Locations and RETIRING victim
-Locations in one atomically activated Exact L0 generation. The process closes
-new scan-fallback selection before activation, closes new work admission on the
-displaced Exact generation at activation, and waits reader, writer, and
-reduction-operation pins from every still-live predecessor generation before
-unlink. The scan barrier is transactional until Exact activation commits. A
-final L0 generation records REMOVED tombstones after DATA directory sync.
-Recovery derives the scan-selection barrier from effective RETIRING
-transitions; Scrub verifies only effective ACTIVE dependencies while
-authenticating all transition bytes.
-
-Long-lived and cached appliance Manifest readers retain access to the current
-Exact repository head, not an operation pin. Each bounded DATA read atomically
-selects and pins the current generation. Ordinary activation therefore does not
-strand dormant files on full Container discovery. If no usable index exists,
-the verified discovery fallback and its scan-selection barrier still apply.
-Explicit fixed-generation readers retain an uncounted snapshot and use verified
-discovery after that snapshot closes admission. Neither reader form allows an
-idle file object to stall RETIRING drain; in-flight reads keep their selected
-predecessor pinned until verification and decoding finish. Candidate identity,
-Record integrity, and reconstructed Chunk verification remain mandatory.
-
-Before admitting frontend I/O, the writable appliance runs the Online GC
-recovery finalizer. A restarted process has no surviving predecessor-generation
-pins, so the active generation's effective RETIRING entries are sufficient
-authority. Each present victim must fully verify and reproduce the complete
-RETIRING Location set; a victim already absent may represent a directory-synced
-unlink interrupted before REMOVED publication. The finalizer syncs DATA before
-activating REMOVED and is idempotent across every interruption. A finalization
-error prevents writable mount admission rather than weakening the barrier.
-
-This authorizes bounded same-process online execution through the shared
-Container and Exact repositories, including restart completion. ADR 0065 adds
-automatic candidate scheduling and ADR 0069 requires one cross-process
-Appliance Lease before recovery or mutation.
-
-## Process-local recovery protection projection (17 September 2026)
-
-Candidate proof consumes both retained Recovery Checkpoint graphs required by
-ADR 0020. Their complete protected Chunk projection may now be retained in one
-process-local Online-GC cache, keyed by each retained head descriptor identity
-`(generation, file length, body hash)`. Recovery Checkpoints are immutable after
-publication, so the projection for that identity is immutable. Every proof still
-reads the two 4 KiB head records and checks the selected object length before a
-hit; a changed, missing, or mismatched descriptor invalidates the projection and
-repeats the complete independent byte audit and graph traversal.
-
-The cache is empty at process start, retains only active head identities, and is
-hard bounded by retained Chunk entries. It accelerates Online-GC proof only.
-Independent recovery and Scrub never consult it and continue to verify retained
-checkpoint bytes themselves. Retirement revalidation remains unchanged and
-continues to bind the durable Recovery Checkpoint root-pin set.
+Normal scans use bounded leased Direct I/O; adapters without a lease use bounded
+positional reads and re-audit. Batches and shortlist retention are limited to
+4,096 rows. No path casts file bytes to Rust structs. Fault tests cover stale
+bindings, incomplete dependency closure, activation races, every retirement
+interruption and restart completion.

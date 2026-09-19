@@ -132,25 +132,42 @@ fn gc_namespace_view_matches_full_graph_reachability_and_transition_inputs() {
     );
 }
 
+/// Shard boundaries come from the record keys alone, so a commit that changes
+/// one inode may only replace the one shard that inode lives in. That is the
+/// whole point of ADR 0095: without it a commit re-encodes, re-hashes and
+/// republishes the entire Namespace no matter how little changed.
 #[test]
-fn content_defined_namespace_shards_retain_most_ids_across_one_local_edit() {
+fn changing_one_inode_replaces_exactly_one_namespace_shard() {
     let before = large_xattr_namespace(None).encode_graph().unwrap();
     let after = large_xattr_namespace(Some(142)).encode_graph().unwrap();
-    let before_ids = before
-        .shards()
-        .iter()
-        .map(fastdup_format::EncodedNamespaceShard::object_id)
-        .collect::<std::collections::BTreeSet<_>>();
-    let after_ids = after
-        .shards()
-        .iter()
-        .map(fastdup_format::EncodedNamespaceShard::object_id)
-        .collect::<std::collections::BTreeSet<_>>();
-    let retained = before_ids.intersection(&after_ids).count();
+    let ids = |graph: &fastdup_format::EncodedNamespaceGraph| {
+        graph
+            .shards()
+            .iter()
+            .map(fastdup_format::EncodedNamespaceShard::object_id)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before_ids = ids(&before);
+    let after_ids = ids(&after);
     assert!(
-        retained * 2 >= before_ids.len(),
-        "one local edit should retain most bounded namespace objects: {retained}/{}",
+        before_ids.len() > 2,
+        "the fixture must span several shards: {}",
         before_ids.len()
+    );
+    assert_eq!(
+        before_ids.difference(&after_ids).count(),
+        1,
+        "one changed inode must retire exactly one shard: {before_ids:?} -> {after_ids:?}"
+    );
+    assert_eq!(
+        after_ids.difference(&before_ids).count(),
+        1,
+        "one changed inode must publish exactly one new shard"
+    );
+    assert_eq!(
+        before.shards().len(),
+        after.shards().len(),
+        "a value-only edit must not repartition the Namespace"
     );
 }
 
@@ -483,4 +500,105 @@ fn every_truncated_or_single_byte_corrupt_namespace_graph_object_is_rejected_wit
             );
         }
     }
+}
+
+/// One directory's entries are a contiguous run in the canonical order, which
+/// is what lets the reachability proof walk them without a child map. The tree
+/// below interleaves two parents around a third so a run that ended early or
+/// started late would leave an inode unreachable.
+#[test]
+fn interleaved_directory_runs_prove_reachability_and_directory_link_counts() {
+    let file = |inode: u64| {
+        DurableInode::new(inode, 0o600, 10, 20, 1, 4, 5, object_id(2)).expect("regular inode")
+    };
+    let directory = |inode: u64, links: u32| {
+        DurableInode::new_directory(inode, 0o750, 10, 20, links, 1).expect("directory inode")
+    };
+    let entry = |parent: u64, target: u64, name: &[u8]| {
+        NamespaceEntry::new(parent, target, name.to_vec()).expect("valid entry")
+    };
+    let inodes = |first_directory_links: u32| {
+        vec![
+            directory(2, first_directory_links),
+            directory(3, 2),
+            file(4),
+            directory(5, 2),
+            file(6),
+            file(7),
+        ]
+    };
+    let entries = vec![
+        entry(1, 2, b"a"),
+        entry(1, 3, b"b"),
+        entry(2, 4, b"c"),
+        entry(2, 5, b"d"),
+        entry(3, 6, b"e"),
+        entry(5, 7, b"f"),
+    ];
+
+    let root = NamespaceRoot::new(1_024, 8, 0, inodes(3), entries.clone())
+        .expect("a reachable tree with matching link counts is valid");
+    assert_eq!(root.inodes().len(), 6);
+    assert_eq!(
+        NamespaceRoot::decode_canonical_state(
+            &root.encode_canonical_state().expect("encode the tree")
+        ),
+        Ok(root),
+        "the encoder must round-trip the tree byte-exactly"
+    );
+
+    assert_eq!(
+        NamespaceRoot::new(1_024, 8, 0, inodes(2), entries.clone()),
+        Err(MetadataFormatError::InvalidPayload),
+        "a directory's link count must include its child directories"
+    );
+    let mut parented_by_a_file = entries;
+    parented_by_a_file.push(entry(4, 7, b"g"));
+    parented_by_a_file.sort_by(|left, right| {
+        (left.parent_inode(), left.name()).cmp(&(right.parent_inode(), right.name()))
+    });
+    assert_eq!(
+        NamespaceRoot::new(1_024, 8, 0, inodes(3), parented_by_a_file),
+        Err(MetadataFormatError::InvalidPayload),
+        "only a directory may parent an entry"
+    );
+}
+
+/// Reports the per-generation commit cost of one whole Namespace. Every
+/// checkpoint pays construction, proof and encoding once, so this is the budget
+/// that grows with the pool rather than with the change.
+#[test]
+#[ignore = "A/B timing benchmark; run explicitly in release mode with --nocapture"]
+fn benchmark_whole_namespace_commit_encoding() {
+    const ENTRIES: u64 = 120_000;
+    let inodes = (2..2 + ENTRIES)
+        .map(|inode| {
+            DurableInode::new_directory(inode, 0o750, 10, 20, 2, 1).expect("directory inode")
+        })
+        .collect::<Vec<_>>();
+    let entries = (2..2 + ENTRIES)
+        .map(|inode| {
+            NamespaceEntry::new(1, inode, format!("fixture-{inode:016}").into_bytes())
+                .expect("valid entry")
+        })
+        .collect::<Vec<_>>();
+
+    let construct = std::time::Instant::now();
+    let root = NamespaceRoot::new(4_000_000, ENTRIES + 2, ENTRIES, inodes, entries)
+        .expect("valid namespace");
+    let construct = construct.elapsed();
+    let encode = std::time::Instant::now();
+    let payload = root
+        .encode_canonical_state()
+        .expect("encode canonical state");
+    let encode = encode.elapsed();
+    let graph = std::time::Instant::now();
+    let encoded = root.encode_graph().expect("encode graph");
+    let graph = graph.elapsed();
+    eprintln!(
+        "namespace_commit entries={ENTRIES} payload_bytes={} shards={} \
+         construct_and_prove={construct:?} encode={encode:?} encode_graph={graph:?}",
+        payload.len(),
+        encoded.shards().len()
+    );
 }

@@ -452,10 +452,16 @@ fn assert_historical_demotion_or_memory_pressure(status: HistoricalProofCacheSta
         assert!(status.admissions() > 0);
         return;
     }
+    // The shared read-cache budget may also grant this pool no residency at
+    // all, which the process-global core decides from live headroom rather than
+    // from this commit. Either way the commit itself must still have offered
+    // the demotion, which the rejection counter records.
     assert!(
         status.admission_rejections() > 0
-            && (status.swap_used_bytes() > 0 || status.available_bytes() <= status.reserve_bytes()),
-        "a successful commit may omit Historical proofs only under observed memory pressure"
+            && (status.swap_used_bytes() > 0
+                || status.available_bytes() <= status.reserve_bytes()
+                || status.target_entries() == 0),
+        "a successful commit may omit Historical proofs only when the cache declined them: {status:?}"
     );
 }
 

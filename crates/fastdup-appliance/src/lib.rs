@@ -29,6 +29,7 @@ pub use pool_isolation::{
 };
 
 pub use checkpoint::{
+    INGEST_PENDING_GATE_BYTES_V1,
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, CpuPhaseStatus,
     DurableNamespace, DurableNamespaceError, GenerationProofSetStatus, INODE_RESERVATION_SPAN_V1,
     ProfiledCheckpoint, WriteThroughStatus, checkpoint_exact_index_profile_v1,

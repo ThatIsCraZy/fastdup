@@ -83,6 +83,7 @@ fn seqcdc_force_scalar() -> bool {
 mod manifest_planning;
 mod metrics;
 mod write_through;
+pub use write_through::INGEST_PENDING_GATE_BYTES_V1;
 
 #[cfg(test)]
 use manifest_planning::SeqCdcStream;
@@ -387,6 +388,12 @@ impl OnlineDependencyProofs {
             .generation
             .lock()
             .expect("ASSERT: Generation Proof Set lock poisoned");
+        while !frozen && !state.publishing.is_empty() && state.publishing.contains(&key) {
+            state = self
+                .publication_completed
+                .wait(state)
+                .expect("ASSERT: Generation Proof Set lock poisoned while admitting Active proof");
+        }
         if let Some(references) = references {
             let target = if frozen {
                 &mut state.frozen_references
@@ -564,6 +571,12 @@ impl OnlineDependencyProofs {
                 .map(|proof| proof.entry)
             {
                 assert_entry_matches(entry, chunk_id, logical_length);
+                if state.publishing.contains(&key) {
+                    state = self.publication_completed.wait(state).expect(
+                        "ASSERT: Generation Proof Set lock poisoned while awaiting publication",
+                    );
+                    continue;
+                }
                 drop(state);
                 self.remember_active(entry, OnlineProofAdmission::Touch);
                 return PublicationClaim::Existing(entry);
@@ -2442,7 +2455,9 @@ where
         let record = self.publish_generation(&commit, manifests, &retained_ranges)?;
         self.write_through.complete_cut(sealed_at_cut);
         self.write_through.clear_checkpoint_staging_gate();
+        let proof_retire = timings.begin(CheckpointStage::ProofRetire);
         self.online_dependency_proofs.complete_frozen();
+        drop(proof_retire);
         metadata_started.finish_into(&mut metrics.metadata_commit);
         total_started.finish_into(&mut metrics.total);
         Ok(Some(ProfiledCheckpoint { record, metrics }))

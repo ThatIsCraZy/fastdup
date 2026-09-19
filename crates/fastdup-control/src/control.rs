@@ -282,6 +282,14 @@ pub struct AgentRuntime {
     cache_window: Mutex<crate::cache_window::CacheWindow>,
     events: broadcast::Sender<ControlEvent>,
     shutdown: watch::Sender<bool>,
+    /// Ids of the Jobs this process is executing right now.
+    ///
+    /// A Job has no durable progress, so the only thing that can finish one is
+    /// the task that started it. Anything the store still calls open that is
+    /// absent here is therefore dead, and the sampler fails it. Without that,
+    /// one stranded record blocks every later action: the submit guard and the
+    /// management surface both treat an open Job as an operation in progress.
+    executing_jobs: Mutex<BTreeSet<String>>,
 }
 
 impl AgentRuntime {
@@ -305,7 +313,50 @@ impl AgentRuntime {
             cache_window: Mutex::default(),
             events,
             shutdown,
+            executing_jobs: Mutex::new(BTreeSet::new()),
         })
+    }
+
+    fn enter_job(&self, id: &str) {
+        self.executing_jobs
+            .lock()
+            .expect("ASSERT: executing job set poisoned")
+            .insert(id.to_owned());
+    }
+
+    fn leave_job(&self, id: &str) {
+        self.executing_jobs
+            .lock()
+            .expect("ASSERT: executing job set poisoned")
+            .remove(id);
+    }
+
+    /// Fails Jobs the store still calls open that no task is executing.
+    fn fail_abandoned_jobs(&self) {
+        let Ok(open) = self.store.open_jobs() else {
+            return;
+        };
+        if open.is_empty() {
+            return;
+        }
+        let executing = self
+            .executing_jobs
+            .lock()
+            .expect("ASSERT: executing job set poisoned")
+            .clone();
+        for mut job in open {
+            if executing.contains(&job.id) {
+                continue;
+            }
+            let progress = job.progress_basis_points;
+            update_job(
+                self,
+                &mut job,
+                JobState::Failed,
+                progress,
+                "Aktion wurde unterbrochen und ist nicht mehr aktiv",
+            );
+        }
     }
 
     pub fn start_sampler(self: &Arc<Self>) {
@@ -405,6 +456,7 @@ impl AgentRuntime {
     }
 
     fn sample_once(&self) {
+        self.fail_abandoned_jobs();
         let frontend = read_frontend_counters();
         let health = crate::runtime_health::RuntimeHealth::read(POSIX_MOUNT, REPOSITORY_UNIT);
         self.sample_frontend(frontend.as_ref(), health);
@@ -614,6 +666,7 @@ impl AgentRuntime {
     }
 
     fn execute_job(&self, mut job: JobStatus, command: Command) {
+        self.enter_job(&job.id);
         update_job(
             self,
             &mut job,
@@ -622,6 +675,7 @@ impl AgentRuntime {
             "Aktion wird ausgeführt",
         );
         let result = self.execute_command(command);
+        self.leave_job(&job.id);
         match result {
             Ok(message) => update_job(self, &mut job, JobState::Succeeded, 10_000, &message),
             Err(error) => {

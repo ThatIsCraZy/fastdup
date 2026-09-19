@@ -917,6 +917,86 @@ fn completing_one_publication_batch_is_atomic_with_generation_freeze() {
 }
 
 #[test]
+fn frozen_proof_waits_for_the_owned_publication_claim() {
+    let proofs = Arc::new(OnlineDependencyProofs::new().expect("allocate proof sets"));
+    let entry = budget_entry(42);
+    let key = (entry.chunk_id(), entry.logical_length());
+    assert!(matches!(
+        proofs.claim_publication(key.0, key.1),
+        PublicationClaim::Acquired
+    ));
+    assert!(proofs.freeze_for_commit());
+    proofs.remember_frozen(entry, OnlineProofAdmission::Published);
+
+    let waiting_proofs = Arc::clone(&proofs);
+    let started = Arc::new(std::sync::Barrier::new(2));
+    let waiting_started = Arc::clone(&started);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        waiting_started.wait();
+        let claim = waiting_proofs.claim_publication(key.0, key.1);
+        sender.send(claim).expect("report the competing claim");
+    });
+    started.wait();
+    let escaped = receiver.recv_timeout(Duration::from_millis(100)).ok();
+
+    proofs.finish_publications(&[entry], &[key]);
+    let claim = escaped.unwrap_or_else(|| {
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the competing claim resumes after publication completion")
+    });
+    waiter
+        .join()
+        .expect("the competing claimant does not panic");
+
+    assert!(
+        escaped.is_none(),
+        "a Frozen proof cannot overtake its in-flight publication owner"
+    );
+    assert!(matches!(claim, PublicationClaim::Existing(existing) if existing == entry));
+}
+
+#[test]
+fn active_proof_admission_waits_for_an_owned_publication_claim() {
+    let proofs = Arc::new(OnlineDependencyProofs::new().expect("allocate proof sets"));
+    let entry = budget_entry(43);
+    let key = (entry.chunk_id(), entry.logical_length());
+    assert!(matches!(
+        proofs.claim_publication(key.0, key.1),
+        PublicationClaim::Acquired
+    ));
+
+    let waiting_proofs = Arc::clone(&proofs);
+    let started = Arc::new(std::sync::Barrier::new(2));
+    let waiting_started = Arc::clone(&started);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        waiting_started.wait();
+        waiting_proofs.remember_active(entry, OnlineProofAdmission::ExactReuse);
+        sender.send(()).expect("report the Active proof admission");
+    });
+    started.wait();
+    let escaped = receiver.recv_timeout(Duration::from_millis(100)).is_ok();
+
+    proofs.abandon_publications(&[key]);
+    if !escaped {
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Active proof admission resumes after claim abandonment");
+    }
+    waiter
+        .join()
+        .expect("the Active proof admission does not panic");
+
+    assert!(
+        !escaped,
+        "an Active proof cannot overtake its in-flight publication owner"
+    );
+    assert_eq!(proofs.verified_entry(key.0, u64::from(key.1)), Some(entry));
+}
+
+#[test]
 fn publication_claims_match_grouped_encoder_locations_by_chunk_key() {
     let proofs = OnlineDependencyProofs::new().expect("allocate proof sets");
     let container_id = ContainerId::new([0xB8; 16]).expect("fixture ID is nonzero");
@@ -1375,14 +1455,15 @@ fn full_registry_never_evicts_an_in_flight_ingest_lane() {
         2..u64::try_from(MAX_ACTIVE_INGEST_LANES_V1 + 2).expect("fixture lane bound fits u64")
     {
         let inode = InodeId::new(raw_inode).expect("fixture inode is nonzero");
-        held.push(registry.acquire_lane(inode));
+        held.push(registry.acquire_lane(inode).0);
     }
     assert_eq!(registry.lanes.len(), MAX_ACTIVE_INGEST_LANES_V1);
 
     let overflow_inode =
         u64::try_from(MAX_ACTIVE_INGEST_LANES_V1 + 2).expect("fixture overflow inode fits u64");
     let overflow = registry
-        .acquire_lane(InodeId::new(overflow_inode).expect("fixture overflow inode is nonzero"));
+        .acquire_lane(InodeId::new(overflow_inode).expect("fixture overflow inode is nonzero"))
+        .0;
     assert!(Arc::ptr_eq(&overflow, &registry.overflow));
     assert_eq!(registry.lanes.len(), MAX_ACTIVE_INGEST_LANES_V1);
 
@@ -1390,8 +1471,9 @@ fn full_registry_never_evicts_an_in_flight_ingest_lane() {
         ..(overflow_inode
             + u64::try_from(MAX_ACTIVE_INGEST_LANES_V1 * 2 + 2).expect("fixture grace fits u64"))
     {
-        let candidate =
-            registry.acquire_lane(InodeId::new(raw_inode).expect("fixture inode is nonzero"));
+        let candidate = registry
+            .acquire_lane(InodeId::new(raw_inode).expect("fixture inode is nonzero"))
+            .0;
         assert!(Arc::ptr_eq(&candidate, &registry.overflow));
     }
     drop(held.remove(0));
@@ -1402,6 +1484,11 @@ fn full_registry_never_evicts_an_in_flight_ingest_lane() {
                     .expect("fixture grace fits u64"),
         )
         .expect("fixture replacement inode is nonzero"),
+    );
+    let (replacement, evicted) = replacement;
+    assert!(
+        evicted.is_some(),
+        "replacing a released Lane must report the evicted stream so its bytes can be released"
     );
     assert!(!Arc::ptr_eq(&replacement, &registry.overflow));
     assert_eq!(registry.lanes.len(), MAX_ACTIVE_INGEST_LANES_V1);

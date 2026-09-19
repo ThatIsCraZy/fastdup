@@ -3307,14 +3307,38 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
                 progress.pages_skipped_resident += 1;
                 continue;
             }
-            match self.readers[run_index].warm_page(page_ordinal) {
-                Ok(true) => {
-                    progress.pages_warmed += 1;
+            // Extend over the consecutive absent ordinals this cursor is about
+            // to visit anyway: one range read replaces one read per page.
+            let page_count = readers[run_index].descriptor().page_count();
+            let limit = EXACT_COMPACTION_PAGES_PER_IO
+                .min(page_count - page_ordinal)
+                .min(policy.maximum_pages - scanned + 1);
+            let mut span = 1;
+            while span < limit {
+                let next = *page_cursor % progress.total_pages;
+                if select_warm_page(readers, next) != Some((run_index, page_ordinal + span)) {
+                    break;
+                }
+                if self.readers[run_index]
+                    .page_cache
+                    .peek(readers[run_index].descriptor().run_hash(), page_ordinal + span)
+                    .is_some()
+                {
+                    break;
+                }
+                *page_cursor = page_cursor.wrapping_add(1);
+                scanned += 1;
+                span += 1;
+            }
+            match self.readers[run_index].warm_page_span(page_ordinal, span) {
+                Ok(warmed) if warmed == span => {
+                    progress.pages_warmed += warmed;
                     if progress.pages_warmed >= policy.maximum_pages {
                         break;
                     }
                 }
-                Ok(false) => {
+                Ok(warmed) => {
+                    progress.pages_warmed += warmed;
                     progress.pages_rejected += 1;
                     break;
                 }
@@ -4805,6 +4829,23 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         }
         self.read_page(page_ordinal)?;
         Ok(self.page_cache.peek(run_hash, page_ordinal).is_some())
+    }
+
+    /// Warms `count` consecutive pages in one range read, returning how many
+    /// the bounded page cache actually retained.
+    fn warm_page_span(
+        &self,
+        first: usize,
+        count: usize,
+    ) -> Result<usize, ExactIndexStoreError> {
+        if count == 1 {
+            return Ok(usize::from(self.warm_page(first)?));
+        }
+        let run_hash = self.descriptor.run_hash();
+        self.decoded_page_span(first, count)?;
+        Ok((first..first + count)
+            .take_while(|ordinal| self.page_cache.peek(run_hash, *ordinal).is_some())
+            .count())
     }
 
     fn read_page(&self, page_ordinal: usize) -> Result<Arc<ExactIndexPage>, ExactIndexStoreError> {

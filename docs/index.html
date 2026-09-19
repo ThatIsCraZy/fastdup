@@ -39,9 +39,9 @@
         "name": "fastdup",
         "applicationCategory": "StorageApplication",
         "operatingSystem": "Rocky Linux 10 x86-64",
-        "softwareVersion": "0.7.4",
+        "softwareVersion": "0.8.0",
         "license": "https://www.apache.org/licenses/LICENSE-2.0",
-        "downloadUrl": "https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm",
+        "downloadUrl": "https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm",
         "codeRepository": "https://github.com/ThatIsCraZy/fastdup"
       }
     </script>
@@ -60,6 +60,8 @@
         <a class="lang-en" href="#ueberblick">Overview</a>
         <a class="lang-de" href="#performance">Leistung</a>
         <a class="lang-en" href="#performance">Performance</a>
+        <a class="lang-de" href="#veeam">Veeam</a>
+        <a class="lang-en" href="#veeam">Veeam</a>
         <a href="#rust">Rust</a>
         <a class="lang-de" href="#webui">WebUI</a>
         <a class="lang-en" href="#webui">WebUI</a>
@@ -109,12 +111,12 @@
           <div class="hero-actions">
             <a
               class="button primary lang-de"
-              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm"
+              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm"
               >RPM herunterladen <span>↓</span></a
             >
             <a
               class="button primary lang-en"
-              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm"
+              href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm"
               >Download RPM <span>↓</span></a
             >
             <a class="button secondary lang-de" href="#installation"
@@ -133,7 +135,7 @@
             data.
           </p>
           <div class="compatibility">
-            <span>RPM v0.7.4</span><span>Rocky Linux 10</span><span>x86-64</span
+            <span>RPM v0.8.0</span><span>Rocky Linux 10</span><span>x86-64</span
             ><span>Rust</span>
           </div>
         </div>
@@ -156,16 +158,20 @@
 
       <div class="section-shell release-note">
         <p lang="de" class="lang-de">
-          <b>Neu in v0.7.4 · 12.09.2026:</b> Begrenzte Record-Reads bei fehlenden
-          Exact-Index-Hinweisen, korrekter Mount-/Dienstzustand, zurückgegebenes
-          Allocator-RAM sowie Lese- und Schreib-IOPS in der WebUI.
-          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.4">Release-Details ↗</a>
+          <b>Neu in v0.8.0 · 19.09.2026:</b> Veeam-Backup über SMB und SMB Fast
+          Clone sind auf der Test-Appliance bestätigt. Ingest verliert keinen
+          Durchsatz mehr über die Laufzeit, der Namespace wird als
+          inhaltsadressierter Baum veröffentlicht. Repository-Format-Epoch 3 —
+          bestehende Pools werden nicht migriert.
+          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.8.0">Release-Details ↗</a>
         </p>
         <p lang="en" class="lang-en">
-          <b>New in v0.7.4 · 12 September 2026:</b> Bounded Record reads when Exact
-          hints are missing, accurate mount/service health, reclaimed allocator
-          RAM, and read/write IOPS in the WebUI.
-          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.4">Release details ↗</a>
+          <b>New in v0.8.0 · 19 September 2026:</b> Veeam backup over SMB and SMB
+          Fast Clone are confirmed on the test appliance. Ingest no longer
+          degrades with uptime, and the Namespace is published as a
+          content-addressed tree. Repository format epoch 3 — existing pools are
+          not migrated.
+          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.8.0">Release details ↗</a>
         </p>
       </div>
       <section class="trust-strip" aria-label="Produktmerkmale">
@@ -592,6 +598,131 @@
           </div>
         </div>
       </section>
+      <section id="veeam" class="section-shell plain-section">
+        <div class="section-heading">
+          <div class="eyebrow lang-de"><span></span> VEEAM · 19.09.2026</div>
+          <div class="eyebrow lang-en"><span></span> VEEAM · 19 SEPTEMBER 2026</div>
+          <h2 lang="de" class="lang-de">
+            Veeam-Backup über SMB läuft — gemessen, nicht zertifiziert.
+          </h2>
+          <h2 lang="en" class="lang-en">
+            Veeam backup over SMB works — measured, not certified.
+          </h2>
+        </div>
+        <p lang="de" class="lang-de section-lead">
+          Veeam Backup &amp; Replication schreibt eine VMware-Backup-Sicherung auf
+          eine fastdup-SMB-Freigabe. Fünf aufeinanderfolgende Sessions auf der
+          Test-Appliance endeten mit Ergebnis <b>Success</b>. Veeam meldete
+          durchgehend das Target als Bottleneck.
+        </p>
+        <p lang="en" class="lang-en section-lead">
+          Veeam Backup &amp; Replication writing a VMware backup job to a fastdup
+          SMB share. Five consecutive sessions on the test appliance finished
+          with result <b>Success</b>, and Veeam reported the target as the
+          bottleneck throughout.
+        </p>
+        <div class="metric-grid">
+          <article>
+            <span lang="de" class="lang-de metric">8 / 8</span
+            ><span lang="en" class="lang-en metric">8 / 8</span
+            ><strong lang="de" class="lang-de">Tasks erfolgreich</strong
+            ><strong lang="en" class="lang-en">tasks succeeded</strong>
+            <h3 lang="de" class="lang-de">Eine vollständige Session</h3>
+            <h3 lang="en" class="lang-en">One complete session</h3>
+            <p lang="de" class="lang-de">
+              Full-Backup, 620,0 GiB verarbeitet, 283,4 GiB auf die Appliance
+              übertragen.
+            </p>
+            <p lang="en" class="lang-en">
+              Full backup, 620.0 GiB processed, 283.4 GiB transferred to the
+              appliance.
+            </p>
+          </article>
+          <article>
+            <span lang="de" class="lang-de metric">653,3</span
+            ><span lang="en" class="lang-en metric">653.3</span
+            ><strong>MB/s</strong>
+            <h3 lang="de" class="lang-de">Übertragung, aggregiert</h3>
+            <h3 lang="en" class="lang-en">Aggregate transfer</h3>
+            <p lang="de" class="lang-de">
+              283,4 GiB in einem Task-Fenster von 465,8 Sekunden, acht parallele
+              Tasks.
+            </p>
+            <p lang="en" class="lang-en">
+              283.4 GiB in a 465.8-second task window across eight parallel
+              tasks.
+            </p>
+          </article>
+          <article>
+            <span class="metric">0</span
+            ><strong lang="de" class="lang-de">Fehler</strong
+            ><strong lang="en" class="lang-en">failures</strong>
+            <h3 lang="de" class="lang-de">SMB-Operationen</h3>
+            <h3 lang="en" class="lang-en">SMB operations</h3>
+            <p lang="de" class="lang-de">
+              74.710 Writes, 768 Flushes, 803 Closes — keiner davon
+              fehlgeschlagen.
+            </p>
+            <p lang="en" class="lang-en">
+              74,710 writes, 768 flushes, 803 closes — none of them failed.
+            </p>
+          </article>
+        </div>
+        <div class="benchmark-notes">
+          <p lang="de" class="lang-de">
+            <b>Fast Clone über SMB ist ebenfalls bestätigt.</b> Mit der
+            4-KiB-Clone-Geometrie aus v0.7.1 funktionieren ausgerichtete Clones,
+            Teil-Clone-Längen und aufeinanderfolgende Clones auf dieselbe Quelle.
+            Die hier dokumentierte Session war ein Full-Backup und prüft damit
+            den Schreibpfad, nicht Fast Clone; dafür gelten die separaten
+            Clone-Läufe vom 09.09.2026.
+          </p>
+          <p lang="en" class="lang-en">
+            <b>Fast Clone over SMB is confirmed as well.</b> With the 4 KiB clone
+            geometry from v0.7.1, aligned clones, partial clone lengths and
+            consecutive clones against the same source all work. The session
+            documented here was a Full backup and therefore exercises the write
+            path rather than Fast Clone; the separate clone runs of 9 September
+            2026 cover that.
+          </p>
+          <p lang="de" class="lang-de">
+            <b>Was das nicht ist:</b> keine Veeam-Zertifizierung, keine von Veeam
+            unterstützte Konfiguration, keine Support-Zusage und keine
+            Performance-SLA. Gemessen wurde auf genau einer Test-Appliance.
+          </p>
+          <p lang="en" class="lang-en">
+            <b>What this is not:</b> not a Veeam certification, not a
+            Veeam-supported configuration, not a support statement, and not a
+            performance SLA. It was measured on exactly one test appliance.
+          </p>
+          <p lang="de" class="lang-de">
+            <b>In Arbeit:</b> Die Integration des <b>Veeam Repository Agent</b> in
+            die Appliance, damit fastdup als Linux-Repository eingebunden werden
+            kann und nicht nur als SMB-Freigabe. Das ist noch nicht Teil eines
+            Release.
+          </p>
+          <p lang="en" class="lang-en">
+            <b>In progress:</b> integrating the <b>Veeam Repository Agent</b> into
+            the appliance, so fastdup can be added as a Linux repository rather
+            than only as an SMB share. This is not part of a release yet.
+          </p>
+        </div>
+        <div class="evidence-links">
+          <a
+            href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/testing/veeam-backup-2026-09-19.md"
+            ><span lang="de" class="lang-de">Veeam-Backup: vollständige Messung</span
+            ><span lang="en" class="lang-en">Veeam backup: full measurement</span> ↗</a
+          ><a
+            href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/testing/veeam-consecutive-clones-2026-09-09.md"
+            ><span lang="de" class="lang-de">Fast Clone: aufeinanderfolgende Clones</span
+            ><span lang="en" class="lang-en">Fast Clone: consecutive clones</span> ↗</a
+          ><a
+            href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/testing/veeam-clone-alignment-2026-09-09.md"
+            ><span lang="de" class="lang-de">Fast Clone: Ausrichtung</span
+            ><span lang="en" class="lang-en">Fast Clone: alignment</span> ↗</a
+          >
+        </div>
+      </section>
       <section id="reduction" class="section-shell reduction-section">
         <div class="section-heading">
           <div class="eyebrow">REDUCTION</div>
@@ -640,14 +771,14 @@
             <span class="stage workload">WORKLOAD</span>
             <h3>Metadata Fast Clone</h3>
             <p lang="de" class="lang-de">
-              copy_file_range klont vorhandene Extents über Metadaten. Der
-              Nutzen hängt von der Anwendung ab; Samba Fast Clone ist weiterhin
-              experimentell und nicht Veeam-qualifiziert.
+              copy_file_range klont vorhandene Extents über Metadaten. Fast
+              Clone über SMB ist mit Veeam auf der Test-Appliance bestätigt —
+              eine Zertifizierung durch Veeam ist das nicht.
             </p>
             <p lang="en" class="lang-en">
-              copy_file_range clones existing extents through metadata. Benefits
-              depend on the application; Samba Fast Clone remains experimental
-              and is not Veeam-qualified.
+              copy_file_range clones existing extents through metadata. Fast
+              Clone over SMB is confirmed with Veeam on the test appliance —
+              which is not a certification by Veeam.
             </p>
           </article>
           <article>
@@ -1045,12 +1176,12 @@
                 retention
               </li>
               <li class="lang-de">
-                Als qualifiziertes Veeam-Repository — Fast Clone ist
-                experimentell und nicht zertifiziert
+                Als von Veeam zertifiziertes Repository — Backup und Fast Clone
+                funktionieren gemessen, zertifiziert ist die Integration nicht
               </li>
               <li class="lang-en">
-                As a qualified Veeam repository — Fast Clone is experimental and
-                not certified
+                As a Veeam-certified repository — backup and Fast Clone are
+                measured to work, but the integration is not certified
               </li>
               <li class="lang-de">
                 Wenn Herstellersupport, Reaktionszeiten oder Kapazitätsgarantien
@@ -1234,10 +1365,10 @@
             </div>
             <pre
               id="install"
-            ><code>curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm &amp;&amp;
-curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/SHA256SUMS &amp;&amp;
+            ><code>curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm &amp;&amp;
+curl -fLO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/SHA256SUMS &amp;&amp;
 sha256sum --check --ignore-missing SHA256SUMS &amp;&amp;
-sudo dnf install ./fastdup-0.7.4-1.el10.x86_64.rpm &amp;&amp;
+sudo dnf install ./fastdup-0.8.0-1.el10.x86_64.rpm &amp;&amp;
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code></pre>
             <p id="copy-status" role="status" aria-live="polite"></p>
             <div class="terminal-result">
@@ -1327,12 +1458,17 @@ sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code>
             Test with your own software before relying on it.
           </li>
           <li class="lang-de">
-            <b>Samba Fast Clone ist experimentell.</b> Als Veeam-Repository ist
-            fastdup derzeit nicht qualifiziert.
+            <b>Veeam läuft, ist aber nicht zertifiziert.</b> Backup über SMB und
+            SMB Fast Clone sind auf der Test-Appliance bestätigt. Eine
+            Veeam-Zertifizierung, eine Support-Zusage oder eine Performance-SLA
+            ist damit nicht verbunden. Am Veeam Repository Agent in der
+            Appliance wird gearbeitet.
           </li>
           <li class="lang-en">
-            <b>Samba Fast Clone is experimental.</b> fastdup is currently not
-            qualified as a Veeam repository.
+            <b>Veeam works, but is not certified.</b> Backup over SMB and SMB
+            Fast Clone are confirmed on the test appliance. That is not a Veeam
+            certification, a support statement, or a performance SLA. Work on
+            the Veeam Repository Agent inside the appliance is under way.
           </li>
           <li class="lang-de">
             <b>Kein Produktions-Support, keine Performance-SLA.</b> Fragen und
@@ -1537,22 +1673,22 @@ sudo systemctl enable --now fastdup-agent.service fastdup-control.service</code>
             See the WebUI. Install the RPM. Evaluate fastdup.
           </h2>
           <p class="lang-de">
-            Release 0.7.4 für Rocky Linux 10 auf x86-64. Forschungsprototyp —
+            Release 0.8.0 für Rocky Linux 10 auf x86-64. Forschungsprototyp —
             bitte nicht als einzige Kopie wichtiger Daten einsetzen.
           </p>
           <p class="lang-en">
-            Release 0.7.4 for Rocky Linux 10 on x86-64. Research prototype —
+            Release 0.8.0 for Rocky Linux 10 on x86-64. Research prototype —
             please do not use it as the only copy of important data.
           </p>
         </div>
         <div>
           <a
             class="button primary lang-de"
-            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm"
+            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm"
             >RPM herunterladen <span>↓</span></a
           ><a
             class="button primary lang-en"
-            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm"
+            href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm"
             >Download RPM <span>↓</span></a
           ><a
             class="button secondary"

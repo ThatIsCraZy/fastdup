@@ -280,7 +280,9 @@ fn metadata_tier_loss_recovers_the_latest_self_contained_checkpoint() {
         .expect("publish one self-contained DATA-tier checkpoint")
         .expect("one committed source generation exists");
     assert_eq!(published.generation(), committed.generation());
-    assert_eq!(published.metadata_object_count(), 3);
+    // Graph root, one inode shard, one entry shard, one Manifest: the Namespace
+    // publishes inode and directory-entry records as separate shards.
+    assert_eq!(published.metadata_object_count(), 4);
     data.crash();
 
     let replacement_metadata = MemoryStorageIo::new();

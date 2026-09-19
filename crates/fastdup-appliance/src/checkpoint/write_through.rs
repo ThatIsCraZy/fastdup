@@ -49,7 +49,7 @@ const DETACHED_CONTAINER_BUDGET_BYTES_V1: usize = 2 * CONTAINER_PAYLOAD_TARGET_B
 // admission blocks while the combined region would exceed it; only checkpoint
 // planning (Container absorption) or a queue handoff releases it. A commit-cut
 // drain itself never blocks: all Lanes can be drained while the region is empty.
-const INGEST_PENDING_GATE_BYTES_V1: usize = WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1
+pub const INGEST_PENDING_GATE_BYTES_V1: usize = WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1
     - WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1
     - DETACHED_CONTAINER_BUDGET_BYTES_V1;
 const PUBLICATION_WAIT_DIAGNOSTIC_INTERVAL_V1: Duration = Duration::from_secs(5);
@@ -60,7 +60,7 @@ const WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1: usize = 1_024 * 1_024;
 const SINGLE_STREAM_INGEST_BATCH_BYTES_V1: usize = 4 * 1_024 * 1_024;
 const SINGLE_STREAM_INGEST_RING_SLOTS_V1: usize = 8;
 const INGEST_BATCH_MAXIMUM_AGE_V1: Duration = Duration::from_millis(10);
-const MAX_ACTIVE_INGEST_LANES_V1: usize = (WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1
+pub(super) const MAX_ACTIVE_INGEST_LANES_V1: usize = (WRITE_THROUGH_BUFFER_BUDGET_BYTES_V1
     - WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1
     - DETACHED_CONTAINER_BUDGET_BYTES_V1)
     / (CONTAINER_PAYLOAD_TARGET_BYTES + CDC_MAXIMUM_BYTES)
@@ -877,6 +877,7 @@ pub(super) struct PendingRegions {
     residue_bytes: Arc<AtomicUsize>,
     space_available: Arc<(Mutex<()>, Condvar)>,
     checkpoint_staging_open: Arc<AtomicBool>,
+    commit_cut_staging_depth: Arc<AtomicUsize>,
     forced_staging_batches: Arc<AtomicU64>,
 }
 
@@ -887,12 +888,17 @@ impl PendingRegions {
             residue_bytes: Arc::new(AtomicUsize::new(0)),
             space_available: Arc::new((Mutex::new(()), Condvar::new())),
             checkpoint_staging_open: Arc::new(AtomicBool::new(false)),
+            commit_cut_staging_depth: Arc::new(AtomicUsize::new(0)),
             forced_staging_batches: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn residue_bytes(&self) -> usize {
         self.residue_bytes.load(Ordering::Relaxed)
+    }
+
+    fn lane_region_bytes(&self) -> usize {
+        self.lane_region_bytes.load(Ordering::Relaxed)
     }
 
     /// Reserves staging growth for one Ingest Batch, blocking while the
@@ -918,7 +924,7 @@ impl PendingRegions {
             {
                 break;
             }
-            if self.checkpoint_staging_open.load(Ordering::Acquire) {
+            if self.staging_hatch_admits() {
                 atomic_saturating_add(&self.forced_staging_batches, 1);
                 break;
             }
@@ -928,6 +934,42 @@ impl PendingRegions {
         }
         drop(guard);
         self.lane_region_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Reports whether either escape hatch currently admits a blocked batch.
+    ///
+    /// The watchdog hatch and the commit-cut hatch are tracked separately so a
+    /// scoped commit-cut window cannot close a one-generation hatch that the
+    /// checkpoint watchdog opened for a transient admission pause.
+    fn staging_hatch_admits(&self) -> bool {
+        self.checkpoint_staging_open.load(Ordering::Acquire)
+            || self.commit_cut_staging_depth.load(Ordering::Acquire) != 0
+    }
+
+    /// Admits blocked staging for as long as a commit cut waits for its own
+    /// Ingest backlog.
+    ///
+    /// The pending region a blocked batch wants is released by the Lane drain
+    /// that this very cut performs once the wait returns, so the wait and the
+    /// gate would otherwise form a cycle that only the five-second watchdog
+    /// breaks. Admitting here cannot grow the region past its structural bound:
+    /// a Lane retains at most one Container target plus its incomplete `SeqCDC`
+    /// suffix, and in-flight reservations are bounded by the Ingest Batch
+    /// target times the worker count.
+    fn open_commit_cut_staging(&self) {
+        self.commit_cut_staging_depth
+            .fetch_add(1, Ordering::AcqRel);
+        self.space_available.1.notify_all();
+    }
+
+    fn close_commit_cut_staging(&self) {
+        let previous = self
+            .commit_cut_staging_depth
+            .fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous != 0,
+            "ASSERT: commit-cut staging hatch cannot close below its open count"
+        );
     }
 
     fn force_checkpoint_staging(&self) {
@@ -1011,6 +1053,24 @@ impl PendingRegions {
             "ASSERT: Container absorption cannot underflow the Drain Residue ledger"
         );
         self.space_available.1.notify_all();
+    }
+}
+
+/// Holds the commit-cut staging hatch open for the lifetime of the value.
+struct CommitCutStagingHatch<'a> {
+    regions: &'a PendingRegions,
+}
+
+impl<'a> CommitCutStagingHatch<'a> {
+    fn open(regions: &'a PendingRegions) -> Self {
+        regions.open_commit_cut_staging();
+        Self { regions }
+    }
+}
+
+impl Drop for CommitCutStagingHatch<'_> {
+    fn drop(&mut self) {
+        self.regions.close_commit_cut_staging();
     }
 }
 
@@ -1104,7 +1164,18 @@ impl WriteThroughRegistry {
         }
     }
 
-    fn acquire_lane(&mut self, inode: InodeId) -> Arc<Mutex<WriteThroughStream>> {
+    /// Returns the Lane for `inode` and any Lane evicted to make room for it.
+    ///
+    /// The caller must release the evicted Lane's charged bytes: its buffers
+    /// are freed with the stream, so bytes left charged against the
+    /// pending-region gate retire that capacity for the process lifetime.
+    fn acquire_lane(
+        &mut self,
+        inode: InodeId,
+    ) -> (
+        Arc<Mutex<WriteThroughStream>>,
+        Option<Arc<Mutex<WriteThroughStream>>>,
+    ) {
         let touch = self.next_touch;
         self.next_touch = self
             .next_touch
@@ -1112,7 +1183,7 @@ impl WriteThroughRegistry {
             .expect("ASSERT: Ingest Lane touch sequence cannot overflow");
         if let Some(lane) = self.lanes.get_mut(&inode) {
             lane.last_touch = touch;
-            return Arc::clone(&lane.stream);
+            return (Arc::clone(&lane.stream), None);
         }
         if self
             .overflow
@@ -1121,8 +1192,9 @@ impl WriteThroughRegistry {
             .inode
             == Some(inode)
         {
-            return Arc::clone(&self.overflow);
+            return (Arc::clone(&self.overflow), None);
         }
+        let mut released = None;
         if self.lanes.len() >= MAX_ACTIVE_INGEST_LANES_V1 {
             let eviction_grace = u64::try_from(MAX_ACTIVE_INGEST_LANES_V1 * 2)
                 .expect("ASSERT: bounded Ingest Lane grace fits u64");
@@ -1134,10 +1206,13 @@ impl WriteThroughRegistry {
                 .min_by_key(|(candidate_inode, lane)| (lane.last_touch, **candidate_inode))
                 .map(|(candidate_inode, _)| *candidate_inode);
             if let Some(evicted) = evicted {
-                let removed = self.lanes.remove(&evicted);
-                assert!(removed.is_some(), "ASSERT: selected Ingest Lane vanished");
+                let removed = self
+                    .lanes
+                    .remove(&evicted)
+                    .expect("ASSERT: selected Ingest Lane vanished");
+                released = Some(removed.stream);
             } else {
-                return Arc::clone(&self.overflow);
+                return (Arc::clone(&self.overflow), None);
             }
         }
         let lane = Arc::new(Mutex::new(WriteThroughStream::default()));
@@ -1157,7 +1232,7 @@ impl WriteThroughRegistry {
             self.lanes.len() <= MAX_ACTIVE_INGEST_LANES_V1,
             "ASSERT: registered Ingest Lanes exceed the process memory budget"
         );
-        lane
+        (lane, released)
     }
 }
 
@@ -1293,6 +1368,7 @@ struct IngestQueue {
     space_available: Condvar,
     completed: Condvar,
     admission_closing: AtomicBool,
+    cut_pending: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -1723,6 +1799,7 @@ impl IngestQueue {
             space_available: Condvar::new(),
             completed: Condvar::new(),
             admission_closing: AtomicBool::new(false),
+            cut_pending: AtomicBool::new(false),
         }
     }
 
@@ -1743,6 +1820,26 @@ impl IngestQueue {
             .lock()
             .expect("ASSERT: ingest queue lock poisoned while reopening admission");
         self.admission_closing.store(false, Ordering::SeqCst);
+    }
+
+    /// Releases writers that are blocked on queue capacity because the commit
+    /// cut waiting for the admission fence is the only path that reclaims it.
+    /// Queue admission that does not block keeps its ordinary backpressure.
+    fn notify_commit_cut_pending(&self) {
+        let _state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned while announcing a commit cut");
+        self.cut_pending.store(true, Ordering::SeqCst);
+        self.space_available.notify_all();
+    }
+
+    fn notify_commit_cut_taken(&self) {
+        let _state = self
+            .state
+            .lock()
+            .expect("ASSERT: ingest queue lock poisoned while completing a commit cut");
+        self.cut_pending.store(false, Ordering::SeqCst);
     }
 
     fn seal_inode_for_admission_backpressure(&self, inode: InodeId) {
@@ -1826,7 +1923,13 @@ impl IngestQueue {
             .checked_add(fragment.bytes.len())
             .is_none_or(|total| total > MULTI_STREAM_QUEUE_BUDGET_BYTES_V1)
         {
-            if self.admission_closing.load(Ordering::Acquire) {
+            // Both signals mean the same thing for a writer that still holds
+            // mutation admission: the capacity it is waiting for is reclaimed
+            // by a checkpoint that cannot run until this writer returns.
+            if self.admission_closing.load(Ordering::Acquire)
+                || self.cut_pending.load(Ordering::Acquire)
+            {
+                record_ingest_wait(&mut state, waited, wait_started);
                 if seal_open_ingest_batch(&mut state, inode) {
                     self.work_available.notify_all();
                 }
@@ -1839,16 +1942,13 @@ impl IngestQueue {
                 .expect("ASSERT: ingest queue lock poisoned while applying backpressure");
         }
         if self.admission_closing.load(Ordering::Acquire) {
+            record_ingest_wait(&mut state, waited, wait_started);
             if seal_open_ingest_batch(&mut state, inode) {
                 self.work_available.notify_all();
             }
             return;
         }
-        if waited {
-            state.ingest_ring_wait_ns = state.ingest_ring_wait_ns.saturating_add(
-                u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            );
-        }
+        record_ingest_wait(&mut state, waited, wait_started);
         record_ingest_batch_target(&mut state, WRITE_THROUGH_FRAGMENT_MAX_BYTES_V1);
         state.buffered_bytes = state
             .buffered_bytes
@@ -1892,6 +1992,7 @@ impl IngestQueue {
         let mut waited = false;
         loop {
             if self.admission_closing.load(Ordering::Acquire) {
+                record_ingest_wait(&mut state, waited, wait_started);
                 if seal_open_ingest_batch(&mut state, inode) {
                     self.work_available.notify_all();
                 }
@@ -1924,12 +2025,19 @@ impl IngestQueue {
                 .checked_add(fragment.bytes.len())
                 .is_some_and(|total| total <= WRITE_THROUGH_QUEUE_BUDGET_BYTES_V1);
             if has_slot && has_bytes {
-                if waited {
-                    state.ingest_ring_wait_ns = state.ingest_ring_wait_ns.saturating_add(
-                        u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    );
-                }
+                record_ingest_wait(&mut state, waited, wait_started);
                 return Some(state);
+            }
+            // A commit cut is waiting for the admission fence that this
+            // writer holds, and only that cut reclaims the capacity this wait
+            // needs. Seal what the batch already has and leave the fragment
+            // resident for checkpoint planning instead of forming that cycle.
+            if self.cut_pending.load(Ordering::Acquire) {
+                record_ingest_wait(&mut state, waited, wait_started);
+                if seal_open_ingest_batch(&mut state, inode) {
+                    self.work_available.notify_all();
+                }
+                return None;
             }
             waited = true;
             #[cfg(test)]
@@ -2113,6 +2221,21 @@ impl IngestQueue {
 
 fn ingest_ring_slots(queue: &InodeJobQueue) -> usize {
     queue.pending.len() + usize::from(queue.in_flight) + usize::from(queue.open.is_some())
+}
+
+/// Accounts a writer's ingest-capacity wait on every exit path.
+///
+/// A writer released by an announced commit cut waited exactly as long as one
+/// released by returning capacity, and under load that is the release path
+/// almost every stall takes. Charging only the capacity path left the reported
+/// wait near zero while writers were parked for most of their wall time.
+fn record_ingest_wait(state: &mut IngestQueueState, waited: bool, since: Instant) {
+    if !waited {
+        return;
+    }
+    state.ingest_ring_wait_ns = state
+        .ingest_ring_wait_ns
+        .saturating_add(u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX));
 }
 
 fn active_ingest_inodes_with_candidate(state: &IngestQueueState, candidate: InodeId) -> usize {
@@ -2739,6 +2862,8 @@ where
             maximum_ingest_ring_slots: u64::try_from(ingest.maximum_ingest_ring_slots)
                 .expect("ASSERT: bounded Ingest Ring slots fit u64"),
             ingest_ring_wait_ns: ingest.ingest_ring_wait_ns,
+            pending_region_bytes: self.pending_regions.lane_region_bytes() as u64,
+            pending_residue_bytes: self.pending_regions.residue_bytes() as u64,
             hash_cpu: self.hash_cpu.status(),
             encode_cpu: self.encode_cpu.status(),
             planning_cpu: self.planning_cpu.status(),
@@ -2762,6 +2887,42 @@ where
 
     pub(super) fn forced_staging_batches(&self) -> u64 {
         self.pending_regions.forced_staging_batches()
+    }
+
+    /// Bytes the pending-region gate currently charges for Lane payload.
+    #[cfg(test)]
+    pub(super) fn charged_region_bytes(&self) -> usize {
+        self.pending_regions.lane_region_bytes()
+    }
+
+    /// Bytes the live Ingest Lanes actually hold right now.
+    #[cfg(test)]
+    pub(super) fn live_lane_region_bytes(&self) -> usize {
+        let registry = self
+            .registry
+            .lock()
+            .expect("ASSERT: write-through registry lock poisoned");
+        let mut total = 0;
+        for lane in registry.lanes.values() {
+            let stream = lane
+                .stream
+                .lock()
+                .expect("ASSERT: write-through lane lock poisoned");
+            total += stream.tail.len() + stream.pending.bytes;
+        }
+        let overflow = registry
+            .overflow
+            .lock()
+            .expect("ASSERT: write-through overflow lane lock poisoned");
+        total + overflow.tail.len() + overflow.pending.bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_cut_staging_open(&self) -> bool {
+        self.pending_regions
+            .commit_cut_staging_depth
+            .load(Ordering::Acquire)
+            != 0
     }
 
     #[cfg(test)]
@@ -2790,6 +2951,11 @@ where
         timings: &CheckpointTimings,
         metrics: &mut CheckpointMetrics,
     ) {
+        // The backlog this wait drains is staged through the pending-region
+        // gate, and the gate is reclaimed by the Lane drain that follows the
+        // wait. Hold the commit-cut hatch open for exactly this window so the
+        // cycle never forms instead of leaving it to the watchdog.
+        let _hatch = CommitCutStagingHatch::open(&self.pending_regions);
         for inode in commit.inodes() {
             let ingest = timings.begin(CheckpointStage::IngestWait);
             self.queue
@@ -3032,6 +3198,13 @@ where
                 continue;
             };
             let fence = commit_fences.get(&inode.get()).copied().unwrap_or(u64::MIN);
+            // The drain publishes Lane payload without a staging reservation,
+            // so nothing settles its ledger the way `stage_write_batch` does.
+            // Measure the Lane's gated region across the whole drain and give
+            // back everything that left it other than the Drain Residue, which
+            // `transfer_lane_to_residue` moves rather than releases.
+            let region_before = lane.tail.len() + lane.pending.bytes;
+            let mut transferred_to_residue = 0_usize;
             loop {
                 let extract_started = timings.begin(CheckpointStage::StableExtract);
                 let previous_tail = lane.tail.len();
@@ -3105,6 +3278,9 @@ where
                         // The Lane payload and its Drain Residue share one gated
                         // region; this transfer never blocks a drain.
                         self.pending_regions.transfer_lane_to_residue(charged_bytes);
+                        transferred_to_residue = transferred_to_residue
+                            .checked_add(charged_bytes)
+                            .expect("ASSERT: bounded Drain Residue transfer cannot overflow");
                         residues.push(DrainResidue {
                             inode,
                             chunks,
@@ -3125,6 +3301,15 @@ where
                     break;
                 }
             }
+            let region_after = lane.tail.len() + lane.pending.bytes;
+            let detached = region_before
+                .checked_sub(region_after)
+                .expect("ASSERT: a commit-cut drain cannot grow its Lane region");
+            self.pending_regions.release_lane_bytes(
+                detached
+                    .checked_sub(transferred_to_residue)
+                    .expect("ASSERT: Drain Residue is part of the detached Lane region"),
+            );
             assert!(
                 lane.pending
                     .chunks
@@ -3154,11 +3339,25 @@ where
     }
 
     pub(super) fn lane_for(&self, inode: InodeId) -> Arc<Mutex<WriteThroughStream>> {
-        let mut registry = self
-            .registry
-            .lock()
-            .expect("ASSERT: write-through registry lock poisoned");
-        registry.acquire_lane(inode)
+        let (lane, evicted) = {
+            let mut registry = self
+                .registry
+                .lock()
+                .expect("ASSERT: write-through registry lock poisoned");
+            registry.acquire_lane(inode)
+        };
+        // An evicted Lane's retained payload vanishes with its buffers. Give
+        // the bytes back to the gate outside the Registry lock; leaving them
+        // charged retires that capacity permanently and eventually blocks
+        // every staging reservation the process makes.
+        if let Some(evicted) = evicted {
+            let evicted = evicted
+                .lock()
+                .expect("ASSERT: evicted Ingest Lane lock poisoned");
+            self.pending_regions
+                .release_lane_bytes(evicted.tail.len() + evicted.pending.bytes);
+        }
+        lane
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3177,6 +3376,7 @@ where
         if extraction == StableExtraction::FillContainer && stable_before < stable_required {
             return Ok(Vec::new());
         }
+        let warm_read_cache = self.advanced_reduction_enabled_for(inode);
         let mut externalized = Vec::new();
         while state.pending.bytes < CONTAINER_PAYLOAD_FLUSH_BYTES {
             let maximum_batch_bytes = CONTAINER_PAYLOAD_FLUSH_BYTES
@@ -3230,16 +3430,18 @@ where
                     logical_length,
                     false,
                 ) {
-                    let segments: Vec<&[u8]> = chunk
-                        .bytes
-                        .parts
-                        .as_slice()
-                        .iter()
-                        .map(MutationPayload::as_bytes)
-                        .collect();
-                    self.index
-                        .read_cache()
-                        .admit_writer_chunk(chunk_id, &segments);
+                    if warm_read_cache {
+                        let segments: Vec<&[u8]> = chunk
+                            .bytes
+                            .parts
+                            .as_slice()
+                            .iter()
+                            .map(MutationPayload::as_bytes)
+                            .collect();
+                        self.index
+                            .read_cache()
+                            .admit_writer_chunk(chunk_id, &segments);
+                    }
                     externalized.push(self.externalized_proven_location(
                         inode,
                         chunk.offset,
@@ -3525,6 +3727,7 @@ where
             .try_reserve(chunks.len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
         let mut entries = Vec::with_capacity(chunks.len());
+        let warm_read_cache = self.advanced_reduction_enabled_for(inode);
         for pending in chunks {
             let chunk_id = pending.chunk_id;
             let entry = locations
@@ -3542,19 +3745,21 @@ where
                     second_length: u64::from(expected_length),
                 });
             }
-            // Publication/Exact claims have completed. Before resident dirty
-            // backing is retired, offer logical bytes to the same reader cache.
-            // This is content reuse only, never a physical verification proof.
-            let segments: Vec<&[u8]> = pending
-                .bytes
-                .parts
-                .as_slice()
-                .iter()
-                .map(MutationPayload::as_bytes)
-                .collect();
-            self.index
-                .read_cache()
-                .admit_writer_chunk(chunk_id, &segments);
+            // Only Similarity-enabled writers warm potential Base bytes.
+            // Demand reads retain their normal verified cache admission.
+            // Writer content never creates physical Location evidence.
+            if warm_read_cache {
+                let segments: Vec<&[u8]> = pending
+                    .bytes
+                    .parts
+                    .as_slice()
+                    .iter()
+                    .map(MutationPayload::as_bytes)
+                    .collect();
+                self.index
+                    .read_cache()
+                    .admit_writer_chunk(chunk_id, &segments);
+            }
             entries.push(entry);
         }
         // One shared virtual file per bounded publication lets live reads
@@ -3654,6 +3859,14 @@ where
 
     fn admission_closing(&self) {
         self.queue.notify_admission_closing();
+    }
+
+    fn commit_cut_pending(&self) {
+        self.queue.notify_commit_cut_pending();
+    }
+
+    fn commit_cut_taken(&self) {
+        self.queue.notify_commit_cut_taken();
     }
 
     fn admission_opened(&self) {

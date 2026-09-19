@@ -1,12 +1,9 @@
 //! Content-identified Metadata object publication, cache-aware reads and canonical names.
 use super::metadata_gc::mark_metadata_gc_unclassified;
-use super::{
-    GenerationError, GenerationRepository, MAX_METADATA_OBJECT_BYTES_U64, METADATA_SUFFIX,
-    StagedMetadata,
-};
+use super::{GenerationError, GenerationRepository, METADATA_SUFFIX, StagedMetadata};
 use crate::StorageIo;
 use crate::manifest_tree::ManifestTreeError;
-use fastdup_format::{MAX_METADATA_OBJECT_BYTES, MetadataObjectId};
+use fastdup_format::{MAX_METADATA_OBJECT_BYTES, METADATA_HEADER_BYTES, MetadataObjectId};
 use std::sync::Arc;
 
 impl<I: StorageIo> GenerationRepository<I> {
@@ -27,19 +24,11 @@ impl<I: StorageIo> GenerationRepository<I> {
         let object_id = MetadataObjectId::from_encoded(encoded)?;
         let published_name = metadata_name(object_id);
         if self.storage.exists(&published_name)? {
-            {
-                // An existing image is not evidence from this publication. Verify
-                // collisions independently, even when its object bytes are cached.
-                let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
-                let existing = self.storage.read(&published_name)?;
-                let existing_id = MetadataObjectId::from_encoded(&existing)?;
-                if existing_id != object_id || existing != encoded {
-                    return Err(GenerationError::MetadataIdentityCollision(object_id));
-                }
+            if !self.published_metadata_header_matches(&published_name, encoded)? {
+                return Err(GenerationError::MetadataIdentityCollision(object_id));
             }
-            // The durable image was just proven byte-identical to this encoding,
-            // which is the same evidence the publishing branch carries forward.
-            // Discarding it would leave a repeatedly restaged object uncached.
+            // The durable envelope carries this encoding's identity, so the
+            // image is the one a reread would have produced.
             self.metadata_cache.admit_validated(object_id, encoded);
             return Ok(StagedMetadata {
                 object_id,
@@ -65,6 +54,30 @@ impl<I: StorageIo> GenerationRepository<I> {
         })
     }
 
+    /// Compares the durable header of one published name with this encoding.
+    ///
+    /// The name is the BLAKE3-256 identity of the encoding, and the publication
+    /// protocol links it only after the complete image is durable. Since the
+    /// appliance owns its Metadata pool, rereading the payload of a name that is
+    /// already present would restage nothing: the aligned header alone commits
+    /// to the object identity, the payload length, the total file length and the
+    /// payload checksum. Damage below that header is what scrub exists for; it
+    /// reads every object instead of the incidental subset that a publication
+    /// happens to restage.
+    fn published_metadata_header_matches(
+        &self,
+        published_name: &str,
+        encoded: &[u8],
+    ) -> Result<bool, GenerationError> {
+        // An existing image is not evidence from this publication, so the probe
+        // observes durable bytes rather than any reusable representation.
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        let header = self
+            .storage
+            .read_exact_at(published_name, 0, METADATA_HEADER_BYTES)?;
+        Ok(header == encoded[..METADATA_HEADER_BYTES])
+    }
+
     pub(super) fn read_metadata(
         &self,
         object_id: MetadataObjectId,
@@ -85,13 +98,11 @@ impl<I: StorageIo> GenerationRepository<I> {
     ) -> Result<Arc<Vec<u8>>, ManifestTreeError> {
         self.check_maintenance()?;
         self.metadata_cache.read(object_id, || {
-            let name = metadata_name(object_id);
-            let length = self.storage.object_len(&name)?;
-            if length > MAX_METADATA_OBJECT_BYTES_U64 {
-                return Err(ManifestTreeError::IdentityMismatch(object_id));
-            }
-            let bytes = self.storage.read(&name)?;
-            if u64::try_from(bytes.len()) != Ok(length) {
+            // The bound is checked on what was actually read. Measuring the
+            // object first only repeats what the read already reports, because
+            // no other writer can resize it between the two operations.
+            let bytes = self.storage.read(&metadata_name(object_id))?;
+            if bytes.len() > MAX_METADATA_OBJECT_BYTES {
                 return Err(ManifestTreeError::IdentityMismatch(object_id));
             }
             Ok(bytes)

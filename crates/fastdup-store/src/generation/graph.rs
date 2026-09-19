@@ -247,12 +247,25 @@ impl<I: StorageIo> GenerationRepository<I> {
         previous_record: CommitRecord,
         proposed_root: &NamespaceRoot,
     ) -> Result<(), GenerationError> {
+        let previous_root = self.writer_predecessor_root(previous_record)?;
+        verify_generation_transition_pair(previous_record, &previous_root, proposed_root)
+    }
+
+    /// Reuses the immutable, proven writer view across all edits of a cut.
+    /// The complete Commit Record still fences final activation. Independent
+    /// validation must read and prove the stored graph even while this is warm.
+    pub(super) fn writer_predecessor_root(
+        &self,
+        previous_record: CommitRecord,
+    ) -> Result<std::sync::Arc<NamespaceRoot>, GenerationError> {
         // The predecessor Root is content-identified, so a repository-local
         // copy keyed by its object ID is as authoritative as a fresh reread
         // for this writer-side transition check. Recovery, mount, and offline
         // scrub always reread and rehash the complete graph independently.
         let object_id = previous_record.namespace_root();
-        let previous_root = if let Some(root) = self.cached_previous_namespace_root(object_id) {
+        let previous_root = if crate::read_intent::independent() {
+            std::sync::Arc::new(self.read_namespace_root(object_id)?)
+        } else if let Some(root) = self.cached_previous_namespace_root(object_id) {
             root
         } else {
             let root = std::sync::Arc::new(self.read_namespace_root(object_id)?);
@@ -266,7 +279,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         {
             return Err(GenerationError::PreviousGenerationRecordMismatch);
         }
-        verify_generation_transition_pair(previous_record, &previous_root, proposed_root)
+        Ok(previous_root)
     }
 }
 

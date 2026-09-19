@@ -207,16 +207,30 @@ impl PresentedCapacityControl {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         statfs.attach_logical_quota_namespace(&namespace)?;
         let control = Self { statfs, namespace };
-        if let Some(manifest) = load_share_capacity_manifest()? {
-            apply_reduction_rules(&control.namespace, manifest.reduction_rules)?;
-            control.replace(
-                manifest.revision,
-                manifest
-                    .rules
-                    .into_iter()
-                    .map(|rule| (rule.inode, rule.capacity_bytes))
-                    .collect(),
-            )?;
+        if let Some((path, manifest)) = load_share_capacity_manifest()? {
+            // The manifest names Share inodes. A pool that was re-provisioned
+            // keeps the manifest but not those inodes, and applying it then
+            // fails the mount with a bare `NoEntry`. Fail closed, but say what
+            // has to be corrected: skipping the rules would silently drop a
+            // quota the operator configured.
+            let describe = |error: String| {
+                format!(
+                    "Share capacity manifest {} does not match this Namespace ({error}).                      It names Share inodes from an earlier pool; remove or regenerate it.",
+                    path.display()
+                )
+            };
+            apply_reduction_rules(&control.namespace, manifest.reduction_rules)
+                .map_err(describe)?;
+            control
+                .replace(
+                    manifest.revision,
+                    manifest
+                        .rules
+                        .into_iter()
+                        .map(|rule| (rule.inode, rule.capacity_bytes))
+                        .collect(),
+                )
+                .map_err(|error| describe(error.to_string()))?;
         }
         Ok(control)
     }
@@ -494,7 +508,7 @@ fn apply_reduction_rules(namespace: &Namespace, rules: Vec<ReductionRule>) -> Re
 }
 
 fn load_share_capacity_manifest()
--> Result<Option<ShareCapacityManifest>, Box<dyn std::error::Error>> {
+-> Result<Option<(std::path::PathBuf, ShareCapacityManifest)>, Box<dyn std::error::Error>> {
     let Some(path) = std::env::var_os("FASTDUP_SHARE_CAPACITY_MANIFEST") else {
         return Ok(None);
     };
@@ -511,7 +525,7 @@ fn load_share_capacity_manifest()
     if manifest.version != PROTOCOL_VERSION || manifest.rules.len() > MAX_CAPACITY_RULES {
         return Err("Share capacity manifest version or rule count is invalid".into());
     }
-    Ok(Some(manifest))
+    Ok(Some((path, manifest)))
 }
 
 fn ok_response() -> ManagementResponse {

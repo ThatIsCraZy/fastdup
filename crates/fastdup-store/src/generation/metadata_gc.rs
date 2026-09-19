@@ -775,14 +775,12 @@ impl<I: StorageIo> GenerationRepository<I> {
         let mut bytes_removed = 0_u64;
         for (object_id, name) in candidates {
             self.check_maintenance()?;
+            // Only the reclaimed size is needed here. Reading each unreachable
+            // object back would reprove the content addressing of bytes that
+            // are about to be unlinked, which cannot change the unlink decision
+            // that the reachability set already made.
             let length = self.storage.object_len(name)?;
             if length > MAX_METADATA_OBJECT_BYTES_U64 {
-                return Err(GenerationError::MetadataIdentityCollision(*object_id));
-            }
-            let bytes = self.storage.read(name)?;
-            if u64::try_from(bytes.len()) != Ok(length)
-                || MetadataObjectId::from_encoded(&bytes)? != *object_id
-            {
                 return Err(GenerationError::MetadataIdentityCollision(*object_id));
             }
             bytes_removed = bytes_removed

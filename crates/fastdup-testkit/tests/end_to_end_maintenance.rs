@@ -1139,7 +1139,7 @@ fn shutdown_cancels_metadata_gc_without_losing_committed_data_or_reusing_partial
     use std::fmt::Write as _;
     use std::num::NonZeroUsize;
 
-    for operation in [StorageOperation::Read, StorageOperation::RemoveFile] {
+    for operation in [StorageOperation::ObjectLen, StorageOperation::RemoveFile] {
         let metadata = MemoryStorageIo::new();
         let (generations, containers, indexes, profile) =
             seeded_repositories_using(metadata.clone(), MemoryStorageIo::new());
@@ -1210,7 +1210,7 @@ fn shutdown_cancels_metadata_gc_without_losing_committed_data_or_reusing_partial
             .count();
         assert_eq!(
             remaining,
-            if operation == StorageOperation::Read {
+            if operation == StorageOperation::ObjectLen {
                 3
             } else {
                 2

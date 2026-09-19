@@ -1,8 +1,8 @@
 %global debug_package %{nil}
 
 Name:           fastdup
-Version:        0.7.4
-Release: 63%{?dist}
+Version:        0.8.0
+Release:        1%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -110,6 +110,84 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.8.0-1
+- Release the record-range Namespace, the Ingest gate accounting and the
+  bounded mount audits as 0.8.0. Repository format epoch 3: pools written by
+  0.7.x are refused, not migrated, and have to be re-ingested.
+- Veeam backup over SMB is confirmed on the test appliance. Five consecutive
+  VMware backup job sessions completed with result Success, all eight tasks
+  Target-bottlenecked, 74,710 SMB writes and 768 flushes with zero failures.
+- Fast Clone over SMB is confirmed with the 4 KiB clone geometry from 0.7.1.
+
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-77
+- Keep the commit-cut hatch and the watchdog hatch independent so a long cut
+  wait can no longer close the hatch the supervisor still holds.
+
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-76
+- Emit Namespace shards in graph order instead of object-id order, so the
+  durable operation sequence stays a function of the work performed.
+
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-75
+- Bound a Namespace shard by payload bytes as well as record count, so inodes
+  carrying large xattr sets cannot exceed the Metadata Object limit.
+
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-74
+- Name the Share capacity manifest and what is wrong with it when its Share
+  inodes do not exist, instead of failing the mount with a bare NoEntry. A
+  re-provisioned pool keeps the manifest but not the inodes it names.
+
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-73
+- Publish the Namespace as record-range shards whose boundaries come from the
+  record keys, so one changed inode replaces exactly one shard instead of
+  re-encoding and republishing the whole Namespace (ADR 0095).
+- Repository format epoch 3. Pools written by an earlier release are refused,
+  not migrated; they have to be re-ingested.
+
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-72
+- Charge the Ingest pending-region gate only for bytes the live Lanes hold.
+  Lane eviction and the commit-cut drain detached payload without settling it,
+  which retired the whole gate over time and collapsed steady-state ingest from
+  224 MB/s to 61 MB/s and falling (ADR 0098).
+- Report pending_region_bytes and pending_residue_bytes with the gate size.
+
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-71
+- Audit Similarity and Exact Index runs in bounded range reads instead of one
+  read per page, which removed a 22 second single-threaded page-at-a-time
+  audit from every mount.
+- Fail Jobs that no task is executing, so one stranded record can no longer
+  disable every repository action for good.
+- Account a writer's ingest-capacity wait on every release path, including the
+  announced commit cut that almost every stall actually takes.
+
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-70
+- Admit the Ingest backlog a commit cut is waiting for through the
+  pending-region gate for exactly that window, so a saturated gate no longer
+  needs the five-second watchdog to release the cut (ADR 0097).
+
+* Sat Sep 19 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-69
+- Release writers parked on the multi-stream ingest budget when a commit cut is
+  announced, which the single-stream ring wait already honoured.
+
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-68
+- Rebuild from the current working tree after a forced rebuild of the runtime and
+  control-plane packages, and add concurrent write/checkpoint acceptance coverage.
+
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-67
+- Announce commit cuts before requesting the admission fence, releasing parked
+  write-through writers without waiting for the five-second checkpoint watchdog.
+
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-66
+- Hash Namespace shards concurrently, reuse Container entropy, and skip an
+  unusable pool-wide content-dirty probe while recording the Namespace-tree plan.
+
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-65
+- Prove each Namespace once during construction, encode proven roots without a
+  second graph walk, and allocate the proof from bounded vectors.
+
+* Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-64
+- Verify published Metadata objects from their durable header, omit redundant
+  GC payload reads, and cover metadata publication and single-stream SMB I/O.
+
 * Fri Sep 18 2026 fastdup maintainers <noreply@fastdup.local> - 0.7.4-63
 - Share verified Container images across readers, reuse freshly sealed envelope
   views, and keep maintenance scans from consuming resident Container images.

@@ -4,175 +4,78 @@ status: accepted
 
 # Rotate the Exact Index Activation Log through paired slots
 
-The pre-stable Exact Index Activation Log uses two fixed, directory-durable
-files, `exact-index.activation.wal` and
-`exact-index.activation.1.wal`. A new writer bounds each ordinary slot at 64
-exact 4-KiB Activation Records (256 KiB). When the selected slot reaches that
-bound, the writer replaces only the inactive slot's contents with an exact copy
-of the selected slot's last Activation Record followed by the new Activation
-Record. The copied record is the **bridge record**. Its byte identity makes the
-two slots one unambiguous overlapping chain without a mutable head pointer.
+The Exact Index Activation Log uses two directory-durable files:
+`exact-index.activation.wal` and `exact-index.activation.1.wal`. Each slot holds
+at most 64 exact 4-KiB Activation Records. Rotation replaces only the inactive
+slot with the selected slot's final record followed by the successor. The copied
+byte-identical record is the bridge between both histories.
 
-This decision extends the nonauthoritative-index rule from
-[ADR 0015](0015-keep-exact-dedup-correct-without-index-authority.md), the RoW
-rebuild rule from [ADR 0023](0023-rebuild-indexes-as-new-generations.md), and
-the immutable sorted-Run design from
-[ADR 0035](0035-build-the-exact-index-from-immutable-sorted-runs.md). It uses
-the same proven paired-slot shape as the Namespace Commit Log without making
-the two logs one transaction: Exact activation failure may degrade reduction
-performance but never blocks or rolls back Namespace durability.
+This keeps activation bounded without a mutable head pointer, rename-over,
+deletion, or assumed atomic sector write. Exact activation remains independent
+of Namespace durability: an invalid activation graph disables rebuildable Exact
+acceleration but never makes Namespace DATA unavailable.
 
-## Why paired slots
+## Durable invariants
 
-The previous single append-only file stopped after 16,384 records. At the
-measured 287 Container/index activations per ten-minute ISO workload, this
-would disable new Exact Index activations after approximately 9.5 hours. An
-unbounded replacement file would merely postpone the same lifetime and startup
-cost problem.
+Both slot names are created, file-synchronized, and made directory-durable
+before use. Initialization is idempotent and synchronizes the directory even
+when both names already exist.
 
-Two pre-created names fit the existing storage seam:
+Inside a nonempty slot:
 
-- the selected slot is never modified during rotation;
-- every rotation write targets only the inactive slot;
-- checksummed records make a torn trailing write distinguishable from a
-  complete invalid record;
-- the bridge is byte-identical to the other slot's final valid record; and
-- the final synchronization of the inactive slot is the only rotation commit
-  point.
-
-No mutable head pointer, deletion, rename-over-existing, or assumed atomic
-sector write is required. Slot choice, overlap, bounds, and recovery
-remain behind the existing `ExactIndexRunRepository` interface.
-
-## Slot invariants
-
-Both names are created, truncated to zero, file-synchronized, and then made
-directory-durable before an Activation Record can use them. Initialization is
-idempotent and synchronizes the directory even when both names already exist.
-
-Within one nonempty slot:
-
-- every complete record passes its structural and CRC32C checks;
-- generations increase by exactly one;
-- `previous_record_hash` names the exact preceding record, except that the
-  first bridge may name a predecessor no longer retained in that slot;
+- every complete record passes structural and CRC32C validation;
+- record generations advance by one and link by `previous_record_hash`;
 - Run Set generations increase strictly; and
-- an ordinary new slot contains at most 64 records or 262,144 bytes.
+- the slot contains at most 64 records or 256 KiB.
 
-A partial final record is a torn tail and is ignored only for recovery. A
-complete invalid record, invalid internal hash link, or non-increasing Run Set
-generation rejects the complete activation graph. Append requires a clean
-tail; it never overwrites or repairs ambiguous live bytes.
+The first bridge may name an unretained predecessor. Recovery may ignore only a
+partial final record; a complete invalid record, broken link, invalid generation
+or dirty append tail rejects the graph.
 
-Across two nonempty slots, the slot with the higher final generation is
-selectable only when its first complete record is byte-identical to the lower
-slot's final record. Equal final generations require byte-identical final
-records. The longer byte-valid prefix supplies transition evidence; equal
-length prefixes must be entirely byte-identical. A fork, missing overlap, or a
-nonempty peer without one valid record disables the index rather than selecting
-an arbitrarily convenient history.
+Across nonempty slots, the higher final generation is selectable only when its
+first complete record equals the lower slot's final record. Equal final
+generations require identical final records. The longer valid prefix provides
+transition evidence; equal-length prefixes must be identical. A fork, missing
+overlap, or nonempty peer without a valid record disables the index.
 
-Index disablement is safe because the Exact Index is rebuildable acceleration.
-It must never make Namespace DATA unavailable or authorize reclamation.
+## Publication
 
-## Append and rotation protocol
+Activation runs under the repository activation lock after the candidate Run
+Set and all immutable Run dependencies are durable and validated. The online
+owner may use validated encoder output and successful publication as evidence;
+standalone activation performs independent storage audits.
 
-All steps run under the Exact Index Repository's activation lock and only after
-the candidate Run Set and every immutable Run dependency have been validated
-and made durable. Under the same exclusive online owner, validated encoder
-output and successful publication supply that evidence (ADR 0046); unknown
-dependencies and standalone activation retain independent storage audits.
+Below the slot limit, the writer validates the retained synchronized snapshot,
+appends one successor, validates the resulting chain and synchronizes that slot.
+At the limit it leaves the selected slot untouched, truncates the inactive slot,
+writes the bridge and successor, sets the length to 8 KiB, validates the new
+chain and synchronizes the inactive slot. The final slot sync is the only commit
+point in either path.
 
-For an ordinary append below the 64-record bound:
+The writer consumes and returns one bounded slot buffer. Ordinary append does
+not rehash or decode the known prefix; rotation moves the final encoded record
+within the same buffer. Standalone activation still rereads the target slot.
+Only a successful final sync advances the live cursor. Any error discards the
+cursor, so retry independently reconstructs storage and dependencies, including
+after an effective sync reported failure. Retrying an already selected Run Set
+audits its dependencies and synchronizes the selected slot without appending.
 
-1. use the writer's last successfully synchronized snapshot, or independently
-   load both bounded slots when that state is unknown;
-2. require a clean tail and verify the proposed generation, predecessor hash,
-   and increasing Run Set generation;
-3. append the new record and set the slot's exact length;
-4. validate the new successor against the already validated prefix and extend
-   the owned slot buffer; standalone activation additionally rereads the target slot; and
-5. synchronize that slot.
+The online predecessor lookup may reuse a matching installed lookup directory.
+A selector mismatch uses the independent path. Recovery and offline audit never
+trust the writer cursor.
 
-Step 5 is the sole activation commit point.
+## Recovery and verification
 
-At the bound:
+Recovery validates both slots and their unique overlap, then pairs the selected
+record with its content-addressed Run Set and every referenced Run. Offline
+`audit_activation_log` repeats the full graph audit and rejects corruption in
+either peer. Discarded activation history pins neither Runs nor DATA.
 
-1. retain the selected slot unchanged;
-2. truncate only the inactive slot in the process-visible state;
-3. write the selected last record at offset zero as the bridge;
-4. write the new record immediately after it and set the length to 8 KiB;
-5. move the exact last encoded record into the retained buffer as the bridge
-   and append its validated successor;
-   standalone activation additionally rereads the target slot; and
-6. synchronize the inactive slot.
+Fault injection covers every append and rotation boundary. Recovery may expose
+only the previous activation or the complete successor, and only an effective
+final sync may expose the successor. Lifetime tests rotate repeatedly while
+both slots remain within 256 KiB and compare the retained writer buffer with
+independent recovery.
 
-Step 6 is both rotation and activation commit. A crash before it selects the
-old durable slot. An effective synchronization may select the complete new
-slot even if the call returned an ambiguous error. No mixed Run Set is valid.
-The live cursor advances only on success. A write or sync error discards it;
-the next append must reconstruct the actual stored selector and dependencies,
-including when an effective sync returned an error. Recovery always discards
-the cursor before independently verifying storage. Cache eviction cannot
-discard or advance this bounded required writer state.
-
-Retrying an already-selected Run Set audits its immutable dependencies and
-synchronizes the selected slot without appending another record.
-
-## Recovery and scrub
-
-Recovery reads and validates both slot files, selects their unique overlapping
-head, then pairs that record with its exact content-addressed Run Set and every
-referenced immutable Run before exposing an active reader. A corrupt or missing
-activation graph disables index acceleration but does not roll back the
-Namespace Commit WAL.
-
-Both activation slots are bounded to 64 records from creation. A former 64-MiB
-single-slot chain is unsupported pre-production state and is not a migration
-input. The authoritative Commit-chain fence from ADR 0071 is present from the
-first repository Commit.
-
-Offline `audit_activation_log` repeats both local chain and cross-slot overlap
-checks and fully audits the selected Run Set dependency graph. Discarded
-activation history is not a snapshot and does not pin old Runs or DATA.
-
-## Paired verification
-
-- Writer: validates the selected snapshot and exact intended chain before
-  mutation, then advances the live snapshot only after the final slot sync.
-  Standalone activation retains independent target readback.
-- Reader/recovery: validates both slots, bridge identity, the selected record,
-  Run Set identity, and every Run dependency.
-- Offline scrub: uses the explicit activation-log audit seam and fails on a
-  corrupt inactive peer as well as a corrupt selected peer.
-- Fault injection: fails before and after every rotation operation and accepts
-  only the previous or complete new Run Set. Only an effective final slot sync
-  may expose the new activation.
-- Lifetime gate: performs repeated rotations while requiring both slots to
-  remain at or below 256 KiB.
-
-## Consequences
-
-Activation-log I/O and memory are lifetime-bounded. Rotation occurs every 63
-successor activations because one of each
-64 records is the bridge. The record byte format is unchanged. This decision
-does not solve large Exact-Run compaction or index-object garbage collection.
-Repository-wide format-epoch fencing is supplied separately by ADR 0071.
-
-## Bounded online writer work (2026-09-13)
-
-The writer consumes and returns its existing bounded slot snapshot. Appending
-one valid successor does not require copying, rehashing or decoding the whole
-known prefix. Rotation moves the exact last encoded record within that buffer;
-the same allocation can serve later rotations. Only a successful final file
-sync returns the advanced snapshot to the Repository. Every failure discards
-the consumed snapshot, so retry independently reconstructs storage, including
-an effective sync that returned an error. Standalone activation still reads
-back and decodes the target. Recovery and offline audit always validate both
-complete stored chains and their bridge.
-
-The online predecessor lookup also borrows the known selector and reuses its
-matching installed lookup directory without cloning the WAL image or rebuilding
-the same family directory. A selector mismatch retains the independent path.
-Tests compare the moved writer buffer with independent recovery through two
-rotations, and inject failures before/after every activation and rotation I/O.
+The former pre-production 64-MiB single-slot chain is not a migration input.
+Repository-wide format fencing is defined by ADR 0071.

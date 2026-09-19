@@ -1383,7 +1383,8 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
         concat!(
             "write_through_ingest_ring batches={} fragments={} maximum_batch_bytes={} ",
             "minimum_batch_target_bytes={} maximum_batch_target_bytes={} ",
-            "maximum_slots={} full_wait_ns={}"
+            "maximum_slots={} full_wait_ns={} ",
+            "pending_region_bytes={} pending_residue_bytes={} pending_gate_bytes={}"
         ),
         status.ingest_batches(),
         status.ingest_fragments(),
@@ -1392,6 +1393,9 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
         status.maximum_ingest_batch_target_bytes(),
         status.maximum_ingest_ring_slots(),
         status.ingest_ring_wait_ns(),
+        status.pending_region_bytes(),
+        status.pending_residue_bytes(),
+        fastdup_appliance::INGEST_PENDING_GATE_BYTES_V1,
     );
     emit_cpu_phase_state("write_through_hash_cpu", status.hash_cpu());
     emit_cpu_phase_state("write_through_encode_cpu", status.encode_cpu());

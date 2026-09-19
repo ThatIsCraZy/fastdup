@@ -2286,6 +2286,68 @@ impl From<SimilarityIndexFamilyError> for SimilarityIndexStoreError {
 mod tests {
     use super::BucketOrdinals;
 
+    /// Auditing a Run on every mount reads it twice from end to end. Doing that
+    /// one page at a time is device-bound at a few thousand IOPS regardless of
+    /// how fast the Run streams, which put a 22 second single-threaded audit in
+    /// front of every mount on the test appliance.
+    #[test]
+    fn auditing_a_similarity_run_reads_it_in_spans_not_pages() {
+        use super::*;
+        let root =
+            std::env::temp_dir().join(format!("similarity-audit-spans-{}", std::process::id()));
+        let mut storage = crate::FsStorageIo::open(&root).unwrap();
+        let counters = Arc::new(crate::metadata_read_telemetry::MetadataReadCounters::default());
+        storage.metadata_reads = Some(Arc::clone(&counters));
+        let repo = SimilarityIndexRepository::new_with_memory_snapshot(
+            storage,
+            MemoryPressureSnapshot::new(32 << 30, 30 << 30, 0),
+        );
+        let entries = (1..=8_000_u64)
+            .map(|n| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&n.to_be_bytes());
+                SimilarityIndexEntry::new(
+                    ChunkId::from_bytes(id),
+                    65536,
+                    1,
+                    [n.wrapping_mul(131) % 1021; 4],
+                    [n; 8],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        repo.publish_entries(1, entries).unwrap();
+        let lease_reads = || {
+            counters
+                .rows()
+                .iter()
+                .filter(|row| row.mode == "directLease")
+                .map(|row| row.operations)
+                .sum::<u64>()
+        };
+        let before = lease_reads();
+        let index = repo.recover_generation(1).unwrap();
+        let reads = lease_reads() - before;
+        let descriptor = index.partitions[0].descriptor;
+        assert!(
+            descriptor.page_count() > crate::similarity_read::SIMILARITY_AUDIT_PAGES_PER_IO_V1,
+            "the fixture must span more than one range read: {} pages",
+            descriptor.page_count()
+        );
+        let spans = |pages: usize| {
+            pages.div_ceil(crate::similarity_read::SIMILARITY_AUDIT_PAGES_PER_IO_V1) as u64
+        };
+        let budget = 2 * spans(descriptor.page_count()) + spans(descriptor.bucket_page_count()) + 8;
+        assert!(
+            reads <= budget,
+            "auditing {} entry and {} bucket pages took {reads} reads against a {budget} budget",
+            descriptor.page_count(),
+            descriptor.bucket_page_count()
+        );
+        drop(index);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn audited_similarity_pages_are_warm_for_queries() {
         use super::*;

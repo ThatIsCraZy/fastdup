@@ -4,143 +4,83 @@ status: accepted
 
 # Resume recent scrub checks from durable progress
 
-A stopped or completed initial Scrub round resumes fully checked immutable Containers instead
-of rereading their payloads on every mount. This supersedes ADR 0090's
-process-local progress rule and extends ADR 0091's deferred DATA requirements.
-The persisted result means **checked during this round**, never healthy forever,
-current payload proof, writer publication evidence, or GC deletion authority.
+Initial Scrub may reuse fully checked immutable Containers from the current
+round instead of rereading their payloads after every mount. Persisted progress
+means only **checked during this round**. It is neither current health, writer
+evidence, a payload cache nor GC deletion authority. This replaces ADR 0090's
+process-local-only progress rule and extends ADR 0091's deferred DATA checks.
 
-## Progress and reconciliation
+## Journal and validity
 
-The Metadata Pool holds one append journal, `.fastdup-scrub-progress-v1`. Its
-header binds the validator version, round start, durable Appliance/Pool identities
-and local Metadata/DATA directory device/inode identities. A copied pool pair
-with different local identities starts over. Restoring files in place under the
-same identities cannot be detected from this binding alone. Unknown versions,
-foreign or damaged headers, clock reversal, and rounds at least seven days old
-start a fresh pass. A durable completion marker retains the preceding checks on
-the next mount. It records historical successful coverage, not current health.
-Subsequent mounts may append checks for new or changed Containers and another
-completion marker. Neither completion nor reuse moves the original round start,
-so restarting cannot indefinitely postpone the seven-day full-pass threshold.
-There is no permanent healthy flag or new periodic scrub timer;
-explicit offline Scrub continues to force complete content verification.
+The Metadata Pool stores `.fastdup-scrub-progress-v1`. Its header binds validator
+version, original round start, Appliance/Pool identities and local Metadata/DATA
+directory device/inode identities. Unknown version, foreign/damaged header,
+clock reversal or age of at least seven days starts a fresh round. Copying a pool
+pair changes local identities; an in-place restore may remain undetected.
 
-This amends the original completion policy (2026-09-12): a successful scrub
-previously forced a new full payload pass on the very next restart, even after
-an orderly shutdown. Because that discarded every reusable certificate, the
-parallel envelope-resume pool had no work and startup instead used the single
-paced payload verifier. Completion is now replayed as a checksummed marker;
-the journal format and conservative behavior of older readers remain unchanged.
+A durable completion marker allows later mounts to retain the round and append
+checks for new or changed Containers. It never advances the original start, so
+restart cannot postpone the seven-day full pass indefinitely. Explicit offline
+Scrub always performs complete verification.
 
-Only a successful full Container check, including decoded identities and
-independent Bases, mints an opaque progress entry. Each entry contains Container
-ID, generation, byte length, structural fingerprint, check time, Chunk identities
-and logical lengths, and dependent Base identities. The Chunk map is extracted
-from the same verified image, without extra DATA I/O. The journal is larger than
-a boolean-per-Container table because a new mount may select a newer Namespace
-graph; old verified counts alone cannot discharge its DATA requirements.
+Only a successful full check mints an entry. It records Container identity,
+generation, byte length, structural fingerprint, check time, Chunk identities
+and lengths, and dependent Base identities extracted from the same verified
+image. These facts let a later Namespace graph prove current coverage; counts
+alone cannot.
 
-Fresh complete checks also hand their typed physical Location evidence to the
-existing online unified cache after Independent verification has ended (ADR
-0046). This evidence comes directly from the full verifier in the current
-process, is evictable, and does not retain Container payloads. Journal recording
-does not create it: resumed entries, failed checks and envelope reconciliation
-never seed that cache. Later scrubs still bypass all cached evidence. Thus the
-handoff avoids a second ingest verification of freshly scrubbed Locations
-without changing the journal's historical meaning or the GC gate.
+On resume, the worker inventories current Containers. Two uncached random-advice
+Header/Footer reads must match saved identity, generation, length, fingerprint
+and Chunk count before payload work may be skipped. Changed valid envelopes are
+fully checked. Current graph requirements are reconstructed independently, only
+selectable non-RETIRING Locations satisfy them, and Base availability is tracked
+across the whole pass. Missing or damaged DATA fails closed.
 
-The next worker inventories current Containers after mounting. A saved entry
-can skip payload work only after two uncached, random-advice Header/Footer reads
-validate the current ID, generation, length, structure fingerprint and Chunk
-count. Changed valid envelopes require full verification. Missing or damaged
-DATA still fails closed. Current required Chunk identities are reconstructed
-from the selected Metadata graph; only currently selectable Locations discharge
-them. Coverage also tracks independent Base availability across the pass,
-regardless of whether a Base precedes or follows its dependent Container.
-RETIRING Locations cannot satisfy either requirement. An entirely absent
-Container or Base therefore cannot be hidden by an old journal entry.
+Envelope-only reconciliation cannot detect payload corruption that leaves the
+envelope unchanged. Demand reads, offline Scrub and the next full round retain
+independent payload verification. The startup GC gate remains closed until
+current Chunk and Base coverage completes; integrity failure keeps the existing
+sticky write-admission failure.
 
-This is historical verification, not detection of new payload bitrot: corruption
-that leaves the envelope unchanged may wait until a demand read, offline Scrub,
-or a subsequent full round. Demand reads always verify payload and dependencies.
-The startup GC gate remains closed until current graph and Base coverage finish;
-ordinary generation-bound GC authorization remains separate. Integrity failure
-retains the existing sticky write-admission failure.
+Fresh full checks may hand typed Location evidence to the process-local unified
+cache after Independent verification. Resumed entries, envelope checks and
+journal replay never seed it. Later scrub still bypasses cached evidence.
 
-## Durability and resource bounds
+## Durable encoding and bounds
 
-All fields are encoded explicitly in little endian. The fixed 80-byte header
-has an eight-byte magic/version, 32-byte binding, eight-byte round start and
-BLAKE3 checksum. Each length-framed entry has a type, explicit fields and a
-BLAKE3 checksum bound to the header. Complete readback precedes acceptance;
-unknown, torn or corrupt suffixes are truncated to the accepted prefix before
-appending. A reset synchronizes truncation before writing the new header.
-File and directory synchronization publish new journals. No DATA formats or
-Commit-WAL semantics change. Validator changes must invalidate the journal version.
+All fields are explicitly little endian. The 80-byte header contains magic and
+version, a 32-byte binding, round start and BLAKE3 checksum. Length-framed entries
+carry a type, explicit fields and a checksum bound to the header. Acceptance
+requires complete readback. Torn or corrupt suffixes are truncated to the valid
+prefix before append; reset syncs truncation before the new header. File and
+directory sync publish the journal. Validator changes require a new version.
 
-The worker synchronizes after 64 newly checked Containers or five seconds at a
-Container boundary, and when orderly cancellation joins the worker. A crash may
-repeat the unsynchronized suffix; it cannot turn partial verification into an
-accepted entry. Journal I/O failure disables persistence and reuse for the rest
-of that process while full verification continues, with a journal warning.
-Offline verification never consults this auxiliary journal.
+The worker syncs after 64 new Containers, five seconds at a Container boundary,
+or orderly cancellation. Journal failure disables persistence for the process
+but full verification continues. Offline verification never reads the journal.
 
-The in-memory journal index stores offsets, not all saved Chunk maps. Replay
-still allocates one format-bounded entry at a time. Resume prefetch groups at
-most 32 entries and at most one MiB of encoded certificate bytes; an individually
-larger entry is handled alone under the existing format bound. Current graph
-and independent-Base coverage remain pass-local memory.
+The in-memory index holds offsets, not saved Chunk maps. Replay allocates one
+format-bounded entry at a time. Prefetch groups at most 32 entries and 1 MiB of
+certificates; a larger legal entry runs alone.
 
-Envelope reconciliation uses a dedicated persistent pool of 32 workers, separate
-from frontend and encoding pools. Each worker issues only one synchronous storage
-operation at a time, so asynchronous batches have at most 32 outstanding resume
-I/Os, not 64 for the Header/Footer pair. Idle I/O scheduling applies to every
-worker. Header and Footer checks remain unchanged: the Footer supplies the
-fingerprint, while cross-checking both envelopes detects mismatched identity,
-generation and layout. No new durable format or validation rule is introduced.
+## Concurrent verification
 
-Idle envelope reconciliation has no artificial read-duty sleep. On observed
-frontend DATA activity, the coordinator reduces subsequent batches to one entry
-for the existing five-second activity window; already dispatched envelope reads
-back off before continuing. Payload verification shares the same bounded pool
-(see the extension below) and retains its per-worker duty limits. Envelope tasks fully join before coverage is
-merged or payload verification begins, including on error or shutdown. A failed
-batch contributes no coverage. A real envelope or I/O failure takes precedence
-over a concurrent stop request. The ordinary scrub gate and full on-demand checks
-remain authoritative.
+A dedicated idle-priority pool of 32 workers performs envelope reconciliation
+and, in later batches, full verification. A worker issues one synchronous
+storage operation at a time, so no phase exceeds 32 outstanding operations.
+Frontend activity reduces subsequent batches to one item for the existing
+five-second window.
 
-Telemetry distinguishes carried-forward checks, new checks and remaining
-Containers, including historical UI samples. Regressions hold 32 actual envelope
-reads in flight, reject oversized batches, verify failure leaves coverage
-incomplete, and cancel an in-flight batch before any Footer request is issued.
-Completion/restart regressions also prove envelope-only reads after repeated
-successful passes, replay of appended checks after completion, unextended expiry,
-current-envelope failure, and before/after-I/O crashes during completion replay
-and torn-tail repair. The complete marker alone never opens the GC gate.
+Full-check input batches contain at most 32 Containers and split again at 64 MiB
+of primary images. Reads use at most 256-KiB portions with cancellation and the
+activity-sensitive duty delay. Dependency, decoder, certificate and coverage
+state retain their existing separate bounds.
 
-## Concurrent full verification (2026-09-13)
+Every submitted task joins before coverage merge, journal append, phase change,
+error return or shutdown. A failed batch contributes no coverage; real
+corruption or I/O errors outrank cancellation. The coordinator alone merges
+certificates and writes ordered progress.
 
-New or changed Containers now undergo full verification asynchronously on the
-same dedicated 32-worker pool. Envelope reconciliation and full verification
-run in successive batches, so they cannot double the outstanding-I/O limit.
-Each worker performs at most one blocking storage operation at a time, including
-dependency reads; asynchronous dispatch is implemented by the existing pool,
-not a new kernel-I/O backend. Independent intent and complete verification of
-payloads, identities and dependencies remain unchanged.
-
-Each input batch contains at most 32 Containers. Before submitting payload work,
-their validated lengths split it further into groups whose Container images
-sum to at most 64 MiB. This bounds primary image memory; decoder, dependency,
-certificate and coverage working memory are additional existing verifier state.
-Workers read in at most 256-KiB portions with cancellation and the existing
-activity-sensitive duty delay. Frontend activity reduces subsequent batches to
-one Container. Every submitted task joins before a batch returns, including on
-error. Real corruption or storage errors take precedence over cancellation.
-
-Successful certificates merge into coverage on the coordinator only after the
-complete verification batch succeeds. Journal writes and progress accounting
-remain ordered and single-writer. Failed or cancelled batches cannot open the
-GC gate. Fresh successful physical evidence may still enter the unified cache;
-neither that evidence nor historical progress bypasses independent scrub reads.
-There is no durable format change.
+Tests cover 32 actual outstanding reads, batch and memory limits, cancellation,
+completion replay, non-extended expiry, changed envelopes, corrupt/torn tails,
+I/O interruption and the rule that completion alone never opens the GC gate.

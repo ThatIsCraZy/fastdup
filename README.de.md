@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
+  <strong><a href="https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm">RPM herunterladen</a></strong>
   · <a href="https://thatiscrazy.github.io/fastdup/">Produktseite</a>
-  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.7.4">Release-Informationen</a>
+  · <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.8.0">Release-Informationen</a>
 </p>
 
 fastdup ist eine experimentelle, softwaredefinierte Single-Node-
@@ -31,6 +31,57 @@ HTTPS-WebUI hält die Administration einfach.
 > fastdup ist ein Forschungsprototyp und kein produktionsreifes Backup-Produkt.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
+
+## Neu in v0.8.0 · 19. September 2026
+
+> [!IMPORTANT]
+> **Repository-Format-Epoch 3. Bestehende Pools werden nicht migriert.** Ein von
+> 0.7.x geschriebenes Repository wird beim Mount abgelehnt, nicht konvertiert.
+> Plane Re-Provisionierung und erneutes Einlesen, bevor du 0.8.0 auf einer
+> Appliance mit noch benötigten Daten installierst.
+
+- **Veeam-Backup über SMB ist auf der Test-Appliance bestätigt.** Fünf
+  aufeinanderfolgende VMware-Sessions von Veeam Backup & Replication endeten mit
+  Ergebnis `Success`. In der detailliert erfassten Session waren alle acht Tasks
+  erfolgreich, Veeam meldete durchgehend das Target als Bottleneck, 283,4 GiB
+  übertragen in einem Task-Fenster von 465,8 s, 74.710 SMB-Writes, 768 Flushes
+  und 803 Closes ohne einen einzigen Fehler.
+- **SMB Fast Clone ist bestätigt** mit der 4-KiB-Clone-Geometrie aus v0.7.1:
+  ausgerichtete Clones, Teil-Clone-Längen und aufeinanderfolgende Clones auf
+  dieselbe Quelle.
+- **Ingest verliert keinen Durchsatz mehr über die Laufzeit.** Drei sich
+  überlagernde Defekte — ein Commit Cut, der auf die Mutation-Admission-Fence
+  wartete, derselbe Cut, der danach am Pending-Region-Gate wartete, und ein
+  Pending-Region-Ledger, das rund ein Drittel jedes eingelesenen Bytes verlor —
+  machten den Schreibpfad unter Dauerlast monoton langsamer. Steady-State-Dedup-
+  Ingest auf einem gealterten Pool: von 61 MB/s und fallend auf 224–256 MB/s und
+  stabil; `freeze` von 5.001 ms auf 0,93 ms pro Generation (ADR 0096, 0097, 0098).
+- **Der Namespace wird als inhaltsadressierter Baum veröffentlicht**, aus
+  Record-Range-Shards, deren Grenzen allein aus den Record-Keys folgen. Eine
+  geänderte Inode ersetzt genau einen Shard, statt den gesamten Namespace neu zu
+  veröffentlichen; `encode_graph` bei 120.000 Einträgen von 29,3 ms auf 13,7 ms
+  (ADR 0095). Das ist der Grund für Format-Epoch 3.
+- **Mount-Audits sind begrenzt.** Similarity- und Exact-Index-Runs werden in
+  256-KiB-Range-Reads geprüft statt mit einem 4-KiB-Direct-I/O-Read pro Seite.
+  Das entfernt ein 22 Sekunden langes, single-threaded Audit vor jedem Mount:
+  22 s → 3 s.
+- **Ein hängengebliebener Job legt nicht mehr alle Repository-Aktionen lahm.**
+  Offene Jobs werden beim Start der Control Plane beendet, verwaiste Jobs
+  innerhalb eines Sampler-Ticks geschlossen — beides über exakte Prüfungen statt
+  Timeouts, damit ein langer Offline-Scrub nie abgeräumt wird.
+
+Das ist eine auf einer Appliance gemessene, funktionierende Konfiguration. Es
+ist **keine** Veeam-zertifizierte oder Veeam-qualifizierte Integration und
+enthält keine Support-Zusage und keine Performance-SLA. An der Integration des
+**Veeam Repository Agent** in die Appliance wird gearbeitet, damit fastdup als
+Linux-Repository und nicht nur als SMB-Freigabe eingebunden werden kann; das ist
+nicht Teil dieses Release.
+
+Workspace-Suite: 1.111 Tests bestanden, 0 fehlgeschlagen.
+
+[Release-Details v0.8.0](docs/releases/v0.8.md) · RPM-Version **0.8.0-1**.
+[Veeam-Backup-Prüfung](docs/testing/veeam-backup-2026-09-19.md) ·
+[Fast-Clone-Prüfung](docs/testing/veeam-consecutive-clones-2026-09-09.md).
 
 ## Neu in v0.7.4 · 12. September 2026
 
@@ -237,11 +288,11 @@ Benötigt werden:
 Aktuelles Binärpaket herunterladen und installieren:
 
 ```bash
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/fastdup-0.7.4-1.el10.x86_64.rpm
-curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.7.4/SHA256SUMS
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/fastdup-0.8.0-1.el10.x86_64.rpm
+curl -LO https://github.com/ThatIsCraZy/fastdup/releases/download/v0.8.0/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 
-sudo dnf install ./fastdup-0.7.4-1.el10.x86_64.rpm
+sudo dnf install ./fastdup-0.8.0-1.el10.x86_64.rpm
 sudo systemctl enable --now fastdup-agent.service fastdup-control.service
 ```
 
@@ -384,7 +435,9 @@ sudo dnf remove fastdup
 - keine eingebaute Device Redundancy, Replikation, WORM, Encryption-at-Rest-
   Policy, Cloud Tier oder Schutz vor Geräteverlust
 - POSIX-Umfang und breite Samba-/Client-Konformität noch unvollständig
-- Samba Fast Clone bleibt experimentell und ist noch nicht für Veeam qualifiziert
+- Veeam-Backup und SMB Fast Clone sind auf der Test-Appliance bestätigt, das ist
+  aber keine Veeam-zertifizierte Integration und keine Support-Zusage
+- der Veeam Repository Agent ist noch nicht in die Appliance integriert
 - Advanced Similarity Reduction bleibt bis zu breiterer Workload-Evidenz opt-in
 - kein Produktions-Support, Performance-SLA oder Kapazitätsversprechen
 

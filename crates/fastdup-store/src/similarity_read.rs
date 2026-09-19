@@ -3,10 +3,13 @@
 
 use fastdup_format::{
     SIMILARITY_INDEX_HEADER_BYTES, SIMILARITY_INDEX_PAGE_BYTES, SimilarityBucketKey,
-    SimilarityIndexEntry, SimilarityIndexPage, SimilarityIndexRunDescriptor,
+    SimilarityBucketPage, SimilarityIndexEntry, SimilarityIndexPage, SimilarityIndexRunDescriptor,
 };
 
 use crate::ImmutableFileLease;
+
+/// Pages per audit range read: one 256 KiB Direct-I/O range per 64 pages.
+pub(crate) const SIMILARITY_AUDIT_PAGES_PER_IO_V1: usize = 64;
 use crate::similarity_index_repository::{SimilarityIndexStoreError, SimilarityPageCache};
 use std::sync::Arc;
 
@@ -77,34 +80,36 @@ fn audit_source(
     lease: &ImmutableFileLease,
     descriptor: SimilarityIndexRunDescriptor,
     page_cache: &SimilarityPageCache,
-    mut observe_bucket_page: impl FnMut(SimilarityBucketKey),
+    observe_bucket_page: impl FnMut(SimilarityBucketKey),
 ) -> Result<(SimilarityBucketKey, SimilarityBucketKey), SimilarityIndexStoreError> {
     let independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
     let mut audit = descriptor.start_hash_audit();
     let header = exact_range(lease, 0, SIMILARITY_INDEX_HEADER_BYTES)?;
     audit.update(0, &header)?;
 
-    for ordinal in 0..descriptor.page_count() {
-        let offset = descriptor
-            .page_offset(ordinal)
-            .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-        let bytes = exact_page(lease, offset)?;
-        let page = descriptor.decode_page(ordinal, &bytes)?;
-        audit.verify_page(&page)?;
-        audit.update(offset, &bytes)?;
-    }
+    for_each_page_span(
+        lease,
+        |ordinal| descriptor.page_offset(ordinal),
+        descriptor.page_count(),
+        |ordinal, offset, bytes| {
+            let page = descriptor.decode_page(ordinal, bytes)?;
+            audit.verify_page(&page)?;
+            Ok(audit.update(offset, bytes)?)
+        },
+    )?;
 
     // Verify the complete fresh on-disk hash and page ordering first. Cached
     // bytes cannot make a damaged publication pass this gate.
-    for ordinal in 0..descriptor.bucket_page_count() {
-        let offset = descriptor
-            .bucket_page_offset(ordinal)
-            .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-        let bytes = exact_page(lease, offset)?;
-        let page = descriptor.decode_bucket_page(ordinal, &bytes)?;
-        audit.verify_bucket_page(&page)?;
-        audit.update(offset, &bytes)?;
-    }
+    for_each_page_span(
+        lease,
+        |ordinal| descriptor.bucket_page_offset(ordinal),
+        descriptor.bucket_page_count(),
+        |ordinal, offset, bytes| {
+            let page = descriptor.decode_bucket_page(ordinal, bytes)?;
+            audit.verify_bucket_page(&page)?;
+            Ok(audit.update(offset, bytes)?)
+        },
+    )?;
     let footer_offset = descriptor.footer_offset();
     audit.update(footer_offset, &exact_page(lease, footer_offset)?)?;
     audit.finish()?;
@@ -114,25 +119,53 @@ fn audit_source(
     // pages in the shared budget before the nonlocal Bucket semantic walk.
     // Admission may fail/shrink: correctness always has the bounded fallback.
     let run_hash = descriptor.run_hash();
-    for ordinal in 0..descriptor.page_count() {
-        if page_cache.get_entry(run_hash, ordinal).is_none() {
-            let offset = descriptor
-                .page_offset(ordinal)
-                .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-            let page = Arc::new(descriptor.decode_page(ordinal, &exact_page(lease, offset)?)?);
-            page_cache.insert_entry(run_hash, ordinal, page);
+    let mut ordinal = 0;
+    while ordinal < descriptor.page_count() {
+        if page_cache.get_entry(run_hash, ordinal).is_some() {
+            ordinal += 1;
+            continue;
         }
+        // Retain only the contiguous absent pages: a warm cache still pays
+        // nothing, and a cold one pays one range read instead of one per page.
+        let mut span = 1;
+        while span < SIMILARITY_AUDIT_PAGES_PER_IO_V1
+            && ordinal + span < descriptor.page_count()
+            && page_cache.get_entry(run_hash, ordinal + span).is_none()
+        {
+            span += 1;
+        }
+        let offset = descriptor
+            .page_offset(ordinal)
+            .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+        let bytes = page_span(lease, offset, span)?;
+        for (index, page_bytes) in bytes.chunks_exact(SIMILARITY_INDEX_PAGE_BYTES).enumerate() {
+            let page = Arc::new(descriptor.decode_page(ordinal + index, page_bytes)?);
+            page_cache.insert_entry(run_hash, ordinal + index, page);
+        }
+        ordinal += span;
     }
+    walk_buckets(lease, descriptor, page_cache, observe_bucket_page)
+}
+
+/// Proves every Bucket reference against its Entry and reports the Run's key range.
+fn walk_buckets(
+    lease: &ImmutableFileLease,
+    descriptor: SimilarityIndexRunDescriptor,
+    page_cache: &SimilarityPageCache,
+    mut observe_bucket_page: impl FnMut(SimilarityBucketKey),
+) -> Result<(SimilarityBucketKey, SimilarityBucketKey), SimilarityIndexStoreError> {
+    let run_hash = descriptor.run_hash();
     let mut semantic_entry_page = None;
     let mut minimum_bucket_key = None;
     let mut maximum_bucket_key = None;
+    // The walk consumes Bucket pages in ascending order, so a miss can refill a
+    // whole span at once instead of paying one Direct-I/O read per page.
+    let mut bucket_span: Option<(usize, Vec<u8>)> = None;
     for ordinal in 0..descriptor.bucket_page_count() {
-        let offset = descriptor
-            .bucket_page_offset(ordinal)
-            .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-        let page = match page_cache.get_bucket(run_hash, ordinal) {
-            Some(page) => page,
-            None => Arc::new(descriptor.decode_bucket_page(ordinal, &exact_page(lease, offset)?)?),
+        let page = if let Some(page) = page_cache.get_bucket(run_hash, ordinal) {
+            page
+        } else {
+            bucket_page_from_span(lease, descriptor, ordinal, &mut bucket_span)?
         };
         minimum_bucket_key.get_or_insert_with(|| page.first_key());
         maximum_bucket_key = Some(page.last_key());
@@ -159,6 +192,33 @@ fn audit_source(
         minimum_bucket_key.ok_or(SimilarityIndexStoreError::IndexCorruption)?,
         maximum_bucket_key.ok_or(SimilarityIndexStoreError::IndexCorruption)?,
     ))
+}
+
+/// Decodes one Bucket page from the resident span, refilling the span first.
+fn bucket_page_from_span(
+    lease: &ImmutableFileLease,
+    descriptor: SimilarityIndexRunDescriptor,
+    ordinal: usize,
+    bucket_span: &mut Option<(usize, Vec<u8>)>,
+) -> Result<Arc<SimilarityBucketPage>, SimilarityIndexStoreError> {
+    let covered = bucket_span.as_ref().is_some_and(|(first, bytes)| {
+        ordinal >= *first && ordinal - *first < bytes.len() / SIMILARITY_INDEX_PAGE_BYTES
+    });
+    if !covered {
+        let span = SIMILARITY_AUDIT_PAGES_PER_IO_V1.min(descriptor.bucket_page_count() - ordinal);
+        let offset = descriptor
+            .bucket_page_offset(ordinal)
+            .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+        *bucket_span = Some((ordinal, page_span(lease, offset, span)?));
+    }
+    let (first, bytes) = bucket_span
+        .as_ref()
+        .expect("ASSERT: a Bucket span covering this ordinal is resident");
+    let start = (ordinal - first) * SIMILARITY_INDEX_PAGE_BYTES;
+    Ok(Arc::new(descriptor.decode_bucket_page(
+        ordinal,
+        &bytes[start..start + SIMILARITY_INDEX_PAGE_BYTES],
+    )?))
 }
 
 fn mapped_entry(
@@ -206,6 +266,51 @@ fn exact_page(
 ) -> Result<Vec<u8>, SimilarityIndexStoreError> {
     let offset = usize::try_from(offset).map_err(|_| SimilarityIndexStoreError::IndexCorruption)?;
     exact_range(lease, offset, SIMILARITY_INDEX_PAGE_BYTES)
+}
+
+/// Reads `pages` consecutive pages from `offset` as one Direct-I/O range.
+fn page_span(
+    lease: &ImmutableFileLease,
+    offset: u64,
+    pages: usize,
+) -> Result<Vec<u8>, SimilarityIndexStoreError> {
+    let offset = usize::try_from(offset).map_err(|_| SimilarityIndexStoreError::IndexCorruption)?;
+    let length = pages
+        .checked_mul(SIMILARITY_INDEX_PAGE_BYTES)
+        .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+    let bytes = exact_range(lease, offset, length)?;
+    if bytes.len() != length {
+        return Err(SimilarityIndexStoreError::IndexCorruption);
+    }
+    Ok(bytes)
+}
+
+/// Walks `count` consecutive pages in ascending order, reading them in bounded
+/// spans instead of one range per page.
+///
+/// The audit sees the same pages, in the same order, decoded from the same
+/// bytes; only the I/O granularity differs. Auditing a Run on every mount
+/// otherwise costs one 4 KiB Direct-I/O read per page, which is device-bound
+/// at a few thousand IOPS no matter how fast the Run can be streamed.
+fn for_each_page_span(
+    lease: &ImmutableFileLease,
+    page_offset: impl Fn(usize) -> Option<u64>,
+    count: usize,
+    mut observe: impl FnMut(usize, u64, &[u8]) -> Result<(), SimilarityIndexStoreError>,
+) -> Result<(), SimilarityIndexStoreError> {
+    let mut ordinal = 0;
+    while ordinal < count {
+        let span = SIMILARITY_AUDIT_PAGES_PER_IO_V1.min(count - ordinal);
+        let first = page_offset(ordinal).ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+        let bytes = page_span(lease, first, span)?;
+        for (index, page_bytes) in bytes.chunks_exact(SIMILARITY_INDEX_PAGE_BYTES).enumerate() {
+            let offset = page_offset(ordinal + index)
+                .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+            observe(ordinal + index, offset, page_bytes)?;
+        }
+        ordinal += span;
+    }
+    Ok(())
 }
 
 fn exact_range(

@@ -156,6 +156,92 @@ fn recovery_rechecks_a_warm_namespace_after_durable_corruption() {
 }
 
 #[test]
+fn successor_edits_reuse_the_proven_predecessor_but_independent_reads_do_not() {
+    let path = std::env::temp_dir().join(format!("successor-predecessor-{}", std::process::id()));
+    let mut storage = crate::FsStorageIo::open(&path).unwrap();
+    let counters = Arc::new(crate::metadata_read_telemetry::MetadataReadCounters::default());
+    storage.metadata_reads = Some(Arc::clone(&counters));
+    let mut repo = GenerationRepository::new(storage, PolicySetId::new([3; 32]).unwrap());
+    // No encoded-object cache: only the installed, already-proven root may
+    // avoid a whole Namespace read/decode for every path-local Manifest edit.
+    repo.metadata_cache = Arc::new(crate::metadata_object_cache::MetadataObjectCache::limited(
+        0,
+    ));
+    let initial = repo
+        .commit_namespace(&NamespaceRoot::new(4096, 2, 0, vec![], vec![]).unwrap())
+        .unwrap();
+    let manifest = ManifestLeaf::new(
+        4096,
+        vec![ManifestExtent::Fill {
+            logical_length: 4096,
+            value: 3,
+        }],
+    )
+    .unwrap();
+    let manifest_root = repo.publish_manifest(&manifest).unwrap();
+    let namespace = NamespaceRoot::new(
+        4096,
+        130,
+        1,
+        (2..130)
+            .map(|inode| DurableInode::new(inode, 0o600, 0, 0, 1, 1, 4096, manifest_root).unwrap())
+            .collect(),
+        (2..130)
+            .map(|inode| {
+                NamespaceEntry::new(1, inode, format!("file-{inode:04}").into_bytes()).unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    let record = repo.commit_namespace(&namespace).unwrap();
+    let predecessor = super::SuccessorPredecessor::from_committed_record(record);
+    let summary = repo.scrub_manifest_tree_metadata(manifest_root).unwrap();
+    let namespace_reads = || {
+        counters
+            .rows()
+            .iter()
+            .filter(|row| row.reason == "namespace")
+            .map(|row| row.operations)
+            .sum::<u64>()
+    };
+    let before = namespace_reads();
+    let mut proof = repo.reuse_manifest_successor(predecessor, summary);
+    for value in 4..12 {
+        proof = repo
+            .stage_manifest_replacement_successor(
+                proof,
+                0..4096,
+                &[ManifestExtent::Fill {
+                    logical_length: 4096,
+                    value,
+                }],
+            )
+            .unwrap();
+        proof = repo
+            .retain_predecessor_manifest_range_successor(proof, manifest_root, 0..4096)
+            .unwrap();
+    }
+    assert_eq!(
+        namespace_reads(),
+        before,
+        "path-local edits must reuse the single proven Namespace instead of reading/decoding it per edit"
+    );
+
+    let name = metadata_name(record.namespace_root());
+    repo.storage.write_at(&name, 0, &[0]).unwrap();
+    repo.storage.sync_file(&name).unwrap();
+    {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        assert!(
+            repo.retain_predecessor_manifest_range_successor(proof, manifest_root, 0..4096)
+                .is_err()
+        );
+    }
+    assert_eq!(repo.recover_latest().unwrap().unwrap().record(), initial);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn recovery_and_scrub_reject_damaged_storage_heads_despite_warm_manifest_bytes() {
     use std::os::unix::fs::FileExt;
     let path = std::env::temp_dir().join(format!("metadata-head-fault-{}", std::process::id()));

@@ -354,6 +354,131 @@ fn online_similarity_learns_new_bases_and_obeys_live_share_overrides() {
 }
 
 #[test]
+fn writer_cache_warming_follows_live_share_policy_without_disabling_demand_reads() {
+    let appliance = DurableNamespace::open_with_reduction_indexes(
+        NamespaceConfig::default(),
+        GenerationRepository::new(MemoryStorageIo::new(), checkpoint_policy_set()),
+        ContainerRepository::new(MemoryStorageIo::new()),
+        &ExactIndexRunRepository::new(MemoryStorageIo::new()),
+        &SimilarityIndexRepository::new(MemoryStorageIo::new()),
+        32,
+    )
+    .unwrap();
+    let namespace = appliance.namespace();
+    namespace.replace_share_reduction(false, vec![]).unwrap();
+    // Cross a full Container, then leave a checkpoint residue. Repeating the
+    // payload also covers Exact-hit admission in the two writer paths.
+    let payload = pseudo_random_bytes(36 * 1_024 * 1_024);
+    let before = appliance
+        .verified_read_cache_status()
+        .compression_attempts();
+    let mut last = None;
+    for name in [b"cold-base".as_slice(), b"cold-exact".as_slice()] {
+        let (inode, handle) = create_file(&appliance, name);
+        for (ordinal, bytes) in payload.chunks(1_024 * 1_024).enumerate() {
+            namespace
+                .dispatch(
+                    CALLER,
+                    Operation::Write {
+                        inode,
+                        handle,
+                        offset: (ordinal * 1_024 * 1_024) as u64,
+                        data: bytes,
+                    },
+                )
+                .unwrap();
+        }
+        appliance.checkpoint().unwrap();
+        last = Some((inode, handle));
+    }
+    assert_eq!(
+        appliance
+            .verified_read_cache_status()
+            .compression_attempts(),
+        before,
+        "Similarity-off ingest must not copy, rehash or compress writer payload for the read cache"
+    );
+    let (inode, handle) = last.unwrap();
+    let read = || {
+        let Reply::Data(bytes) = namespace
+            .dispatch(
+                CALLER,
+                Operation::Read {
+                    inode,
+                    handle,
+                    offset: 0,
+                    length: 1_024 * 1_024,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("read DATA")
+        };
+        assert_eq!(bytes, payload[..1_024 * 1_024]);
+    };
+    read();
+    let warmed = appliance.verified_read_cache_status();
+    assert!(
+        warmed.compression_attempts() > before,
+        "demand reads still admit verified bytes"
+    );
+    read();
+    assert!(appliance.verified_read_cache_status().hits() > warmed.hits());
+
+    // A live explicit Share override wins over the disabled default.
+    namespace
+        .replace_share_reduction(false, vec![(ROOT_INODE, true)])
+        .unwrap();
+    let enabled_before = appliance
+        .verified_read_cache_status()
+        .compression_attempts();
+    let (enabled_inode, enabled_handle) = create_file(&appliance, b"enabled-exact");
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: enabled_inode,
+                handle: enabled_handle,
+                offset: 0,
+                data: &payload[8 * 1_024 * 1_024..10 * 1_024 * 1_024],
+            },
+        )
+        .unwrap();
+    appliance.checkpoint().unwrap();
+    assert!(
+        appliance
+            .verified_read_cache_status()
+            .compression_attempts()
+            > enabled_before
+    );
+
+    namespace
+        .replace_share_reduction(true, vec![(ROOT_INODE, false)])
+        .unwrap();
+    let disabled_before = appliance
+        .verified_read_cache_status()
+        .compression_attempts();
+    namespace
+        .dispatch(
+            CALLER,
+            Operation::Write {
+                inode: enabled_inode,
+                handle: enabled_handle,
+                offset: 2 * 1_024 * 1_024,
+                data: &payload[16 * 1_024 * 1_024..18 * 1_024 * 1_024],
+            },
+        )
+        .unwrap();
+    appliance.checkpoint().unwrap();
+    assert_eq!(
+        appliance
+            .verified_read_cache_status()
+            .compression_attempts(),
+        disabled_before
+    );
+}
+
+#[test]
 #[ignore = "explicit release-mode online Similarity A/B benchmark"]
 fn online_similarity_performance_ab() {
     let base = pseudo_random_bytes(4 * 1_024 * 1_024);
@@ -2591,4 +2716,146 @@ fn commit_cut_batches_stable_partial_lanes_into_one_container() {
         "distinct partial Lanes must share one large Container: {container_lengths:?} metrics: {:?}",
         committed.metrics()
     );
+}
+
+/// Budget for one commit cut taken while a stream is parked on ingest capacity.
+const COMMIT_CUT_BUDGET: Duration = Duration::from_millis(500);
+
+/// Waits until the writer stops advancing, which means it parked inside an
+/// admitted mutation instead of returning from it.
+fn wait_for_parked_writer(progress: &std::sync::atomic::AtomicU64) -> u64 {
+    use std::sync::atomic::Ordering;
+    let deadline = std::time::Instant::now() + STORAGE_REACH_TIMEOUT;
+    let mut observed = progress.load(Ordering::Acquire);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let current = progress.load(Ordering::Acquire);
+        if current == observed && current > 0 {
+            return current;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fixture must park one admitted write on ingest capacity"
+        );
+        observed = current;
+    }
+}
+
+/// A commit cut must not wait for a mutation that is itself waiting for the
+/// cut. An admitted write holds mutation admission until it returns, and a
+/// write parked on ingest capacity only returns once a checkpoint reclaims that
+/// capacity, so a cut that requests the admission fence first forms a circular
+/// wait. In the appliance only the five-second checkpoint watchdog breaks it,
+/// which is a supervisor timeout rather than a release path; here nothing
+/// breaks it at all, so this test hangs to its deadline if the cut is not
+/// announced before the fence is requested.
+fn check_commit_cut_releases_parked_writers(streams: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let paused = PausedStorageIo::disarmed_before_name_prefix(
+        MemoryStorageIo::new(),
+        StorageOperation::SyncFile,
+        ".",
+    );
+    let appliance = Arc::new(open_appliance_with_paused_containers(paused.clone()));
+    let progress = Arc::new(AtomicU64::new(0));
+    let mut writers = Vec::new();
+    for stream in 0..streams {
+        let (inode, handle) = create_file(
+            &appliance,
+            format!("cut-under-ingest-pressure-{stream}").as_bytes(),
+        );
+        let writer_appliance = Arc::clone(&appliance);
+        let writer_progress = Arc::clone(&progress);
+        writers.push(std::thread::spawn(move || {
+            for ordinal in 0_u64..128 {
+                let block = distinct_fixture_block(ordinal + (stream as u64) * 128);
+                match writer_appliance.namespace().dispatch(
+                    CALLER,
+                    Operation::Write {
+                        inode,
+                        handle,
+                        offset: ordinal * 1_048_576,
+                        data: &block,
+                    },
+                ) {
+                    Ok(Reply::Written { .. }) => {
+                        writer_progress.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Err(PosixError::Again) => break,
+                    Ok(reply) => panic!("unexpected write reply: {reply:?}"),
+                    Err(error) => panic!("unexpected write error: {error:?}"),
+                }
+            }
+        }));
+    }
+
+    assert!(
+        paused.wait_until_reached(STORAGE_REACH_TIMEOUT),
+        "the stream must reach blocked Container durability"
+    );
+    let parked = wait_for_parked_writer(&progress);
+    assert!(
+        appliance.namespace().mutation_admission_open(),
+        "the fixture must not need an admission pause to set up"
+    );
+
+    let cut_appliance = Arc::clone(&appliance);
+    let (cut_tx, cut_rx) = mpsc::channel();
+    let cut = std::thread::spawn(move || {
+        let _ = cut_tx.send(cut_appliance.checkpoint_profiled());
+    });
+
+    let deadline = std::time::Instant::now() + STORAGE_REACH_TIMEOUT;
+    while progress.load(Ordering::Acquire) == parked {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the commit cut must release the parked writer instead of waiting for it"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // `mutation_admission_open` also reports closed while a cut merely holds the
+    // fence, which is exactly when this check runs. The claim under test is that
+    // no supervisor pause was needed, and that is what `closing` reports.
+    assert!(
+        !appliance.namespace().mutation_admission_closing(),
+        "releasing the writer must not require closing admission"
+    );
+
+    paused.resume();
+    for writer in writers {
+        writer.join().expect("writer thread completes");
+    }
+    let profiled = cut_rx
+        .recv_timeout(STORAGE_REACH_TIMEOUT)
+        .expect("the checkpoint completes once Container durability resumes")
+        .expect("checkpoint succeeds")
+        .expect("a dirty stream needs one generation");
+    cut.join().expect("checkpoint thread completes");
+
+    // The runtime supervisor closes mutation admission when a checkpoint
+    // exceeds five seconds, so a cut that waits for its own writers degrades
+    // into that timeout instead of failing: throughput collapses while every
+    // operation still reports success. The budget keeps that regression a test
+    // failure rather than a field symptom.
+    let freeze = profiled.metrics().freeze().wall();
+    assert!(
+        freeze < COMMIT_CUT_BUDGET,
+        "the commit cut spent {freeze:?} freezing against a {COMMIT_CUT_BUDGET:?} budget"
+    );
+}
+
+/// One active inode parks its writer on the single-stream Ingest Ring.
+#[test]
+fn a_commit_cut_releases_writers_parked_on_ingest_capacity() {
+    check_commit_cut_releases_parked_writers(1);
+}
+
+/// Two or more active inodes take the unbatched path, which parks its writer on
+/// the multi-stream queue budget instead of the ring. A release that covers
+/// only one of those two waits leaves every workload writing more than one file
+/// at a time to the supervisor timeout, which is every real one.
+#[test]
+fn a_commit_cut_releases_writers_parked_on_the_multi_stream_budget() {
+    check_commit_cut_releases_parked_writers(3);
 }

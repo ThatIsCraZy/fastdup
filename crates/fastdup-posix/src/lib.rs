@@ -914,6 +914,19 @@ pub trait MutationObserver: std::fmt::Debug + Send + Sync {
     /// backpressure may resume.
     fn admission_opened(&self) {}
 
+    /// Signals that a commit cut is about to take the mutation admission fence.
+    ///
+    /// An already admitted mutation holds admission until it returns, so an
+    /// observer that would block it on advisory queue capacity must release it
+    /// instead: that capacity is reclaimed by the very cut now waiting. Bytes
+    /// stay owned by the Namespace, so releasing costs planning work, never
+    /// durability. Queue admission that does not block is unaffected.
+    fn commit_cut_pending(&self) {}
+
+    /// Signals that the commit cut released the mutation admission fence and
+    /// ordinary queue backpressure applies again.
+    fn commit_cut_taken(&self) {}
+
     /// Waits until every accepted mutation through `mutation_sequence` has
     /// left the observer's asynchronous processing queue.
     fn wait_through(&self, _inode: InodeId, _mutation_sequence: u64) {}
@@ -2676,6 +2689,25 @@ pub struct Namespace {
     lock_changed: Notify,
 }
 
+/// Announces a pending commit cut for the lifetime of the fence request.
+struct CommitCutSignal<'a> {
+    namespace: &'a Namespace,
+}
+
+impl<'a> CommitCutSignal<'a> {
+    fn enter(namespace: &'a Namespace) -> Self {
+        namespace.signal_observer(|observer| observer.commit_cut_pending());
+        Self { namespace }
+    }
+}
+
+impl Drop for CommitCutSignal<'_> {
+    fn drop(&mut self) {
+        self.namespace
+            .signal_observer(|observer| observer.commit_cut_taken());
+    }
+}
+
 struct MutationAdmissionFence<'a> {
     admitted: RwLockWriteGuard<'a, bool>,
     fence: &'a AtomicUsize,
@@ -3219,6 +3251,17 @@ impl Namespace {
         self.mutation_admission_closing.load(Ordering::Acquire)
     }
 
+    fn signal_observer(&self, signal: impl FnOnce(&dyn MutationObserver)) {
+        if let Some(observer) = self
+            .mutation_observer
+            .read()
+            .expect("ASSERT: mutation observer lock poisoned")
+            .as_ref()
+        {
+            signal(observer.as_ref());
+        }
+    }
+
     fn mutation_admission_fence(&self) -> MutationAdmissionFence<'_> {
         self.mutation_admission_fenced
             .fetch_add(1, Ordering::SeqCst);
@@ -3711,6 +3754,12 @@ impl Namespace {
     /// disagree while the catalog is exclusively locked.
     #[allow(clippy::too_many_lines)]
     pub fn begin_commit(&self) -> Result<Option<NamespaceCommit>, PosixError> {
+        // The fence below waits for every admitted mutation to return. A
+        // mutation that is blocked on advisory ingest capacity cannot return
+        // until this cut reclaims that capacity, so waiting for it first would
+        // be a circular wait broken only by an external timeout. Announcing the
+        // cut releases those writers before the fence is requested.
+        let _cut_signal = CommitCutSignal::enter(self);
         let _mutation_fence = self.mutation_admission_fence();
         let mut catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
         if let Some(inflight) = &catalog.inflight_commit {
@@ -3720,17 +3769,16 @@ impl Namespace {
         let namespace_mutation_sequence = root_mutation_sequence(&catalog);
         let namespace_dirty =
             namespace_mutation_sequence != catalog.committed_namespace_mutation_sequence;
-        let mut content_dirty = false;
-        for (&inode, object) in &catalog.inodes {
-            if inode == ROOT_INODE {
-                continue;
-            }
-            let state = object.state.read().expect("ASSERT: inode lock poisoned");
-            if state.link_count > 0 && state.data.has_active_mutations() {
-                content_dirty = true;
-                break;
-            }
-        }
+        // The answer is only consulted when the Namespace itself is clean, so a
+        // dirty Namespace must not pay a pool-wide probe it cannot use. Every
+        // probed inode is locked individually while this holds the catalog.
+        let content_dirty = !namespace_dirty
+            && catalog.inodes.iter().any(|(&inode, object)| {
+                inode != ROOT_INODE && {
+                    let state = object.state.read().expect("ASSERT: inode lock poisoned");
+                    state.link_count > 0 && state.data.has_active_mutations()
+                }
+            });
         if !namespace_dirty && !content_dirty {
             if let Some(admission) = self.commit_capacity_admission.get() {
                 admission.finish_uncheckpointed_active();

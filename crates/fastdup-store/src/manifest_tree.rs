@@ -97,6 +97,10 @@ impl EncodedManifestTree {
     pub(crate) fn objects(&self) -> &[(MetadataObjectId, Vec<u8>)] {
         &self.objects
     }
+
+    pub(crate) fn into_objects(self) -> Vec<(MetadataObjectId, Vec<u8>)> {
+        self.objects
+    }
 }
 
 #[derive(Clone, Copy)]

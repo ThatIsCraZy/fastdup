@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fastdup_format::{
     ChunkId, CommitRecord, ContainerId, DurableInode, DurableRootMetadata, DurableTimes,
@@ -30,7 +30,7 @@ use fastdup_store::{
 
 use crate::ManifestCommittedFile;
 
-use super::metrics::{CheckpointReductionMetrics, PhaseStarted};
+use super::metrics::{CheckpointReductionMetrics, CheckpointStage, PhaseStarted};
 use super::write_through::DrainResidue;
 use super::{
     CDC_MAXIMUM_BYTES, COMPRESSION_REGION_TARGET_BYTES, CONTAINER_PAYLOAD_TARGET_BYTES,
@@ -92,13 +92,15 @@ where
                     let mut proof = self
                         .generations
                         .reuse_manifest_successor(predecessor, *previous);
-                    for replacement in replacements {
-                        proof = self.generations.stage_manifest_replacement_successor(
-                            proof,
-                            replacement.replaced.clone(),
-                            &replacement.extents,
-                        )?;
-                    }
+                    let edits: Vec<_> = replacements
+                        .iter()
+                        .map(|replacement| {
+                            (replacement.replaced.clone(), replacement.extents.as_slice())
+                        })
+                        .collect();
+                    proof = self
+                        .generations
+                        .stage_manifest_replacements_successor(proof, &edits)?;
                     if !appended.is_empty() {
                         proof = self
                             .generations
@@ -115,13 +117,15 @@ where
                     let mut proof = self
                         .generations
                         .reuse_manifest_successor(predecessor, *previous);
-                    for replacement in replacements {
-                        proof = self.generations.stage_manifest_replacement_successor(
-                            proof,
-                            replacement.replaced.clone(),
-                            &replacement.extents,
-                        )?;
-                    }
+                    let edits: Vec<_> = replacements
+                        .iter()
+                        .map(|replacement| {
+                            (replacement.replaced.clone(), replacement.extents.as_slice())
+                        })
+                        .collect();
+                    proof = self
+                        .generations
+                        .stage_manifest_replacements_successor(proof, &edits)?;
                     proof = self
                         .generations
                         .stage_manifest_truncate_successor(proof, *logical_size)?;
@@ -180,13 +184,21 @@ where
             .installed_predecessor
             .lock()
             .expect("ASSERT: installed predecessor lock poisoned");
+        let phase = self
+            .checkpoint_timings
+            .begin(CheckpointStage::MetadataManifests);
         let (durable_inodes, successor_proofs) =
             self.publish_manifest_plans(commit, manifests, predecessor, retained_ranges)?;
+        drop(phase);
         let mut installs = Vec::new();
         installs
             .try_reserve_exact(commit.inodes().len())
             .map_err(|_| DurableNamespaceError::OutOfMemory)?;
+        let phase = self
+            .checkpoint_timings
+            .begin(CheckpointStage::NamespaceRoot);
         let root = namespace_root_for_commit(commit, durable_inodes)?;
+        drop(phase);
         let fallback = self
             .manifest_readers
             .online_graph_verifier(self.containers.clone());
@@ -194,6 +206,9 @@ where
             proofs: Arc::clone(&self.online_dependency_proofs),
             fallback,
         };
+        let phase = self
+            .checkpoint_timings
+            .begin(CheckpointStage::NamespaceCommit);
         let committed = self
             .generations
             .commit_namespace_with_successor_proofs_using(
@@ -203,6 +218,10 @@ where
                 &successor_proofs,
                 &graph_verifier,
             )?;
+        drop(phase);
+        let _phase = self
+            .checkpoint_timings
+            .begin(CheckpointStage::NamespaceInstall);
         let (record, verified_files) = committed.into_parts();
         assert_eq!(
             verified_files.len(),
@@ -1650,9 +1669,11 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             .reuse_location(self.index, self.containers, chunk_id, length, true)
             .is_some()
         {
-            self.index
-                .read_cache()
-                .admit_writer_chunk(chunk_id, &[&bytes]);
+            if self.advanced {
+                self.index
+                    .read_cache()
+                    .admit_writer_chunk(chunk_id, &[&bytes]);
+            }
             self.record_exact_hit(length);
             exact_started.finish_into(&mut self.metrics.exact_lookup);
             return Ok(());
@@ -1820,10 +1841,12 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
         }
         self.index
             .publish_reduction_batch(published_entries, similarities, publication_guard);
-        for (&chunk_id, bytes) in self.chunk_ids.iter().zip(&self.chunks) {
-            self.index
-                .read_cache()
-                .admit_writer_chunk(chunk_id, &[bytes]);
+        if self.advanced {
+            for (&chunk_id, bytes) in self.chunk_ids.iter().zip(&self.chunks) {
+                self.index
+                    .read_cache()
+                    .admit_writer_chunk(chunk_id, &[bytes]);
+            }
         }
         self.chunks.clear();
         self.chunk_ids.clear();
@@ -1882,8 +1905,24 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
     }
 }
 
+/// Shared kernel entropy source for Container identities.
+///
+/// Sealing a Container is a hot-path event, so the source is opened once for the
+/// process instead of once per identity. A lost race merely opens the device
+/// twice and keeps the first handle.
+fn container_entropy() -> Result<&'static Mutex<File>, DurableNamespaceError> {
+    static ENTROPY: OnceLock<Mutex<File>> = OnceLock::new();
+    if let Some(entropy) = ENTROPY.get() {
+        return Ok(entropy);
+    }
+    let opened = File::open("/dev/urandom")?;
+    Ok(ENTROPY.get_or_init(|| Mutex::new(opened)))
+}
+
 pub(super) fn random_container_id() -> Result<ContainerId, DurableNamespaceError> {
-    let mut random = File::open("/dev/urandom")?;
+    let mut random = container_entropy()?
+        .lock()
+        .expect("ASSERT: Container entropy lock poisoned");
     loop {
         let mut bytes = [0_u8; 16];
         random.read_exact(&mut bytes)?;

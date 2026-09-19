@@ -6,20 +6,16 @@ the product boundary; implementation and format details belong in specifications
 and ADRs.
 
 **MVP**:
-The first usable FUSE appliance with crash-safe manifests, bounded updates,
-SeqCDC, Exact Dedup, bounded in-memory acceleration, RAW/Zstd encodings, and
-adaptive DATA/Metadata GC. A durable, rebuildable Similarity Index and
-Depth-1 ZSTD_PREFIX/Sparse-XOR encodings form the optional Advanced Reduction
-path; Dictionary encoding, Reorder, production Samba hardening, and device-loss
-protection remain later stages.
+The first usable appliance profile: byte-exact POSIX storage with bounded crash
+recovery and Exact Dedup on functioning storage. It excludes production and
+single-device-loss claims.
 _Avoid_: Container-store milestone, production appliance
 
 **Advanced reduction**:
-The optional writer path that pins one coherent Exact/Similarity snapshot and
-uses bounded Similarity Candidates to trial Depth-1 ZSTD_PREFIX and Sparse-XOR
-encodings behind one dependent-codec policy.
-Unavailable or stale acceleration falls back to independent encoding without
-weakening content truth.
+An optional writer policy that uses Similarity Candidates to trial Depth-1
+ZSTD_PREFIX and Sparse-XOR encodings. Similarity is a hint; every Base resolves
+through current Exact state, and any unavailable evidence falls back to an
+independent encoding.
 _Avoid_: Delta mode, authoritative Similarity Index
 
 ## Stored data
@@ -206,19 +202,19 @@ promise that physical capacity is reserved for a later write.
 _Avoid_: Capacity reservation, preallocation guarantee, file size
 
 **Namespace root**:
-The identity of the immutable directory and inode state selected by one commit
-generation.
+The identity of the complete immutable directory-and-inode graph selected by
+one commit generation.
 _Avoid_: Mount point, recovery checkpoint
 
 **Metadata object**:
-An immutable, content-identified metadata blob referenced by namespace or inode
-nodes when it is too large to represent inline.
+An immutable, content-identified blob that carries Namespace, Manifest, or
+other durable repository metadata.
 _Avoid_: User data chunk, online index
 
 **Namespace shard**:
-A bounded immutable piece of one Namespace Root's canonical byte stream. Only
-the ordered, hash-bound shard set selected by that Root is meaningful; a shard
-is not an independently mutable directory or inode partition.
+A bounded immutable run of Inode records or directory-entry records selected by
+one Namespace Root. Its key-derived range enables content reuse, but only the
+complete root-selected graph is a Namespace.
 _Avoid_: Directory shard, namespace database page, independent root
 
 **Commit record**:
@@ -235,10 +231,9 @@ bridge record.
 _Avoid_: Recovery checkpoint, online index
 
 **Recovery checkpoint**:
-A self-contained immutable copy of one committed Namespace graph stored on the
-Data Tier for complete Metadata-Tier loss. Paired selector heads retain the
-current and previous complete copies; each copy embeds its exact Commit Record
-and every transitively reachable Metadata object, but no online index.
+A Data-Tier copy of committed Namespace and Manifest recovery state for
+rebuilding after complete Metadata-Tier loss. It may lag normal durability and
+contains no online index.
 _Avoid_: Commit WAL, normal checkpoint, snapshot, backup
 
 **Visible version**:
@@ -532,19 +527,12 @@ _Avoid_: Scrub, normal startup
 **Committed start**:
 A mount from a structurally valid committed Metadata graph whose DATA availability
 and integrity are checked on demand and by background scrub.
-_Avoid_: Verified repository, index-authoritative start
+_Avoid_: Structural start, degraded start, verified repository, index-authoritative start
 
 **Scrub round progress**:
 Historical full checks of immutable Containers within one incomplete verification
 round, reusable only after reconciliation with present DATA and current graph requirements.
 _Avoid_: Healthy forever, current payload proof, GC deletion authority
-
-**Structural start**:
-A mount after complete structural validation but before every stored chunk has
-been rehashed. Every chunk is fully verified when read, while background scrub
-checks stored content independently.
-_Alias_: Degraded start
-_Avoid_: Unverified read, rebuild
 
 **Re-anchoring**:
 The explicit maintenance rewrite that changes the logical Base Chunk used by
@@ -623,8 +611,7 @@ existing objects.
 _Avoid_: Feature flags, software version
 
 **Placement window**:
-A bounded input range within which physical ordering may be changed to improve
-compression while retaining restore locality.
+A bounded logical range used to plan encoding and preserve restore locality.
 _Avoid_: Global reorder, compression region
 
 **Forced chunk boundary**:
@@ -670,12 +657,6 @@ The acknowledged history that may be lost after a process crash or power loss.
 Every successful write must become part of a recoverable commit within ten
 seconds, regardless of open handles or application-level file completeness.
 _Avoid_: Flush interval, retention period
-
-**Recovery checkpoint**:
-A data-tier copy of namespace and manifest recovery state used to rebuild after
-the complete loss of the metadata tier. It may intentionally lag normal crash
-durability.
-_Avoid_: Online metadata index, commit group
 
 **Recovered generation**:
 The newest wholly valid commit generation selected after a crash. Recovery does
@@ -762,21 +743,15 @@ process state is replaceable and does not define the Repository's durable state.
 _Avoid_: Repository, Appliance ID, Control plane
 
 **Online writer state**:
-The serialized Repository owner's validated generation and publication state,
-advanced through its own successful writes and required synchronization. It
-avoids reconstructing known state from disk on every mutation. It is bounded
-required working state, distinct from evictable read acceleration; uncertain
-activation I/O revokes the WAL cursor and recovery reconstructs it independently.
-The constant-sized Exact Run allocator skips observed orphan names and consumes
-reserved output ranges before I/O; it is shared with GC and reconstructed by a
-new owner, rather than scanning the Metadata directory on each publication.
+A bounded process-local projection of the current owner's validated generation
+and publication state. It avoids redundant discovery but is reconstructed after
+restart or uncertain activation and is never durable authority.
 _Avoid_: Read cache, proof of durability from RAM, durable recovery authority
 
 **Repository format epoch**:
-A compatibility fence carried by the authoritative Commit chain. Every current
-repository begins at epoch one; epoch zero and unknown epochs are unsupported
-pre-production state rather than migration inputs. The fence prevents an older
-writer from silently advancing the repository.
+A repository-wide compatibility fence carried by the authoritative Commit
+chain. Readers and writers accept only supported epochs and fail closed before
+an incompatible writer can advance the repository.
 _Avoid_: Object version, software version, Policy Set
 
 **Appliance recovery latch**:

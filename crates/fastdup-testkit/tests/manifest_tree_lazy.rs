@@ -730,6 +730,166 @@ fn retained_clone_proof_rejects_a_manifest_not_named_by_the_predecessor() {
     ));
 }
 
+#[test]
+fn batched_replacements_publish_only_the_final_tree_and_match_serial_edits() {
+    let policy = PolicySetId::new([0xa8; 32]).unwrap();
+    let edits: Vec<_> = (0..80_u64)
+        .map(|ordinal| {
+            (
+                ordinal * 8192..ordinal * 8192 + 4096,
+                vec![ManifestExtent::Fill {
+                    logical_length: 4096,
+                    value: u8::try_from(ordinal + 32).unwrap(),
+                }],
+            )
+        })
+        .collect();
+    let mut outcomes = Vec::new();
+    for batched in [false, true] {
+        let storage = MemoryStorageIo::new();
+        let (repo, _, predecessor, summary) = seed_splice_predecessor(&storage, policy);
+        let mut proof = repo.reuse_manifest_successor(predecessor, summary);
+        let baseline = storage.operation_count();
+        if batched {
+            let edits: Vec<_> = edits
+                .iter()
+                .map(|(range, extents)| (range.clone(), extents.as_slice()))
+                .collect();
+            proof = repo
+                .stage_manifest_replacements_successor(proof, &edits)
+                .unwrap();
+        } else {
+            for (range, extents) in &edits {
+                proof = repo
+                    .stage_manifest_replacement_successor(proof, range.clone(), extents)
+                    .unwrap();
+            }
+        }
+        let syncs = storage.operations()[baseline..]
+            .iter()
+            .filter(|op| **op == StorageOperation::SyncFile)
+            .count();
+        assert_eq!(
+            repo.scrub_manifest_tree_metadata(proof.summary().root())
+                .unwrap(),
+            proof.summary()
+        );
+        outcomes.push((proof.summary(), syncs));
+    }
+    assert_eq!(
+        outcomes[0].0, outcomes[1].0,
+        "batching must preserve the exact tree identity and allocation"
+    );
+    assert!(
+        outcomes[1].1 * 4 < outcomes[0].1,
+        "intermediate roots/leaves must not be synchronized: serial={}, batched={}",
+        outcomes[0].1,
+        outcomes[1].1
+    );
+}
+
+#[test]
+fn batched_replacement_faults_recover_the_old_or_complete_new_tree() {
+    let policy = PolicySetId::new([0xa9; 32]).unwrap();
+    let publish = |repo: &GenerationRepository<MemoryStorageIo>,
+                   containers: &ContainerRepository<MemoryStorageIo>,
+                   predecessor,
+                   summary|
+     -> Result<_, fastdup_store::GenerationError> {
+        let edits: Vec<_> = (0..6_u64)
+            .map(|ordinal| {
+                (
+                    ordinal * 8192..ordinal * 8192 + 4096,
+                    vec![ManifestExtent::Fill {
+                        logical_length: 4096,
+                        value: 0x91,
+                    }],
+                )
+            })
+            .collect();
+        let edits: Vec<_> = edits
+            .iter()
+            .map(|(range, extents)| (range.clone(), extents.as_slice()))
+            .collect();
+        let proof = repo.stage_manifest_replacements_successor(
+            repo.reuse_manifest_successor(predecessor, summary),
+            &edits,
+        )?;
+        let root = NamespaceRoot::new(
+            RESERVATION_END,
+            FILE_INODE + 1,
+            2,
+            vec![DurableInode::new(
+                FILE_INODE,
+                0o600,
+                0,
+                0,
+                1,
+                2,
+                proof.summary().logical_size(),
+                proof.summary().root(),
+            )?],
+            vec![NamespaceEntry::new(
+                ROOT_INODE,
+                FILE_INODE,
+                b"splice".to_vec(),
+            )?],
+        )?;
+        Ok(repo
+            .commit_namespace_with_successor_proofs_using(
+                &root,
+                containers,
+                predecessor,
+                &[proof],
+                containers,
+            )?
+            .record())
+    };
+    let storage = MemoryStorageIo::new();
+    let (repo, containers, predecessor, summary) = seed_splice_predecessor(&storage, policy);
+    let baseline = storage.operation_count();
+    let next = publish(&repo, &containers, predecessor, summary).unwrap();
+    let operations = storage.operations()[baseline..].to_vec();
+    assert_eq!(operations.last(), Some(&StorageOperation::SyncFile));
+    let expected = repo
+        .recover_latest()
+        .unwrap()
+        .unwrap()
+        .namespace_root()
+        .inodes()[0]
+        .manifest_root();
+    for after in [false, true] {
+        for position in 0..operations.len() {
+            let storage = MemoryStorageIo::new();
+            let (repo, containers, predecessor, summary) =
+                seed_splice_predecessor(&storage, policy);
+            storage.arm_failpoint(after, storage.operation_count() + position);
+            let _ = publish(&repo, &containers, predecessor, summary);
+            storage.clear_faults();
+            drop(repo);
+            storage.crash();
+            let reopened = GenerationRepository::new(storage, policy);
+            let recovered = reopened.recover_latest().unwrap().unwrap();
+            let root = recovered.namespace_root().inodes()[0].manifest_root();
+            match recovered.record().generation() {
+                2 => assert_eq!(root, summary.root()),
+                3 => {
+                    assert_eq!(recovered.record(), next);
+                    assert_eq!(root, expected);
+                }
+                other => panic!("mixed generation {other} at fault {position}, after={after}"),
+            }
+            assert_eq!(
+                reopened
+                    .scrub_manifest_tree_metadata(root)
+                    .unwrap()
+                    .logical_size(),
+                3 * WINDOW_BYTES
+            );
+        }
+    }
+}
+
 fn publish_splice_generation(
     repository: &GenerationRepository<MemoryStorageIo>,
     containers: &ContainerRepository<MemoryStorageIo>,

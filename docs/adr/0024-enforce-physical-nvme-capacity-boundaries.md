@@ -1,11 +1,10 @@
 ---
-status: superseded by ADR-0080 through ADR-0084
+status: superseded by ADR 0080 through ADR 0084
 ---
 
-# Enforce physical NVMe capacity boundaries
+# Enforce physical capacity boundaries
 
-This record combined five independently enforceable decisions and made partial
-implementation look complete. Its decisions now live at their actual proof
-boundaries: Pool identity and roles in ADR 0080, physical quota isolation in
-ADR 0081, mutation capacity reservation in ADR 0082, cached physical `statfs`
-reporting in ADR 0083, and Small-File placement in ADR 0084.
+This record combined separate proof boundaries and made partial implementation
+look complete. Use ADR 0080 for Pool identity and roles, 0081 for physical
+isolation, 0082 for mutation admission, 0083 for cached `statfs`, and 0084 for
+Small-File placement.

@@ -7,6 +7,9 @@ use fastdup_testkit::MemoryStorageIo;
 use std::sync::mpsc;
 
 const MIB: usize = 1_048_576;
+/// An order of magnitude below the five-second supervisor threshold, so a cut
+/// that waits on its own backlog fails here instead of in the field.
+const COMMIT_CUT_BUDGET: Duration = Duration::from_millis(500);
 const CALLER: RequestContext = RequestContext {
     uid: 1000,
     gid: 1000,
@@ -218,8 +221,13 @@ fn frozen_cut_keeps_fill_recipes_before_post_cut_job_retirement() {
     check_handoff(true);
 }
 
+/// A checkpoint that is already running must never wait on pending-region
+/// capacity, because the Lane drain that releases that capacity is the
+/// statement after the wait. Before ADR 0097 the cycle was broken by the
+/// five-second supervisor timeout, which turned every multi-stream ingest into
+/// a sequence of five-second stalls.
 #[test]
-fn transient_checkpoint_pause_releases_a_saturated_staging_gate() {
+fn a_saturated_staging_gate_never_blocks_the_frozen_commit_cut() {
     let appliance = open_appliance();
     let gate_bytes = appliance.write_through.saturate_pending_gate_for_tests();
     let (inode, handle) = create(&appliance, b"staging");
@@ -230,49 +238,36 @@ fn transient_checkpoint_pause_releases_a_saturated_staging_gate() {
     let checkpoint = std::thread::spawn(move || {
         let _ = result_tx.send(worker.checkpoint_profiled());
     });
-    while !appliance.checkpoint_lock_is_held() {
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let result = result_rx
+        .recv_timeout(COMMIT_CUT_BUDGET)
+        .expect("the commit cut must admit the backlog it is waiting for");
+    checkpoint.join().unwrap();
+
+    assert!(
+        appliance.namespace().mutation_admission_open(),
+        "releasing the cut must not require an admission pause"
+    );
     assert!(
         !appliance.checkpoint_staging_gate_open(),
-        "a normal checkpoint must not bypass the staging gate"
+        "the cut must not borrow the one-generation watchdog hatch"
     );
-    let stuck_deadline = std::time::Instant::now() + Duration::from_millis(250);
-    while std::time::Instant::now() < stuck_deadline {
-        assert!(
-            result_rx.try_recv().is_err(),
-            "the Frozen cut must remain blocked while the staging gate is saturated"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        !appliance.write_through.commit_cut_staging_open(),
+        "the commit-cut hatch is scoped to the cut wait"
+    );
 
-    appliance
-        .namespace()
-        .pause_mutation_admission_for(AdmissionPauseReason::CheckpointTimeout);
-    assert!(appliance.force_checkpoint_staging_gate_for_transient_pause());
-    assert!(appliance.checkpoint_staging_gate_open());
-
-    let result = result_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the forced staging gate must release the Frozen cut");
-    checkpoint.join().unwrap();
     let metrics = result
-        .expect("forced staging must preserve checkpoint integrity")
+        .expect("hatched staging must preserve checkpoint integrity")
         .expect("a dirty checkpoint must commit")
         .metrics();
     assert!(
         metrics.checkpoint_rechunk_bytes() <= u64::try_from(MIB).unwrap(),
-        "forced staging lost stable bytes: {} bytes",
+        "hatched staging lost stable bytes: {} bytes",
         metrics.checkpoint_rechunk_bytes()
     );
-    assert_eq!(
-        appliance.forced_staging_batches(),
-        1,
-        "exactly one saturated staging batch may bypass the gate"
-    );
     assert!(
-        !appliance.checkpoint_staging_gate_open(),
-        "a successful commit must clear the forced staging gate"
+        appliance.forced_staging_batches() >= 1,
+        "the blocked batch must be accounted as a hatched admission"
     );
     assert_file(appliance.namespace(), inode, &[91; MIB]);
     appliance
@@ -313,71 +308,103 @@ fn checkpoint_staging_force_policy_only_opens_for_transient_pauses() {
     }
 }
 
-/// The staging escape hatch is scoped to one generation, so a supervisor that
-/// keeps checkpointing while admission stays closed has to re-apply the force
-/// policy for every attempt. A catch-up checkpoint that inherits the cleared
-/// gate freezes its commit cut and then waits in the Ingest Queue for a batch
-/// that only that same cut could release.
+/// The commit-cut hatch must close with the cut that opened it. A hatch that
+/// leaked across generations would turn the pending-region gate into an
+/// advisory number and let Lane payload grow past its budget between
+/// checkpoints.
 #[test]
-fn a_committed_generation_closes_the_staging_gate_for_the_next_checkpoint() {
+fn consecutive_commit_cuts_each_close_their_staging_hatch() {
     let appliance = open_appliance();
     let gate_bytes = appliance.write_through.saturate_pending_gate_for_tests();
+    // Distinct content: repeating a block would let Exact Dedup answer the
+    // second write without new staging pressure, so the gate would never engage.
     let first_block = vec![91_u8; MIB].into_boxed_slice();
     let second_block = vec![92_u8; MIB].into_boxed_slice();
     let (first, first_handle) = create(&appliance, b"catch-up-first");
-    write(&appliance, first, first_handle, 0, &first_block);
-    appliance
-        .namespace()
-        .pause_mutation_admission_for(AdmissionPauseReason::CheckpointTimeout);
-    assert!(appliance.force_checkpoint_staging_gate_for_transient_pause());
-    appliance
-        .checkpoint_profiled()
-        .expect("forced staging must preserve checkpoint integrity")
-        .expect("a dirty checkpoint must commit");
-    assert!(
-        !appliance.checkpoint_staging_gate_open(),
-        "a committed generation must clear the forced staging gate"
-    );
-
-    // Distinct content: repeating the first block would let Exact Dedup answer
-    // the write without new staging pressure, so the gate would never engage.
-    appliance.namespace().resume_mutation_admission();
     let (second, second_handle) = create(&appliance, b"catch-up-second");
-    write(&appliance, second, second_handle, 0, &second_block);
-    appliance
-        .namespace()
-        .pause_mutation_admission_for(AdmissionPauseReason::CheckpointTimeout);
 
-    let worker = Arc::clone(&appliance);
-    let (result_tx, result_rx) = mpsc::sync_channel(1);
-    let catch_up = std::thread::spawn(move || {
-        let _ = result_tx.send(worker.checkpoint_profiled());
-    });
-    let stuck_deadline = std::time::Instant::now() + Duration::from_millis(250);
-    while std::time::Instant::now() < stuck_deadline {
+    for (inode, handle, block) in [
+        (first, first_handle, &first_block),
+        (second, second_handle, &second_block),
+    ] {
+        write(&appliance, inode, handle, 0, block);
+        let worker = Arc::clone(&appliance);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let checkpoint = std::thread::spawn(move || {
+            let _ = result_tx.send(worker.checkpoint_profiled());
+        });
+        result_rx
+            .recv_timeout(COMMIT_CUT_BUDGET)
+            .expect("every generation must admit its own backlog")
+            .expect("hatched staging must preserve checkpoint integrity")
+            .expect("a dirty checkpoint must commit");
+        checkpoint.join().unwrap();
         assert!(
-            result_rx.try_recv().is_err(),
-            "the catch-up cut must remain blocked until the gate is forced again"
+            !appliance.write_through.commit_cut_staging_open(),
+            "a committed generation must close its commit-cut hatch"
         );
-        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            !appliance.checkpoint_staging_gate_open(),
+            "a committed generation must leave the watchdog hatch closed"
+        );
     }
 
-    assert!(appliance.force_checkpoint_staging_gate_for_transient_pause());
-    result_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("re-forcing the staging gate must release the catch-up cut")
-        .expect("forced staging must preserve checkpoint integrity")
-        .expect("a dirty catch-up checkpoint must commit");
-    catch_up.join().unwrap();
-    assert_eq!(
-        appliance.forced_staging_batches(),
-        2,
-        "each generation may admit exactly one saturated staging batch"
-    );
     assert_file(appliance.namespace(), first, &first_block);
     assert_file(appliance.namespace(), second, &second_block);
     appliance
         .write_through
         .release_pending_gate_for_tests(gate_bytes);
+    drop(appliance);
+}
+
+/// The pending-region gate must charge exactly what the Ingest Lanes hold.
+///
+/// Two paths detach Lane payload without a staging reservation to settle it:
+/// evicting a Lane frees its buffers, and the commit-cut drain publishes Lane
+/// payload into Containers outside `stage_write_batch`. Bytes left charged for
+/// either retire gate capacity for the process lifetime. On the test appliance
+/// the ledger reached 3.1 GiB against a 304 MiB gate after 10 GiB of ingest,
+/// at which point every staging reservation blocked, the Ingest workers parked
+/// instead of staging, and the writers behind them spent 91 % of their wall
+/// time waiting for a checkpoint to wake them.
+#[test]
+fn the_pending_region_gate_charges_only_what_the_lanes_hold() {
+    let appliance = open_appliance();
+    let assert_exact = |stage: &str| {
+        let charged = appliance.write_through.charged_region_bytes();
+        let live = appliance.write_through.live_lane_region_bytes();
+        assert_eq!(
+            charged, live,
+            "{stage}: the gate charges {charged} bytes for {live} bytes of Lane payload"
+        );
+    };
+
+    // Enough payload for the commit-cut drain to publish a Container, which is
+    // the detachment that `stage_write_batch` never settles.
+    let (inode, handle) = create(&appliance, b"drain-publication");
+    let payload = vec![37_u8; 40 * MIB];
+    write(&appliance, inode, handle, 0, &payload);
+    appliance
+        .checkpoint()
+        .expect("a drained checkpoint commits");
+    assert_exact("after the commit-cut drain");
+
+    // Enough inodes to pass the Registry's eviction grace, so Lanes are
+    // actually evicted while they still hold payload rather than overflowing.
+    for ordinal in 0..(super::write_through::MAX_ACTIVE_INGEST_LANES_V1 * 3) {
+        let (evicting, evicting_handle) =
+            create(&appliance, format!("lane-{ordinal}").as_bytes());
+        write(&appliance, evicting, evicting_handle, 0, &vec![91_u8; 65_536]);
+    }
+    appliance
+        .checkpoint()
+        .expect("a checkpoint over evicted Lanes commits");
+    assert_exact("after Lane eviction");
+    assert!(
+        appliance.write_through.charged_region_bytes()
+            < super::write_through::INGEST_PENDING_GATE_BYTES_V1,
+        "the ledger must stay inside its own gate"
+    );
+    assert_file(appliance.namespace(), inode, &payload);
     drop(appliance);
 }

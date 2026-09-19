@@ -7,9 +7,12 @@ use crate::manifest_tree::{
     ManifestTreeSummary, read_manifest_tree_range, rewrite_manifest_tree_range,
     rewrite_manifest_tree_range_successor, splice_manifest_tree, truncate_manifest_tree,
 };
-use fastdup_format::{ManifestExtent, MetadataObjectId};
+use fastdup_format::{
+    ManifestExtent, ManifestInnerNode, MetadataObjectId, MetadataObjectKind, metadata_object_kind,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 impl<I: StorageIo> GenerationRepository<I> {
@@ -80,6 +83,115 @@ impl<I: StorageIo> GenerationRepository<I> {
             replacement,
             false,
         )
+    }
+
+    /// Stages ordered, disjoint edits of one Manifest for the next Commit.
+    /// Up to 32 edits share an in-memory tree overlay; only reachable nodes of
+    /// its final tree are published, child-first. A group also ends after 8 MiB
+    /// of encoded nodes (plus one bounded edit), bounding transient images.
+    ///
+    /// # Errors
+    /// Returns the same errors as `stage_manifest_replacement_successor`, or
+    /// rejects overlapping/out-of-order ranges. The caller still owes the
+    /// shared directory barrier and Commit-WAL sync.
+    ///
+    /// # Panics
+    /// Panics on a poisoned publication barrier or inconsistent encoder identity.
+    #[allow(clippy::too_many_lines)]
+    pub fn stage_manifest_replacements_successor(
+        &self,
+        mut previous: ManifestSuccessorProof,
+        replacements: &[(Range<u64>, &[ManifestExtent])],
+    ) -> Result<ManifestSuccessorProof, GenerationError> {
+        use crate::manifest_tree::ManifestTreeError;
+        let _publication_guard = self
+            .metadata_gc_barrier
+            .read()
+            .expect("ASSERT: Metadata GC publication barrier poisoned");
+        let mut cursor = 0;
+        let mut previous_end = 0;
+        while cursor < replacements.len() {
+            let mut overlay = BTreeMap::<MetadataObjectId, Arc<Vec<u8>>>::new();
+            let mut encoded_bytes = 0_usize;
+            let mut summary = previous.summary;
+            let group_start = cursor;
+            while cursor < replacements.len() && cursor - group_start < 32 {
+                let (range, extents) = &replacements[cursor];
+                if range.start < previous_end || range.start >= range.end {
+                    return Err(ManifestTreeError::InvalidReplacement.into());
+                }
+                previous_end = range.end;
+                for (chunk_id, logical_length) in manifest_dependencies(extents)? {
+                    if let Some(first_length) =
+                        previous.introduced_chunks.insert(chunk_id, logical_length)
+                        && first_length != logical_length
+                    {
+                        return Err(GenerationError::ManifestChunkLengthConflict {
+                            chunk_id,
+                            first_length,
+                            second_length: logical_length,
+                        });
+                    }
+                }
+                let (tree, next) =
+                    rewrite_manifest_tree_range_successor(summary, range.clone(), extents, |id| {
+                        overlay
+                            .get(&id)
+                            .cloned()
+                            .map_or_else(|| self.read_manifest_node(id), Ok)
+                    })?;
+                for (id, encoded) in tree.into_objects() {
+                    if let std::collections::btree_map::Entry::Vacant(slot) = overlay.entry(id) {
+                        encoded_bytes = encoded_bytes.saturating_add(encoded.len());
+                        slot.insert(Arc::new(encoded));
+                    }
+                }
+                summary = next;
+                cursor += 1;
+                if encoded_bytes >= 8 * 1_024 * 1_024 {
+                    break;
+                }
+            }
+            // Follow only newly encoded nodes. Unchanged subtrees already have
+            // durable coverage; intermediate overwritten roots are unreachable.
+            let mut pending = vec![(summary.root(), false)];
+            let mut visited = BTreeSet::new();
+            while let Some((id, children_done)) = pending.pop() {
+                let Some(encoded) = overlay.get(&id) else {
+                    continue;
+                };
+                if children_done {
+                    let staged = self.stage_metadata_with_status(encoded)?;
+                    assert_eq!(
+                        staged.object_id, id,
+                        "ASSERT: batched Manifest encoder identity matches publication"
+                    );
+                    if staged.published_new {
+                        previous.introduced_metadata.insert(id);
+                    }
+                } else if visited.insert(id) {
+                    pending.push((id, true));
+                    match metadata_object_kind(encoded).map_err(ManifestTreeError::from)? {
+                        MetadataObjectKind::ManifestLeaf => {}
+                        MetadataObjectKind::ManifestInnerNode => {
+                            let node =
+                                ManifestInnerNode::decode(encoded).map_err(ManifestTreeError::from)?;
+                            pending.extend(
+                                node.children()
+                                    .iter()
+                                    .rev()
+                                    .map(|child| (child.child(), false)),
+                            );
+                        }
+                        _ => return Err(ManifestTreeError::InvalidTree.into()),
+                    }
+                }
+            }
+            self.mark_successor_root_release_durable(&previous)?;
+            previous.summary = summary;
+            previous.metadata_root_pin = self.pin_metadata_root(summary.root());
+        }
+        Ok(previous)
     }
 
     fn publish_manifest_replacement_successor_with_sync(
@@ -298,8 +410,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         &self,
         proof: &ManifestSuccessorProof,
     ) -> Result<(), GenerationError> {
-        let predecessor_root =
-            self.read_namespace_root(proof.predecessor.record.namespace_root())?;
+        let predecessor_root = self.writer_predecessor_root(proof.predecessor.record)?;
         if !record_matches_namespace_root(proof.predecessor.record, &predecessor_root) {
             return Err(GenerationError::PreviousGenerationRecordMismatch);
         }
@@ -339,8 +450,7 @@ impl<I: StorageIo> GenerationRepository<I> {
         source_root: MetadataObjectId,
         source_range: Range<u64>,
     ) -> Result<ManifestSuccessorProof, GenerationError> {
-        let predecessor_root =
-            self.read_namespace_root(successor.predecessor.record.namespace_root())?;
+        let predecessor_root = self.writer_predecessor_root(successor.predecessor.record)?;
         let source_inode = predecessor_root
             .file_inodes()
             .find(|inode| inode.manifest_root() == source_root)

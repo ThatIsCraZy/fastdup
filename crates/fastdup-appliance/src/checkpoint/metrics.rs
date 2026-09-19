@@ -96,6 +96,8 @@ pub struct WriteThroughStatus {
     pub(super) maximum_ingest_batch_target_bytes: u64,
     pub(super) maximum_ingest_ring_slots: u64,
     pub(super) ingest_ring_wait_ns: u64,
+    pub(super) pending_region_bytes: u64,
+    pub(super) pending_residue_bytes: u64,
     pub(super) hash_cpu: CpuPhaseStatus,
     pub(super) encode_cpu: CpuPhaseStatus,
     pub(super) planning_cpu: CpuPhaseStatus,
@@ -105,6 +107,18 @@ pub struct WriteThroughStatus {
 }
 
 impl WriteThroughStatus {
+    /// Lane payload currently charged against the Ingest pending-region gate.
+    #[must_use]
+    pub const fn pending_region_bytes(self) -> u64 {
+        self.pending_region_bytes
+    }
+
+    /// Commit-cut Drain Residue currently charged against the same gate.
+    #[must_use]
+    pub const fn pending_residue_bytes(self) -> u64 {
+        self.pending_residue_bytes
+    }
+
     #[must_use]
     pub const fn buffered_bytes(self) -> u64 {
         self.buffered_bytes
@@ -549,7 +563,7 @@ impl PhaseStarted {
 /// Fixed-size live observations; none of these locks protects pipeline work.
 #[derive(Debug, Default)]
 pub(super) struct CheckpointTimings {
-    operations: [fastdup_store::OperationTiming; 16],
+    operations: [fastdup_store::OperationTiming; 21],
 }
 
 #[derive(Clone, Copy)]
@@ -570,6 +584,11 @@ pub(super) enum CheckpointStage {
     IndexPublish,
     MetadataCommit,
     Total,
+    MetadataManifests,
+    NamespaceRoot,
+    NamespaceCommit,
+    NamespaceInstall,
+    ProofRetire,
 }
 
 pub(super) struct ObservedPhase {
@@ -592,7 +611,7 @@ impl CheckpointTimings {
     }
 
     pub(super) fn snapshots(&self) -> Vec<fastdup_store::OperationTimingSnapshot> {
-        const IDS: [&str; 16] = [
+        const IDS: [&str; 21] = [
             "checkpointCheckpointLock",
             "checkpointProofFreeze",
             "checkpointCutCapture",
@@ -609,6 +628,11 @@ impl CheckpointTimings {
             "checkpointIndexPublish",
             "checkpointMetadataCommit",
             "checkpointTotal",
+            "checkpointMetadataManifests",
+            "checkpointNamespaceRoot",
+            "checkpointNamespaceCommit",
+            "checkpointNamespaceInstall",
+            "checkpointProofRetire",
         ];
         self.operations
             .iter()

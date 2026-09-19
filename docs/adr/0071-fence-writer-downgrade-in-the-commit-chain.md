@@ -4,28 +4,17 @@ status: accepted
 
 # Fence writer downgrade in the authoritative Commit chain
 
-ADR 0046 advances the current Repository Format Epoch to **two** for aligned
-Direct-I/O storage. Both older epochs require a pre-stable repository rebuild;
-there is no migration. The Commit-chain downgrade fence and validation-before-
-mutation rules below continue to apply, with epoch two as the sole current epoch.
+The Repository Format Epoch is carried by every Commit Record, so the
+authoritative chain is also the writer-compatibility fence. Writers, recovery,
+and offline scrub accept only the current epoch and fail before mutation on any
+other value; an older binary therefore cannot silently advance a newer pool.
 
-Every Commit Record uses format v2 and carries Repository Format Epoch two in
-the field at offset 22. The current writer reads and writes exactly epoch two.
-Append, recovery, and offline Scrub validate every retained record before graph
-fallback. Epochs zero and one, Commit format v1, and unknown epochs are unsupported
-pre-production state and fail closed before repository mutation.
+The current epoch is **3**, introduced by ADR 0095 for record-range Namespace
+shards. Epochs 0–2 are unsupported pre-production inputs. There is no migration:
+an older pool must be re-ingested.
 
-The Commit chain is the downgrade fence because it is already the authoritative
-mutation boundary and older binaries reject the v2 record structurally. A
-separate marker file was rejected because binaries predating the marker could
-ignore it. Since the repository has not shipped, there is no older-epoch import,
-upgrade transaction, downgrade writer model, or migration utility to maintain.
-The first Commit of every repository already carries the fence.
-
-Policy Set and Repository Format Epoch remain distinct. A Policy Set identifies
-chunking, encoding, placement, and maintenance choices for one generation; the
-epoch fences repository-wide reader/writer compatibility. Object-local versions
-still determine how individual immutable bytes decode. Under ADR 0074 the
-writer accepts only the one current Policy Set from the first Commit. Current
-object writers and readers likewise have no compatibility obligation to
-superseded pre-production encodings.
+The Commit chain is the fence because every writer already has to validate it.
+A separate marker could be ignored by binaries predating that marker. Repository
+epoch, object-local format version, and Policy Set remain separate concepts:
+the epoch gates repository-wide compatibility, object versions define decoding,
+and the Policy Set governs new writer and maintenance choices.

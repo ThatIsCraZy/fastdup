@@ -115,7 +115,24 @@ impl ControlStore {
             connection: Arc::new(Mutex::new(connection)),
         };
         store.ensure_default_settings()?;
+        store.fail_interrupted_jobs()?;
         Ok(store)
+    }
+
+    /// Fails every job that was still queued or running when the process ended.
+    ///
+    /// Jobs execute inside this process and hold no durable progress, so one
+    /// that survives a restart can never finish. Leaving it behind is not a
+    /// cosmetic wart: the management surface derives its busy state from open
+    /// jobs, so a single stranded record disables every repository action for
+    /// good.
+    fn fail_interrupted_jobs(&self) -> Result<usize, StoreError> {
+        let now = unix_seconds();
+        Ok(self.locked()?.execute(
+            "UPDATE jobs SET state = 'failed', message = ?1, updated_at = ?2
+             WHERE state IN ('queued', 'running')",
+            params!["Aktion wurde durch einen Neustart unterbrochen", now],
+        )?)
     }
 
     pub fn user_ui_language(&self, username: &str) -> Result<String, StoreError> {
@@ -301,6 +318,17 @@ impl ControlStore {
             params![job_state_name(job.state), job.progress_basis_points, job.message, job.updated_at, job.id],
         )?;
         Ok(())
+    }
+
+    /// Returns every Job the store still records as queued or running.
+    pub fn open_jobs(&self) -> Result<Vec<JobStatus>, StoreError> {
+        let connection = self.locked()?;
+        let mut statement = connection.prepare(
+            "SELECT id, kind, state, progress_basis_points, message, created_at, updated_at
+             FROM jobs WHERE state IN ('queued', 'running') ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([], row_to_job)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn recent_jobs(&self, limit: usize) -> Result<Vec<JobStatus>, StoreError> {
@@ -708,6 +736,62 @@ fn roll_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Job runs inside the Control Plane process and keeps no durable
+    /// progress, so one that outlives a restart can never reach a terminal
+    /// state. Leaving it open blocks every later action: the submit guard and
+    /// the management surface both read an open Job as work in progress.
+    #[test]
+    fn reopening_the_store_fails_jobs_that_outlived_the_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.db");
+        let stranded = {
+            let store = ControlStore::open(&path).unwrap();
+            let now = unix_seconds();
+            let stranded = JobStatus {
+                id: "11111111-1111-1111-1111-111111111111".to_owned(),
+                kind: "mount".to_owned(),
+                state: JobState::Running,
+                progress_basis_points: 500,
+                message: "Aktion wird ausgeführt".to_owned(),
+                created_at: now,
+                updated_at: now,
+            };
+            store.insert_job("mount-key", &stranded).unwrap();
+            let done = JobStatus {
+                id: "22222222-2222-2222-2222-222222222222".to_owned(),
+                state: JobState::Succeeded,
+                message: "Repository ist online".to_owned(),
+                ..stranded.clone()
+            };
+            store.insert_job("done-key", &done).unwrap();
+            assert_eq!(store.open_jobs().unwrap().len(), 1);
+            stranded
+        };
+
+        let store = ControlStore::open(&path).unwrap();
+        assert!(
+            store.open_jobs().unwrap().is_empty(),
+            "a restart must not leave a Job that nothing can finish"
+        );
+        let reaped = store
+            .recent_jobs(8)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == stranded.id)
+            .expect("the stranded Job is retained for the operator");
+        assert_eq!(reaped.state, JobState::Failed);
+        assert_eq!(
+            store
+                .recent_jobs(8)
+                .unwrap()
+                .into_iter()
+                .filter(|job| job.state == JobState::Succeeded)
+                .count(),
+            1,
+            "reaping must not touch Jobs that already finished"
+        );
+    }
 
     #[test]
     fn ui_language_is_validated_persisted_and_isolated_per_user() {

@@ -4,48 +4,19 @@ status: accepted
 
 # Require a CQE-driven io_uring DATA publisher
 
-Amended by [ADR 0046](0046-bound-verified-read-cache-by-live-memory-headroom.md)
-on 12 September 2026: all reusable read content shares one application cache;
-repository I/O and FUSE file data use direct paths. File-backed mappings and
-separate replacement policies described below are superseded. Immutable leases,
-verification and publication ordering remain required.
+The DATA tier requires `io_uring`; ring setup failure aborts startup rather than
+selecting a synchronous publisher. One ring-owning thread receives bounded
+commands, submits independent publication state machines, and advances only the
+operation named by each CQE. `SINGLE_ISSUER` is enabled; `DEFER_TASKRUN` remains
+disabled by measured Linux 6.12/XFS performance.
 
-The DATA tier requires `io_uring`; ring setup failure aborts daemon startup
-instead of selecting a synchronous adapter. One ring-owning thread receives
-commands through a bounded channel and an `eventfd` poll, keeps independent
-publication state machines in flight, and advances only the operation named by
-each CQE. `SINGLE_ISSUER` is enabled because that thread also creates the ring.
-`DEFER_TASKRUN` is not enabled: on the Linux 6.12 XFS benchmark it reduced the
-1,000-by-128-KiB publisher by 7.3 and 17.8 percent in two alternating pairs.
+Container publication uses aligned `O_DIRECT` I/O under ADR 0046. The ring owner
+continues servicing other operations while CPU-side preparation completes.
+Writer evidence follows ADR 0059; file sync, no-replace rename, root-directory
+sync, bounded ownership, and error propagation remain mandatory. No cache hit or
+CQE completion alone establishes durability.
 
-**Read-cache amendment, 12 September 2026:** ADR 0046's application-owned
-read-caching policy supersedes the buffered demand-read/kernel-readahead policy
-in the following historical implementation description. Linux page cache and
-file-backed mmap are not a target cache tier. Existing paths remain explicitly
-tracked migration work; Metadata read attribution now exposes them. The
-publication threshold and durability ordering below are not changed by this
-telemetry amendment.
-
-The short-lived Container publication descriptor uses `O_DIRECT` only when
-the sealed image is at least 4 MiB. Smaller publications remain buffered. The
-writer allocates the complete image at a 4-KiB-aligned address, so Direct mode
-does not add a full-image alignment copy. Building, Body, Sealed Header, and
-the three publication samples use the selected descriptor; file fsync,
-no-replace rename, and root-directory fsync remain mandatory. After rename the
-descriptor is dropped, and ordinary demand reads use buffered descriptors with
-kernel readahead. The threshold is the first tested size without a throughput
-or p99 regression on the Linux 6.12 XFS A/B series recorded in
-`docs/benchmarks/direct-io-publication-2026-09-01.md`.
-
-Writer-image verification at or above 1 MiB runs asynchronously through a
-bounded queue on the existing process Rayon pool. Smaller images remain inline
-because dispatch costs exceed their short verification time. The ring owner
-never waits for a large verification batch; it continues to accept commands,
-consume CQEs, and submit durability work for other operations. Container
-length fixup uses `IORING_OP_FTRUNCATE`, and root-sync completion still releases
-only the callers captured before that submission.
-
-This supersedes ADR 0046's batch-barrier worker, separate verifier-pool, setup
-fallback, and operator-selectable synchronous DATA adapter. It does not change
-the Container publication order, byte budget, sampled-storage policy, metadata
-tier, recovery, or scrub semantics.
+This decision concerns the DATA publication engine only. Metadata writers,
+recovery, scrub, and application caching retain their own boundaries. Benchmark
+evidence lives in
+[`direct-io-publication-2026-09-01.md`](../benchmarks/direct-io-publication-2026-09-01.md).
