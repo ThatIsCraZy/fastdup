@@ -86,6 +86,18 @@ pub trait Filesystem {
     /// invalidation notifications after successful userspace mutations.
     fn register_notify(&self, notify: Notify) {}
 
+    /// Registers one received write before its asynchronous request task is
+    /// spawned.
+    ///
+    /// Filesystems that allow parallel direct writes can return a nonzero,
+    /// per-inode scheduling ticket. Offset and size let a bounded scheduler
+    /// repair kernel fragmentation without reordering overlapping writes. The
+    /// ticket is copied into [`Request::write_sequence`]. The default leaves
+    /// write scheduling to the implementation and preserves upstream behaviour.
+    fn register_write_request(&self, inode: Inode, offset: u64, size: u32) -> u64 {
+        0
+    }
+
     /// initialize filesystem. Called before any other filesystem method.
     async fn init(&self, req: Request) -> Result<ReplyInit>;
 

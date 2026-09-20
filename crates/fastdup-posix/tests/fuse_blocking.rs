@@ -254,6 +254,99 @@ async fn write_queue_admission_does_not_block_the_fuse_runtime_thread() {
     );
 }
 
+#[tokio::test]
+async fn parallel_overlapping_writes_remain_in_fuse_receive_order() {
+    let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));
+    let Reply::Created { entry, handle } = namespace
+        .dispatch(
+            CALLER,
+            Operation::Create {
+                parent: ROOT_INODE,
+                name: b"ordered-parallel-write",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .expect("fixture file is created")
+    else {
+        panic!("create returned the wrong reply");
+    };
+    let filesystem = FuseFilesystem::new(Arc::clone(&namespace));
+    let first_sequence =
+        Filesystem::register_write_request(&filesystem, entry.attr.inode.get(), 0, 6);
+    let second_sequence =
+        Filesystem::register_write_request(&filesystem, entry.attr.inode.get(), 0, 6);
+
+    let later_filesystem = filesystem.clone();
+    let inode = entry.attr.inode.get();
+    let raw_handle = handle.get();
+    let later = tokio::spawn(async move {
+        Filesystem::write(
+            &later_filesystem,
+            Request {
+                write_sequence: second_sequence,
+                ..Request::default()
+            },
+            inode,
+            raw_handle,
+            0,
+            b"second",
+            0,
+            0,
+        )
+        .await
+        .expect("later received write succeeds")
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !later.is_finished(),
+        "a later received write must wait for the missing earlier write"
+    );
+
+    let first = Filesystem::write(
+        &filesystem,
+        Request {
+            write_sequence: first_sequence,
+            ..Request::default()
+        },
+        inode,
+        raw_handle,
+        0,
+        b"first!",
+        0,
+        0,
+    )
+    .await
+    .expect("first received write succeeds");
+    assert_eq!(first.written, 6);
+    assert_eq!(
+        later
+            .await
+            .expect("later write task does not panic")
+            .written,
+        6
+    );
+
+    let Reply::Data(bytes) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Read {
+                inode: entry.attr.inode,
+                handle,
+                offset: 0,
+                length: 6,
+            },
+        )
+        .expect("read the final live view")
+    else {
+        panic!("read returned the wrong reply");
+    };
+    assert_eq!(bytes, b"second");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn owned_fuse_write_reaches_the_namespace_without_a_second_payload_copy() {
     let namespace = Arc::new(Namespace::new_volatile(NamespaceConfig::default()));

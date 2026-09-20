@@ -38,9 +38,11 @@ pub use control::{AgentControl, AgentRuntime, ApplianceControl, InMemoryControl}
 pub use detail_telemetry::{
     AdmissionTelemetry, AllocatorMemoryTelemetry, CacheBudgetTelemetry, CachePoolTelemetry,
     CacheTelemetry, CacheWindowCounters, CacheWindowTelemetry, CheckpointPhase,
-    CheckpointTelemetry, CodecBufferTelemetry, DetailTelemetry, FrontendLatency, GcTelemetry,
-    IoUringTelemetry, MetadataReadRow, MetadataReadTelemetry, OperationLatency, PipelineOperation,
-    PipelineTelemetry, ReadCacheCompression, ReductionTelemetry, RuntimeDetails, ScrubTelemetry,
+    CheckpointTelemetry, CodecBufferTelemetry, DetailTelemetry, ExactCacheTelemetry,
+    ExactMembershipTelemetry, ExactWarmTelemetry, FrontendLatency, GcPhaseDurations, GcTelemetry,
+    IoUringTelemetry, MetadataGcTelemetry, MetadataReadRow, MetadataReadTelemetry,
+    OperationLatency, PipelineOperation, PipelineTelemetry, ReadCacheCompression,
+    ReductionTelemetry, RuntimeDetails, ScrubTelemetry,
 };
 pub use inventory::{BackingDisk, BlockInventory, BlockTarget, InventoryError};
 pub use jobs::{AuditEvent, JobState, JobStatus};
@@ -55,8 +57,8 @@ pub use samba_users::SambaUserRequest;
 pub use shares::{CapacityUnit, LogicalQuota, ShareSettings, SmbEncryption};
 pub use store::{ControlStore, StoreError, TelemetryStore};
 pub use telemetry::{
-    DiskTelemetry, RuntimeIssue, SeriesPoint, SmallFileQuotaStatus, StorageUsageTelemetry,
-    SystemSampler, TelemetrySnapshot, dedup_rate,
+    DiskTelemetry, IngestReductionTelemetry, RuntimeIssue, SeriesPoint, SmallFileQuotaStatus,
+    StorageUsageTelemetry, SystemSampler, TelemetrySnapshot, dedup_rate,
 };
 pub use tls::{TlsIdentity, TlsIdentityError};
 

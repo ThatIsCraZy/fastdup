@@ -2170,12 +2170,10 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         keep.dedup_by(|left, right| left.1 == right.1);
 
         let mut keep_runs = Vec::new();
-        let mut probes = 0_u64;
         for (id, _) in &keep {
-            probes = probes.wrapping_add(1);
-            if probes.is_multiple_of(256) {
-                crate::maintenance_cancellation::check_io(cancellation)?;
-            }
+            // Each object can incur independent storage latency while the
+            // foreground publisher is waiting for our generation lock.
+            crate::maintenance_cancellation::check_io(cancellation)?;
             // Wholly slot-named sets must exist and stay whole: resolve every
             // Run identity before unlinking anything.
             let run_set = self.read_run_set(*id)?;
@@ -2206,11 +2204,14 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     ) -> Result<(ExactIndexRunRetirement, bool), ExactIndexStoreError> {
         let mut report = ExactIndexRunRetirement::default();
         let mut deferred = false;
-        let mut probes = 0_u64;
         for name in self.storage.list_names()? {
-            probes = probes.wrapping_add(1);
-            if probes.is_multiple_of(256) {
-                crate::maintenance_cancellation::check_io(cancellation)?;
+            if let Err(cancelled) = crate::maintenance_cancellation::check_io(cancellation) {
+                // A partial sweep is safe and resumable, but persist any
+                // already completed unlinks before releasing the locks.
+                if report.runs_removed != 0 || report.run_sets_removed != 0 {
+                    self.storage.sync_root()?;
+                }
+                return Err(cancelled.into());
             }
             if let Some((run_profile, generation)) = parse_run_name(&name)? {
                 if generation >= window.deletion_floor

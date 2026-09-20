@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
-import { DetailTelemetryPanel, type DetailTelemetry } from "./detail-telemetry";
+import { DetailTelemetryPanel, detailTabs, type DetailTelemetry } from "./detail-telemetry";
 import { I18nProvider } from "./i18n";
 import { previewSnapshot } from "./types";
 vi.mock("echarts-for-react", () => ({ default: () => <div data-testid="phase-chart" /> }));
@@ -36,16 +36,16 @@ it("separates allocation reuse from disk-saving cache hit rates", () => {
 });
 const operation = {operations:100,errors:2,p50Micros:500,p95Micros:2500,p99Micros:10000};
 const details: DetailTelemetry = {latency:{read:operation,write:{...operation,operations:0,errors:0}},runtime:{runtimeId:"test",ioUring:{ringEntries:64,inflightBytes:1000000,maxInflightBytes:8000000,peakInflightBytes:4000000,submitted:18,completed:16},caches:[{id:"verifiedRead",hits:75,misses:25,evictions:3,residentBytes:1024},{id:"exactIndex",hits:0,misses:0,evictions:0,residentPages:0}],reduction:{enabled:true,queries:7,candidates:4,acceptedPrefixes:2,acceptedSparseXor:1,savedPayloadBytes:5000,fallbacks:4,errors:0},gc:{state:"collected",observedAt:100,totalMs:12,unlinkedBytes:8000},checkpoint:{completedAt:100,generation:8,totalMs:10,phases:[{id:"freeze",wallMs:2,cpuMs:1}]}}};
-it("renders real counters, distinguishes no samples, and switches all six detail views", () => {
+it("renders real counters, distinguishes no samples, and switches all seven detail views", () => {
  render(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details}} historical={false} loading={false}/></I18nProvider>);
- expect(screen.getByText('0,5 ms')).toBeVisible();
+ expect(screen.getByText('500 µs')).toBeVisible();
  const write = screen.getByRole('row',{name:/Write/});expect(within(write).getAllByText('—')).toHaveLength(3);
  fireEvent.click(screen.getByRole('tab',{name:'io_uring'}));expect(screen.getByText('1 MB')).toBeVisible();
  fireEvent.click(screen.getByRole('tab',{name:'Caches'}));expect(screen.getByText('75 %')).toBeVisible();expect(within(screen.getByRole('row',{name:/Exact Index/})).getByText('—')).toBeVisible();
  fireEvent.click(screen.getByRole('tab',{name:'Lesevermeidung'}));expect(screen.getByText('5 KB')).toBeVisible();
  fireEvent.click(screen.getByRole('tab',{name:'GC & Scrub'}));expect(screen.getByText('8 KB')).toBeVisible();
- fireEvent.click(screen.getByRole('tab',{name:'Checkpoint-Phasen'}));expect(screen.getByTestId('phase-chart')).toBeVisible();expect(screen.getByText('2 ms')).toBeVisible();
- fireEvent.keyDown(screen.getByRole('tab',{name:'Checkpoint-Phasen'}),{key:'Home'});expect(screen.getByRole('tab',{name:'Latenzen'})).toHaveFocus();
+ fireEvent.click(screen.getByRole('tab',{name:'Checkpoint & Pipeline'}));expect(screen.getByTestId('phase-chart')).toBeVisible();expect(screen.getByText('2 ms')).toBeVisible();
+ fireEvent.keyDown(screen.getByRole('tab',{name:'Checkpoint & Pipeline'}),{key:'Home'});expect(screen.getByRole('tab',{name:'Latenzen'})).toHaveFocus();
 });
 it("never substitutes live details for an empty historical interval", () => {
  render(<I18nProvider><DetailTelemetryPanel historical={true} loading={false}/></I18nProvider>);
@@ -153,7 +153,7 @@ it("shows the governed Metadata object cache and its recent counters",()=>{
 it("shows cache compression gauges at the selected sample and separate lifetime codec costs",()=>{
  const readCacheCompression={decodedResidentBytes:1000000,compressedResidentBytes:2000000,compressedLogicalBytes:8000000,attempts:10,admissions:8,compressionNanos:1000000,hits:40,decompressions:20,decompressionNanos:1000000,promotions:3,demotions:2,failures:0,bypasses:2,workingBytes:0,peakWorkingBytes:100000,maxWorkingBytes:1000000};
  const runtime={...details.runtime!,readCacheCompression};
- const view=render(<I18nProvider><DetailTelemetryPanel initialTab={2} sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={true} loading={false}/></I18nProvider>);
+ const view=render(<I18nProvider><DetailTelemetryPanel initialTab={detailTabs.caches} sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={true} loading={false}/></I18nProvider>);
  const panel=within(screen.getByLabelText('Verified Read · RAM-Kompression'));
  expect(panel.getByText('4×')).toBeVisible();
  expect(within(panel.getByText('RAM durch Kompression gespart').parentElement!).getByText('6 MB')).toBeVisible();
@@ -162,7 +162,7 @@ it("shows cache compression gauges at the selected sample and separate lifetime 
  fireEvent.click(panel.getByText('Kompressionskosten · seit Mount'));
  expect(panel.getByText('50 µs')).toBeVisible();
  expect(panel.getByText('100 µs')).toBeVisible();
- view.rerender(<I18nProvider><DetailTelemetryPanel initialTab={2} sample={{...previewSnapshot.telemetry,details}} historical={true} loading={false}/></I18nProvider>);
+ view.rerender(<I18nProvider><DetailTelemetryPanel initialTab={detailTabs.caches} sample={{...previewSnapshot.telemetry,details}} historical={true} loading={false}/></I18nProvider>);
  expect(screen.queryByLabelText('Verified Read · RAM-Kompression')).not.toBeInTheDocument();
 });
 
@@ -170,12 +170,101 @@ it("shows cache compression gauges at the selected sample and separate lifetime 
 it("separates allocator retention from cache occupancy and preserves missing samples", () => {
  const allocatorMemory = {arenaBytes:9000000000, allocatedBytes:3000000000, freeBytes:6000000000, anonymousResidentBytes:4000000000, trimAttempts:2, lastTrimMicros:108000};
  const sample = {...previewSnapshot.telemetry, details:{...details, runtime:{...details.runtime!, allocatorMemory}}};
- const view = render(<I18nProvider><DetailTelemetryPanel sample={sample} historical={false} loading={false} initialTab={2}/></I18nProvider>);
+ const view = render(<I18nProvider><DetailTelemetryPanel sample={sample} historical={false} loading={false} initialTab={detailTabs.caches}/></I18nProvider>);
  fireEvent.click(screen.getByText("Prozessspeicher und Allocator"));
  expect(screen.getByText("Freie Allocator-Blöcke")).toBeVisible();
  expect(screen.getByText("6 GB")).toBeVisible();
  expect(screen.getByText("108 ms")).toBeVisible();
  expect(screen.getByText(/diese Werte werden nicht addiert/)).toBeVisible();
- view.rerender(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details}} historical={true} loading={false} initialTab={2}/></I18nProvider>);
+ view.rerender(<I18nProvider><DetailTelemetryPanel sample={{...previewSnapshot.telemetry,details}} historical={true} loading={false} initialTab={detailTabs.caches}/></I18nProvider>);
  expect(screen.queryByText("Prozessspeicher und Allocator")).not.toBeInTheDocument();
+});
+
+it("surfaces the compressed-tier admission rate instead of only its cost", () => {
+ const readCacheCompression={decodedResidentBytes:1000000,compressedResidentBytes:2000000,compressedLogicalBytes:8000000,attempts:10,admissions:8,compressionNanos:1000000,hits:40,decompressions:20,decompressionNanos:1000000,promotions:3,demotions:2,failures:0,bypasses:2,workingBytes:250,peakWorkingBytes:100000,maxWorkingBytes:1000000};
+ render(<I18nProvider><DetailTelemetryPanel initialTab={detailTabs.caches} sample={{...previewSnapshot.telemetry,details:{...details,runtime:{...details.runtime!,readCacheCompression}}}} historical={false} loading={false}/></I18nProvider>);
+ const panel=within(screen.getByLabelText('Verified Read · RAM-Kompression'));
+ fireEvent.click(panel.getByText('Kompressionskosten · seit Mount'));
+ expect(within(panel.getByText('Komprimiert aufgenommen').parentElement!).getByText('8')).toBeVisible();
+ expect(within(panel.getByText('Annahmequote').parentElement!).getByText('80 %')).toBeVisible();
+ expect(panel.getByRole('progressbar',{name:'Codec-Arbeitsreserve'})).toHaveAttribute('max','1000000');
+});
+
+it("names the container under verification and the failure that blocks writes", () => {
+ const scrub={state:"failed",totalContainers:100,verifiedContainers:25,verifiedBytes:1000,readBytes:2000,currentContainer:"container-42",error:"checksum mismatch"};
+ render(<I18nProvider><DetailTelemetryPanel initialTab={detailTabs.maintenance} sample={{...previewSnapshot.telemetry,details:{...details,runtime:{...details.runtime!,scrub}}}} historical={false} loading={false}/></I18nProvider>);
+ expect(screen.getByRole('alert')).toHaveTextContent('checksum mismatch');
+ const section=within(screen.getByLabelText('Hintergrundprüfung'));
+ expect(section.getByText('container-42')).toBeVisible();
+ expect(section.getByRole('progressbar',{name:'Geprüfte Container'})).toHaveAttribute('value','25');
+});
+
+it("shows the outstanding io_uring submissions and the metadata read totals", () => {
+ const metadataReads={intervalSeconds:2,rows:[
+  {reason:"indexLookup",object:"exactIndex",mode:"bufferedRange",operations:10,requestedBytes:40960,returnedBytes:36864,errors:1,elapsedMicros:10000,maxMicros:3000,inFlight:3,operationsPerSecond:5,requestedMbps:1.5},
+  {reason:"manifest",object:"metadataObject",mode:"mmap",operations:4,requestedBytes:8192,returnedBytes:8192,errors:0,elapsedMicros:0,maxMicros:0,inFlight:0,operationsPerSecond:2,requestedMbps:0.5},
+ ]};
+ render(<I18nProvider><DetailTelemetryPanel initialTab={detailTabs.ioUring} sample={{...previewSnapshot.telemetry,details:{...details,runtime:{...details.runtime!,metadataReads}}}} historical={false} loading={false}/></I18nProvider>);
+ expect(within(screen.getByText('Offene Vorgänge').parentElement!).getByText('2')).toBeVisible();
+ fireEvent.click(screen.getByRole('tab',{name:'Metadata-Reads'}));
+ expect(within(screen.getByText('Angefordert · Summe').parentElement!).getByText('2 MB/s')).toBeVisible();
+ expect(within(screen.getByText('Laufende Reads · Summe').parentElement!).getByText('3')).toBeVisible();
+});
+
+it("lists caches outside the shared budget instead of letting the governed pool hide them", () => {
+ const runtime={...details.runtime!,
+  caches:[{id:"verifiedRead",hits:75,misses:25,evictions:3,residentBytes:1024},{id:"historicalProofs",hits:10,misses:90,evictions:1,residentBytes:2048}],
+  cacheBudget:{maximumMemoryUsedBasisPoints:9200,effectiveLimitBytes:1e9,availableBytes:5e8,budgetBytes:4e8,pools:[
+   {id:"unifiedRead",fallbackTier:"data",residentBytes:3e8,targetBytes:4e8,leasedBytes:3e8,hits:900,misses:100,evictions:5},
+   {id:"codecBuffers",fallbackTier:"memory",residentBytes:1e6,targetBytes:2e6,leasedBytes:2e6,hits:1,misses:0,evictions:0},
+  ]}};
+ render(<I18nProvider><DetailTelemetryPanel initialTab={detailTabs.caches} sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={false} loading={false}/></I18nProvider>);
+ expect(within(screen.getByRole('row',{name:/Unified Read Cache/})).getByText('90 %')).toBeVisible();
+ expect(within(screen.getByRole('row',{name:/Verified Read/})).getByText('75 %')).toBeVisible();
+ expect(within(screen.getByRole('row',{name:/Historical Proofs/})).getByText('10 %')).toBeVisible();
+ expect(screen.queryByRole('row',{name:/Codec/})).not.toBeInTheDocument();
+});
+
+it("breaks the collection run into phases and separates the metadata sweep", () => {
+ const gc={state:"collected",observedAt:100,totalMs:12000,unlinkedBytes:8000,
+  phasesMs:{recovery:10,metadataGc:200,candidateCatalog:30,candidateProof:40,relocation:5000,
+   retiringActivation:6,pinDrain:7,victimVerify:800,unlink:9,dataSync:1000,removedActivation:11,postCollectionCatalog:12},
+  metadataGc:{markMode:"exact_snapshot",exactReason:"wal_rotation",wallMs:200,barrierWaitMs:15,
+   objectGraphReadBytes:12000000,candidateReadBytes:900000,catalogReadBytes:400000,
+   catalogWriteBytes:120000,unlinkedBytes:1400000,rootSyncs:12,catalogChainRuns:4},
+  reverseDependencyEdges:1204881,exactRunsRetired:118};
+ render(<I18nProvider><DetailTelemetryPanel initialTab={detailTabs.maintenance} sample={{...previewSnapshot.telemetry,details:{...details,runtime:{...details.runtime!,gc}}}} historical={false} loading={false}/></I18nProvider>);
+ expect(within(screen.getByLabelText('Dauer des letzten GC-Laufs nach Phase')).getByTestId('phase-chart')).toBeVisible();
+ const metadata=within(screen.getByLabelText('Metadata-GC im selben Lauf'));
+ expect(metadata.getByText('Exakter Katalog neu aufgebaut')).toBeVisible();
+ expect(metadata.getByText(/WAL-Rotation/)).toBeVisible();
+ expect(within(metadata.getByText('Auf Barriere gewartet').parentElement!).getByText('15 ms')).toBeVisible();
+ fireEvent.click(screen.getByText('Katalog, Abhängigkeiten und Exact-Rückzug'));
+ expect(within(screen.getByText('Rückwärtskanten').parentElement!).getByText('1.204.881')).toBeVisible();
+ expect(within(screen.getByText('Offene Katalogänderungen').parentElement!).getByText('—')).toBeVisible();
+});
+
+it("keeps the collection detail absent instead of zeroed for runs without it", () => {
+ const gc={state:"collected",observedAt:100,totalMs:12000,unlinkedBytes:8000};
+ render(<I18nProvider><DetailTelemetryPanel initialTab={detailTabs.maintenance} sample={{...previewSnapshot.telemetry,details:{...details,runtime:{...details.runtime!,gc}}}} historical={true} loading={false}/></I18nProvider>);
+ expect(screen.queryByLabelText('Dauer des letzten GC-Laufs nach Phase')).not.toBeInTheDocument();
+ expect(screen.queryByLabelText('Metadata-GC im selben Lauf')).not.toBeInTheDocument();
+ expect(screen.queryByText('Katalog, Abhängigkeiten und Exact-Rückzug')).not.toBeInTheDocument();
+});
+
+it("shows how often the membership filter avoids an index lookup", () => {
+ const runtime={...details.runtime!,
+  exactMembership:{leasedRuns:8,filters:7,constructedFilters:2,missingFilters:1,pageBoundsRuns:7,
+   missingPageBounds:1,pageBoundsBytes:4096,probes:1000,definitelyAbsent:940,requiresExactLookup:60},
+  exactWarm:{state:"warmed"},
+  exactCache:{protectedLimitBytes:2000000000,protectedResidentBytes:1500000000}};
+ render(<I18nProvider><DetailTelemetryPanel initialTab={detailTabs.reduction} sample={{...previewSnapshot.telemetry,details:{...details,runtime}}} historical={false} loading={false}/></I18nProvider>);
+ const panel=within(screen.getByLabelText('Exact-Index · vermiedene Lookups'));
+ expect(panel.getByRole('progressbar',{name:'Ohne Index-Lookup beantwortet'})).toHaveAttribute('value','940');
+ expect(panel.getByText('94 %')).toBeVisible();
+ expect(panel.getByText('Index vorgewärmt')).toBeVisible();
+ fireEvent.click(panel.getByText('Filterabdeckung der Index-Runs'));
+ expect(within(panel.getByText('Filter fehlen').parentElement!).getByText('1')).toBeVisible();
+ fireEvent.click(screen.getByRole('tab',{name:'Caches'}));
+ expect(screen.getByRole('progressbar',{name:'Geschütztes Index-RAM'})).toHaveAttribute('max','2000000000');
 });

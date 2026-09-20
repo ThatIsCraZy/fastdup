@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -272,6 +273,26 @@ describe("FastDup Control Plane UI", () => {
     await act(async () => {resolveHistory(new Response("[]"));});
     expect(container.querySelector(".telemetry-metrics")).not.toHaveTextContent("12,3");
     expect(screen.queryByText("Historisches Laufwerk")).not.toBeInTheDocument();
+  });
+
+  it("trennt die Reduktion beim Schreiben von der Belegung auf den Pools", async () => {
+    const original = globalThis.fetch;
+    const telemetry = {...previewSnapshot.telemetry,
+      ingestReduction: {logicalChunkBytes: 8_000_000_000, physicalContainerBytes: 2_000_000_000}};
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => String(input).endsWith("/snapshot")
+      ? Promise.resolve(new Response(JSON.stringify({...previewSnapshot, telemetry})))
+      : original(input, init)));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", {name: "Telemetrie"}));
+    const ingest = screen.getByText("Reduktion beim Schreiben").parentElement!;
+    expect(within(ingest).getByText("4,00×")).toBeVisible();
+    expect(within(screen.getByText("Angebotene Chunk-Bytes").parentElement!).getByText("8 GB")).toBeVisible();
+  });
+
+  it("zeigt fehlende Ingest-Zähler als unbekannt statt als Faktor 1", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", {name: "Telemetrie"}));
+    expect(within(screen.getByText("Reduktion beim Schreiben").parentElement!).getByText("—")).toBeVisible();
   });
 
   it("exportiert den Audit-Verlauf und bestätigt den Download", async () => {

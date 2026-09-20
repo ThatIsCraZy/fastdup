@@ -51,6 +51,7 @@ use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 
 const SCHEDULER_RESOLUTION: Duration = Duration::from_millis(50);
 const CHECKPOINT_WARNING: Duration = Duration::from_secs(5);
+const CHECKPOINT_MAINTENANCE_GRACE: Duration = Duration::from_secs(1);
 const ONLINE_GC_SCHEDULER_RESOLUTION: Duration = Duration::from_secs(5);
 const RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(90);
 
@@ -1514,6 +1515,19 @@ fn record_checkpoint_attempt(
 
 struct CheckpointContentionGuard(MaintenanceCancellation);
 
+async fn prioritize_checkpoint<T>(
+    worker: impl std::future::Future<Output = T>,
+    cancellation: &MaintenanceCancellation,
+    grace: Duration,
+) -> T {
+    tokio::pin!(worker);
+    tokio::select! {
+        result = &mut worker => return result,
+        () = sleep(grace) => cancellation.cancel_contention(),
+    }
+    worker.await
+}
+
 impl Drop for CheckpointContentionGuard {
     fn drop(&mut self) {
         self.0.clear_contention();
@@ -1544,12 +1558,20 @@ async fn checkpoint_cycle(
     }
     let _contention_guard = CheckpointContentionGuard(gc_cancellation.clone());
     let worker_appliance = Arc::clone(&appliance);
-    let mut worker = tokio::task::spawn_blocking(move || worker_appliance.checkpoint_profiled());
+    let worker = tokio::task::spawn_blocking(move || worker_appliance.checkpoint_profiled());
+    // Yield maintenance before the durability watchdog has to close frontend
+    // admission. Keep the original five-second deadline and error handling.
+    let worker = prioritize_checkpoint(
+        await_worker(worker),
+        &gc_cancellation,
+        CHECKPOINT_MAINTENANCE_GRACE,
+    );
+    tokio::pin!(worker);
     let result = if already_paused {
-        await_worker(worker).await?
+        worker.await?
     } else {
         tokio::select! {
-            result = &mut worker => map_worker_result(result)?,
+            result = &mut worker => result?,
             () = sleep(CHECKPOINT_WARNING) => {
                 gc_cancellation.cancel_contention();
                 if DurabilitySupervisor::checkpoint_progress(CHECKPOINT_WARNING)
@@ -1561,7 +1583,7 @@ async fn checkpoint_cycle(
                     );
                     force_transient_checkpoint_staging_gate(&appliance);
                 }
-                await_worker(worker).await?
+                worker.await?
             }
             dirty_bytes = appliance
                 .namespace()
@@ -1569,7 +1591,7 @@ async fn checkpoint_cycle(
                 appliance.namespace().pause_mutation_admission_for(fastdup_posix::AdmissionPauseReason::DirtyPressure);
                 emit_checkpoint_pressure(&appliance, dirty_bytes, true);
                 force_transient_checkpoint_staging_gate(&appliance);
-                await_worker(worker).await?
+                worker.await?
             }
         }
     };
@@ -1946,6 +1968,30 @@ mod tests {
     use fastdup_appliance::request_online_gc_now;
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_checkpoint_releases_maintenance_before_admission_timeout() {
+        let cancellation = MaintenanceCancellation::new();
+        let maintenance_token = cancellation.clone();
+        let (released, wait_for_lock) = oneshot::channel();
+        let maintenance = tokio::task::spawn_blocking(move || {
+            while !maintenance_token.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = released.send(());
+        });
+        let result = timeout(
+            Duration::from_millis(500),
+            prioritize_checkpoint(wait_for_lock, &cancellation, Duration::from_millis(20)),
+        )
+        .await;
+        cancellation.cancel();
+        maintenance.await.unwrap();
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "a checkpoint waiting on maintenance must request yield before the admission deadline"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn online_gc_stop_cancels_blocking_worker_before_join() {

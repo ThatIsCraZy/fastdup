@@ -16,20 +16,21 @@ use fuse3::raw::reply::{
 use fuse3::raw::{Filesystem, OwnedRequestPayload, Request};
 use fuse3::{Errno, FileType, MountOptions, SetAttr, Timestamp};
 use futures_util::stream::{self, Stream};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::num::NonZeroU32;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::pin::Pin;
-#[cfg(test)]
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify as TokioNotify, Semaphore};
 
 const MAXIMUM_WRITE_BYTES: u32 = 1_024 * 1_024;
+const PER_INODE_WRITE_PIPELINE_DEPTH: usize = 8;
+const PER_INODE_WRITE_REORDER_GRACE: Duration = Duration::from_millis(2);
 const FOPEN_DIRECT_IO: u32 = 1;
 const ZERO_TTL: Duration = Duration::ZERO;
 const INTERNAL_CONTEXT: RequestContext = RequestContext {
@@ -351,10 +352,287 @@ impl Drop for LookupTrackingStream {
     }
 }
 
+/// Restores contiguous per-inode FUSE fragment order after the kernel is
+/// allowed to submit direct writes concurrently.
+///
+/// Registration happens synchronously in the FUSE receive loop. Async request
+/// tasks may then be polled in any order. The scheduler searches only the first
+/// eight received writes for the next contiguous offset, never moves a write
+/// ahead of an overlapping predecessor, and falls back to receive order after
+/// two milliseconds or a full window. Only the selected write crosses the
+/// Namespace seam; other tasks remain at the async FUSE edge and do not consume
+/// blocking-executor workers.
+#[derive(Debug, Default)]
+struct PerInodeWritePipeline {
+    lanes: Mutex<BTreeMap<u64, Arc<WritePipelineLane>>>,
+}
+
+#[derive(Debug, Default)]
+struct WritePipelineLane {
+    state: Mutex<WritePipelineLaneState>,
+    changed: TokioNotify,
+}
+
+#[derive(Debug)]
+struct WritePipelineLaneState {
+    next_registered: u64,
+    outstanding: usize,
+    selected: Option<u64>,
+    expected_offset: Option<u64>,
+    gap_since: Option<Instant>,
+    pending: BTreeMap<u64, PendingWrite>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingWrite {
+    offset: u64,
+    length: u64,
+}
+
+impl Default for WritePipelineLaneState {
+    fn default() -> Self {
+        Self {
+            next_registered: 1,
+            outstanding: 0,
+            selected: None,
+            expected_offset: None,
+            gap_since: None,
+            pending: BTreeMap::new(),
+        }
+    }
+}
+
+impl PerInodeWritePipeline {
+    fn register(&self, inode: u64, offset: u64, length: u32) -> u64 {
+        let lane = {
+            let mut lanes = self
+                .lanes
+                .lock()
+                .expect("ASSERT: per-inode write-pipeline registry lock poisoned");
+            Arc::clone(lanes.entry(inode).or_default())
+        };
+        let mut state = lane
+            .state
+            .lock()
+            .expect("ASSERT: per-inode write-pipeline lock poisoned");
+        let sequence = state.next_registered;
+        state.next_registered = state
+            .next_registered
+            .checked_add(1)
+            .expect("ASSERT: FUSE write receive sequence cannot overflow");
+        state.outstanding = state
+            .outstanding
+            .checked_add(1)
+            .expect("ASSERT: outstanding FUSE write count cannot overflow");
+        assert!(
+            state
+                .pending
+                .insert(
+                    sequence,
+                    PendingWrite {
+                        offset,
+                        length: u64::from(length),
+                    },
+                )
+                .is_none(),
+            "ASSERT: monotonic FUSE write sequence cannot already be pending"
+        );
+        drop(state);
+        lane.changed.notify_waiters();
+        sequence
+    }
+
+    async fn wait_for_turn(self: &Arc<Self>, inode: u64, sequence: u64) -> WritePipelineTurn {
+        assert_ne!(
+            sequence, 0,
+            "ASSERT: only registered FUSE writes enter the ordered pipeline"
+        );
+        let lane = {
+            let lanes = self
+                .lanes
+                .lock()
+                .expect("ASSERT: per-inode write-pipeline registry lock poisoned");
+            Arc::clone(
+                lanes
+                    .get(&inode)
+                    .expect("ASSERT: a received FUSE write remains registered until retirement"),
+            )
+        };
+        loop {
+            let changed = lane.changed.notified();
+            let (deadline, wake_selected) = {
+                let mut state = lane
+                    .state
+                    .lock()
+                    .expect("ASSERT: per-inode write-pipeline lock poisoned");
+                assert!(
+                    state.pending.contains_key(&sequence) && sequence < state.next_registered,
+                    "ASSERT: a FUSE write ticket lies inside its registered sequence"
+                );
+                let previously_selected = state.selected;
+                let deadline = select_next_write(&mut state);
+                if state.selected == Some(sequence) {
+                    return WritePipelineTurn {
+                        pipeline: Arc::clone(self),
+                        inode,
+                        sequence,
+                    };
+                }
+                (
+                    deadline,
+                    previously_selected.is_none() && state.selected.is_some(),
+                )
+            };
+            if wake_selected {
+                lane.changed.notify_waiters();
+            }
+            match deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        () = changed => {}
+                        () = tokio::time::sleep_until(deadline.into()) => {}
+                    }
+                }
+                None => changed.await,
+            }
+        }
+    }
+
+    fn finish(&self, inode: u64, sequence: u64) {
+        let lane = {
+            let lanes = self
+                .lanes
+                .lock()
+                .expect("ASSERT: per-inode write-pipeline registry lock poisoned");
+            Arc::clone(
+                lanes
+                    .get(&inode)
+                    .expect("ASSERT: an active FUSE write retains its pipeline lane"),
+            )
+        };
+        let idle = {
+            let mut state = lane
+                .state
+                .lock()
+                .expect("ASSERT: per-inode write-pipeline lock poisoned");
+            assert_eq!(
+                state.selected,
+                Some(sequence),
+                "ASSERT: only the selected FUSE write may retire"
+            );
+            let write = state
+                .pending
+                .remove(&sequence)
+                .expect("ASSERT: a retiring FUSE write remains pending");
+            state.selected = None;
+            state.expected_offset = write.offset.checked_add(write.length);
+            state.gap_since = None;
+            state.outstanding = state
+                .outstanding
+                .checked_sub(1)
+                .expect("ASSERT: a retiring FUSE write was registered");
+            state.outstanding == 0
+        };
+        lane.changed.notify_waiters();
+
+        if idle {
+            let mut lanes = self
+                .lanes
+                .lock()
+                .expect("ASSERT: per-inode write-pipeline registry lock poisoned");
+            if lanes
+                .get(&inode)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &lane))
+                && lane
+                    .state
+                    .lock()
+                    .expect("ASSERT: per-inode write-pipeline lock poisoned")
+                    .outstanding
+                    == 0
+            {
+                lanes.remove(&inode);
+            }
+        }
+    }
+}
+
+fn select_next_write(state: &mut WritePipelineLaneState) -> Option<Instant> {
+    if state.selected.is_some() || state.pending.is_empty() {
+        return None;
+    }
+    let first_sequence = *state
+        .pending
+        .first_key_value()
+        .expect("ASSERT: a nonempty pipeline has a first write")
+        .0;
+    if state.expected_offset.is_none() {
+        state.selected = Some(first_sequence);
+        state.gap_since = None;
+        return None;
+    }
+
+    let expected_offset = state.expected_offset.expect("ASSERT: checked above");
+    let candidate = state
+        .pending
+        .iter()
+        .take(PER_INODE_WRITE_PIPELINE_DEPTH)
+        .find_map(|(&sequence, write)| {
+            (write.offset == expected_offset
+                && state
+                    .pending
+                    .range(..sequence)
+                    .all(|(_, earlier)| !write_ranges_overlap(*write, *earlier)))
+            .then_some(sequence)
+        });
+    if let Some(sequence) = candidate {
+        state.selected = Some(sequence);
+        state.gap_since = None;
+        return None;
+    }
+
+    let now = Instant::now();
+    let gap_since = *state.gap_since.get_or_insert(now);
+    let deadline = gap_since + PER_INODE_WRITE_REORDER_GRACE;
+    if state.pending.len() >= PER_INODE_WRITE_PIPELINE_DEPTH || now >= deadline {
+        state.selected = Some(first_sequence);
+        state.gap_since = None;
+        None
+    } else {
+        Some(deadline)
+    }
+}
+
+fn write_ranges_overlap(left: PendingWrite, right: PendingWrite) -> bool {
+    let left_end = left.offset.checked_add(left.length);
+    let right_end = right.offset.checked_add(right.length);
+    match (left_end, right_end) {
+        (Some(left_end), Some(right_end)) => {
+            left.length != 0
+                && right.length != 0
+                && left.offset < right_end
+                && right.offset < left_end
+        }
+        _ => true,
+    }
+}
+
+struct WritePipelineTurn {
+    pipeline: Arc<PerInodeWritePipeline>,
+    inode: u64,
+    sequence: u64,
+}
+
+impl Drop for WritePipelineTurn {
+    fn drop(&mut self) {
+        self.pipeline.finish(self.inode, self.sequence);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FuseFilesystem {
     namespace: Arc<Namespace>,
     blocking_permits: Arc<Semaphore>,
+    write_pipeline: Arc<PerInodeWritePipeline>,
     statfs_source: Option<Arc<dyn StatFsSource>>,
     kernel_notify: Arc<OnceLock<KernelNotifier>>,
     frontend_telemetry: Arc<FrontendTelemetry>,
@@ -387,6 +665,7 @@ impl FuseFilesystem {
         Self {
             namespace,
             blocking_permits: Arc::new(Semaphore::new(workers)),
+            write_pipeline: Arc::new(PerInodeWritePipeline::default()),
             statfs_source: None,
             kernel_notify: Arc::new(OnceLock::new()),
             frontend_telemetry: Arc::new(FrontendTelemetry::default()),
@@ -440,6 +719,15 @@ impl FuseFilesystem {
         write_flags: u32,
     ) -> fuse3::Result<ReplyWrite> {
         let started = Instant::now();
+        let _write_turn = if request.write_sequence == 0 {
+            None
+        } else {
+            Some(
+                self.write_pipeline
+                    .wait_for_turn(inode, request.write_sequence)
+                    .await,
+            )
+        };
         if write_flags & fuse3::raw::flags::FUSE_WRITE_CACHE != 0 {
             self.frontend_telemetry.record_write(None, started);
             return Err(libc::EIO.into());
@@ -581,6 +869,10 @@ impl Filesystem for FuseFilesystem {
                 .is_ok(),
             "ASSERT: one FUSE filesystem receives exactly one notification channel"
         );
+    }
+
+    fn register_write_request(&self, inode: u64, offset: u64, size: u32) -> u64 {
+        self.write_pipeline.register(inode, offset, size)
     }
 
     async fn init(&self, _request: Request) -> fuse3::Result<ReplyInit> {
@@ -2066,8 +2358,9 @@ fn release_lookup_reference(namespace: &Namespace, inode: InodeId) {
 mod tests {
     use super::{
         FrontendTelemetry, FuseFilesystem, INTERNAL_CONTEXT, KernelDataInvalidation,
-        LookupTrackingStream, StatFsSnapshot, dispatch_mutation_with_backpressure, fallocate_mode,
-        regular_file_open_flags,
+        LookupTrackingStream, PER_INODE_WRITE_REORDER_GRACE, PendingWrite, StatFsSnapshot,
+        WritePipelineLaneState, dispatch_mutation_with_backpressure, fallocate_mode,
+        regular_file_open_flags, select_next_write, write_ranges_overlap,
     };
     use crate::{
         AccessMode, FallocateMode, Namespace, NamespaceConfig, OpenOptions, Operation, PosixError,
@@ -2077,8 +2370,7 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
-
+    use std::time::{Duration, Instant};
     #[test]
     fn frontend_telemetry_counts_successes_errors_and_fixed_latency_buckets() {
         let telemetry = FrontendTelemetry::default();
@@ -2099,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn regular_handles_use_application_owned_read_caching() {
+    fn regular_handles_remain_serialized_until_parallel_writes_qualify() {
         assert_eq!(regular_file_open_flags(OpenOptions::READ_ONLY), 1);
         assert_eq!(
             regular_file_open_flags(OpenOptions {
@@ -2109,6 +2401,57 @@ mod tests {
             1
         );
         assert_eq!(regular_file_open_flags(OpenOptions::READ_WRITE), 1);
+    }
+
+    #[test]
+    fn write_pipeline_repairs_interleaved_non_overlapping_fuse_fragments() {
+        let mut state = WritePipelineLaneState {
+            expected_offset: Some(4),
+            outstanding: 2,
+            ..WritePipelineLaneState::default()
+        };
+        state.pending.insert(
+            1,
+            PendingWrite {
+                offset: 8,
+                length: 4,
+            },
+        );
+        state.pending.insert(
+            2,
+            PendingWrite {
+                offset: 4,
+                length: 4,
+            },
+        );
+
+        assert_eq!(select_next_write(&mut state), None);
+        assert_eq!(state.selected, Some(2));
+    }
+
+    #[test]
+    fn write_pipeline_never_reorders_overlapping_writes() {
+        let mut state = WritePipelineLaneState {
+            expected_offset: Some(4),
+            outstanding: 2,
+            gap_since: Instant::now()
+                .checked_sub(PER_INODE_WRITE_REORDER_GRACE + Duration::from_millis(1)),
+            ..WritePipelineLaneState::default()
+        };
+        let earlier = PendingWrite {
+            offset: 6,
+            length: 4,
+        };
+        let contiguous = PendingWrite {
+            offset: 4,
+            length: 4,
+        };
+        assert!(write_ranges_overlap(earlier, contiguous));
+        state.pending.insert(1, earlier);
+        state.pending.insert(2, contiguous);
+
+        assert_eq!(select_next_write(&mut state), None);
+        assert_eq!(state.selected, Some(1));
     }
 
     #[test]

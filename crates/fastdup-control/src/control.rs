@@ -48,6 +48,7 @@ struct RuntimeFrontendCounters {
     write_bytes: u64,
     exact_hit_bytes: u64,
     new_chunk_bytes: u64,
+    ingest_reduction: Option<crate::IngestReductionTelemetry>,
     presented_capacity_revision: String,
 }
 
@@ -528,6 +529,7 @@ impl AgentRuntime {
             None
         };
         snapshot.details = frontend.map(|frontend| Box::new(frontend.details.clone()));
+        snapshot.ingest_reduction = frontend.and_then(|frontend| frontend.ingest_reduction);
         if let Some(runtime) = snapshot.details.as_mut().and_then(|d| d.runtime.as_mut())
             && let Ok(mut window) = self.cache_window.lock()
         {
@@ -1502,6 +1504,21 @@ fn parse_frontend_counters(response: &serde_json::Value) -> Option<RuntimeFronte
             write_bytes: response.pointer("/frontend/write_bytes")?.as_u64()?,
             exact_hit_bytes: response.pointer("/frontend/exact_hit_bytes")?.as_u64()?,
             new_chunk_bytes: response.pointer("/frontend/new_chunk_bytes")?.as_u64()?,
+            // Older runtimes omit the ingest counters; that stays unavailable, not zero.
+            ingest_reduction: response
+                .pointer("/frontend/logical_chunk_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .zip(
+                    response
+                        .pointer("/frontend/physical_container_bytes")
+                        .and_then(serde_json::Value::as_u64),
+                )
+                .map(|(logical_chunk_bytes, physical_container_bytes)| {
+                    crate::IngestReductionTelemetry {
+                        logical_chunk_bytes,
+                        physical_container_bytes,
+                    }
+                }),
             presented_capacity_revision: response
                 .get("presented_capacity_revision")
                 .and_then(serde_json::Value::as_str)

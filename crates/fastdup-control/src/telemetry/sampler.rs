@@ -170,6 +170,7 @@ impl SystemSampler {
             small_file_quota: None,
             storage_usage: None,
             details: None,
+            ingest_reduction: None,
             sequence: self.sequence,
             observed_at,
             repository_state: self.repository_state.clone(),

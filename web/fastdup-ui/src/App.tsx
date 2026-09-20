@@ -2,7 +2,9 @@ import { formatQueueDepth } from "./disk-io";
 import { StorageOverview } from "./storage-overview";
 import { SambaUsersSettings, WebUsersSettings, CertificateSettings } from "./settings-access";
 import { RecentJobs } from "./recent-jobs";
-import { DetailTelemetryPanel } from "./detail-telemetry";
+import { DetailTelemetryPanel, detailTabs } from "./detail-telemetry";
+import { formatBytes, formatCount } from "./format";
+import { Meter, StatGrid } from "./components/telemetry";
 import { appendResourceSample, resourceChartOption, type ResourceSample } from "./resource-history";
 import { I18nProvider, useI18n, type UiLanguage } from "./i18n";
 import {
@@ -208,18 +210,6 @@ function NotificationCenter({
       ))}
     </div>
   );
-}
-
-function formatBytes(value: number, locale: string) {
-  if (!Number.isFinite(value)) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-  let current = value;
-  let unit = 0;
-  while (current >= 1000 && unit < units.length - 1) {
-    current /= 1000;
-    unit += 1;
-  }
-  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(current)} ${units[unit]}`;
 }
 
 function repositoryDisks(snapshot: ApplianceSnapshot): DiskTelemetry[] {
@@ -1507,6 +1497,9 @@ function TelemetryPage({
   const displayedSnapshot = { ...snapshot, series: historical ? (history ?? []).map(item => ({time: item.observedAt, read: item.frontendReadMbps, write: item.frontendWriteMbps})) : snapshot.series };
   const usage = sample?.storageUsage;
   const physical = usage?.metadataUsedBytes != null && usage.dataUsedBytes != null ? usage.metadataUsedBytes + usage.dataUsedBytes : undefined;
+  const ingest = sample?.ingestReduction;
+  // Ingest work, not occupancy: the pools still hold storage awaiting collection.
+  const ingestRatio = ingest?.physicalContainerBytes ? ingest.logicalChunkBytes / ingest.physicalContainerBytes : null;
   const number = (value?: number | null, digits = 1) => value == null ? "—" : value.toLocaleString(locale, {minimumFractionDigits: digits, maximumFractionDigits: digits});
   const rate = (value?: number) => value == null ? "—" : `${number(value)} MB/s`;
   const resourceSamples = historical ? history ?? [] : liveResources;
@@ -1549,7 +1542,7 @@ function TelemetryPage({
           ))}
         </div>
       </div>
-      <p className="telemetry-sample-note" role="status">{loading ? t("Lädt") : sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</p>
+      <p className="telemetry-sample-note" role="status">{loading ? t("Lädt") : sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)} · ${t("Messreihe")} ${formatCount(sample.sequence, locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</p>
       {historyError && <p className="telemetry-history-error" role="alert">{t("Verlauf konnte nicht geladen werden.")} <button onClick={() => selectRange(range)}>{t("Erneut versuchen")}</button></p>}
       <nav className="telemetry-jump-links" aria-label={t("Telemetrie-Bereiche")}>
         <a href="#telemetry-performance">{t("Durchsatz & Ressourcen")}</a>
@@ -1627,7 +1620,7 @@ function TelemetryPage({
         <DiskTelemetryTable disks={historical ? sample?.disks ?? [] : disks} historical={historical} />
       </section>
       <section id="telemetry-diagnostics" aria-label={t("Ursachen & Details")}>
-        <DetailTelemetryPanel sample={sample} historical={historical} loading={loading} initialTab={2} />
+        <DetailTelemetryPanel sample={sample} historical={historical} loading={loading} initialTab={detailTabs.caches} />
       </section>
       <section id="telemetry-capacity" aria-label={t("Belegung & Reduktion")}>
         <Card>
@@ -1638,15 +1631,39 @@ function TelemetryPage({
             </div>
           </CardHeader>
           <CardContent className="telemetry-occupancy">
-            <dl className="telemetry-values">
-              <div><dt>{t("Logische Belegung")}</dt><dd>{usage?.logicalAllocatedBytes == null ? "—" : formatBytes(usage.logicalAllocatedBytes, locale)}</dd></div>
-              <div><dt>{t("Physische Belegung")}</dt><dd>{physical == null ? "—" : formatBytes(physical, locale)}</dd></div>
-              <div><dt>DATA</dt><dd>{usage?.dataUsedBytes == null ? "—" : formatBytes(usage.dataUsedBytes, locale)}</dd></div>
-              <div><dt>Metadata</dt><dd>{usage?.metadataUsedBytes == null ? "—" : formatBytes(usage.metadataUsedBytes, locale)}</dd></div>
-              <div><dt>{t("Checkpoint-Alter")}</dt><dd>{sample?.lastCheckpointSeconds == null ? "—" : `${number(sample.lastCheckpointSeconds, 0)} s`}</dd></div>
-              <div><dt>Generation</dt><dd>{number(sample?.commitGeneration, 0)}</dd></div>
-            </dl>
-            <p className="detail-note">{t("Exact Dedup zählt Treffer seit dem Mount, ohne FILL und Clone-Reuse. Gesamtreduktion = aktuelle logische Belegung / belegte Bytes auf DATA und Metadata, einschließlich Overhead und noch nicht freigegebenem Speicher.")}</p>
+            <div className="telemetry-pool-meters">
+              <Meter
+                label="DATA"
+                ariaLabel="DATA Belegung"
+                value={usage?.dataUsedBytes}
+                max={usage?.dataCapacityBytes}
+                valueText={formatBytes(usage?.dataUsedBytes, locale)}
+                limitText={usage?.dataCapacityBytes == null ? undefined : formatBytes(usage.dataCapacityBytes, locale)}
+                limitLabel="belegt von"
+              />
+              <Meter
+                label="Metadata"
+                ariaLabel="Metadata Belegung"
+                value={usage?.metadataUsedBytes}
+                max={usage?.metadataCapacityBytes}
+                valueText={formatBytes(usage?.metadataUsedBytes, locale)}
+                limitText={usage?.metadataCapacityBytes == null ? undefined : formatBytes(usage.metadataCapacityBytes, locale)}
+                limitLabel="belegt von"
+              />
+            </div>
+            <StatGrid columns={4} items={[
+              { label: "Logische Belegung", value: formatBytes(usage?.logicalAllocatedBytes, locale) },
+              { label: "Physische Belegung", value: formatBytes(physical, locale) },
+              { label: "Checkpoint-Alter", value: sample?.lastCheckpointSeconds == null ? "—" : `${number(sample.lastCheckpointSeconds, 0)} s` },
+              { label: "Generation", value: formatCount(sample?.commitGeneration, locale) },
+            ]} />
+            <StatGrid columns={3} items={[
+              { label: "Reduktion beim Schreiben", value: ingestRatio == null ? "—" : `${number(ingestRatio, 2)}×`,
+                hint: "Angebotene Chunk-Bytes je geschriebenem Container-Byte seit dem Mount" },
+              { label: "Angebotene Chunk-Bytes", value: formatBytes(ingest?.logicalChunkBytes, locale) },
+              { label: "Geschriebene Container-Bytes", value: formatBytes(ingest?.physicalContainerBytes, locale) },
+            ]} />
+            <p className="detail-note">{t("Exact Dedup zählt Treffer seit dem Mount, ohne FILL und Clone-Reuse. Gesamtreduktion = aktuelle logische Belegung / belegte Bytes auf DATA und Metadata, einschließlich Overhead und noch nicht freigegebenem Speicher. Reduktion beim Schreiben betrachtet nur den Ingest seit dem Mount und kennt weder Overhead noch noch nicht bereinigten Speicher.")}</p>
             {usage?.logicalObservedAt != null && <p className="detail-note">{t("Logische Belegung erfasst")}: {new Date(usage.logicalObservedAt * 1000).toLocaleString(locale)}</p>}
           </CardContent>
         </Card>

@@ -1,7 +1,19 @@
 import { useState } from "react";
-import ReactECharts from "echarts-for-react";
 import { PipelineTelemetryPanel, checkpointPhaseLabels as phaseLabels, type PipelineTelemetry } from "./pipeline-telemetry";
 import { useI18n } from "./i18n";
+import { formatBytes, formatCount, formatDuration, formatPercent, formatRate, hitRate } from "./format";
+import {
+  ColumnToggle,
+  DataTable,
+  Disclosure,
+  InlineMeter,
+  Meter,
+  PanelSection,
+  PhaseBars,
+  Segmented,
+  StatGrid,
+  type TelemetryColumn,
+} from "./components/telemetry";
 import type { TelemetrySnapshot } from "./types";
 
 export interface OperationLatency { operations: number; errors: number; p50Micros: number; p95Micros: number; p99Micros: number }
@@ -29,26 +41,82 @@ export interface DetailTelemetry {
     caches: { id: string; hits: number; misses: number; evictions: number; residentBytes?: number | null; residentPages?: number | null }[];
     reduction: { skippedColdCandidates?: number; explorationReads?: number; backendBaseReads?: number; warmBaseReuses?: number; successfulBaseTrials?: number; enabled: boolean; queries: number; candidates: number; acceptedPrefixes: number; acceptedSparseXor: number; savedPayloadBytes: number; fallbacks: number; errors: number };
     checkpoint?: { completedAt: number; generation: number; totalMs: number; unattributedMs?: number | null; phases: { id: string; wallMs: number; cpuMs: number }[] } | null;
-    gc?: { state: string; observedAt: number; totalMs?: number | null; readBytes?: number | null; writeBytes?: number | null; unlinkedBytes?: number | null; candidates?: number | null; victims?: number | null; abortedCandidates?: number | null } | null;
+    gc?: {
+      state: string; observedAt: number; totalMs?: number | null; readBytes?: number | null; writeBytes?: number | null;
+      unlinkedBytes?: number | null; candidates?: number | null; victims?: number | null; abortedCandidates?: number | null;
+      phasesMs?: Record<string, number> | null;
+      metadataGc?: {
+        markMode: string; exactReason?: string | null; wallMs: number; barrierWaitMs: number;
+        objectGraphReadBytes: number; candidateReadBytes: number; catalogReadBytes: number;
+        catalogWriteBytes: number; unlinkedBytes: number; rootSyncs: number; catalogChainRuns: number;
+      } | null;
+      catalogExaminedBytes?: number | null; catalogWriteBytes?: number | null; candidateProofReadBytes?: number | null;
+      reverseDependencyEdges?: number | null; reverseDependencyRequiredChunks?: number | null;
+      candidateQueueRetained?: number | null; candidateQueueScannedRows?: number | null;
+      catalogPendingUpdates?: number | null; exactRetirementMs?: number | null;
+      exactRunsRetired?: number | null; exactRunSetsRetired?: number | null;
+    } | null;
+    exactCache?: { protectedLimitBytes: number; protectedResidentBytes: number } | null;
+    exactMembership?: {
+      leasedRuns: number; filters: number; constructedFilters: number; missingFilters: number;
+      pageBoundsRuns: number; missingPageBounds: number; pageBoundsBytes: number;
+      probes: number; definitelyAbsent: number; requiresExactLookup: number;
+    } | null;
+    exactWarm?: { state: string } | null;
   } | null;
 }
 
+/**
+ * Seven views over one runtime sample. Every view follows the same shape:
+ * a titled section with its question, the headline values as a meter or a stat
+ * grid, repeating records as a table, and forensic detail behind a collapsed
+ * disclosure. See `components/telemetry` for the presentation rules.
+ */
+const tabs = ["Latenzen", "io_uring", "Metadata-Reads", "Caches", "Lesevermeidung", "GC & Scrub", "Checkpoint & Pipeline"];
+const LATENCY = 0, IO_URING = 1, METADATA_READS = 2, CACHES = 3, REDUCTION = 4, MAINTENANCE = 5, CHECKPOINT = 6;
+/** Tab indices by name, so callers never hard-code a position in `tabs`. */
+export const detailTabs = {
+  latency: LATENCY, ioUring: IO_URING, metadataReads: METADATA_READS, caches: CACHES,
+  reduction: REDUCTION, maintenance: MAINTENANCE, checkpoint: CHECKPOINT,
+} as const;
 const tabGroups = [
-  { label: "Antwortzeiten & I/O", indices: [0, 1] },
-  { label: "RAM & Lesezugriffe", indices: [2, 6, 3] },
-  { label: "Wartung & Commit", indices: [4, 5] },
+  { label: "Antwortzeiten & I/O", indices: [LATENCY, IO_URING, METADATA_READS] },
+  { label: "RAM & Lesevermeidung", indices: [CACHES, REDUCTION] },
+  { label: "Wartung & Commit", indices: [MAINTENANCE, CHECKPOINT] },
 ];
 const tabOrder = tabGroups.flatMap(group => group.indices);
 const tabHints = [
   "Wie lange dauern Dateizugriffe?",
   "Wie stark ist die asynchrone DATA-Verarbeitung belegt?",
+  "Welche Lesewege reichen Anfragen an das Betriebssystem weiter?",
   "Welche Caches vermeiden Backend-Zugriffe und wie viel RAM nutzen sie?",
   "Welche Vergleichsversuche vermeiden DATA-Lesezugriffe?",
   "Was prüfen und bereinigen die Hintergrundprozesse?",
-  "Wo wartet die Pipeline und warum ist die Schreibannahme gesperrt?",
-  "Welche Lesewege reichen Anfragen an das Betriebssystem weiter?",
+  "Wie verteilt sich die Checkpoint-Dauer und wo wartet die Schreibannahme?",
 ];
-const tabs = ["Latenzen", "io_uring", "Caches", "Lesevermeidung", "GC & Scrub", "Checkpoint-Phasen", "Metadata-Reads"];
+
+const scrubStates: Record<string, string> = { running: "Läuft", complete: "Abgeschlossen", failed: "Fehlgeschlagen", cancelled: "Unterbrochen" };
+const gcStates: Record<string, string> = { running: "Läuft", failed: "Fehlgeschlagen", noCandidates: "Keine Kandidaten", noProfitableCandidates: "Keine profitablen Kandidaten", catalogRebuilt: "Katalog erneuert", collected: "Abgeschlossen", metadataOnly: "Nur Metadaten", dataOnly: "Nur DATA" };
+const gcPhaseLabels: Record<string, string> = {
+  recovery: "Recovery", metadataGc: "Metadata-GC", candidateCatalog: "Kandidatenkatalog",
+  candidateProof: "Kandidaten prüfen", relocation: "Umlagerung", retiringActivation: "Rückzug aktivieren",
+  pinDrain: "Pins abwarten", victimVerify: "Victims prüfen", unlink: "Container entfernen",
+  dataSync: "DATA synchronisieren", removedActivation: "Entfernung aktivieren",
+  postCollectionCatalog: "Katalog nachführen",
+};
+const markModes: Record<string, string> = {
+  reused: "Katalog wiederverwendet", addition_delta: "Nur Zugänge nachgetragen",
+  catalog_compaction: "Katalog verdichtet", exact_snapshot: "Exakter Katalog neu aufgebaut",
+};
+const exactReasons: Record<string, string> = {
+  process_start: "Prozessstart", unclassified_publication: "Nicht zugeordnete Publikation",
+  metadata_root_pin_drain: "Metadata-Root-Pins abgewartet", wal_rotation: "WAL-Rotation",
+  uncertain_wal_durability: "WAL-Dauerhaftigkeit unklar", delta_chain_limit: "Delta-Kette zu lang",
+  recovery_checkpoint_pin_change: "Recovery-Checkpoint-Pin geändert",
+};
+const warmStates: Record<string, string> = {
+  warmed: "Index vorgewärmt", cancelled: "Abgebrochen", "no-new-demand": "Kein neuer Bedarf",
+};
 const metadataReasons: Record<string,string> = {other:"Nicht zugeordnet",indexLookup:"Index-Abfrage · Cache-Miss",indexCompaction:"Index-Zusammenführung",indexAudit:"Index-Prüfung",indexEnvelope:"Index-Header / Footer",manifest:"Manifest lesen",namespace:"Namespace / Verwaltungsgraph",recoveryScrub:"Recovery / Scrub",garbageCollection:"Garbage Collection"};
 const metadataObjects: Record<string,string> = {exactIndex:"Exact Index",similarityIndex:"Similarity Index",metadataObject:"Metadatenobjekt",smallFile:"Small-File-Container",control:"Commit / Journal / Verwaltung",other:"Weitere Dateien"};
 const metadataModes: Record<string,string> = {directRange:"Direkter Bereich",directFile:"Direkte Datei",directStructure:"Direkte Struktur",directLease:"Direkter Zugriff mit Dateilease",bufferedRange:"Gepufferter Bereich",bufferedFile:"Gepufferte Datei",bufferedStructure:"Gepufferte Struktur",mmap:"mmap"};
@@ -65,43 +133,151 @@ const cacheDescriptions: Record<string, string> = {
   metadataObjects: "Unveränderliche Namespace- und Manifest-Objekte",
 };
 
+type CachePool = { id: string; hits: number; misses: number; evictions: number; residentBytes?: number | null; residentPages?: number | null };
 
-export function DetailTelemetryPanel({ sample, historical, loading, initialTab = 0 }: { sample?: TelemetrySnapshot; historical: boolean; loading: boolean; initialTab?: number }) {
+export function DetailTelemetryPanel({ sample, historical, loading, initialTab = LATENCY }: { sample?: TelemetrySnapshot; historical: boolean; loading: boolean; initialTab?: number }) {
   const { t, locale } = useI18n();
   const [tab, setTab] = useState(initialTab);
   const [cacheRange, setCacheRange] = useState<"total" | "5m">("total");
   const [cacheCounters, setCacheCounters] = useState(false);
+  const [metadataTotals, setMetadataTotals] = useState(false);
   const details = sample?.details;
   const runtime = details?.runtime;
-  const number = (value?: number | null) => value == null ? "—" : value.toLocaleString(locale, { maximumFractionDigits: 2 });
-  const bytes = (value?: number | null) => value == null ? "—" : value >= 1e9 ? `${number(value / 1e9)} GB` : value >= 1e6 ? `${number(value / 1e6)} MB` : value >= 1e3 ? `${number(value / 1e3)} KB` : `${number(value)} B`;
+  const count = (value?: number | null) => formatCount(value, locale);
+  const bytes = (value?: number | null) => formatBytes(value, locale);
+  const duration = (value?: number | null) => formatDuration(value, locale);
+  const percent = (value?: number | null) => formatPercent(value, locale);
   const timestamp = (value: number) => new Date(value * 1000).toLocaleString(locale);
   const empty = <p className="detail-empty">{t("Runtime-Messdaten sind momentan nicht verfügbar. Die Anzeige wird automatisch aktualisiert.")}</p>;
-  const rows = (values: [string, string][]) => <dl className="telemetry-values">{values.map(([label, value]) => <div key={label}><dt>{t(label)}</dt><dd>{value}</dd></div>)}</dl>;
+
   const checkpoint = runtime?.checkpoint;
   const nestedPhases = new Set(["cdc", "hashFill", "exactLookup", "encode", "containerPublish"]);
   const chartPhases = checkpoint?.unattributedMs != null
     ? [...checkpoint.phases.filter(phase => !nestedPhases.has(phase.id)), {id:"unattributed", wallMs:checkpoint.unattributedMs}]
     : checkpoint?.phases ?? [];
   const gc = runtime?.gc;
+  const metadataGc = gc?.metadataGc;
+  const gcPhases = Object.entries(gc?.phasesMs ?? {})
+    .filter(([, ms]) => Number.isFinite(ms))
+    .map(([id, ms]) => ({ id, label: gcPhaseLabels[id] ?? id, ms }));
   const reduction = runtime?.reduction;
   const budget = runtime?.cacheBudget;
   const scrub = runtime?.scrub;
   const compression = runtime?.readCacheCompression;
   const metadataReads = runtime?.metadataReads;
-  const [metadataTotals, setMetadataTotals] = useState(false);
-  const pools = [...(budget?.pools ?? runtime?.caches ?? [])].filter(pool => pool.id !== "codecBuffers").sort((a, b) => {
-    const tier = (id: string) => budget?.pools.find(pool => pool.id === id)?.fallbackTier;
+  const ioUring = runtime?.ioUring;
+  const residentTotal = budget?.pools.reduce((sum, pool) => sum + pool.residentBytes, 0) ?? 0;
+  // Budget-governed pools carry the tier and the reservation; the remaining caches
+  // report their own counters and would otherwise never be shown at all.
+  const budgetPools = (budget?.pools ?? []).filter(pool => pool.id !== "codecBuffers");
+  const ungoverned = (runtime?.caches ?? []).filter(cache => !budgetPools.some(pool => pool.id === cache.id));
+  const pools: CachePool[] = [...budgetPools, ...ungoverned].sort((a, b) => {
+    const tier = (id: string) => budgetPools.find(pool => pool.id === id)?.fallbackTier;
     return Number(tier(b.id) === "data") - Number(tier(a.id) === "data");
   });
+  const windowCounts = (id: string) => cacheRange === "total"
+    ? pools.find(pool => pool.id === id)
+    : runtime?.cacheWindow?.seconds ? runtime.cacheWindow.pools.find(pool => pool.id === id) : undefined;
+
+  const latencyRows = details?.latency
+    ? ([["Read", details.latency.read], ["Write", details.latency.write]] as const).map(([name, item]) => ({ name, item }))
+    : [];
+  const percentile = (item: OperationLatency, value: number) =>
+    item.operations + item.errors === 0 ? "—" : value > 1e15 ? "> 100 ms" : duration(value / 1000);
+  const latencyColumns: TelemetryColumn<{ name: string; item: OperationLatency }>[] = [
+    { key: "operation", label: "Operation", render: row => row.name },
+    { key: "p50", label: "p50", numeric: true, render: row => percentile(row.item, row.item.p50Micros) },
+    { key: "p95", label: "p95", numeric: true, render: row => percentile(row.item, row.item.p95Micros) },
+    { key: "p99", label: "p99", numeric: true, render: row => percentile(row.item, row.item.p99Micros) },
+    { key: "operations", label: "Erfolgreich", numeric: true, render: row => count(row.item.operations) },
+    { key: "errors", label: "Fehler", numeric: true, render: row => count(row.item.errors) },
+  ];
+
+  const poolColumns: (TelemetryColumn<CachePool> | false)[] = [
+    { key: "cache", label: "Cache", render: pool => <>
+      <span>{cacheLabels[pool.id] ?? pool.id}</span>
+      {cacheDescriptions[pool.id] && <small className="cache-description">{t(cacheDescriptions[pool.id])}</small>}
+    </> },
+    Boolean(budget) && { key: "tier", label: "Rückfall auf", render: pool => {
+      const tier = budgetPools.find(item => item.id === pool.id)?.fallbackTier;
+      return <span className={`cache-tier ${tier === "data" ? "data" : "metadata"}`}>
+        {pool.id === "unifiedRead" ? "Metadata + DATA" : tier === "data" ? "DATA" : tier === "metadata" ? "Metadata" : "—"}
+      </span>;
+    } },
+    { key: "rate", label: "Hit Rate", numeric: true, render: pool => {
+      const counts = windowCounts(pool.id);
+      const rate = hitRate(counts?.hits, counts?.misses);
+      return <InlineMeter percent={rate} text={percent(rate)} />;
+    } },
+    cacheCounters && { key: "hits", label: "Hits", numeric: true, render: pool => count(windowCounts(pool.id)?.hits) },
+    cacheCounters && { key: "misses", label: "Misses", numeric: true, render: pool => count(windowCounts(pool.id)?.misses) },
+    cacheCounters && { key: "evictions", label: "Evictions", numeric: true, render: pool => count(windowCounts(pool.id)?.evictions) },
+    { key: "resident", label: "Belegung", numeric: true, render: pool => pool.residentBytes != null
+      ? bytes(pool.residentBytes)
+      : pool.residentPages != null ? `${count(pool.residentPages)} ${t("Seiten")}` : "—" },
+    Boolean(budget) && { key: "target", label: "Zielbudget", numeric: true, render: pool => bytes(budgetPools.find(item => item.id === pool.id)?.targetBytes) },
+    Boolean(budget) && cacheCounters && { key: "leased", label: "Reserviert", numeric: true, render: pool => bytes(budgetPools.find(item => item.id === pool.id)?.leasedBytes) },
+  ];
+
+  const metadataRows = [...(metadataReads?.rows ?? [])].sort((a, b) => b.requestedMbps - a.requestedMbps || b.requestedBytes - a.requestedBytes);
+  const metadataInterval = (metadataReads?.intervalSeconds ?? 0) > 0;
+  const metadataColumns: (TelemetryColumn<(typeof metadataRows)[number]> | false)[] = [
+    { key: "reason", label: "Ursache", render: row => t(metadataReasons[row.reason] ?? row.reason) },
+    { key: "object", label: "Daten", render: row => t(metadataObjects[row.object] ?? row.object) },
+    { key: "mode", label: "Zugriffsweg", render: row => t(metadataModes[row.mode] ?? row.mode) },
+    { key: "mbps", label: "Angefordert · MB/s", numeric: true, render: row => metadataInterval ? formatRate(row.requestedMbps, "", locale).trim() : "—" },
+    { key: "ops", label: "Aufrufe/s", numeric: true, render: row => metadataInterval ? count(row.operationsPerSecond) : "—" },
+    { key: "inflight", label: "Laufende Reads", numeric: true, render: row => row.mode === "mmap" ? "—" : count(row.inFlight) },
+    metadataTotals && { key: "operations", label: "Aufrufe", numeric: true, render: row => count(row.operations) },
+    metadataTotals && { key: "requested", label: "Angefordert", numeric: true, render: row => bytes(row.requestedBytes) },
+    metadataTotals && { key: "returned", label: "Erfolgreich geliefert", numeric: true, render: row => bytes(row.returnedBytes) },
+    metadataTotals && { key: "errors", label: "Fehler", numeric: true, render: row => count(row.errors) },
+    metadataTotals && { key: "average", label: "Ø Lesezeit", numeric: true, render: row => row.mode === "mmap" || !row.operations ? "—" : duration(row.elapsedMicros / row.operations / 1000) },
+    metadataTotals && { key: "maximum", label: "Max. Lesezeit", numeric: true, render: row => row.mode === "mmap" || !row.operations ? "—" : duration(row.maxMicros / 1000) },
+  ];
+  const metadataMbps = metadataRows.reduce((sum, row) => sum + row.requestedMbps, 0);
+  const metadataOperations = metadataRows.reduce((sum, row) => sum + row.operationsPerSecond, 0);
+  const metadataInFlight = metadataRows.filter(row => row.mode !== "mmap").reduce((sum, row) => sum + row.inFlight, 0);
+
+  const checkpointColumns: TelemetryColumn<{ id: string; wallMs: number; cpuMs: number }>[] = [
+    { key: "phase", label: "Phase", render: phase => t(phaseLabels[phase.id] ?? phase.id) },
+    { key: "wall", label: "Wall time", numeric: true, render: phase => duration(phase.wallMs) },
+    { key: "cpu", label: "Process CPU", numeric: true, render: phase => duration(phase.cpuMs) },
+  ];
+
+  const warmBaseRate = hitRate(reduction?.warmBaseReuses, reduction?.backendBaseReads);
+  const membership = runtime?.exactMembership;
+  const membershipRate = membership && membership.probes
+    ? (membership.definitelyAbsent * 100) / membership.probes
+    : null;
+  const gcForensics = [
+    { label: "Katalog untersucht", value: bytes(gc?.catalogExaminedBytes) },
+    { label: "Katalog geschrieben", value: bytes(gc?.catalogWriteBytes) },
+    { label: "Kandidatennachweise gelesen", value: bytes(gc?.candidateProofReadBytes) },
+    { label: "Rückwärtskanten", value: count(gc?.reverseDependencyEdges) },
+    { label: "Benötigte Chunks", value: count(gc?.reverseDependencyRequiredChunks) },
+    { label: "Kandidatenwarteschlange", value: count(gc?.candidateQueueRetained) },
+    { label: "Durchsuchte Warteschlangenzeilen", value: count(gc?.candidateQueueScannedRows) },
+    { label: "Offene Katalogänderungen", value: count(gc?.catalogPendingUpdates) },
+    { label: "Exact-Rückzug", value: duration(gc?.exactRetirementMs) },
+    { label: "Zurückgezogene Runs", value: count(gc?.exactRunsRetired) },
+    { label: "Zurückgezogene Run-Sets", value: count(gc?.exactRunSetsRetired) },
+  ];
+
   return <section className="detail-telemetry" aria-label={t("Detailtelemetrie")}>
-    <div className="detail-telemetry-heading"><h2>{t("Ursachen & Details")}</h2><span>{sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</span></div>
+    <div className="detail-telemetry-heading">
+      <h2>{t("Ursachen & Details")}</h2>
+      <span>
+        {sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}
+        {runtime?.runtimeId && ` · ${t("Runtime")} ${runtime.runtimeId}`}
+      </span>
+    </div>
     {scrub && <div className="detail-scrub" role={scrub.state === "failed" ? "alert" : "status"}>
-      <strong>{t("Hintergrundprüfung")}: {t(({running:"Läuft",complete:"Abgeschlossen",failed:"Fehlgeschlagen",cancelled:"Unterbrochen"} as Record<string,string>)[scrub.state] ?? scrub.state)}</strong>
-      <span>{number(scrub.verifiedContainers)} / {number(scrub.totalContainers)} {t("Container geprüft")} · {bytes(scrub.readBytes)} {t("gelesen")}</span>
-      {scrub.resumedContainers !== undefined && <span>{number(scrub.resumedContainers)} {t("aus vorheriger Prüfung übernommen")} · {number(scrub.newlyVerifiedContainers ?? 0)} {t("neu geprüft")} · {number(scrub.remainingContainers ?? 0)} {t("noch ausstehend")}</span>}
+      <strong>{t("Hintergrundprüfung")}: {t(scrubStates[scrub.state] ?? scrub.state)}</strong>
+      <span>{count(scrub.verifiedContainers)} / {count(scrub.totalContainers)} {t("Container geprüft")} · {bytes(scrub.readBytes)} {t("gelesen")}</span>
+      {scrub.resumedContainers !== undefined && <span>{count(scrub.resumedContainers)} {t("aus vorheriger Prüfung übernommen")} · {count(scrub.newlyVerifiedContainers ?? 0)} {t("neu geprüft")} · {count(scrub.remainingContainers ?? 0)} {t("noch ausstehend")}</span>}
       {scrub.state === "running" && <><progress aria-label={t("Hintergrundprüfung")} value={scrub.verifiedContainers} max={Math.max(1, scrub.totalContainers)} /><small>{t("Lesezugriffe werden vollständig geprüft. Die Hintergrundprüfung begrenzt ihre Last; automatische Speicherbereinigung wartet auf ihren Abschluss.")}</small></>}
-      {scrub.state === "failed" && <small>{t("Datenprüfung fehlgeschlagen. Neue Schreibzugriffe sind gesperrt. Details stehen im Dienstprotokoll.")}</small>}
+      {scrub.state === "failed" && <small>{t("Datenprüfung fehlgeschlagen. Neue Schreibzugriffe sind gesperrt. Details stehen im Dienstprotokoll.")}{scrub.error ? ` · ${scrub.error}` : ""}</small>}
     </div>}
     <div className="detail-tabs detail-tab-groups" role="tablist" aria-label={t("Detailtelemetrie")}>
       {tabGroups.map(group => <div className="detail-tab-group" role="presentation" key={group.label}><span className="detail-tab-group-label">{t(group.label)}</span><div role="presentation">{group.indices.map(index => <button key={tabs[index]} role="tab" id={`detail-tab-${index}`} aria-controls="detail-panel" aria-selected={tab === index} tabIndex={tab === index ? 0 : -1} onClick={() => setTab(index)} onKeyDown={event => {
@@ -115,137 +291,344 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
     <div id="detail-panel" role="tabpanel" aria-labelledby={`detail-tab-${tab}`} tabIndex={0} aria-busy={loading}>
       <p className="detail-panel-hint">{t(tabHints[tab])}</p>
       {loading ? <p>{t("Lädt")}</p> : <>
-        {tab === 0 && (details?.latency ? <>
-          <p className="detail-note">{t("Histogramm-Perzentile seit dem Mount, inklusive fehlgeschlagener Requests. Werte sind Bucket-Obergrenzen, keine Intervallmittelwerte.")}</p>
-          <div className="telemetry-table-scroll"><table><thead><tr>{["Operation", "p50", "p95", "p99", "Erfolgreich", "Fehler"].map(label => <th key={label}>{t(label)}</th>)}</tr></thead><tbody>
-            {([['Read', details.latency.read], ['Write', details.latency.write]] as const).map(([name, item]) => <tr key={name}><th>{name}</th>{[item.p50Micros, item.p95Micros, item.p99Micros].map((value, index) => <td key={index}>{item.operations + item.errors === 0 ? "—" : value > 1e15 ? "> 100 ms" : `${number(value / 1000)} ms`}</td>)}<td>{number(item.operations)}</td><td>{number(item.errors)}</td></tr>)}
-          </tbody></table></div>
-        </> : empty)}
-        {tab === 1 && (runtime ? <>
-          <p className="detail-note">{t("Data-Tier io_uring: aktuelle Belegung und kumulative Zähler seit dem Mount.")}</p>
-          {rows([["In-Flight", bytes(runtime.ioUring.inflightBytes)], ["In-Flight Limit", bytes(runtime.ioUring.maxInflightBytes)], ["Peak In-Flight", bytes(runtime.ioUring.peakInflightBytes)], ["Ring Entries", number(runtime.ioUring.ringEntries)], ["Submitted", number(runtime.ioUring.submitted)], ["Completed", number(runtime.ioUring.completed)]])}
-          <progress aria-label={t("In-Flight Belegung")} value={runtime.ioUring.inflightBytes} max={Math.max(1, runtime.ioUring.maxInflightBytes)} />
-        </> : empty)}
-        {tab === 2 && (runtime ? <>
-          {budget && <div className="cache-memory">
-            {rows([["RAM-Obergrenze", `${number(budget.maximumMemoryUsedBasisPoints / 100)} %`], ["Effektives RAM", bytes(budget.effectiveLimitBytes)], ["Verfügbares RAM", bytes(budget.availableBytes)], ["Gemeinsames Cache-Budget", bytes(budget.budgetBytes)], ["Cache-Belegung", bytes(budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0))]])}
-            <progress aria-label={t("Cache-Budget Belegung")} value={budget.pools.reduce((sum, pool) => sum + pool.residentBytes, 0)} max={Math.max(1, budget.budgetBytes)} />
-          </div>}
-          <div className="cache-toolbar">
-            <div><h3>{t("Cache-Wirkung")}</h3><p className="detail-note">{t("Treffer vermeiden Zugriffe auf das angegebene Tier. Alle Inhalte teilen sich einen Cache; wiederverwendete DATA-Inhalte erhalten mehr Schutz bei der Verdrängung.")}</p></div>
-            <div className="cache-range" role="group" aria-label={t("Cache-Zeitraum")}><button aria-pressed={cacheRange === "5m"} onClick={() => setCacheRange("5m")}>{t("Letzte 5 Minuten")}</button><button aria-pressed={cacheRange === "total"} onClick={() => setCacheRange("total")}>{t("Gesamt seit Mount")}</button></div>
-            <label className="cache-counter-toggle"><input type="checkbox" checked={cacheCounters} onChange={event => setCacheCounters(event.target.checked)} />{t("Zähler & Reservierung anzeigen")}</label>
-          </div>
-          <p className="detail-note">{t(cacheRange === "total" ? "Cache Hit Rates seit dem Mount. Ohne Zugriffe wird keine Rate angezeigt." : "Trefferrate und Zählerdifferenzen der letzten 5 Minuten vor diesem Messpunkt. RAM-Belegung und Budgets gelten zum Messpunkt.")}</p>
-          {cacheRange === "5m" && <p className="detail-note">{runtime.cacheWindow?.seconds ? `${t("Erfasster Zeitraum")}: ${number(runtime.cacheWindow.seconds)} s` : t("Für dieses Zeitfenster sind noch keine Messdaten verfügbar.")}</p>}
-          <div className="telemetry-table-scroll"><table><thead><tr>{["Cache", ...(budget ? ["Rückfall auf"] : []), "Hit Rate", ...(cacheCounters ? ["Hits", "Misses", "Evictions"] : []), "Belegung", ...(budget ? ["Zielbudget", ...(cacheCounters ? ["Reserviert"] : [])] : [])].map(label => <th key={label}>{t(label)}</th>)}</tr></thead><tbody>{pools.map(cache => {
-            const pool = budget?.pools.find(item => item.id === cache.id);
-            const counts = cacheRange === "total" ? cache : runtime.cacheWindow?.seconds ? runtime.cacheWindow.pools.find(pool => pool.id === cache.id) : undefined;
-            const hitRate = counts && counts.hits + counts.misses ? counts.hits * 100 / (counts.hits + counts.misses) : null;
-            return <tr key={cache.id}>
-              <th scope="row"><span>{cacheLabels[cache.id] ?? cache.id}</span>{cacheDescriptions[cache.id] && <small className="cache-description">{t(cacheDescriptions[cache.id])}</small>}</th>
-              {budget && <td><span className={`cache-tier ${pool?.fallbackTier === "data" ? "data" : "metadata"}`}>{cache.id === "unifiedRead" ? "Metadata + DATA" : pool?.fallbackTier === "data" ? "DATA" : pool?.fallbackTier === "metadata" ? "Metadata" : "—"}</span></td>}
-              <td><span className="cache-hit-rate">{hitRate == null ? "—" : `${number(hitRate)} %`}{hitRate != null && <span className="cache-hit-track" aria-hidden="true"><span style={{width: `${hitRate}%`}} /></span>}</span></td>
-              {cacheCounters && <><td>{number(counts?.hits)}</td><td>{number(counts?.misses)}</td><td>{number(counts?.evictions)}</td></>}
-              <td>{cache.residentBytes != null ? bytes(cache.residentBytes) : "residentPages" in cache && cache.residentPages != null ? `${number(cache.residentPages)} ${t("Seiten")}` : "—"}</td>
-              {budget && <><td>{bytes(pool?.targetBytes)}</td>{cacheCounters && <td>{bytes(pool?.leasedBytes)}</td>}</>}
-            </tr>;
-          })}</tbody></table></div>
-          {budget && runtime.caches.filter(cache => cache.id === "locationProofs").map(proof => <details key={proof.id} className="telemetry-disclosure">
-            <summary>{t("Location-Nachweise · seit Mount")}</summary>
-            <p className="detail-note">{t("Treffer ermöglichen Dedup- und Commit-Prüfungen ohne erneutes Lesen der Nutzdaten. Die Belegung ist im gemeinsamen Cache enthalten.")}</p>
-            {rows([
-              ["Hit Rate", proof.hits + proof.misses ? `${number(proof.hits * 100 / (proof.hits + proof.misses))} %` : "—"],
-              ["Hits", number(proof.hits)], ["Misses", number(proof.misses)],
-              ["Evictions", number(proof.evictions)], ["Belegung", bytes(proof.residentBytes)]
-            ])}
-          </details>)}
-          {compression && <div className="read-cache-compression" aria-label={t("Verified Read · RAM-Kompression")}>
-            <h3>{t("Verified Read · RAM-Kompression")}</h3>
-            <p className="detail-note">{t("Geprüfte Nutzdaten bleiben komprimiert im RAM, wenn das Speicher spart; andernfalls bleiben sie unkomprimiert. Beide Darstellungen teilen sich das gemeinsame Cache-Budget. Speicherwerte gelten zum Messpunkt.")}</p>
-            {rows([
-              ["Direkt im RAM", bytes(compression.decodedResidentBytes)],
-              ["Komprimiert im RAM", bytes(compression.compressedResidentBytes)],
-              ["Darin enthaltene Nutzdaten", bytes(compression.compressedLogicalBytes)],
-              ["RAM durch Kompression gespart", bytes(Math.max(0, compression.compressedLogicalBytes - compression.compressedResidentBytes))],
-              ["Cache-Kompressionsfaktor", compression.compressedResidentBytes ? `${number(compression.compressedLogicalBytes / compression.compressedResidentBytes)}×` : "—"]
-            ])}
-            <details><summary>{t("Kompressionskosten · seit Mount")}</summary>
-              {rows([
-                ["Treffer auf komprimierte Einträge", number(compression.hits)],
-                ["Dekompressionen", number(compression.decompressions)],
-                ["Ø Dekompression inkl. Prüfung", compression.decompressions ? `${number(compression.decompressionNanos / compression.decompressions / 1000)} µs` : "—"],
-                ["Ø Kompressionsversuch", compression.attempts ? `${number(compression.compressionNanos / compression.attempts / 1000)} µs` : "—"],
-                ["In direkte Darstellung übernommen", number(compression.promotions)],
-                ["Wieder komprimiert", number(compression.demotions)],
-                ["Kompression ausgelassen", number(compression.bypasses)],
-                ["Ungültige Cache-Einträge", number(compression.failures)],
-                ["Aktive Codec-Arbeitsreserve", bytes(compression.workingBytes)],
-                ["Spitze der Codec-Arbeitsreserve", bytes(compression.peakWorkingBytes)],
-                ["Grenze der Codec-Arbeitsreserve", bytes(compression.maxWorkingBytes)]
-              ])}
-              <p className="detail-note">{t("Komprimierte Treffer benötigen keinen DATA-Zugriff. Gleichzeitig aktive Leser können eine Dekompression teilen. Die Arbeitsreserve begrenzt temporäre Codec-Puffer und zählt separat zur Cache-Belegung.")}</p>
-            </details>
-          </div>}
-          {budget && <p className="detail-note">{t("Zielbudget wird laufend angepasst. Reservierter Speicher wird erst nach der Verdrängung für andere Caches freigegeben. Die Belegung enthält Cache-Verwaltungsdaten.")}</p>}
-          <div className="cache-advanced">          {runtime.codecBuffers && <details className="telemetry-disclosure"><summary>{t("Wiederverwendbare Codec-Puffer")}</summary>
-            {rows([
-              ["Freie Puffer im Pool", bytes(runtime.codecBuffers.retainedBytes)],
-              ["Puffer in Verwendung", bytes(runtime.codecBuffers.activeBytes)],
-              ["Spitze in Verwendung", bytes(runtime.codecBuffers.peakActiveBytes)],
-              ["Puffer wiederverwendet", number(runtime.codecBuffers.hits)],
-              ["Neue Puffer angelegt", number(runtime.codecBuffers.misses)],
-              ["Puffer freigegeben", number(runtime.codecBuffers.evictions)],
-              ["Zielbudget", bytes(budget?.pools.find(pool => pool.id === "codecBuffers")?.targetBytes)],
-            ])}
-            <small>{t("Freie Puffer nutzen das gemeinsame RAM-Budget nachrangig. Aktive Puffer können auch von Cache-Einträgen oder Lesern gehalten werden; die Werte werden nicht addiert. Zähler gelten seit dem Mount.")}</small>
-          </details>}
-          {runtime.allocatorMemory && <details className="detail-note">
-            <summary>{t("Prozessspeicher und Allocator")}</summary>
-            {rows([
-              ["Anonymes RAM", bytes(runtime.allocatorMemory.anonymousResidentBytes)],
-              ["Vom Allocator belegt", bytes(runtime.allocatorMemory.allocatedBytes)],
-              ["Freie Allocator-Blöcke", bytes(runtime.allocatorMemory.freeBytes)],
-              ["Allocator-Arenen", bytes(runtime.allocatorMemory.arenaBytes)],
-              ["RAM-Bereinigungen", number(runtime.allocatorMemory.trimAttempts)],
-              ["Letzte RAM-Bereinigung", `${number(runtime.allocatorMemory.lastTrimMicros / 1000)} ms`],
-            ])}
-            <p>{t("Allocator-Werte enthalten Caches und Arbeitsspeicher. Freie Blöcke können bereits aus dem RAM entfernt sein; diese Werte werden nicht addiert. Messung im Hintergrund, normalerweise alle 30 Sekunden.")}</p>
-          </details>}
-          </div>
 
+        {tab === LATENCY && (details?.latency ? <PanelSection
+          title="Antwortzeiten der Dateizugriffe"
+          description="Histogramm-Perzentile seit dem Mount, inklusive fehlgeschlagener Requests. Werte sind Bucket-Obergrenzen, keine Intervallmittelwerte."
+        >
+          <DataTable label="Antwortzeiten" columns={latencyColumns} rows={latencyRows} rowKey={row => row.name} />
+        </PanelSection> : empty)}
+
+        {tab === IO_URING && (ioUring ? <PanelSection
+          title="Data-Tier io_uring"
+          description="Aktuelle Belegung des asynchronen DATA-Pfads; die Zähler laufen seit dem Mount."
+        >
+          <Meter
+            label="In-Flight"
+            ariaLabel="In-Flight Belegung"
+            value={ioUring.inflightBytes}
+            max={ioUring.maxInflightBytes}
+            valueText={bytes(ioUring.inflightBytes)}
+          />
+          <StatGrid columns={3} items={[
+            { label: "In-Flight Limit", value: bytes(ioUring.maxInflightBytes) },
+            { label: "Peak In-Flight", value: bytes(ioUring.peakInflightBytes) },
+            { label: "Ring Entries", value: count(ioUring.ringEntries) },
+            { label: "Submitted", value: count(ioUring.submitted) },
+            { label: "Completed", value: count(ioUring.completed) },
+            { label: "Offene Vorgänge", value: count(Math.max(0, ioUring.submitted - ioUring.completed)) },
+          ]} />
+        </PanelSection> : empty)}
+
+        {tab === METADATA_READS && (metadataReads ? <PanelSection
+          title="Metadata-Lesewege"
+          description="Direkte Backend-Reads nach Ursache. Der Unified Read Cache bedient wiederverwendbare Inhalte vor dem Backend. Angeforderte Bereiche enthalten keinen Ausrichtungs- oder Format-Overhead; physische MB/s und IOPS stehen bei den Laufwerken."
+          aside={<ColumnToggle label="Summen und Lesezeiten seit Mount anzeigen" checked={metadataTotals} onChange={setMetadataTotals} />}
+        >
+          <StatGrid columns={4} items={[
+            { label: "Messintervall", value: metadataInterval ? `${count(metadataReads.intervalSeconds)} s` : t("Erster Messpunkt · Raten noch nicht verfügbar") },
+            { label: "Angefordert · Summe", value: metadataInterval ? formatRate(metadataMbps, "MB/s", locale) : "—" },
+            { label: "Aufrufe/s · Summe", value: metadataInterval ? count(metadataOperations) : "—" },
+            { label: "Laufende Reads · Summe", value: count(metadataInFlight) },
+          ]} />
+          <DataTable
+            label="Metadata-Lesewege"
+            columns={metadataColumns}
+            rows={metadataRows}
+            rowKey={row => `${row.reason}/${row.object}/${row.mode}`}
+            empty="Noch keine Metadata-Reads erfasst."
+            note="Lesezeiten erfassen den direkten Backend-Aufruf einschließlich Pufferaufbau. Das Öffnen der Datei ist nicht enthalten. Separate Metadatenzugriffe des Host-Dateisystems werden hier nicht gezählt."
+          />
+        </PanelSection> : empty)}
+
+        {tab === CACHES && (runtime ? <>
+          {budget && <PanelSection
+            title="Gemeinsames RAM-Budget"
+            description="Alle Caches teilen sich ein Budget. Wiederverwendete DATA-Inhalte erhalten mehr Schutz bei der Verdrängung."
+          >
+            <Meter
+              label="Cache-Belegung"
+              ariaLabel="Cache-Budget Belegung"
+              value={residentTotal}
+              max={budget.budgetBytes}
+              valueText={bytes(residentTotal)}
+            />
+            <StatGrid columns={4} items={[
+              { label: "RAM-Obergrenze", value: percent(budget.maximumMemoryUsedBasisPoints / 100) },
+              { label: "Effektives RAM", value: bytes(budget.effectiveLimitBytes) },
+              { label: "Verfügbares RAM", value: bytes(budget.availableBytes) },
+              { label: "Gemeinsames Cache-Budget", value: bytes(budget.budgetBytes) },
+            ]} />
+          </PanelSection>}
+          {runtime.exactCache && <PanelSection
+            title="Exact Index · geschütztes RAM"
+            description="Diese Index-Seiten bleiben von der Verdrängung ausgenommen, damit ein Lookup ein RAM-Zugriff bleibt."
+          >
+            <Meter
+              label="Geschützt im RAM"
+              ariaLabel="Geschütztes Index-RAM"
+              value={runtime.exactCache.protectedResidentBytes}
+              max={runtime.exactCache.protectedLimitBytes}
+              valueText={bytes(runtime.exactCache.protectedResidentBytes)}
+              limitText={bytes(runtime.exactCache.protectedLimitBytes)}
+            />
+          </PanelSection>}
+          <PanelSection
+            title="Cache-Wirkung"
+            description="Treffer vermeiden Zugriffe auf das angegebene Tier. RAM-Belegung und Budgets gelten immer zum Messpunkt."
+            aside={<div className="section-controls">
+              <Segmented
+                label="Cache-Zeitraum"
+                value={cacheRange}
+                onChange={setCacheRange}
+                options={[{ value: "5m", label: "Letzte 5 Minuten" }, { value: "total", label: "Gesamt seit Mount" }]}
+              />
+              <ColumnToggle label="Zähler & Reservierung anzeigen" checked={cacheCounters} onChange={setCacheCounters} />
+            </div>}
+          >
+            <p className="detail-note">{t(cacheRange === "total" ? "Cache Hit Rates seit dem Mount. Ohne Zugriffe wird keine Rate angezeigt." : "Trefferrate und Zählerdifferenzen der letzten 5 Minuten vor diesem Messpunkt.")}</p>
+            {cacheRange === "5m" && <p className="detail-note">{runtime.cacheWindow?.seconds ? `${t("Erfasster Zeitraum")}: ${count(runtime.cacheWindow.seconds)} s` : t("Für dieses Zeitfenster sind noch keine Messdaten verfügbar.")}</p>}
+            <DataTable
+              label="Cache-Wirkung"
+              columns={poolColumns}
+              rows={pools}
+              rowKey={pool => pool.id}
+              empty="Keine Cache-Pools im Messpunkt."
+              note={budget ? "Zielbudget wird laufend angepasst. Reservierter Speicher wird erst nach der Verdrängung für andere Caches freigegeben. Die Belegung enthält Cache-Verwaltungsdaten." : undefined}
+            />
+          </PanelSection>
+          {compression && <PanelSection
+            title="Verified Read · RAM-Kompression"
+            description="Geprüfte Nutzdaten bleiben komprimiert im RAM, wenn das Speicher spart; andernfalls bleiben sie unkomprimiert. Beide Darstellungen teilen sich das gemeinsame Cache-Budget."
+          >
+            <StatGrid columns={5} items={[
+              { label: "Direkt im RAM", value: bytes(compression.decodedResidentBytes) },
+              { label: "Komprimiert im RAM", value: bytes(compression.compressedResidentBytes) },
+              { label: "Darin enthaltene Nutzdaten", value: bytes(compression.compressedLogicalBytes) },
+              { label: "RAM durch Kompression gespart", value: bytes(Math.max(0, compression.compressedLogicalBytes - compression.compressedResidentBytes)) },
+              { label: "Cache-Kompressionsfaktor", value: compression.compressedResidentBytes ? `${count(compression.compressedLogicalBytes / compression.compressedResidentBytes)}×` : "—" },
+            ]} />
+            <Disclosure
+              summary="Kompressionskosten · seit Mount"
+              note="Komprimierte Treffer benötigen keinen DATA-Zugriff. Gleichzeitig aktive Leser können eine Dekompression teilen. Die Arbeitsreserve begrenzt temporäre Codec-Puffer und zählt separat zur Cache-Belegung."
+            >
+              <StatGrid columns={4} items={[
+                { label: "Kompressionsversuche", value: count(compression.attempts) },
+                { label: "Komprimiert aufgenommen", value: count(compression.admissions) },
+                { label: "Annahmequote", value: compression.attempts ? percent(compression.admissions * 100 / compression.attempts) : "—" },
+                { label: "Treffer auf komprimierte Einträge", value: count(compression.hits) },
+                { label: "Dekompressionen", value: count(compression.decompressions) },
+                { label: "Ø Dekompression inkl. Prüfung", value: compression.decompressions ? duration(compression.decompressionNanos / compression.decompressions / 1e6) : "—" },
+                { label: "Ø Kompressionsversuch", value: compression.attempts ? duration(compression.compressionNanos / compression.attempts / 1e6) : "—" },
+                { label: "In direkte Darstellung übernommen", value: count(compression.promotions) },
+                { label: "Wieder komprimiert", value: count(compression.demotions) },
+                { label: "Kompression ausgelassen", value: count(compression.bypasses) },
+                { label: "Ungültige Cache-Einträge", value: count(compression.failures) },
+                { label: "Spitze der Codec-Arbeitsreserve", value: bytes(compression.peakWorkingBytes) },
+              ]} />
+              <Meter
+                label="Codec-Arbeitsreserve"
+                value={compression.workingBytes}
+                max={compression.maxWorkingBytes}
+                valueText={bytes(compression.workingBytes)}
+                limitText={bytes(compression.maxWorkingBytes)}
+              />
+            </Disclosure>
+          </PanelSection>}
+          <div className="cache-advanced">
+            {runtime.codecBuffers && <Disclosure
+              summary="Wiederverwendbare Codec-Puffer"
+              note="Freie Puffer nutzen das gemeinsame RAM-Budget nachrangig. Aktive Puffer können auch von Cache-Einträgen oder Lesern gehalten werden; die Werte werden nicht addiert. Zähler gelten seit dem Mount."
+            >
+              <StatGrid columns={2} items={[
+                { label: "Freie Puffer im Pool", value: bytes(runtime.codecBuffers.retainedBytes) },
+                { label: "Puffer in Verwendung", value: bytes(runtime.codecBuffers.activeBytes) },
+                { label: "Spitze in Verwendung", value: bytes(runtime.codecBuffers.peakActiveBytes) },
+                { label: "Puffer wiederverwendet", value: count(runtime.codecBuffers.hits) },
+                { label: "Neue Puffer angelegt", value: count(runtime.codecBuffers.misses) },
+                { label: "Puffer freigegeben", value: count(runtime.codecBuffers.evictions) },
+                { label: "Zielbudget", value: bytes(budget?.pools.find(pool => pool.id === "codecBuffers")?.targetBytes) },
+              ]} />
+            </Disclosure>}
+            {runtime.allocatorMemory && <Disclosure
+              summary="Prozessspeicher und Allocator"
+              note="Allocator-Werte enthalten Caches und Arbeitsspeicher. Freie Blöcke können bereits aus dem RAM entfernt sein; diese Werte werden nicht addiert. Messung im Hintergrund, normalerweise alle 30 Sekunden."
+            >
+              <StatGrid columns={2} items={[
+                { label: "Anonymes RAM", value: bytes(runtime.allocatorMemory.anonymousResidentBytes) },
+                { label: "Vom Allocator belegt", value: bytes(runtime.allocatorMemory.allocatedBytes) },
+                { label: "Freie Allocator-Blöcke", value: bytes(runtime.allocatorMemory.freeBytes) },
+                { label: "Allocator-Arenen", value: bytes(runtime.allocatorMemory.arenaBytes) },
+                { label: "RAM-Bereinigungen", value: count(runtime.allocatorMemory.trimAttempts) },
+                { label: "Letzte RAM-Bereinigung", value: duration(runtime.allocatorMemory.lastTrimMicros / 1000) },
+              ]} />
+            </Disclosure>}
+          </div>
         </> : empty)}
-        {tab === 3 && (reduction ? <>
-          <div className="detail-section-heading"><div><h3>{t("Ähnlichkeitsvergleich & Lesevermeidung")}</h3><p className="detail-note">{t("Die Similarity-Auswahl vermeidet unprofitable DATA-Leseversuche. Warme Basen kommen aus dem Verified-Read-Cache; Stichproben halten die Auswahl lernfähig.")}</p></div><span className="cache-tier">{t(reduction.enabled ? "Aktiv · seit dem Mount" : "Deaktiviert · seit dem Mount")}</span></div>
-          <div className="reduction-evidence">{rows([["Kalte Kandidaten übersprungen", number(reduction.skippedColdCandidates)], ["Basen aus RAM wiederverwendet", number(reduction.warmBaseReuses)], ["Backend-Leseversuche (Basen)", number(reduction.backendBaseReads)]])}</div>
-          <div className="detail-columns"><div><h3>{t("Auswahl & Lernverhalten")}</h3>{rows([["Queries", number(reduction.queries)], ["Kandidaten", number(reduction.candidates)], ["Stichproben-Leseversuche", number(reduction.explorationReads)], ["Basisversuche mit Mehrgewinn", number(reduction.successfulBaseTrials)]])}</div>
-          <div><h3>{t("Ergebnis der Kodierung")}</h3>{rows([["Accepted Prefix", number(reduction.acceptedPrefixes)], ["Accepted Sparse-XOR", number(reduction.acceptedSparseXor)], ["Eingesparte Payload", bytes(reduction.savedPayloadBytes)], ["Independent Fallbacks", number(reduction.fallbacks)], ["Fehler", number(reduction.errors)]])}</div></div>
+
+        {tab === REDUCTION && (reduction ? <>
+          <PanelSection
+            title="Ähnlichkeitsvergleich & Lesevermeidung"
+            description="Die Similarity-Auswahl vermeidet unprofitable DATA-Leseversuche. Warme Basen kommen aus dem Verified-Read-Cache; Stichproben halten die Auswahl lernfähig."
+            aside={<span className="cache-tier">{t(reduction.enabled ? "Aktiv · seit dem Mount" : "Deaktiviert · seit dem Mount")}</span>}
+          >
+            <Meter
+              label="Basen aus RAM statt aus DATA"
+              value={reduction.warmBaseReuses}
+              max={warmBaseRate == null ? null : (reduction.warmBaseReuses ?? 0) + (reduction.backendBaseReads ?? 0)}
+              valueText={percent(warmBaseRate)}
+              hint="Anteil der Vergleichsbasen, die ohne Backend-Leseversuch bereitstanden"
+            />
+            <StatGrid columns={3} items={[
+              { label: "Kalte Kandidaten übersprungen", value: count(reduction.skippedColdCandidates) },
+              { label: "Basen aus RAM wiederverwendet", value: count(reduction.warmBaseReuses) },
+              { label: "Backend-Leseversuche (Basen)", value: count(reduction.backendBaseReads) },
+            ]} />
+          </PanelSection>
+          <div className="detail-columns">
+            <PanelSection title="Auswahl & Lernverhalten">
+              <StatGrid columns={2} items={[
+                { label: "Queries", value: count(reduction.queries) },
+                { label: "Kandidaten", value: count(reduction.candidates) },
+                { label: "Stichproben-Leseversuche", value: count(reduction.explorationReads) },
+                { label: "Basisversuche mit Mehrgewinn", value: count(reduction.successfulBaseTrials) },
+              ]} />
+            </PanelSection>
+            <PanelSection title="Ergebnis der Kodierung">
+              <StatGrid columns={2} items={[
+                { label: "Accepted Prefix", value: count(reduction.acceptedPrefixes) },
+                { label: "Accepted Sparse-XOR", value: count(reduction.acceptedSparseXor) },
+                { label: "Eingesparte Payload", value: bytes(reduction.savedPayloadBytes) },
+                { label: "Independent Fallbacks", value: count(reduction.fallbacks) },
+                { label: "Fehler", value: count(reduction.errors) },
+              ]} />
+            </PanelSection>
+          </div>
           <p className="detail-note">{t("Die Zähler beschreiben Versuche seit dem Mount, keine Bytes oder physische I/Os. Stichproben sind Teil der Backend-Leseversuche; eingesparte Payload beschreibt nur Advanced Reduction.")}</p>
+          {membership && <PanelSection
+            title="Exact-Index · vermiedene Lookups"
+            description="Membership-Filter beantworten „liegt nicht vor“ ohne eine Index-Seite zu lesen. Nur der Rest wird im Index nachgeschlagen."
+            aside={runtime?.exactWarm && <span className="cache-tier">{t(warmStates[runtime.exactWarm.state] ?? runtime.exactWarm.state)}</span>}
+          >
+            <Meter
+              label="Ohne Index-Lookup beantwortet"
+              value={membership.definitelyAbsent}
+              max={membership.probes}
+              valueText={percent(membershipRate)}
+              hint="Anteil der Prüfungen, die der Filter allein entscheiden konnte"
+            />
+            <StatGrid columns={3} items={[
+              { label: "Prüfungen", value: count(membership.probes) },
+              { label: "Sicher nicht vorhanden", value: count(membership.definitelyAbsent) },
+              { label: "Index-Lookup nötig", value: count(membership.requiresExactLookup) },
+            ]} />
+            <Disclosure
+              summary="Filterabdeckung der Index-Runs"
+              note="Fehlende Filter oder Seitengrenzen erzwingen den vollständigen Index-Lookup, bis sie aufgebaut sind."
+            >
+              <StatGrid columns={4} items={[
+                { label: "Geleaste Runs", value: count(membership.leasedRuns) },
+                { label: "Filter vorhanden", value: count(membership.filters) },
+                { label: "Filter aufgebaut", value: count(membership.constructedFilters) },
+                { label: "Filter fehlen", value: count(membership.missingFilters) },
+                { label: "Runs mit Seitengrenzen", value: count(membership.pageBoundsRuns) },
+                { label: "Seitengrenzen fehlen", value: count(membership.missingPageBounds) },
+                { label: "Seitengrenzen im RAM", value: bytes(membership.pageBoundsBytes) },
+              ]} />
+            </Disclosure>
+          </PanelSection>}
         </> : empty)}
-        {tab === 4 && (runtime ? <div className="detail-columns"><div><h3>{t("Letzter GC-Lauf")}</h3>{gc ? <><p className="detail-note">{timestamp(gc.observedAt)} · {t(({running:"Läuft",failed:"Fehlgeschlagen",noCandidates:"Keine Kandidaten",noProfitableCandidates:"Keine profitablen Kandidaten",catalogRebuilt:"Katalog erneuert",collected:"Abgeschlossen"} as Record<string,string>)[gc.state] ?? gc.state)}</p>{rows([["Dauer", gc.totalMs == null ? "—" : `${number(gc.totalMs)} ms`], ["Kandidaten", number(gc.candidates)], ["Geprüfte Victims", number(gc.victims)], ["Abgebrochene Kandidaten", number(gc.abortedCandidates)], ["Relocation Read", bytes(gc.readBytes)], ["Relocation Write", bytes(gc.writeBytes)], ["Unlinked", bytes(gc.unlinkedBytes)]])}</> : <p>{t("Seit dem Mount wurde noch kein GC-Lauf gestartet.")}</p>}</div>
-          <div><h3>{t("Hintergrundprüfung")}</h3>{scrub ? <>{rows([["Container geprüft", `${number(scrub.verifiedContainers)} / ${number(scrub.totalContainers)}`], ["aus vorheriger Prüfung übernommen", number(scrub.resumedContainers)], ["neu geprüft", number(scrub.newlyVerifiedContainers)], ["noch ausstehend", number(scrub.remainingContainers)], ["Geprüfte Container-Bytes", bytes(scrub.verifiedBytes)], ["Gelesene Bytes", bytes(scrub.readBytes)]])}</> : <p className="detail-note">{t("Keine Messdaten zur Hintergrundprüfung verfügbar.")}</p>}</div></div> : empty)}
-        {tab === 6 && (metadataReads ? <>
-          <h3>{t("Metadata-Lesewege")}</h3>
-          <p className="detail-note">{t("Direkte Backend-Reads nach Ursache. Der Unified Read Cache bedient wiederverwendbare Inhalte vor dem Backend. Angeforderte Bereiche enthalten keinen Ausrichtungs- oder Format-Overhead; physische MB/s und IOPS stehen bei den Laufwerken.")}</p>
-          <p>{metadataReads.intervalSeconds > 0 ? `${t("Messintervall")}: ${number(metadataReads.intervalSeconds)} s` : t("Erster Messpunkt · Raten noch nicht verfügbar")}</p>
-          <label><input type="checkbox" checked={metadataTotals} onChange={event => setMetadataTotals(event.target.checked)} />{t("Summen und Lesezeiten seit Mount anzeigen")}</label>
-          {metadataReads.rows.length === 0 ? <p>{t("Noch keine Metadata-Reads erfasst.")}</p> : <div className="telemetry-table-scroll"><table><thead><tr>{["Ursache", "Daten", "Zugriffsweg", "Angefordert · MB/s", "Aufrufe/s", "Laufende Reads", ...(metadataTotals ? ["Aufrufe", "Angefordert", "Erfolgreich geliefert", "Fehler", "Ø Lesezeit", "Max. Lesezeit"] : [])].map(label => <th key={label}>{t(label)}</th>)}</tr></thead><tbody>
-            {[...metadataReads.rows].sort((a,b) => b.requestedMbps - a.requestedMbps || b.requestedBytes - a.requestedBytes).map(row => <tr key={`${row.reason}/${row.object}/${row.mode}`}>
-              <th scope="row">{t(metadataReasons[row.reason] ?? row.reason)}</th><td>{t(metadataObjects[row.object] ?? row.object)}</td><td>{t(metadataModes[row.mode] ?? row.mode)}</td>
-              <td>{metadataReads.intervalSeconds > 0 ? number(row.requestedMbps) : "—"}</td><td>{metadataReads.intervalSeconds > 0 ? number(row.operationsPerSecond) : "—"}</td><td>{row.mode === "mmap" ? "—" : number(row.inFlight)}</td>
-              {metadataTotals && <><td>{number(row.operations)}</td><td>{bytes(row.requestedBytes)}</td><td>{bytes(row.returnedBytes)}</td><td>{number(row.errors)}</td><td>{row.mode === "mmap" || !row.operations ? "—" : `${number(row.elapsedMicros / row.operations / 1000)} ms`}</td><td>{row.mode === "mmap" || !row.operations ? "—" : `${number(row.maxMicros / 1000)} ms`}</td></>}
-            </tr>)}
-          </tbody></table></div>}
-          <small>{t("Lesezeiten erfassen den direkten Backend-Aufruf einschließlich Pufferaufbau. Das Öffnen der Datei ist nicht enthalten. Separate Metadatenzugriffe des Host-Dateisystems werden hier nicht gezählt.")}</small>
+
+        {tab === MAINTENANCE && (runtime ? <>
+          <PanelSection title="Letzter GC-Lauf">
+            {gc ? <>
+              <p className="detail-note">{timestamp(gc.observedAt)} · {t(gcStates[gc.state] ?? gc.state)}</p>
+              <StatGrid columns={4} items={[
+                { label: "Dauer", value: duration(gc.totalMs) },
+                { label: "Kandidaten", value: count(gc.candidates) },
+                { label: "Geprüfte Victims", value: count(gc.victims) },
+                { label: "Abgebrochene Kandidaten", value: count(gc.abortedCandidates) },
+                { label: "Relocation Read", value: bytes(gc.readBytes) },
+                { label: "Relocation Write", value: bytes(gc.writeBytes) },
+                { label: "Unlinked", value: bytes(gc.unlinkedBytes) },
+              ]} />
+            </> : <p className="detail-note">{t("Seit dem Mount wurde noch kein GC-Lauf gestartet.")}</p>}
+          </PanelSection>
+        {gcPhases.length > 0 && <PanelSection
+          title="Dauer des letzten GC-Laufs nach Phase"
+          description="Die Phasen laufen nacheinander; zusammen ergeben sie die Gesamtdauer des Laufs."
+        >
+          <PhaseBars phases={gcPhases} />
+        </PanelSection>}
+        {metadataGc && <PanelSection
+          title="Metadata-GC im selben Lauf"
+          description="Namespace- und Manifestobjekte werden im selben Zyklus bereinigt. Nur ein exakt aufgebauter Katalog darf löschen."
+          aside={<span className="cache-tier">{t(markModes[metadataGc.markMode] ?? metadataGc.markMode)}</span>}
+        >
+          {metadataGc.exactReason && <p className="detail-note">{t("Exakter Katalog nötig")}: {t(exactReasons[metadataGc.exactReason] ?? metadataGc.exactReason)}</p>}
+          <StatGrid columns={4} items={[
+            { label: "Dauer", value: duration(metadataGc.wallMs) },
+            { label: "Auf Barriere gewartet", value: duration(metadataGc.barrierWaitMs) },
+            { label: "Objektgraph gelesen", value: bytes(metadataGc.objectGraphReadBytes) },
+            { label: "Unlinked", value: bytes(metadataGc.unlinkedBytes) },
+          ]} />
+          <Disclosure summary="Katalogarbeit der Metadata-GC">
+            <StatGrid columns={3} items={[
+              { label: "Kandidaten gelesen", value: bytes(metadataGc.candidateReadBytes) },
+              { label: "Katalog gelesen", value: bytes(metadataGc.catalogReadBytes) },
+              { label: "Katalog geschrieben", value: bytes(metadataGc.catalogWriteBytes) },
+              { label: "Root-Syncs", value: count(metadataGc.rootSyncs) },
+              { label: "Katalog-Kettenläufe", value: count(metadataGc.catalogChainRuns) },
+            ]} />
+          </Disclosure>
+        </PanelSection>}
+        {gc && gcForensics.some(item => item.value !== "—") && <Disclosure
+          summary="Katalog, Abhängigkeiten und Exact-Rückzug"
+          note="Zähler des letzten Laufs. Sie beschreiben geprüfte Arbeit, keine physischen I/Os."
+        >
+          <StatGrid columns={4} items={gcForensics} />
+        </Disclosure>}
+          <PanelSection title="Hintergrundprüfung">
+            {scrub ? <>
+              <Meter
+                label="Geprüfte Container"
+                value={scrub.verifiedContainers}
+                max={scrub.totalContainers}
+                valueText={count(scrub.verifiedContainers)}
+                limitText={count(scrub.totalContainers)}
+                hint={scrub.currentContainer ? "Aktuell geprüfter Container" : undefined}
+              />
+              {scrub.currentContainer && <p className="detail-note detail-code">{scrub.currentContainer}</p>}
+              <StatGrid columns={5} items={[
+                { label: "aus vorheriger Prüfung übernommen", value: count(scrub.resumedContainers) },
+                { label: "neu geprüft", value: count(scrub.newlyVerifiedContainers) },
+                { label: "noch ausstehend", value: count(scrub.remainingContainers) },
+                { label: "Geprüfte Container-Bytes", value: bytes(scrub.verifiedBytes) },
+                { label: "Gelesene Bytes", value: bytes(scrub.readBytes) },
+              ]} />
+              {scrub.error && <p className="detail-note" role="note">{scrub.error}</p>}
+            </> : <p className="detail-note">{t("Keine Messdaten zur Hintergrundprüfung verfügbar.")}</p>}
+          </PanelSection>
         </> : empty)}
-        {tab === 5 && <>
+
+        {tab === CHECKPOINT && <>
           {runtime?.pipeline && <PipelineTelemetryPanel pipeline={runtime.pipeline} />}
-          {checkpoint ? <>
-          <p className="detail-note">{t("Letzter abgeschlossener Checkpoint")}: {timestamp(checkpoint.completedAt)} · Generation {number(checkpoint.generation)} · {number(checkpoint.totalMs)} ms</p>
-          <ReactECharts style={{height:Math.max(280, chartPhases.length * 28)}} option={{animation:false,textStyle:{fontFamily:'Inter, "Segoe UI", sans-serif'},grid:{left:230,right:30,top:15,bottom:35},tooltip:{trigger:'axis',valueFormatter:(value:number)=>`${number(value)} ms`},xAxis:{type:'value',name:'ms',axisLabel:{color:'#afbecb'},splitLine:{lineStyle:{color:'#253945'}}},yAxis:{type:'category',inverse:true,data:chartPhases.map(phase=>t(phaseLabels[phase.id]??phase.id)),axisLabel:{color:'#afbecb'}},series:[{type:'bar',data:chartPhases.map(phase=>phase.wallMs),itemStyle:{color:'#63c4d5'},barMaxWidth:16}]}} />
-          <div className="telemetry-table-scroll"><table><thead><tr><th>{t("Phase")}</th><th>Wall time</th><th>Process CPU</th></tr></thead><tbody>{checkpoint.phases.map(phase=><tr key={phase.id}><th>{t(phaseLabels[phase.id]??phase.id)}</th><td>{number(phase.wallMs)} ms</td><td>{number(phase.cpuMs)} ms</td></tr>)}</tbody></table></div>
-          <p className="detail-note">{t(checkpoint.unattributedMs != null ? "Das Diagramm zeigt getrennte Hauptphasen. CDC, Hash, Exact Lookup, Encoding und Container Publish sind Teil der Manifestplanung. Sonstige Verwaltung ist die verbleibende Gesamtdauer. Process CPU umfasst alle Prozess-Threads während einer Phase." : "Process CPU umfasst alle während der Phase aktiven Threads. Die Phasen bilden nicht die gesamte Checkpoint-Dauer ab.")}</p>
-        </> : runtime ? <p className="detail-empty">{t("Seit dem Mount wurde noch kein Checkpoint abgeschlossen.")}</p> : empty}</>}
+          {checkpoint ? <PanelSection
+            title="Letzter abgeschlossener Checkpoint"
+            description={checkpoint.unattributedMs != null
+              ? "Das Diagramm zeigt getrennte Hauptphasen. CDC, Hash, Exact Lookup, Encoding und Container Publish sind Teil der Manifestplanung. Sonstige Verwaltung ist die verbleibende Gesamtdauer. Process CPU umfasst alle Prozess-Threads während einer Phase."
+              : "Process CPU umfasst alle während der Phase aktiven Threads. Die Phasen bilden nicht die gesamte Checkpoint-Dauer ab."}
+          >
+            <StatGrid columns={3} items={[
+              { label: "Abgeschlossen", value: timestamp(checkpoint.completedAt) },
+              { label: "Generation", value: count(checkpoint.generation) },
+              { label: "Gesamtdauer", value: duration(checkpoint.totalMs) },
+            ]} />
+            <PhaseBars phases={chartPhases.map(phase => ({id: phase.id, label: phaseLabels[phase.id] ?? phase.id, ms: phase.wallMs}))} />
+            <DataTable label="Checkpoint-Phasen" columns={checkpointColumns} rows={checkpoint.phases} rowKey={phase => phase.id} />
+          </PanelSection> : runtime ? <p className="detail-empty">{t("Seit dem Mount wurde noch kein Checkpoint abgeschlossen.")}</p> : empty}
+        </>}
+
       </>}
     </div>
   </section>;

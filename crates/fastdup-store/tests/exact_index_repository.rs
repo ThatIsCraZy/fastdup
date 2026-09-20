@@ -46,6 +46,10 @@ fn entry_with_crc(ordinal: u8, record_crc32c: u32) -> ExactIndexEntry {
 struct PositionalStorage {
     inner: FsStorageIo,
     range_reads: Arc<AtomicUsize>,
+    cancel_on_run_set_read: Option<MaintenanceCancellation>,
+    run_set_reads: Arc<AtomicUsize>,
+    cancel_on_remove: Option<MaintenanceCancellation>,
+    root_syncs: Arc<AtomicUsize>,
 }
 
 impl PositionalStorage {
@@ -53,6 +57,10 @@ impl PositionalStorage {
         Self {
             inner: FsStorageIo::open(root).expect("open positional Exact storage"),
             range_reads: Arc::new(AtomicUsize::new(0)),
+            cancel_on_run_set_read: None,
+            run_set_reads: Arc::new(AtomicUsize::new(0)),
+            cancel_on_remove: None,
+            root_syncs: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -71,6 +79,12 @@ impl StorageIo for PositionalStorage {
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        if name.ends_with(".fdxset") {
+            self.run_set_reads.fetch_add(1, Ordering::Relaxed);
+            if let Some(cancellation) = &self.cancel_on_run_set_read {
+                cancellation.cancel_contention();
+            }
+        }
         self.inner.read(name)
     }
 
@@ -100,10 +114,15 @@ impl StorageIo for PositionalStorage {
     }
 
     fn remove_file(&self, name: &str) -> io::Result<()> {
-        self.inner.remove_file(name)
+        self.inner.remove_file(name)?;
+        if let Some(cancellation) = &self.cancel_on_remove {
+            cancellation.cancel_contention();
+        }
+        Ok(())
     }
 
     fn sync_root(&self) -> io::Result<()> {
+        self.root_syncs.fetch_add(1, Ordering::Relaxed);
         self.inner.sync_root()
     }
 }
@@ -787,6 +806,80 @@ fn generation_drain_stop_is_distinct_from_integrity_failure() {
     let result = waiter.join().expect("drain worker does not panic");
     assert!(result.is_err());
     drop(old_pin);
+}
+
+#[test]
+fn retirement_yields_between_run_set_reads_and_releases_the_publisher_lock() {
+    let root = test_root("retirement-per-object-cancel");
+    let mut storage = PositionalStorage::open(&root);
+    let profile = ExactIndexProfileId::new([0xEC; 32]).unwrap();
+    let repository = ExactIndexRunRepository::new(storage.clone());
+    for ordinal in 1..=8 {
+        repository
+            .append_level_zero(profile, vec![entry(ordinal)])
+            .unwrap();
+    }
+    let cancellation = MaintenanceCancellation::new();
+    storage.cancel_on_run_set_read = Some(cancellation.clone());
+    storage.run_set_reads.store(0, Ordering::Relaxed);
+    let collector = ExactIndexRunRepository::new(storage.clone());
+    let result = collector.retire_unreferenced_cancellable(Some(&cancellation));
+    assert!(
+        result.is_err_and(|error| error.is_cancelled()),
+        "cancellation during reference resolution must stop at the next object"
+    );
+    assert_eq!(storage.run_set_reads.load(Ordering::Relaxed), 1);
+    // The same repository must be able to advance, and cold recovery must still
+    // select a complete generation after the aborted reference scan.
+    collector
+        .append_level_zero(profile, vec![entry(9)])
+        .unwrap();
+    let cold = ExactIndexRunRepository::new(storage.inner.clone());
+    let active = cold.recover_active_generation().unwrap().unwrap();
+    let expected = entry(9);
+    assert_eq!(
+        active
+            .lookup_transitions(expected.chunk_id(), expected.logical_length())
+            .unwrap()
+            .candidates(),
+        &[expected]
+    );
+}
+
+#[test]
+fn cancelled_partial_exact_sweep_syncs_unlinks_and_can_resume() {
+    let root = test_root("retirement-partial-cancel");
+    let mut storage = PositionalStorage::open(&root);
+    let profile = ExactIndexProfileId::new([0xED; 32]).unwrap();
+    let repository = ExactIndexRunRepository::new(storage.clone());
+    repository
+        .append_level_zero(profile, vec![entry(1)])
+        .unwrap();
+    // Unselected names model immutable Run Sets left by interrupted activation.
+    let original = storage
+        .list_names()
+        .unwrap()
+        .into_iter()
+        .find(|name| name.ends_with(".fdxset"))
+        .unwrap();
+    let bytes = storage.read(&original).unwrap();
+    for n in 1..=4 {
+        let name = format!("{n:064x}.fdxset");
+        storage.create_new(&name).unwrap();
+        storage.write_at(&name, 0, &bytes).unwrap();
+        storage.sync_file(&name).unwrap();
+    }
+    storage.sync_root().unwrap();
+    let cancellation = MaintenanceCancellation::new();
+    storage.cancel_on_remove = Some(cancellation.clone());
+    let collector = ExactIndexRunRepository::new(storage.clone());
+    let before = storage.root_syncs.load(Ordering::Relaxed);
+    let result = collector.retire_unreferenced_cancellable(Some(&cancellation));
+    assert!(result.is_err_and(|error| error.is_cancelled()));
+    assert_eq!(storage.root_syncs.load(Ordering::Relaxed) - before, 1);
+    let cold = ExactIndexRunRepository::new(storage.inner.clone());
+    assert!(cold.recover_active_generation().unwrap().is_some());
+    assert_eq!(cold.retire_unreferenced().unwrap().run_sets_removed(), 3);
 }
 
 #[test]

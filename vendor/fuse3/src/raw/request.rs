@@ -11,6 +11,12 @@ pub struct Request {
     pub gid: u32,
     /// the pid of this request.
     pub pid: u32,
+    /// Receive-order ticket assigned by the filesystem for one inode's writes.
+    ///
+    /// Zero means that the filesystem does not require userspace write
+    /// ordering. The raw session obtains nonzero tickets synchronously before
+    /// it spawns request tasks, so task scheduling cannot reorder them.
+    pub write_sequence: u64,
 }
 
 impl From<&fuse_in_header> for Request {
@@ -20,6 +26,7 @@ impl From<&fuse_in_header> for Request {
             uid: header.uid,
             gid: header.gid,
             pid: header.pid,
+            write_sequence: 0,
         }
     }
 }

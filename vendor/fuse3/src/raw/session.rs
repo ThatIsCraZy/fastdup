@@ -802,6 +802,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                         uid: 0,
                         gid: 0,
                         pid: 0,
+                        write_sequence: 0,
                     })
                     .await;
 
@@ -2244,7 +2245,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
     #[instrument(skip(self, data, fs))]
     async fn handle_write(
         &mut self,
-        request: Request,
+        mut request: Request,
         in_header: fuse_in_header,
         data: Vec<u8>,
         data_size: usize,
@@ -2286,6 +2287,9 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
             return;
         }
+
+        request.write_sequence =
+            fs.register_write_request(in_header.nodeid, write_in.offset, write_in.size);
 
         let payload_start = payload.as_ptr() as usize - request_data.as_ptr() as usize;
         let payload_end = payload_start + payload.len();

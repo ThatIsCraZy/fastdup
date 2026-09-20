@@ -48,6 +48,43 @@ pub struct RuntimeDetails {
     pub reduction: ReductionTelemetry,
     pub checkpoint: Option<CheckpointTelemetry>,
     pub gc: Option<GcTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_cache: Option<ExactCacheTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_membership: Option<ExactMembershipTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_warm: Option<ExactWarmTelemetry>,
+}
+
+/// Index pages held against eviction so a lookup stays a RAM access.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactCacheTelemetry {
+    pub protected_limit_bytes: u64,
+    pub protected_resident_bytes: u64,
+}
+
+/// Membership filters answer "definitely absent" without reading an index page.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactMembershipTelemetry {
+    pub leased_runs: u64,
+    pub filters: u64,
+    pub constructed_filters: u64,
+    pub missing_filters: u64,
+    pub page_bounds_runs: u64,
+    pub missing_page_bounds: u64,
+    pub page_bounds_bytes: u64,
+    pub probes: u64,
+    pub definitely_absent: u64,
+    pub requires_exact_lookup: u64,
+}
+
+/// Outcome of the most recent index warm-up cycle.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactWarmTelemetry {
+    pub state: String,
 }
 
 /// Reusable work buffers; active owners can also belong to content caches.
@@ -219,6 +256,68 @@ pub struct GcTelemetry {
     pub candidates: Option<u64>,
     pub victims: Option<u64>,
     pub aborted_candidates: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phases_ms: Option<GcPhaseDurations>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_gc: Option<MetadataGcTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_examined_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_write_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_proof_read_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse_dependency_edges: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse_dependency_required_chunks: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_queue_retained: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_queue_scanned_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_pending_updates: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_retirement_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_runs_retired: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_run_sets_retired: Option<u64>,
+}
+
+/// Wall time per collection phase of the last cycle; phases do not overlap.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcPhaseDurations {
+    pub recovery: f64,
+    pub metadata_gc: f64,
+    pub candidate_catalog: f64,
+    pub candidate_proof: f64,
+    pub relocation: f64,
+    pub retiring_activation: f64,
+    pub pin_drain: f64,
+    pub victim_verify: f64,
+    pub unlink: f64,
+    pub data_sync: f64,
+    pub removed_activation: f64,
+    pub post_collection_catalog: f64,
+}
+
+/// Namespace and manifest collection that runs inside the same GC cycle.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataGcTelemetry {
+    pub mark_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_reason: Option<String>,
+    pub wall_ms: f64,
+    pub barrier_wait_ms: f64,
+    pub object_graph_read_bytes: u64,
+    pub candidate_read_bytes: u64,
+    pub catalog_read_bytes: u64,
+    pub catalog_write_bytes: u64,
+    pub unlinked_bytes: u64,
+    pub root_syncs: u64,
+    pub catalog_chain_runs: u64,
 }
 
 pub(crate) fn parse_details(frontend: &serde_json::Value) -> DetailTelemetry {
@@ -332,6 +431,79 @@ mod tests {
         );
         let restored: DetailTelemetry = serde_json::from_value(saved).unwrap();
         assert_eq!(restored.runtime.unwrap().codec_buffers.unwrap().hits, 1999);
+    }
+
+    #[test]
+    fn collection_phases_and_membership_evidence_survive_the_history_roundtrip() {
+        let mut frontend = serde_json::json!({"details": {
+            "runtimeId":"test", "ioUring":{"ringEntries":64,"inflightBytes":0,"maxInflightBytes":1,"peakInflightBytes":0,"submitted":0,"completed":0},
+            "caches":[], "reduction":{"enabled":true,"queries":0,"candidates":0,"acceptedPrefixes":0,"acceptedSparseXor":0,"savedPayloadBytes":0,"fallbacks":0,"errors":0},
+            "gc":{"state":"collected","observedAt":100,"totalMs":12.0}
+        }});
+        let legacy = parse_details(&frontend).runtime.unwrap();
+        assert!(
+            legacy.exact_membership.is_none(),
+            "old runtimes stay readable"
+        );
+        assert!(legacy.gc.unwrap().phases_ms.is_none());
+
+        frontend["details"]["gc"]["phasesMs"] = serde_json::json!({
+            "recovery":1.0,"metadataGc":2.0,"candidateCatalog":3.0,"candidateProof":4.0,
+            "relocation":5.0,"retiringActivation":6.0,"pinDrain":7.0,"victimVerify":8.0,
+            "unlink":9.0,"dataSync":10.0,"removedActivation":11.0,"postCollectionCatalog":12.0});
+        frontend["details"]["gc"]["metadataGc"] = serde_json::json!({
+            "markMode":"incremental","exactReason":"runRetirement","wallMs":13.0,"barrierWaitMs":14.0,
+            "objectGraphReadBytes":15,"candidateReadBytes":16,"catalogReadBytes":17,
+            "catalogWriteBytes":18,"unlinkedBytes":19,"rootSyncs":20,"catalogChainRuns":21});
+        for (key, value) in [
+            ("catalogExaminedBytes", 22),
+            ("catalogWriteBytes", 23),
+            ("candidateProofReadBytes", 24),
+            ("reverseDependencyEdges", 25),
+            ("reverseDependencyRequiredChunks", 26),
+            ("candidateQueueRetained", 27),
+            ("candidateQueueScannedRows", 28),
+            ("catalogPendingUpdates", 29),
+            ("exactRunsRetired", 30),
+            ("exactRunSetsRetired", 31),
+        ] {
+            frontend["details"]["gc"][key] = serde_json::json!(value);
+        }
+        frontend["details"]["gc"]["exactRetirementMs"] = serde_json::json!(32.0);
+        frontend["details"]["exactCache"] =
+            serde_json::json!({"protectedLimitBytes":100,"protectedResidentBytes":40});
+        frontend["details"]["exactMembership"] = serde_json::json!({
+            "leasedRuns":8,"filters":7,"constructedFilters":2,"missingFilters":1,
+            "pageBoundsRuns":7,"missingPageBounds":1,"pageBoundsBytes":4096,
+            "probes":1000,"definitelyAbsent":940,"requiresExactLookup":60});
+        frontend["details"]["exactWarm"] = serde_json::json!({"state":"warmed"});
+
+        let saved = serde_json::to_value(parse_details(&frontend)).unwrap();
+        for key in ["exactCache", "exactMembership", "exactWarm"] {
+            assert_eq!(saved["runtime"][key], frontend["details"][key], "{key}");
+        }
+        // The older GcTelemetry options still serialize as explicit nulls, so
+        // compare the added blocks rather than the whole record.
+        for key in [
+            "phasesMs",
+            "metadataGc",
+            "exactRetirementMs",
+            "catalogExaminedBytes",
+        ] {
+            assert_eq!(
+                saved["runtime"]["gc"][key], frontend["details"]["gc"][key],
+                "gc.{key}"
+            );
+        }
+        let restored: DetailTelemetry = serde_json::from_value(saved).unwrap();
+        let runtime = restored.runtime.unwrap();
+        let gc = runtime.gc.unwrap();
+        assert!((gc.phases_ms.unwrap().post_collection_catalog - 12.0).abs() < 1e-9);
+        assert_eq!(gc.metadata_gc.unwrap().mark_mode, "incremental");
+        assert_eq!(gc.exact_run_sets_retired, Some(31));
+        assert_eq!(runtime.exact_membership.unwrap().definitely_absent, 940);
+        assert_eq!(runtime.exact_cache.unwrap().protected_resident_bytes, 40);
+        assert_eq!(runtime.exact_warm.unwrap().state, "warmed");
     }
 
     #[test]

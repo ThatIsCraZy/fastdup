@@ -493,11 +493,11 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        self.storage.set_len(&temporary_name, 0)?;
+        self.storage.set_len_unpublished(&temporary_name, 0)?;
         let encoded_record = record.encode();
         let commit_offset = u64::try_from(RECOVERY_CHECKPOINT_HEADER_BYTES)
             .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
-        let mut output = ImmutableWriteBuffer::new()?;
+        let mut output = ImmutableWriteBuffer::new_unpublished()?;
         output.append(
             &self.storage,
             &temporary_name,
@@ -572,8 +572,12 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         // The body hash is now known. Patch only the fixed header; all entry
         // fields were batched across boundaries without partial-page appends.
         self.storage
-            .write_at(&temporary_name, 0, &descriptor.encode_header())?;
-        self.storage.set_len(&temporary_name, file_length)?;
+            .write_unpublished_at(&temporary_name, 0, &descriptor.encode_header())?;
+        self.storage
+            .set_len_unpublished(&temporary_name, file_length)?;
+        // This name has no selector or published reader until the final file
+        // sync and rename below. Syncing each one-MiB length extension would
+        // serialize background copying with foreground DATA publication.
         // The pinned source graph was validated by the sole caller before
         // copying. Every copied object is hash-bound to that graph above;
         // lengths, entry CRCs and the body hash come from the emitted bytes.
@@ -1433,13 +1437,20 @@ mod tests {
         let checkpoints = RecoveryCheckpointRepository::new(data);
         let before = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get);
         let edges_before = crate::direct_io::WRITE_EDGE_READS.with(std::cell::Cell::get);
+        let syncs_before = crate::direct_io::LENGTH_HEAD_SYNC_CALLS.with(std::cell::Cell::get);
         let summary = checkpoints.publish_committed(&source).unwrap().unwrap();
         let writes = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get) - before;
         let edge_reads =
             crate::direct_io::WRITE_EDGE_READS.with(std::cell::Cell::get) - edges_before;
+        let length_syncs =
+            crate::direct_io::LENGTH_HEAD_SYNC_CALLS.with(std::cell::Cell::get) - syncs_before;
         eprintln!(
-            "checkpoint bytes={}, writes={writes}, write-edge reads={edge_reads}",
+            "checkpoint bytes={}, writes={writes}, write-edge reads={edge_reads}, length syncs={length_syncs}",
             summary.file_length()
+        );
+        assert!(
+            length_syncs <= 1,
+            "only selector heads need incremental durability; temporary checkpoint batches must not sync their length heads: {length_syncs}"
         );
         assert_eq!(
             edge_reads, 0,

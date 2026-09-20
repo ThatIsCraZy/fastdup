@@ -6,8 +6,8 @@ mod snapshot;
 
 pub use sampler::{SystemSampler, dedup_rate};
 pub use snapshot::{
-    DiskTelemetry, RuntimeIssue, SeriesPoint, SmallFileQuotaStatus, StorageUsageTelemetry,
-    TelemetrySnapshot,
+    DiskTelemetry, IngestReductionTelemetry, RuntimeIssue, SeriesPoint, SmallFileQuotaStatus,
+    StorageUsageTelemetry, TelemetrySnapshot,
 };
 
 pub(crate) use sampler::filesystem_usage;

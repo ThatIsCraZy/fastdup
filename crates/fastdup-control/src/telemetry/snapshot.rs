@@ -74,6 +74,8 @@ pub struct TelemetrySnapshot {
     pub storage_usage: Option<Box<StorageUsageTelemetry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Box<DetailTelemetry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_reduction: Option<IngestReductionTelemetry>,
     pub sequence: u64,
     pub observed_at: String,
     pub repository_state: RepositoryState,
@@ -117,6 +119,24 @@ impl StorageUsageTelemetry {
     }
 }
 
+/// Chunk bytes offered to the containers against the container bytes written
+/// since the mount. This is ingest work, never the occupancy on the pools.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestReductionTelemetry {
+    pub logical_chunk_bytes: u64,
+    pub physical_container_bytes: u64,
+}
+
+impl IngestReductionTelemetry {
+    /// Reduction achieved while writing, or none without a written container.
+    #[must_use]
+    pub fn ratio(&self) -> Option<f64> {
+        (self.physical_container_bytes != 0)
+            .then(|| self.logical_chunk_bytes as f64 / self.physical_container_bytes as f64)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SmallFileQuotaStatus {
@@ -131,6 +151,7 @@ impl Default for TelemetrySnapshot {
             small_file_quota: None,
             storage_usage: None,
             details: None,
+            ingest_reduction: None,
             sequence: 0,
             observed_at: unix_seconds().to_string(),
             repository_state: RepositoryState::Uninitialized,
