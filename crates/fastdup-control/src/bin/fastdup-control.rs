@@ -906,6 +906,8 @@ mod settings_api_tests {
                 repository: None,
                 settings: fastdup_control::RepositorySettings::default(),
                 shares: vec![],
+                veeam: None,
+                veeam_active: false,
                 jobs: vec![],
                 certificate_fingerprint: String::new(),
             }),

@@ -46,7 +46,7 @@ its unique target. Local logs/harness/package outputs: `.artifacts/clone-offsets
 
 ## Test appliance activation
 
-Installed `fastdup-0.7.1-3.el10.x86_64` on `10.1.1.161`. RPM SHA-256:
+Installed `fastdup-0.7.1-3.el10.x86_64` on the isolated test appliance. RPM SHA-256:
 
 ```
 1c454f36fb64ec33385cfa502d9c887412c392c063d69e921d4ac09449564896

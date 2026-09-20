@@ -3322,7 +3322,10 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
                 }
                 if self.readers[run_index]
                     .page_cache
-                    .peek(readers[run_index].descriptor().run_hash(), page_ordinal + span)
+                    .peek(
+                        readers[run_index].descriptor().run_hash(),
+                        page_ordinal + span,
+                    )
                     .is_some()
                 {
                     break;
@@ -4834,11 +4837,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
 
     /// Warms `count` consecutive pages in one range read, returning how many
     /// the bounded page cache actually retained.
-    fn warm_page_span(
-        &self,
-        first: usize,
-        count: usize,
-    ) -> Result<usize, ExactIndexStoreError> {
+    fn warm_page_span(&self, first: usize, count: usize) -> Result<usize, ExactIndexStoreError> {
         if count == 1 {
             return Ok(usize::from(self.warm_page(first)?));
         }

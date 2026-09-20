@@ -2,7 +2,7 @@
 
 ## Observation
 
-Read-only inspection of `10.1.1.161` on 12 September 2026 found
+Read-only inspection of the isolated test appliance on 12 September 2026 found
 `fastdup-0.7.4-7.el10.x86_64`, repository PID 138767, with Metadata on
 `/dev/sdb1` and DATA on `/dev/sdc1`. A separate Veeam server was writing through
 SMB. No service was restarted, no cache was dropped, and no package was changed.

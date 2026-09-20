@@ -6,7 +6,7 @@ that checkpoint and catches up the next Active epoch before reopening admission.
 The live journal, completed-write counters and throughput samples reproduce this
 stop/drain/reopen cycle. This is a diagnosis, with no runtime change or deployment.
 
-Observed on test VM `10.1.1.161`, running `fastdup-0.7.4-13.el10.x86_64`, repository
+Observed on the isolated test appliance, running `fastdup-0.7.4-13.el10.x86_64`, repository
 PID 180746, started at 03:19:22 CEST. The source workspace also contains concurrent
 module extraction work; function names below identify the relevant seams without
 depending on changing line numbers.

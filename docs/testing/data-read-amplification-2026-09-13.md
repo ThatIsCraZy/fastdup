@@ -2,7 +2,7 @@
 
 ## Live observations
 
-Read-only measurements on `10.1.1.161` found `fastdup-0.7.4-8.el10.x86_64`,
+Read-only measurements on the isolated test appliance found `fastdup-0.7.4-8.el10.x86_64`,
 repository PID 151309. This is newer than the build in the preceding Metadata
 diagnosis. This investigation did not restart services, install packages, drop
 caches, or change the running backup. Existing unrelated workspace changes

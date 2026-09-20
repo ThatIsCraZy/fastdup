@@ -1,4 +1,4 @@
-//! Coordinates the SMB frontend with the lifecycle of the repository mount.
+//! Coordinates the managed frontends with the lifecycle of the repository mount.
 
 use std::path::Path;
 use std::process::Command;
@@ -78,23 +78,39 @@ pub async fn stop_for_unmount() -> BackendStopOutcome {
 }
 
 fn start_after_mount_blocking() -> BackendStartOutcome {
-    start_with(&run_system_command)
+    let smb = start_with(&run_system_command, SMB_UNIT);
+    let veeam = start_with(&run_system_command, "fastdup-veeam.service");
+    if matches!(smb, BackendStartOutcome::Failed) || matches!(veeam, BackendStartOutcome::Failed) {
+        BackendStartOutcome::Failed
+    } else if matches!(veeam, BackendStartOutcome::Started) {
+        veeam
+    } else {
+        smb
+    }
 }
 
 fn stop_for_unmount_blocking() -> BackendStopOutcome {
-    stop_with(&run_system_command)
+    let veeam = stop_with(&run_system_command, "fastdup-veeam.service");
+    let smb = stop_with(&run_system_command, SMB_UNIT);
+    if matches!(veeam, BackendStopOutcome::Failed) || matches!(smb, BackendStopOutcome::Failed) {
+        BackendStopOutcome::Failed
+    } else if matches!(veeam, BackendStopOutcome::ForceStopped) {
+        veeam
+    } else {
+        smb
+    }
 }
 
-fn start_with(runner: &dyn Fn(&[&str]) -> bool) -> BackendStartOutcome {
-    if !runner(&[SYSTEMCTL, "is-enabled", "--quiet", SMB_UNIT]) {
+fn start_with(runner: &dyn Fn(&[&str]) -> bool, unit: &str) -> BackendStartOutcome {
+    if !runner(&[SYSTEMCTL, "is-enabled", "--quiet", unit]) {
         return BackendStartOutcome::Disabled;
     }
-    if runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+    if runner(&[SYSTEMCTL, "is-active", "--quiet", unit]) {
         return BackendStartOutcome::AlreadyActive;
     }
     for attempt in 0..START_ATTEMPTS {
-        let _ = runner(&bounded(SYSTEMCTL, &["start", SMB_UNIT]));
-        if runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+        let _ = runner(&bounded(SYSTEMCTL, &["start", unit]));
+        if runner(&[SYSTEMCTL, "is-active", "--quiet", unit]) {
             return BackendStartOutcome::Started;
         }
         if attempt + 1 < START_ATTEMPTS {
@@ -104,34 +120,34 @@ fn start_with(runner: &dyn Fn(&[&str]) -> bool) -> BackendStartOutcome {
     BackendStartOutcome::Failed
 }
 
-fn stop_with(runner: &dyn Fn(&[&str]) -> bool) -> BackendStopOutcome {
-    if !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+fn stop_with(runner: &dyn Fn(&[&str]) -> bool, unit: &str) -> BackendStopOutcome {
+    if !runner(&[SYSTEMCTL, "is-active", "--quiet", unit]) {
         return BackendStopOutcome::AlreadyInactive;
     }
-    let _ = runner(&bounded(SYSTEMCTL, &["stop", SMB_UNIT]));
-    if !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+    let _ = runner(&bounded(SYSTEMCTL, &["stop", unit]));
+    if !runner(&[SYSTEMCTL, "is-active", "--quiet", unit]) {
         return BackendStopOutcome::Stopped;
     }
-    if force_inactive(runner) {
+    if force_inactive(runner, unit) {
         return BackendStopOutcome::ForceStopped;
     }
     BackendStopOutcome::Failed
 }
 
-fn force_inactive(runner: &dyn Fn(&[&str]) -> bool) -> bool {
+fn force_inactive(runner: &dyn Fn(&[&str]) -> bool, unit: &str) -> bool {
     for attempt in 0..FORCE_ATTEMPTS {
-        if !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+        if !runner(&[SYSTEMCTL, "is-active", "--quiet", unit]) {
             return true;
         }
-        let _ = runner(&bounded(SYSTEMCTL, &["kill", "--signal=SIGKILL", SMB_UNIT]));
-        if !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT]) {
+        let _ = runner(&bounded(SYSTEMCTL, &["kill", "--signal=SIGKILL", unit]));
+        if !runner(&[SYSTEMCTL, "is-active", "--quiet", unit]) {
             return true;
         }
         if attempt + 1 < FORCE_ATTEMPTS {
             sleep(FORCE_POLL);
         }
     }
-    !runner(&[SYSTEMCTL, "is-active", "--quiet", SMB_UNIT])
+    !runner(&[SYSTEMCTL, "is-active", "--quiet", unit])
 }
 
 fn bounded<'a>(command: &'a str, args: &'a [&'a str]) -> Vec<&'a str> {
@@ -271,7 +287,7 @@ mod tests {
     fn start_only_touches_an_enabled_backend() {
         let runner = Runner::new(false, false, true);
         let runner_ref = runner.clone();
-        let outcome = start_with(&move |args| runner_ref.run(args));
+        let outcome = start_with(&move |args| runner_ref.run(args), SMB_UNIT);
         assert_eq!(outcome, BackendStartOutcome::Disabled);
         assert_eq!(runner.calls.borrow().len(), 1);
     }
@@ -280,7 +296,7 @@ mod tests {
     fn an_already_active_backend_is_not_restarted() {
         let runner = Runner::new(true, true, true);
         let runner_ref = runner.clone();
-        let outcome = start_with(&move |args| runner_ref.run(args));
+        let outcome = start_with(&move |args| runner_ref.run(args), SMB_UNIT);
         assert_eq!(outcome, BackendStartOutcome::AlreadyActive);
         assert_eq!(
             runner.calls.borrow()[1],
@@ -292,7 +308,7 @@ mod tests {
     fn mount_starts_a_stopped_enabled_backend() {
         let runner = Runner::new(false, true, true);
         let runner_ref = runner.clone();
-        let outcome = start_with(&move |args| runner_ref.run(args));
+        let outcome = start_with(&move |args| runner_ref.run(args), SMB_UNIT);
         assert_eq!(outcome, BackendStartOutcome::Started);
         assert_eq!(
             runner.calls.borrow()[2],
@@ -304,7 +320,7 @@ mod tests {
     fn graceful_stop_precedes_force() {
         let runner = Runner::new(true, true, true);
         let runner_ref = runner.clone();
-        let outcome = stop_with(&move |args| runner_ref.run(args));
+        let outcome = stop_with(&move |args| runner_ref.run(args), SMB_UNIT);
         assert_eq!(outcome, BackendStopOutcome::Stopped);
         assert_eq!(
             runner.calls.borrow()[1],
@@ -320,7 +336,7 @@ mod tests {
     fn failed_graceful_stop_escalates_to_force() {
         let runner = Runner::new(true, true, false);
         let runner_ref = runner.clone();
-        let outcome = stop_with(&move |args| runner_ref.run(args));
+        let outcome = stop_with(&move |args| runner_ref.run(args), SMB_UNIT);
         assert_eq!(outcome, BackendStopOutcome::ForceStopped);
         assert_eq!(
             runner.calls.borrow()[1],
@@ -336,7 +352,7 @@ mod tests {
     fn inactive_backend_is_not_stopped() {
         let runner = Runner::new(false, true, true);
         let runner_ref = runner.clone();
-        let outcome = stop_with(&move |args| runner_ref.run(args));
+        let outcome = stop_with(&move |args| runner_ref.run(args), SMB_UNIT);
         assert_eq!(outcome, BackendStopOutcome::AlreadyInactive);
         assert_eq!(runner.calls.borrow().len(), 1);
     }

@@ -269,6 +269,6 @@ boundary, without high-frequency profiling overhead:
 - A 10-Gbit link has protocol overhead, and Veeam's transferred bytes are not
   guaranteed to equal Ethernet bytes or final backup-file bytes. The gap from
   6.04 Gbit/s payload to line rate cannot be assigned solely from these counters.
-- The conclusion applies to the warm `Testjob-Benni2` Active Full and its SMB
+- The conclusion applies to the warm qualification-job Active Full and its SMB
   topology. Cold-cache behavior and synthetic/merge operations have different
   I/O patterns and require separate qualification.

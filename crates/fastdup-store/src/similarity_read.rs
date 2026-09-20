@@ -304,8 +304,8 @@ fn for_each_page_span(
         let first = page_offset(ordinal).ok_or(SimilarityIndexStoreError::IndexCorruption)?;
         let bytes = page_span(lease, first, span)?;
         for (index, page_bytes) in bytes.chunks_exact(SIMILARITY_INDEX_PAGE_BYTES).enumerate() {
-            let offset = page_offset(ordinal + index)
-                .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+            let offset =
+                page_offset(ordinal + index).ok_or(SimilarityIndexStoreError::IndexCorruption)?;
             observe(ordinal + index, offset, page_bytes)?;
         }
         ordinal += span;

@@ -59,7 +59,7 @@ lane ownership.
 
 ## Installed RPM and SMB verification
 
-RPM `fastdup-0.6.4-7.el10.x86_64` was installed on `10.1.1.161`.
+RPM `fastdup-0.6.4-7.el10.x86_64` was installed on the isolated test appliance.
 The prior runtime was stopped and its disconnected FUSE mount detached before
 installation. Startup recovery completed, and the repository, control plane,
 agent, and Samba were active. `rpm -V` reported only the existing repository

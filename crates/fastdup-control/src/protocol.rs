@@ -14,6 +14,13 @@ pub const CONTROL_SOCKET_PATH: &str = "/run/fastdup/agent.sock";
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Command {
+    ConfigureVeeam {
+        settings: crate::VeeamSettings,
+        #[serde(default)]
+        bootstrap_password: Option<crate::BootstrapPassword>,
+    },
+    StartVeeam,
+    StopVeeam,
     Provision {
         metadata_target: String,
         data_target: String,

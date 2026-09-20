@@ -1,6 +1,6 @@
 # Live checkpoint diagnosis with publication timings
 
-Read-only observations on `10.1.1.161`, `fastdup-0.7.4-14.el10.x86_64`, repository
+Read-only observations on the isolated test appliance, `fastdup-0.7.4-14.el10.x86_64`, repository
 PID 187676, started 2026-09-13 04:04:40 CEST. The updated runtime exposes the new
 pipeline telemetry. The existing Veeam SMB job supplied the workload; no service
 restart, configuration change or additional write workload was performed.

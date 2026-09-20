@@ -2,7 +2,7 @@
 
 ## Live evidence on build 0.7.4-10
 
-Read-only measurements on `10.1.1.161`, repository PID 162330, observed
+Read-only measurements on the isolated test appliance, repository PID 162330, observed
 `fastdup-0.7.4-10.el10.x86_64`. No installation, restart, cache dropping,
 ptrace stop, or repository mutation was performed on the VM. Local fixes in
 this report are not deployed by this investigation.

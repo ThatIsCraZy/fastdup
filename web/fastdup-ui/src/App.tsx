@@ -1,3 +1,4 @@
+import { VeeamPage } from "./veeam";
 import { formatQueueDepth } from "./disk-io";
 import { StorageOverview } from "./storage-overview";
 import { SambaUsersSettings, WebUsersSettings, CertificateSettings } from "./settings-access";
@@ -80,6 +81,7 @@ const navigation = [
   ["Repository", Layers3],
   ["Laufwerke", HardDrive],
   ["SMB-Freigaben", FolderSymlink],
+  ["Veeam", ServerCog],
   ["Telemetrie", Activity],
   ["Ereignisse", ScrollText],
   ["Einstellungen", SlidersHorizontal],
@@ -111,6 +113,9 @@ const jobLabels: Record<string, string> = {
   update_settings: "Einstellungen",
   upsert_share: "SMB-Freigabe",
   delete_share: "Share-Löschung",
+  configure_veeam: "Veeam-Provisionierung",
+  start_veeam: "Veeam-Start",
+  stop_veeam: "Veeam-Stop",
 };
 
 type NoticeTone = "working" | "success" | "error";
@@ -2161,7 +2166,7 @@ function Application() {
         }`,
         message: job.message,
       });
-      if (job.state === "succeeded") void refresh();
+      if (job.state === "succeeded" || job.state === "failed") void refresh();
     });
     source.addEventListener("alert", (event) => {
       const alert = JSON.parse((event as MessageEvent).data) as {
@@ -2407,6 +2412,8 @@ function Application() {
         remove={removeShare}
       />
     );
+  else if (active === "Veeam")
+    content = <VeeamPage snapshot={snapshot} busy={operationBusy} submit={submit} />;
   else if (active === "Telemetrie")
     content = (
       <TelemetryPage

@@ -1054,6 +1054,15 @@ fn assert_veeam_clone_recovers_exact_offsets(length: u64) {
 }
 
 fn assert_veeam_clone_sequence(ranges: &[(u64, u64, u64)]) {
+    assert_veeam_clone_sequence_with_target(ranges, false);
+}
+
+#[test]
+fn clone_over_dirty_target_retires_payload_and_recovers_without_data_io() {
+    assert_veeam_clone_sequence_with_target(&[(4_096, 8_192, 65_536)], true);
+}
+
+fn assert_veeam_clone_sequence_with_target(ranges: &[(u64, u64, u64)], dirty_target: bool) {
     let metadata = MemoryStorageIo::new();
     let containers = MemoryStorageIo::new();
     let appliance = open(metadata.clone(), containers.clone());
@@ -1089,6 +1098,25 @@ fn assert_veeam_clone_sequence(ranges: &[(u64, u64, u64)]) {
     let before = containers.operation_count();
     let mut expected = vec![0; payload.len()];
     for &(source_offset, target_offset, length) in ranges {
+        if dirty_target {
+            let dirty = vec![b'D'; usize::try_from(length).unwrap()];
+            appliance
+                .namespace()
+                .dispatch(
+                    CALLER,
+                    Operation::Write {
+                        inode: target_inode,
+                        handle: target_handle,
+                        offset: target_offset,
+                        data: &dirty,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                appliance.namespace().checkpointable_dirty_payload_bytes(),
+                length
+            );
+        }
         clone_fixture(
             &appliance,
             source_inode,
@@ -1103,6 +1131,10 @@ fn assert_veeam_clone_sequence(ranges: &[(u64, u64, u64)]) {
         let target = usize::try_from(target_offset).unwrap();
         let length = usize::try_from(length).unwrap();
         expected[target..target + length].copy_from_slice(&payload[source..source + length]);
+        assert_eq!(
+            appliance.namespace().checkpointable_dirty_payload_bytes(),
+            0
+        );
     }
     appliance.checkpoint().unwrap().unwrap();
     assert_eq!(

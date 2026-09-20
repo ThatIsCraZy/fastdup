@@ -1,0 +1,12 @@
+[Unit]
+Description=Provision the FastDup Veeam service container
+After=fastdup-repository.service
+Before=fastdup-veeam.service
+Conflicts=fastdup-veeam.service
+ConditionPathIsMountPoint=/srv/fastdup/repository
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/fastdup/veeam-provision
+TimeoutStartSec=10min
+UMask=0077

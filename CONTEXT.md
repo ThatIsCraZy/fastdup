@@ -122,6 +122,19 @@ Dictionary Objects. It is neither a cross-Container compression history nor a
 source of durable content or liveness truth.
 _Avoid_: Compression catalog, shared Zstd stream, dictionary index
 
+**Veeam Service Container**:
+An isolated Linux service environment hosting Veeam's original Repository
+services. It owns one exclusive Repository directory and retains its service
+identity across restarts and software updates.
+_Avoid_: Container, Storage Container, Hardened Repository
+
+**Immutability authority**:
+An appliance-managed binding between one Namespace subtree and the single
+mapped service UID allowed to set or clear durable inode protection flags in
+that subtree. Appliance root remains the recovery authority; ordinary writers
+and the Veeam transport identity are never authorities.
+_Avoid_: Repository owner, sudo user, retention clock
+
 **Container**:
 An immutable collection of physical chunk encodings with enough local metadata
 to validate and rediscover its contents.

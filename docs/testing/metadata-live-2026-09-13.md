@@ -1,6 +1,6 @@
 # Remaining Metadata reads during live Veeam ingest
 
-Read-only observation on `10.1.1.161`, 2026-09-13 CEST. Running package:
+Read-only observation on the isolated test appliance, 2026-09-13 CEST. Running package:
 `fastdup-0.7.4-15.el10.x86_64`; Repository PID 259763. Metadata is `sdb1`
 (on sdb), DATA is `sdc1`. No service restart, configuration change or cache drop.
 

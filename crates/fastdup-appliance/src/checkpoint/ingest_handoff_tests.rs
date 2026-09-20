@@ -392,9 +392,14 @@ fn the_pending_region_gate_charges_only_what_the_lanes_hold() {
     // Enough inodes to pass the Registry's eviction grace, so Lanes are
     // actually evicted while they still hold payload rather than overflowing.
     for ordinal in 0..(super::write_through::MAX_ACTIVE_INGEST_LANES_V1 * 3) {
-        let (evicting, evicting_handle) =
-            create(&appliance, format!("lane-{ordinal}").as_bytes());
-        write(&appliance, evicting, evicting_handle, 0, &vec![91_u8; 65_536]);
+        let (evicting, evicting_handle) = create(&appliance, format!("lane-{ordinal}").as_bytes());
+        write(
+            &appliance,
+            evicting,
+            evicting_handle,
+            0,
+            &vec![91_u8; 65_536],
+        );
     }
     appliance
         .checkpoint()

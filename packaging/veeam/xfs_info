@@ -1,0 +1,24 @@
+#!/usr/bin/python3
+"""Veeam capability query for the FastDup adapter; delegate all other paths."""
+import ctypes
+import os
+import sys
+
+
+def managed_repository():
+    try:
+        library = ctypes.CDLL('/usr/local/lib/libfastdup-reflink.so')
+        library.fastdup_reflink_available.restype = ctypes.c_int
+        return library.fastdup_reflink_available() == 1
+    except (OSError, AttributeError):
+        return False
+
+
+if (len(sys.argv) == 2 and os.path.realpath(sys.argv[1]) == '/repository'
+        and managed_repository()):
+    fs = os.statvfs('/repository')
+    print('meta-data=fastdup                    (Veeam compatibility view)')
+    print('         =                       reflink=1')
+    print(f'data     =                       bsize={fs.f_frsize}   blocks={fs.f_blocks}')
+    sys.exit(0)
+os.execv('/usr/sbin/xfs_info', ['xfs_info', *sys.argv[1:]])

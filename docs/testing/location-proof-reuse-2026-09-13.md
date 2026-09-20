@@ -2,7 +2,7 @@
 
 ## Live observation
 
-Read-only samples on `10.1.1.161` found `fastdup-0.7.4-11.el10.x86_64`,
+Read-only samples on the isolated test appliance found `fastdup-0.7.4-11.el10.x86_64`,
 repository PID 167516. The process started at approximately 23:52:59 UTC on
 12 September. This investigation did not install, restart, stop, trace with
 ptrace, or mutate the running repository.

@@ -28,7 +28,7 @@ Locations, Manifest reads, concurrent Record misses and generation publication.
 
 ## VM observations
 
-Read-only inspection of test VM 10.1.1.161 found mount owner PID 1142 active.
+Read-only inspection of the isolated test appliance found mount owner PID 1142 active.
 A five-minute journal sample contained 12 reports that a checkpoint exceeded
 five seconds and closed mutation admission. Comparison Base reads also continue
 to accumulate. Thus write gaps have an explicit backpressure mechanism; this

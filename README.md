@@ -42,14 +42,19 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
   pool now retains its granted target out of headroom no other pool wants. It
   never grows an idle target, yields as soon as pools genuinely compete, and is
   skipped entirely under hard memory pressure.
-- **A concept for the Veeam hardened repository is on record.**
-  [docs/research/veeam-hardened-repository-concept.md](docs/research/veeam-hardened-repository-concept.md)
-  describes running the original Veeam repository services in a local Linux
-  system container against a fastdup-backed XFS-compatible path instead of the
-  SMB route. It is a request for comments, not a roadmap, and it is explicit
-  about the unsolved critical path: the FUSE mount answers
-  `FICLONE`/`FICLONERANGE` with `ENOTTY` today, so SMB remains the only proven
-  Fast Clone path.
+- **An experimental Veeam Linux repository is now integrated.** The WebUI
+  provisions an isolated system container with its own IPv4 configuration,
+  optional logical quota, Advanced Reduction and scoped hardened immutability.
+  A process-scoped adapter translates Veeam reflink requests into native
+  metadata-only range clones while the storage core limits immutable flags to
+  the detected Veeam service identities and repository roots. On one lab
+  appliance, an eight-task Active Full averaged 777 MB/s, a Veeam export issued
+  7,924 native clones for 33.2 GB, Backup Validator succeeded, and an ordinary
+  hardened job completed with protected restore points. See the
+  [qualification report](docs/testing/veeam-service-container-2026-09-20.md) and
+  [operator guide](docs/operations/veeam-service-container.md). This remains an
+  experimental compatibility layer, not real XFS, Veeam certification or a
+  support commitment.
 
 No format change: v0.8.1 reads and writes the same epoch-3 repository as v0.8.0,
 and upgrading from v0.8.0 needs no repository work.
@@ -451,9 +456,9 @@ sudo dnf remove fastdup
 - no built-in device redundancy, replication, WORM, encryption-at-rest policy,
   cloud tier, or device-loss protection
 - incomplete POSIX and broad Samba/client conformance coverage
-- Veeam backup and SMB Fast Clone are confirmed on the test appliance, but this
-  is not a Veeam-certified integration and carries no support statement
-- the Veeam Repository Agent is not yet integrated into the appliance
+- Veeam backup, native Fast Clone and scoped hardened immutability are qualified
+  on one lab appliance; the Linux repository integration remains experimental,
+  is not real XFS and carries no Veeam certification or support statement
 - advanced similarity reduction remains opt-in pending broader workload evidence
 - no production support, performance SLA, or capacity commitment
 

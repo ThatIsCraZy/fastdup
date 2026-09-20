@@ -291,6 +291,7 @@ pub struct AgentRuntime {
     /// one stranded record blocks every later action: the submit guard and the
     /// management surface both treat an open Job as an operation in progress.
     executing_jobs: Mutex<BTreeSet<String>>,
+    configuration_lock: Mutex<()>,
 }
 
 impl AgentRuntime {
@@ -315,6 +316,7 @@ impl AgentRuntime {
             events,
             shutdown,
             executing_jobs: Mutex::new(BTreeSet::new()),
+            configuration_lock: Mutex::new(()),
         })
     }
 
@@ -463,23 +465,27 @@ impl AgentRuntime {
         self.sample_frontend(frontend.as_ref(), health);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn sample_frontend(
         &self,
         frontend: Option<&RuntimeFrontendCounters>,
         health: crate::runtime_health::RuntimeHealth,
     ) {
+        let policy_guard = self.configuration_lock.try_lock().ok();
         let binding = self.store.repository_binding().ok().flatten();
         let state = binding
             .as_ref()
             .map_or(RepositoryState::Uninitialized, |binding| {
                 binding.state.clone()
             });
-        let state = if state == RepositoryState::Mounting
+        let state = if policy_guard.is_some()
+            && state == RepositoryState::Mounting
             && health.mounted == Some(true)
             && health.process == crate::runtime_health::ProcessState::Running
             && frontend.is_some()
             && let Ok(shares) = self.store.shares()
-            && sync_share_capacities(&shares).is_ok()
+            && let Ok(veeam) = self.store.veeam()
+            && sync_share_capacities(&shares, veeam.as_ref()).is_ok()
             && apply_samba(&self.samba, &shares).is_ok()
             && self.set_state(RepositoryState::Online).is_ok()
         {
@@ -566,11 +572,15 @@ impl AgentRuntime {
                     .saturating_sub(checkpoint.completed_at),
             );
         }
-        if let Some(frontend) = frontend
+        if policy_guard.is_some()
+            && let Some(frontend) = frontend
             && let Ok(shares) = self.store.shares()
-            && frontend.presented_capacity_revision != share_capacity_revision(&shares)
+            && let Ok(veeam) = self.store.veeam()
+            && let handoff = resolved_veeam_handoff(veeam.as_ref())
+            && frontend.presented_capacity_revision
+                != share_capacity_revision(&shares, veeam.as_ref(), handoff)
         {
-            let _ = sync_share_capacities(&shares);
+            let _ = sync_share_capacities_with_handoff(&shares, veeam.as_ref(), handoff);
         }
         if let Ok(mut latest) = self.latest.write() {
             if latest.runtime_issue != snapshot.runtime_issue {
@@ -619,6 +629,9 @@ impl AgentRuntime {
             repository,
             settings: self.store.settings().map_err(problem("settings_failed"))?,
             shares: self.store.shares().map_err(problem("shares_failed"))?,
+            veeam: self.store.veeam().map_err(problem("veeam_settings"))?,
+            veeam_active: run_process("systemctl", &["is-active", "--quiet", crate::veeam::UNIT])
+                .is_ok(),
             jobs: self.store.recent_jobs(20).map_err(problem("jobs_failed"))?,
             certificate_fingerprint: self.fingerprint.clone(),
         })
@@ -693,7 +706,29 @@ impl AgentRuntime {
 
     #[allow(clippy::too_many_lines)]
     fn execute_command(&self, command: Command) -> Result<String, ControlProblem> {
+        let _configuration = self
+            .configuration_lock
+            .lock()
+            .map_err(problem("configuration_lock"))?;
         match command {
+            Command::ConfigureVeeam {
+                settings,
+                bootstrap_password,
+            } => self.configure_veeam(&settings, bootstrap_password.as_ref()),
+            Command::StartVeeam => {
+                let settings = self
+                    .store
+                    .veeam()
+                    .map_err(problem("veeam_settings"))?
+                    .ok_or_else(|| {
+                        ControlProblem::new("veeam_missing", "Veeam wurde noch nicht provisioniert")
+                    })?;
+                self.configure_veeam(&settings, None)
+            }
+            Command::StopVeeam => {
+                run_process("systemctl", &["disable", "--now", crate::veeam::UNIT])?;
+                Ok("Veeam-Servicecontainer wurde gestoppt; Daten und Dienstzustand bleiben erhalten".into())
+            }
             Command::Provision {
                 metadata_target,
                 data_target,
@@ -834,6 +869,87 @@ impl AgentRuntime {
         }
     }
 
+    fn configure_veeam(
+        &self,
+        settings: &crate::VeeamSettings,
+        password: Option<&crate::BootstrapPassword>,
+    ) -> Result<String, ControlProblem> {
+        settings.validate()?;
+        if let Some(password) = password {
+            password.validate()?;
+            if !settings.ssh_enabled {
+                return Err(ControlProblem::new(
+                    "veeam_ssh_disabled",
+                    "Passwort kann nur bei aktivem Installationszugang gesetzt werden",
+                ));
+            }
+        }
+        let current = self.store.veeam().map_err(problem("veeam_settings"))?;
+        if current.as_ref().map_or(0, |value| value.revision) != settings.revision {
+            return Err(ControlProblem::new(
+                "veeam_conflict",
+                "Veeam-Konfiguration wurde zwischenzeitlich geändert",
+            ));
+        }
+        if current.is_none()
+            && !dry_run()
+            && Path::new(crate::veeam::DIRECTORY)
+                .symlink_metadata()
+                .is_ok()
+        {
+            return Err(ControlProblem::new(
+                "veeam_directory_conflict",
+                "Der Ordner veeam existiert bereits und wird nicht übernommen",
+            ));
+        }
+        let shares = self.store.shares().map_err(problem("shares_failed"))?;
+        if shares.iter().any(|share| {
+            share
+                .name
+                .trim_end_matches('$')
+                .eq_ignore_ascii_case("veeam")
+        }) {
+            return Err(ControlProblem::new(
+                "veeam_name_conflict",
+                "Die bestehende SMB-Freigabe veeam muss zuerst umbenannt werden",
+            ));
+        }
+        if !dry_run() {
+            if !repository_mount_is_active() {
+                return Err(ControlProblem::new(
+                    "repository_mount_unavailable",
+                    "Veeam benötigt ein gemountetes Repository",
+                ));
+            }
+            if !Path::new("/usr/share/fastdup/veeam-rootfs.tar.gz").is_file() {
+                return Err(ControlProblem::new(
+                    "veeam_image_missing",
+                    "Das lokal gebaute Veeam-Containerimage fehlt",
+                ));
+            }
+            run_process("systemctl", &["stop", crate::veeam::UNIT])?;
+            if let Err(error) = sync_share_capacities(&shares, Some(settings)) {
+                let _ = sync_share_capacities(&shares, current.as_ref());
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.store.save_veeam(settings) {
+            if !dry_run() {
+                let _ = sync_share_capacities(&shares, current.as_ref());
+            }
+            return Err(ControlProblem::new("veeam_conflict", error.to_string()));
+        }
+        if !dry_run() {
+            crate::veeam::provision(settings, password)?;
+        }
+        Ok(if settings.hardened_immutability {
+            "Veeam-Servicecontainer mit Fast Clone und Hardened-Immutability-Autorität provisioniert."
+        } else {
+            "Veeam-Servicecontainer mit Fast-Clone-Adapter provisioniert."
+        }
+        .into())
+    }
+
     fn start_repository(&self) -> Result<(), ControlProblem> {
         if dry_run() {
             return Ok(());
@@ -854,7 +970,13 @@ impl AgentRuntime {
         let shares = self.store.shares().map_err(problem("shares_failed"))?;
         let deadline = std::time::Instant::now() + REPOSITORY_START_TIMEOUT;
         loop {
-            match sync_share_capacities(&shares) {
+            match sync_share_capacities(
+                &shares,
+                self.store
+                    .veeam()
+                    .map_err(problem("veeam_settings"))?
+                    .as_ref(),
+            ) {
                 Ok(()) => {
                     apply_samba(&self.samba, &shares)?;
                     return Ok(());
@@ -890,7 +1012,13 @@ impl AgentRuntime {
             .map_err(problem("binding_failed"))?
             .is_some_and(|binding| binding.state == RepositoryState::Online);
         if online && !dry_run() {
-            sync_share_capacities(shares)?;
+            sync_share_capacities(
+                shares,
+                self.store
+                    .veeam()
+                    .map_err(problem("veeam_settings"))?
+                    .as_ref(),
+            )?;
         }
         apply_samba(&self.samba, shares)
     }
@@ -1200,6 +1328,9 @@ fn update_job(
 
 fn command_name(command: &Command) -> &'static str {
     match command {
+        Command::ConfigureVeeam { .. } => "configure_veeam",
+        Command::StartVeeam => "start_veeam",
+        Command::StopVeeam => "stop_veeam",
         Command::Provision { .. } => "provision",
         Command::Adopt { .. } => "adopt",
         Command::Mount => "mount",
@@ -1266,6 +1397,7 @@ fn systemctl(action: &str, unit: &str) -> Result<(), ControlProblem> {
 }
 
 fn stop_share_backend_best_effort() {
+    let _ = run_process("systemctl", &["stop", crate::veeam::UNIT]);
     if dry_run() {
         return;
     }
@@ -1530,7 +1662,11 @@ fn parse_frontend_counters(response: &serde_json::Value) -> Option<RuntimeFronte
     }
 }
 
-fn share_capacity_revision(shares: &[ShareSettings]) -> String {
+fn share_capacity_revision(
+    shares: &[ShareSettings],
+    veeam: Option<&crate::VeeamSettings>,
+    identity: Option<crate::veeam::ImmutabilityIdentity>,
+) -> String {
     let mut shares = shares.iter().collect::<Vec<_>>();
     shares.sort_by(|left, right| left.id.cmp(&right.id));
     let mut digest = Sha256::new();
@@ -1549,10 +1685,57 @@ fn share_capacity_revision(shares: &[ShareSettings]) -> String {
             digest.update(0_u64.to_le_bytes());
         }
     }
+    if let Some(veeam) = veeam {
+        digest.update(b"\0veeam-root-v6\0");
+        digest.update([u8::from(
+            veeam.advanced_reduction == AdvancedReduction::DependentV1,
+        )]);
+        digest.update([u8::from(veeam.hardened_immutability)]);
+        digest.update(
+            veeam
+                .logical_quota
+                .and_then(crate::LogicalQuota::bytes)
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+        digest.update(
+            identity
+                .map_or(0, |value| value.authority_uid)
+                .to_le_bytes(),
+        );
+        digest.update(
+            identity
+                .map_or(0, |value| value.authority_gid)
+                .to_le_bytes(),
+        );
+        digest.update(identity.map_or(0, |value| value.writer_uid).to_le_bytes());
+        digest.update(identity.map_or(0, |value| value.writer_gid).to_le_bytes());
+        digest.update(identity.map_or(0, |value| value.handoff_uid).to_le_bytes());
+        digest.update(identity.map_or(0, |value| value.handoff_gid).to_le_bytes());
+    }
     format!("{:x}", digest.finalize())
 }
 
-fn sync_share_capacities(shares: &[ShareSettings]) -> Result<(), ControlProblem> {
+fn sync_share_capacities(
+    shares: &[ShareSettings],
+    veeam: Option<&crate::VeeamSettings>,
+) -> Result<(), ControlProblem> {
+    sync_share_capacities_with_handoff(shares, veeam, resolved_veeam_handoff(veeam))
+}
+
+fn resolved_veeam_handoff(
+    veeam: Option<&crate::VeeamSettings>,
+) -> Option<crate::veeam::ImmutabilityIdentity> {
+    veeam
+        .filter(|settings| settings.hardened_immutability)
+        .and_then(|_| crate::veeam::immutability_identity())
+}
+
+fn sync_share_capacities_with_handoff(
+    shares: &[ShareSettings],
+    veeam: Option<&crate::VeeamSettings>,
+    identity: Option<crate::veeam::ImmutabilityIdentity>,
+) -> Result<(), ControlProblem> {
     if !repository_mount_is_active() {
         return Err(ControlProblem::new(
             "repository_mount_unavailable",
@@ -1561,6 +1744,7 @@ fn sync_share_capacities(shares: &[ShareSettings]) -> Result<(), ControlProblem>
     }
     let mut rules = Vec::new();
     let mut reduction_rules = Vec::new();
+    let mut immutability_rules = Vec::new();
     for share in shares {
         let path = SambaConfig::share_path(share);
         SambaConfig::prepare_share_directory(share).map_err(problem("share_directory"))?;
@@ -1586,14 +1770,47 @@ fn sync_share_capacities(shares: &[ShareSettings]) -> Result<(), ControlProblem>
             }));
         }
     }
-    let revision = share_capacity_revision(shares);
+    if let Some(veeam) = veeam {
+        veeam.validate()?;
+        crate::veeam::prepare_directory().map_err(problem("veeam_directory"))?;
+        let inode = std::fs::metadata(crate::veeam::DIRECTORY)
+            .map_err(problem("veeam_directory"))?
+            .ino();
+        reduction_rules.push(serde_json::json!({"inode": inode, "enabled": veeam.advanced_reduction == AdvancedReduction::DependentV1}));
+        if veeam.hardened_immutability
+            && let Some(identity) = identity
+        {
+            for protected_root in [
+                crate::veeam::DIRECTORY,
+                crate::veeam::IMMUTABILITY_STATE_DIRECTORY,
+            ] {
+                let protected_inode = std::fs::metadata(protected_root)
+                    .map_err(problem("veeam_directory"))?
+                    .ino();
+                immutability_rules.push(serde_json::json!({
+                    "inode": protected_inode,
+                    "authority_uid": identity.authority_uid,
+                    "authority_gid": identity.authority_gid,
+                    "writer_uid": identity.writer_uid,
+                    "writer_gid": identity.writer_gid,
+                    "handoff_uid": identity.handoff_uid,
+                    "handoff_gid": identity.handoff_gid,
+                }));
+            }
+        }
+        if let Some(quota) = veeam.logical_quota {
+            rules.push(serde_json::json!({"inode":inode, "capacity_bytes":quota.bytes()}));
+        }
+    }
+    let revision = share_capacity_revision(shares, veeam, identity);
     send_management_operation(&serde_json::json!({
         "kind": "update_presented_capacities",
         "revision": revision,
         "rules": rules,
         "reduction_rules": reduction_rules,
+        "immutability_rules": immutability_rules,
     }))?;
-    persist_share_capacity_manifest(&revision, &rules, &reduction_rules)?;
+    persist_share_capacity_manifest(&revision, &rules, &reduction_rules, &immutability_rules)?;
     Ok(())
 }
 
@@ -1601,6 +1818,7 @@ fn persist_share_capacity_manifest(
     revision: &str,
     rules: &[serde_json::Value],
     reduction_rules: &[serde_json::Value],
+    immutability_rules: &[serde_json::Value],
 ) -> Result<(), ControlProblem> {
     if dry_run() {
         return Ok(());
@@ -1628,6 +1846,7 @@ fn persist_share_capacity_manifest(
             "revision": revision,
             "rules": rules,
             "reduction_rules": reduction_rules,
+            "immutability_rules": immutability_rules,
         }),
     )
     .map_err(problem("share_capacity_manifest_write"))?;
@@ -1712,7 +1931,7 @@ fn send_hot_settings_configuration(
     .map(|_| ())
 }
 
-fn run_process(program: &str, arguments: &[&str]) -> Result<String, ControlProblem> {
+pub(crate) fn run_process(program: &str, arguments: &[&str]) -> Result<String, ControlProblem> {
     let output = ProcessCommand::new(program)
         .args(arguments)
         .output()
@@ -1822,7 +2041,7 @@ mod tests {
         );
         let frontend = |open, failed| {
             parse_frontend_counters(&serde_json::json!({
-                "ok":true, "presented_capacity_revision":share_capacity_revision(&[]),
+                "ok":true, "presented_capacity_revision":share_capacity_revision(&[], None, None),
                 "frontend": {"mutation_admission_open":open,"integrity_failed":failed,
                     "read_bytes":8_000_000,"write_bytes":10_000_000,
                     "exact_hit_bytes":0,"new_chunk_bytes":0}
@@ -2011,16 +2230,19 @@ mod tests {
     fn share_capacity_revision_is_order_independent_and_capacity_sensitive() {
         let mut first = test_share("one");
         let second = test_share("two");
-        let initial = share_capacity_revision(&[first.clone(), second.clone()]);
+        let initial = share_capacity_revision(&[first.clone(), second.clone()], None, None);
         assert_eq!(
             initial,
-            share_capacity_revision(&[second.clone(), first.clone()])
+            share_capacity_revision(&[second.clone(), first.clone()], None, None)
         );
         first.logical_quota = Some(crate::LogicalQuota {
             value: 10,
             unit: crate::CapacityUnit::Tb,
         });
-        assert_ne!(initial, share_capacity_revision(&[first, second]));
+        assert_ne!(
+            initial,
+            share_capacity_revision(&[first, second], None, None)
+        );
     }
 
     fn test_share(id: &str) -> ShareSettings {

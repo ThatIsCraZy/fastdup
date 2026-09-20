@@ -29,11 +29,10 @@ pub use pool_isolation::{
 };
 
 pub use checkpoint::{
-    INGEST_PENDING_GATE_BYTES_V1,
     CHECKPOINT_DIRTY_PAYLOAD_BYTES_V1, CheckpointMetrics, CheckpointPhaseMetrics, CpuPhaseStatus,
-    DurableNamespace, DurableNamespaceError, GenerationProofSetStatus, INODE_RESERVATION_SPAN_V1,
-    ProfiledCheckpoint, WriteThroughStatus, checkpoint_exact_index_profile_v1,
-    checkpoint_policy_set,
+    DurableNamespace, DurableNamespaceError, GenerationProofSetStatus,
+    INGEST_PENDING_GATE_BYTES_V1, INODE_RESERVATION_SPAN_V1, ProfiledCheckpoint,
+    WriteThroughStatus, checkpoint_exact_index_profile_v1, checkpoint_policy_set,
 };
 pub use checkpoint_trigger::{
     CONTAINER_COMMIT_COALESCE, CheckpointAction, CheckpointPressure, CheckpointProgressAction,

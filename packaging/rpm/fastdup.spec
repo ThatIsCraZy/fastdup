@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.8.1
-Release:        7%{?dist}
+Release:        26%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -13,6 +13,9 @@ Requires:       fuse3
 Requires:       samba = 4.23.5
 Requires:       samba-common-tools
 Requires:       systemd
+Requires:       systemd-container
+Requires:       python3
+Requires:       iputils
 Requires:       systemd-udev
 Requires:       util-linux
 Requires:       xfsprogs
@@ -47,6 +50,12 @@ install -d \
     %{buildroot}%{_sysconfdir}/fastdup \
     %{buildroot}%{_sysconfdir}/samba
 
+install -d %{buildroot}%{_datadir}/fastdup
+install -m 0755 veeam/veeam-provision %{buildroot}%{_libexecdir}/fastdup/
+install -d %{buildroot}%{_libexecdir}/fastdup/veeam
+install -m 0755 veeam/libfastdup-reflink.so veeam/xfs_info %{buildroot}%{_libexecdir}/fastdup/veeam/
+install -m 0644 veeam/rootfs.tar.gz %{buildroot}%{_datadir}/fastdup/veeam-rootfs.tar.gz
+install -m 0644 systemd/fastdup-veeam.service systemd/fastdup-veeam-provision.service %{buildroot}%{_unitdir}/
 install -m 0755 bin/fastdup-durable-fuse %{buildroot}%{_libexecdir}/fastdup/
 install -m 0755 bin/fastdup-control %{buildroot}%{_libexecdir}/fastdup/
 install -m 0755 bin/fastdup-agent %{buildroot}%{_libexecdir}/fastdup/
@@ -91,6 +100,11 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %files
 %doc README.md
 %{_libexecdir}/fastdup/fastdup-durable-fuse
+%{_libexecdir}/fastdup/veeam-provision
+%{_libexecdir}/fastdup/veeam/
+%{_datadir}/fastdup/veeam-rootfs.tar.gz
+%{_unitdir}/fastdup-veeam.service
+%{_unitdir}/fastdup-veeam-provision.service
 %{_libexecdir}/fastdup/fastdup-control
 %{_libexecdir}/fastdup/fastdup-agent
 %{_bindir}/fastdup-maintenance

@@ -1,8 +1,9 @@
 use fastdup_posix::{
-    FS_IMMUTABLE_FL, FallocateMode, HandleId, InodeId, Namespace, NamespaceConfig, OpenOptions,
-    Operation, POSIX_ACL_ACCESS_XATTR, POSIX_ACL_DEFAULT_XATTR, PosixError, ROOT_INODE, Reply,
-    RequestContext, XattrSetMode,
+    FS_IMMUTABLE_FL, FallocateMode, HandleId, InodeAttributesUpdate, InodeId, Namespace,
+    NamespaceConfig, OpenOptions, Operation, POSIX_ACL_ACCESS_XATTR, POSIX_ACL_DEFAULT_XATTR,
+    PosixError, ProtectionCommitFence, ROOT_INODE, Reply, RequestContext, XattrSetMode,
 };
+use std::sync::{Arc, Mutex};
 
 const OWNER: RequestContext = RequestContext {
     uid: 1_000,
@@ -14,6 +15,24 @@ const ROOT: RequestContext = RequestContext {
     gid: 0,
     pid: 1,
 };
+
+const VEEAM_ROOT: RequestContext = RequestContext {
+    uid: 524_288,
+    gid: 524_811,
+    pid: 91,
+};
+const VEEAM_REPOSITORY_UID: u32 = 524_288;
+const VEEAM_REPOSITORY_GID: u32 = 524_288;
+
+#[derive(Debug, Default)]
+struct RecordingFence(Mutex<Vec<u64>>);
+
+impl ProtectionCommitFence for RecordingFence {
+    fn commit_through(&self, sequence: u64) -> Result<(), PosixError> {
+        self.0.lock().unwrap().push(sequence);
+        Ok(())
+    }
+}
 
 fn create(namespace: &Namespace, name: &[u8]) -> (InodeId, HandleId) {
     let Reply::Created { entry, handle } = namespace
@@ -260,6 +279,252 @@ fn immutable_flag_blocks_content_names_and_metadata_until_root_clears_it() {
         ),
         Ok(Reply::Written { .. })
     ));
+}
+
+#[test]
+fn mapped_service_root_controls_only_its_repository_and_waits_for_commit() {
+    let namespace = Namespace::new_volatile(NamespaceConfig::default());
+    let fence = Arc::new(RecordingFence::default());
+    namespace.install_protection_commit_fence(fence.clone());
+    let Reply::Entry(repository) = namespace
+        .dispatch(
+            ROOT,
+            Operation::Mkdir {
+                parent: ROOT_INODE,
+                name: b"veeam",
+                mode: 0o777,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("mkdir reply");
+    };
+    namespace
+        .dispatch(
+            ROOT,
+            Operation::SetAttributes {
+                inode: repository.attr.inode,
+                update: InodeAttributesUpdate {
+                    uid: Some(OWNER.uid),
+                    gid: Some(OWNER.gid),
+                    ..InodeAttributesUpdate::default()
+                },
+            },
+        )
+        .unwrap();
+    namespace
+        .replace_immutability_authorities(vec![(
+            repository.attr.inode,
+            VEEAM_ROOT.uid,
+            VEEAM_ROOT.gid,
+            OWNER.uid,
+            OWNER.gid,
+            VEEAM_REPOSITORY_UID,
+            VEEAM_REPOSITORY_GID,
+        )])
+        .unwrap();
+    let Reply::Created { entry, .. } = namespace
+        .dispatch(
+            OWNER,
+            Operation::Create {
+                parent: repository.attr.inode,
+                name: b"chain.vbk",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("create reply");
+    };
+    let Reply::Created {
+        entry: lock_file, ..
+    } = namespace
+        .dispatch(
+            VEEAM_ROOT,
+            Operation::Create {
+                parent: repository.attr.inode,
+                name: b".veeam.1.lock",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("create lock reply");
+    };
+    assert_eq!(lock_file.attr.uid, VEEAM_ROOT.uid);
+    assert_eq!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetFileFlags {
+                inode: lock_file.attr.inode,
+                flags: FS_IMMUTABLE_FL,
+            },
+        ),
+        Ok(Reply::Empty)
+    );
+    assert!(matches!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetAttributes {
+                inode: lock_file.attr.inode,
+                update: InodeAttributesUpdate {
+                    uid: Some(VEEAM_REPOSITORY_UID),
+                    ..InodeAttributesUpdate::default()
+                },
+            },
+        ),
+        Ok(Reply::Attr(attr)) if attr.uid == VEEAM_REPOSITORY_UID && attr.gid == VEEAM_ROOT.gid
+    ));
+    assert!(matches!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetAttributes {
+                inode: lock_file.attr.inode,
+                update: InodeAttributesUpdate {
+                    gid: Some(VEEAM_REPOSITORY_GID),
+                    ..InodeAttributesUpdate::default()
+                },
+            },
+        ),
+        Ok(Reply::Attr(attr)) if attr.uid == VEEAM_REPOSITORY_UID && attr.gid == VEEAM_REPOSITORY_GID
+    ));
+    assert_eq!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetAttributes {
+                inode: entry.attr.inode,
+                update: InodeAttributesUpdate {
+                    gid: Some(VEEAM_ROOT.gid),
+                    ..InodeAttributesUpdate::default()
+                },
+            },
+        ),
+        Err(PosixError::PermissionDenied)
+    );
+    let Reply::Created {
+        entry: wrong_handoff,
+        ..
+    } = namespace
+        .dispatch(
+            VEEAM_ROOT,
+            Operation::Create {
+                parent: repository.attr.inode,
+                name: b"wrong.lock",
+                mode: 0o600,
+                options: OpenOptions::READ_WRITE,
+                exclusive: true,
+                truncate: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("create invalid handoff reply");
+    };
+    assert_eq!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetAttributes {
+                inode: wrong_handoff.attr.inode,
+                update: InodeAttributesUpdate {
+                    uid: Some(42_424),
+                    gid: Some(42_424),
+                    ..InodeAttributesUpdate::default()
+                },
+            },
+        ),
+        Err(PosixError::PermissionDenied)
+    );
+    assert_eq!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetXattr {
+                inode: entry.attr.inode,
+                name: b"user.unrelated",
+                value: b"denied",
+                mode: XattrSetMode::Upsert,
+            },
+        ),
+        Err(PosixError::PermissionDenied)
+    );
+    assert_eq!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetXattr {
+                inode: entry.attr.inode,
+                name: b"user.immutable.until",
+                value: b"2030-01-01 00:00:00",
+                mode: XattrSetMode::Upsert,
+            },
+        ),
+        Ok(Reply::Empty)
+    );
+    assert!(matches!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetAttributes {
+                inode: entry.attr.inode,
+                update: InodeAttributesUpdate {
+                    uid: Some(VEEAM_REPOSITORY_UID),
+                    gid: Some(VEEAM_REPOSITORY_GID),
+                    ..InodeAttributesUpdate::default()
+                },
+            },
+        ),
+        Ok(Reply::Attr(attr))
+            if attr.uid == VEEAM_REPOSITORY_UID && attr.gid == VEEAM_REPOSITORY_GID
+    ));
+    assert_eq!(
+        namespace.dispatch(
+            OWNER,
+            Operation::SetFileFlags {
+                inode: entry.attr.inode,
+                flags: FS_IMMUTABLE_FL,
+            },
+        ),
+        Err(PosixError::PermissionDenied)
+    );
+    assert_eq!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetFileFlags {
+                inode: entry.attr.inode,
+                flags: FS_IMMUTABLE_FL,
+            },
+        ),
+        Ok(Reply::Empty)
+    );
+    assert_eq!(fence.0.lock().unwrap().len(), 2);
+
+    let (outside, _) = create(&namespace, b"outside.vbk");
+    assert_eq!(
+        namespace.dispatch(
+            VEEAM_ROOT,
+            Operation::SetFileFlags {
+                inode: outside,
+                flags: FS_IMMUTABLE_FL,
+            },
+        ),
+        Err(PosixError::PermissionDenied)
+    );
+    assert_eq!(
+        namespace.dispatch(
+            ROOT,
+            Operation::Rename {
+                parent: repository.attr.inode,
+                name: b"chain.vbk",
+                new_parent: ROOT_INODE,
+                new_name: b"escaped.vbk",
+                no_replace: true,
+            },
+        ),
+        Err(PosixError::CrossDevice)
+    );
 }
 
 #[test]

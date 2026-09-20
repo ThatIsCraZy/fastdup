@@ -72,6 +72,11 @@ impl ControlStore {
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 body TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS veeam_settings (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                revision INTEGER NOT NULL,
+                body TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS shares (
                 id TEXT PRIMARY KEY,
                 revision INTEGER NOT NULL,
@@ -226,6 +231,47 @@ impl ControlStore {
             return Err(StoreError::RevisionConflict);
         }
         Ok(settings)
+    }
+
+    pub fn veeam(&self) -> Result<Option<crate::VeeamSettings>, StoreError> {
+        let body: Option<String> = self
+            .locked()?
+            .query_row(
+                "SELECT body FROM veeam_settings WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        body.map(|body| serde_json::from_str(&body).map_err(StoreError::from))
+            .transpose()
+    }
+
+    pub fn save_veeam(&self, settings: &crate::VeeamSettings) -> Result<(), StoreError> {
+        let mut next = settings.clone();
+        next.revision = settings
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionConflict)?;
+        let db = self.locked()?;
+        let changed = if settings.revision == 0 {
+            db.execute(
+                "INSERT OR IGNORE INTO veeam_settings VALUES(1, ?1, ?2)",
+                params![next.revision, serde_json::to_string(&next)?],
+            )?
+        } else {
+            db.execute(
+                "UPDATE veeam_settings SET revision=?1, body=?2 WHERE singleton=1 AND revision=?3",
+                params![
+                    next.revision,
+                    serde_json::to_string(&next)?,
+                    settings.revision
+                ],
+            )?
+        };
+        if changed != 1 {
+            return Err(StoreError::RevisionConflict);
+        }
+        Ok(())
     }
 
     pub fn shares(&self) -> Result<Vec<ShareSettings>, StoreError> {

@@ -14,6 +14,10 @@ pub struct ApplianceSnapshot {
     pub repository: Option<RepositoryBinding>,
     pub settings: RepositorySettings,
     pub shares: Vec<ShareSettings>,
+    #[serde(default)]
+    pub veeam: Option<crate::VeeamSettings>,
+    #[serde(default)]
+    pub veeam_active: bool,
     pub jobs: Vec<JobStatus>,
     pub certificate_fingerprint: String,
 }

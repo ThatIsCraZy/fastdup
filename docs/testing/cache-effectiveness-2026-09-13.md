@@ -2,7 +2,7 @@
 
 ## Live baseline
 
-Two read-only 20-second measurements on `10.1.1.161` observed
+Two read-only 20-second measurements on the isolated test appliance observed
 `fastdup-0.7.4-9.el10.x86_64`, Repository PID 156542. Thus the preceding
 DATA-cache wiring corrections were already installed. This investigation
 neither installed a package nor restarted the Repository or the running SMB

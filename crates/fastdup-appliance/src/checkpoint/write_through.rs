@@ -957,15 +957,12 @@ impl PendingRegions {
     /// suffix, and in-flight reservations are bounded by the Ingest Batch
     /// target times the worker count.
     fn open_commit_cut_staging(&self) {
-        self.commit_cut_staging_depth
-            .fetch_add(1, Ordering::AcqRel);
+        self.commit_cut_staging_depth.fetch_add(1, Ordering::AcqRel);
         self.space_available.1.notify_all();
     }
 
     fn close_commit_cut_staging(&self) {
-        let previous = self
-            .commit_cut_staging_depth
-            .fetch_sub(1, Ordering::AcqRel);
+        let previous = self.commit_cut_staging_depth.fetch_sub(1, Ordering::AcqRel);
         assert!(
             previous != 0,
             "ASSERT: commit-cut staging hatch cannot close below its open count"

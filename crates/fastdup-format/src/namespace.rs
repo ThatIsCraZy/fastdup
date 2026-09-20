@@ -3,9 +3,7 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use crate::metadata::{
-    NAMESPACE_ROOT_KIND, decode_metadata_object, encode_metadata_object,
-};
+use crate::metadata::{NAMESPACE_ROOT_KIND, decode_metadata_object, encode_metadata_object};
 use crate::{MetadataFormatError, MetadataObjectId};
 
 pub const NAMESPACE_ROOT_HEADER_BYTES: usize = 128;
@@ -2518,7 +2516,9 @@ fn decode_shard_posix_metadata(
                 .chain(&header[44..48])
                 .chain(&header[60..64])
                 .any(|byte| *byte != 0)
-            || payload[target_end..record_end].iter().any(|byte| *byte != 0)
+            || payload[target_end..record_end]
+                .iter()
+                .any(|byte| *byte != 0)
         {
             return Err(MetadataFormatError::InvalidPayload);
         }
@@ -2569,7 +2569,12 @@ fn decode_entry_shard(encoded: &[u8]) -> Result<Vec<NamespaceEntry>, MetadataFor
     if entry_count == 0 || entry_count > NAMESPACE_SHARD_MAX_RECORDS {
         return Err(MetadataFormatError::InvalidPayload);
     }
-    let entries = decode_entries(payload, ENTRY_SHARD_HEADER_BYTES, payload.len(), entry_count)?;
+    let entries = decode_entries(
+        payload,
+        ENTRY_SHARD_HEADER_BYTES,
+        payload.len(),
+        entry_count,
+    )?;
     if entries.windows(2).any(|pair| {
         (pair[0].parent_inode, pair[0].name.as_slice())
             >= (pair[1].parent_inode, pair[1].name.as_slice())
@@ -2607,7 +2612,8 @@ fn encode_root_metadata_blob(
     put_u32(
         &mut blob,
         16,
-        u32::try_from(metadata.xattrs.len()).map_err(|_| MetadataFormatError::ArithmeticOverflow)?,
+        u32::try_from(metadata.xattrs.len())
+            .map_err(|_| MetadataFormatError::ArithmeticOverflow)?,
     );
     let mut cursor = encode_posix_metadata_record(
         &mut blob,
@@ -2654,10 +2660,14 @@ fn decode_root_metadata_blob(blob: &[u8]) -> Result<DurableRootMetadata, Metadat
         }
         xattrs.push(xattr);
     }
-    Ok(
-        DurableRootMetadata::new(get_u16(blob, 0), get_u32(blob, 4), get_u32(blob, 8), get_u32(blob, 12), xattrs)?
-            .with_times(times),
-    )
+    Ok(DurableRootMetadata::new(
+        get_u16(blob, 0),
+        get_u32(blob, 4),
+        get_u32(blob, 8),
+        get_u32(blob, 12),
+        xattrs,
+    )?
+    .with_times(times))
 }
 
 fn encode_namespace_graph_root(

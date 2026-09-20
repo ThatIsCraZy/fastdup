@@ -123,7 +123,22 @@ export interface AuditEvent {
   outcome: string;
   detail: string;
 }
+export interface VeeamSettings {
+  revision: number;
+  interface: string;
+  address: string;
+  prefix: number;
+  gateway: string;
+  dns: string;
+  sshPublicKey: string;
+  sshEnabled: boolean;
+  hardenedImmutability: boolean;
+  advancedReduction: "off" | "dependent_v1";
+  logicalQuota: { value: number; unit: "gb" | "tb" | "pb" } | null;
+}
 export interface ApplianceSnapshot {
+  veeam?: VeeamSettings | null;
+  veeamActive?: boolean;
   telemetry: TelemetrySnapshot;
   targets: BlockTarget[];
   repository?: RepositoryBinding;

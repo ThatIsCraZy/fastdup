@@ -40,7 +40,7 @@ and TMPDIR configured there. Logs and replay harness: `.artifacts/clone-tail/`.
 
 ## Installed verification
 
-Installed `fastdup-0.7.1-2.el10.x86_64` on `10.1.1.161`. RPM SHA-256:
+Installed `fastdup-0.7.1-2.el10.x86_64` on the isolated test appliance. RPM SHA-256:
 
 ```
 6dbde3b4ac217d17f657ff09c4d5a8b17527690ab93ae2bf602650dd6c3d9d9d

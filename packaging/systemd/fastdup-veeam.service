@@ -1,0 +1,24 @@
+[Unit]
+Description=FastDup Veeam service container
+BindsTo=fastdup-repository.service
+PartOf=fastdup-repository.service
+After=fastdup-repository.service network-online.target
+Wants=network-online.target
+ConditionPathIsMountPoint=/srv/fastdup/repository
+ConditionPathExists=/etc/systemd/nspawn/fastdup-veeam.nspawn
+
+[Service]
+Type=notify
+Delegate=yes
+KillMode=mixed
+WatchdogSec=3min
+TasksMax=8192
+ExecStartPre=/usr/bin/findmnt --noheadings --types fuse --mountpoint /srv/fastdup/repository
+ExecStart=/usr/bin/systemd-nspawn --quiet --keep-unit --boot --settings=trusted --machine=fastdup-veeam --directory=/var/lib/machines/fastdup-veeam --notify-ready=yes
+TimeoutStartSec=180
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

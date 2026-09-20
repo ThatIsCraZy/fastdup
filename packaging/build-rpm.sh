@@ -75,6 +75,15 @@ if ldd "$stage_root/samba-vfs/fastdup.so" | grep -q 'not found'; then
     ldd "$stage_root/samba-vfs/fastdup.so" >&2
     exit 1
 fi
+mkdir -p "$stage_root/veeam"
+if [ ! -f "$artifact_root/veeam-image/rootfs.tar.gz" ]; then
+    "$workspace/packaging/veeam/build-image.sh"
+fi
+install -m 0755 "$workspace/packaging/veeam/provision.py" "$stage_root/veeam/veeam-provision"
+gcc -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC -shared \
+    "$workspace/packaging/veeam/reflink.c" -o "$stage_root/veeam/libfastdup-reflink.so" -ldl -pthread
+install -m 0755 "$workspace/packaging/veeam/xfs_info" "$stage_root/veeam/xfs_info"
+install -m 0644 "$artifact_root/veeam-image/rootfs.tar.gz" "$stage_root/veeam/rootfs.tar.gz"
 cp -a "$workspace/packaging/systemd" "$stage_root/"
 cp -a "$workspace/packaging/sysusers.d" "$stage_root/"
 cp -a "$workspace/packaging/tmpfiles.d" "$stage_root/"

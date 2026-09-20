@@ -31,6 +31,7 @@ mod shares;
 mod store;
 mod telemetry;
 mod tls;
+mod veeam;
 
 pub use appliance::ApplianceSnapshot;
 pub use auth::{AuthError, AuthenticatedSession, LoginResult, SessionManager, WebUser};
@@ -61,6 +62,7 @@ pub use telemetry::{
     StorageUsageTelemetry, SystemSampler, TelemetrySnapshot, dedup_rate,
 };
 pub use tls::{TlsIdentity, TlsIdentityError};
+pub use veeam::{BootstrapPassword, VeeamSettings};
 
 #[must_use]
 pub fn unix_seconds() -> i64 {

@@ -1,6 +1,6 @@
 # Metadata activity after background scrub (2026-09-13)
 
-Read-only diagnosis on VM 10.1.1.161, running fastdup 0.7.4-16, PID 268873.
+Read-only diagnosis on the isolated test appliance, running fastdup 0.7.4-16, PID 268873.
 The screenshot at 14:32:19 shows 92 MB/s Metadata reads. Journal confirms
 Container scrub completion at 14:30:46 (74,576 Containers, 5,861,806,080 read bytes).
 

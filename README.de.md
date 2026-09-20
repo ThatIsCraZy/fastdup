@@ -46,14 +46,20 @@ HTTPS-WebUI hält die Administration einfach.
   zugeteiltes Ziel jetzt aus Headroom, den kein anderer Pool will. Ein
   ungenutztes Ziel wächst dadurch nie, bei echter Konkurrenz wird sofort
   abgegeben, und unter harter Speicherknappheit entfällt die Rückhaltung ganz.
-- **Das Konzept für das Veeam Hardened Repository ist dokumentiert.**
-  [docs/research/veeam-hardened-repository-concept.md](docs/research/veeam-hardened-repository-concept.md)
-  beschreibt, die originalen Veeam-Repository-Dienste in einem lokalen
-  Linux-Systemcontainer gegen einen fastdup-gestützten, XFS-kompatiblen Pfad zu
-  betreiben statt über SMB. Das ist ein Request for Comments, keine Roadmap, und
-  benennt den ungelösten kritischen Pfad offen: Der FUSE-Mount beantwortet
-  `FICLONE`/`FICLONERANGE` heute mit `ENOTTY`, SMB bleibt damit der einzige
-  bewiesene Fast-Clone-Weg.
+- **Ein experimentelles Veeam-Linux-Repository ist jetzt integriert.** Die WebUI
+  provisioniert einen isolierten Systemcontainer mit eigener IPv4-Konfiguration,
+  optionaler logischer Quota, Advanced Reduction und begrenzter Hardened
+  Immutability. Ein prozessgebundener Adapter übersetzt Veeams Reflink-Aufrufe in
+  native Metadaten-Clones; der Storage-Kern erlaubt Immutable-Flags nur den
+  erkannten Veeam-Dienstidentitäten und Repository-Wurzeln. Auf einer
+  Labor-Appliance erreichte ein Active Full mit acht Tasks durchschnittlich
+  777 MB/s, ein Veeam-Export erzeugte 7.924 native Clones über 33,2 GB, Backup
+  Validator war erfolgreich und ein normaler Hardened-Job schloss mit
+  geschützten Restore Points ab. Siehe
+  [Qualifikationsbericht](docs/testing/veeam-service-container-2026-09-20.md) und
+  [Betriebsanleitung](docs/operations/veeam-service-container.md). Die Integration
+  bleibt eine experimentelle Kompatibilitätsschicht, kein echtes XFS, keine
+  Veeam-Zertifizierung und keine Support-Zusage.
 
 Keine Formatänderung: v0.8.1 liest und schreibt dasselbe Epoch-3-Repository wie
 v0.8.0, ein Upgrade von v0.8.0 erfordert keine Repository-Arbeit.
@@ -463,9 +469,10 @@ sudo dnf remove fastdup
 - keine eingebaute Device Redundancy, Replikation, WORM, Encryption-at-Rest-
   Policy, Cloud Tier oder Schutz vor Geräteverlust
 - POSIX-Umfang und breite Samba-/Client-Konformität noch unvollständig
-- Veeam-Backup und SMB Fast Clone sind auf der Test-Appliance bestätigt, das ist
-  aber keine Veeam-zertifizierte Integration und keine Support-Zusage
-- der Veeam Repository Agent ist noch nicht in die Appliance integriert
+- Veeam-Backup, nativer Fast Clone und begrenzte Hardened Immutability sind auf
+  einer Labor-Appliance qualifiziert; die Linux-Repository-Integration bleibt
+  experimentell, ist kein echtes XFS und enthält weder Veeam-Zertifizierung noch
+  Support-Zusage
 - Advanced Similarity Reduction bleibt bis zu breiterer Workload-Evidenz opt-in
 - kein Produktions-Support, Performance-SLA oder Kapazitätsversprechen
 

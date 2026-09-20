@@ -174,8 +174,8 @@ impl<I: StorageIo> GenerationRepository<I> {
                     match metadata_object_kind(encoded).map_err(ManifestTreeError::from)? {
                         MetadataObjectKind::ManifestLeaf => {}
                         MetadataObjectKind::ManifestInnerNode => {
-                            let node =
-                                ManifestInnerNode::decode(encoded).map_err(ManifestTreeError::from)?;
+                            let node = ManifestInnerNode::decode(encoded)
+                                .map_err(ManifestTreeError::from)?;
                             pending.extend(
                                 node.children()
                                     .iter()

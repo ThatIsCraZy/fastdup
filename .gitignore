@@ -1,2 +1,4 @@
 /.artifacts/
 /HANDOFF.md
+__pycache__/
+*.pyc

@@ -330,6 +330,15 @@ fn stop_service_with(runner: &dyn Fn(&[&str]) -> bool) -> bool {
 fn validate_share(share: &ShareSettings) -> Result<(), SambaError> {
     validate_token(&share.id, "Freigabe-ID")?;
     validate_token(&share.name, "Freigabename")?;
+    if share
+        .name
+        .trim_end_matches('$')
+        .eq_ignore_ascii_case("veeam")
+    {
+        return Err(SambaError::Invalid(
+            "veeam ist für den Veeam-Servicecontainer reserviert".into(),
+        ));
+    }
     validate_line(&share.description, "Beschreibung")?;
     if share
         .logical_quota
@@ -385,6 +394,19 @@ fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn veeam_name_is_reserved_even_for_hidden_or_disabled_shares() {
+        for name in ["veeam", "VEEAM", "Veeam$"] {
+            let mut value = share();
+            value.name = name.into();
+            value.enabled = false;
+            assert!(SambaConfig::render(&[value]).is_err());
+        }
+        let mut value = share();
+        value.name = "veeam-backups".into();
+        assert!(SambaConfig::render(&[value]).is_ok());
+    }
 
     fn share() -> ShareSettings {
         ShareSettings {

@@ -251,8 +251,17 @@ fn committed_snapshot_rejects_dangling_and_link_count_mismatches() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn clone_range_is_one_metadata_mutation_and_defers_source_data_reads() {
+    clone_range_fixture(false);
+}
+
+#[test]
+fn clone_range_retires_overwritten_dirty_target_payload() {
+    clone_range_fixture(true);
+}
+
+#[allow(clippy::too_many_lines)]
+fn clone_range_fixture(dirty_target: bool) {
     let source_reads = Arc::new(Mutex::new(Vec::new()));
     let target_reads = Arc::new(Mutex::new(Vec::new()));
     let source = CommittedInode::new(
@@ -351,6 +360,20 @@ fn clone_range_is_one_metadata_mutation_and_defers_source_data_reads() {
         Err(PosixError::Unsupported)
     );
 
+    if dirty_target {
+        namespace
+            .dispatch(
+                CALLER,
+                Operation::Write {
+                    inode: target_inode,
+                    handle: target_handle,
+                    offset: 0,
+                    data: b"----------------",
+                },
+            )
+            .expect("dirty target fixture");
+        assert_eq!(namespace.checkpointable_dirty_payload_bytes(), 16);
+    }
     assert_eq!(
         namespace.dispatch(
             CALLER,
@@ -366,8 +389,12 @@ fn clone_range_is_one_metadata_mutation_and_defers_source_data_reads() {
         ),
         Ok(Reply::Cloned {
             bytes: 8,
-            mutation_sequence: 12,
+            mutation_sequence: 12 + u64::from(dirty_target),
         })
+    );
+    assert_eq!(
+        namespace.checkpointable_dirty_payload_bytes(),
+        if dirty_target { 8 } else { 0 }
     );
     assert!(
         source_reads

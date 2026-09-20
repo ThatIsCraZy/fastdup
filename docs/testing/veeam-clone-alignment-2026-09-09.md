@@ -3,7 +3,7 @@
 Reported failure: `Transform.CompileFIB`, invalid parameter, source offset
 1,617,920, target offset 1,609,728, length 8,192.
 
-Read-only inspection of 10.1.1.161 found fastdup `0.6.4-14`, an explicit Samba
+Read-only inspection of the isolated test appliance found fastdup `0.6.4-14`, an explicit Samba
 `clone alignment = 65536`, and a 10,753,359,872-byte source file with Integrity
 xattr `0200`. The temporary target had already been removed. Both repository
 and Samba services were active. No matching Samba journal entry was available;

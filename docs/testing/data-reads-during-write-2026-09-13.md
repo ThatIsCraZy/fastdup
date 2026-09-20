@@ -1,6 +1,6 @@
 # DATA reads during ingest, 2026-09-13
 
-Read-only sampling of VM 10.1.1.161, RPM 0.7.4-16, repository PID 268873.
+Read-only sampling of the isolated test appliance, RPM 0.7.4-16, repository PID 268873.
 The recent online GC/checkpoint changes are not installed in this process.
 
 39.018-second window starting 14:50:45: DATA 1.193 MB/s reads, 68.66 read

@@ -25,6 +25,8 @@ mod versioned_file;
 
 use versioned_file::VersionedFile;
 
+const VEEAM_RETENTION_XATTR: &[u8] = b"user.immutable.until";
+
 pub use fuse_adapter::{
     FrontendTelemetry, FrontendTelemetrySnapshot, FuseFilesystem, StatFsSnapshot,
     StatFsSnapshotError, StatFsSource, volatile_mount_options,
@@ -930,6 +932,18 @@ pub trait MutationObserver: std::fmt::Debug + Send + Sync {
     /// Waits until every accepted mutation through `mutation_sequence` has
     /// left the observer's asynchronous processing queue.
     fn wait_through(&self, _inode: InodeId, _mutation_sequence: u64) {}
+}
+
+/// Durable barrier used only for protection-state changes.
+///
+/// Ordinary writes retain the appliance durability window. Immutable flag
+/// changes wait through their Namespace sequence before the kernel caller is
+/// told that the protection transition succeeded.
+pub trait ProtectionCommitFence: std::fmt::Debug + Send + Sync {
+    /// # Errors
+    /// Returns an I/O error when the requested Namespace prefix cannot be made
+    /// durable before the protection operation replies.
+    fn commit_through(&self, namespace_mutation_sequence: u64) -> Result<(), PosixError>;
 }
 
 /// Pessimistic physical capacity required by one acknowledged mutation.
@@ -2678,11 +2692,13 @@ pub struct Namespace {
     admission_changed: Notify,
     dirty_payload: DirtyPayloadTracker,
     mutation_observer: RwLock<Option<Arc<dyn MutationObserver>>>,
+    protection_commit_fence: OnceLock<Arc<dyn ProtectionCommitFence>>,
     commit_capacity_admission: OnceLock<Arc<dyn CommitCapacityAdmission>>,
     logical_quotas: LogicalQuotaTable,
     logical_usage: Mutex<logical_usage::LogicalUsageSampler>,
     frontend_deletes: AtomicU64,
     reduction_policy: RwLock<ShareReductionPolicy>,
+    immutability_authority: RwLock<ImmutabilityAuthorityPolicy>,
     catalog: RwLock<Catalog>,
     locks: Mutex<LockTable>,
     lock_change_sequence: AtomicU64,
@@ -2740,6 +2756,22 @@ impl DerefMut for MutationAdmissionFence<'_> {
 struct ShareReductionPolicy {
     default_enabled: bool,
     by_inode: BTreeMap<InodeId, (InodeId, bool)>,
+}
+
+#[derive(Debug, Default)]
+struct ImmutabilityAuthorityPolicy {
+    by_inode: BTreeMap<InodeId, ImmutabilityAuthority>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImmutabilityAuthority {
+    root: InodeId,
+    authority_uid: u32,
+    authority_gid: u32,
+    writer_uid: u32,
+    writer_gid: u32,
+    repository_uid: u32,
+    repository_gid: u32,
 }
 
 impl Default for ShareReductionPolicy {
@@ -2804,10 +2836,12 @@ impl Namespace {
             dirty_payload: DirtyPayloadTracker::default(),
             frontend_deletes: AtomicU64::new(0),
             mutation_observer: RwLock::new(None),
+            protection_commit_fence: OnceLock::new(),
             commit_capacity_admission: OnceLock::new(),
             logical_quotas: LogicalQuotaTable::default(),
             logical_usage: Mutex::default(),
             reduction_policy: RwLock::new(ShareReductionPolicy::default()),
+            immutability_authority: RwLock::new(ImmutabilityAuthorityPolicy::default()),
             catalog: RwLock::new(Catalog {
                 next_inode: ROOT_INODE.get() + 1,
                 inode_reservation_end: u64::MAX,
@@ -3088,10 +3122,12 @@ impl Namespace {
             dirty_payload: DirtyPayloadTracker::default(),
             frontend_deletes: AtomicU64::new(0),
             mutation_observer: RwLock::new(None),
+            protection_commit_fence: OnceLock::new(),
             commit_capacity_admission: OnceLock::new(),
             logical_quotas: LogicalQuotaTable::default(),
             logical_usage: Mutex::default(),
             reduction_policy: RwLock::new(ShareReductionPolicy::default()),
+            immutability_authority: RwLock::new(ImmutabilityAuthorityPolicy::default()),
             catalog: RwLock::new(Catalog {
                 next_inode: snapshot.next_inode,
                 inode_reservation_end: snapshot.inode_reservation_end,
@@ -3288,6 +3324,19 @@ impl Namespace {
         self.dirty_payload.load()
     }
 
+    /// Returns the Namespace mutation sequence selected by the last completed
+    /// durable commit.
+    ///
+    /// # Panics
+    /// Panics if an earlier invariant failure poisoned the catalog lock.
+    #[must_use]
+    pub fn committed_namespace_mutation_sequence(&self) -> u64 {
+        self.catalog
+            .read()
+            .expect("ASSERT: catalog lock poisoned")
+            .committed_namespace_mutation_sequence
+    }
+
     /// Installs the one appliance-owned write-through observer before serving
     /// requests. Replacing an installed observer would split one mutation
     /// stream across two reduction states and is therefore an impossible use.
@@ -3306,6 +3355,17 @@ impl Namespace {
             "ASSERT: a Namespace may install only one mutation observer"
         );
         *installed = Some(observer);
+    }
+
+    /// Installs the durable appliance barrier for immutable-flag transitions.
+    ///
+    /// # Panics
+    /// Panics when a barrier was already installed.
+    pub fn install_protection_commit_fence(&self, fence: Arc<dyn ProtectionCommitFence>) {
+        assert!(
+            self.protection_commit_fence.set(fence).is_ok(),
+            "ASSERT: a Namespace may install only one protection commit fence"
+        );
     }
 
     /// Installs the appliance's one physical commit-capacity governor.
@@ -3522,6 +3582,117 @@ impl Namespace {
         Ok(())
     }
 
+    /// Replaces the appliance-managed immutable-flag authorities.
+    ///
+    /// Each rule binds one non-overlapping directory subtree to exactly one
+    /// service UID. Existing cross-boundary hard links are rejected.
+    ///
+    /// # Errors
+    /// Rejects zero/root authority UIDs, missing or non-directory roots,
+    /// nested roots, and existing cross-boundary links.
+    ///
+    /// # Panics
+    /// Panics if an earlier invariant failure poisoned a Namespace lock.
+    pub fn replace_immutability_authorities(
+        &self,
+        rules: Vec<(InodeId, u32, u32, u32, u32, u32, u32)>,
+    ) -> Result<(), PosixError> {
+        if rules.len() > 4096
+            || rules.iter().any(
+                |(
+                    _,
+                    authority_uid,
+                    authority_gid,
+                    writer_uid,
+                    writer_gid,
+                    handoff_uid,
+                    handoff_gid,
+                )| {
+                    *authority_uid == 0
+                        || *authority_gid == 0
+                        || *writer_uid == 0
+                        || *writer_gid == 0
+                        || *handoff_uid == 0
+                        || *handoff_gid == 0
+                },
+            )
+        {
+            return Err(PosixError::InvalidArgument);
+        }
+        let _fence = self.mutation_admission_fence();
+        let catalog = self.catalog.read().expect("catalog lock");
+        let mut roots = BTreeMap::new();
+        for (
+            root,
+            authority_uid,
+            authority_gid,
+            writer_uid,
+            writer_gid,
+            handoff_uid,
+            handoff_gid,
+        ) in rules
+        {
+            validate_directory(&catalog, root)?;
+            let rule = ImmutabilityAuthority {
+                root,
+                authority_uid,
+                authority_gid,
+                writer_uid,
+                writer_gid,
+                repository_uid: handoff_uid,
+                repository_gid: handoff_gid,
+            };
+            if roots.insert(root, rule).is_some() {
+                return Err(PosixError::InvalidArgument);
+            }
+        }
+        let mut by_inode = BTreeMap::new();
+        for (&root, &rule) in &roots {
+            let mut pending = vec![root];
+            while let Some(inode) = pending.pop() {
+                if inode != root && roots.contains_key(&inode) {
+                    return Err(PosixError::InvalidArgument);
+                }
+                if let Some(old) = by_inode.insert(inode, rule) {
+                    if old.root != root {
+                        return Err(PosixError::InvalidArgument);
+                    }
+                    continue;
+                }
+                for ((parent, _), &child) in catalog.entries.range((inode, Vec::new())..) {
+                    if *parent != inode {
+                        break;
+                    }
+                    pending.push(child);
+                }
+            }
+        }
+        for ((parent, _), target) in &catalog.entries {
+            if let Some(rule) = by_inode.get(target)
+                && *target != rule.root
+                && by_inode.get(parent).map(|candidate| candidate.root) != Some(rule.root)
+            {
+                return Err(PosixError::InvalidArgument);
+            }
+        }
+        let mut policy = self
+            .immutability_authority
+            .write()
+            .expect("immutability authority lock");
+        // An open orphan remains in the authority that admitted its creation.
+        for (&inode, &old_rule) in &policy.by_inode {
+            if !by_inode.contains_key(&inode)
+                && let Some(object) = catalog.inodes.get(&inode)
+                && object.state.read().expect("inode lock").link_count == 0
+                && let Some(&rule) = roots.get(&old_rule.root)
+            {
+                by_inode.insert(inode, rule);
+            }
+        }
+        policy.by_inode = by_inode;
+        Ok(())
+    }
+
     /// Whether new encodings for this inode may use Advanced Reduction.
     ///
     /// # Panics
@@ -3568,6 +3739,68 @@ impl Namespace {
     fn same_reduction_share(&self, inode: InodeId, parent: InodeId) -> bool {
         let policy = self.reduction_policy.read().expect("Share reduction lock");
         policy.by_inode.get(&inode).map(|p| p.0) == policy.by_inode.get(&parent).map(|p| p.0)
+    }
+
+    fn associate_immutability_child(&self, parent: InodeId, inode: InodeId) {
+        let mut policy = self
+            .immutability_authority
+            .write()
+            .expect("immutability authority lock");
+        if let Some(rule) = policy.by_inode.get(&parent).copied() {
+            policy.by_inode.insert(inode, rule);
+        }
+    }
+
+    fn same_immutability_domain(&self, inode: InodeId, parent: InodeId) -> bool {
+        let policy = self
+            .immutability_authority
+            .read()
+            .expect("immutability authority lock");
+        policy.by_inode.get(&inode).map(|rule| rule.root)
+            == policy.by_inode.get(&parent).map(|rule| rule.root)
+    }
+
+    fn may_change_file_flags(&self, uid: u32, inode: InodeId) -> bool {
+        uid == 0
+            || self
+                .immutability_authority
+                .read()
+                .expect("immutability authority lock")
+                .by_inode
+                .get(&inode)
+                .is_some_and(|rule| rule.authority_uid == uid)
+    }
+
+    fn may_handoff_authority_owned_inode(
+        &self,
+        uid: u32,
+        inode: InodeId,
+        current_uid: u32,
+        current_gid: u32,
+        requested_uid: Option<u32>,
+        requested_gid: Option<u32>,
+    ) -> bool {
+        self.immutability_authority
+            .read()
+            .expect("immutability authority lock")
+            .by_inode
+            .get(&inode)
+            .is_some_and(|rule| {
+                uid == rule.authority_uid
+                    && ((current_uid == rule.writer_uid && current_gid == rule.writer_gid)
+                        || (current_uid == rule.authority_uid && current_gid == rule.authority_gid)
+                        || (current_uid == rule.repository_uid
+                            && current_gid == rule.repository_gid)
+                        || (current_uid == rule.repository_uid && current_gid == rule.writer_gid)
+                        || (current_uid == rule.writer_uid && current_gid == rule.repository_gid)
+                        || (current_uid == rule.repository_uid
+                            && current_gid == rule.authority_gid)
+                        || (current_uid == rule.authority_uid
+                            && current_gid == rule.repository_gid))
+                    && requested_uid.is_none_or(|requested| requested == rule.repository_uid)
+                    && requested_gid.is_none_or(|requested| requested == rule.repository_gid)
+                    && (requested_uid.is_some() || requested_gid.is_some())
+            })
     }
 
     #[must_use]
@@ -4026,10 +4259,11 @@ impl Namespace {
         let durable_mutation = operation.is_durable_mutation();
         let requires_mutation_admission = operation.requires_mutation_admission();
         let claim = operation.commit_capacity_claim();
-        let _mutation_fence = requires_mutation_admission
+        let mutation_fence = requires_mutation_admission
             .then(|| self.require_mutation_admission())
             .transpose()?;
         let reservation = self.reserve_commit_capacity(claim)?;
+        let mut protection_sequence = None;
         let result = match operation {
             Operation::Lookup { parent, name } => self.lookup(parent, name),
             Operation::GetAttr { inode } => self.getattr(inode),
@@ -4043,7 +4277,12 @@ impl Namespace {
             } => self.set_xattr(context, inode, name, value, mode),
             Operation::RemoveXattr { inode, name } => self.remove_xattr(context, inode, name),
             Operation::GetFileFlags { inode } => self.get_file_flags(inode),
-            Operation::SetFileFlags { inode, flags } => self.set_file_flags(context, inode, flags),
+            Operation::SetFileFlags { inode, flags } => {
+                self.set_file_flags(context, inode, flags).map(|sequence| {
+                    protection_sequence = sequence;
+                    Reply::Empty
+                })
+            }
             Operation::SetMode { inode, mode } => self.set_mode(context, inode, mode),
             Operation::SetAttributes { inode, update } => {
                 self.set_attributes(context, inode, update)
@@ -4210,7 +4449,14 @@ impl Namespace {
         if durable_mutation && result.is_ok() {
             reservation.accept();
         }
-        result
+        drop(mutation_fence);
+        let reply = result?;
+        if let Some(sequence) = protection_sequence
+            && let Some(fence) = self.protection_commit_fence.get()
+        {
+            fence.commit_through(sequence)?;
+        }
+        Ok(reply)
     }
 
     fn create_and_track_writer(&self, request: CreateRequest<'_>) -> Result<Reply, PosixError> {
@@ -4379,8 +4625,8 @@ impl Namespace {
         context: RequestContext,
         inode: InodeId,
         flags: u32,
-    ) -> Result<Reply, PosixError> {
-        if context.uid != 0 {
+    ) -> Result<Option<u64>, PosixError> {
+        if !self.may_change_file_flags(context.uid, inode) {
             return Err(PosixError::PermissionDenied);
         }
         let catalog = self.catalog.write().expect("ASSERT: catalog lock poisoned");
@@ -4391,7 +4637,7 @@ impl Namespace {
             .ok_or(PosixError::NoEntry)?;
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
         if state.metadata.file_flags() == flags {
-            return Ok(Reply::Empty);
+            return Ok(None);
         }
         let reservation = self.reserve_commit_capacity(CommitCapacityClaim::new(
             MUTATION_METADATA_INCREMENT_BYTES_V1,
@@ -4411,7 +4657,7 @@ impl Namespace {
             install_root_mutation_sequence(&catalog, next_namespace_sequence);
         }
         reservation.accept();
-        Ok(Reply::Empty)
+        Ok(Some(next_namespace_sequence))
     }
 
     fn set_mode(
@@ -4479,14 +4725,25 @@ impl Namespace {
             .cloned()
             .ok_or(PosixError::NoEntry)?;
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
-        if state.metadata.is_immutable() {
+        let authority_handoff = update.mode.is_none()
+            && update.atime.is_none()
+            && update.mtime.is_none()
+            && self.may_handoff_authority_owned_inode(
+                context.uid,
+                inode,
+                state.uid,
+                state.gid,
+                update.uid,
+                update.gid,
+            );
+        if state.metadata.is_immutable() && !authority_handoff {
             return Err(PosixError::PermissionDenied);
         }
         if context.uid != 0 {
-            if context.uid != state.uid || update.uid.is_some() {
+            if (context.uid != state.uid || update.uid.is_some()) && !authority_handoff {
                 return Err(PosixError::PermissionDenied);
             }
-            if update.gid.is_some_and(|gid| gid != context.gid) {
+            if update.gid.is_some_and(|gid| gid != context.gid) && !authority_handoff {
                 return Err(PosixError::PermissionDenied);
             }
         }
@@ -4554,6 +4811,7 @@ impl Namespace {
         }
         if !self.logical_quotas.same_domain(inode, new_parent)
             || !self.same_reduction_share(inode, new_parent)
+            || !self.same_immutability_domain(inode, new_parent)
         {
             return Err(PosixError::CrossDevice);
         }
@@ -4642,6 +4900,7 @@ impl Namespace {
         adjust_policy_name_matches(&catalog, inode, name_matches, true);
         self.logical_quotas.associate_child(parent, inode);
         self.associate_reduction_child(parent, inode);
+        self.associate_immutability_child(parent, inode);
         install_root_mutation_sequence(&catalog, next_namespace_sequence);
         if self.commit_capacity_admission.get().is_some() {
             assert!(
@@ -4732,7 +4991,11 @@ impl Namespace {
             .cloned()
             .ok_or(PosixError::NoEntry)?;
         let mut state = object.state.write().expect("ASSERT: inode lock poisoned");
-        authorize_xattr_mutation(context, &state, name)?;
+        let retention_authority =
+            name == VEEAM_RETENTION_XATTR && self.may_change_file_flags(context.uid, inode);
+        if !retention_authority {
+            authorize_xattr_mutation(context, &state, name)?;
+        }
         if state.metadata.is_immutable() {
             return Err(PosixError::PermissionDenied);
         }
@@ -4784,6 +5047,7 @@ impl Namespace {
             self.logical_quotas
                 .associate_child(request.parent, entry.attr.inode);
             self.associate_reduction_child(request.parent, entry.attr.inode);
+            self.associate_immutability_child(request.parent, entry.attr.inode);
         }
         if let Ok(Reply::Created { entry, .. }) = &result
             && self.commit_capacity_admission.get().is_some()
@@ -4884,6 +5148,7 @@ impl Namespace {
         adjust_policy_name_matches(&catalog, inode, name_matches, true);
         self.logical_quotas.associate_child(parent, inode);
         self.associate_reduction_child(parent, inode);
+        self.associate_immutability_child(parent, inode);
         parent_state.link_count = next_parent_links;
         parent_state.mutation_sequence = next_parent_sequence;
         drop(parent_state);
@@ -5546,10 +5811,15 @@ impl Namespace {
             "ASSERT: admitted clone allocation must match its logical quota claim"
         );
         let dirty_after = target.data.active_resident_payload_bytes();
-        assert_eq!(
-            dirty_before, dirty_after,
+        assert!(
+            dirty_after <= dirty_before,
             "ASSERT: a metadata clone must not allocate resident dirty payload"
         );
+        // Replacing a live dirty range retires its payload. The clone itself
+        // adds only immutable recipes, so retain only the surviving charge.
+        if target.link_count > 0 {
+            self.dirty_payload.replace(dirty_before, dirty_after);
+        }
         target.mutation_sequence = next_sequence;
         let now = PosixTimestamp::now();
         target.times.mtime = now;
@@ -6005,6 +6275,7 @@ impl Namespace {
         }
         if !self.logical_quotas.same_domain(source_inode, new_parent)
             || !self.same_reduction_share(source_inode, new_parent)
+            || !self.same_immutability_domain(source_inode, new_parent)
         {
             return Err(PosixError::CrossDevice);
         }
@@ -6347,6 +6618,11 @@ impl Namespace {
         self.reduction_policy
             .write()
             .expect("Share reduction lock")
+            .by_inode
+            .remove(&inode);
+        self.immutability_authority
+            .write()
+            .expect("immutability authority lock")
             .by_inode
             .remove(&inode);
     }

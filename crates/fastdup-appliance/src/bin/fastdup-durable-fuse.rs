@@ -1,7 +1,7 @@
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use fastdup_appliance::OnlineGcSchedulerStatus;
@@ -15,7 +15,10 @@ use fastdup_appliance::{
     bind_online_gc_control_socket, checkpoint_exact_index_profile_v1, checkpoint_policy_set,
     online_gc_control_path,
 };
-use fastdup_posix::{FuseFilesystem, Namespace, NamespaceConfig, volatile_mount_options};
+use fastdup_posix::{
+    FuseFilesystem, Namespace, NamespaceConfig, PosixError, ProtectionCommitFence,
+    volatile_mount_options,
+};
 use fastdup_store::{
     ContainerRepository, DataPoolUsage, ExactIndexRunRepository, FsStorageIo,
     GcCandidateCatalogRepository, GcPhaseRequest, GenerationRepository, MaintenanceCancellation,
@@ -77,6 +80,33 @@ type FsAppliance = DurableNamespace<FsStorageIo, FrontendContainerStorage>;
 type FsOnlineMaintenance =
     MaintenanceRepository<FsStorageIo, MaintenanceContainerStorage, FsStorageIo>;
 type FsGcCatalog = GcCandidateCatalogRepository<FsStorageIo>;
+
+struct DurableProtectionCommitFence {
+    appliance: Weak<FsAppliance>,
+}
+
+impl std::fmt::Debug for DurableProtectionCommitFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DurableProtectionCommitFence")
+    }
+}
+
+impl ProtectionCommitFence for DurableProtectionCommitFence {
+    fn commit_through(&self, sequence: u64) -> Result<(), PosixError> {
+        let appliance = self.appliance.upgrade().ok_or(PosixError::Io)?;
+        appliance
+            .checkpoint_profiled()
+            .map_err(|_| PosixError::Io)?;
+        if appliance
+            .namespace()
+            .committed_namespace_mutation_sequence()
+            < sequence
+        {
+            return Err(PosixError::Io);
+        }
+        Ok(())
+    }
+}
 
 struct RecoveredAppliance {
     startup_data_verification: fastdup_store::PendingDataVerification,
@@ -261,6 +291,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_online_gc_recovery(recovered.online_gc_recovery);
     let appliance = Arc::new(recovered.appliance);
     let namespace = appliance.namespace_arc();
+    namespace.install_protection_commit_fence(Arc::new(DurableProtectionCommitFence {
+        appliance: Arc::downgrade(&appliance),
+    }));
     namespace
         .set_advanced_reduction_default(advanced_reduction == AdvancedReductionPolicy::DependentV1);
     namespace.replace_small_file_extensions(small_file_policy_revision, small_file_extensions)?;

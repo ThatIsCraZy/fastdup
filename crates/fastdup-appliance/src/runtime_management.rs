@@ -62,6 +62,8 @@ enum ManagementOperation {
         rules: Vec<PresentedCapacityRule>,
         #[serde(default)]
         reduction_rules: Option<Vec<ReductionRule>>,
+        #[serde(default)]
+        immutability_rules: Option<Vec<ImmutabilityRule>>,
     },
     UpdateAdvancedReductionDefault {
         enabled: bool,
@@ -85,12 +87,30 @@ struct ShareCapacityManifest {
     rules: Vec<PresentedCapacityRule>,
     #[serde(default)]
     reduction_rules: Vec<ReductionRule>,
+    #[serde(default)]
+    immutability_rules: Vec<ImmutabilityRule>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct ReductionRule {
     inode: u64,
     enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct ImmutabilityRule {
+    inode: u64,
+    authority_uid: u32,
+    #[serde(default)]
+    authority_gid: Option<u32>,
+    #[serde(default)]
+    writer_uid: Option<u32>,
+    #[serde(default)]
+    writer_gid: Option<u32>,
+    #[serde(default)]
+    handoff_uid: Option<u32>,
+    #[serde(default)]
+    handoff_gid: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +240,8 @@ impl PresentedCapacityControl {
                 )
             };
             apply_reduction_rules(&control.namespace, manifest.reduction_rules)
+                .map_err(describe)?;
+            apply_immutability_rules(&control.namespace, manifest.immutability_rules)
                 .map_err(describe)?;
             control
                 .replace(
@@ -442,11 +464,19 @@ fn apply_operation(
             revision,
             rules,
             reduction_rules,
+            immutability_rules,
         } => {
             let mut response = update_presented_capacities(capacity_source, revision, rules);
             if response.ok
                 && let Some(rules) = reduction_rules
                 && let Err(error) = apply_reduction_rules(namespace, rules)
+            {
+                response.ok = false;
+                response.error = Some(error);
+            }
+            if response.ok
+                && let Some(rules) = immutability_rules
+                && let Err(error) = apply_immutability_rules(namespace, rules)
             {
                 response.ok = false;
                 response.error = Some(error);
@@ -504,6 +534,55 @@ fn apply_reduction_rules(namespace: &Namespace, rules: Vec<ReductionRule>) -> Re
         .collect::<Result<Vec<_>, _>>()?;
     namespace
         .replace_share_reduction(namespace.advanced_reduction_default(), rules)
+        .map_err(|error| format!("{error:?}"))
+}
+
+fn apply_immutability_rules(
+    namespace: &Namespace,
+    rules: Vec<ImmutabilityRule>,
+) -> Result<(), String> {
+    let rules = rules
+        .into_iter()
+        .map(|rule| {
+            let authority_gid = rule.authority_gid.unwrap_or(rule.authority_uid);
+            let (handoff_uid, handoff_gid) = match (rule.handoff_uid, rule.handoff_gid) {
+                (Some(uid), Some(gid)) => (uid, gid),
+                (None, None) => (rule.authority_uid, rule.authority_uid),
+                _ => {
+                    return Err(
+                        "Immutability handoff UID and GID must be specified together".to_owned(),
+                    );
+                }
+            };
+            let (writer_uid, writer_gid) = match (rule.writer_uid, rule.writer_gid) {
+                (Some(uid), Some(gid)) => (uid, gid),
+                // Version-one manifests used the handoff identity as both the
+                // source and destination. Preserve that behavior until the
+                // controller publishes the dynamically resolved v5 rule.
+                (None, None) => (handoff_uid, handoff_gid),
+                _ => {
+                    return Err(
+                        "Immutability writer UID and GID must be specified together".to_owned()
+                    );
+                }
+            };
+            InodeId::new(rule.inode)
+                .map(|inode| {
+                    (
+                        inode,
+                        rule.authority_uid,
+                        authority_gid,
+                        writer_uid,
+                        writer_gid,
+                        handoff_uid,
+                        handoff_gid,
+                    )
+                })
+                .ok_or_else(|| "Immutability root inode must be nonzero".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    namespace
+        .replace_immutability_authorities(rules)
         .map_err(|error| format!("{error:?}"))
 }
 
@@ -751,6 +830,7 @@ mod tests {
         let quota = apply_operation(
             ManagementOperation::UpdatePresentedCapacities {
                 reduction_rules: None,
+                immutability_rules: None,
                 revision: "shares-r1".to_owned(),
                 rules: vec![PresentedCapacityRule {
                     inode: 42,

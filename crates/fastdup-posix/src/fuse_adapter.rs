@@ -404,13 +404,25 @@ impl Default for WritePipelineLaneState {
 
 impl PerInodeWritePipeline {
     fn register(&self, inode: u64, offset: u64, length: u32) -> u64 {
-        let lane = {
-            let mut lanes = self
-                .lanes
-                .lock()
-                .expect("ASSERT: per-inode write-pipeline registry lock poisoned");
-            Arc::clone(lanes.entry(inode).or_default())
-        };
+        self.register_with_observer(inode, offset, length, || {})
+    }
+
+    fn register_with_observer(
+        &self,
+        inode: u64,
+        offset: u64,
+        length: u32,
+        observer: impl FnOnce(),
+    ) -> u64 {
+        let mut lanes = self
+            .lanes
+            .lock()
+            .expect("ASSERT: per-inode write-pipeline registry lock poisoned");
+        let lane = Arc::clone(lanes.entry(inode).or_default());
+        // Registration and the outstanding increment are one registry
+        // operation. Otherwise the final predecessor can remove this lane
+        // after lookup but before the new write becomes visible in its state.
+        observer();
         let mut state = lane
             .state
             .lock()
@@ -438,6 +450,7 @@ impl PerInodeWritePipeline {
             "ASSERT: monotonic FUSE write sequence cannot already be pending"
         );
         drop(state);
+        drop(lanes);
         lane.changed.notify_waiters();
         sequence
     }
@@ -1411,6 +1424,12 @@ impl Filesystem for FuseFilesystem {
         const FS_IOC32_SETFLAGS: u32 = 0x4004_6602;
         const FS_IOC_FSGETXATTR: u32 = 0x801c_581f;
         const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
+        // User-namespaced root lacks CAP_LINUX_IMMUTABLE in the mount's user
+        // namespace, so Linux rejects its standard setters before FUSE sees
+        // them. The repository-scoped preload adapter translates only those
+        // setters; Namespace authority remains the final security decision.
+        const FASTDUP_IOC_SETFLAGS: u32 = 0x4004_fd02;
+        const FASTDUP_IOC_FSSETXATTR: u32 = 0x401c_fd20;
         const FS_XFLAG_IMMUTABLE: u32 = 0x0000_0008;
         const FSXATTR_BYTES: usize = 28;
         let inode = inode_from_raw(inode)?;
@@ -1431,7 +1450,7 @@ impl Filesystem for FuseFilesystem {
                     data: output.into(),
                 })
             }
-            FS_IOC_SETFLAGS | FS_IOC32_SETFLAGS => {
+            FS_IOC_SETFLAGS | FS_IOC32_SETFLAGS | FASTDUP_IOC_SETFLAGS => {
                 if !(4..=8).contains(&u32::try_from(input.len()).unwrap_or(u32::MAX))
                     || output_size != 0
                     || input
@@ -1478,7 +1497,7 @@ impl Filesystem for FuseFilesystem {
                     data: output.into(),
                 })
             }
-            FS_IOC_FSSETXATTR => {
+            FS_IOC_FSSETXATTR | FASTDUP_IOC_FSSETXATTR => {
                 if input.len() != FSXATTR_BYTES
                     || output_size != 0
                     || input[4..].iter().any(|byte| *byte != 0)
@@ -2358,9 +2377,9 @@ fn release_lookup_reference(namespace: &Namespace, inode: InodeId) {
 mod tests {
     use super::{
         FrontendTelemetry, FuseFilesystem, INTERNAL_CONTEXT, KernelDataInvalidation,
-        LookupTrackingStream, PER_INODE_WRITE_REORDER_GRACE, PendingWrite, StatFsSnapshot,
-        WritePipelineLaneState, dispatch_mutation_with_backpressure, fallocate_mode,
-        regular_file_open_flags, select_next_write, write_ranges_overlap,
+        LookupTrackingStream, PER_INODE_WRITE_REORDER_GRACE, PendingWrite, PerInodeWritePipeline,
+        StatFsSnapshot, WritePipelineLaneState, dispatch_mutation_with_backpressure,
+        fallocate_mode, regular_file_open_flags, select_next_write, write_ranges_overlap,
     };
     use crate::{
         AccessMode, FallocateMode, Namespace, NamespaceConfig, OpenOptions, Operation, PosixError,
@@ -2370,6 +2389,8 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, mpsc};
+    use std::thread;
     use std::time::{Duration, Instant};
     #[test]
     fn frontend_telemetry_counts_successes_errors_and_fixed_latency_buckets() {
@@ -2452,6 +2473,51 @@ mod tests {
 
         assert_eq!(select_next_write(&mut state), None);
         assert_eq!(state.selected, Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_retirement_cannot_detach_an_inflight_registration() {
+        let pipeline = Arc::new(PerInodeWritePipeline::default());
+        let first = pipeline.register(7, 0, 4);
+        let first_turn = pipeline.wait_for_turn(7, first).await;
+        let selected = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let registrar = Arc::clone(&pipeline);
+        let selected_by_registrar = Arc::clone(&selected);
+        let resume_registrar = Arc::clone(&resume);
+        let registration = thread::spawn(move || {
+            registrar.register_with_observer(7, 4, 4, || {
+                selected_by_registrar.wait();
+                resume_registrar.wait();
+            })
+        });
+        selected.wait();
+
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let retirement = thread::spawn(move || {
+            drop(first_turn);
+            finished_tx.send(()).expect("retirement signal is received");
+        });
+        let retired_while_registration_was_inflight =
+            finished_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        resume.wait();
+        let second = registration.join().expect("registration does not panic");
+        if !retired_while_registration_was_inflight {
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("retirement completes after registration");
+        }
+        retirement.join().expect("retirement does not panic");
+
+        assert!(
+            !retired_while_registration_was_inflight,
+            "a final retirement must not detach a registrar that already selected its lane"
+        );
+        let second_turn =
+            tokio::time::timeout(Duration::from_secs(1), pipeline.wait_for_turn(7, second))
+                .await
+                .expect("the registered write receives its turn");
+        drop(second_turn);
     }
 
     #[test]
