@@ -8,7 +8,7 @@ fn payload(value: u8, length: usize) -> VerifiedChunkPayload {
 }
 
 fn cache(limit: usize) -> VerifiedReadCache {
-    let cache = VerifiedReadCache::new_legacy_with_snapshot(
+    let cache = VerifiedReadCache::new_with_snapshot(
         VerifiedReadCacheConfig::new(limit, 0, NonZeroUsize::new(4).unwrap()).unwrap(),
         MemoryPressureSnapshot::new(128 * 1024 * 1024, 128 * 1024 * 1024, 0),
     )
@@ -36,111 +36,58 @@ pub(super) fn shared_group() -> Vec<VerifiedChunkPayload> {
 pub(super) fn limit_payload(cache: &VerifiedReadCache, bytes: usize) {
     cache.update_memory_pressure(MemoryPressureSnapshot::new(
         128 * 1024 * 1024,
-        u64::try_from(cache.metadata_bytes + bytes).unwrap(),
+        u64::try_from(bytes).unwrap(),
         0,
     ));
 }
 
+/// Recomputes resident accounting from the unified directory itself:
+/// one charge per shared decoded backing, one per compressed entry,
+/// plus the unified per-entry directory charge.
 pub(super) fn assert_accounting(cache: &VerifiedReadCache) {
-    let _admission = cache.admission.lock().unwrap();
-    let mut backings = std::collections::BTreeMap::new();
-    let mut entries = 0;
-    for shard in &cache.shards {
-        let state = shard.state.lock().unwrap();
-        for entry in state.sets.iter().flat_map(|set| set.ways.iter().flatten()) {
-            entries += 1;
-            backings.insert(
-                Arc::as_ptr(&entry.backing_charge).addr(),
-                entry.backing_charge.bytes,
-            );
-        }
-    }
-    assert_eq!(cache.entry_count.load(Ordering::Acquire), entries);
-    let resident = cache.resident_bytes.load(Ordering::Acquire);
-    assert_eq!(resident, backings.values().sum::<usize>());
-    let mut compressed = std::collections::BTreeMap::new();
-    for shard in &cache.shards {
-        let state = shard.state.lock().unwrap();
-        for entry in state.sets.iter().flat_map(|set| set.ways.iter().flatten()) {
-            if entry.backing_charge.compressed_logical != 0 {
-                compressed.insert(
-                    Arc::as_ptr(&entry.backing_charge).addr(),
-                    (
-                        entry.backing_charge.bytes,
-                        entry.backing_charge.compressed_logical,
-                    ),
-                );
+    let status = cache.status();
+    let mut entries = 0_usize;
+    let mut backings = std::collections::HashMap::new();
+    let mut compressed_bytes = 0_usize;
+    let mut compressed_logical = 0_usize;
+    cache.unified.visit::<CachedPayload>(|payload| {
+        entries += 1;
+        match payload {
+            CachedPayload::Decoded(payload) => {
+                backings.insert(payload.backing_id(), payload.backing_allocation_bytes());
+            }
+            CachedPayload::Compressed(value) => {
+                compressed_bytes += value.resident_bytes();
+                compressed_logical += value.logical_length();
             }
         }
-    }
-    assert_eq!(
-        cache.compression.resident.load(Ordering::Acquire),
-        compressed.values().map(|v| v.0).sum::<usize>()
-    );
-    assert_eq!(
-        cache.compression.logical.load(Ordering::Acquire),
-        compressed.values().map(|v| v.1).sum::<usize>()
-    );
-    assert!(resident <= cache.target_bytes.load(Ordering::Acquire));
-    assert!(resident + cache.metadata_bytes <= cache.config.hard_limit_bytes);
+    });
+    assert_eq!(status.entry_count(), entries);
+    let expected = backings.values().sum::<usize>() + compressed_bytes + entries * 512;
+    assert_eq!(status.resident_bytes(), expected);
+    assert_eq!(status.compressed_resident_bytes(), compressed_bytes);
+    assert_eq!(status.compressed_logical_bytes(), compressed_logical);
+    assert!(status.resident_bytes() <= status.target_bytes());
 }
 
 #[test]
-fn shared_backing_is_charged_until_its_last_cache_view_is_evicted() {
+fn shared_backing_is_charged_once_and_released_when_pressure_evicts_it() {
     let cache = cache(4 * 1024 * 1024);
     let group = shared_group();
     let bytes = group[0].backing_allocation_bytes();
-    limit_payload(&cache, bytes);
     cache.admit_decoded_group(group.clone());
     assert!(cache.status().entry_count() > 1);
-    let protected = Arc::new(CacheBackingCharge {
-        bytes: 0,
-        compressed_logical: 0,
-    });
-    for _ in 0..1024 {
-        {
-            let mut admission = cache.admission.lock().unwrap();
-            let mut steps = 1;
-            cache.reclaim_locked(&mut admission, &mut steps, 0, Some(&protected));
-            assert_eq!(steps, 0);
-        }
-        assert_accounting(&cache);
-        let status = cache.status();
-        if status.entry_count() == 0 {
-            assert_eq!(status.resident_bytes(), 0);
-            // An outstanding verified reader retains its own immutable bytes.
-            assert_eq!(group[0].as_slice(), &vec![1; 16384]);
-            return;
-        }
-        assert_eq!(status.resident_bytes(), bytes);
-    }
-    panic!("bounded sweeps must eventually retire the shared backing");
-}
-
-#[test]
-fn large_sparse_geometry_makes_progress_with_bounded_admission_work() {
-    let cache = cache(64 * 1024 * 1024);
-    let group = shared_group();
-    let bytes = group[0].backing_allocation_bytes();
-    limit_payload(&cache, bytes);
-    cache.admit_decoded_group(group);
-    let new = payload(93, 262_144);
-    assert_eq!(new.backing_allocation_bytes(), bytes);
-    let slots = cache.shards.len() * cache.shards[0].state.lock().unwrap().sets.len() * CACHE_WAYS;
-    assert!(slots > MAX_RECLAIM_STEPS_PER_GROUP);
-    for _ in 0..=slots.div_ceil(MAX_RECLAIM_STEPS_PER_GROUP) {
-        let before = cache.admission.lock().unwrap().reclaim_cursor;
-        cache.admit_decoded_group(vec![new.clone()]);
-        let after = cache.admission.lock().unwrap().reclaim_cursor;
-        assert!((after + slots - before) % slots <= MAX_RECLAIM_STEPS_PER_GROUP);
-        assert_accounting(&cache);
-        if let Some(hit) = cache.get(new.chunk_id(), 262_144) {
-            assert_eq!(hit, new);
-            assert!(cache.status().evictions() > 0);
-            return;
-        }
-    }
-    panic!("the cursor must progress across admissions, including shared views");
+    assert_eq!(
+        cache.status().resident_bytes(),
+        bytes + group.len() * 512,
+        "one shared backing is charged once for all its cache views"
+    );
+    assert_accounting(&cache);
+    limit_payload(&cache, 0);
+    assert_eq!(cache.status().entry_count(), 0);
+    assert_eq!(cache.status().resident_bytes(), 0);
+    // An outstanding verified reader retains its own immutable bytes.
+    assert_eq!(group[0].as_slice(), &vec![1; 16384]);
 }
 
 #[test]

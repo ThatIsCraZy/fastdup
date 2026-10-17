@@ -1,23 +1,17 @@
-use crate::{CacheObservation, CachePool};
 use fastdup_format::ChunkId;
 pub(crate) use fastdup_format::VerifiedChunkPayload;
-use std::array;
 use std::fmt;
 use std::io;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub(crate) use crate::memory_budget::{MemoryPressureSnapshot, SYSTEM_REFRESH_INTERVAL};
 
 mod compression;
 use compression::{CachedPayload, Compression};
-
-const CACHE_WAYS: usize = 4;
-const CACHE_SLOT_TARGET_BYTES: usize = 16 * 1_024;
-const MAX_RECLAIM_STEPS_PER_GROUP: usize = 256;
 
 /// Deterministic geometry and reserve for isolated tests and embedded runtimes.
 /// Production residency is governed by the process-wide unified cache.
@@ -228,33 +222,6 @@ impl VerifiedReadCacheStatus {
     status_getter!(swap_used_bytes, swap_used_bytes, u64);
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CacheKey {
-    chunk_id: ChunkId,
-    logical_length: u64,
-}
-
-#[derive(Clone, Debug)]
-struct CacheEntry {
-    payload: CachedPayload,
-    recent_hits: u8,
-    last_hit_epoch: u64,
-    backing_charge: Arc<CacheBackingCharge>,
-}
-
-impl CacheEntry {
-    fn matches(&self, key: CacheKey) -> bool {
-        self.payload.chunk_id() == key.chunk_id
-            && u64::try_from(self.payload.len()).ok() == Some(key.logical_length)
-    }
-}
-
-#[derive(Debug)]
-struct CacheBackingCharge {
-    bytes: usize,
-    compressed_logical: usize,
-}
-
 /// Result of one verified read operation.
 ///
 /// Requested payloads retain logical caller order. Admission groups retain all
@@ -341,72 +308,14 @@ impl VerifiedChunkRead {
     }
 }
 
-#[derive(Debug)]
-struct CacheSet {
-    ways: [Option<CacheEntry>; CACHE_WAYS],
-    next_victim: usize,
-}
-
-impl Default for CacheSet {
-    fn default() -> Self {
-        Self {
-            ways: array::from_fn(|_| None),
-            next_victim: 0,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct CacheShardState {
-    sets: Box<[CacheSet]>,
-    counters: CacheShardCounters,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct CacheShardCounters {
-    hit_bytes: u64,
-    hits: u64,
-    misses: u64,
-    admissions: u64,
-    evictions: u64,
-}
-
-impl CacheShardCounters {
-    fn add_assign(&mut self, other: Self) {
-        self.hit_bytes = self.hit_bytes.saturating_add(other.hit_bytes);
-        self.hits = self.hits.saturating_add(other.hits);
-        self.misses = self.misses.saturating_add(other.misses);
-        self.admissions = self.admissions.saturating_add(other.admissions);
-        self.evictions = self.evictions.saturating_add(other.evictions);
-    }
-}
-
-#[repr(C, align(64))]
-#[derive(Debug)]
-struct CacheShard {
-    state: Mutex<CacheShardState>,
-}
-
-#[derive(Debug, Default)]
-struct CacheAdmission {
-    reclaim_cursor: usize,
-    compression_cursor: usize,
-}
-
 /// Verified DATA and compact physical-source views in the unified read cache.
 /// The common owner governs allocation, admission, replacement and pressure;
-/// verification-only callers need not retain the payload backing. The former
-/// four-way implementation is retained solely as a test/replay comparator.
+/// verification-only callers need not retain the payload backing.
 pub struct VerifiedReadCache {
-    unified: Option<crate::ReadCacheNamespace>,
-    location_proofs: Option<crate::ReadCacheNamespace>,
+    unified: crate::ReadCacheNamespace,
+    location_proofs: crate::ReadCacheNamespace,
     config: VerifiedReadCacheConfig,
-    shards: Box<[CacheShard]>,
-    metadata_bytes: usize,
-    admission: Mutex<CacheAdmission>,
     target_bytes: AtomicUsize,
-    resident_bytes: AtomicUsize,
-    entry_count: AtomicUsize,
     pressure_rejections: AtomicU64,
     oversized_rejections: AtomicU64,
     effective_limit_bytes: AtomicU64,
@@ -416,7 +325,6 @@ pub struct VerifiedReadCache {
     started: Instant,
     last_refresh_millis: AtomicU64,
     compression: Compression,
-    budget_pool: Option<CachePool>,
 }
 
 impl fmt::Debug for VerifiedReadCache {
@@ -424,7 +332,6 @@ impl fmt::Debug for VerifiedReadCache {
         formatter
             .debug_struct("VerifiedReadCache")
             .field("status", &self.status())
-            .field("shards", &self.shards.len())
             .finish_non_exhaustive()
     }
 }
@@ -439,7 +346,7 @@ impl VerifiedReadCache {
         let snapshot =
             MemoryPressureSnapshot::read_system().map_err(VerifiedReadCacheError::SystemMemory)?;
         let config = VerifiedReadCacheConfig::conservative(snapshot);
-        Self::build(config, snapshot, true, false)
+        Ok(Self::build(config, snapshot, true))
     }
 
     /// Constructs a deterministic manually refreshed cache for tests and
@@ -452,86 +359,29 @@ impl VerifiedReadCache {
         config: VerifiedReadCacheConfig,
         snapshot: MemoryPressureSnapshot,
     ) -> Result<Self, VerifiedReadCacheError> {
-        Self::build(config, snapshot, false, false)
-    }
-
-    // Historical policy retained only as a test/replay comparator.
-    #[cfg(test)]
-    fn new_legacy_with_snapshot(
-        config: VerifiedReadCacheConfig,
-        snapshot: MemoryPressureSnapshot,
-    ) -> Result<Self, VerifiedReadCacheError> {
-        Self::build(config, snapshot, false, true)
+        Ok(Self::build(config, snapshot, false))
     }
 
     fn build(
         config: VerifiedReadCacheConfig,
         snapshot: MemoryPressureSnapshot,
         automatic_pressure: bool,
-        legacy: bool,
-    ) -> Result<Self, VerifiedReadCacheError> {
-        let shard_count = config.shard_count.get();
-        let approximate_set_bytes = CACHE_WAYS
-            .checked_mul(CACHE_SLOT_TARGET_BYTES)
-            .and_then(|payload| payload.checked_add(size_of::<CacheSet>()))
-            .ok_or(VerifiedReadCacheError::GeometryTooSmall)?;
-        let mut set_count = config.hard_limit_bytes / approximate_set_bytes;
-        set_count -= set_count % shard_count;
-        if set_count < shard_count && legacy {
-            return Err(VerifiedReadCacheError::GeometryTooSmall);
-        }
-        if !legacy {
-            set_count = 0;
-        }
-        let sets_per_shard = set_count / shard_count;
-        let metadata_bytes = set_count
-            .checked_mul(size_of::<CacheSet>())
-            .ok_or(VerifiedReadCacheError::GeometryTooSmall)?;
-        if metadata_bytes >= config.hard_limit_bytes {
-            return Err(VerifiedReadCacheError::GeometryTooSmall);
-        }
-        let mut shards = Vec::new();
-        shards
-            .try_reserve_exact(shard_count)
-            .map_err(|_| VerifiedReadCacheError::OutOfMemory)?;
-        for _ in 0..if legacy { shard_count } else { 0 } {
-            let mut sets = Vec::new();
-            sets.try_reserve_exact(sets_per_shard)
-                .map_err(|_| VerifiedReadCacheError::OutOfMemory)?;
-            sets.resize_with(sets_per_shard, CacheSet::default);
-            shards.push(CacheShard {
-                state: Mutex::new(CacheShardState {
-                    sets: sets.into_boxed_slice(),
-                    counters: CacheShardCounters::default(),
-                }),
-            });
-        }
-        let unified = (!legacy).then(|| {
-            if automatic_pressure {
-                crate::ReadCacheNamespace::system(crate::ReadCacheClass::Data)
-            } else {
-                crate::ReadCacheNamespace::isolated(crate::ReadCacheClass::Data, 0)
-            }
-        });
-        let location_proofs = if legacy {
-            None
-        } else if automatic_pressure {
-            Some(system_location_proofs())
+    ) -> Self {
+        let unified = if automatic_pressure {
+            crate::ReadCacheNamespace::system(crate::ReadCacheClass::Data)
         } else {
-            unified
-                .as_ref()
-                .map(|cache| cache.sibling(crate::ReadCacheClass::LocationProof))
+            crate::ReadCacheNamespace::isolated(crate::ReadCacheClass::Data, 0)
+        };
+        let location_proofs = if automatic_pressure {
+            system_location_proofs()
+        } else {
+            unified.sibling(crate::ReadCacheClass::LocationProof)
         };
         let cache = Self {
             location_proofs,
             unified,
             config,
-            shards: shards.into_boxed_slice(),
-            metadata_bytes,
-            admission: Mutex::new(CacheAdmission::default()),
             target_bytes: AtomicUsize::new(0),
-            resident_bytes: AtomicUsize::new(0),
-            entry_count: AtomicUsize::new(0),
             pressure_rejections: AtomicU64::new(0),
             oversized_rejections: AtomicU64::new(0),
             effective_limit_bytes: AtomicU64::new(0),
@@ -541,10 +391,9 @@ impl VerifiedReadCache {
             started: Instant::now(),
             last_refresh_millis: AtomicU64::new(0),
             compression: Compression::new(snapshot, automatic_pressure),
-            budget_pool: None,
         };
         cache.apply_memory_pressure(snapshot);
-        Ok(cache)
+        cache
     }
 
     /// Applies a fresh pressure sample and immediately purges payloads when
@@ -564,92 +413,25 @@ impl VerifiedReadCache {
     }
 
     fn apply_memory_pressure(&self, snapshot: MemoryPressureSnapshot) {
-        if let Some(cache) = &self.unified {
-            if !self.automatic_pressure {
-                cache.update_pressure(
-                    snapshot,
-                    self.config.hard_limit_bytes as u64,
-                    self.config.reserve_bytes,
-                );
-            }
-            self.compression.refresh_buffers(snapshot);
-            self.target_bytes.store(
-                usize::try_from(cache.capacity()).unwrap_or(usize::MAX),
-                Ordering::Release,
-            );
-            self.effective_limit_bytes
-                .store(snapshot.effective_limit_bytes(), Ordering::Release);
-            self.available_bytes
-                .store(snapshot.available_bytes(), Ordering::Release);
-            self.swap_used_bytes
-                .store(snapshot.swap_used_bytes(), Ordering::Release);
-            return;
-        }
-
-        self.compression.refresh_buffers(snapshot);
-        let mut admission = self
-            .admission
-            .lock()
-            .expect("ASSERT: verified read-cache admission lock poisoned");
-        let total_target = if let Some(pool) = &self.budget_pool {
-            let counters = self.counters();
-            usize::try_from(pool.target(
+        let cache = &self.unified;
+        if !self.automatic_pressure {
+            cache.update_pressure(
                 snapshot,
-                CacheObservation {
-                    hits: counters.hits,
-                    misses: counters.misses,
-                    evictions: counters.evictions,
-                    hit_bytes: counters.hit_bytes,
-                    resident_bytes: (self.resident_bytes.load(Ordering::Acquire)
-                        + self.metadata_bytes) as u64,
-                },
-            ))
-            .unwrap_or(usize::MAX)
-        } else if snapshot.swap_used_bytes() != 0 {
-            0
-        } else {
-            let available = snapshot
-                .available_bytes()
-                .min(snapshot.effective_limit_bytes());
-            let headroom = available.saturating_sub(self.config.reserve_bytes);
-            usize::try_from(headroom)
-                .unwrap_or(usize::MAX)
-                .min(self.config.hard_limit_bytes)
-        };
-        let payload_target = total_target.saturating_sub(self.metadata_bytes);
+                self.config.hard_limit_bytes as u64,
+                self.config.reserve_bytes,
+            );
+        }
+        self.compression.refresh_buffers(snapshot);
+        self.target_bytes.store(
+            usize::try_from(cache.capacity()).unwrap_or(usize::MAX),
+            Ordering::Release,
+        );
         self.effective_limit_bytes
             .store(snapshot.effective_limit_bytes(), Ordering::Release);
         self.available_bytes
             .store(snapshot.available_bytes(), Ordering::Release);
         self.swap_used_bytes
             .store(snapshot.swap_used_bytes(), Ordering::Release);
-        self.target_bytes.store(payload_target, Ordering::Release);
-        if self.resident_bytes.load(Ordering::Acquire) > payload_target {
-            if self.budget_pool.is_some() && payload_target != 0 {
-                let mut steps = self
-                    .shards
-                    .iter()
-                    .map(|shard| {
-                        shard
-                            .state
-                            .lock()
-                            .expect("ASSERT: cache shard lock poisoned")
-                            .sets
-                            .len()
-                            * CACHE_WAYS
-                    })
-                    .sum();
-                self.reclaim_locked(&mut admission, &mut steps, payload_target, None);
-            } else {
-                self.clear_locked();
-            }
-        }
-        if let Some(pool) = &self.budget_pool {
-            pool.applied(
-                total_target as u64,
-                (self.resident_bytes.load(Ordering::Acquire) + self.metadata_bytes) as u64,
-            );
-        }
     }
 
     /// Samples consistent resident accounting and cumulative counters.
@@ -659,36 +441,22 @@ impl VerifiedReadCache {
     #[must_use]
     pub fn status(&self) -> VerifiedReadCacheStatus {
         self.maybe_refresh_pressure();
-        let _admission = self
-            .admission
-            .lock()
-            .expect("ASSERT: cache admission lock poisoned");
-        let counters = self.counters();
-        let mut resident = self.resident_bytes.load(Ordering::Acquire);
-        let mut entries = self.entry_count.load(Ordering::Acquire);
-        let mut compressed = self.compression.resident.load(Ordering::Relaxed);
-        let mut logical = self.compression.logical.load(Ordering::Relaxed);
-        let mut verified_share_limit = self.target_bytes.load(Ordering::Acquire);
-        if let Some(cache) = &self.unified {
-            let stats = cache.stats();
-            resident = usize::try_from(stats.resident_bytes).unwrap_or(usize::MAX);
-            entries = usize::try_from(stats.entries).unwrap_or(usize::MAX);
-            verified_share_limit =
-                usize::try_from(cache.verified_data_limit()).unwrap_or(usize::MAX);
-            compressed = 0;
-            logical = 0;
-            cache.visit::<CachedPayload>(|payload| {
-                if let CachedPayload::Compressed(value) = payload {
-                    compressed += value.resident_bytes();
-                    logical += value.logical_length();
-                }
-            });
-        }
+        let cache = &self.unified;
+        let stats = cache.stats();
+        let resident = usize::try_from(stats.resident_bytes).unwrap_or(usize::MAX);
+        let entries = usize::try_from(stats.entries).unwrap_or(usize::MAX);
+        let verified_share_limit =
+            usize::try_from(cache.verified_data_limit()).unwrap_or(usize::MAX);
+        let mut compressed = 0_usize;
+        let mut logical = 0_usize;
+        cache.visit::<CachedPayload>(|payload| {
+            if let CachedPayload::Compressed(value) = payload {
+                compressed += value.resident_bytes();
+                logical += value.logical_length();
+            }
+        });
         VerifiedReadCacheStatus {
-            location_proofs: self.location_proofs.as_ref().map_or_else(
-                crate::ReadCacheStats::default,
-                crate::ReadCacheNamespace::stats,
-            ),
+            location_proofs: self.location_proofs.stats(),
             compressed_resident_bytes: compressed,
             compressed_logical_bytes: logical,
             compression_attempts: self.compression.attempts.load(Ordering::Relaxed),
@@ -705,17 +473,17 @@ impl VerifiedReadCache {
             codec_working_bytes: self.compression.working(),
             codec_max_working_bytes: self.compression.maximum_working(),
             buffer_pool: self.compression.buffers.status(),
-            hits: counters.hits,
-            misses: counters.misses,
-            admissions: counters.admissions,
-            evictions: counters.evictions,
+            hits: stats.hits,
+            misses: stats.misses,
+            admissions: stats.admissions,
+            evictions: stats.evictions,
             pressure_rejections: self.pressure_rejections.load(Ordering::Relaxed),
             oversized_rejections: self.oversized_rejections.load(Ordering::Relaxed),
             entry_count: entries,
             resident_bytes: resident,
             target_bytes: self.target_bytes.load(Ordering::Acquire),
             verified_share_limit_bytes: verified_share_limit,
-            metadata_bytes: self.metadata_bytes,
+            metadata_bytes: 0,
             hard_limit_bytes: self.config.hard_limit_bytes,
             reserve_bytes: self.config.reserve_bytes,
             effective_limit_bytes: self.effective_limit_bytes.load(Ordering::Acquire),
@@ -727,11 +495,9 @@ impl VerifiedReadCache {
     /// Small physical-source evidence in the same owner as the DATA view.
     /// Returning a proof never returns bytes or selects a live generation.
     pub(crate) fn has_verified_location(&self, candidate: fastdup_format::ExactIndexEntry) -> bool {
-        self.location_proofs.as_ref().is_some_and(|cache| {
-            cache
-                .get::<fastdup_format::ExactIndexEntry>(location_proof_key(candidate))
-                .is_some_and(|entry| *entry == candidate)
-        })
+        self.location_proofs
+            .get::<fastdup_format::ExactIndexEntry>(location_proof_key(candidate))
+            .is_some_and(|entry| *entry == candidate)
     }
 
     // Call only after this exact candidate's complete stored Record, logical
@@ -778,14 +544,12 @@ impl VerifiedReadCache {
         if crate::read_intent::bypass_admission() {
             return;
         }
-        if let Some(cache) = &self.location_proofs {
-            cache.insert(
-                location_proof_key(entry),
-                Arc::new(entry),
-                size_of::<fastdup_format::ExactIndexEntry>() as u64,
-                u64::from(entry.location().record_length()),
-            );
-        }
+        self.location_proofs.insert(
+            location_proof_key(entry),
+            Arc::new(entry),
+            size_of::<fastdup_format::ExactIndexEntry>() as u64,
+            u64::from(entry.location().record_length()),
+        );
     }
 
     pub(crate) fn admit_location_proofs(&self, payloads: &[VerifiedChunkPayload]) {
@@ -798,8 +562,18 @@ impl VerifiedReadCache {
         }
     }
 
-    /// Identity-and-length presence probe: it neither decodes a compressed
-    /// entry, counts a hit, nor promotes recency. Used only to avoid
+    /// Presence probe for prefetch planning: never decodes, counts a hit,
+    /// or changes eviction credit.
+    pub(crate) fn peek_contains(&self, chunk_id: ChunkId, logical_length: u64) -> bool {
+        self.unified
+            .peek::<CachedPayload>(crate::ReadCacheKey {
+                identity: chunk_id.bytes(),
+                ordinal: logical_length,
+            })
+            .is_some()
+    }
+
+    /// Identity-and-length presence probe used only to avoid
     /// double-admitting writer bytes that are already cached; a false miss
     /// merely re-admits verified bytes and a false positive keeps an entry
     /// that real reads still verify on retrieval.
@@ -807,29 +581,7 @@ impl VerifiedReadCache {
         if crate::read_intent::independent() {
             return false;
         }
-        if let Some(cache) = &self.unified {
-            let key = crate::ReadCacheKey {
-                identity: chunk_id.bytes(),
-                ordinal: logical_length,
-            };
-            return cache.get::<CachedPayload>(key).is_some();
-        }
-        let key = CacheKey {
-            chunk_id,
-            logical_length,
-        };
-        let hash = cache_hash(key);
-        let shard = &self.shards[hash & (self.shards.len() - 1)];
-        let state = shard
-            .state
-            .lock()
-            .expect("ASSERT: verified read-cache shard lock poisoned");
-        let set_index = (hash / self.shards.len()) % state.sets.len();
-        state.sets[set_index]
-            .ways
-            .iter()
-            .flatten()
-            .any(|entry| entry.matches(key))
+        self.peek_contains(chunk_id, logical_length)
     }
 
     pub(crate) fn get(
@@ -841,72 +593,22 @@ impl VerifiedReadCache {
             return None;
         }
         self.maybe_refresh_pressure();
-        if let Some(cache) = &self.unified {
-            let key = crate::ReadCacheKey {
-                identity: chunk_id.bytes(),
-                ordinal: logical_length,
-            };
-            let value = cache.get::<CachedPayload>(key)?;
-            return match value.as_ref() {
-                CachedPayload::Decoded(payload) => Some(payload.clone()),
-                CachedPayload::Compressed(value) => self.compressed_hit(value, 0),
-            };
-        }
-        let key = CacheKey {
-            chunk_id,
-            logical_length,
+        let cache = &self.unified;
+        let key = crate::ReadCacheKey {
+            identity: chunk_id.bytes(),
+            ordinal: logical_length,
         };
-        let hash = cache_hash(key);
-        let shard = &self.shards[hash & (self.shards.len() - 1)];
-        let mut state = shard
-            .state
-            .lock()
-            .expect("ASSERT: verified read-cache shard lock poisoned");
-        let set_index = (hash / self.shards.len()) % state.sets.len();
-        let epoch = self.compression.epoch.load(Ordering::Relaxed);
-        let window = self.entry_count.load(Ordering::Relaxed).max(1) as u64;
-        let found = state.sets[set_index]
-            .ways
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.matches(key))
-            .map(|entry| {
-                entry.recent_hits = if epoch.saturating_sub(entry.last_hit_epoch) > window {
-                    1
-                } else {
-                    entry.recent_hits.saturating_add(1)
-                };
-                entry.last_hit_epoch = epoch;
-                (entry.payload.clone(), entry.recent_hits)
-            });
-        let Some((cached, recent_hits)) = found else {
-            state.counters.misses = state.counters.misses.saturating_add(1);
-            return None;
-        };
-        let payload = match cached {
-            CachedPayload::Decoded(payload) => payload,
+        let value = cache.get::<CachedPayload>(key)?;
+        match value.as_ref() {
+            CachedPayload::Decoded(payload) => Some(payload.clone()),
             CachedPayload::Compressed(value) => {
-                drop(state);
-                let payload = self.compressed_hit(&value, recent_hits);
-                state = shard
-                    .state
-                    .lock()
-                    .expect("ASSERT: cache shard lock poisoned");
-                let Some(payload) = payload else {
-                    state.counters.misses = state.counters.misses.saturating_add(1);
-                    return None;
-                };
-                payload
+                // DATA credit grows by 16 per hit up to 32, so the
+                // quotient is a bounded recent-hit estimate for the
+                // promotion utility comparison.
+                let recent_hits = cache.credit(key) / 16;
+                self.compressed_hit(value, recent_hits)
             }
-        };
-        assert_eq!(
-            payload.len() as u64,
-            logical_length,
-            "ASSERT: verified cache entry length changed after admission"
-        );
-        state.counters.hit_bytes = state.counters.hit_bytes.saturating_add(logical_length);
-        state.counters.hits = state.counters.hits.saturating_add(1);
-        Some(payload)
+        }
     }
 
     #[cfg(test)]
@@ -954,199 +656,26 @@ impl VerifiedReadCache {
             }
         };
         self.maybe_refresh_pressure();
-        if let Some(cache) = &self.unified {
-            let values = payloads
-                .into_iter()
-                .map(|value| {
-                    let length = value.len() as u64;
-                    (
-                        crate::ReadCacheKey {
-                            identity: value.chunk_id().bytes(),
-                            ordinal: length,
-                        },
-                        Arc::new(value),
-                        length,
-                    )
-                })
-                .collect();
-            let admitted = cache.insert_groups(vec![(values, allocation_bytes as u64)]);
-            if compressed_logical != 0 {
-                self.compression
-                    .admitted
-                    .fetch_add(admitted, Ordering::Relaxed);
-            }
-            return;
-        }
-        let mut admission = self
-            .admission
-            .lock()
-            .expect("ASSERT: verified read-cache admission lock poisoned");
-        let target = self.target_bytes.load(Ordering::Acquire);
-        if target == 0 {
-            self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        if allocation_bytes > target {
-            self.oversized_rejections.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let backing_charge = Arc::new(CacheBackingCharge {
-            bytes: allocation_bytes,
-            compressed_logical,
-        });
-        let mut admitted_group_refs = 0_usize;
-        let mut reclaim_steps = MAX_RECLAIM_STEPS_PER_GROUP;
-        for payload in payloads {
-            let key = CacheKey {
-                chunk_id: payload.chunk_id(),
-                logical_length: u64::try_from(payload.len())
-                    .expect("ASSERT: verified logical Chunk length fits u64"),
-            };
-            let hash = cache_hash(key);
-            let shard = &self.shards[hash & (self.shards.len() - 1)];
-            loop {
-                let mut state = shard
-                    .state
-                    .lock()
-                    .expect("ASSERT: verified read-cache shard lock poisoned");
-                let set_index = (hash / self.shards.len()) % state.sets.len();
-                let set = &mut state.sets[set_index];
-                if set.ways.iter().flatten().any(|entry| entry.matches(key)) {
-                    break;
-                }
-                let victim = set
-                    .ways
-                    .iter()
-                    .position(Option::is_none)
-                    .unwrap_or(set.next_victim);
-                let victim_is_group = set.ways[victim]
-                    .as_ref()
-                    .is_some_and(|entry| Arc::ptr_eq(&entry.backing_charge, &backing_charge));
-                let victim_bytes = set.ways[victim].as_ref().map_or(0, |entry| {
-                    if victim_is_group {
-                        usize::from(admitted_group_refs == 1) * entry.backing_charge.bytes
-                    } else if Arc::strong_count(&entry.backing_charge) == 1 {
-                        entry.backing_charge.bytes
-                    } else {
-                        0
-                    }
-                });
-                let remaining_group_refs = admitted_group_refs - usize::from(victim_is_group);
-                let added_bytes = if remaining_group_refs == 0 {
-                    backing_charge.bytes
-                } else {
-                    0
-                };
-                let resident = self.resident_bytes.load(Ordering::Acquire);
-                let proposed = resident
-                    .checked_sub(victim_bytes)
-                    .and_then(|remaining| remaining.checked_add(added_bytes))
-                    .expect("ASSERT: verified read-cache resident accounting overflowed");
-                if proposed > target {
-                    if reclaim_steps != 0 {
-                        // Reclaim outside the target shard: readers only ever hold
-                        // one shard, and admission is already globally serialized.
-                        // Protect this group's admitted views so its local reference
-                        // accounting stays valid across the retry.
-                        drop(state);
-                        self.reclaim_locked(
-                            &mut admission,
-                            &mut reclaim_steps,
-                            target.saturating_sub(added_bytes),
-                            Some(&backing_charge),
-                        );
-                        continue;
-                    }
-                    self.pressure_rejections.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-                let replaced = set.ways[victim].replace(CacheEntry {
-                    payload,
-                    recent_hits: 0,
-                    last_hit_epoch: self.compression.epoch.load(Ordering::Relaxed),
-                    backing_charge: Arc::clone(&backing_charge),
-                });
-                if victim_bytes != 0 {
-                    self.uncharge(
-                        &replaced
-                            .as_ref()
-                            .expect("ASSERT: charged victim exists")
-                            .backing_charge,
-                    );
-                }
-                if added_bytes != 0 {
-                    self.charge(&backing_charge);
-                }
-                admitted_group_refs = remaining_group_refs + 1;
-                set.next_victim = (victim + 1) % CACHE_WAYS;
-                self.resident_bytes.store(proposed, Ordering::Release);
-                if replaced.is_some() {
-                    state.counters.evictions = state.counters.evictions.saturating_add(1);
-                } else {
-                    self.entry_count.fetch_add(1, Ordering::Release);
-                }
-                state.counters.admissions = state.counters.admissions.saturating_add(1);
-                assert!(
-                    proposed <= target,
-                    "ASSERT: verified read cache exceeded its current payload target"
-                );
-                assert!(
-                    proposed.saturating_add(self.metadata_bytes) <= self.config.hard_limit_bytes,
-                    "ASSERT: verified read cache exceeded its hard RAM limit"
-                );
-                break;
-            }
-        }
-    }
-
-    /// Persistent round-robin reclamation; the caller holds admission and no
-    /// shard lock. A group has a fixed probe budget even when a backing spans
-    /// many sets. Later admissions continue the cursor instead of rescanning
-    /// the same prefix. Cache hits do not touch this cursor or a global lock.
-    fn reclaim_locked(
-        &self,
-        admission: &mut CacheAdmission,
-        remaining_steps: &mut usize,
-        resident_target: usize,
-        protected: Option<&Arc<CacheBackingCharge>>,
-    ) {
-        while *remaining_steps != 0 && self.resident_bytes.load(Ordering::Acquire) > resident_target
-        {
-            *remaining_steps -= 1;
-            let cursor = admission.reclaim_cursor;
-            let shard = &self.shards[cursor % self.shards.len()];
-            let mut state = shard
-                .state
-                .lock()
-                .expect("ASSERT: verified read-cache shard lock poisoned");
-            let shard_cursor = cursor / self.shards.len();
-            let set_index = (shard_cursor / CACHE_WAYS) % state.sets.len();
-            let way = shard_cursor % CACHE_WAYS;
-            let slots = self.shards.len() * state.sets.len() * CACHE_WAYS;
-            admission.reclaim_cursor = (cursor + 1) % slots;
-            let slot = &mut state.sets[set_index].ways[way];
-            if slot.as_ref().is_none_or(|entry| {
-                protected.is_some_and(|protected| Arc::ptr_eq(&entry.backing_charge, protected))
-            }) {
-                continue;
-            }
-            let entry = slot
-                .take()
-                .expect("ASSERT: selected reclaim slot is populated");
-            // Caller payload views do not own CacheBackingCharge. Only the
-            // final cache view releases its one shared allocation charge.
-            if Arc::strong_count(&entry.backing_charge) == 1 {
-                let bytes = entry.backing_charge.bytes;
-                self.uncharge(&entry.backing_charge);
-                let previous = self.resident_bytes.fetch_sub(bytes, Ordering::AcqRel);
-                assert!(
-                    previous >= bytes,
-                    "ASSERT: reclaimed backing was fully charged"
-                );
-            }
-            let previous = self.entry_count.fetch_sub(1, Ordering::AcqRel);
-            assert!(previous != 0, "ASSERT: reclaimed cache entry was counted");
-            state.counters.evictions = state.counters.evictions.saturating_add(1);
+        let cache = &self.unified;
+        let values = payloads
+            .into_iter()
+            .map(|value| {
+                let length = value.len() as u64;
+                (
+                    crate::ReadCacheKey {
+                        identity: value.chunk_id().bytes(),
+                        ordinal: length,
+                    },
+                    Arc::new(value),
+                    length,
+                )
+            })
+            .collect();
+        let admitted = cache.insert_groups(vec![(values, allocation_bytes as u64)]);
+        if compressed_logical != 0 {
+            self.compression
+                .admitted
+                .fetch_add(admitted, Ordering::Relaxed);
         }
     }
 
@@ -1175,65 +704,6 @@ impl VerifiedReadCache {
             Ok(snapshot) => self.apply_memory_pressure(snapshot),
             Err(_) => self.apply_memory_pressure(MemoryPressureSnapshot::new(0, 0, 1)),
         }
-    }
-
-    fn clear_locked(&self) {
-        let mut removed = 0_usize;
-        for shard in &self.shards {
-            let mut shard_removed = 0_usize;
-            let mut state = shard
-                .state
-                .lock()
-                .expect("ASSERT: verified read-cache shard lock poisoned");
-            for set in &mut state.sets {
-                for way in &mut set.ways {
-                    if way.take().is_some() {
-                        shard_removed = shard_removed
-                            .checked_add(1)
-                            .expect("ASSERT: cache entry count cannot overflow");
-                    }
-                }
-                set.next_victim = 0;
-            }
-            removed = removed
-                .checked_add(shard_removed)
-                .expect("ASSERT: cache entry count cannot overflow");
-            state.counters.evictions = state.counters.evictions.saturating_add(
-                u64::try_from(shard_removed).expect("ASSERT: shard cache entry count fits u64"),
-            );
-        }
-        let previous_count = self.entry_count.swap(0, Ordering::AcqRel);
-        assert_eq!(
-            removed, previous_count,
-            "ASSERT: verified read-cache entry accounting disagreed with its shards"
-        );
-        self.resident_bytes.store(0, Ordering::Release);
-        self.compression.resident.store(0, Ordering::Release);
-        self.compression.logical.store(0, Ordering::Release);
-    }
-
-    fn counters(&self) -> CacheShardCounters {
-        if let Some(cache) = &self.unified {
-            let stats = cache.stats();
-            return CacheShardCounters {
-                hits: stats.hits,
-                misses: stats.misses,
-                admissions: stats.admissions,
-                evictions: stats.evictions,
-                hit_bytes: stats.hit_bytes,
-            };
-        }
-
-        self.shards
-            .iter()
-            .fold(CacheShardCounters::default(), |mut total, shard| {
-                let state = shard
-                    .state
-                    .lock()
-                    .expect("ASSERT: verified read-cache shard lock poisoned");
-                total.add_assign(state.counters);
-                total
-            })
     }
 }
 
@@ -1292,16 +762,6 @@ fn location_proof_key(entry: fastdup_format::ExactIndexEntry) -> crate::ReadCach
         identity: *hash.finalize().as_bytes(),
         ordinal: 0,
     }
-}
-
-fn cache_hash(key: CacheKey) -> usize {
-    let bytes = key.chunk_id.bytes();
-    let first = u64::from_le_bytes(bytes[..8].try_into().expect("ASSERT: exact hash slice"));
-    let second = u64::from_le_bytes(bytes[8..16].try_into().expect("ASSERT: exact hash slice"));
-    let mixed = first ^ second.rotate_left(17) ^ key.logical_length.rotate_left(31);
-    usize::try_from(mixed).unwrap_or_else(|_| {
-        usize::try_from(mixed ^ (mixed >> 32)).expect("ASSERT: folded hash fits usize")
-    })
 }
 
 #[cfg(test)]
@@ -1477,8 +937,8 @@ mod tests {
     }
 
     #[test]
-    fn full_byte_budget_admits_a_new_workload_into_an_empty_set() {
-        let cache = VerifiedReadCache::new_legacy_with_snapshot(
+    fn full_byte_budget_admits_a_new_workload_by_recycling_cold_data() {
+        let cache = VerifiedReadCache::new_with_snapshot(
             VerifiedReadCacheConfig::new(2 * 1024 * 1024, 0, NonZeroUsize::MIN).unwrap(),
             MemoryPressureSnapshot::new(8 * 1024 * 1024, 8 * 1024 * 1024, 0),
         )
@@ -1486,119 +946,46 @@ mod tests {
         cache.compression.enabled.store(false, Ordering::Relaxed);
         let old = verified_payload(&vec![31; 65536]);
         let allocation = old.backing_allocation_bytes();
-        let set_count = cache.shards[0].state.lock().unwrap().sets.len();
-        let set_for = |payload: &VerifiedChunkPayload| {
-            cache_hash(CacheKey {
-                chunk_id: payload.chunk_id(),
-                logical_length: u64::try_from(payload.len()).unwrap(),
-            }) % set_count
-        };
-        let new = (32..=255)
-            .map(|value| verified_payload(&vec![value; 65536]))
-            .find(|payload| set_for(payload) != set_for(&old))
-            .unwrap();
+        let new = verified_payload(&vec![47; 65536]);
         cache.update_memory_pressure(MemoryPressureSnapshot::new(
             8 * 1024 * 1024,
-            u64::try_from(cache.status().metadata_bytes() + allocation).unwrap(),
+            u64::try_from(allocation + 512).unwrap(),
             0,
         ));
         cache.admit_decoded_group(vec![old]);
-        assert_eq!(cache.status().resident_bytes(), allocation);
+        assert_eq!(cache.status().resident_bytes(), allocation + 512);
         cache.admit_decoded_group(vec![new.clone()]);
         assert_eq!(
             cache.get(new.chunk_id(), 65536),
             Some(new),
-            "a full byte budget must recycle old data instead of permanently rejecting a new working set"
+            "a full byte budget must recycle cold data instead of permanently rejecting a new working set"
         );
-        assert!(cache.status().resident_bytes() <= allocation);
+        assert!(cache.status().resident_bytes() <= allocation + 512);
     }
 
     #[test]
-    fn shards_are_cache_line_separated_and_total_memory_is_hard_bounded() {
+    fn isolated_target_is_hard_bounded_by_config() {
         let config = VerifiedReadCacheConfig::new(
             2 * 1_024 * 1_024,
             256 * 1_024,
             NonZeroUsize::new(4).expect("four shards"),
         )
         .expect("valid cache geometry");
-        let cache = VerifiedReadCache::new_legacy_with_snapshot(
+        let cache = VerifiedReadCache::new_with_snapshot(
             config,
             MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 4 * 1_024 * 1_024, 0),
         )
         .expect("construct worked cache");
 
-        assert_eq!(align_of::<CacheShard>(), 64);
-        assert_eq!(size_of::<CacheShard>() % 64, 0);
-        assert_eq!(cache.shards.as_ptr().addr() % 64, 0);
         let status = cache.status();
-        assert!(status.metadata_bytes() > 0);
-        assert!(
-            status
-                .target_bytes()
-                .checked_add(status.metadata_bytes())
-                .is_some_and(|bytes| bytes <= status.hard_limit_bytes())
-        );
-    }
-
-    #[test]
-    fn five_colliding_verified_chunks_replace_only_one_four_way_victim() {
-        let cache = VerifiedReadCache::new_legacy_with_snapshot(
-            VerifiedReadCacheConfig::new(2 * 1_024 * 1_024, 0, NonZeroUsize::MIN)
-                .expect("valid one-shard geometry"),
-            MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 8 * 1_024 * 1_024, 0),
-        )
-        .expect("construct collision cache");
-        let set_count = cache.shards[0]
-            .state
-            .lock()
-            .expect("ASSERT: fixture shard lock poisoned")
-            .sets
-            .len();
-        let mut by_set = vec![Vec::<(ChunkId, Vec<u8>)>::new(); set_count];
-        let collision = (0_u64..10_000).find_map(|nonce| {
-            let mut bytes = vec![0_u8; CACHE_SLOT_TARGET_BYTES];
-            bytes[..8].copy_from_slice(&nonce.to_le_bytes());
-            let chunk_id = ChunkId::of(&bytes);
-            let key = CacheKey {
-                chunk_id,
-                logical_length: u64::try_from(bytes.len()).expect("fixture length fits u64"),
-            };
-            let index = cache_hash(key) % set_count;
-            by_set[index].push((chunk_id, bytes));
-            (by_set[index].len() == CACHE_WAYS + 1).then(|| std::mem::take(&mut by_set[index]))
-        });
-        let collision = collision.expect("pigeonhole search finds five colliding fixture IDs");
-        for (chunk_id, bytes) in &collision {
-            cache.admit_verified(
-                *chunk_id,
-                u64::try_from(bytes.len()).expect("fixture length fits u64"),
-                verified_payload(bytes),
-            );
-        }
-
-        assert_eq!(cache.status().entry_count(), CACHE_WAYS);
-        assert_eq!(cache.status().evictions(), 1);
-        assert_eq!(
-            cache.get(
-                collision[0].0,
-                u64::try_from(collision[0].1.len()).expect("fixture length fits u64")
-            ),
-            None
-        );
-        for (chunk_id, bytes) in &collision[1..] {
-            assert_eq!(
-                cache.get(
-                    *chunk_id,
-                    u64::try_from(bytes.len()).expect("fixture length fits u64")
-                ),
-                Some(verified_payload(bytes))
-            );
-        }
+        assert!(status.target_bytes() > 0);
+        assert!(status.target_bytes() <= status.hard_limit_bytes());
+        assert_eq!(status.metadata_bytes(), 0);
     }
 
     #[test]
     fn admission_and_hit_share_and_charge_the_decoder_owned_payload_allocation_once() {
-        let cache = VerifiedReadCache::new_legacy_with_snapshot(
+        let cache = VerifiedReadCache::new_with_snapshot(
             VerifiedReadCacheConfig::new(2 * 1_024 * 1_024, 0, NonZeroUsize::MIN)
                 .expect("valid cache geometry"),
             MemoryPressureSnapshot::new(8 * 1_024 * 1_024, 8 * 1_024 * 1_024, 0),
@@ -1619,7 +1006,7 @@ mod tests {
             .expect("admitted verified payload is resident");
 
         assert!(payload.shares_backing_with(&hit));
-        assert_eq!(cache.status().resident_bytes(), allocation_bytes);
+        assert_eq!(cache.status().resident_bytes(), allocation_bytes + 512);
     }
 
     #[test]
@@ -1634,7 +1021,7 @@ mod tests {
             3 * 1_024 * 1_024,
             Some(0),
         );
-        let cache = VerifiedReadCache::new_legacy_with_snapshot(config, snapshot)
+        let cache = VerifiedReadCache::new_with_snapshot(config, snapshot)
             .expect("construct host-Swap cache");
 
         assert!(cache.status().target_bytes() > 0);
@@ -1643,7 +1030,7 @@ mod tests {
     #[test]
     #[ignore = "manual release-mode verified DATA hit-path A/B"]
     fn adaptive_budget_hit_path_benchmark() {
-        let cache = VerifiedReadCache::new_legacy_with_snapshot(
+        let cache = VerifiedReadCache::new_with_snapshot(
             VerifiedReadCacheConfig::new(1024 * 1024, 0, NonZeroUsize::MIN).unwrap(),
             MemoryPressureSnapshot::new(8 * 1024 * 1024, 8 * 1024 * 1024, 0),
         )

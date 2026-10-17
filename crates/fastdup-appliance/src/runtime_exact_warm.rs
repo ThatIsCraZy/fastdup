@@ -106,6 +106,7 @@ impl ExactCacheWarmRuntimePolicy {
 enum WarmAction {
     Skipped(&'static str),
     Warmed,
+    WarmedStructures,
     Cancelled,
 }
 
@@ -185,7 +186,9 @@ async fn run(
         return Ok(());
     }
     let mut observer = WarmObserver::new(policy, (frontend_operations)());
-    let mut next = policy.base_interval;
+    // First cycle runs at gate pace so missing Exact structures start
+    // building seconds after startup, not after a full base interval.
+    let mut next = policy.gate_interval;
     loop {
         let mut delay = Box::pin(sleep(next));
         tokio::select! {
@@ -212,17 +215,24 @@ async fn run(
                 );                let mut record_action = cycle.action;
                 next = match cycle.action {
                     WarmAction::Skipped(_) => cycle.interval,
-                    WarmAction::Warmed | WarmAction::Cancelled => {
+                    WarmAction::Warmed | WarmAction::WarmedStructures | WarmAction::Cancelled => {
                         if cancellation.check().is_err() {
                             return Ok(());
                         }
+                        let structures_only = cycle.action == WarmAction::WarmedStructures;
                         let repository = repository.clone();
                         let warm_policy = policy.warm_policy;
                         let cancellation = cancellation.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             let _background = set_background_io_priority();
                             let _reads = MetadataReadScope::enter(MetadataReadReason::IndexLookup);
-                            repository.warm_active_generation(&warm_policy, Some(&cancellation))
+                            if structures_only {
+                                repository
+                                    .warm_active_structures(&warm_policy, Some(&cancellation))
+                            } else {
+                                repository
+                                    .warm_active_generation(&warm_policy, Some(&cancellation))
+                            }
                         })
                         .await;
                         let mut next_interval = cycle.interval;
@@ -381,15 +391,23 @@ impl WarmObserver {
             self.frontend_operations = operations;
             self.frontend_activity_at = now;
         }
-        let action = if !scrub_complete {
-            WarmAction::Skipped("scrub-incomplete")
-        } else if !mutation_admission_open {
+        // Membership filters and page bounds gate every Exact dedup
+        // decision, so missing structures warm immediately at background
+        // I/O priority instead of waiting for scrub completion or frontend
+        // idleness. Page warming keeps the full gate set below.
+        let structures_missing = current.missing_filters > 0 || current.missing_bounds > 0;
+        let frontend_recent =
+            now.saturating_duration_since(self.frontend_activity_at) < self.policy.idle_after;
+        let action = if !mutation_admission_open {
             WarmAction::Skipped("mutation-admission-closed")
-        } else if now.saturating_duration_since(self.frontend_activity_at) < self.policy.idle_after
-        {
-            WarmAction::Skipped("frontend-active")
         } else if current.target_pages == 0 || current.protected_limit_bytes == 0 {
             WarmAction::Skipped("cache-budget-closed")
+        } else if structures_missing && (!scrub_complete || frontend_recent) {
+            WarmAction::WarmedStructures
+        } else if !scrub_complete {
+            WarmAction::Skipped("scrub-incomplete")
+        } else if frontend_recent {
+            WarmAction::Skipped("frontend-active")
         } else if current.protected_budget_is_saturated()
             && current.missing_filters == 0
             && current.missing_bounds == 0
@@ -420,6 +438,7 @@ impl WarmObserver {
                     "no-new-demand" => self.policy.base_interval,
                     _ => self.policy.gate_interval,
                 },
+                WarmAction::WarmedStructures => self.policy.gate_interval,
                 WarmAction::Warmed | WarmAction::Cancelled => self.policy.base_interval,
             }
         };
@@ -433,6 +452,7 @@ fn record_status(action: WarmAction) {
         "state": match action {
             WarmAction::Skipped(reason) => reason,
             WarmAction::Warmed => "warmed",
+            WarmAction::WarmedStructures => "warmed-structures",
             WarmAction::Cancelled => "cancelled",
         },
     }));
@@ -509,6 +529,17 @@ mod tests {
         let mut observer = quiet_observer(now);
         let decision = observer.observe_sample(WarmSample::default(), 0, now, true, true);
         assert_eq!(decision.action, WarmAction::Skipped("cache-budget-closed"));
+    }
+
+    #[test]
+    fn missing_structures_warm_before_scrub_and_idle_gates() {
+        let now = Instant::now();
+        let mut observer = WarmObserver::new_at(ExactCacheWarmRuntimePolicy::default(), 1, now);
+        let mut missing = sample();
+        missing.missing_filters = 2;
+        let decision = observer.observe_sample(missing, 2, now, true, false);
+        assert_eq!(decision.action, WarmAction::WarmedStructures);
+        assert_eq!(decision.interval, GATE_INTERVAL);
     }
 
     #[test]

@@ -649,10 +649,11 @@ fn dependent_reads_reuse_verified_bases_across_requests_but_scrub_reads_storage(
             .any(|(name, _, _)| name == &base_name),
         "independent full verification must reread Base storage"
     );
+    // Swap beyond the idle-residue grace band closes the cache completely.
     cache.update_memory_pressure(MemoryPressureSnapshot::new(
         64 * 1024 * 1024,
         32 * 1024 * 1024,
-        4096,
+        16 * 1024 * 1024,
     ));
     storage.clear_range_reads();
     assert_eq!(file.read_at(16384, 16384).unwrap(), second);
@@ -663,6 +664,100 @@ fn dependent_reads_reuse_verified_bases_across_requests_but_scrub_reads_storage(
             .any(|(name, _, _)| name == &base_name)
     );
     assert_eq!(cache.status().resident_bytes(), 0);
+}
+
+#[test]
+fn sequential_reads_prefetch_following_chunks_into_the_application_cache() {
+    use fastdup_store::{MemoryPressureSnapshot, VerifiedReadCache, VerifiedReadCacheConfig};
+    use std::num::NonZeroUsize;
+    let root = unique_test_root("manifest-sequential-prefetch");
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    containers.install_cpu_admission(Arc::new(fastdup_store::WorkerPermits::new(
+        NonZeroUsize::new(4).unwrap(),
+    )));
+    let chunk_len = 64 * 1_024_usize;
+    let chunks: Vec<Vec<u8>> = (0..8_u8)
+        .map(|index| vec![0x30 + index; chunk_len])
+        .collect();
+    let mut entries = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let container_id = ContainerId::new([0xd0 + u8::try_from(index).unwrap(); 16]).unwrap();
+        containers
+            .publish_raw(container_id, 1, &[chunk.as_slice()])
+            .unwrap();
+        let container = containers.read(container_id).unwrap();
+        entries.extend(
+            container
+                .locations()
+                .iter()
+                .copied()
+                .map(ExactIndexEntry::from_verified)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+    }
+    let indexes = ExactIndexRunRepository::new(storage.clone());
+    indexes
+        .append_level_zero(ExactIndexProfileId::new([0xe0; 32]).unwrap(), entries)
+        .unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    let cache = Arc::new(
+        VerifiedReadCache::new_with_snapshot(
+            VerifiedReadCacheConfig::new(8 * 1024 * 1024, 0, NonZeroUsize::new(8).unwrap())
+                .unwrap(),
+            MemoryPressureSnapshot::new(64 * 1024 * 1024, 32 * 1024 * 1024, 0),
+        )
+        .unwrap(),
+    );
+    let manifest = ManifestLeaf::new(
+        u64::try_from(chunk_len * chunks.len()).unwrap(),
+        chunks
+            .iter()
+            .map(|chunk| ManifestExtent::Data {
+                logical_length: u64::try_from(chunk.len()).unwrap(),
+                chunk_id: ChunkId::of(chunk),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers.clone())
+        .unwrap()
+        .with_active_index(&active)
+        .with_verified_read_cache(Arc::clone(&cache));
+    let name_of = |index: usize| format!("{}.fdc", format!("{:02x}", 0xd0 + index).repeat(16));
+    let read_chunk = |index: usize| {
+        file.read_at(
+            u64::try_from(index * chunk_len).unwrap(),
+            u32::try_from(chunk_len).unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(read_chunk(0), chunks[0]);
+    storage.clear_range_reads();
+    assert_eq!(read_chunk(1), chunks[1]);
+    assert!(
+        storage.data_range_reads().len() > 1,
+        "the second sequential read must also prefetch following chunks"
+    );
+    storage.clear_range_reads();
+    assert_eq!(read_chunk(2), chunks[2]);
+    assert!(
+        storage
+            .data_range_reads()
+            .iter()
+            .all(|(name, _, _)| name != &name_of(2)),
+        "chunk 2 must be served from the prefetched application cache"
+    );
+    storage.clear_range_reads();
+    assert_eq!(read_chunk(6), chunks[6]);
+    assert!(
+        storage
+            .data_range_reads()
+            .iter()
+            .all(|(name, _, _)| name != &name_of(6)),
+        "chunk 6 must be served from the grown prefetch window"
+    );
 }
 
 #[test]

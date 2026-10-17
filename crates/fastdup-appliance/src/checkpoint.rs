@@ -344,14 +344,13 @@ impl OnlineDependencyProofs {
         Some(entry)
     }
 
-    fn new() -> Result<Self, DurableNamespaceError> {
-        Ok(Self {
+    fn new() -> Self {
+        Self {
             generation: Mutex::new(GenerationProofState::default()),
             publication_completed: Condvar::new(),
-            historical: HistoricalProofCache::new_system()
-                .map_err(|_| DurableNamespaceError::OutOfMemory)?,
+            historical: HistoricalProofCache::new_system(),
             trace: ProofCacheTraceRecorder::default(),
-        })
+        }
     }
 
     fn remember_active(&self, entry: ExactIndexEntry, admission: OnlineProofAdmission) {
@@ -2094,7 +2093,7 @@ where
         let available_workers = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
         let checkpoint_workers = available_workers;
         let namespace = Arc::new(namespace);
-        let online_dependency_proofs = Arc::new(OnlineDependencyProofs::new()?);
+        let online_dependency_proofs = Arc::new(OnlineDependencyProofs::new());
         let write_through = install_write_through(
             &namespace,
             containers.clone(),

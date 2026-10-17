@@ -433,7 +433,7 @@ fn swap_pressure_disables_run_membership_without_changing_lookup_results() {
     let storage = MemoryStorageIo::new();
     let repository = ExactIndexRunRepository::new_with_memory_snapshot(
         storage.clone(),
-        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 1),
+        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 1 << 30),
     );
     let descriptor = repository
         .publish(&run_at(206, 0))

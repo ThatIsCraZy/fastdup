@@ -1828,7 +1828,7 @@ fn emit_dependency_proof_caches(appliance: &FsAppliance) {
     let proofs = appliance.historical_proof_cache_status();
     eprintln!(
         concat!(
-            "historical_proof_cache policy=s3-fifo hits={} misses={} ",
+            "historical_proof_cache policy=unified-clock hits={} misses={} ",
             "hit_rate_basis_points={} admissions={} admission_rejections={} ",
             "allocation_rejections={} evictions={} ghost_hits={} entries={} ",
             "target_entries={} resident_bytes={} metadata_bytes={} hard_limit_bytes={} ",

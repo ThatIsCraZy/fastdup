@@ -14,9 +14,24 @@ use fastdup_format::{
 };
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const MAX_MANIFEST_READ_BYTES: u32 = 1_024 * 1_024;
+
+// Application-owned sequential readahead. Direct I/O disables kernel
+// readahead and this workspace never populates the Linux page cache, so
+// the manifest recipe itself predicts the next chunks: it knows the full
+// extent map ahead of the read position. The window doubles while a
+// stream stays sequential and resets on the first seek.
+const PREFETCH_MIN_WINDOW_BYTES: u64 = 256 * 1_024;
+const PREFETCH_MAX_WINDOW_BYTES: u64 = 4 * 1_024 * 1_024;
+
+#[derive(Debug, Default)]
+struct SequentialPrefetch {
+    next_offset: Option<u64>,
+    window_bytes: u64,
+    prefetched_chunks: u64,
+}
 
 /// A verified immutable file recipe backed by durable RAW/Zstd containers.
 ///
@@ -31,6 +46,7 @@ pub struct VerifiedManifestFile<I> {
     indexed_reader: Option<Arc<dyn VerifiedChunkReader>>,
     read_cache: Option<Arc<VerifiedReadCache>>,
     locations: Arc<[ExactIndexEntry]>,
+    prefetch: Arc<Mutex<SequentialPrefetch>>,
 }
 
 trait ManifestRecipe: fmt::Debug + Send + Sync {
@@ -366,6 +382,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             indexed_reader: None,
             read_cache: None,
             locations: Arc::from([]),
+            prefetch: Arc::default(),
         })
     }
 
@@ -403,6 +420,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             indexed_reader: None,
             read_cache: None,
             locations: locations.into(),
+            prefetch: Arc::default(),
         })
     }
 
@@ -429,6 +447,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             indexed_reader: None,
             read_cache: None,
             locations: Arc::from([]),
+            prefetch: Arc::default(),
         }
     }
 
@@ -743,16 +762,97 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             .collect())
     }
 
+    /// After a successful Demand read, keeps a proven sequential stream
+    /// fed: the recipe already knows which chunks follow, so the next
+    /// window is batch-read into the application cache before it is
+    /// demanded. Verified reads and cache admission decide residency;
+    /// no kernel readahead or page cache is involved. Every failure is
+    /// ignored because the demand path reproduces the same work.
+    fn prefetch_after<G>(&self, offset: u64, read_end: u64, read_chunks: &mut G)
+    where
+        G: FnMut(&[(ChunkId, u64)]) -> Result<VerifiedChunkRead, StoreError>,
+    {
+        let Some(cache) = &self.read_cache else {
+            return;
+        };
+        if crate::read_intent::independent() || crate::read_intent::scan() {
+            return;
+        }
+        let window = {
+            let mut state = self
+                .prefetch
+                .lock()
+                .expect("ASSERT: manifest prefetch state poisoned");
+            let sequential = state.next_offset == Some(offset);
+            state.next_offset = Some(read_end);
+            if !sequential {
+                state.window_bytes = PREFETCH_MIN_WINDOW_BYTES;
+                return;
+            }
+            let window = state.window_bytes.max(PREFETCH_MIN_WINDOW_BYTES);
+            state.window_bytes = (window * 2).min(PREFETCH_MAX_WINDOW_BYTES);
+            window
+        };
+        if read_end >= self.logical_size() {
+            return;
+        }
+        let length = window
+            .min(self.logical_size() - read_end)
+            .min(u64::from(MAX_MANIFEST_READ_BYTES));
+        let Ok(extents) = self.recipe.read_range(read_end, length) else {
+            return;
+        };
+        let mut requests: Vec<(ChunkId, u64)> = Vec::new();
+        for located in &extents {
+            let request = match *located.extent() {
+                ManifestExtent::Data {
+                    chunk_id,
+                    logical_length,
+                } => (chunk_id, logical_length),
+                ManifestExtent::DataSlice {
+                    chunk_id,
+                    chunk_length,
+                    ..
+                } => (chunk_id, u64::from(chunk_length)),
+                ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => continue,
+            };
+            if requests.last() == Some(&request) || cache.peek_contains(request.0, request.1) {
+                continue;
+            }
+            requests.push(request);
+        }
+        if requests.is_empty() {
+            return;
+        }
+        let fetched = u64::try_from(requests.len()).unwrap_or(u64::MAX);
+        if self.read_cached_many(&requests, read_chunks).is_ok() {
+            let mut state = self
+                .prefetch
+                .lock()
+                .expect("ASSERT: manifest prefetch state poisoned");
+            state.prefetched_chunks = state.prefetched_chunks.saturating_add(fetched);
+        }
+    }
+
+    /// Chunks admitted by sequential prefetching on this file reader.
+    #[allow(dead_code, reason = "telemetry surface for prefetch effectiveness")]
+    pub(crate) fn prefetched_chunks(&self) -> u64 {
+        self.prefetch
+            .lock()
+            .expect("ASSERT: manifest prefetch state poisoned")
+            .prefetched_chunks
+    }
+
     fn read_at_using<F, G>(
         &self,
         offset: u64,
         length: u32,
         mut read_chunk: F,
-        read_chunks: G,
+        mut read_chunks: G,
     ) -> Result<Vec<Bytes>, ManifestReadError>
     where
         F: FnMut(ChunkId, u64) -> Result<VerifiedChunkRead, StoreError>,
-        G: FnOnce(&[(ChunkId, u64)]) -> Result<VerifiedChunkRead, StoreError>,
+        G: FnMut(&[(ChunkId, u64)]) -> Result<VerifiedChunkRead, StoreError>,
     {
         if length > MAX_MANIFEST_READ_BYTES {
             return Err(ManifestReadError::RequestTooLarge(length));
@@ -774,16 +874,14 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             })
             .count();
         if data_extent_count < 2 {
-            return assemble_manifest_read(
-                offset,
-                read_end,
-                &extents,
-                |chunk_id, logical_length| {
+            let output =
+                assemble_manifest_read(offset, read_end, &extents, |chunk_id, logical_length| {
                     self.read_cached(chunk_id, logical_length, || {
                         read_chunk(chunk_id, logical_length)
                     })
-                },
-            );
+                })?;
+            self.prefetch_after(offset, read_end, &mut read_chunks);
+            return Ok(output);
         }
 
         let mut requests = Vec::new();
@@ -804,7 +902,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
                 ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => {}
             }
         }
-        let payloads = self.read_cached_many(&requests, read_chunks)?;
+        let payloads = self.read_cached_many(&requests, |missing| read_chunks(missing))?;
         let mut payloads = payloads.into_iter();
         let output =
             assemble_manifest_read(offset, read_end, &extents, |chunk_id, logical_length| {
@@ -827,6 +925,7 @@ impl<I: StorageIo> VerifiedManifestFile<I> {
             payloads.next().is_none(),
             "ASSERT: a verified Read Plan cannot return extra payloads"
         );
+        self.prefetch_after(offset, read_end, &mut read_chunks);
         Ok(output)
     }
 }

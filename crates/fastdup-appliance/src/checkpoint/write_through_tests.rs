@@ -188,12 +188,11 @@ fn proof_budget_overflow_keeps_existing_proofs_and_verifies_uncached_dependencie
     // This test requires a historical hit; supply deterministic capacity
     // instead of competing with concurrently running system-cache tests.
     let snapshot = fastdup_store::MemoryPressureSnapshot::new(1 << 30, 1 << 30, 0);
-    let mut owned = OnlineDependencyProofs::new().unwrap();
+    let mut owned = OnlineDependencyProofs::new();
     owned.historical = HistoricalProofCache::new_with_snapshot(
         crate::historical_proof_cache::HistoricalProofCacheConfig::conservative(snapshot),
         snapshot,
-    )
-    .unwrap();
+    );
     let proofs = Arc::new(owned);
     for ordinal in 0..MAX_ONLINE_DEPENDENCY_PROOFS_V1 / 2 {
         proofs.remember_active(budget_entry(ordinal), OnlineProofAdmission::Published);
@@ -283,7 +282,7 @@ fn proof_budget_overflow_keeps_existing_proofs_and_verifies_uncached_dependencie
 
 #[test]
 fn proof_budget_overflow_releases_completed_publication_claims() {
-    let proofs = OnlineDependencyProofs::new().unwrap();
+    let proofs = OnlineDependencyProofs::new();
     for ordinal in 0..MAX_ONLINE_DEPENDENCY_PROOFS_V1 {
         proofs.remember_active(budget_entry(ordinal), OnlineProofAdmission::Published);
     }
@@ -350,7 +349,7 @@ fn idle_checkpoint_releases_reference_admission_from_completed_ingest() {
 
 #[test]
 fn generation_proof_admission_preserves_reuse_across_freeze() {
-    let proofs = OnlineDependencyProofs::new().unwrap();
+    let proofs = OnlineDependencyProofs::new();
     let location =
         ExactIndexLocation::raw(ContainerId::new([29; 16]).unwrap(), 1, 4096, 256, 0).unwrap();
     let id = ChunkId::of(b"proof");
@@ -374,7 +373,7 @@ fn generation_proof_admission_preserves_reuse_across_freeze() {
 
 #[test]
 fn generation_arena_checks_full_keys_and_survives_cancelled_freeze() {
-    let proofs = OnlineDependencyProofs::new().unwrap();
+    let proofs = OnlineDependencyProofs::new();
     let location =
         ExactIndexLocation::raw(ContainerId::new([29; 16]).unwrap(), 1, 4096, 256, 0).unwrap();
     let mut first = [3_u8; 32];
@@ -608,7 +607,7 @@ fn ingest_exact_references_are_read_free_without_minting_payload_proofs() {
         "Commit reference checking reads no DATA"
     );
     // Saturating required workspace must retain the same read-free fallback.
-    let proofs = Arc::new(OnlineDependencyProofs::new().unwrap());
+    let proofs = Arc::new(OnlineDependencyProofs::new());
     for ordinal in 0..MAX_ONLINE_DEPENDENCY_PROOFS_V1 {
         proofs.remember_active(budget_entry(ordinal), OnlineProofAdmission::Published);
     }
@@ -849,7 +848,7 @@ fn failed_exact_publication_retains_one_gc_guard_until_owner_teardown() {
 fn completing_one_publication_batch_is_atomic_with_generation_freeze() {
     const ENTRY_COUNT: usize = 16_384;
 
-    let proofs = Arc::new(OnlineDependencyProofs::new().expect("allocate proof sets"));
+    let proofs = Arc::new(OnlineDependencyProofs::new());
     let container_id = ContainerId::new([0xA7; 16]).expect("fixture ID is nonzero");
     let mut entries = Vec::with_capacity(ENTRY_COUNT);
     let mut claimed = Vec::with_capacity(ENTRY_COUNT);
@@ -918,7 +917,7 @@ fn completing_one_publication_batch_is_atomic_with_generation_freeze() {
 
 #[test]
 fn frozen_proof_waits_for_the_owned_publication_claim() {
-    let proofs = Arc::new(OnlineDependencyProofs::new().expect("allocate proof sets"));
+    let proofs = Arc::new(OnlineDependencyProofs::new());
     let entry = budget_entry(42);
     let key = (entry.chunk_id(), entry.logical_length());
     assert!(matches!(
@@ -959,7 +958,7 @@ fn frozen_proof_waits_for_the_owned_publication_claim() {
 
 #[test]
 fn active_proof_admission_waits_for_an_owned_publication_claim() {
-    let proofs = Arc::new(OnlineDependencyProofs::new().expect("allocate proof sets"));
+    let proofs = Arc::new(OnlineDependencyProofs::new());
     let entry = budget_entry(43);
     let key = (entry.chunk_id(), entry.logical_length());
     assert!(matches!(
@@ -998,7 +997,7 @@ fn active_proof_admission_waits_for_an_owned_publication_claim() {
 
 #[test]
 fn publication_claims_match_grouped_encoder_locations_by_chunk_key() {
-    let proofs = OnlineDependencyProofs::new().expect("allocate proof sets");
+    let proofs = OnlineDependencyProofs::new();
     let container_id = ContainerId::new([0xB8; 16]).expect("fixture ID is nonzero");
     let low_id = ChunkId::from_bytes([0x11; 32]);
     let high_id = ChunkId::from_bytes([0xEE; 32]);

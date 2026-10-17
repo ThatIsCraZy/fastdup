@@ -337,7 +337,7 @@ fn swap_pressure_disables_envelope_admission_without_changing_verified_reads() {
     let gib = 1_024_u64.pow(3);
     let repository = ContainerRepository::new_with_descriptor_cache_snapshot(
         storage.clone(),
-        MemoryPressureSnapshot::new(128 * gib, 96 * gib, 1),
+        MemoryPressureSnapshot::new(128 * gib, 96 * gib, gib),
     );
     let container_id = ContainerId::new([0xB5; 16]).expect("container identity is nonzero");
     let payload = b"cache pressure may cost IO but cannot change verified bytes";
@@ -386,7 +386,7 @@ fn swap_pressure_disables_envelope_admission_without_changing_verified_reads() {
     assert_eq!(status.hits(), 0);
     assert_eq!(status.misses(), 2);
     assert_eq!(status.pressure_rejections(), 2);
-    assert_eq!(status.swap_used_bytes(), 1);
+    assert_eq!(status.swap_used_bytes(), gib);
 }
 
 #[test]
@@ -653,7 +653,7 @@ fn a_resident_image_rebuilds_an_unadmitted_envelope_view() {
     let gib = 1_024_u64.pow(3);
     let repository = ContainerRepository::new_with_descriptor_cache_snapshot(
         storage.clone(),
-        MemoryPressureSnapshot::new(128 * gib, 96 * gib, 1),
+        MemoryPressureSnapshot::new(128 * gib, 96 * gib, gib),
     );
     let container_id = ContainerId::new([0xB7; 16]).expect("container identity is nonzero");
     let record = b"a resident image still carries its envelope";

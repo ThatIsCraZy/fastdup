@@ -195,10 +195,11 @@ fn swap_or_lost_headroom_purges_cache_and_refuses_new_admissions() {
     )
     .expect("warm cache");
     assert_eq!(cache.status().entry_count(), 1);
+    // Swap beyond the idle-residue grace band purges the cache entirely.
     cache.update_memory_pressure(MemoryPressureSnapshot::new(
         8 * 1_024 * 1_024,
         4 * 1_024 * 1_024,
-        4 * 1_024,
+        4 * 1_024 * 1_024,
     ));
     let pressured = cache.status();
     assert_eq!(pressured.target_bytes(), 0);

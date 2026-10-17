@@ -1,13 +1,13 @@
 use super::{
-    CacheBackingCharge, CacheKey, ChunkId, MemoryPressureSnapshot, VerifiedChunkPayload,
-    VerifiedReadCache, cache_hash, shared_cache_reserve_bytes,
+    ChunkId, MemoryPressureSnapshot, VerifiedChunkPayload, VerifiedReadCache,
+    shared_cache_reserve_bytes,
 };
 use crate::{CacheFallback, CacheObservation, CachePool};
 use fastdup_format::{BufferPool, CompressedVerifiedChunkPayload, MAX_LOGICAL_CHUNK_BYTES};
 use std::num::NonZeroUsize;
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::{Condvar, TryLockError};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -49,8 +49,6 @@ pub(super) struct Compression {
     maximum: usize,
     utility: Mutex<Utility>,
     pub(super) epoch: AtomicU64,
-    pub(super) resident: AtomicUsize,
-    pub(super) logical: AtomicUsize,
     pub(super) attempts: AtomicU64,
     pub(super) admitted: AtomicU64,
     pub(super) compress_ns: AtomicU64,
@@ -94,8 +92,6 @@ impl Compression {
                 .max(CODEC_WORK + MAX_LOGICAL_CHUNK_BYTES),
             utility: Mutex::new(Utility::default()),
             epoch: AtomicU64::new(0),
-            resident: AtomicUsize::new(0),
-            logical: AtomicUsize::new(0),
             attempts: AtomicU64::new(0),
             admitted: AtomicU64::new(0),
             compress_ns: AtomicU64::new(0),
@@ -244,7 +240,6 @@ impl VerifiedReadCache {
             self.admit_group(payloads.into_iter().map(CachedPayload::Decoded).collect());
             return;
         }
-        self.demote_cold_victim(&payloads[0]);
         // Either compress the complete shared allocation's admitted Chunk
         // views or keep its zero-copy representation. Keeping some compressed
         // siblings while a raw sibling pins the whole backing would waste RAM.
@@ -270,31 +265,25 @@ impl VerifiedReadCache {
                 .map(CompressedVerifiedChunkPayload::resident_bytes)
                 .sum::<usize>();
             if total < payloads[0].backing_allocation_bytes() {
-                if let Some(cache) = &self.unified {
-                    let groups = compressed
-                        .into_iter()
-                        .map(|value| {
-                            let bytes = value.resident_bytes() as u64;
-                            let length = value.logical_length() as u64;
-                            let key = crate::ReadCacheKey {
-                                identity: value.chunk_id().bytes(),
-                                ordinal: length,
-                            };
-                            (
-                                vec![(key, Arc::new(CachedPayload::Compressed(value)), length)],
-                                bytes,
-                            )
-                        })
-                        .collect();
-                    let admitted = cache.insert_groups(groups);
-                    self.compression
-                        .admitted
-                        .fetch_add(admitted, Ordering::Relaxed);
-                    return;
-                }
-                for value in compressed {
-                    self.admit_group(vec![CachedPayload::Compressed(value)]);
-                }
+                let groups = compressed
+                    .into_iter()
+                    .map(|value| {
+                        let bytes = value.resident_bytes() as u64;
+                        let length = value.logical_length() as u64;
+                        let key = crate::ReadCacheKey {
+                            identity: value.chunk_id().bytes(),
+                            ordinal: length,
+                        };
+                        (
+                            vec![(key, Arc::new(CachedPayload::Compressed(value)), length)],
+                            bytes,
+                        )
+                    })
+                    .collect();
+                let admitted = self.unified.insert_groups(groups);
+                self.compression
+                    .admitted
+                    .fetch_add(admitted, Ordering::Relaxed);
                 return;
             }
         }
@@ -334,228 +323,26 @@ impl VerifiedReadCache {
     }
 
     fn invalidate_compressed(&self, value: &CompressedVerifiedChunkPayload) {
-        if let Some(cache) = &self.unified {
-            cache.remove_if::<CachedPayload>(crate::ReadCacheKey {
-                identity: value.chunk_id().bytes(), ordinal: value.logical_length() as u64,
-            }, |entry| matches!(entry, CachedPayload::Compressed(current) if current.shares_backing_with(value)));
-            return;
-        }
-
-        let _admission = self
-            .admission
-            .lock()
-            .expect("ASSERT: cache admission lock poisoned");
-        let key = CacheKey {
-            chunk_id: value.chunk_id(),
-            logical_length: value.logical_length() as u64,
-        };
-        let hash = cache_hash(key);
-        let shard = &self.shards[hash & (self.shards.len() - 1)];
-        let mut state = shard
-            .state
-            .lock()
-            .expect("ASSERT: cache shard lock poisoned");
-        let set_index = (hash / self.shards.len()) % state.sets.len();
-        let Some(slot) = state.sets[set_index].ways.iter_mut().find(|slot| {
-            slot.as_ref().is_some_and(|entry| {
-                matches!(&entry.payload,
-                CachedPayload::Compressed(current) if current.shares_backing_with(value))
-            })
-        }) else {
-            return;
-        };
-        let entry = slot.take().expect("ASSERT: invalid cache entry exists");
-        assert_eq!(
-            Arc::strong_count(&entry.backing_charge),
-            1,
-            "ASSERT: compressed ownership is independent"
-        );
-        self.uncharge(&entry.backing_charge);
-        self.resident_bytes
-            .fetch_sub(entry.backing_charge.bytes, Ordering::AcqRel);
-        self.entry_count.fetch_sub(1, Ordering::AcqRel);
-        state.counters.evictions = state.counters.evictions.saturating_add(1);
-    }
-
-    fn demote_cold_victim(&self, incoming: &VerifiedChunkPayload) {
-        if self.unified.is_some()
-            || self
-                .resident_bytes
-                .load(Ordering::Acquire)
-                .saturating_add(incoming.backing_allocation_bytes())
-                <= self.target_bytes.load(Ordering::Acquire)
-        {
-            return;
-        }
-        // One bounded candidate on a separate demotion cursor; codec work happens
-        // outside admission/shard locks. Shared raw backings stay shared until
-        // their final cache view is eligible, avoiding a duplicate RAM charge.
-        let candidate = {
-            let Ok(mut admission) = self.admission.try_lock() else {
-                return;
-            };
-            let cursor = admission.compression_cursor;
-            let shard = &self.shards[cursor % self.shards.len()];
-            let state = shard
-                .state
-                .lock()
-                .expect("ASSERT: cache shard lock poisoned");
-            let set_index = (cursor / self.shards.len()) % state.sets.len();
-            admission.compression_cursor = (cursor + 1) % (self.shards.len() * state.sets.len());
-            let epoch = self.compression.epoch.load(Ordering::Relaxed);
-            let window = self.entry_count.load(Ordering::Relaxed).max(1) as u64;
-            state.sets[set_index]
-                .ways
-                .iter()
-                .flatten()
-                .find_map(|entry| {
-                    let CachedPayload::Decoded(payload) = &entry.payload else {
-                        return None;
-                    };
-                    (Arc::strong_count(&entry.backing_charge) == 1
-                        && epoch.saturating_sub(entry.last_hit_epoch) > window)
-                        .then(|| payload.clone())
-                })
-        };
-        let Some(payload) = candidate else {
-            return;
-        };
-        let Some(_workspace) = self.compression.permit(CODEC_WORK, false) else {
-            return;
-        };
-        let start = Instant::now();
-        self.compression.attempts.fetch_add(1, Ordering::Relaxed);
-        let compressed = payload.compress_for_cache_with_pool(&self.compression.buffers);
-        self.compression
-            .compress_ns
-            .fetch_add(nanos(start), Ordering::Relaxed);
-        let Some(value) = compressed else {
-            return;
-        };
-        let Ok(_admission) = self.admission.try_lock() else {
-            return;
-        };
-        let key = CacheKey {
-            chunk_id: payload.chunk_id(),
-            logical_length: payload.len() as u64,
-        };
-        let hash = cache_hash(key);
-        let shard = &self.shards[hash & (self.shards.len() - 1)];
-        let mut state = shard
-            .state
-            .lock()
-            .expect("ASSERT: cache shard lock poisoned");
-        let set_index = (hash / self.shards.len()) % state.sets.len();
-        let Some(entry) = state.sets[set_index]
-            .ways
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.matches(key))
-        else {
-            return;
-        };
-        let CachedPayload::Decoded(current) = &entry.payload else {
-            return;
-        };
-        let epoch = self.compression.epoch.load(Ordering::Relaxed);
-        if !current.shares_backing_with(&payload)
-            || Arc::strong_count(&entry.backing_charge) != 1
-            || epoch.saturating_sub(entry.last_hit_epoch)
-                <= self.entry_count.load(Ordering::Relaxed).max(1) as u64
-        {
-            return;
-        }
-        let bytes = value.resident_bytes();
-        let saved = entry.backing_charge.bytes.saturating_sub(bytes);
-        if saved == 0 {
-            return;
-        }
-        let charge = Arc::new(CacheBackingCharge {
-            bytes,
-            compressed_logical: value.logical_length(),
-        });
-        self.charge(&charge);
-        entry.payload = CachedPayload::Compressed(value);
-        entry.backing_charge = charge;
-        entry.recent_hits = 0;
-        self.resident_bytes.fetch_sub(saved, Ordering::AcqRel);
-        self.compression.demotions.fetch_add(1, Ordering::Relaxed);
+        self.unified.remove_if::<CachedPayload>(crate::ReadCacheKey {
+            identity: value.chunk_id().bytes(), ordinal: value.logical_length() as u64,
+        }, |entry| matches!(entry, CachedPayload::Compressed(current) if current.shares_backing_with(value)));
     }
 
     fn promote(&self, payload: &VerifiedChunkPayload) {
-        if self.unified.is_some() {
-            return;
-        }
-        let _admission = match self.admission.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return,
+        // Hot compressed entries swap to their decoded representation
+        // in place. `replace` charges only the delta and never evicts
+        // another entry to save codec CPU.
+        let key = crate::ReadCacheKey {
+            identity: payload.chunk_id().bytes(),
+            ordinal: payload.len() as u64,
         };
-        let key = CacheKey {
-            chunk_id: payload.chunk_id(),
-            logical_length: payload.len() as u64,
-        };
-        let hash = cache_hash(key);
-        let shard = &self.shards[hash & (self.shards.len() - 1)];
-        let mut state = shard
-            .state
-            .lock()
-            .expect("ASSERT: cache shard lock poisoned");
-        let set_index = (hash / self.shards.len()) % state.sets.len();
-        let Some(entry) = state.sets[set_index]
-            .ways
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.matches(key))
-        else {
-            return;
-        };
-        if !matches!(entry.payload, CachedPayload::Compressed(_)) {
-            return;
-        }
-        let target = self.target_bytes.load(Ordering::Acquire);
-        let bytes = payload.backing_allocation_bytes();
-        let extra = bytes.saturating_sub(entry.backing_charge.bytes);
-        // Avoiding a decode must never evict another DATA-saving entry.
-        // With no free lease, the hot payload stays compressed and RAM-only.
-        if self
-            .resident_bytes
-            .load(Ordering::Acquire)
-            .saturating_add(extra)
-            > target
-        {
-            return;
-        }
-        self.uncharge(&entry.backing_charge);
-        let charge = Arc::new(CacheBackingCharge {
-            bytes,
-            compressed_logical: 0,
-        });
-        self.charge(&charge);
-        entry.payload = CachedPayload::Decoded(payload.clone());
-        entry.backing_charge = charge;
-        self.resident_bytes.fetch_add(extra, Ordering::AcqRel);
-        self.compression.promotions.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(super) fn charge(&self, backing: &CacheBackingCharge) {
-        if backing.compressed_logical != 0 {
-            self.compression
-                .resident
-                .fetch_add(backing.bytes, Ordering::Relaxed);
-            self.compression
-                .logical
-                .fetch_add(backing.compressed_logical, Ordering::Relaxed);
-            self.compression.admitted.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    pub(super) fn uncharge(&self, backing: &CacheBackingCharge) {
-        if backing.compressed_logical != 0 {
-            self.compression
-                .resident
-                .fetch_sub(backing.bytes, Ordering::Relaxed);
-            self.compression
-                .logical
-                .fetch_sub(backing.compressed_logical, Ordering::Relaxed);
+        if self.unified.replace(
+            key,
+            Arc::new(CachedPayload::Decoded(payload.clone())),
+            payload.backing_allocation_bytes() as u64,
+            payload.len() as u64,
+        ) {
+            self.compression.promotions.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -613,33 +400,6 @@ mod policy_tests {
         });
         assert_eq!(codec.working(), 0);
         assert!(codec.permit(codec.maximum + 1, false).is_none());
-    }
-
-    #[test]
-    fn a_cold_single_owner_is_recompressed_under_admission_pressure() {
-        let cache = VerifiedReadCache::new_legacy_with_snapshot(
-            VerifiedReadCacheConfig::new(4 << 20, 0, NonZeroUsize::MIN).unwrap(),
-            MemoryPressureSnapshot::new(128 << 20, 128 << 20, 0),
-        )
-        .unwrap();
-        let payload = crate::read_cache::tests::verified_payload(&vec![73; 65536]);
-        cache.compression.enabled.store(false, Ordering::Relaxed);
-        cache.admit_decoded_group(vec![payload.clone()]);
-        cache.compression.enabled.store(true, Ordering::Relaxed);
-        let target = cache.metadata_bytes + cache.status().resident_bytes();
-        cache.update_memory_pressure(MemoryPressureSnapshot::new(128 << 20, target as u64, 0));
-        let key = CacheKey {
-            chunk_id: payload.chunk_id(),
-            logical_length: 65536,
-        };
-        let sets = cache.shards[0].state.lock().unwrap().sets.len();
-        cache.admission.lock().unwrap().compression_cursor = cache_hash(key) % sets;
-        cache.compression.epoch.store(100, Ordering::Relaxed);
-        cache.demote_cold_victim(&payload);
-        assert_eq!(cache.status().demotions(), 1);
-        assert!(cache.status().resident_bytes() < 65536 / 4);
-        assert_eq!(cache.get(payload.chunk_id(), 65536).unwrap(), payload);
-        crate::read_cache::reclamation_tests::assert_accounting(&cache);
     }
 }
 

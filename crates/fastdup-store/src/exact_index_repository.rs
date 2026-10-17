@@ -827,6 +827,24 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
         result
     }
 
+    /// Builds missing Exact membership filters and page bounds for the
+    /// installed generation without warming pages. Same cache-owned
+    /// admission and authority rules as `warm_active_generation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns cancellation or an error from one verified Acceleration read.
+    pub fn warm_active_structures(
+        &self,
+        policy: &ExactCacheWarmPolicy,
+        cancellation: Option<&MaintenanceCancellation>,
+    ) -> Result<ExactCacheWarmProgress, ExactIndexStoreError> {
+        let Some(generation) = self.pin_active_generation() else {
+            return Ok(ExactCacheWarmProgress::default());
+        };
+        generation.warm_structures_cycle(policy, cancellation)
+    }
+
     /// Durably publishes one immutable run without activating it.
     ///
     /// Idempotent retry succeeds only when an existing canonical name has the
@@ -2864,7 +2882,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
 
     fn membership_budget_bytes_now(&self) -> usize {
         stable_capacity_budget(
-            u64::try_from(self.page_cache.protected_budget_bytes()).unwrap_or(u64::MAX),
+            u64::try_from(self.page_cache.structure_budget_bytes()).unwrap_or(u64::MAX),
         )
     }
 
@@ -3231,6 +3249,24 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
             .sum()
     }
 
+    /// Builds only missing membership filters and page bounds. Structures
+    /// gate every Exact lookup, so startup warming runs them ahead of the
+    /// page-warming schedule; pages stay with `warm_cycle`.
+    pub(crate) fn warm_structures_cycle(
+        &self,
+        policy: &ExactCacheWarmPolicy,
+        cancellation: Option<&MaintenanceCancellation>,
+    ) -> Result<ExactCacheWarmProgress, ExactIndexStoreError> {
+        let mut progress = ExactCacheWarmProgress {
+            active_runs: self.readers.len(),
+            total_pages: self.warm_page_count(),
+            ..ExactCacheWarmProgress::default()
+        };
+        let readers = self.run_readers();
+        self.warm_structures(policy, cancellation, readers, &mut progress)?;
+        Ok(progress)
+    }
+
     pub(crate) fn warm_cycle(
         &self,
         policy: &ExactCacheWarmPolicy,
@@ -3267,7 +3303,7 @@ impl<I: StorageIo> ActivatedExactIndex<I> {
             .collect::<Vec<_>>();
         candidates.sort_unstable_by_key(|index| readers[*index].descriptor().page_count());
         for index in candidates.into_iter().take(policy.maximum_structures) {
-            let remaining = self.readers[index].page_cache.protected_budget_bytes();
+            let remaining = self.readers[index].page_cache.structure_budget_bytes();
             progress.structures_requested += 1;
             if self.readers[index].warm_structure(remaining, cancellation)? {
                 progress.structures_built += 1;
@@ -4358,6 +4394,18 @@ impl ExactIndexPageCache {
         }
         self.protected_limit_bytes()
             .saturating_sub(self.protected_resident_bytes())
+    }
+    /// Budget for building pinned Exact structures (membership filters,
+    /// page bounds). These serve every dedup decision, so they measure
+    /// against stable effective capacity instead of waiting for the
+    /// broker's damped target to grow after process start.
+    fn structure_budget_bytes(&self) -> usize {
+        if self.cache.capacity() == 0 {
+            return 0;
+        }
+        let stable =
+            usize::try_from(self.cache.stable_protected_budget_bytes()).unwrap_or(usize::MAX);
+        self.protected_budget_bytes().max(stable)
     }
     fn protected_resident_bytes(&self) -> usize {
         usize::try_from(
@@ -5934,7 +5982,7 @@ mod tests {
         }
         repository
             .page_cache
-            .apply_pressure_snapshot(MemoryPressureSnapshot::new(8 << 30, 6 << 30, 1));
+            .apply_pressure_snapshot(MemoryPressureSnapshot::new(8 << 30, 6 << 30, 1 << 30));
         let before: u64 = counters.rows().iter().map(|row| row.operations).sum();
         repository
             .append_level_zero(profile, vec![reuse_fixture(4)])
@@ -6197,10 +6245,10 @@ mod tests {
         ));
         assert_eq!(cache.status().target_pages(), 0);
 
-        cache.apply_pressure_snapshot(MemoryPressureSnapshot::new(128 * gib, 96 * gib, 1));
+        cache.apply_pressure_snapshot(MemoryPressureSnapshot::new(128 * gib, 96 * gib, gib));
         let swapped = cache.status();
         assert_eq!(swapped.target_pages(), 0);
-        assert_eq!(swapped.swap_used_bytes(), 1);
+        assert_eq!(swapped.swap_used_bytes(), gib);
     }
 
     #[test]
@@ -6665,7 +6713,11 @@ mod tests {
             .membership_status();
         assert_eq!(evicted.filter_count(), 3);
         assert_eq!(evicted.missing_filter_count(), 0);
-        assert_eq!(evicted.missing_page_bounds_count(), 3);
+        assert_eq!(
+            evicted.missing_page_bounds_count(),
+            0,
+            "page bounds are pinned with membership"
+        );
         repository
             .page_cache
             .apply_pressure_snapshot(projection_snapshot());
@@ -6673,7 +6725,6 @@ mod tests {
         let progress = repository
             .warm_active_generation(&ExactCacheWarmPolicy::default(), None)
             .unwrap();
-        assert!(progress.structures_built >= 3);
         let warmed = repository
             .pin_active_generation()
             .unwrap()
@@ -6697,7 +6748,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_page_budget_keeps_pinned_membership_and_skips_evictable_bounds() {
+    fn closed_page_budget_keeps_pinned_membership_and_bounds() {
         let repository = reuse_repository("warm-closed-budget");
         let profile = ExactIndexProfileId::new([103; 32]).unwrap();
         repository
@@ -6711,7 +6762,7 @@ mod tests {
         let progress = repository
             .warm_active_generation(&ExactCacheWarmPolicy::default(), None)
             .unwrap();
-        assert_eq!(progress.structures_requested, 1);
+        assert_eq!(progress.structures_requested, 0);
         assert_eq!(progress.structures_built, 0);
         assert_eq!(progress.pages_warmed, 0);
         let status = repository
@@ -6720,6 +6771,6 @@ mod tests {
             .membership_status();
         assert_eq!(status.filter_count(), 1);
         assert_eq!(status.missing_filter_count(), 0);
-        assert_eq!(status.missing_page_bounds_count(), 1);
+        assert_eq!(status.missing_page_bounds_count(), 0);
     }
 }

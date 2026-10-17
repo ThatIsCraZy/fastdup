@@ -474,19 +474,30 @@ impl State {
             sum.saturating_add(pool.observed.resident_bytes)
         });
         let reserve = cache_memory_reserve(snapshot.effective_limit_bytes());
-        let raw = if snapshot.swap_used_bytes() != 0 {
-            0
-        } else {
-            resident
-                .saturating_add(
-                    snapshot
-                        .available_bytes()
-                        .min(snapshot.effective_limit_bytes()),
-                )
-                .saturating_sub(reserve)
-                .min(snapshot.effective_limit_bytes().saturating_sub(reserve))
-        };
-        self.hard_pressure = snapshot.swap_used_bytes() != 0
+        let unscaled = resident
+            .saturating_add(
+                snapshot
+                    .available_bytes()
+                    .min(snapshot.effective_limit_bytes()),
+            )
+            .saturating_sub(reserve)
+            .min(snapshot.effective_limit_bytes().saturating_sub(reserve));
+        // Graduated Swap response: idle-page residue within the grace band
+        // quarters the budget instead of flushing it; real thrashing and
+        // sustained PSI stalls still close admission promptly.
+        let swap = snapshot.swap_used_bytes();
+        let mut raw = crate::memory_budget::swap_scaled_capacity(
+            unscaled,
+            swap,
+            snapshot.effective_limit_bytes(),
+        );
+        let psi = snapshot.psi_memory_some_avg10_bps();
+        if psi >= 500 {
+            raw /= 2;
+        }
+        self.hard_pressure = swap
+            > crate::memory_budget::swap_grace_bytes(snapshot.effective_limit_bytes())
+            || psi >= 2_000
             || snapshot.available_bytes() < reserve
             || (previous_effective_limit != 0
                 && snapshot.effective_limit_bytes() < previous_effective_limit)
@@ -852,12 +863,24 @@ mod tests {
         );
         assert_eq!(t, 0);
         a.applied(0, 0);
+        // Swap beyond the idle-residue grace band revokes payload targets.
         assert_eq!(
             a.target(
-                MemoryPressureSnapshot::new(100_000, 100_000, 1),
+                MemoryPressureSnapshot::new(100_000, 100_000, 90_000),
                 CacheObservation::default()
             ),
             0
+        );
+        a.applied(0, 0);
+        // A single swapped page only quarters the budget; admission stays
+        // open instead of flushing the whole cache for idle residue.
+        let quartered = a.target(
+            MemoryPressureSnapshot::new(100_000, 100_000, 1),
+            CacheObservation::default(),
+        );
+        assert!(
+            quartered > 0 && quartered <= 23_250,
+            "grace-band Swap must shrink, not revoke: {quartered}"
         );
     }
     #[test]

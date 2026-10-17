@@ -92,7 +92,7 @@ fn indexed_graph_verification_is_bounded_and_corruption_falls_back_to_one_comple
     let profile = ExactIndexProfileId::new([0xB4; 32]).expect("profile identity is nonzero");
     let indexes = ExactIndexRunRepository::new_with_memory_snapshot(
         storage.clone(),
-        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 1),
+        MemoryPressureSnapshot::new(128 << 30, 96 << 30, 1 << 30),
     );
     let descriptor = indexes
         .publish(

@@ -275,7 +275,7 @@ mod tests {
         let cache = ContainerDescriptorCache::new_with_snapshot(MemoryPressureSnapshot::new(
             128 * gib,
             96 * gib,
-            1,
+            gib,
         ));
         let id = ContainerId::new([0x56; 16]).expect("nonzero ID");
         cache.insert(id, descriptor(id));
@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(status.target_entries(), 0);
         assert_eq!(status.entry_count(), 0);
         assert_eq!(status.pressure_rejections(), 1);
-        assert_eq!(status.swap_used_bytes(), 1);
+        assert_eq!(status.swap_used_bytes(), gib);
     }
 
     #[test]
@@ -300,7 +300,7 @@ mod tests {
         cache.insert(id, descriptor(id));
         assert_eq!(cache.status().entry_count(), 1);
 
-        cache.apply_memory_pressure(MemoryPressureSnapshot::new(128 * gib, 96 * gib, 1));
+        cache.apply_memory_pressure(MemoryPressureSnapshot::new(128 * gib, 96 * gib, gib));
 
         assert_eq!(cache.get(id), None);
         let status = cache.status();

@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -22,6 +22,35 @@ pub struct MemoryPressureSnapshot {
     host_swap_used: u64,
     cgroup_swap_used: u64,
     cgroup_swap_limit: u64,
+    psi_memory_some_avg10_bps: u32,
+}
+
+/// Swap charged to this process that is tolerated as idle-page residue
+/// (thread stacks, one-time initialization) instead of active thrashing.
+#[must_use]
+pub(crate) const fn swap_grace_bytes(effective_limit_bytes: u64) -> u64 {
+    let scaled = effective_limit_bytes / 512;
+    if scaled < 4_096 {
+        4_096
+    } else if scaled > 8 * 1_024 * 1_024 {
+        8 * 1_024 * 1_024
+    } else {
+        scaled
+    }
+}
+
+/// Graduated capacity response to process Swap: within the grace band the
+/// cache quarters instead of flushing completely; beyond it admission
+/// closes exactly as before.
+#[must_use]
+pub(crate) const fn swap_scaled_capacity(capacity: u64, swap_used: u64, effective: u64) -> u64 {
+    if swap_used == 0 {
+        capacity
+    } else if swap_used <= swap_grace_bytes(effective) {
+        capacity / 4
+    } else {
+        0
+    }
 }
 
 impl MemoryPressureSnapshot {
@@ -39,6 +68,7 @@ impl MemoryPressureSnapshot {
             host_swap_used: 0,
             cgroup_swap_used: 0,
             cgroup_swap_limit: 0,
+            psi_memory_some_avg10_bps: 0,
         }
     }
 
@@ -62,7 +92,15 @@ impl MemoryPressureSnapshot {
                 Some(limit) => limit,
                 None => UNBOUNDED_SWAP,
             },
+            psi_memory_some_avg10_bps: 0,
         }
+    }
+
+    /// Returns this snapshot with a PSI memory-pressure reading attached.
+    #[must_use]
+    pub const fn with_psi(mut self, psi_memory_some_avg10_bps: u32) -> Self {
+        self.psi_memory_some_avg10_bps = psi_memory_some_avg10_bps;
+        self
     }
 
     /// Returns the process-wide governed system snapshot.
@@ -124,6 +162,13 @@ impl MemoryPressureSnapshot {
     pub const fn swap_protection_enforced(self) -> bool {
         self.cgroup_swap_limit == 0
     }
+
+    /// PSI `memory.some avg10` in basis points (10,000 = 100% stalled).
+    /// Zero when the kernel exposes no pressure file.
+    #[must_use]
+    pub const fn psi_memory_some_avg10_bps(self) -> u32 {
+        self.psi_memory_some_avg10_bps
+    }
 }
 
 trait MemoryBudgetSource: Send + Sync {
@@ -154,6 +199,7 @@ pub struct MemoryBudgetGovernor {
     host_swap_used: AtomicU64,
     cgroup_swap_used: AtomicU64,
     cgroup_swap_limit: AtomicU64,
+    psi_memory_some_avg10_bps: AtomicU64,
     samples: AtomicU64,
     sample_failures: AtomicU64,
 }
@@ -196,6 +242,7 @@ impl MemoryBudgetGovernor {
             host_swap_used: AtomicU64::new(0),
             cgroup_swap_used: AtomicU64::new(1),
             cgroup_swap_limit: AtomicU64::new(UNBOUNDED_SWAP),
+            psi_memory_some_avg10_bps: AtomicU64::new(0),
             samples: AtomicU64::new(0),
             sample_failures: AtomicU64::new(0),
         }
@@ -221,6 +268,10 @@ impl MemoryBudgetGovernor {
             self.host_swap_used.load(Ordering::Acquire),
             self.cgroup_swap_used.load(Ordering::Acquire),
             decode_swap_limit(self.cgroup_swap_limit.load(Ordering::Acquire)),
+        )
+        .with_psi(
+            u32::try_from(self.psi_memory_some_avg10_bps.load(Ordering::Acquire))
+                .unwrap_or(u32::MAX),
         ))
     }
 
@@ -299,6 +350,10 @@ impl MemoryBudgetGovernor {
                 snapshot.cgroup_swap_limit_bytes().unwrap_or(UNBOUNDED_SWAP),
                 Ordering::Release,
             );
+            self.psi_memory_some_avg10_bps.store(
+                u64::from(snapshot.psi_memory_some_avg10_bps()),
+                Ordering::Release,
+            );
             self.valid.store(true, Ordering::Release);
             self.samples.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -359,18 +414,40 @@ fn sample_linux_memory() -> io::Result<MemoryPressureSnapshot> {
     let mut cgroup_swap_limit = None;
 
     if let Some(cgroup) = current_cgroup_v2()? {
-        let maximum = read_optional_limit(cgroup.join("memory.max"))?;
-        let high = read_optional_limit(cgroup.join("memory.high"))?;
-        let current = read_counter(cgroup.join("memory.current"))?;
-        let cgroup_limit = [maximum, high].into_iter().flatten().min();
-        if let Some(limit) = cgroup_limit {
-            effective_limit = effective_limit.min(limit);
-            available = available.min(limit.saturating_sub(current));
+        // cgroup v2 limits are hierarchical: an ancestor slice can bound
+        // this leaf below its own memory.max. Walk every ancestor and take
+        // the tightest limit and headroom along the path.
+        let mut levels: Vec<(Option<u64>, u64)> = Vec::new();
+        let mut swap_limits: Vec<u64> = Vec::new();
+        let mut path = Some(cgroup.as_path());
+        while let Some(dir) = path {
+            let maximum = read_optional_limit(dir.join("memory.max")).ok().flatten();
+            let high = read_optional_limit(dir.join("memory.high")).ok().flatten();
+            let limit = [maximum, high].into_iter().flatten().min();
+            let current = read_counter(dir.join("memory.current")).unwrap_or(0);
+            levels.push((limit, current));
+            if let Ok(Some(swap_limit)) = read_optional_existing_limit(dir.join("memory.swap.max"))
+            {
+                swap_limits.push(swap_limit);
+            }
+            if dir == Path::new("/sys/fs/cgroup") {
+                break;
+            }
+            path = dir.parent();
         }
+        let (walked_limit, walked_available) =
+            effective_from_ancestors(effective_limit, available, &levels);
+        effective_limit = walked_limit;
+        available = walked_available;
         cgroup_swap_used = read_optional_counter(cgroup.join("memory.swap.current"))?;
-        cgroup_swap_limit = read_optional_existing_limit(cgroup.join("memory.swap.max"))?;
+        cgroup_swap_limit = swap_limits.into_iter().min();
+        if cgroup_swap_limit.is_none() {
+            cgroup_swap_limit = read_optional_existing_limit(cgroup.join("memory.swap.max"))?;
+        }
     }
 
+    let psi_bps = fs::read_to_string("/proc/pressure/memory")
+        .map_or(0, |text| parse_psi_some_avg10_bps(&text));
     Ok(MemoryPressureSnapshot::with_swap_state(
         effective_limit,
         available,
@@ -378,7 +455,47 @@ fn sample_linux_memory() -> io::Result<MemoryPressureSnapshot> {
         host_swap_used,
         cgroup_swap_used,
         cgroup_swap_limit,
-    ))
+    )
+    .with_psi(psi_bps))
+}
+
+/// Tightest effective limit and headroom along a cgroup ancestor chain.
+/// `levels` holds `(limit, current)` per directory from leaf to root;
+/// `memory.current` is hierarchical, so `limit - current` at any level
+/// bounds what this subtree may still allocate.
+fn effective_from_ancestors(
+    host_limit: u64,
+    host_available: u64,
+    levels: &[(Option<u64>, u64)],
+) -> (u64, u64) {
+    let mut limit = host_limit;
+    let mut available = host_available;
+    for &(level_limit, current) in levels {
+        if let Some(level_limit) = level_limit {
+            limit = limit.min(level_limit);
+            available = available.min(level_limit.saturating_sub(current));
+        }
+    }
+    (limit, available)
+}
+
+/// Parses `some avg10=1.23` from `/proc/pressure/memory` into basis points.
+fn parse_psi_some_avg10_bps(text: &str) -> u32 {
+    let Some(line) = text.lines().find(|line| line.starts_with("some ")) else {
+        return 0;
+    };
+    let Some(value) = line
+        .split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix("avg10="))
+    else {
+        return 0;
+    };
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, "0"));
+    let whole: u64 = whole.parse().unwrap_or(0);
+    let mut digits = fraction.chars();
+    let tenths = u64::from(digits.next().and_then(|c| c.to_digit(10)).unwrap_or(0));
+    let hundredths = u64::from(digits.next().and_then(|c| c.to_digit(10)).unwrap_or(0));
+    u32::try_from(whole * 100 + tenths * 10 + hundredths).unwrap_or(u32::MAX)
 }
 
 fn status_kib(status: &str, key: &str) -> io::Result<u64> {
@@ -516,6 +633,39 @@ mod tests {
             MemoryBudgetGovernor::with_source(Box::new(unprotected), Duration::from_mins(1));
 
         assert!(governor.require_no_swap().is_err());
+    }
+
+    #[test]
+    fn psi_some_avg10_parses_into_basis_points() {
+        let text = "some avg10=1.23 avg60=0.45 avg300=0.10 total=1234\nfull avg10=0.50 avg60=0.00 avg300=0.00 total=42\n";
+        assert_eq!(parse_psi_some_avg10_bps(text), 123);
+        assert_eq!(parse_psi_some_avg10_bps("some avg10=0.00 total=0\n"), 0);
+        assert_eq!(parse_psi_some_avg10_bps(""), 0);
+        assert_eq!(parse_psi_some_avg10_bps("some avg10=87.5 total=9\n"), 8750);
+    }
+
+    #[test]
+    fn ancestor_limits_tighten_below_the_leaf_limit() {
+        let gib = 1_u64 << 30;
+        let (limit, available) = effective_from_ancestors(
+            64 * gib,
+            40 * gib,
+            &[
+                (Some(32 * gib), 8 * gib),
+                (Some(16 * gib), 12 * gib),
+                (None, 0),
+            ],
+        );
+        assert_eq!(limit, 16 * gib);
+        assert_eq!(available, 4 * gib, "ancestor headroom bounds the subtree");
+    }
+
+    #[test]
+    fn swap_scaling_quarters_within_grace_and_closes_beyond() {
+        let gib = 1_u64 << 30;
+        assert_eq!(swap_scaled_capacity(gib, 0, 64 * gib), gib);
+        assert_eq!(swap_scaled_capacity(gib, 1_024, 64 * gib), gib / 4);
+        assert_eq!(swap_scaled_capacity(gib, gib, 64 * gib), 0);
     }
 
     #[test]

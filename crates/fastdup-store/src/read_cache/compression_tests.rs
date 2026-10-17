@@ -8,7 +8,7 @@ fn payload(bytes: &[u8]) -> VerifiedChunkPayload {
 }
 
 fn cache() -> VerifiedReadCache {
-    VerifiedReadCache::new_legacy_with_snapshot(
+    VerifiedReadCache::new_with_snapshot(
         VerifiedReadCacheConfig::new(4 * 1024 * 1024, 0, NonZeroUsize::new(4).unwrap()).unwrap(),
         MemoryPressureSnapshot::new(128 * 1024 * 1024, 128 * 1024 * 1024, 0),
     )
@@ -35,7 +35,11 @@ fn compressed_entries_are_self_contained_and_survive_cache_purge_as_owned_views(
     let status = cache.status();
     assert!(status.compressed_resident_bytes() < 65536 / 4);
     assert_eq!(status.compressed_logical_bytes(), 65536);
-    assert_eq!(status.resident_bytes(), status.compressed_resident_bytes());
+    // Unified resident bytes add the fixed per-entry directory charge.
+    assert_eq!(
+        status.resident_bytes(),
+        status.compressed_resident_bytes() + 512
+    );
     let id = original.chunk_id();
     drop(original);
     let hit = cache.get(id, 65536).unwrap();
@@ -71,6 +75,37 @@ fn repeated_expensive_decodes_promote_without_a_fixed_hot_byte_reservation() {
     }
     assert_eq!(cache.status().decompressions(), decoded);
     super::reclamation_tests::assert_accounting(&cache);
+}
+
+fn unified_cache() -> VerifiedReadCache {
+    VerifiedReadCache::new_with_snapshot(
+        VerifiedReadCacheConfig::new(4 * 1024 * 1024, 0, NonZeroUsize::new(4).unwrap()).unwrap(),
+        MemoryPressureSnapshot::new(128 * 1024 * 1024, 128 * 1024 * 1024, 0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn unified_hot_compressed_entries_promote_to_decoded_in_place() {
+    let cache = unified_cache();
+    let original = payload(&vec![41; 65536]);
+    cache.admit_decoded_group(vec![original.clone()]);
+    let id = original.chunk_id();
+    drop(original);
+    assert!(cache.status().compressed_resident_bytes() > 0);
+    for _ in 0..128 {
+        assert_eq!(cache.get(id, 65536).unwrap().as_slice(), &vec![41; 65536]);
+        if cache.status().promotions() != 0 {
+            break;
+        }
+    }
+    assert_eq!(cache.status().promotions(), 1);
+    assert_eq!(cache.status().compressed_resident_bytes(), 0);
+    let decoded = cache.status().decompressions();
+    for _ in 0..16 {
+        assert_eq!(cache.get(id, 65536).unwrap().as_slice(), &vec![41; 65536]);
+    }
+    assert_eq!(cache.status().decompressions(), decoded);
 }
 
 #[test]
