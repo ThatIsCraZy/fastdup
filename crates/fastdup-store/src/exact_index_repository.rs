@@ -477,6 +477,9 @@ pub struct ExactIndexPageCacheStatus {
     misses: u64,
     resident_pages: u64,
     evictions: u64,
+    pressure_evictions: u64,
+    admission_evictions: u64,
+    removals: u64,
     pressure_rejections: u64,
     target_pages: u64,
     capacity_pages: u64,
@@ -507,6 +510,21 @@ impl ExactIndexPageCacheStatus {
     #[must_use]
     pub const fn evictions(self) -> u64 {
         self.evictions
+    }
+
+    #[must_use]
+    pub const fn pressure_evictions(self) -> u64 {
+        self.pressure_evictions
+    }
+
+    #[must_use]
+    pub const fn admission_evictions(self) -> u64 {
+        self.admission_evictions
+    }
+
+    #[must_use]
+    pub const fn removals(self) -> u64 {
+        self.removals
     }
 
     #[must_use]
@@ -4425,6 +4443,9 @@ impl ExactIndexPageCache {
             misses: stats.misses,
             resident_pages: stats.entries,
             evictions: stats.evictions,
+            pressure_evictions: stats.pressure_evictions,
+            admission_evictions: stats.admission_evictions,
+            removals: stats.removals,
             pressure_rejections: stats.rejections,
             target_pages: self.cache.capacity() / ACCOUNTED_PAGE_BYTES,
             capacity_pages: self.capacity_pages,

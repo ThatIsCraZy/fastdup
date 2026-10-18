@@ -159,6 +159,9 @@ pub struct VerifiedReadCacheStatus {
     misses: u64,
     admissions: u64,
     evictions: u64,
+    pressure_evictions: u64,
+    admission_evictions: u64,
+    removals: u64,
     pressure_rejections: u64,
     oversized_rejections: u64,
     entry_count: usize,
@@ -204,6 +207,9 @@ impl VerifiedReadCacheStatus {
     status_getter!(misses, misses, u64);
     status_getter!(admissions, admissions, u64);
     status_getter!(evictions, evictions, u64);
+    status_getter!(pressure_evictions, pressure_evictions, u64);
+    status_getter!(admission_evictions, admission_evictions, u64);
+    status_getter!(removals, removals, u64);
     status_getter!(pressure_rejections, pressure_rejections, u64);
     status_getter!(oversized_rejections, oversized_rejections, u64);
     status_getter!(entry_count, entry_count, usize);
@@ -477,6 +483,9 @@ impl VerifiedReadCache {
             misses: stats.misses,
             admissions: stats.admissions,
             evictions: stats.evictions,
+            pressure_evictions: stats.pressure_evictions,
+            admission_evictions: stats.admission_evictions,
+            removals: stats.removals,
             pressure_rejections: self.pressure_rejections.load(Ordering::Relaxed),
             oversized_rejections: self.oversized_rejections.load(Ordering::Relaxed),
             entry_count: entries,

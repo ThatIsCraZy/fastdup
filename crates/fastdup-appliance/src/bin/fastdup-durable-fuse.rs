@@ -1694,6 +1694,7 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         concat!(
             "exact_index_page_cache hits={} misses={} hit_rate_basis_points={} ",
             "resident_pages={} target_pages={} capacity_pages={} evictions={} ",
+            "pressure_evictions={} admission_evictions={} removals={} ",
             "pressure_rejections={} protected_limit_bytes={} protected_resident_bytes={} ",
             "reserve_bytes={} effective_limit_bytes={} available_bytes={} swap_used_bytes={}"
         ),
@@ -1704,6 +1705,9 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         exact.target_pages(),
         exact.capacity_pages(),
         exact.evictions(),
+        exact.pressure_evictions(),
+        exact.admission_evictions(),
+        exact.removals(),
         exact.pressure_rejections(),
         exact.protected_limit_bytes(),
         exact.protected_resident_bytes(),
@@ -1747,6 +1751,7 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
     eprintln!(
         concat!(
             "verified_read_cache hits={} misses={} admissions={} evictions={} ",
+            "pressure_evictions={} admission_evictions={} removals={} ",
             "pressure_rejections={} oversized_rejections={} entries={} resident_bytes={} ",
             "target_bytes={} verified_share_limit_bytes={} metadata_bytes={} ",
             "hard_limit_bytes={} reserve_bytes={} ",
@@ -1756,6 +1761,9 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         cache.misses(),
         cache.admissions(),
         cache.evictions(),
+        cache.pressure_evictions(),
+        cache.admission_evictions(),
+        cache.removals(),
         cache.pressure_rejections(),
         cache.oversized_rejections(),
         cache.entry_count(),
@@ -1778,6 +1786,7 @@ fn emit_similarity_index_page_cache(appliance: &FsAppliance) {
             "similarity_index_page_cache hits={} misses={} hit_rate_basis_points={} ",
             "entry_hits={} entry_misses={} bucket_hits={} bucket_misses={} ",
             "resident_pages={} target_pages={} capacity_pages={} evictions={} ",
+            "pressure_evictions={} admission_evictions={} removals={} ",
             "pressure_rejections={} reserve_bytes={} effective_limit_bytes={} ",
             "available_bytes={} swap_used_bytes={}"
         ),
@@ -1792,6 +1801,9 @@ fn emit_similarity_index_page_cache(appliance: &FsAppliance) {
         similarity.target_pages(),
         similarity.capacity_pages(),
         similarity.evictions(),
+        similarity.pressure_evictions(),
+        similarity.admission_evictions(),
+        similarity.removals(),
         similarity.pressure_rejections(),
         similarity.reserve_bytes(),
         similarity.effective_limit_bytes(),

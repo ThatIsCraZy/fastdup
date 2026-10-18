@@ -28,11 +28,18 @@ const VERIFIED_DATA_SHARE_BASIS_POINTS: u64 = 2_000;
 const VERIFIED_DATA_MINIMUM_BYTES: u64 = 4096 + ENTRY_BYTES;
 const PROTECTED_EXACT_SHARE_BASIS_POINTS: u64 = 7_000;
 const PROTECTED_EXACT_MINIMUM_BYTES: u64 = 4096 + ENTRY_BYTES;
-// TinyLFU-style frequency sketch per shard. Counters saturate at 15 and are
-// halved after a bounded number of increments so stale popularity decays.
+// TinyLFU-style frequency sketch per shard with a doorkeeper: a key's
+// first touch in a window only sets a doorkeeper bit, later touches
+// increment the counter. Without it, one-hit ingest streams incremented
+// every counter (65,536 ops over 8,192 counters averages 8 per counter),
+// so the admission gate's "seen at least twice" test was true for almost
+// every key. Counters saturate at 15 and are halved with the doorkeeper
+// cleared after a bounded number of touches.
 const SKETCH_COUNTERS: usize = 8192;
 const SKETCH_MAX: u8 = 15;
 const SKETCH_RESET_OPS: u32 = 65_536;
+const DOORKEEPER_BITS: usize = 32_768;
+const DOORKEEPER_WORDS: usize = DOORKEEPER_BITS / 64;
 // Bounded ghost fingerprints of evicted keys per shard. A re-requested ghost
 // key is proven reuse and re-enters with eviction credit.
 const GHOST_CAPACITY: usize = 1024;
@@ -172,6 +179,17 @@ struct Key {
     object: ReadCacheKey,
 }
 
+/// Why an entry left residency. Retired-generation purges and explicit
+/// removals are lifecycle events, not capacity evictions; conflating them
+/// made Run retirement look like pressure collapse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnchargeCause {
+    Pressure,
+    Admission,
+    Removal,
+    Invalidation,
+}
+
 #[derive(Debug, Default)]
 struct Counters {
     hits: AtomicU64,
@@ -179,6 +197,10 @@ struct Counters {
     hit_bytes: AtomicU64,
     admissions: AtomicU64,
     evictions: AtomicU64,
+    pressure_evictions: AtomicU64,
+    admission_evictions: AtomicU64,
+    removals: AtomicU64,
+    invalidations: AtomicU64,
     rejections: AtomicU64,
     ghost_hits: AtomicU64,
     sketch_rejections: AtomicU64,
@@ -194,6 +216,10 @@ pub struct ReadCacheStats {
     pub hit_bytes: u64,
     pub admissions: u64,
     pub evictions: u64,
+    pub pressure_evictions: u64,
+    pub admission_evictions: u64,
+    pub removals: u64,
+    pub invalidations: u64,
     pub rejections: u64,
     pub ghost_hits: u64,
     pub sketch_rejections: u64,
@@ -209,6 +235,10 @@ impl Counters {
             hit_bytes: self.hit_bytes.load(Ordering::Relaxed),
             admissions: self.admissions.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
+            pressure_evictions: self.pressure_evictions.load(Ordering::Relaxed),
+            admission_evictions: self.admission_evictions.load(Ordering::Relaxed),
+            removals: self.removals.load(Ordering::Relaxed),
+            invalidations: self.invalidations.load(Ordering::Relaxed),
             rejections: self.rejections.load(Ordering::Relaxed),
             ghost_hits: self.ghost_hits.load(Ordering::Relaxed),
             sketch_rejections: self.sketch_rejections.load(Ordering::Relaxed),
@@ -241,6 +271,8 @@ struct Entries {
     pinned_clock: VecDeque<Key>,
     stale_keys: usize,
     sketch: Box<[u8]>,
+    doorkeeper: Box<[u64]>,
+    doorkeeper_sets: u32,
     sketch_ops: u32,
     ghost: VecDeque<u64>,
 }
@@ -255,6 +287,8 @@ impl Default for Entries {
             pinned_clock: VecDeque::new(),
             stale_keys: 0,
             sketch: vec![0; SKETCH_COUNTERS].into_boxed_slice(),
+            doorkeeper: vec![0; DOORKEEPER_WORDS].into_boxed_slice(),
+            doorkeeper_sets: 0,
             sketch_ops: 0,
             ghost: VecDeque::new(),
         }
@@ -288,15 +322,33 @@ impl Entries {
     }
 
     fn sketch_increment(&mut self, fingerprint: u64) {
-        let index = usize::try_from(fingerprint >> 32).unwrap_or(0) & (SKETCH_COUNTERS - 1);
-        let counter = &mut self.sketch[index];
-        *counter = (*counter).saturating_add(1).min(SKETCH_MAX);
+        // Bit layout: shard selection owns bits 0..6 and the sketch counter
+        // index bits 32..45, so the doorkeeper indexes bits 6..21. Indexing
+        // from the low bits would leave only 128 usable bits per shard
+        // because every key in a shard shares the low 6 bits.
+        let bit = usize::try_from(fingerprint >> 6).unwrap_or(0) & (DOORKEEPER_BITS - 1);
+        let word = &mut self.doorkeeper[bit / 64];
+        let seen = *word & (1_u64 << (bit % 64)) != 0;
+        if seen {
+            let index = usize::try_from(fingerprint >> 32).unwrap_or(0) & (SKETCH_COUNTERS - 1);
+            let counter = &mut self.sketch[index];
+            *counter = (*counter).saturating_add(1).min(SKETCH_MAX);
+        } else {
+            *word |= 1_u64 << (bit % 64);
+            self.doorkeeper_sets = self.doorkeeper_sets.saturating_add(1);
+        }
         self.sketch_ops = self.sketch_ops.saturating_add(1);
-        if self.sketch_ops >= SKETCH_RESET_OPS {
+        // Reset before the doorkeeper saturates (half its bits set keeps
+        // the false-positive rate bounded) or the op window elapses.
+        if self.sketch_ops >= SKETCH_RESET_OPS
+            || self.doorkeeper_sets >= u32::try_from(DOORKEEPER_BITS / 2).unwrap_or(u32::MAX)
+        {
             self.sketch_ops = 0;
+            self.doorkeeper_sets = 0;
             for counter in &mut self.sketch {
                 *counter /= 2;
             }
+            self.doorkeeper.fill(0);
         }
     }
 
@@ -589,7 +641,10 @@ impl Core {
     fn fixed_bytes() -> u64 {
         (size_of::<Self>()
             + SHARDS * size_of::<Shard>()
-            + SHARDS * (SKETCH_COUNTERS + GHOST_CAPACITY * size_of::<u64>())
+            + SHARDS
+                * (SKETCH_COUNTERS
+                    + DOORKEEPER_WORDS * size_of::<u64>()
+                    + GHOST_CAPACITY * size_of::<u64>())
             + MAX_FLIGHTS * 1024) as u64
     }
 
@@ -692,13 +747,20 @@ impl Core {
         }
     }
 
-    fn get<T: Any + Send + Sync>(&self, key: Key, counters: &Counters) -> Option<Arc<T>> {
+    fn get<T: Any + Send + Sync>(
+        &self,
+        key: Key,
+        counters: &Counters,
+        count_sketch: bool,
+    ) -> Option<Arc<T>> {
         self.refresh();
         let mut shard = self.shards[Self::shard(key)]
             .0
             .lock()
             .expect("ASSERT: cache shard poisoned");
-        shard.sketch_increment(Self::fingerprint(key));
+        if count_sketch {
+            shard.sketch_increment(Self::fingerprint(key));
+        }
         if let Some(entry) = shard.map.get_mut(&key) {
             let value = Arc::clone(&entry.value)
                 .downcast::<T>()
@@ -807,14 +869,16 @@ impl Core {
             // No global cold fallback: the selected borrower yields (cold
             // first, then credited FIFO) before a group at or below its
             // guarantee loses entries to a scope-All search.
-            let cold_evicted = !cold_exhausted && self.evict_cold(state, scope, &mut cold_budget);
+            let cold_evicted = !cold_exhausted
+                && self.evict_cold(state, scope, &mut cold_budget, UnchargeCause::Pressure);
             if cold_evicted {
                 evicted += 1;
                 continue;
             }
             cold_exhausted = true;
-            if !self.evict(state, false, scope)
-                && (scope == EvictionScope::All || !self.evict(state, false, EvictionScope::All))
+            if !self.evict(state, false, scope, UnchargeCause::Pressure)
+                && (scope == EvictionScope::All
+                    || !self.evict(state, false, EvictionScope::All, UnchargeCause::Pressure))
             {
                 return false;
             }
@@ -823,7 +887,7 @@ impl Core {
         true
     }
 
-    fn uncharge(&self, state: &mut Admission, entry: Entry) {
+    fn uncharge(&self, state: &mut Admission, entry: Entry, cause: UnchargeCause) {
         let counters = &entry.allocation.counters;
         let payload = if Arc::strong_count(&entry.allocation) == 1 {
             entry.allocation.bytes
@@ -835,14 +899,44 @@ impl Core {
         for observation in [counters.as_ref(), &self.counters] {
             observation.resident.fetch_sub(charge, Ordering::Relaxed);
             observation.entries.fetch_sub(1, Ordering::Relaxed);
-            observation.evictions.fetch_add(1, Ordering::Relaxed);
+            match cause {
+                UnchargeCause::Pressure => {
+                    observation.evictions.fetch_add(1, Ordering::Relaxed);
+                    observation
+                        .pressure_evictions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                UnchargeCause::Admission => {
+                    observation.evictions.fetch_add(1, Ordering::Relaxed);
+                    observation
+                        .admission_evictions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                UnchargeCause::Removal => {
+                    // Total evictions keep their historical meaning for
+                    // the budget-demand and warming controllers; the split
+                    // counters below are purely additive.
+                    observation.evictions.fetch_add(1, Ordering::Relaxed);
+                    observation.removals.fetch_add(1, Ordering::Relaxed);
+                }
+                UnchargeCause::Invalidation => {
+                    observation.evictions.fetch_add(1, Ordering::Relaxed);
+                    observation.invalidations.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         // The returned immutable Arc may outlive eviction. That reader memory
         // continues to reduce measured headroom; eviction cannot invalidate it.
         drop(entry);
     }
 
-    fn evict(&self, state: &mut Admission, second_chance: bool, scope: EvictionScope) -> bool {
+    fn evict(
+        &self,
+        state: &mut Admission,
+        second_chance: bool,
+        scope: EvictionScope,
+        cause: UnchargeCause,
+    ) -> bool {
         for _ in 0..SHARDS {
             let index = state.cursor % SHARDS;
             state.cursor = state.cursor.wrapping_add(1);
@@ -872,7 +966,7 @@ impl Core {
                     .expect("ASSERT: cache clock covers owners");
                 shard.ghost_remember(Self::fingerprint(key));
                 shard.compact();
-                self.uncharge(state, entry);
+                self.uncharge(state, entry, cause);
                 return true;
             }
         }
@@ -883,7 +977,13 @@ impl Core {
     /// requeued untouched, so an unproven admission candidate can churn
     /// cold space without ever displacing a warm working set. Examination
     /// work is bounded by `budget` across the whole call.
-    fn evict_cold(&self, state: &mut Admission, scope: EvictionScope, budget: &mut usize) -> bool {
+    fn evict_cold(
+        &self,
+        state: &mut Admission,
+        scope: EvictionScope,
+        budget: &mut usize,
+        cause: UnchargeCause,
+    ) -> bool {
         for _ in 0..SHARDS {
             if *budget == 0 {
                 return false;
@@ -909,6 +1009,9 @@ impl Core {
                     continue;
                 };
                 if entry.credit != 0 {
+                    // Age credit on examination: without it, a cold-only
+                    // admission regime would never decay a once-hot set.
+                    entry.credit /= 2;
                     let class = entry.class;
                     shard.push(class, key);
                     continue;
@@ -919,7 +1022,7 @@ impl Core {
                     .expect("ASSERT: cache clock covers owners");
                 shard.ghost_remember(Self::fingerprint(key));
                 shard.compact();
-                self.uncharge(state, entry);
+                self.uncharge(state, entry, cause);
                 return true;
             }
         }
@@ -939,7 +1042,7 @@ impl Core {
             shard.stale_keys += 1;
             shard.reclaim_clocks();
             shard.compact();
-            self.uncharge(&mut state, entry);
+            self.uncharge(&mut state, entry, UnchargeCause::Removal);
         }
     }
 
@@ -960,7 +1063,7 @@ impl Core {
                 shard.stale_keys += 1;
                 shard.reclaim_clocks();
                 shard.compact();
-                self.uncharge(&mut state, entry);
+                self.uncharge(&mut state, entry, UnchargeCause::Removal);
             }
         }
     }
@@ -973,7 +1076,7 @@ impl Core {
         for slot in &self.shards {
             let mut shard = slot.0.lock().expect("ASSERT: cache shard poisoned");
             for entry in shard.purge_namespace(namespace) {
-                self.uncharge(&mut state, entry);
+                self.uncharge(&mut state, entry, UnchargeCause::Removal);
             }
             shard.compact();
         }
@@ -1091,7 +1194,13 @@ impl ReadCacheNamespace {
         if crate::read_intent::independent() {
             return None;
         }
-        self.0.core.get(self.key(key), &self.0.counters)
+        // The frequency sketch exists only to gate DATA admission
+        // (cold_only). Counting every class (and Scan maintenance) drowned
+        // that signal in index-page traffic.
+        let count_sketch = self.0.class == ReadCacheClass::Data && !crate::read_intent::scan();
+        self.0
+            .core
+            .get(self.key(key), &self.0.counters, count_sketch)
     }
 
     /// Shares overlapping cold work for one complete immutable request. This
@@ -1267,7 +1376,10 @@ impl ReadCacheNamespace {
                             .lock()
                             .expect("ASSERT: cache shard poisoned");
                         let fingerprint = Core::fingerprint(key);
-                        proven |= shard.sketch_estimate(fingerprint) >= 2
+                        // The doorkeeper absorbs each key's first touch in
+                        // a window, so a counter of 1 already means "seen
+                        // at least twice recently".
+                        proven |= shard.sketch_estimate(fingerprint) >= 1
                             || shard.ghost.iter().any(|known| *known == fingerprint);
                         !shard.map.contains_key(&key)
                     })
@@ -1307,7 +1419,12 @@ impl ReadCacheNamespace {
                 || state.resident.saturating_add(added) > state.target)
                 && steps != 0
             {
-                if !core.evict(&mut state, false, EvictionScope::VerifiedData) {
+                if !core.evict(
+                    &mut state,
+                    false,
+                    EvictionScope::VerifiedData,
+                    UnchargeCause::Admission,
+                ) {
                     break;
                 }
                 steps -= 1;
@@ -1343,10 +1460,20 @@ impl ReadCacheNamespace {
                 let freed = if cold_only {
                     // An unproven candidate rejects rather than hunting cold
                     // victims in groups that hold their guarantee.
-                    core.evict_cold(&mut state, scope, &mut cold_budget)
+                    core.evict_cold(
+                        &mut state,
+                        scope,
+                        &mut cold_budget,
+                        UnchargeCause::Admission,
+                    )
                 } else {
-                    core.evict(&mut state, true, scope)
-                        || core.evict(&mut state, true, EvictionScope::All)
+                    core.evict(&mut state, true, scope, UnchargeCause::Admission)
+                        || core.evict(
+                            &mut state,
+                            true,
+                            EvictionScope::All,
+                            UnchargeCause::Admission,
+                        )
                 };
                 if !freed {
                     break;
@@ -1359,6 +1486,20 @@ impl ReadCacheNamespace {
                         observation
                             .sketch_rejections
                             .fetch_add(1, Ordering::Relaxed);
+                    }
+                    // The group was demand-fetched as one record: record a
+                    // touch for every sibling so the next sibling demand
+                    // proves the group instead of re-reading the record
+                    // once per chunk (bounds the cost at two reads).
+                    for (values, _, _) in &groups {
+                        for (object, _, _) in values {
+                            let key = self.key(*object);
+                            core.shards[Core::shard(key)]
+                                .0
+                                .lock()
+                                .expect("ASSERT: cache shard poisoned")
+                                .sketch_increment(Core::fingerprint(key));
+                        }
                     }
                 }
                 reject();
@@ -1392,8 +1533,11 @@ impl ReadCacheNamespace {
                     reject();
                     continue;
                 }
+                // Admission is not demand: counting inserts made every
+                // miss+insert pair look like two touches. Only DATA demand
+                // gets feed the sketch (plus explicit touches on cold-only
+                // rejection below).
                 let fingerprint = Core::fingerprint(key);
-                shard.sketch_increment(fingerprint);
                 let credit = if shard.ghost_take(fingerprint) {
                     for observation in [self.0.counters.as_ref(), &core.counters] {
                         observation.ghost_hits.fetch_add(1, Ordering::Relaxed);
@@ -1731,7 +1875,7 @@ impl ReadCacheNamespace {
             shard.stale_keys += 1;
             shard.reclaim_clocks();
             shard.compact();
-            core.uncharge(&mut state, entry);
+            core.uncharge(&mut state, entry, UnchargeCause::Invalidation);
         }
     }
 
@@ -2068,6 +2212,96 @@ mod tests {
     }
 
     #[test]
+    fn removals_are_split_from_pressure_evictions() {
+        let charge = 4096 + ENTRY_BYTES;
+        let cache = ReadCacheNamespace::isolated(ReadCacheClass::SimilarityPage, 16 * charge);
+        for ordinal in 0..16 {
+            cache.insert(key(ordinal), Arc::new(vec![5_u8; 4096]), 4096, 4096);
+        }
+        cache.remove(key(0));
+        cache.remove(key(1));
+        let stats = cache.stats();
+        assert_eq!(stats.removals, 2);
+        assert_eq!(stats.pressure_evictions, 0);
+        assert_eq!(stats.evictions, 2, "total keeps its historical meaning");
+        cache.set_capacity(4 * charge);
+        let stats = cache.stats();
+        assert!(stats.pressure_evictions > 0, "target shrink is pressure");
+        assert_eq!(stats.evictions, stats.pressure_evictions + stats.removals);
+        assert_eq!(stats.removals, 2);
+    }
+
+    #[test]
+    fn doorkeeper_keeps_one_hit_streams_unproven() {
+        fn fingerprint(sketch_index: u64, door_index: u64) -> u64 {
+            (sketch_index << 32) | (door_index << 6)
+        }
+        let mut entries = Entries::default();
+        // A one-hit stream over one sketch counter must never raise it.
+        for door in 0..256_u64 {
+            entries.sketch_increment(fingerprint(9, door * 7 + 1));
+        }
+        assert_eq!(entries.sketch_estimate(fingerprint(9, 1)), 0);
+        // The second touch of a key starts counting; the third raises it.
+        entries.sketch_increment(fingerprint(9, 1));
+        assert_eq!(entries.sketch_estimate(fingerprint(9, 1)), 1);
+        entries.sketch_increment(fingerprint(9, 1));
+        assert_eq!(entries.sketch_estimate(fingerprint(9, 1)), 2);
+        // Reset halves counters and clears the doorkeeper: the same key is
+        // a first touch again and does not increment.
+        let mut entries = Entries::default();
+        entries.sketch_increment(fingerprint(4, 3));
+        entries.sketch_increment(fingerprint(4, 3));
+        entries.sketch_increment(fingerprint(4, 3));
+        assert_eq!(entries.sketch_estimate(fingerprint(4, 3)), 2);
+        for low in 0..u64::from(SKETCH_RESET_OPS) {
+            entries.sketch_increment(fingerprint(100 + (low % 64), (low * 3 + 5) & 0x3fff));
+        }
+        let decayed = entries.sketch_estimate(fingerprint(4, 3));
+        assert!(decayed <= 1, "resets must at least halve the counter");
+        entries.sketch_increment(fingerprint(4, 3));
+        assert_eq!(
+            entries.sketch_estimate(fingerprint(4, 3)),
+            decayed,
+            "first touch after reset must stop at the doorkeeper"
+        );
+        entries.sketch_increment(fingerprint(4, 3));
+        assert_eq!(entries.sketch_estimate(fingerprint(4, 3)), decayed + 1);
+    }
+
+    #[test]
+    fn rejected_sibling_group_is_proven_by_the_next_demand() {
+        // Restore amplification bound: an unproven Record group rejected
+        // under a fully credited DATA cache must be admittable after one
+        // more demand touch, never re-read once per sibling forever.
+        let charge = 4096 + ENTRY_BYTES;
+        let data = ReadCacheNamespace::isolated(ReadCacheClass::Data, 16 * charge);
+        for ordinal in 0..16 {
+            data.insert(key(ordinal), Arc::new(vec![1_u8; 4096]), 4096, 4096);
+            assert!(data.get::<Vec<u8>>(key(ordinal)).is_some());
+        }
+        let group = || {
+            vec![(
+                (100..103)
+                    .map(|ordinal| (key(ordinal), Arc::new(vec![2_u8; 4096]), 4096))
+                    .collect::<Vec<_>>(),
+                3 * 4096,
+            )]
+        };
+        // Credit ageing during the cold search may already admit the group
+        // on the first attempt; that also satisfies the bound. Otherwise
+        // the rejection touch plus one demand must prove it.
+        if data.insert_groups(group()) == 0 {
+            assert!(data.get::<Vec<u8>>(key(100)).is_none(), "demand miss");
+            assert_eq!(
+                data.insert_groups(group()),
+                3,
+                "rejection touch plus one demand must prove the group"
+            );
+        }
+    }
+
+    #[test]
     fn cold_eviction_budget_charges_only_examined_entries() {
         let charge = 4096 + ENTRY_BYTES;
         let cache = ReadCacheNamespace::isolated(ReadCacheClass::Data, 4096 * charge);
@@ -2080,7 +2314,12 @@ mod tests {
             .lock()
             .expect("ASSERT: cache admission poisoned");
         let mut budget = 3_usize;
-        assert!(core.evict_cold(&mut state, EvictionScope::All, &mut budget));
+        assert!(core.evict_cold(
+            &mut state,
+            EvictionScope::All,
+            &mut budget,
+            UnchargeCause::Pressure
+        ));
         assert_eq!(
             budget, 2,
             "one examined cold victim must cost one budget unit, not a whole shard scan"
