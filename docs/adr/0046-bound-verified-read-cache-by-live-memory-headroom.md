@@ -42,6 +42,10 @@ open mutation admission and the same cache and I/O limits.
 - **Scan** uses hits and may fill only eviction-free headroom; it never chooses
   a victim or exceeds a class ceiling.
 - **Independent** bypasses resident and in-flight reuse and admits nothing.
+  Navigation structures derived from the audited bytes of the same leased
+  identity (Exact page-key bounds) may locate pages; page bytes must be
+  read fresh. Writer-born bounds that no audit has checked may not steer
+  an Independent read.
 
 Verification-only Scan reads retain neither payload nor Location evidence.
 Demand reads may retain payload plus compact evidence for a fully verified,

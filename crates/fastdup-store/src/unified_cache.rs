@@ -1268,7 +1268,9 @@ impl ReadCacheNamespace {
         }
     }
 
-    /// Inspects residency without recording a hit. Intended for cold telemetry.
+    /// Inspects residency without recording a hit or earning credit. For
+    /// presence probes and audited navigation structures that may locate
+    /// bytes under Independent intent without reusing them.
     ///
     /// # Panics
     /// Panics on a poisoned shard or inconsistent representation type.

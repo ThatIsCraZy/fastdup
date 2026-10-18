@@ -611,6 +611,7 @@ pub struct ExactRunMembershipStatus {
     page_independent_reads: u64,
     page_distinct_compaction_born: u64,
     page_bounds_miss_reads: u64,
+    page_bounds_writer_fallbacks: u64,
     active_page_count: u64,
 }
 
@@ -728,6 +729,11 @@ impl ExactRunMembershipStatus {
     #[must_use]
     pub const fn page_bounds_miss_reads(self) -> u64 {
         self.page_bounds_miss_reads
+    }
+
+    #[must_use]
+    pub const fn page_bounds_writer_fallbacks(self) -> u64 {
+        self.page_bounds_writer_fallbacks
     }
 }
 
@@ -3458,6 +3464,12 @@ impl<I> ActivatedExactIndex<I> {
                 .filter_map(|reader| reader.mapping.as_ref())
                 .map(|mapping| mapping.bounds_miss_reads())
                 .fold(0_u64, u64::saturating_add),
+            page_bounds_writer_fallbacks: self
+                .readers
+                .iter()
+                .filter_map(|reader| reader.mapping.as_ref())
+                .map(|mapping| mapping.bounds_writer_fallbacks())
+                .fold(0_u64, u64::saturating_add),
             active_page_count: self
                 .readers
                 .iter()
@@ -5224,6 +5236,10 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bounded batch descent with provenance guard and span merging"
+    )]
     fn try_lookup_batch_into(
         &self,
         keys: &[(ChunkId, u32)],
@@ -5233,6 +5249,16 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         let _read_reason = crate::MetadataReadScope::enter_unless_attributed(
             crate::MetadataReadReason::IndexLookup,
         );
+        // Same provenance rule as the serial descent: Independent reads may
+        // not be steered by writer-born bounds that no audit has checked.
+        if crate::read_intent::independent()
+            && self
+                .mapping
+                .as_ref()
+                .is_some_and(|mapping| mapping.writer_born())
+        {
+            return Ok(false);
+        }
         let Some(bounds) = self
             .mapping
             .as_ref()
@@ -5875,10 +5901,21 @@ mod tests {
     }
 
     fn reuse_repository(label: &str) -> ExactIndexRunRepository<crate::FsStorageIo> {
+        reuse_repository_at(label, true)
+    }
+
+    fn reuse_repository_reopen(label: &str) -> ExactIndexRunRepository<crate::FsStorageIo> {
+        reuse_repository_at(label, false)
+    }
+
+    fn reuse_repository_at(
+        label: &str,
+        clean: bool,
+    ) -> ExactIndexRunRepository<crate::FsStorageIo> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts/tests")
             .join(format!("exact-reuse-{label}-{}", std::process::id()));
-        if root.exists() {
+        if clean && root.exists() {
             std::fs::remove_dir_all(&root).unwrap();
         }
         let repository = ExactIndexRunRepository::new_with_memory_snapshot(
@@ -5899,6 +5936,54 @@ mod tests {
             )
             .unwrap();
         repository
+    }
+
+    #[test]
+    fn independent_descent_peeks_audited_bounds_only_for_disk_opened_runs() {
+        let profile = ExactIndexProfileId::new([64; 32]).unwrap();
+        let entries: Vec<_> = (0..2_000).map(reuse_fixture).collect();
+        let writer = reuse_repository("bounds-independent");
+        writer.append_level_zero(profile, entries).unwrap();
+        // Writer-born mappings: Independent must not trust writer bounds.
+        let pin = writer.pin_active_generation().unwrap();
+        {
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+            assert_eq!(
+                pin.lookup_transitions(reuse_fixture(1_999).chunk_id(), 32)
+                    .unwrap()
+                    .candidates()
+                    .len(),
+                1
+            );
+        }
+        assert!(
+            pin.membership_status().page_bounds_writer_fallbacks() > 0,
+            "writer-born bounds must fall back under Independent"
+        );
+        drop(pin);
+        drop(writer);
+
+        // Reopened from disk, bounds are an audited function of the leased
+        // bytes: the Independent descent runs in RAM, leaf bytes stay fresh.
+        let reopened = reuse_repository_reopen("bounds-independent");
+        let pin = reopened.recover_active().unwrap().unwrap();
+        let before = pin.membership_status().page_bounds_miss_reads();
+        {
+            let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+            assert_eq!(
+                pin.lookup_transitions(reuse_fixture(1_999).chunk_id(), 32)
+                    .unwrap()
+                    .candidates()
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(
+            pin.membership_status().page_bounds_miss_reads(),
+            before,
+            "disk-opened bounds must serve the Independent descent"
+        );
+        assert_eq!(pin.membership_status().page_bounds_writer_fallbacks(), 0);
     }
 
     #[test]

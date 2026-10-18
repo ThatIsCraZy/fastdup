@@ -1676,7 +1676,7 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
             "definitely_absent={} requires_exact_lookup={} ",
             "page_physical_reads={} page_distinct={} page_rereads={} ",
             "page_demand_reads={} page_scan_reads={} page_independent_reads={} ",
-            "page_distinct_compaction_born={} page_bounds_miss_reads={} active_page_count={}"
+            "page_distinct_compaction_born={} page_bounds_miss_reads={} page_bounds_writer_fallbacks={} active_page_count={}"
         ),
         membership.leased_run_count(),
         membership.positional_run_count(),
@@ -1699,6 +1699,7 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         membership.page_independent_reads(),
         membership.page_distinct_compaction_born(),
         membership.page_bounds_miss_reads(),
+        membership.page_bounds_writer_fallbacks(),
         membership.active_page_count(),
     );
     let exact = appliance.exact_index_page_cache_status();

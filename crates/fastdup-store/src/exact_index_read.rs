@@ -59,6 +59,7 @@ pub(crate) struct ImmutableExactIndexRun {
     bounds_cache: crate::ReadCacheNamespace,
     writer_pages: Option<crate::ReadCacheNamespace>,
     bounds_miss_reads: std::sync::atomic::AtomicU64,
+    bounds_writer_fallbacks: std::sync::atomic::AtomicU64,
 }
 
 impl ImmutableExactIndexRun {
@@ -143,6 +144,7 @@ impl ImmutableExactIndexRun {
             bounds_cache,
             writer_pages: None,
             bounds_miss_reads: std::sync::atomic::AtomicU64::new(0),
+            bounds_writer_fallbacks: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -176,7 +178,17 @@ impl ImmutableExactIndexRun {
             bounds_cache,
             writer_pages: Some(pages),
             bounds_miss_reads: std::sync::atomic::AtomicU64::new(0),
+            bounds_writer_fallbacks: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    pub(crate) fn writer_born(&self) -> bool {
+        self.writer_pages.is_some()
+    }
+
+    pub(crate) fn bounds_writer_fallbacks(&self) -> u64 {
+        self.bounds_writer_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn bounds_miss_reads(&self) -> u64 {
@@ -190,13 +202,27 @@ impl ImmutableExactIndexRun {
         chunk_id: ChunkId,
         logical_length: u32,
     ) -> Result<ExactIndexPagePosition, ExactIndexStoreError> {
-        if let Some(bounds) =
+        // Independent reads may navigate with bounds derived from this
+        // leased identity's audited bytes (open/warm_structure); leaf bytes
+        // are still read fresh below. Writer-born bounds were never checked
+        // against disk, so Independent must not trust them (ADR 0059).
+        // Demand/Scan keep get() so resident bounds earn eviction credit.
+        let bounds = if crate::read_intent::independent() {
+            if self.writer_born() {
+                self.bounds_writer_fallbacks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            } else {
+                self.peek_page_bounds()
+            }
+        } else {
             self.bounds_cache
                 .get::<Box<[ExactPageKeyBounds]>>(crate::ReadCacheKey {
                     identity: self.descriptor.run_hash(),
                     ordinal: 0,
                 })
-        {
+        };
+        if let Some(bounds) = bounds {
             return bounds
                 .get(page_ordinal)
                 .map(|bounds| bounds.position(chunk_id, logical_length))
