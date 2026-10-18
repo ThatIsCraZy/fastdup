@@ -100,6 +100,37 @@ fn complete_bucket_replacements_survive_compaction_and_restart() {
 }
 
 #[test]
+fn variable_lengths_in_one_band_survive_compaction_and_restart() {
+    let storage = MemoryStorageIo::new();
+    let exact = exact();
+    let repository = SimilarityIndexRepository::new(storage.clone());
+    let online = OnlineSimilarityRepository::open(repository.clone(), &exact).unwrap();
+    let template = similarity_index_entry_v1(&target()).unwrap();
+    let lengths = [65_536_u32, 66_560, 70_000, 73_727, 69_121];
+    for ordinal in (0..80_u8).rev() {
+        let entry = SimilarityIndexEntry::new(
+            ChunkId::from_bytes([ordinal; 32]),
+            lengths[usize::from(ordinal) % lengths.len()],
+            template.fingerprint_profile(),
+            template.superfeatures(),
+            template.sketch(),
+        )
+        .unwrap();
+        online
+            .append(&exact.pin_active_generation().unwrap(), &[entry])
+            .unwrap_or_else(|error| panic!("append ordinal {ordinal} failed: {error}"));
+    }
+    assert_eq!(online.status().errors, 0);
+    assert!(online.status().compactions >= 20);
+    OnlineSimilarityRepository::audit(&repository).unwrap();
+    drop(online);
+    storage.crash();
+    let recovered = OnlineSimilarityRepository::open(repository.clone(), &exact).unwrap();
+    assert_eq!(recovered.status().errors, 0);
+    OnlineSimilarityRepository::audit(&repository).unwrap();
+}
+
+#[test]
 fn filesystem_compaction_preserves_a_leased_old_mapping_until_release() {
     use fastdup_store::FsStorageIo;
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -144,6 +175,48 @@ fn filesystem_compaction_preserves_a_leased_old_mapping_until_release() {
     online.append_current(&entries(6..7)).unwrap();
     assert!(!storage.exists(partition).unwrap());
     OnlineSimilarityRepository::audit(&repository).unwrap();
+}
+
+#[test]
+fn filesystem_publication_accepts_entries_whose_length_is_inside_a_band() {
+    use fastdup_store::FsStorageIo;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts/tmp")
+        .join(format!(
+            "online-similarity-band-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    let storage = FsStorageIo::open(root.join("similarity")).unwrap();
+    let exact = ExactIndexRunRepository::new(FsStorageIo::open(root.join("exact")).unwrap());
+    let location =
+        ExactIndexLocation::raw(ContainerId::new([1; 16]).unwrap(), 1, 4096, 65728, 1).unwrap();
+    exact
+        .append_level_zero(
+            ExactIndexProfileId::new([1; 32]).unwrap(),
+            vec![ExactIndexEntry::active(ChunkId::of(b"anchor"), 65536, location).unwrap()],
+        )
+        .unwrap();
+    let repository = SimilarityIndexRepository::new(storage);
+    let online = OnlineSimilarityRepository::open(repository.clone(), &exact).unwrap();
+    let template = similarity_index_entry_v1(&target()).unwrap();
+    let entry = SimilarityIndexEntry::new(
+        ChunkId::from_bytes([77; 32]),
+        70_000,
+        template.fingerprint_profile(),
+        template.superfeatures(),
+        template.sketch(),
+    )
+    .unwrap();
+    online
+        .append(&exact.pin_active_generation().unwrap(), &[entry])
+        .unwrap();
+    assert_eq!(online.status().errors, 0);
+    OnlineSimilarityRepository::audit(&repository).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn publish_four(storage: &MemoryStorageIo) -> (usize, usize) {

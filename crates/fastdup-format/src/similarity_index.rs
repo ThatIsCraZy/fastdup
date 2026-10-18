@@ -405,6 +405,7 @@ impl SimilarityIndexRun {
             &self.bucket_references,
             &self.entries,
             self.fingerprint_profile,
+            self.bucket_profile,
         )?;
         let mut encoder = SimilarityIndexRunStreamEncoder::new(self.stream_layout())?;
         let mut bytes = Vec::new();
@@ -491,7 +492,12 @@ impl SimilarityIndexRun {
             bucket_references.extend_from_slice(page.references());
         }
         validate_entries(&entries, descriptor.fingerprint_profile)?;
-        validate_bucket_references(&bucket_references, &entries, descriptor.fingerprint_profile)?;
+        validate_bucket_references(
+            &bucket_references,
+            &entries,
+            descriptor.fingerprint_profile,
+            descriptor.bucket_profile,
+        )?;
         if entries.len() != descriptor.entry_count || key_bounds(&entries) != descriptor.key_bounds
         {
             return Err(SimilarityIndexFormatError::InvalidHeader);
@@ -1695,7 +1701,12 @@ fn build_bucket_references(
             retained_in_bucket += 1;
         }
     }
-    validate_bucket_references(retained.as_slice(), entries, entries[0].fingerprint_profile)?;
+    validate_bucket_references(
+        retained.as_slice(),
+        entries,
+        entries[0].fingerprint_profile,
+        bucket_profile,
+    )?;
     Ok((retained, bucket_count))
 }
 
@@ -1703,6 +1714,7 @@ fn validate_bucket_references(
     references: &[SimilarityBucketReference],
     entries: &[SimilarityIndexEntry],
     fingerprint_profile: u16,
+    bucket_profile: u16,
 ) -> Result<(), SimilarityIndexFormatError> {
     if references.is_empty()
         || !references
@@ -1732,7 +1744,8 @@ fn validate_bucket_references(
             .ok_or(SimilarityIndexFormatError::InvalidBucketReference)?;
         let slot = usize::from(reference.key.slot);
         if entry.fingerprint_profile != reference.key.fingerprint_profile
-            || entry.logical_length != reference.key.logical_length
+            || similarity_bucket_length(bucket_profile, entry.logical_length)
+                != reference.key.logical_length
             || entry.superfeatures.get(slot) != Some(&reference.key.superfeature)
         {
             return Err(SimilarityIndexFormatError::InvalidBucketReference);
@@ -1954,5 +1967,36 @@ mod tests {
             assert!(length - band <= band / 8 + 1024);
             previous = band;
         }
+    }
+
+    #[test]
+    fn v2_run_round_trips_entries_inside_length_bands() {
+        use super::{SimilarityIndexEntry, SimilarityIndexRun};
+        use crate::ChunkId;
+
+        let entries: Vec<_> = [65_536_u32, 70_000, 73_727]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, length)| {
+                SimilarityIndexEntry::new(
+                    ChunkId::of(format!("band-chunk-{ordinal}").as_bytes()),
+                    length,
+                    1,
+                    [11, 22, 33, 44],
+                    [7; 8],
+                )
+                .unwrap()
+            })
+            .collect();
+        let run = SimilarityIndexRun::new(1, SIMILARITY_BUCKET_PROFILE_V2, 1, entries).unwrap();
+        assert!(
+            run.bucket_references()
+                .iter()
+                .all(|reference| reference.key().logical_length() == 65_536)
+        );
+        let bytes = run.encode().unwrap();
+        let decoded = SimilarityIndexRun::decode(&bytes).unwrap();
+        assert_eq!(decoded.entries(), run.entries());
+        assert_eq!(decoded.bucket_references(), run.bucket_references());
     }
 }

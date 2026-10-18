@@ -4,6 +4,7 @@
 use fastdup_format::{
     SIMILARITY_INDEX_HEADER_BYTES, SIMILARITY_INDEX_PAGE_BYTES, SimilarityBucketKey,
     SimilarityBucketPage, SimilarityIndexEntry, SimilarityIndexPage, SimilarityIndexRunDescriptor,
+    similarity_bucket_length,
 };
 
 use crate::ImmutableFileLease;
@@ -180,7 +181,8 @@ fn walk_buckets(
             )?;
             let key = reference.key();
             if entry.fingerprint_profile() != key.fingerprint_profile()
-                || entry.logical_length() != key.logical_length()
+                || similarity_bucket_length(descriptor.bucket_profile(), entry.logical_length())
+                    != key.logical_length()
                 || entry.superfeatures().get(usize::from(key.slot())) != Some(&key.superfeature())
             {
                 return Err(SimilarityIndexStoreError::IndexCorruption);
