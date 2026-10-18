@@ -219,6 +219,14 @@ impl Drop for Workspace<'_> {
 
 impl VerifiedReadCache {
     pub(crate) fn admit_decoded_group(&self, payloads: Vec<VerifiedChunkPayload>) {
+        self.admit_decoded_group_inner(payloads, false);
+    }
+
+    pub(crate) fn admit_decoded_group_writer(&self, payloads: Vec<VerifiedChunkPayload>) {
+        self.admit_decoded_group_inner(payloads, true);
+    }
+
+    fn admit_decoded_group_inner(&self, payloads: Vec<VerifiedChunkPayload>, writer_warming: bool) {
         if payloads.is_empty() {
             return;
         }
@@ -237,7 +245,10 @@ impl VerifiedReadCache {
         self.compression.epoch.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         if !self.compression.enabled.load(Ordering::Relaxed) {
-            self.admit_group(payloads.into_iter().map(CachedPayload::Decoded).collect());
+            self.admit_group(
+                payloads.into_iter().map(CachedPayload::Decoded).collect(),
+                writer_warming,
+            );
             return;
         }
         // Either compress the complete shared allocation's admitted Chunk
@@ -280,7 +291,11 @@ impl VerifiedReadCache {
                         )
                     })
                     .collect();
-                let admitted = self.unified.insert_groups(groups);
+                let admitted = if writer_warming {
+                    self.unified.insert_groups_writer_warming(groups)
+                } else {
+                    self.unified.insert_groups(groups)
+                };
                 self.compression
                     .admitted
                     .fetch_add(admitted, Ordering::Relaxed);
@@ -288,7 +303,10 @@ impl VerifiedReadCache {
             }
         }
         self.compression.bypasses.fetch_add(1, Ordering::Relaxed);
-        self.admit_group(payloads.into_iter().map(CachedPayload::Decoded).collect());
+        self.admit_group(
+            payloads.into_iter().map(CachedPayload::Decoded).collect(),
+            writer_warming,
+        );
     }
 
     pub(super) fn compressed_hit(
@@ -413,7 +431,7 @@ fn invalidation_removes_only_the_failed_copy_and_allows_fresh_admission() {
     .unwrap();
     let value = crate::read_cache::tests::verified_payload(&vec![81; 65536]);
     let old = value.compress_for_cache().unwrap();
-    cache.admit_group(vec![CachedPayload::Compressed(old.clone())]);
+    cache.admit_group(vec![CachedPayload::Compressed(old.clone())], false);
     cache.invalidate_compressed(&old);
     assert_eq!(cache.status().resident_bytes(), 0);
     assert_eq!(cache.status().entry_count(), 0);

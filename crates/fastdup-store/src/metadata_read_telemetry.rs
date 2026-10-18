@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataReadReason {
     Other,
     IndexLookup,
@@ -55,6 +55,23 @@ impl MetadataReadScope {
     #[must_use]
     pub fn enter(reason: MetadataReadReason) -> Self {
         Self(REASON.with(|current| current.replace(reason)), PhantomData)
+    }
+
+    /// Attributes only when no outer scope already named a reason, so
+    /// low-level page readers default to lookup without overriding an
+    /// enclosing compaction or audit attribution.
+    #[must_use]
+    pub fn enter_unless_attributed(reason: MetadataReadReason) -> Self {
+        Self(
+            REASON.with(|current| {
+                let previous = current.get();
+                if previous == MetadataReadReason::Other {
+                    current.set(reason);
+                }
+                previous
+            }),
+            PhantomData,
+        )
     }
 }
 impl Drop for MetadataReadScope {

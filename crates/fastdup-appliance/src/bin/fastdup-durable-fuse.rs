@@ -24,7 +24,7 @@ use fastdup_store::{
     GcCandidateCatalogRepository, GcPhaseRequest, GenerationRepository, MaintenanceCancellation,
     MaintenanceRepository, OnlineGcCycleOutcome, OnlineGcCycleReport, OnlineGcRecoveryReport,
     OnlineGcRunMode, RecoveryCheckpointRepository, SimilarityIndexRepository, TieredStorageIo,
-    system_memory_budget_governor,
+    allocator_memory_status, cache_budget_status, system_memory_budget_governor,
 };
 
 mod common;
@@ -1713,6 +1713,8 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         exact.swap_used_bytes(),
     );
     emit_similarity_index_page_cache(appliance);
+    emit_cache_budget();
+    emit_allocator_memory();
     let descriptors = appliance.container_descriptor_cache_status();
     eprintln!(
         concat!(
@@ -1798,6 +1800,56 @@ fn emit_similarity_index_page_cache(appliance: &FsAppliance) {
     );
 }
 
+fn emit_cache_budget() {
+    let status = cache_budget_status();
+    let resident: u64 = status.pools.iter().map(|pool| pool.resident_bytes).sum();
+    eprintln!(
+        concat!(
+            "cache_budget budget_bytes={} raw_budget_bytes={} resident_bytes={} ",
+            "available_bytes={} effective_limit_bytes={} psi_bps={} hard_pressure={}"
+        ),
+        status.budget_bytes,
+        status.raw_budget_bytes,
+        resident,
+        status.available_bytes,
+        status.effective_limit_bytes,
+        status.psi_bps,
+        status.hard_pressure,
+    );
+    for pool in &status.pools {
+        eprintln!(
+            concat!(
+                "cache_budget_pool name={} resident_bytes={} target_bytes={} ",
+                "leased_bytes={} hits={} misses={} evictions={}"
+            ),
+            pool.name,
+            pool.resident_bytes,
+            pool.target_bytes,
+            pool.leased_bytes,
+            pool.hits,
+            pool.misses,
+            pool.evictions,
+        );
+    }
+}
+
+fn emit_allocator_memory() {
+    if let Some(status) = allocator_memory_status() {
+        eprintln!(
+            concat!(
+                "allocator_memory arena_bytes={} allocated_bytes={} free_bytes={} ",
+                "anonymous_resident_bytes={} trim_attempts={} last_trim_micros={}"
+            ),
+            status.arena_bytes,
+            status.allocated_bytes,
+            status.free_bytes,
+            status.anonymous_resident_bytes,
+            status.trim_attempts,
+            status.last_trim_micros,
+        );
+    }
+}
+
 fn emit_memory_budget_governor() {
     let status = system_memory_budget_governor().status();
     if let Some(snapshot) = status.snapshot() {
@@ -1809,7 +1861,8 @@ fn emit_memory_budget_governor() {
                 "memory_budget_governor samples={} sample_failures={} ",
                 "effective_limit_bytes={} available_bytes={} process_swap_used_bytes={} ",
                 "host_swap_used_bytes={} ",
-                "cgroup_swap_used_bytes={} cgroup_swap_limit_bytes={} swap_protected={}"
+                "cgroup_swap_used_bytes={} cgroup_swap_limit_bytes={} swap_protected={} ",
+                "psi_memory_some_avg10_bps={}"
             ),
             status.samples(),
             status.sample_failures(),
@@ -1820,6 +1873,7 @@ fn emit_memory_budget_governor() {
             snapshot.cgroup_swap_used_bytes(),
             swap_limit,
             snapshot.swap_protection_enforced(),
+            snapshot.psi_memory_some_avg10_bps(),
         );
     } else {
         eprintln!(

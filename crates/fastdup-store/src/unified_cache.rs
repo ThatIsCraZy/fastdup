@@ -804,10 +804,10 @@ impl Core {
                 return false;
             }
             let scope = Self::pressure_victim_scope(state);
-            let cold_evicted = !cold_exhausted
-                && (self.evict_cold(state, scope, &mut cold_budget)
-                    || (scope != EvictionScope::All
-                        && self.evict_cold(state, EvictionScope::All, &mut cold_budget)));
+            // No global cold fallback: the selected borrower yields (cold
+            // first, then credited FIFO) before a group at or below its
+            // guarantee loses entries to a scope-All search.
+            let cold_evicted = !cold_exhausted && self.evict_cold(state, scope, &mut cold_budget);
             if cold_evicted {
                 evicted += 1;
                 continue;
@@ -894,10 +894,14 @@ impl Core {
                 .0
                 .lock()
                 .expect("ASSERT: cache shard poisoned");
+            // Charge only entries actually examined: deducting the whole
+            // clock length up front spent the entire budget on the first
+            // shard whenever one queue exceeded it, silently disabling
+            // cold-first eviction at production scale.
             let mut examined = shard.clock_len(scope).min(*budget);
-            *budget -= examined;
             while examined > 0 {
                 examined -= 1;
+                *budget -= 1;
                 let Some(key) = shard.pop(scope) else { break };
                 let Some(entry) = shard.map.get_mut(&key) else {
                     shard.stale_keys = shard.stale_keys.saturating_sub(1);
@@ -1206,10 +1210,29 @@ impl ReadCacheNamespace {
     /// same class ceilings but skips every victim search, so it can neither
     /// displace a resident entry nor exceed the common target. Independent
     /// intent still declines all admission except pinned working acceleration.
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn insert_groups<T: Any + Send + Sync>(
         &self,
         groups: Vec<AdmissionGroup<T>>,
+    ) -> u64 {
+        self.insert_groups_inner(groups, false)
+    }
+
+    /// Speculative writer warming: DATA offered without a demand miss may
+    /// fill (and FIFO-recycle within) its guaranteed share, but it never
+    /// borrows another group's idle share and never evicts outside DATA.
+    /// Demand reads and restore prefetch keep the borrowing path above.
+    pub(crate) fn insert_groups_writer_warming<T: Any + Send + Sync>(
+        &self,
+        groups: Vec<AdmissionGroup<T>>,
+    ) -> u64 {
+        self.insert_groups_inner(groups, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn insert_groups_inner<T: Any + Send + Sync>(
+        &self,
+        groups: Vec<AdmissionGroup<T>>,
+        writer_warming: bool,
     ) -> u64 {
         let scan_fill = !self.0.class.pinned() && crate::read_intent::scan();
         if groups.is_empty()
@@ -1274,6 +1297,28 @@ impl ReadCacheNamespace {
             reject();
             return 0;
         }
+        if writer_warming && !pinned && self.0.class == ReadCacheClass::Data {
+            // Authoritative under the admission lock: recycle only DATA's
+            // own FIFO window; never borrow beyond its guaranteed share and
+            // never take a victim from an index group.
+            let limit = verified_data_limit(state.target);
+            let mut steps = ADMISSION_STEPS;
+            while (state.verified_bytes.saturating_add(added) > limit
+                || state.resident.saturating_add(added) > state.target)
+                && steps != 0
+            {
+                if !core.evict(&mut state, false, EvictionScope::VerifiedData) {
+                    break;
+                }
+                steps -= 1;
+            }
+            if state.verified_bytes.saturating_add(added) > limit
+                || state.resident.saturating_add(added) > state.target
+            {
+                reject();
+                return 0;
+            }
+        }
         if !pinned && state.resident.saturating_add(added) > state.target {
             if scan_fill {
                 reject();
@@ -1296,8 +1341,9 @@ impl ReadCacheNamespace {
                     break;
                 };
                 let freed = if cold_only {
+                    // An unproven candidate rejects rather than hunting cold
+                    // victims in groups that hold their guarantee.
                     core.evict_cold(&mut state, scope, &mut cold_budget)
-                        || core.evict_cold(&mut state, EvictionScope::All, &mut cold_budget)
                 } else {
                     core.evict(&mut state, true, scope)
                         || core.evict(&mut state, true, EvictionScope::All)
@@ -1474,6 +1520,25 @@ impl ReadCacheNamespace {
     pub fn stats(&self) -> ReadCacheStats {
         self.0.core.refresh();
         self.0.counters.snapshot()
+    }
+
+    /// Cheap pre-copy eligibility for writer warming: the chunk can fit
+    /// the DATA share by recycling DATA's own window, without borrowing.
+    /// The authoritative check repeats under the admission lock on insert.
+    pub(crate) fn writer_warming_may_fit(&self, bytes: u64) -> bool {
+        self.0.core.refresh();
+        let state = self
+            .0
+            .core
+            .admission
+            .lock()
+            .expect("ASSERT: cache admission poisoned");
+        bytes <= verified_data_limit(state.target)
+            && state
+                .target
+                .saturating_sub(state.resident)
+                .saturating_add(state.verified_bytes)
+                >= bytes
     }
 
     #[cfg(test)]
@@ -2000,6 +2065,62 @@ mod tests {
             );
         }
         assert_eq!(cache.stats().resident_bytes, 32 * charge);
+    }
+
+    #[test]
+    fn cold_eviction_budget_charges_only_examined_entries() {
+        let charge = 4096 + ENTRY_BYTES;
+        let cache = ReadCacheNamespace::isolated(ReadCacheClass::Data, 4096 * charge);
+        for ordinal in 0..512 {
+            cache.insert(key(ordinal), Arc::new(vec![3_u8; 4096]), 4096, 4096);
+        }
+        let core = &cache.0.core;
+        let mut state = core
+            .admission
+            .lock()
+            .expect("ASSERT: cache admission poisoned");
+        let mut budget = 3_usize;
+        assert!(core.evict_cold(&mut state, EvictionScope::All, &mut budget));
+        assert_eq!(
+            budget, 2,
+            "one examined cold victim must cost one budget unit, not a whole shard scan"
+        );
+    }
+
+    #[test]
+    fn writer_warming_recycles_only_the_data_share() {
+        let charge = 4096 + ENTRY_BYTES;
+        let data = ReadCacheNamespace::isolated(ReadCacheClass::Data, 100 * charge);
+        let similarity = data.sibling(ReadCacheClass::SimilarityPage);
+        for ordinal in 0..10 {
+            similarity.insert(
+                key(10_000 + ordinal),
+                Arc::new(vec![7_u8; 4096]),
+                4096,
+                4096,
+            );
+        }
+        for ordinal in 0..60 {
+            let admitted = data.insert_groups_writer_warming(vec![(
+                vec![(key(ordinal), Arc::new(vec![9_u8; 4096]), 4096)],
+                4096,
+            )]);
+            assert_eq!(admitted, 1);
+        }
+        // DATA share is 20% of the 100-entry target: 60 warmed chunks must
+        // FIFO-recycle inside at most 20 resident entries (plus one
+        // boundary entry), while every similarity page stays resident.
+        assert!(
+            data.stats().resident_bytes <= 21 * charge,
+            "writer warming borrowed beyond the DATA share: {}",
+            data.stats().resident_bytes
+        );
+        for ordinal in 0..10 {
+            assert!(
+                similarity.peek::<Vec<u8>>(key(10_000 + ordinal)).is_some(),
+                "writer warming displaced similarity entry {ordinal}"
+            );
+        }
     }
 
     #[test]

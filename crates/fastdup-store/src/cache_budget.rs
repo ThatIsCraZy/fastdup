@@ -58,6 +58,8 @@ struct State {
     pools: BTreeMap<u64, PoolState>,
     next_id: u64,
     budget: u64,
+    raw_budget: u64,
+    psi_bps: u32,
     hard_pressure: bool,
     refreshed: Instant,
     new_pool: bool,
@@ -251,6 +253,8 @@ impl Broker {
             pools: BTreeMap::new(),
             next_id: 0,
             budget: 0,
+            raw_budget: 0,
+            psi_bps: 0,
             hard_pressure: true,
             refreshed: Instant::now(),
             new_pool: false,
@@ -509,6 +513,8 @@ impl State {
         if psi >= 500 {
             raw /= 2;
         }
+        self.raw_budget = raw;
+        self.psi_bps = psi;
         self.hard_pressure = swap
             > crate::memory_budget::swap_grace_bytes(snapshot.effective_limit_bytes())
             || psi >= 2_000
@@ -648,6 +654,9 @@ pub struct CacheBudgetStatus {
     pub effective_limit_bytes: u64,
     pub available_bytes: u64,
     pub budget_bytes: u64,
+    pub raw_budget_bytes: u64,
+    pub psi_bps: u32,
+    pub hard_pressure: bool,
     pub pools: Vec<CachePoolStatus>,
 }
 
@@ -665,6 +674,9 @@ pub fn cache_budget_status() -> CacheBudgetStatus {
         effective_limit_bytes: state.effective_limit,
         available_bytes: state.available,
         budget_bytes: state.budget,
+        raw_budget_bytes: state.raw_budget,
+        psi_bps: state.psi_bps,
+        hard_pressure: state.hard_pressure,
         pools: state
             .pools
             .values()

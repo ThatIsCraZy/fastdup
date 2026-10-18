@@ -1494,7 +1494,9 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         if let Some(page) = partition.page_cache.get_bucket(run_hash, ordinal) {
             return Ok(page);
         }
-        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
+        let _read_reason = crate::MetadataReadScope::enter_unless_attributed(
+            crate::MetadataReadReason::IndexLookup,
+        );
         let offset = partition
             .descriptor
             .bucket_page_offset(ordinal)
@@ -1542,8 +1544,9 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         let page = if let Some(page) = partition.page_cache.get_entry(run_hash, page_ordinal) {
             page
         } else {
-            let _read_reason =
-                crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
+            let _read_reason = crate::MetadataReadScope::enter_unless_attributed(
+                crate::MetadataReadReason::IndexLookup,
+            );
             let offset = partition
                 .descriptor
                 .page_offset(page_ordinal)

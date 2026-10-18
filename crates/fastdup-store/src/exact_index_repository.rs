@@ -4663,7 +4663,9 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         candidates: &mut Vec<ExactIndexEntry>,
         maximum_candidates: usize,
     ) -> Result<bool, ExactIndexStoreError> {
-        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
+        let _read_reason = crate::MetadataReadScope::enter_unless_attributed(
+            crate::MetadataReadReason::IndexLookup,
+        );
         if self.membership_resident() {
             let membership = self
                 .membership
@@ -4994,7 +4996,9 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         candidates: &mut [Vec<ExactIndexEntry>],
         complete: &mut [bool],
     ) -> Result<bool, ExactIndexStoreError> {
-        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
+        let _read_reason = crate::MetadataReadScope::enter_unless_attributed(
+            crate::MetadataReadReason::IndexLookup,
+        );
         let Some(bounds) = self
             .mapping
             .as_ref()

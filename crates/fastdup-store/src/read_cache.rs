@@ -525,6 +525,11 @@ impl VerifiedReadCache {
         {
             return;
         }
+        // Eligibility before the copy, re-hash, and compression attempt:
+        // speculative warming that cannot fit DATA's share costs nothing.
+        if !self.unified.writer_warming_may_fit(length as u64) {
+            return;
+        }
         let mut bytes = Vec::new();
         if bytes.try_reserve_exact(length).is_err() {
             return;
@@ -533,7 +538,7 @@ impl VerifiedReadCache {
             bytes.extend_from_slice(segment);
         }
         if let Some(payload) = VerifiedChunkPayload::verify_writer_bytes(chunk_id, bytes) {
-            self.admit_decoded_group(vec![payload]);
+            self.admit_decoded_group_writer(vec![payload]);
         }
     }
 
@@ -626,7 +631,7 @@ impl VerifiedReadCache {
     /// Atomically accounts one decoder backing while admitting any number of
     /// verified Chunk views from that Encoding Record.
     #[allow(clippy::too_many_lines)]
-    fn admit_group(&self, payloads: Vec<CachedPayload>) {
+    fn admit_group(&self, payloads: Vec<CachedPayload>, writer_warming: bool) {
         if crate::read_intent::bypass_admission() {
             return;
         }
@@ -671,7 +676,11 @@ impl VerifiedReadCache {
                 )
             })
             .collect();
-        let admitted = cache.insert_groups(vec![(values, allocation_bytes as u64)]);
+        let admitted = if writer_warming {
+            cache.insert_groups_writer_warming(vec![(values, allocation_bytes as u64)])
+        } else {
+            cache.insert_groups(vec![(values, allocation_bytes as u64)])
+        };
         if compressed_logical != 0 {
             self.compression
                 .admitted

@@ -589,6 +589,12 @@ impl<I: Clone + StorageIo> OnlineSimilarityRepository<I> {
                     .iter()
                     .all(|run| run.bucket_profile() == runs[start].bucket_profile())
         }) {
+            // Compaction streams whole Runs sequentially: attribute its disk
+            // reads to compaction (not demand lookup) and keep the streamed
+            // pages from displacing demand-resident index pages.
+            let _compaction_reads =
+                crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexCompaction);
+            let _scan_reads = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
             let bucket_profile = runs[start].bucket_profile();
             let generation = next_generation(&mut publisher)?;
             let mut cursors: Vec<_> = runs[start..start + 4]
