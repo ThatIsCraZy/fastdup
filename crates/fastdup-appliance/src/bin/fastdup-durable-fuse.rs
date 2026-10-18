@@ -1774,6 +1774,7 @@ fn emit_similarity_index_page_cache(appliance: &FsAppliance) {
     eprintln!(
         concat!(
             "similarity_index_page_cache hits={} misses={} hit_rate_basis_points={} ",
+            "entry_hits={} entry_misses={} bucket_hits={} bucket_misses={} ",
             "resident_pages={} target_pages={} capacity_pages={} evictions={} ",
             "pressure_rejections={} reserve_bytes={} effective_limit_bytes={} ",
             "available_bytes={} swap_used_bytes={}"
@@ -1781,6 +1782,10 @@ fn emit_similarity_index_page_cache(appliance: &FsAppliance) {
         similarity.hits(),
         similarity.misses(),
         similarity.hit_rate_basis_points(),
+        similarity.entry_hits(),
+        similarity.entry_misses(),
+        similarity.bucket_hits(),
+        similarity.bucket_misses(),
         similarity.resident_pages(),
         similarity.target_pages(),
         similarity.capacity_pages(),

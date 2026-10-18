@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.8.1
-Release:        31%{?dist}
+Release:        32%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup

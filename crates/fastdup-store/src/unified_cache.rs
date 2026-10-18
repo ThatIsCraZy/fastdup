@@ -100,6 +100,12 @@ impl ReadCacheClass {
             | Self::LocationProof
             | Self::HistoricalProof
             | Self::ContainerDescriptor => 16,
+            // Index pages are metadata with dense reuse during candidate
+            // search and publication maintenance. One credit per hit made a
+            // queried page evictable after a single aging sweep, unlike the
+            // streaming classes above. Exact pages stay protected by their
+            // budget group, so this does not outrank the Exact fast path.
+            Self::SimilarityPage => 8,
             _ => 1,
         }
     }

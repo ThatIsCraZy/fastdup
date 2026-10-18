@@ -265,6 +265,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
                 minimum_bucket_key: verified.minimum_bucket_key,
                 maximum_bucket_key: verified.maximum_bucket_key,
                 mapping: verified.mapping,
+                fences: verified.fences,
                 page_cache: Arc::clone(&self.page_cache),
             });
         }
@@ -1053,12 +1054,15 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             .storage
             .lease_immutable_file(name, envelope.descriptor.file_length())?
         {
-            // Optional acceleration has a fixed per-open allocation ceiling.
-            // Only the successfully audited Run hash may enter the governor.
+            // Bucket fences are the search spine: one last-key per Bucket
+            // page, bounded to 64 KiB per partition and roughly 0.15% of
+            // the index bytes. They stay resident with the partition
+            // instead of competing with streaming DATA in the unified
+            // cache, where one eviction downgrades every later search on
+            // this partition to a binary search over disk pages.
             let count = envelope.descriptor.bucket_page_count();
             let mut fences = Vec::new();
             let collect = count <= MAX_BUCKET_FENCE_BYTES / size_of::<SimilarityBucketKey>()
-                && self.page_cache.target_pages.load(AtomicOrdering::Acquire) != 0
                 && fences.try_reserve_exact(count).is_ok();
             let mapping = Arc::new(ImmutableSimilarityRun::open(
                 lease,
@@ -1070,15 +1074,12 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
                     }
                 },
             )?);
-            if collect {
-                self.page_cache
-                    .insert_fences(envelope.descriptor.run_hash(), fences);
-            }
             return Ok(VerifiedSimilarityPartition {
                 descriptor: mapping.descriptor(),
                 minimum_bucket_key: mapping.minimum_bucket_key(),
                 maximum_bucket_key: mapping.maximum_bucket_key(),
                 mapping: Some(mapping),
+                fences: collect.then(|| fences.into()),
             });
         }
         let (descriptor, minimum_bucket_key, maximum_bucket_key) =
@@ -1088,6 +1089,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             minimum_bucket_key,
             maximum_bucket_key,
             mapping: None,
+            fences: None,
         })
     }
 
@@ -1121,6 +1123,7 @@ struct VerifiedSimilarityPartition {
     minimum_bucket_key: SimilarityBucketKey,
     maximum_bucket_key: SimilarityBucketKey,
     mapping: Option<Arc<ImmutableSimilarityRun>>,
+    fences: Option<Arc<[SimilarityBucketKey]>>,
 }
 
 pub(crate) struct StagedSimilarityIndex {
@@ -1211,6 +1214,7 @@ struct RecoveredSimilarityPartition {
     minimum_bucket_key: SimilarityBucketKey,
     maximum_bucket_key: SimilarityBucketKey,
     mapping: Option<Arc<ImmutableSimilarityRun>>,
+    fences: Option<Arc<[SimilarityBucketKey]>>,
     page_cache: Arc<SimilarityPageCache>,
 }
 
@@ -1224,8 +1228,12 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         };
         let ordinals = self.read_bucket(partition, key)?;
         let mut entries = Vec::with_capacity(usize::from(ordinals.len));
+        // Bucket ordinals ascend, so candidates frequently share one Entry
+        // page. Reusing it avoids one cache lookup (and one potential
+        // reload after a mid-bucket eviction) per candidate.
+        let mut entry_page = None;
         for n in 0..usize::from(ordinals.len) {
-            let entry = self.read_entry(partition, ordinals.values[n])?;
+            let entry = self.read_entry_cached(partition, ordinals.values[n], &mut entry_page)?;
             validate_query_entry(entry, key, usize::from(key.slot()), self.bucket_profile())?;
             entries.push(entry);
         }
@@ -1239,6 +1247,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             page: 0,
             reference: 0,
             cached: None,
+            entry_page: None,
             failed: false,
         }
     }
@@ -1439,10 +1448,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             .get(partition_ordinal)
             .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
         let mut lower = 0_usize;
-        if let Some(fences) = partition
-            .page_cache
-            .get_fences(partition.descriptor.run_hash())
-        {
+        if let Some(fences) = partition.fences.as_deref() {
             lower = fences.partition_point(|last| *last < key);
         } else {
             let mut upper = partition.descriptor.bucket_page_count();
@@ -1503,14 +1509,6 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             .page_cache
             .insert_bucket(run_hash, ordinal, Arc::clone(&page));
         Ok(page)
-    }
-
-    fn read_entry(
-        &self,
-        partition_ordinal: usize,
-        entry_ordinal: u32,
-    ) -> Result<SimilarityIndexEntry, SimilarityIndexStoreError> {
-        self.read_entry_cached(partition_ordinal, entry_ordinal, &mut None)
     }
 
     fn read_entry_cached(
@@ -1598,6 +1596,12 @@ pub(crate) struct SimilarityPageCache {
     automatic_pressure: bool,
     capacity_pages: u64,
     target_pages: AtomicU64,
+    // Indexed by cache kind: 0 Entry, 1 Bucket. The aggregate namespace
+    // counters cannot tell a missing search spine (Bucket) from missing
+    // candidate payload (Entry), which need opposite remedies. Fences are
+    // resident with their partition and are not cache entries.
+    kind_hits: [AtomicU64; 2],
+    kind_misses: [AtomicU64; 2],
 }
 impl SimilarityPageCache {
     fn new(snapshot: MemoryPressureSnapshot, automatic_pressure: bool) -> Self {
@@ -1614,6 +1618,8 @@ impl SimilarityPageCache {
             },
             automatic_pressure,
             target_pages: AtomicU64::new(0),
+            kind_hits: [AtomicU64::new(0), AtomicU64::new(0)],
+            kind_misses: [AtomicU64::new(0), AtomicU64::new(0)],
         };
         cache.apply_pressure_snapshot(snapshot);
         cache
@@ -1624,39 +1630,31 @@ impl SimilarityPageCache {
             ordinal: (ordinal as u64) * 3 + kind,
         }
     }
-    fn get_fences(&self, hash: [u8; 32]) -> Option<Arc<[SimilarityBucketKey]>> {
-        self.cache
-            .get::<Arc<[SimilarityBucketKey]>>(Self::key(hash, 0, 2))
-            .map(|keys| Arc::clone(keys.as_ref()))
-    }
-    fn insert_fences(&self, hash: [u8; 32], keys: Vec<SimilarityBucketKey>) {
-        let bytes = keys
-            .capacity()
-            .saturating_mul(size_of::<SimilarityBucketKey>());
-        if keys.is_empty() || bytes > MAX_BUCKET_FENCE_BYTES {
-            return;
-        }
-        let keys: Arc<[SimilarityBucketKey]> = keys.into();
-        self.cache.insert(
-            Self::key(hash, 0, 2),
-            Arc::new(keys),
-            bytes as u64 + 32,
-            4096,
-        );
+    fn record_kind(&self, kind: usize, hit: bool) {
+        let counter = if hit {
+            &self.kind_hits[kind]
+        } else {
+            &self.kind_misses[kind]
+        };
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
     }
     pub(crate) fn get_entry(
         &self,
         hash: [u8; 32],
         ordinal: usize,
     ) -> Option<Arc<SimilarityIndexPage>> {
-        self.cache.get(Self::key(hash, ordinal, 0))
+        let found = self.cache.get(Self::key(hash, ordinal, 0));
+        self.record_kind(0, found.is_some());
+        found
     }
     pub(crate) fn get_bucket(
         &self,
         hash: [u8; 32],
         ordinal: usize,
     ) -> Option<Arc<SimilarityBucketPage>> {
-        self.cache.get(Self::key(hash, ordinal, 1))
+        let found = self.cache.get(Self::key(hash, ordinal, 1));
+        self.record_kind(1, found.is_some());
+        found
     }
     pub(crate) fn insert_entry(
         &self,
@@ -1699,6 +1697,10 @@ impl SimilarityPageCache {
         SimilarityIndexPageCacheStatus {
             hits: stats.hits,
             misses: stats.misses,
+            entry_hits: self.kind_hits[0].load(AtomicOrdering::Relaxed),
+            entry_misses: self.kind_misses[0].load(AtomicOrdering::Relaxed),
+            bucket_hits: self.kind_hits[1].load(AtomicOrdering::Relaxed),
+            bucket_misses: self.kind_misses[1].load(AtomicOrdering::Relaxed),
             resident_pages: stats.entries,
             evictions: stats.evictions,
             pressure_rejections: stats.rejections,
@@ -1842,6 +1844,7 @@ pub(crate) struct SimilarityBuckets<'a, I> {
     page: usize,
     reference: usize,
     cached: Option<Arc<SimilarityBucketPage>>,
+    entry_page: Option<QueryEntryPage>,
     failed: bool,
 }
 
@@ -1893,9 +1896,11 @@ impl<I: Clone + StorageIo> SimilarityBuckets<'_, I> {
             if entries.len() == 64 {
                 return Err(SimilarityIndexStoreError::IndexCorruption);
             }
-            let entry = self
-                .index
-                .read_entry(self.partition, reference.entry_ordinal())?;
+            let entry = self.index.read_entry_cached(
+                self.partition,
+                reference.entry_ordinal(),
+                &mut self.entry_page,
+            )?;
             validate_query_entry(
                 entry,
                 key,
@@ -1966,6 +1971,10 @@ pub struct SimilarityIndexRebuildStatus {
 pub struct SimilarityIndexPageCacheStatus {
     hits: u64,
     misses: u64,
+    entry_hits: u64,
+    entry_misses: u64,
+    bucket_hits: u64,
+    bucket_misses: u64,
     resident_pages: u64,
     evictions: u64,
     pressure_rejections: u64,
@@ -1986,6 +1995,26 @@ impl SimilarityIndexPageCacheStatus {
     #[must_use]
     pub const fn misses(self) -> u64 {
         self.misses
+    }
+
+    #[must_use]
+    pub const fn entry_hits(self) -> u64 {
+        self.entry_hits
+    }
+
+    #[must_use]
+    pub const fn entry_misses(self) -> u64 {
+        self.entry_misses
+    }
+
+    #[must_use]
+    pub const fn bucket_hits(self) -> u64 {
+        self.bucket_hits
+    }
+
+    #[must_use]
+    pub const fn bucket_misses(self) -> u64 {
+        self.bucket_misses
     }
 
     #[must_use]
@@ -2461,6 +2490,21 @@ mod tests {
             before,
             "a fresh full audit must supply query pages without another backend read"
         );
+        let kinds = index.page_cache_status();
+        assert_eq!(
+            kinds.entry_hits() + kinds.bucket_hits(),
+            kinds.hits(),
+            "per-kind hits must account for every Similarity page-cache hit"
+        );
+        assert_eq!(
+            kinds.entry_misses() + kinds.bucket_misses(),
+            kinds.misses(),
+            "per-kind misses must account for every Similarity page-cache miss"
+        );
+        assert!(
+            kinds.bucket_hits() > 0 && kinds.entry_hits() > 0,
+            "streaming buckets must touch Bucket and Entry pages"
+        );
         let name = partition_name(1, 0);
         drop(index);
         // The warm decoded cache must not conceal a later bad durable image.
@@ -2512,7 +2556,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_buckets_cross_pages_and_fence_eviction_preserves_lookup() {
+    fn streamed_buckets_cross_pages_and_resident_fences_survive_cache_pressure() {
         use super::*;
         use std::collections::BTreeMap;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2552,10 +2596,8 @@ mod tests {
         repository.publish_entries(1, entries).unwrap();
         let index = repository.recover_generation(1).unwrap();
         assert!(
-            repository
-                .page_cache
-                .get_fences(index.partitions[0].descriptor.run_hash())
-                .is_some()
+            index.partitions[0].fences.is_some(),
+            "bucket fences must stay resident with their partition"
         );
         assert_eq!(
             index
@@ -2572,10 +2614,8 @@ mod tests {
             .apply_pressure_snapshot(MemoryPressureSnapshot::new(32 << 30, 0, 1));
         assert_eq!(repository.page_cache.status().resident_pages(), 0);
         assert!(
-            repository
-                .page_cache
-                .get_fences(index.partitions[0].descriptor.run_hash())
-                .is_none()
+            index.partitions[0].fences.is_some(),
+            "cache pressure must not evict the resident search spine"
         );
         for (&key, entries) in &expected {
             assert_eq!(&index.bucket_entries(key).unwrap(), entries);
