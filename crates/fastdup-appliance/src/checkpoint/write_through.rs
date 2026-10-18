@@ -1182,14 +1182,25 @@ impl WriteThroughRegistry {
             lane.last_touch = touch;
             return (Arc::clone(&lane.stream), None);
         }
-        if self
-            .overflow
-            .lock()
-            .expect("ASSERT: write-through overflow lane lock poisoned")
-            .inode
-            == Some(inode)
-        {
-            return (Arc::clone(&self.overflow), None);
+        // Never wait for the Overflow Lane while holding the Registry: its
+        // owner may be applying publication-queue backpressure while the
+        // completing publisher and the checkpoint need the Registry to
+        // retire work and release that queue space. A busy Overflow Lane is
+        // a valid choice for this inode either way — staging revalidates
+        // the stream identity under the Lane lock and drains it first if it
+        // currently serves another inode.
+        match self.overflow.try_lock() {
+            Ok(stream) => {
+                if stream.inode == Some(inode) {
+                    return (Arc::clone(&self.overflow), None);
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return (Arc::clone(&self.overflow), None);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("ASSERT: write-through overflow lane lock poisoned")
+            }
         }
         let mut released = None;
         if self.lanes.len() >= MAX_ACTIVE_INGEST_LANES_V1 {

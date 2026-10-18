@@ -1499,6 +1499,44 @@ fn full_registry_never_evicts_an_in_flight_ingest_lane() {
 }
 
 #[test]
+fn acquiring_a_lane_never_waits_for_the_busy_overflow_lane() {
+    // The caller of `acquire_lane` holds the Registry. If acquisition waited
+    // for the Overflow Lane there, a staging worker holding that Lane across
+    // publication-queue backpressure could deadlock against the publisher
+    // and checkpoint threads that need the Registry to retire work.
+    let registry = Arc::new(Mutex::new(WriteThroughRegistry::default()));
+    let overflow = {
+        let registry = registry.lock().expect("registry lock");
+        Arc::clone(&registry.overflow)
+    };
+    overflow.lock().expect("overflow lane lock").inode =
+        Some(InodeId::new(999).expect("fixture inode is nonzero"));
+    let guard = overflow.lock().expect("overflow lane lock");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let acquiring = {
+        let registry = Arc::clone(&registry);
+        let overflow = Arc::clone(&overflow);
+        std::thread::spawn(move || {
+            let (lane, _) = registry
+                .lock()
+                .expect("registry lock")
+                .acquire_lane(InodeId::new(1_000).expect("fixture inode is nonzero"));
+            sender
+                .send(Arc::ptr_eq(&lane, &overflow))
+                .expect("test receiver stays alive");
+        })
+    };
+    let acquired = receiver.recv_timeout(Duration::from_millis(400));
+    drop(guard);
+    acquiring.join().expect("lane acquisition thread completes");
+    assert!(
+        matches!(acquired, Ok(true)),
+        "lane acquisition must fall back to the busy Overflow Lane instead of \
+         waiting for it while holding the Registry"
+    );
+}
+
+#[test]
 fn cpu_admission_uses_available_workers_during_ingest_io() {
     let budget = NonZeroUsize::new(10).unwrap();
     let permits = WorkerPermits::new(budget);
