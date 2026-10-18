@@ -1673,7 +1673,10 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
             "filters={} allocated_bytes={} ",
             "huge_page_advised_filters={} huge_page_advised_bytes={} probes={} ",
             "constructed_filters={} missing_filters={} missing_page_bounds={} ",
-            "definitely_absent={} requires_exact_lookup={}"
+            "definitely_absent={} requires_exact_lookup={} ",
+            "page_physical_reads={} page_distinct={} page_rereads={} ",
+            "page_demand_reads={} page_scan_reads={} page_independent_reads={} ",
+            "page_distinct_compaction_born={} page_bounds_miss_reads={} active_page_count={}"
         ),
         membership.leased_run_count(),
         membership.positional_run_count(),
@@ -1688,6 +1691,15 @@ fn emit_verified_read_cache(appliance: &FsAppliance) {
         membership.missing_page_bounds_count(),
         membership.definitely_absent(),
         membership.requires_exact_lookup(),
+        membership.page_physical_reads(),
+        membership.page_distinct(),
+        membership.page_rereads(),
+        membership.page_demand_reads(),
+        membership.page_scan_reads(),
+        membership.page_independent_reads(),
+        membership.page_distinct_compaction_born(),
+        membership.page_bounds_miss_reads(),
+        membership.active_page_count(),
     );
     let exact = appliance.exact_index_page_cache_status();
     eprintln!(

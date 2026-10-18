@@ -124,6 +124,9 @@ pub struct ExactIndexRunRepository<I> {
     retirement_references: Arc<Mutex<Option<ExactRetirementReferenceWindow>>>,
     page_cache: Arc<ExactIndexPageCache>,
     membership_counters: Arc<ExactRunMembershipCounters>,
+    page_lifecycle: Arc<ExactPageLifecycleCounters>,
+    page_reads_by_run:
+        Arc<Mutex<std::collections::HashMap<[u8; 32], std::sync::Weak<ExactRunPageReads>>>>,
     warm_cursor: Arc<AtomicUsize>,
     publication_timings: ExactPublicationTimings,
 }
@@ -600,6 +603,15 @@ pub struct ExactRunMembershipStatus {
     probes: u64,
     definitely_absent: u64,
     requires_exact_lookup: u64,
+    page_physical_reads: u64,
+    page_rereads: u64,
+    page_distinct: u64,
+    page_demand_reads: u64,
+    page_scan_reads: u64,
+    page_independent_reads: u64,
+    page_distinct_compaction_born: u64,
+    page_bounds_miss_reads: u64,
+    active_page_count: u64,
 }
 
 impl ExactRunMembershipStatus {
@@ -672,6 +684,51 @@ impl ExactRunMembershipStatus {
     pub const fn requires_exact_lookup(self) -> u64 {
         self.requires_exact_lookup
     }
+
+    #[must_use]
+    pub const fn page_physical_reads(self) -> u64 {
+        self.page_physical_reads
+    }
+
+    #[must_use]
+    pub const fn page_rereads(self) -> u64 {
+        self.page_rereads
+    }
+
+    #[must_use]
+    pub const fn page_distinct(self) -> u64 {
+        self.page_distinct
+    }
+
+    #[must_use]
+    pub const fn page_demand_reads(self) -> u64 {
+        self.page_demand_reads
+    }
+
+    #[must_use]
+    pub const fn page_scan_reads(self) -> u64 {
+        self.page_scan_reads
+    }
+
+    #[must_use]
+    pub const fn page_independent_reads(self) -> u64 {
+        self.page_independent_reads
+    }
+
+    #[must_use]
+    pub const fn active_page_count(self) -> u64 {
+        self.active_page_count
+    }
+
+    #[must_use]
+    pub const fn page_distinct_compaction_born(self) -> u64 {
+        self.page_distinct_compaction_born
+    }
+
+    #[must_use]
+    pub const fn page_bounds_miss_reads(self) -> u64 {
+        self.page_bounds_miss_reads
+    }
 }
 
 /// Bounded work accepted by one proactive Exact-acceleration warm cycle.
@@ -729,6 +786,96 @@ struct ExactRunMembershipCounters {
     requires_exact_lookup: AtomicU64,
 }
 
+/// Repository-lifetime Exact page-fetch lifecycle evidence. Physical reads
+/// count pages not served by the hot page cache; distinct increments when
+/// a page identity is fetched for the first time, so identity churn stays
+/// visible after readers drop.
+#[derive(Debug, Default)]
+struct ExactPageLifecycleCounters {
+    physical_reads: AtomicU64,
+    demand_reads: AtomicU64,
+    scan_reads: AtomicU64,
+    independent_reads: AtomicU64,
+    rereads: AtomicU64,
+    distinct_pages: AtomicU64,
+    distinct_compaction_born: AtomicU64,
+}
+
+/// One Run identity's fetched-page bitmap, shared across reader
+/// reconstructions via the repository registry.
+#[derive(Debug)]
+struct ExactRunPageReads {
+    seen: Box<[AtomicU64]>,
+    lifecycle: Arc<ExactPageLifecycleCounters>,
+    compaction_born: bool,
+}
+
+impl ExactRunPageReads {
+    fn new(
+        page_count: usize,
+        lifecycle: &Arc<ExactPageLifecycleCounters>,
+        compaction_born: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            seen: (0..page_count.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            lifecycle: Arc::clone(lifecycle),
+            compaction_born,
+        })
+    }
+
+    fn record(&self, page_ordinal: usize) {
+        let counters = &self.lifecycle;
+        counters
+            .physical_reads
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        match crate::ReadIntentScope::current() {
+            crate::ReadIntent::Demand => {
+                counters.demand_reads.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            crate::ReadIntent::Scan => {
+                counters.scan_reads.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            crate::ReadIntent::Independent => {
+                counters
+                    .independent_reads
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        // The bitmap tracks foreground demand only: compaction/audit
+        // streams would mark whole Runs seen and turn later first demand
+        // reads into fake rereads.
+        if crate::MetadataReadScope::current() != crate::MetadataReadReason::IndexLookup {
+            return;
+        }
+        if let Some(word) = self.seen.get(page_ordinal / 64) {
+            let mask = 1_u64 << (page_ordinal % 64);
+            if word.fetch_or(mask, AtomicOrdering::Relaxed) & mask != 0 {
+                counters.rereads.fetch_add(1, AtomicOrdering::Relaxed);
+            } else {
+                counters
+                    .distinct_pages
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                if self.compaction_born {
+                    counters
+                        .distinct_compaction_born
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn distinct(&self) -> u64 {
+        self.seen
+            .iter()
+            .map(|word| u64::from(word.load(AtomicOrdering::Relaxed).count_ones()))
+            .sum()
+    }
+}
+
 /// Payload-free evidence from pairing every ACTIVE index entry with its
 /// immutable Container location during an offline scrub.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -766,6 +913,8 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             retirement_references: Arc::new(Mutex::new(None)),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, true)),
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
+            page_lifecycle: Arc::new(ExactPageLifecycleCounters::default()),
+            page_reads_by_run: Arc::new(Mutex::new(std::collections::HashMap::new())),
             warm_cursor: Arc::new(AtomicUsize::new(0)),
             publication_timings: ExactPublicationTimings::default(),
         }
@@ -791,6 +940,8 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             retirement_references: Arc::new(Mutex::new(None)),
             page_cache: Arc::new(ExactIndexPageCache::build(snapshot, false)),
             membership_counters: Arc::new(ExactRunMembershipCounters::default()),
+            page_lifecycle: Arc::new(ExactPageLifecycleCounters::default()),
+            page_reads_by_run: Arc::new(Mutex::new(std::collections::HashMap::new())),
             warm_cursor: Arc::new(AtomicUsize::new(0)),
             publication_timings: ExactPublicationTimings::default(),
         }
@@ -1008,6 +1159,8 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 CachedRunMembership::required_bytes(descriptor.entry_count()),
             ))),
             membership_counters: Arc::clone(&self.membership_counters),
+            page_lifecycle: Arc::clone(&self.page_lifecycle),
+            page_reads: self.page_reads_for(descriptor, false),
         })
     }
 
@@ -2893,9 +3046,37 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
                 mapping,
                 membership,
                 membership_counters: Arc::clone(&self.membership_counters),
+                page_lifecycle: Arc::clone(&self.page_lifecycle),
+                page_reads: self.page_reads_for(descriptor, false),
             });
         }
         Ok(readers)
+    }
+
+    /// Bitmaps are shared per Run identity across reader reconstructions:
+    /// a generation install that rebuilds readers for an unchanged Run
+    /// must neither reset its fetch history nor double-count distinct
+    /// pages when the old readers drop.
+    fn page_reads_for(
+        &self,
+        descriptor: ExactIndexRunDescriptor,
+        compaction_born: bool,
+    ) -> Arc<ExactRunPageReads> {
+        let run_hash = descriptor.run_hash();
+        let mut by_run = self
+            .page_reads_by_run
+            .lock()
+            .expect("ASSERT: Exact page-read registry poisoned");
+        if let Some(existing) = by_run.get(&run_hash).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        let reads = ExactRunPageReads::new(
+            descriptor.page_count(),
+            &self.page_lifecycle,
+            compaction_born,
+        );
+        by_run.insert(run_hash, Arc::downgrade(&reads));
+        reads
     }
 
     fn membership_budget_bytes_now(&self) -> usize {
@@ -2951,6 +3132,8 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             mapping: audited.mapping,
             membership,
             membership_counters: Arc::clone(&self.membership_counters),
+            page_lifecycle: Arc::clone(&self.page_lifecycle),
+            page_reads: self.page_reads_for(audited.descriptor, true),
         })
     }
 
@@ -3223,6 +3406,11 @@ impl<I> ActivatedExactIndex<I> {
         else {
             return ExactRunMembershipStatus::default();
         };
+        let lifecycle = &self
+            .readers
+            .first()
+            .expect("ASSERT: readers checked non-empty")
+            .page_lifecycle;
         assert!(
             self.readers
                 .iter()
@@ -3255,6 +3443,26 @@ impl<I> ActivatedExactIndex<I> {
             probes: counters.probes.load(AtomicOrdering::Relaxed),
             definitely_absent: counters.definitely_absent.load(AtomicOrdering::Relaxed),
             requires_exact_lookup: counters.requires_exact_lookup.load(AtomicOrdering::Relaxed),
+            page_physical_reads: lifecycle.physical_reads.load(AtomicOrdering::Relaxed),
+            page_rereads: lifecycle.rereads.load(AtomicOrdering::Relaxed),
+            page_distinct: lifecycle.distinct_pages.load(AtomicOrdering::Relaxed),
+            page_demand_reads: lifecycle.demand_reads.load(AtomicOrdering::Relaxed),
+            page_scan_reads: lifecycle.scan_reads.load(AtomicOrdering::Relaxed),
+            page_independent_reads: lifecycle.independent_reads.load(AtomicOrdering::Relaxed),
+            page_distinct_compaction_born: lifecycle
+                .distinct_compaction_born
+                .load(AtomicOrdering::Relaxed),
+            page_bounds_miss_reads: self
+                .readers
+                .iter()
+                .filter_map(|reader| reader.mapping.as_ref())
+                .map(|mapping| mapping.bounds_miss_reads())
+                .fold(0_u64, u64::saturating_add),
+            active_page_count: self
+                .readers
+                .iter()
+                .map(|reader| reader.descriptor.page_count() as u64)
+                .fold(0_u64, u64::saturating_add),
         }
     }
 }
@@ -4602,6 +4810,8 @@ pub struct ExactIndexRunReader<I> {
     mapping: Option<Arc<ImmutableExactIndexRun>>,
     membership: Option<Arc<CachedRunMembership>>,
     membership_counters: Arc<ExactRunMembershipCounters>,
+    page_lifecycle: Arc<ExactPageLifecycleCounters>,
+    page_reads: Arc<ExactRunPageReads>,
 }
 
 impl<I> ExactIndexRunReader<I> {
@@ -4898,6 +5108,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
     }
 
     fn warm_page(&self, page_ordinal: usize) -> Result<bool, ExactIndexStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexWarm);
         let run_hash = self.descriptor.run_hash();
         if self.page_cache.peek(run_hash, page_ordinal).is_some() {
             return Ok(true);
@@ -4909,6 +5120,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
     /// Warms `count` consecutive pages in one range read, returning how many
     /// the bounded page cache actually retained.
     fn warm_page_span(&self, first: usize, count: usize) -> Result<usize, ExactIndexStoreError> {
+        let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexWarm);
         if count == 1 {
             return Ok(usize::from(self.warm_page(first)?));
         }
@@ -5005,6 +5217,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         for (index, page_bytes) in span.chunks_exact(EXACT_INDEX_PAGE_BYTES).enumerate() {
             let ordinal = first + index;
             let page = Arc::new(self.descriptor.decode_page(ordinal, page_bytes)?);
+            self.page_reads.record(ordinal);
             self.page_cache.insert(run_hash, ordinal, Arc::clone(&page));
             resident.insert(ordinal, page);
         }
@@ -5071,12 +5284,20 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
                 if page_ordinal >= page_count {
                     continue;
                 }
-                let page = match resident.get(&page_ordinal).cloned() {
-                    Some(page) => page,
-                    None => self
-                        .page_cache
-                        .peek(run_hash, page_ordinal)
-                        .expect("ASSERT: a batched lookup page is resident or was just span-read"),
+                let page = if let Some(page) = resident.get(&page_ordinal).cloned() {
+                    page
+                } else {
+                    // Consume resident pages through get() so batch demand
+                    // earns hit credit like per-key lookup; peek() left
+                    // frequently queried pages at zero credit. A page
+                    // evicted since the presence probe (or an Independent
+                    // read) falls back to a load.
+                    let page = match self.page_cache.get(run_hash, page_ordinal) {
+                        Some(page) => page,
+                        None => self.load_page(page_ordinal, true)?,
+                    };
+                    resident.insert(page_ordinal, Arc::clone(&page));
+                    page
                 };
                 let (chunk_id, logical_length) = keys[ordinal];
                 let matches = page.candidates(chunk_id, logical_length);
@@ -5135,6 +5356,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
                 .read_exact_at(&self.name, offset, EXACT_INDEX_PAGE_BYTES)?;
             self.descriptor.decode_page(page_ordinal, &bytes)?
         });
+        self.page_reads.record(page_ordinal);
         if admit {
             self.page_cache
                 .insert(run_hash, page_ordinal, Arc::clone(&page));
@@ -5187,6 +5409,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
                 page
             } else {
                 let page = Arc::new(self.descriptor.decode_page(page_ordinal, page_bytes)?);
+                self.page_reads.record(page_ordinal);
                 self.page_cache
                     .insert(run_hash, page_ordinal, Arc::clone(&page));
                 page
@@ -5676,6 +5899,27 @@ mod tests {
             )
             .unwrap();
         repository
+    }
+
+    #[test]
+    fn page_read_lifecycle_distinguishes_distinct_and_rereads() {
+        let _lookup = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexLookup);
+        let lifecycle = Arc::new(ExactPageLifecycleCounters::default());
+        let reads = ExactRunPageReads::new(130, &lifecycle, false);
+        reads.record(3);
+        reads.record(3);
+        reads.record(65);
+        assert_eq!(lifecycle.physical_reads.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(lifecycle.rereads.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(lifecycle.demand_reads.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(reads.distinct(), 2);
+        assert_eq!(lifecycle.distinct_pages.load(AtomicOrdering::Relaxed), 2);
+        drop(reads);
+        assert_eq!(
+            lifecycle.distinct_pages.load(AtomicOrdering::Relaxed),
+            2,
+            "distinct is counted when a bit is first set, never folded twice"
+        );
     }
 
     #[test]

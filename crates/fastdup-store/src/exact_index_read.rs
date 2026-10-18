@@ -58,6 +58,7 @@ pub(crate) struct ImmutableExactIndexRun {
     descriptor: ExactIndexRunDescriptor,
     bounds_cache: crate::ReadCacheNamespace,
     writer_pages: Option<crate::ReadCacheNamespace>,
+    bounds_miss_reads: std::sync::atomic::AtomicU64,
 }
 
 impl ImmutableExactIndexRun {
@@ -141,6 +142,7 @@ impl ImmutableExactIndexRun {
             descriptor,
             bounds_cache,
             writer_pages: None,
+            bounds_miss_reads: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -173,7 +175,13 @@ impl ImmutableExactIndexRun {
             descriptor,
             bounds_cache,
             writer_pages: Some(pages),
+            bounds_miss_reads: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    pub(crate) fn bounds_miss_reads(&self) -> u64 {
+        self.bounds_miss_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn page_position(
@@ -194,6 +202,10 @@ impl ImmutableExactIndexRun {
                 .map(|bounds| bounds.position(chunk_id, logical_length))
                 .ok_or(ExactIndexStoreError::IdentityMismatch);
         }
+        // Bounds-miss descent bypasses the decoded page cache entirely:
+        // count it so lookup disk reads reconcile with cache misses.
+        self.bounds_miss_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let offset = self
             .descriptor
             .page_offset(page_ordinal)

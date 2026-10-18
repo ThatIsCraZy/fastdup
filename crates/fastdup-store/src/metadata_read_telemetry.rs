@@ -17,8 +17,9 @@ pub enum MetadataReadReason {
     Namespace,
     RecoveryScrub,
     GarbageCollection,
+    IndexWarm,
 }
-const REASONS: [&str; 9] = [
+const REASONS: [&str; 10] = [
     "other",
     "indexLookup",
     "indexCompaction",
@@ -28,6 +29,7 @@ const REASONS: [&str; 9] = [
     "namespace",
     "recoveryScrub",
     "garbageCollection",
+    "indexWarm",
 ];
 const OBJECTS: [&str; 6] = [
     "exactIndex",
@@ -52,6 +54,11 @@ thread_local! {
 /// Synchronous attribution scope; deliberately cannot cross threads or awaits.
 pub struct MetadataReadScope(MetadataReadReason, PhantomData<Rc<()>>);
 impl MetadataReadScope {
+    #[must_use]
+    pub fn current() -> MetadataReadReason {
+        REASON.with(Cell::get)
+    }
+
     #[must_use]
     pub fn enter(reason: MetadataReadReason) -> Self {
         Self(REASON.with(|current| current.replace(reason)), PhantomData)
