@@ -793,11 +793,26 @@ impl Core {
 
     fn reclaim_toward_target(&self, state: &mut Admission, max_evictions: usize) -> bool {
         let mut evicted = 0_usize;
+        // Spend a bounded examination budget on never-hit entries first.
+        // Pure FIFO pressure eviction would flush proven index pages at the
+        // same rate as one-touch admissions whenever the Broker target
+        // falls, which is exactly when their hit credit must matter.
+        let mut cold_budget = ADMISSION_STEPS;
+        let mut cold_exhausted = false;
         while state.resident > state.target {
             if evicted >= max_evictions {
                 return false;
             }
             let scope = Self::pressure_victim_scope(state);
+            let cold_evicted = !cold_exhausted
+                && (self.evict_cold(state, scope, &mut cold_budget)
+                    || (scope != EvictionScope::All
+                        && self.evict_cold(state, EvictionScope::All, &mut cold_budget)));
+            if cold_evicted {
+                evicted += 1;
+                continue;
+            }
+            cold_exhausted = true;
             if !self.evict(state, false, scope)
                 && (scope == EvictionScope::All || !self.evict(state, false, EvictionScope::All))
             {
@@ -1963,6 +1978,28 @@ mod tests {
         data.set_capacity(charge);
         assert_eq!(exact.stats().resident_bytes, charge);
         assert_eq!(data.stats().resident_bytes, 0);
+    }
+
+    #[test]
+    fn pressure_reclamation_evicts_cold_entries_before_credited_ones() {
+        let charge = 4096 + ENTRY_BYTES;
+        let cache = ReadCacheNamespace::isolated(ReadCacheClass::SimilarityPage, 64 * charge);
+        for ordinal in 0..64 {
+            cache.insert(key(ordinal), Arc::new(vec![9_u8; 4096]), 4096, 4096);
+        }
+        // Warm a minority: a lowered target must spend its evictions on the
+        // never-hit majority first instead of FIFO-flushing proven pages.
+        for ordinal in 0..8 {
+            assert!(cache.get::<Vec<u8>>(key(ordinal)).is_some());
+        }
+        cache.set_capacity(32 * charge);
+        for ordinal in 0..8 {
+            assert!(
+                cache.peek::<Vec<u8>>(key(ordinal)).is_some(),
+                "credited entry {ordinal} must survive pressure while cold entries remain"
+            );
+        }
+        assert_eq!(cache.stats().resident_bytes, 32 * charge);
     }
 
     #[test]

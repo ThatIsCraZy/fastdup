@@ -1631,6 +1631,11 @@ impl SimilarityPageCache {
         }
     }
     fn record_kind(&self, kind: usize, hit: bool) {
+        // Independent verification bypasses the namespace counters as well;
+        // counting only here would make the per-kind sums diverge.
+        if crate::read_intent::independent() {
+            return;
+        }
         let counter = if hit {
             &self.kind_hits[kind]
         } else {
