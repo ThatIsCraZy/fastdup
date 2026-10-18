@@ -215,6 +215,8 @@ pub struct ReductionTelemetry {
     pub warm_base_reuses: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successful_base_trials: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_xor_skips: Option<u64>,
     pub enabled: bool,
     pub queries: u64,
     pub candidates: u64,

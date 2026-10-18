@@ -204,3 +204,121 @@ fn misleading_hints_learn_to_skip_data_reads_but_warm_and_demand_reads_still_ver
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn dense_bases_skip_xor_and_saturated_results_stop_base_loads() {
+    let root = std::env::temp_dir().join(format!(
+        "codec-preselection-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let storage = ReadCountingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let mut seed = 71_u64;
+    let base_a = (0..65536)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            u8::try_from(seed & 0xff).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut base_b = base_a.clone();
+    base_b[40_000] ^= 0x5a;
+    let container_id = ContainerId::new([0xe7; 16]).unwrap();
+    containers
+        .publish_raw(container_id, 1, &[&base_a, &base_b])
+        .unwrap();
+    let published = containers.read(container_id).unwrap();
+    let entries = vec![
+        ExactIndexEntry::from_verified(published.locations()[0]).unwrap(),
+        ExactIndexEntry::from_verified(published.locations()[1]).unwrap(),
+    ];
+    let exact = ExactIndexRunRepository::new(storage.clone());
+    exact
+        .append_level_zero(ExactIndexProfileId::new([0xe6; 32]).unwrap(), entries)
+        .unwrap();
+    let active = exact.pin_active_generation().unwrap();
+    let similarities = SimilarityIndexRepository::new(storage);
+    let mut stager = similarities.entry_stager(1);
+    stager
+        .push(crate::similarity_index_entry_v1(&base_a).unwrap())
+        .unwrap();
+    stager
+        .push(crate::similarity_index_entry_v1(&base_b).unwrap())
+        .unwrap();
+    let publication = similarities
+        .finish_staged_entries(1, stager, active.run_set().id().unwrap())
+        .unwrap();
+    similarities.activate_staged_family(publication).unwrap();
+    let planner = PersistentReductionIndex::new(
+        &active,
+        Arc::new(similarities.recover_latest().unwrap().unwrap()),
+    )
+    .unwrap();
+    let plan = |target: &[u8]| {
+        planner
+            .plan_chunk_for_publication(&containers, ChunkId::of(target), target)
+            .unwrap()
+            .0
+    };
+
+    // Sparse edit outside every probe: the XOR trial runs and the tiny
+    // dependent result saturates, so the second candidate Base is never
+    // read from DATA even though two candidates were ranked.
+    let mut sparse = base_a.clone();
+    sparse[100] ^= 0x5a;
+    assert!(matches!(plan(&sparse), PersistentChunkPlan::Dependent(_)));
+    let after_sparse = planner.status();
+    assert!(after_sparse.candidates() >= 2);
+    assert_eq!(after_sparse.backend_base_reads(), 1);
+    assert!(after_sparse.sparse_xor_trials() >= 1);
+    assert_eq!(after_sparse.dense_xor_skips(), 0);
+
+    // One flipped byte inside every sampled probe classifies dense: the XOR
+    // trial is skipped and ZSTD_PREFIX carries the dependent result.
+    let mut dense = base_a.clone();
+    for block in 0..16 {
+        dense[block * 4096 + 7] ^= 0x5a;
+    }
+    assert!(matches!(plan(&dense), PersistentChunkPlan::Dependent(_)));
+    let after_dense = planner.status();
+    assert!(after_dense.dense_xor_skips() >= 1);
+    assert_eq!(
+        after_dense.sparse_xor_trials(),
+        after_sparse.sparse_xor_trials()
+    );
+    assert!(after_dense.accepted_prefixes() > after_sparse.accepted_prefixes());
+
+    // Warm-first: with Base B resident, the resident candidate is tried
+    // before the Sketch-closer cold Base A, so this plan needs no DATA read.
+    let cache = VerifiedReadCache::new_with_snapshot(
+        VerifiedReadCacheConfig::new(4 * 1024 * 1024, 0, NonZeroUsize::MIN).unwrap(),
+        MemoryPressureSnapshot::new(64 * 1024 * 1024, 32 * 1024 * 1024, 0),
+    )
+    .unwrap();
+    let payload = containers
+        .find_verified_independent_base_payload_with_index(
+            &active,
+            ChunkId::of(&base_b),
+            65536,
+            Some(&cache),
+        )
+        .unwrap();
+    assert_eq!(payload.as_slice(), base_b);
+    let before_warm = planner.status();
+    let (warm_plan, _) = planner
+        .plan_chunk_for_publication_cached(&containers, ChunkId::of(&sparse), &sparse, Some(&cache))
+        .unwrap();
+    assert!(matches!(warm_plan, PersistentChunkPlan::Dependent(_)));
+    let after_warm = planner.status();
+    assert_eq!(
+        after_warm.backend_base_reads(),
+        before_warm.backend_base_reads()
+    );
+    assert!(after_warm.warm_base_reuses() > before_warm.warm_base_reuses());
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -30,6 +30,10 @@ use fastdup_format::SimilarityIndexEntry;
 const MAXIMUM_DEPENDENT_TRIALS_V1: usize = 4;
 const DEPENDENT_MINIMUM_SAVINGS_BYTES_V1: usize = 4_096;
 const DEPENDENT_MINIMUM_SAVINGS_PERCENT_V1: usize = 5;
+/// A Base counts as sparse when at most one in eight sampled blocks differs.
+const SPARSE_SAMPLE_DIVISOR_V1: usize = 8;
+const SAMPLE_BLOCK_BYTES_V1: usize = 4096;
+const SAMPLE_PROBE_BYTES_V1: usize = 64;
 const REDUCTION_COUNTER_STRIPES: usize = 64;
 const _: () = assert!(REDUCTION_COUNTER_STRIPES.is_power_of_two());
 
@@ -47,6 +51,7 @@ struct ReductionCounterStripe {
     base_read_bytes: AtomicU64,
     prefix_trials: AtomicU64,
     sparse_xor_trials: AtomicU64,
+    dense_xor_skips: AtomicU64,
     accepted_prefixes: AtomicU64,
     accepted_sparse_xor: AtomicU64,
     independent_fallbacks: AtomicU64,
@@ -93,6 +98,7 @@ impl ReductionCounters {
                     base_read_bytes: stripe.base_read_bytes.load(Ordering::Relaxed),
                     prefix_trials: stripe.prefix_trials.load(Ordering::Relaxed),
                     sparse_xor_trials: stripe.sparse_xor_trials.load(Ordering::Relaxed),
+                    dense_xor_skips: stripe.dense_xor_skips.load(Ordering::Relaxed),
                     accepted_prefixes: stripe.accepted_prefixes.load(Ordering::Relaxed),
                     accepted_sparse_xor: stripe.accepted_sparse_xor.load(Ordering::Relaxed),
                     independent_fallbacks: stripe.independent_fallbacks.load(Ordering::Relaxed),
@@ -122,6 +128,7 @@ struct ReductionCounterValues {
     base_read_bytes: u64,
     prefix_trials: u64,
     sparse_xor_trials: u64,
+    dense_xor_skips: u64,
     accepted_prefixes: u64,
     accepted_sparse_xor: u64,
     independent_fallbacks: u64,
@@ -157,6 +164,7 @@ impl ReductionCounterValues {
         self.sparse_xor_trials = self
             .sparse_xor_trials
             .saturating_add(other.sparse_xor_trials);
+        self.dense_xor_skips = self.dense_xor_skips.saturating_add(other.dense_xor_skips);
         self.accepted_prefixes = self
             .accepted_prefixes
             .saturating_add(other.accepted_prefixes);
@@ -319,6 +327,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
                     target.bytes(),
                     &fingerprint,
                     counters,
+                    cache,
                     &snapshot,
                 )
                 .unwrap_or_else(|_| {
@@ -495,6 +504,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
             base_read_bytes: counters.base_read_bytes,
             prefix_trials: counters.prefix_trials,
             sparse_xor_trials: counters.sparse_xor_trials,
+            dense_xor_skips: counters.dense_xor_skips,
             accepted_prefixes: counters.accepted_prefixes,
             accepted_sparse_xor: counters.accepted_sparse_xor,
             independent_fallbacks: counters.independent_fallbacks,
@@ -569,7 +579,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         cache: Option<&VerifiedReadCache>,
         snapshot: &ReductionBatchSnapshot<I>,
     ) -> Result<PersistentChunkPlan, PersistentReductionError> {
-        match self.prepare_trial(target_id, target, fingerprint, counters, snapshot)? {
+        match self.prepare_trial(target_id, target, fingerprint, counters, cache, snapshot)? {
             PreparedChunkTrial::Ready(plan) => Ok(plan),
             PreparedChunkTrial::Trials(mut trial) => {
                 while let Some((candidate, base)) = self.read_next_trial_base(
@@ -592,6 +602,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         target: &'a [u8],
         fingerprint: &SimilarityFingerprint,
         counters: &ReductionCounterStripe,
+        cache: Option<&VerifiedReadCache>,
         snapshot: &ReductionBatchSnapshot<I>,
     ) -> Result<PreparedChunkTrial<'a>, PersistentReductionError> {
         let lookup_phase = ReductionTimer::new(&counters.candidate_lookup_ns);
@@ -642,15 +653,20 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
                 independent,
             )));
         };
+        let mut ranked = candidates;
+        if let Some(cache) = cache {
+            // Resident Bases cost no DATA read, so they are tried ahead of
+            // colder candidates. The sort is stable: Sketch ranking stays
+            // the order inside the resident and cold groups.
+            ranked.sort_by_key(|candidate| {
+                !cache.peek_contains(candidate.chunk_id(), u64::from(candidate.logical_length()))
+            });
+        }
         Ok(PreparedChunkTrial::Trials(ChunkTrial {
             target_id,
             target,
             independent,
-            candidates: candidates
-                .into_iter()
-                .take(4)
-                .collect::<Vec<_>>()
-                .into_iter(),
+            candidates: ranked.into_iter().take(4).collect::<Vec<_>>().into_iter(),
             maximum_encoded_payload_bytes,
             best: None,
             remaining_trials: MAXIMUM_DEPENDENT_TRIALS_V1,
@@ -672,7 +688,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
         SimilarityBaseCandidate,
         fastdup_format::VerifiedChunkPayload,
     )> {
-        if trial.remaining_trials == 0 {
+        if trial.remaining_trials == 0 || trial.saturated() {
             return None;
         }
         let exact = snapshot.exact.as_ref()?;
@@ -742,6 +758,14 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
 }
 
 impl ChunkTrial<'_> {
+    /// A dependent result at or below half the independent size leaves too
+    /// little marginal headroom to justify another speculative Base load.
+    fn saturated(&self) -> bool {
+        self.best.as_ref().is_some_and(|(bytes, _)| {
+            bytes.saturating_mul(2) <= self.independent.encoded_payload_bytes()
+        })
+    }
+
     fn run_base(
         &mut self,
         candidate: SimilarityBaseCandidate,
@@ -771,33 +795,42 @@ impl ChunkTrial<'_> {
         let expected = BaseChunkRef::new(candidate.chunk_id(), candidate.logical_length());
         let base = VerifiedBaseChunk::from_verified_location(expected, base_bytes)
             .map_err(|_| PersistentReductionError::VerifiedBaseMismatch)?;
-        let sparse_base = IndependentBaseRef::from_verified_identity(
-            candidate.chunk_id(),
-            candidate.logical_length(),
-            base_bytes,
-        )
-        .map_err(|_| PersistentReductionError::VerifiedBaseMismatch)?;
-        counters.sparse_xor_trials.fetch_add(1, Ordering::Relaxed);
-        *remaining_trials -= 1;
-        let sparse = SparseXorDelta::encode_bounded_prehashed_trial(
-            sparse_base,
-            base_bytes,
-            *target_id,
-            target,
-            trial_cap,
-        )
-        .map_err(|_| PersistentReductionError::SparseXorCodec)?;
-        if let Some(sparse) = sparse.filter(|s| s.cost().run_count() != 0) {
-            let sparse_bytes = usize::try_from(sparse.cost().encoded_payload_bytes())
-                .map_err(|_| PersistentReductionError::SparseXorCodec)?;
-            let prepared = sparse
-                .into_encoding()
-                .into_prepared_record()
-                .map(PreparedDependentRecord::from)
-                .map_err(|_| PersistentReductionError::SparseXorCodec)?;
-            if best.as_ref().is_none_or(|(bytes, _)| sparse_bytes < *bytes) {
-                *best = Some((sparse_bytes, prepared));
+        // Codec pre-selection: Sparse-XOR only wins on sparse same-offset
+        // edits. When sampled blocks mostly differ, spend the bounded trial
+        // budget on ZSTD_PREFIX alone so more Bases fit the same four trials.
+        // The bounded encoders remain the only size authority either way.
+        let (differing, sampled) = sampled_differing_blocks(base_bytes, target);
+        if differing.saturating_mul(SPARSE_SAMPLE_DIVISOR_V1) <= sampled {
+            let sparse_base = IndependentBaseRef::from_verified_identity(
+                candidate.chunk_id(),
+                candidate.logical_length(),
+                base_bytes,
+            )
+            .map_err(|_| PersistentReductionError::VerifiedBaseMismatch)?;
+            counters.sparse_xor_trials.fetch_add(1, Ordering::Relaxed);
+            *remaining_trials -= 1;
+            let sparse = SparseXorDelta::encode_bounded_prehashed_trial(
+                sparse_base,
+                base_bytes,
+                *target_id,
+                target,
+                trial_cap,
+            )
+            .map_err(|_| PersistentReductionError::SparseXorCodec)?;
+            if let Some(sparse) = sparse.filter(|s| s.cost().run_count() != 0) {
+                let sparse_bytes = usize::try_from(sparse.cost().encoded_payload_bytes())
+                    .map_err(|_| PersistentReductionError::SparseXorCodec)?;
+                let prepared = sparse
+                    .into_encoding()
+                    .into_prepared_record()
+                    .map(PreparedDependentRecord::from)
+                    .map_err(|_| PersistentReductionError::SparseXorCodec)?;
+                if best.as_ref().is_none_or(|(bytes, _)| sparse_bytes < *bytes) {
+                    *best = Some((sparse_bytes, prepared));
+                }
             }
+        } else {
+            counters.dense_xor_skips.fetch_add(1, Ordering::Relaxed);
         }
 
         if *remaining_trials != 0 {
@@ -968,6 +1001,7 @@ pub struct PersistentReductionStatus {
     base_read_bytes: u64,
     prefix_trials: u64,
     sparse_xor_trials: u64,
+    dense_xor_skips: u64,
     accepted_prefixes: u64,
     accepted_sparse_xor: u64,
     independent_fallbacks: u64,
@@ -1008,6 +1042,7 @@ impl PersistentReductionStatus {
     reduction_status_getter!(base_read_bytes, base_read_bytes, u64);
     reduction_status_getter!(prefix_trials, prefix_trials, u64);
     reduction_status_getter!(sparse_xor_trials, sparse_xor_trials, u64);
+    reduction_status_getter!(dense_xor_skips, dense_xor_skips, u64);
     reduction_status_getter!(accepted_prefixes, accepted_prefixes, u64);
     reduction_status_getter!(accepted_sparse_xor, accepted_sparse_xor, u64);
     reduction_status_getter!(independent_fallbacks, independent_fallbacks, u64);
@@ -1020,6 +1055,28 @@ pub enum PersistentChunkPlan {
     NoCandidates,
     Independent(PreparedIndependentRecord),
     Dependent(PreparedDependentRecord),
+}
+
+/// Counts fixed-stride sample blocks whose probe bytes differ between the
+/// resident Base and target, returned as `(differing, sampled)`. This only
+/// selects codec trials; it is never a size or identity authority, so a
+/// sampling error loses at most one optional Sparse-XOR trial while the
+/// `ZSTD_PREFIX` trial still runs against the same Base.
+fn sampled_differing_blocks(base: &[u8], target: &[u8]) -> (usize, usize) {
+    let length = base.len().min(target.len());
+    let blocks = length.div_ceil(SAMPLE_BLOCK_BYTES_V1).max(1);
+    let mut differing = 0_usize;
+    for block in 0..blocks {
+        let start = block * SAMPLE_BLOCK_BYTES_V1;
+        if start >= length {
+            break;
+        }
+        let end = (start + SAMPLE_PROBE_BYTES_V1).min(length);
+        if base[start..end] != target[start..end] {
+            differing += 1;
+        }
+    }
+    (differing, blocks)
 }
 
 fn dependent_payload_cap(independent_bytes: usize) -> Option<usize> {
@@ -1220,6 +1277,27 @@ mod tests {
         let chunks = vec![PrehashedChunk::new(ChunkId::of(&large), &large); 128];
         assert_eq!(fingerprint_workers(&chunks, total), total);
         assert_eq!(fingerprint_workers(&chunks[..1], total), NonZeroUsize::MIN);
+    }
+
+    #[test]
+    fn sampled_blocks_classify_sparse_and_dense_edits() {
+        let base = vec![7_u8; 65_536];
+        assert_eq!(sampled_differing_blocks(&base, &base), (0, 16));
+        // A flip outside every fixed probe is deliberately invisible: the
+        // estimate only selects trials, and ZSTD_PREFIX still runs.
+        let mut unprobed = base.clone();
+        unprobed[100] = 9;
+        assert_eq!(sampled_differing_blocks(&base, &unprobed), (0, 16));
+        let mut probed = base.clone();
+        probed[3] = 9;
+        assert_eq!(sampled_differing_blocks(&base, &probed), (1, 16));
+        let mut dense = base.clone();
+        for block in 0..16 {
+            dense[block * SAMPLE_BLOCK_BYTES_V1 + 1] = 9;
+        }
+        assert_eq!(sampled_differing_blocks(&base, &dense), (16, 16));
+        assert_eq!(sampled_differing_blocks(&[], &[]), (0, 1));
+        assert_eq!(sampled_differing_blocks(&[1, 2, 3], &[1, 9, 3]), (1, 1));
     }
 
     #[test]

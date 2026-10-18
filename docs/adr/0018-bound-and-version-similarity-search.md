@@ -72,3 +72,29 @@ calls, not device commands or bytes: one verified load may issue several I/Os,
 and an OS cache may satisfy them. Legacy `base_reads` counts candidate resolution
 attempts and must not be displayed as physical disk reads. Older telemetry
 without the new counters remains unavailable in the UI.
+
+## Codec pre-selection, saturation, and warm-first trials (18 October 2026)
+
+Measured Veeam ingest showed Sparse-XOR winning almost no trials while
+consuming half of the four-trial budget on every loaded Base. Three
+writer-policy refinements keep the v1 bounds, formats, and the 5%/4 KiB
+acceptance rule unchanged:
+
+- Before spending a Sparse-XOR trial, the writer compares fixed in-memory
+  sample probes (64 bytes per 4 KiB block) of the resident Base and target.
+  When more than one in eight sampled blocks differs, the XOR trial is
+  skipped and only `ZSTD_PREFIX` runs, so up to four Bases fit the same
+  trial budget. The sample is never a size or identity authority; a wrong
+  estimate loses at most one optional XOR trial.
+- Once the best dependent result is at or below half the independent size,
+  no further Base is loaded for that Chunk; remaining headroom cannot repay
+  another speculative read.
+- Candidates whose Base is already resident in the verified read cache are
+  tried before colder candidates, preserving Sketch order inside each
+  group. Residency is a volatility-only hint proven by an application-cache
+  probe, never by kernel page-cache state.
+
+Telemetry adds `dense_xor_skips`. Near-miss savings below the acceptance
+threshold remain unobservable by design: bounded trials abort at the
+payload cap instead of reporting a full encoded size, so threshold tuning
+stays an offline-simulation question rather than a telemetry readout.

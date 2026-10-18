@@ -1458,7 +1458,7 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
     eprintln!(
         concat!(
             "advanced_reduction enabled={} queries={} candidates={} base_reads={} ",
-            "base_read_bytes={} sparse_xor_trials={} prefix_trials={} ",
+            "base_read_bytes={} sparse_xor_trials={} dense_xor_skips={} prefix_trials={} ",
             "accepted_sparse_xor={} accepted_prefixes={} ",
             "independent_fallbacks={} no_candidate_fallbacks={} ",
             "saved_payload_bytes={} errors={}"
@@ -1469,6 +1469,7 @@ fn emit_write_through_cpu_state(appliance: &FsAppliance) {
         reduction.base_reads(),
         reduction.base_read_bytes(),
         reduction.sparse_xor_trials(),
+        reduction.dense_xor_skips(),
         reduction.prefix_trials(),
         reduction.accepted_sparse_xor(),
         reduction.accepted_prefixes(),
