@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use fastdup_format::{
-    ChunkId, ExactIndexRunSetId, SIMILARITY_INDEX_HEADER_BYTES, SIMILARITY_INDEX_PAGE_BYTES,
+    ChunkId, ExactIndexRunSetId, SIMILARITY_BUCKET_REFERENCES_PER_PAGE,
+    SIMILARITY_INDEX_ENTRIES_PER_PAGE, SIMILARITY_INDEX_HEADER_BYTES, SIMILARITY_INDEX_PAGE_BYTES,
     SimilarityBucketKey, SimilarityBucketPage, SimilarityIndexEntry, SimilarityIndexFamilyError,
     SimilarityIndexFormatError, SimilarityIndexPage, SimilarityIndexPartitionRef,
     SimilarityIndexRun, SimilarityIndexRunDescriptor, SimilarityIndexRunFamily,
@@ -302,6 +303,17 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             if self.storage.exists(&name)? {
                 self.storage.remove_file(&name)?;
             }
+            // A deleted Run can never be queried again. Releasing its pages
+            // here keeps retired generations from displacing the active
+            // index working set until ordinary eviction reaches them.
+            let entry_pages = usize::try_from(part.entry_count())
+                .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?
+                .div_ceil(SIMILARITY_INDEX_ENTRIES_PER_PAGE);
+            let bucket_pages = usize::try_from(part.bucket_reference_count())
+                .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?
+                .div_ceil(SIMILARITY_BUCKET_REFERENCES_PER_PAGE);
+            self.page_cache
+                .purge_run(part.run_hash(), entry_pages, bucket_pages);
         }
         self.storage.remove_file(&name)?;
         self.storage.sync_root()?;
@@ -1672,6 +1684,15 @@ impl SimilarityPageCache {
             SIMILARITY_INDEX_PAGE_BYTES as u64,
         );
     }
+    pub(crate) fn purge_run(&self, hash: [u8; 32], entry_pages: usize, bucket_pages: usize) {
+        self.cache.remove(Self::key(hash, 0, 2));
+        for ordinal in 0..entry_pages {
+            self.cache.remove(Self::key(hash, ordinal, 0));
+        }
+        for ordinal in 0..bucket_pages {
+            self.cache.remove(Self::key(hash, ordinal, 1));
+        }
+    }
     fn status(&self) -> SimilarityIndexPageCacheStatus {
         let stats = self.cache.stats();
         let pressure = self.cache.pressure();
@@ -2320,10 +2341,12 @@ impl From<SimilarityIndexFamilyError> for SimilarityIndexStoreError {
 mod tests {
     use super::BucketOrdinals;
 
-    /// Auditing a Run on every mount reads it twice from end to end. Doing that
+    /// Auditing a Run on every mount must stream it once in spans. Doing that
     /// one page at a time is device-bound at a few thousand IOPS regardless of
     /// how fast the Run streams, which put a 22 second single-threaded audit in
-    /// front of every mount on the test appliance.
+    /// front of every mount on the test appliance. Reading it twice would put
+    /// the same avoidable load on the metadata device during ingest, where
+    /// online publication audits every new batch and compaction family.
     #[test]
     fn auditing_a_similarity_run_reads_it_in_spans_not_pages() {
         use super::*;
@@ -2371,7 +2394,7 @@ mod tests {
         let spans = |pages: usize| {
             pages.div_ceil(crate::similarity_read::SIMILARITY_AUDIT_PAGES_PER_IO_V1) as u64
         };
-        let budget = 2 * spans(descriptor.page_count()) + spans(descriptor.bucket_page_count()) + 8;
+        let budget = spans(descriptor.page_count()) + spans(descriptor.bucket_page_count()) + 8;
         assert!(
             reads <= budget,
             "auditing {} entry and {} bucket pages took {reads} reads against a {budget} budget",
@@ -2446,6 +2469,45 @@ mod tests {
             .unwrap();
         assert!(repo.recover_generation(1).is_err());
         drop(repo);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removing_a_retired_family_purges_its_cached_pages() {
+        use super::*;
+        let root =
+            std::env::temp_dir().join(format!("similarity-retired-purge-{}", std::process::id()));
+        assert!(!root.exists());
+        let repository = SimilarityIndexRepository::new_with_memory_snapshot(
+            crate::FsStorageIo::open(&root).unwrap(),
+            MemoryPressureSnapshot::new(32 << 30, 30 << 30, 0),
+        );
+        let entries = (1..=512_u64)
+            .map(|n| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&n.to_be_bytes());
+                SimilarityIndexEntry::new(
+                    ChunkId::from_bytes(id),
+                    65536,
+                    1,
+                    [n.wrapping_mul(131) % 1021; 4],
+                    [n; 8],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        repository.publish_entries(1, entries).unwrap();
+        let index = repository.recover_generation(1).unwrap();
+        assert!(repository.page_cache_status().resident_pages() > 0);
+        drop(index);
+        repository.remove_family(1).unwrap();
+        assert_eq!(
+            repository.page_cache_status().resident_pages(),
+            0,
+            "pages of a deleted Run cannot be queried again and must not \
+             keep displacing active index pages"
+        );
+        drop(repository);
         std::fs::remove_dir_all(root).unwrap();
     }
 

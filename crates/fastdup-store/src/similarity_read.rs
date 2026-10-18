@@ -11,6 +11,10 @@ use crate::ImmutableFileLease;
 
 /// Pages per audit range read: one 256 KiB Direct-I/O range per 64 pages.
 pub(crate) const SIMILARITY_AUDIT_PAGES_PER_IO_V1: usize = 64;
+/// Decoded pages an audit may hold locally until its complete-file hash
+/// passes. This covers every online partition (at most 32,768 bucket
+/// references) while keeping the transient decoded set near 10 MiB.
+const SIMILARITY_AUDIT_RETAINED_PAGE_LIMIT: usize = 2_048;
 use crate::similarity_index_repository::{SimilarityIndexStoreError, SimilarityPageCache};
 use std::sync::Arc;
 
@@ -87,6 +91,25 @@ fn audit_source(
     let mut audit = descriptor.start_hash_audit();
     let header = exact_range(lease, 0, SIMILARITY_INDEX_HEADER_BYTES)?;
     audit.update(0, &header)?;
+    // Bounded Runs keep their decoded pages only in this local set until
+    // the complete-file hash passes. They are admitted to the shared cache
+    // after `finish`, so a failed audit cannot poison later opens, and the
+    // semantic Bucket walk needs no second pass over the metadata device.
+    let mut retained = descriptor
+        .page_count()
+        .checked_add(descriptor.bucket_page_count())
+        .filter(|total| *total <= SIMILARITY_AUDIT_RETAINED_PAGE_LIMIT)
+        .map(|_| RetainedAuditPages::default());
+    if let Some(retained) = &mut retained {
+        retained
+            .entries
+            .try_reserve_exact(descriptor.page_count())
+            .map_err(|_| SimilarityIndexStoreError::OutOfMemory)?;
+        retained
+            .buckets
+            .try_reserve_exact(descriptor.bucket_page_count())
+            .map_err(|_| SimilarityIndexStoreError::OutOfMemory)?;
+    }
 
     for_each_page_span(
         lease,
@@ -95,6 +118,12 @@ fn audit_source(
         |ordinal, offset, bytes| {
             let page = descriptor.decode_page(ordinal, bytes)?;
             audit.verify_page(&page)?;
+            if let Some(retained) = &mut retained {
+                if retained.entries.len() != ordinal {
+                    return Err(SimilarityIndexStoreError::IndexCorruption);
+                }
+                retained.entries.push(Arc::new(page));
+            }
             Ok(audit.update(offset, bytes)?)
         },
     )?;
@@ -108,6 +137,12 @@ fn audit_source(
         |ordinal, offset, bytes| {
             let page = descriptor.decode_bucket_page(ordinal, bytes)?;
             audit.verify_bucket_page(&page)?;
+            if let Some(retained) = &mut retained {
+                if retained.buckets.len() != ordinal {
+                    return Err(SimilarityIndexStoreError::IndexCorruption);
+                }
+                retained.buckets.push(Arc::new(page));
+            }
             Ok(audit.update(offset, bytes)?)
         },
     )?;
@@ -115,6 +150,14 @@ fn audit_source(
     audit.update(footer_offset, &exact_page(lease, footer_offset)?)?;
     audit.finish()?;
     drop(independent);
+
+    if let Some(retained) = retained {
+        let run_hash = descriptor.run_hash();
+        for (ordinal, page) in retained.entries.iter().enumerate() {
+            page_cache.insert_entry(run_hash, ordinal, Arc::clone(page));
+        }
+        return walk_buckets_retained(descriptor, &retained, page_cache, observe_bucket_page);
+    }
 
     // The Run hash is now bound to the current immutable lease. Retain Entry
     // pages in the shared budget before the nonlocal Bucket semantic walk.
@@ -146,6 +189,63 @@ fn audit_source(
         ordinal += span;
     }
     walk_buckets(lease, descriptor, page_cache, observe_bucket_page)
+}
+
+#[derive(Default)]
+struct RetainedAuditPages {
+    entries: Vec<Arc<SimilarityIndexPage>>,
+    buckets: Vec<Arc<SimilarityBucketPage>>,
+}
+
+/// Proves every Bucket reference against the Entry pages retained by the
+/// hash audit. No page is read from the lease a second time.
+fn walk_buckets_retained(
+    descriptor: SimilarityIndexRunDescriptor,
+    retained: &RetainedAuditPages,
+    page_cache: &SimilarityPageCache,
+    mut observe_bucket_page: impl FnMut(SimilarityBucketKey),
+) -> Result<(SimilarityBucketKey, SimilarityBucketKey), SimilarityIndexStoreError> {
+    if retained.entries.len() != descriptor.page_count()
+        || retained.buckets.len() != descriptor.bucket_page_count()
+    {
+        return Err(SimilarityIndexStoreError::IndexCorruption);
+    }
+    let run_hash = descriptor.run_hash();
+    let mut minimum_bucket_key = None;
+    let mut maximum_bucket_key = None;
+    for (ordinal, page) in retained.buckets.iter().enumerate() {
+        minimum_bucket_key.get_or_insert_with(|| page.first_key());
+        maximum_bucket_key = Some(page.last_key());
+        observe_bucket_page(page.last_key());
+        for reference in page.references() {
+            let entry_ordinal = usize::try_from(reference.entry_ordinal())
+                .map_err(|_| SimilarityIndexStoreError::IndexCorruption)?;
+            let entry = retained
+                .entries
+                .get(entry_ordinal / fastdup_format::SIMILARITY_INDEX_ENTRIES_PER_PAGE)
+                .and_then(|entry_page| {
+                    entry_page
+                        .entries()
+                        .get(entry_ordinal % fastdup_format::SIMILARITY_INDEX_ENTRIES_PER_PAGE)
+                })
+                .copied()
+                .filter(|_| entry_ordinal < descriptor.entry_count())
+                .ok_or(SimilarityIndexStoreError::IndexCorruption)?;
+            let key = reference.key();
+            if entry.fingerprint_profile() != key.fingerprint_profile()
+                || similarity_bucket_length(descriptor.bucket_profile(), entry.logical_length())
+                    != key.logical_length()
+                || entry.superfeatures().get(usize::from(key.slot())) != Some(&key.superfeature())
+            {
+                return Err(SimilarityIndexStoreError::IndexCorruption);
+            }
+        }
+        page_cache.insert_bucket(run_hash, ordinal, Arc::clone(page));
+    }
+    Ok((
+        minimum_bucket_key.ok_or(SimilarityIndexStoreError::IndexCorruption)?,
+        maximum_bucket_key.ok_or(SimilarityIndexStoreError::IndexCorruption)?,
+    ))
 }
 
 /// Proves every Bucket reference against its Entry and reports the Run's key range.
