@@ -37,3 +37,18 @@ Pressure sampling includes ancestor cgroup limits and Linux PSI memory
 pressure. Small process Swap residue quarters cache capacity instead of
 flushing it; Swap beyond the grace band or sustained PSI pressure still closes
 admission promptly.
+
+## Proportional pressure shrink (18 October 2026)
+
+Live ingest showed a sawtooth: one below-reserve available-memory sample
+could collapse a warm multi-gigabyte target, after which refill took minutes
+and every cycle re-read Exact and Similarity index pages from the metadata
+device. The applied budget now moves toward a lower raw budget at a bounded
+rate — at most 1/16 of the current budget per second under hard pressure and
+1/64 under soft pressure — and a hard-pressure pool target moves only one
+bounded step per refresh while growth is still rejected immediately. A lower
+effective cgroup/host limit remains a hard ceiling at the unchanged 92%
+boundary. Pinned Exact membership filters and page-key bounds stay outside
+the evictable target, so the governor can shrink payload capacity to its
+fixed floor without zeroing the Exact fast path. Sustained pressure still
+reclaims the full payload; only the one-sample flush is removed.

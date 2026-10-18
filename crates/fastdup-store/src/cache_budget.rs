@@ -9,6 +9,12 @@ const MIB: u64 = 1 << 20;
 /// A candidate outside its deadband must persist for this many periods before
 /// stable targets move. This removes one-sample memory-headroom oscillation.
 const TARGET_STREAK_TRIGGER: i8 = 4;
+/// Budget shrink speed under pressure, as a divisor of the current budget
+/// per second. Hard pressure releases at most 1/16 per second and soft
+/// pressure 1/64, so one low-available or PSI sample cannot flush a warm
+/// multi-gigabyte working set before the allocator returns freed pages.
+const HARD_PRESSURE_SHRINK_PER_SECOND_DIVISOR: u128 = 16;
+const SOFT_PRESSURE_SHRINK_PER_SECOND_DIVISOR: u128 = 64;
 
 /// Work avoided by reuse: storage access or a work-buffer allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,9 +262,10 @@ impl Broker {
 
 impl State {
     fn rebalance(&mut self, snapshot: MemoryPressureSnapshot) {
+        let elapsed = self.refreshed.elapsed();
         self.refreshed = Instant::now();
         self.new_pool = false;
-        self.refresh_headroom(snapshot);
+        self.refresh_headroom(snapshot, elapsed);
         let hard_pressure = self.hard_pressure;
         let old: BTreeMap<u64, u64> = self
             .pools
@@ -426,7 +433,12 @@ impl State {
             let old = old.get(&id).copied().unwrap_or(pool.fixed);
             let candidate = candidate.get(&id).copied().unwrap_or(pool.fixed);
             if hard_pressure {
-                pool.desired = old.min(candidate);
+                // Growth is rejected immediately, but a shrink moves only
+                // one bounded step toward the candidate per refresh. The
+                // budget rate limit above bounds the aggregate pace.
+                let shrink = old.saturating_sub(candidate);
+                let movement = step.max(shrink / 32).min(shrink);
+                pool.desired = old.saturating_sub(movement);
                 pool.target_drift = 0;
                 continue;
             }
@@ -466,7 +478,7 @@ impl State {
         }
     }
 
-    fn refresh_headroom(&mut self, snapshot: MemoryPressureSnapshot) {
+    fn refresh_headroom(&mut self, snapshot: MemoryPressureSnapshot, elapsed: Duration) {
         let previous_effective_limit = self.effective_limit;
         self.effective_limit = snapshot.effective_limit_bytes();
         self.available = snapshot.available_bytes();
@@ -483,8 +495,10 @@ impl State {
             .saturating_sub(reserve)
             .min(snapshot.effective_limit_bytes().saturating_sub(reserve));
         // Graduated Swap response: idle-page residue within the grace band
-        // quarters the budget instead of flushing it; real thrashing and
-        // sustained PSI stalls still close admission promptly.
+        // quarters the raw budget instead of flushing it. The applied budget
+        // below only moves toward that raw value at a bounded rate, so real
+        // thrashing and sustained PSI stalls still close admission, but no
+        // single sample can flush the whole cache.
         let swap = snapshot.swap_used_bytes();
         let mut raw = crate::memory_budget::swap_scaled_capacity(
             unscaled,
@@ -502,16 +516,33 @@ impl State {
             || (previous_effective_limit != 0
                 && snapshot.effective_limit_bytes() < previous_effective_limit)
             || raw == 0;
-        self.budget = if raw == 0 || self.hard_pressure || self.budget == 0 {
+        let ceiling = self.effective_limit.saturating_sub(reserve);
+        let limit_shrank = previous_effective_limit != 0
+            && snapshot.effective_limit_bytes() < previous_effective_limit;
+        self.budget = if self.budget == 0 || limit_shrank {
+            // A lower effective limit is a hard ceiling, not a pressure
+            // sample: never lease above the new 92% boundary.
             raw
+        } else if raw >= self.budget {
+            self.budget.saturating_add((raw - self.budget) / 8)
         } else {
-            let smoothed = if raw < self.budget {
-                self.budget.saturating_sub((self.budget - raw).div_ceil(4))
+            let deficit = self.budget - raw;
+            let elapsed_ms = u128::from(
+                u64::try_from(elapsed.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1),
+            );
+            let divisor = if self.hard_pressure {
+                HARD_PRESSURE_SHRINK_PER_SECOND_DIVISOR
             } else {
-                self.budget.saturating_add((raw - self.budget) / 8)
+                SOFT_PRESSURE_SHRINK_PER_SECOND_DIVISOR
             };
-            smoothed.min(self.effective_limit.saturating_sub(reserve))
-        };
+            let allowed = u64::try_from(u128::from(self.budget) * elapsed_ms / (1_000 * divisor))
+                .unwrap_or(u64::MAX)
+                .max(1);
+            self.budget.saturating_sub(deficit.min(allowed))
+        }
+        .min(ceiling);
     }
 
     fn retain_target_budget(&mut self, fixed: u64, distributable: u64) {
@@ -661,7 +692,13 @@ mod tests {
         CachePool::register(Arc::clone(broker), "test", tier, 0, 100_000)
     }
     fn tick(broker: &Broker, snapshot: MemoryPressureSnapshot) {
-        broker.0.lock().unwrap().rebalance(snapshot);
+        let mut state = broker.0.lock().unwrap();
+        // Simulate one ordinary refresh period so time-bounded shrink steps
+        // advance in tests exactly as they do between production samples.
+        state.refreshed = Instant::now()
+            .checked_sub(PERIOD)
+            .unwrap_or_else(Instant::now);
+        state.rebalance(snapshot);
     }
 
     #[test]
@@ -705,14 +742,40 @@ mod tests {
                 );
                 cache.applied(target, resident);
             }
-            let target = cache.target(
-                MemoryPressureSnapshot::new(24_000 * MIB, 0, 0),
+            let pressured = MemoryPressureSnapshot::new(24_000 * MIB, 0, 0);
+            let mut resident_now = resident;
+            let mut target = cache.target(
+                pressured,
                 CacheObservation {
-                    resident_bytes: resident,
+                    resident_bytes: resident_now,
                     ..CacheObservation::default()
                 },
             );
-            assert_eq!(target, MIB, "real pressure must still reclaim the payload");
+            assert!(
+                target > warm_target / 2,
+                "one pressure sample must shrink proportionally, not flush: {target}"
+            );
+            cache.applied(target, resident_now.min(target));
+            resident_now = resident_now.min(target);
+            for _ in 0..4_000 {
+                if target == MIB {
+                    break;
+                }
+                tick(&broker, pressured);
+                target = cache.target(
+                    pressured,
+                    CacheObservation {
+                        resident_bytes: resident_now,
+                        ..CacheObservation::default()
+                    },
+                );
+                cache.applied(target, resident_now.min(target));
+                resident_now = resident_now.min(target);
+            }
+            assert_eq!(
+                target, MIB,
+                "sustained pressure must still reclaim the payload"
+            );
         }
     }
 
@@ -853,16 +916,37 @@ mod tests {
         let t = a.target(pressure(), CacheObservation::default());
         assert!(t > 0);
         a.applied(t, t);
-        // New pressure must revoke admission within the normal refresh period.
-        let t = a.target(
-            MemoryPressureSnapshot::new(100_000, 0, 0),
+        // One pressure sample shrinks proportionally; it must not revoke a
+        // warm payload target in a single refresh period.
+        let pressured = MemoryPressureSnapshot::new(100_000, 0, 0);
+        let mut current = a.target(
+            pressured,
             CacheObservation {
                 resident_bytes: t,
                 ..CacheObservation::default()
             },
         );
-        assert_eq!(t, 0);
-        a.applied(0, 0);
+        assert!(
+            current > t / 2,
+            "first pressure sample flushed the target: {current} from {t}"
+        );
+        a.applied(current, current);
+        // Sustained pressure still reclaims the whole payload target.
+        for _ in 0..4_000 {
+            if current == 0 {
+                break;
+            }
+            tick(&broker, pressured);
+            current = a.target(
+                pressured,
+                CacheObservation {
+                    resident_bytes: current,
+                    ..CacheObservation::default()
+                },
+            );
+            a.applied(current, current);
+        }
+        assert_eq!(current, 0, "sustained pressure must revoke payload targets");
         // Swap beyond the idle-residue grace band revokes payload targets.
         assert_eq!(
             a.target(
@@ -1032,7 +1116,10 @@ mod tests {
         assert_eq!(state.pools[&data.id].desired, 50);
         state.pools.get_mut(&data.id).unwrap().desired = 30;
         state.damp_targets(&old, 10, 4, true);
-        assert_eq!(state.pools[&data.id].desired, 30);
+        assert_eq!(
+            state.pools[&data.id].desired, 40,
+            "hard pressure moves one bounded step toward the candidate"
+        );
         assert_eq!(state.pools[&data.id].target_drift, 0);
     }
 }
