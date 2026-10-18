@@ -1,5 +1,5 @@
 //! Payload-free structural validation. This is deliberately not a content proof.
-use super::dependent::is_dependent_codec;
+use super::dependent::{is_dependent_codec, is_zstd_prefix_codec, zstd_prefix_codec_id};
 use super::envelope::{IndexEntry, decode_index};
 use super::records::{validate_logical_chunk_length, validate_raw_record_constants};
 use super::summary::IntrinsicSummaryAccumulator;
@@ -9,7 +9,7 @@ use super::{
     MAX_DECODED_RECORD_BYTES, MAX_RECORD_BYTES, MIN_RAW_RECORD_BYTES, RAW_CODEC, RECORD_ALIGNMENT,
     RECORD_HEADER_BYTES, RECORD_HEADER_BYTES_U16, RECORD_HEADER_BYTES_U32, RECORD_MAGIC,
     SPARSE_XOR_CODEC, SealedContainerDescriptor, ZSTD_CODEC, ZSTD_LEVEL_V1, ZSTD_PREFIX_CODEC,
-    ZSTD_PREFIX_LEVEL_V1, align_up_usize, get_u16, get_u32,
+    ZSTD_PREFIX_FLEX_CODEC, ZSTD_PREFIX_LEVEL_V1, align_up_usize, get_u16, get_u32,
 };
 
 /// A Chunk identity and optional Depth-1 dependency authenticated by Container
@@ -188,17 +188,19 @@ fn validate_prefix(bytes: &[u8], record_length: usize) -> Result<(), FormatError
                     .iter()
                     .chain(&bytes[100..128])
                     .all(|b| *b == 0) => {}
-        ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC => {
+        ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC | SPARSE_XOR_CODEC => {
             if get_u32(bytes, 56) != 1
-                || get_u32(bytes, 100) != get_u32(bytes, 36)
+                || (is_zstd_prefix_codec(codec)
+                    && codec != zstd_prefix_codec_id(get_u32(bytes, 100), get_u32(bytes, 36)))
+                || (codec == SPARSE_XOR_CODEC && get_u32(bytes, 100) != get_u32(bytes, 36))
                 || bytes[64..96].iter().all(|b| *b == 0)
                 || get_u32(bytes, 96)
-                    != if codec == ZSTD_PREFIX_CODEC {
+                    != if is_zstd_prefix_codec(codec) {
                         ZSTD_PREFIX_LEVEL_V1 as u32
                     } else {
                         1
                     }
-                || (codec == ZSTD_PREFIX_CODEC && bytes[104..128].iter().any(|b| *b != 0))
+                || (is_zstd_prefix_codec(codec) && bytes[104..128].iter().any(|b| *b != 0))
                 || (codec == SPARSE_XOR_CODEC && bytes[112..128].iter().any(|b| *b != 0))
             {
                 return Err(FormatError::InvalidDependentRecord);

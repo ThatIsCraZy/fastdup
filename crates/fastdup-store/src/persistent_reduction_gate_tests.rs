@@ -322,3 +322,72 @@ fn dense_bases_skip_xor_and_saturated_results_stop_base_loads() {
     assert!(after_warm.warm_base_reuses() > before_warm.warm_base_reuses());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn length_band_candidates_reach_flexible_prefix_trials() {
+    let root = std::env::temp_dir().join(format!(
+        "length-band-candidates-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let storage = ReadCountingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let mut seed = 71_u64;
+    let stream = (0..70_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            u8::try_from(seed & 0xff).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let base = stream[..65_536].to_vec();
+    let container_id = ContainerId::new([0xe5; 16]).unwrap();
+    containers.publish_raw(container_id, 1, &[&base]).unwrap();
+    let entry =
+        ExactIndexEntry::from_verified(containers.read(container_id).unwrap().locations()[0])
+            .unwrap();
+    let exact = ExactIndexRunRepository::new(storage.clone());
+    exact
+        .append_level_zero(ExactIndexProfileId::new([0xe4; 32]).unwrap(), vec![entry])
+        .unwrap();
+    let active = exact.pin_active_generation().unwrap();
+    let similarities = SimilarityIndexRepository::new(storage);
+    let mut stager = similarities.entry_stager(1);
+    stager
+        .push(crate::similarity_index_entry_v1(&base).unwrap())
+        .unwrap();
+    let publication = similarities
+        .finish_staged_entries(1, stager, active.run_set().id().unwrap())
+        .unwrap();
+    similarities.activate_staged_family(publication).unwrap();
+    let planner = PersistentReductionIndex::new(
+        &active,
+        Arc::new(similarities.recover_latest().unwrap().unwrap()),
+    )
+    .unwrap();
+    let plan = |target: &[u8]| {
+        planner
+            .plan_chunk_for_publication(&containers, ChunkId::of(target), target)
+            .unwrap()
+            .0
+    };
+
+    // Same length band (65_536..73_728), different exact length: the Base is
+    // a candidate and the flexible Prefix trial wins. Under exact-length
+    // buckets this target found no candidate at all.
+    let longer = stream.clone();
+    assert!(matches!(plan(&longer), PersistentChunkPlan::Dependent(_)));
+    let status = planner.status();
+    assert!(status.candidates() >= 1);
+    assert_eq!(status.accepted_prefixes(), 1);
+    assert_eq!(status.errors(), 0);
+
+    // A target in a different length band stays outside the candidate set.
+    let shorter = stream[..20_000].to_vec();
+    assert!(!matches!(plan(&shorter), PersistentChunkPlan::Dependent(_)));
+    std::fs::remove_dir_all(root).unwrap();
+}

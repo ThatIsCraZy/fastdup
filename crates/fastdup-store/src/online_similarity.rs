@@ -12,10 +12,12 @@ use crate::StorageIo;
 use crate::exact_index_repository::{ExactIndexGenerationPin, ExactIndexRunRepository};
 use crate::reduction_similarity::SimilarityFingerprint;
 use crate::similarity_index_repository::{
-    RecoveredSimilarityIndex, SimilarityBaseCandidate, SimilarityIndexRepository,
-    SimilarityIndexStoreError,
+    RecoveredSimilarityIndex, SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT, SimilarityBaseCandidate,
+    SimilarityIndexRepository, SimilarityIndexStoreError,
 };
-use fastdup_format::{ChunkId, SimilarityBucketKey, SimilarityIndexEntry};
+use fastdup_format::{
+    ChunkId, SimilarityBucketKey, SimilarityIndexEntry, similarity_bucket_length,
+};
 
 const HEAD_BYTES: usize = 4096;
 const MAX_FAMILIES: usize = 24;
@@ -128,14 +130,48 @@ impl<I: Clone + StorageIo> OnlineReductionGeneration<I> {
         self.exact.pin_active_generation()
     }
 
-    fn bucket(&self, key: SimilarityBucketKey) -> Result<Vec<SimilarityIndexEntry>, Error> {
+    fn bucket(
+        &self,
+        fingerprint_profile: u16,
+        slot: u8,
+        logical_length: u32,
+        superfeature: u64,
+    ) -> Result<Vec<SimilarityIndexEntry>, Error> {
+        // Newest complete value per bucket profile. During the v1-to-v2
+        // transition both key spaces stay visible as a Chunk-ID union, so
+        // neither profile shadows the other's representatives.
+        let mut satisfied: [Option<u16>; 2] = [None, None];
+        let mut found = 0_usize;
+        let mut merged: Vec<SimilarityIndexEntry> = Vec::new();
         for run in self.runs.iter().rev() {
+            let profile = run.bucket_profile();
+            if satisfied[..found].contains(&Some(profile)) {
+                continue;
+            }
+            let key = SimilarityBucketKey::new(
+                fingerprint_profile,
+                slot,
+                similarity_bucket_length(profile, logical_length),
+                superfeature,
+            )?;
             let entries = run.bucket_entries(key)?;
-            if !entries.is_empty() {
-                return Ok(entries);
+            if entries.is_empty() {
+                continue;
+            }
+            satisfied[found] = Some(profile);
+            found += 1;
+            for entry in entries {
+                match merged.binary_search_by_key(&entry.chunk_id(), |e| e.chunk_id()) {
+                    Ok(index) => {
+                        if merged[index] != entry {
+                            return Err(Error::IndexCorruption);
+                        }
+                    }
+                    Err(index) => merged.insert(index, entry),
+                }
             }
         }
-        Ok(Vec::new())
+        Ok(merged)
     }
 
     pub(crate) fn candidates(
@@ -146,12 +182,12 @@ impl<I: Clone + StorageIo> OnlineReductionGeneration<I> {
     ) -> Result<Vec<SimilarityBaseCandidate>, Error> {
         let mut buckets = Vec::with_capacity(4);
         for (slot, value) in fingerprint.superfeatures().into_iter().enumerate() {
-            buckets.push(self.bucket(SimilarityBucketKey::new(
+            buckets.push(self.bucket(
                 fingerprint.profile(),
                 u8::try_from(slot).map_err(|_| Error::IndexCorruption)?,
                 length,
                 value,
-            )?)?);
+            )?);
         }
         let mut positions = [0; 4];
         let mut candidates: Vec<SimilarityBaseCandidate> = Vec::with_capacity(16);
@@ -489,7 +525,10 @@ impl<I: Clone + StorageIo> OnlineSimilarityRepository<I> {
                 let key = SimilarityBucketKey::new(
                     entry.fingerprint_profile(),
                     u8::try_from(slot).map_err(|_| Error::IndexCorruption)?,
-                    entry.logical_length(),
+                    similarity_bucket_length(
+                        SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT,
+                        entry.logical_length(),
+                    ),
                     value,
                 )?;
                 mutations.entry(key).or_default().push(entry);
@@ -503,9 +542,17 @@ impl<I: Clone + StorageIo> OnlineSimilarityRepository<I> {
                 .into_iter()
                 .filter_map(|(key, values)| {
                     let result = (|| {
-                        let mut merged = previous
-                            .as_ref()
-                            .map_or_else(|| Ok(Vec::new()), |g| g.bucket(key))?;
+                        let mut merged = previous.as_ref().map_or_else(
+                            || Ok(Vec::new()),
+                            |g| {
+                                g.bucket(
+                                    key.fingerprint_profile(),
+                                    key.slot(),
+                                    values[0].logical_length(),
+                                    key.superfeature(),
+                                )
+                            },
+                        )?;
                         let old = merged.clone();
                         merge_entries(&mut merged, &values)?;
                         Ok((old != merged).then_some((key, merged)))
@@ -517,7 +564,11 @@ impl<I: Clone + StorageIo> OnlineSimilarityRepository<I> {
                 })
                 .peekable();
             if buckets.peek().is_some() {
-                let run = Arc::new(self.repository.publish_buckets(generation, buckets)?);
+                let run = Arc::new(self.repository.publish_buckets(
+                    generation,
+                    SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT,
+                    buckets,
+                )?);
                 refs.push(RunRef {
                     generation,
                     first: sequence,
@@ -528,10 +579,17 @@ impl<I: Clone + StorageIo> OnlineSimilarityRepository<I> {
                 runs.push(run);
             }
         }
-        while let Some(start) = refs
-            .windows(4)
-            .position(|w| w[0].level < 15 && w.iter().all(|r| r.level == w[0].level))
-        {
+        while let Some(start) = (0..refs.len().saturating_sub(3)).find(|&start| {
+            // Compaction never merges across bucket profiles: re-keying a
+            // v1 bucket stream into length bands is the rebuild's job.
+            let level = refs[start].level;
+            level < 15
+                && refs[start..start + 4].iter().all(|r| r.level == level)
+                && runs[start..start + 4]
+                    .iter()
+                    .all(|run| run.bucket_profile() == runs[start].bucket_profile())
+        }) {
+            let bucket_profile = runs[start].bucket_profile();
             let generation = next_generation(&mut publisher)?;
             let mut cursors: Vec<_> = runs[start..start + 4]
                 .iter()
@@ -564,7 +622,11 @@ impl<I: Clone + StorageIo> OnlineSimilarityRepository<I> {
                 }
                 newest.map(Ok)
             });
-            let run = Arc::new(self.repository.publish_buckets(generation, merge)?);
+            let run = Arc::new(self.repository.publish_buckets(
+                generation,
+                bucket_profile,
+                merge,
+            )?);
             drop(cursors);
             let reference = RunRef {
                 generation,

@@ -10,13 +10,14 @@ use fastdup_format::{
     SimilarityBucketKey, SimilarityBucketPage, SimilarityIndexEntry, SimilarityIndexFamilyError,
     SimilarityIndexFormatError, SimilarityIndexPage, SimilarityIndexPartitionRef,
     SimilarityIndexRun, SimilarityIndexRunDescriptor, SimilarityIndexRunFamily,
+    similarity_bucket_length,
 };
 
 use crate::StorageIo;
 use crate::read_cache::{MemoryPressureSnapshot, shared_cache_reserve_bytes};
 use crate::reduction_similarity::{
-    MAX_SIMILARITY_CANDIDATES, SIMILARITY_BUCKET_PROFILE_V1, SIMILARITY_PROFILE_V1,
-    SimilarityError, SimilarityFingerprint,
+    MAX_SIMILARITY_CANDIDATES, SIMILARITY_BUCKET_PROFILE_CURRENT, SIMILARITY_BUCKET_PROFILE_V1,
+    SIMILARITY_PROFILE_V1, SimilarityError, SimilarityFingerprint,
 };
 use crate::similarity_external_sort::{
     BuiltSimilarityPartition, PartitionedSimilarityBuild, SimilarityEntryStager,
@@ -28,6 +29,10 @@ use crate::similarity_read::ImmutableSimilarityRun;
 pub const SIMILARITY_FINGERPRINT_PROFILE_V1: u16 = SIMILARITY_PROFILE_V1;
 /// The bounded 64-representative bucket policy written by this implementation.
 pub const SIMILARITY_REPRESENTATIVE_PROFILE_V1: u16 = SIMILARITY_BUCKET_PROFILE_V1;
+/// The bucket profile written for new Similarity families: geometric
+/// length bands instead of exact logical lengths. Profile-v1 families stay
+/// readable and queryable during the transition.
+pub const SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT: u16 = SIMILARITY_BUCKET_PROFILE_CURRENT;
 
 /// Durable immutable Similarity snapshot publication and streaming rebuild.
 #[derive(Clone, Debug)]
@@ -58,6 +63,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     pub(crate) fn publish_buckets(
         &self,
         generation: u64,
+        bucket_profile: u16,
         buckets: impl IntoIterator<
             Item = Result<
                 (SimilarityBucketKey, Vec<SimilarityIndexEntry>),
@@ -112,7 +118,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             let temporary_name = format!(".online-{generation:016x}-{ordinal:04x}.building");
             let layout = SimilarityIndexRunLayout::new(
                 SIMILARITY_FINGERPRINT_PROFILE_V1,
-                SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+                bucket_profile,
                 generation,
                 entries.len(),
                 pending.len(),
@@ -149,7 +155,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
                 return Err(SimilarityIndexStoreError::IndexCorruption);
             }
             for (ordinal, &entry) in entries.iter().enumerate() {
-                validate_query_entry(entry, key, usize::from(key.slot()))?;
+                validate_query_entry(entry, key, usize::from(key.slot()), bucket_profile)?;
                 if ordinal > 0 && entries[ordinal - 1].chunk_id() >= entry.chunk_id() {
                     return Err(SimilarityIndexStoreError::IndexCorruption);
                 }
@@ -164,7 +170,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             pending.push((key, entries));
         }
         flush(&mut pending, &mut build)?;
-        self.publish_built_online_family(generation, &build)
+        self.publish_built_online_family(generation, bucket_profile, &build)
     }
 
     /// Audits the published immutable objects once and carries their leases
@@ -172,6 +178,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     fn publish_built_online_family(
         &self,
         generation: u64,
+        bucket_profile: u16,
         build: &PartitionedSimilarityBuild,
     ) -> Result<RecoveredSimilarityIndex<I>, SimilarityIndexStoreError> {
         let _guard = self
@@ -214,7 +221,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         }
         let family = SimilarityIndexRunFamily::new(
             SIMILARITY_FINGERPRINT_PROFILE_V1,
-            SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+            bucket_profile,
             generation,
             build.logical_entry_count,
             references,
@@ -342,7 +349,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         &self,
         run: &SimilarityIndexRun,
     ) -> Result<SimilarityIndexRunFamily, SimilarityIndexStoreError> {
-        require_v1_profiles(run.fingerprint_profile(), run.bucket_profile())?;
+        require_supported_profiles(run.fingerprint_profile(), run.bucket_profile())?;
         self.publish_entries(run.generation(), run.entries().iter().copied())
     }
 
@@ -444,7 +451,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         let family = match source_exact_run_set_id {
             Some(id) => SimilarityIndexRunFamily::new_bound(
                 SIMILARITY_FINGERPRINT_PROFILE_V1,
-                SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+                SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT,
                 generation,
                 build.logical_entry_count,
                 id,
@@ -452,7 +459,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             )?,
             None => SimilarityIndexRunFamily::new(
                 SIMILARITY_FINGERPRINT_PROFILE_V1,
-                SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+                SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT,
                 generation,
                 build.logical_entry_count,
                 references,
@@ -489,7 +496,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
     ) -> Result<StagedSimilarityIndex, SimilarityIndexStoreError> {
         let family = SimilarityIndexRunFamily::new_bound(
             SIMILARITY_FINGERPRINT_PROFILE_V1,
-            SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+            SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT,
             generation,
             0,
             source_exact_run_set_id,
@@ -687,7 +694,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         generation: u64,
     ) -> Result<RecoveredSimilarityIndex<I>, SimilarityIndexStoreError> {
         let family = self.read_family(&family_name(generation))?;
-        require_v1_profiles(family.fingerprint_profile(), family.bucket_profile())?;
+        require_supported_profiles(family.fingerprint_profile(), family.bucket_profile())?;
         if family.generation() != generation {
             return Err(SimilarityIndexStoreError::IdentityMismatch);
         }
@@ -784,7 +791,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
         {
             let LatestSimilarityPublication { generation, name } = publication;
             let family = self.read_family(&name)?;
-            require_v1_profiles(family.fingerprint_profile(), family.bucket_profile())?;
+            require_supported_profiles(family.fingerprint_profile(), family.bucket_profile())?;
             if family.generation() != generation {
                 return Err(SimilarityIndexStoreError::IdentityMismatch);
             }
@@ -971,7 +978,8 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
                 };
                 let key = reference.key();
                 if entry.fingerprint_profile() != key.fingerprint_profile()
-                    || entry.logical_length() != key.logical_length()
+                    || similarity_bucket_length(descriptor.bucket_profile(), entry.logical_length())
+                        != key.logical_length()
                     || entry.superfeatures().get(usize::from(key.slot()))
                         != Some(&key.superfeature())
                 {
@@ -1206,7 +1214,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         let mut entries = Vec::with_capacity(usize::from(ordinals.len));
         for n in 0..usize::from(ordinals.len) {
             let entry = self.read_entry(partition, ordinals.values[n])?;
-            validate_query_entry(entry, key, usize::from(key.slot()))?;
+            validate_query_entry(entry, key, usize::from(key.slot()), self.bucket_profile())?;
             entries.push(entry);
         }
         Ok(entries)
@@ -1222,6 +1230,18 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             failed: false,
         }
     }
+    /// Returns the bucket profile shared by every partition in this family.
+    /// An empty partition set carries no buckets and reports the current
+    /// writer profile.
+    #[must_use]
+    pub fn bucket_profile(&self) -> u16 {
+        self.partitions
+            .first()
+            .map_or(SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT, |partition| {
+                partition.descriptor.bucket_profile()
+            })
+    }
+
     #[must_use]
     pub const fn status(&self) -> SimilarityIndexRebuildStatus {
         self.status
@@ -1280,13 +1300,15 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         fingerprint: &SimilarityFingerprint,
         logical_length: u32,
     ) -> Result<Vec<SimilarityBaseCandidate>, SimilarityIndexStoreError> {
+        let bucket_profile = self.bucket_profile();
+        let bucket_length = similarity_bucket_length(bucket_profile, logical_length);
         let target_superfeatures = fingerprint.superfeatures();
         let mut cursors: [Option<QueryBucketCursor>; 4] = [None, None, None, None];
         for (slot, superfeature) in target_superfeatures.into_iter().enumerate() {
             let key = SimilarityBucketKey::new(
                 fingerprint.profile(),
                 u8::try_from(slot).map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
-                logical_length,
+                bucket_length,
                 superfeature,
             )?;
             let Some(partition_ordinal) = self.partition_for_key(key) else {
@@ -1297,7 +1319,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
                 let mut entry_page = None;
                 let entry =
                     self.read_entry_cached(partition_ordinal, entry_ordinal, &mut entry_page)?;
-                validate_query_entry(entry, key, slot)?;
+                validate_query_entry(entry, key, slot, bucket_profile)?;
                 cursors[slot] = Some(QueryBucketCursor {
                     key,
                     partition_ordinal,
@@ -1346,7 +1368,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
                         ordinal,
                         &mut active.entry_page,
                     )?;
-                    validate_query_entry(next, active.key, slot)?;
+                    validate_query_entry(next, active.key, slot, bucket_profile)?;
                     if next.chunk_id() <= current.chunk_id() {
                         return Err(SimilarityIndexStoreError::IndexCorruption);
                     }
@@ -1359,7 +1381,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             if entry.chunk_id() == target_id {
                 continue;
             }
-            if entry.logical_length() != logical_length
+            if similarity_bucket_length(bucket_profile, entry.logical_length()) != bucket_length
                 || entry.fingerprint_profile() != fingerprint.profile()
                 || matched_slots == 0
                 || entry
@@ -1375,7 +1397,7 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             }
             let candidate = SimilarityBaseCandidate {
                 chunk_id: entry.chunk_id(),
-                logical_length,
+                logical_length: entry.logical_length(),
                 sketch_distance: fingerprint
                     .distance_from_sketch(entry.fingerprint_profile(), entry.sketch())
                     .map_err(map_similarity_error)?,
@@ -1743,9 +1765,10 @@ fn validate_query_entry(
     entry: SimilarityIndexEntry,
     key: SimilarityBucketKey,
     slot: usize,
+    bucket_profile: u16,
 ) -> Result<(), SimilarityIndexStoreError> {
     if entry.fingerprint_profile() != key.fingerprint_profile()
-        || entry.logical_length() != key.logical_length()
+        || similarity_bucket_length(bucket_profile, entry.logical_length()) != key.logical_length()
         || entry.superfeatures().get(slot) != Some(&key.superfeature())
     {
         return Err(SimilarityIndexStoreError::IndexCorruption);
@@ -1852,7 +1875,12 @@ impl<I: Clone + StorageIo> SimilarityBuckets<'_, I> {
             let entry = self
                 .index
                 .read_entry(self.partition, reference.entry_ordinal())?;
-            validate_query_entry(entry, key, usize::from(key.slot()))?;
+            validate_query_entry(
+                entry,
+                key,
+                usize::from(key.slot()),
+                self.index.bucket_profile(),
+            )?;
             if entries
                 .last()
                 .is_some_and(|previous: &SimilarityIndexEntry| {
@@ -2132,12 +2160,15 @@ fn verify_partition_reference(
     Ok(())
 }
 
-fn require_v1_profiles(
+fn require_supported_profiles(
     fingerprint_profile: u16,
     bucket_profile: u16,
 ) -> Result<(), SimilarityIndexStoreError> {
     if fingerprint_profile != SIMILARITY_PROFILE_V1
-        || bucket_profile != SIMILARITY_BUCKET_PROFILE_V1
+        || !matches!(
+            bucket_profile,
+            SIMILARITY_BUCKET_PROFILE_V1 | SIMILARITY_BUCKET_PROFILE_CURRENT
+        )
     {
         return Err(SimilarityIndexStoreError::UnsupportedProfile);
     }
@@ -2160,6 +2191,9 @@ fn ensure_object<I: StorageIo>(storage: &I, name: &str) -> io::Result<()> {
     }
 }
 
+// Object names keep the v1 profile fields as a frozen naming scheme so a
+// family stays addressable by generation alone; the manifest and Run
+// headers carry the authoritative bucket profile.
 fn family_name(generation: u64) -> String {
     format!(
         "similarity-family.{SIMILARITY_PROFILE_V1:04x}.{SIMILARITY_BUCKET_PROFILE_V1:04x}.{generation:016x}.fdsf"

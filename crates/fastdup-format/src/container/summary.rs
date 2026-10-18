@@ -3,7 +3,7 @@ use super::dependent::is_dependent_codec;
 use super::{
     CONTAINER_SUMMARY_BYTES, ContainerLayout, FormatError, HEADER_BYTES, RAW_CODEC,
     RECORD_ALIGNMENT, RECORD_HEADER_BYTES, SPARSE_XOR_CODEC, ZSTD_CODEC, ZSTD_PREFIX_CODEC,
-    get_u16, get_u32, get_u64, put_u16, put_u32, put_u64,
+    ZSTD_PREFIX_FLEX_CODEC, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64,
 };
 
 /// Exact lifetime-invariant geometry used to rank one immutable Container for
@@ -127,7 +127,9 @@ impl IntrinsicSummaryAccumulator {
                     .checked_add(decoded_bytes)
                     .ok_or(FormatError::ArithmeticOverflow)?;
             }
-            (ZSTD_PREFIX_CODEC, Some(base_id)) if base_id != [0; 32] && chunk_count == 1 => {
+            (ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC, Some(base_id))
+                if base_id != [0; 32] && chunk_count == 1 =>
+            {
                 self.summary.zstd_prefix_record_count = self
                     .summary
                     .zstd_prefix_record_count

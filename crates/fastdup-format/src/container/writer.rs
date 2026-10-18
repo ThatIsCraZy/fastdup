@@ -14,8 +14,8 @@ use super::{
     ContainerId, ContainerLayout, FOOTER_BYTES, FOOTER_BYTES_USIZE, FOOTER_CRC_OFFSET,
     FOOTER_HASH_OFFSET, FormatError, HEADER_BYTES, INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES,
     MAX_RECORD_BYTES, MIN_RAW_RECORD_BYTES, RAW_CODEC, RECORD_ALIGNMENT, SPARSE_XOR_CODEC,
-    VerifiedChunkLocation, VerifiedRawLocation, ZSTD_CODEC, ZSTD_PREFIX_CODEC, align_up,
-    crc32c_with_zeroed_field, get_u16, get_u32, put_u32,
+    VerifiedChunkLocation, VerifiedRawLocation, ZSTD_CODEC, ZSTD_PREFIX_CODEC,
+    ZSTD_PREFIX_FLEX_CODEC, align_up, crc32c_with_zeroed_field, get_u16, get_u32, put_u32,
 };
 use fastdup_copy_metrics::CopyClass;
 use fastdup_copy_metrics::record_copy;
@@ -153,7 +153,7 @@ pub(super) fn encode_container_from_adaptive_plans(
                     .checked_add(1)
                     .ok_or(FormatError::ArithmeticOverflow)?;
             }
-            ZSTD_PREFIX_CODEC => {
+            ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC => {
                 zstd_prefix_record_count = zstd_prefix_record_count
                     .checked_add(1)
                     .ok_or(FormatError::ArithmeticOverflow)?;
@@ -302,7 +302,7 @@ pub(super) fn encode_container_from_records(
                     .checked_add(1)
                     .ok_or(FormatError::ArithmeticOverflow)?;
             }
-            ZSTD_PREFIX_CODEC => {
+            ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC => {
                 zstd_prefix_record_count = zstd_prefix_record_count
                     .checked_add(1)
                     .ok_or(FormatError::ArithmeticOverflow)?;
@@ -471,7 +471,7 @@ pub(super) fn encode_container_from_adaptive_plans_zeroed(
                     .checked_add(1)
                     .ok_or(FormatError::ArithmeticOverflow)?;
             }
-            ZSTD_PREFIX_CODEC => {
+            ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC => {
                 zstd_prefix_record_count = zstd_prefix_record_count
                     .checked_add(1)
                     .ok_or(FormatError::ArithmeticOverflow)?;

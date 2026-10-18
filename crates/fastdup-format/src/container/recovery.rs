@@ -1,5 +1,7 @@
 //! Bounded envelope/index discovery and selected-record verification. Candidates are not content proofs.
-use super::dependent::{DependentDependency, ValidatedDependentRecord, is_dependent_codec};
+use super::dependent::{
+    DependentDependency, ValidatedDependentRecord, is_dependent_codec, is_zstd_prefix_codec,
+};
 use super::envelope::{
     ContainerHeader, IndexEntry, decode_footer, decode_index, valid_recovery_index_entry_geometry,
     validate_container_file_length,
@@ -13,7 +15,7 @@ use super::{
     CHUNK_TABLE_ENTRY_BYTES, ChunkId, ContainerId, ContainerLayout, FOOTER_BYTES, FormatError,
     HEADER_BYTES_U16, MAX_DECODED_RECORD_BYTES, MAX_RECORD_BYTES, MIN_RAW_RECORD_BYTES, RAW_CODEC,
     RECORD_ALIGNMENT, RECORD_CRC_OFFSET, RECORD_HEADER_BYTES, SPARSE_XOR_CODEC, ZSTD_CODEC,
-    ZSTD_PREFIX_CODEC, get_u16, get_u32,
+    ZSTD_PREFIX_CODEC, ZSTD_PREFIX_FLEX_CODEC, get_u16, get_u32,
 };
 use crate::exact_index::ExactIndexEntry;
 use crate::exact_index::ExactLocationTransition;
@@ -207,7 +209,11 @@ impl SealedContainerDescriptor {
             || record_end > self.header.layout.index_offset
             || !matches!(
                 location.codec_id(),
-                RAW_CODEC | ZSTD_CODEC | ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC
+                RAW_CODEC
+                    | ZSTD_CODEC
+                    | ZSTD_PREFIX_CODEC
+                    | SPARSE_XOR_CODEC
+                    | ZSTD_PREFIX_FLEX_CODEC
             )
             || location.record_decoded_length() == 0
             || usize::try_from(location.record_decoded_length())
@@ -439,7 +445,7 @@ impl SealedContainerDescriptor {
         record_bytes: &[u8],
         base: &[u8],
     ) -> Result<RawRecord, FormatError> {
-        if candidate.location().codec_id() != ZSTD_PREFIX_CODEC {
+        if !is_zstd_prefix_codec(candidate.location().codec_id()) {
             return Err(FormatError::ExactLocationMismatch);
         }
         self.decode_dependent_candidate_using(candidate, record_bytes, |record| record.decode(base))
@@ -460,7 +466,7 @@ impl SealedContainerDescriptor {
         record_bytes: &[u8],
         base: &VerifiedChunkPayload,
     ) -> Result<RawRecord, FormatError> {
-        if candidate.location().codec_id() != ZSTD_PREFIX_CODEC {
+        if !is_zstd_prefix_codec(candidate.location().codec_id()) {
             return Err(FormatError::ExactLocationMismatch);
         }
         self.decode_dependent_candidate_using(candidate, record_bytes, |record| {

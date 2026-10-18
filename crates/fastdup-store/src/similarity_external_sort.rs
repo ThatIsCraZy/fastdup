@@ -7,14 +7,14 @@ use fastdup_format::{
     ChunkId, SIMILARITY_BUCKET_REFERENCES_PER_PAGE, SIMILARITY_INDEX_ENTRIES_PER_PAGE,
     SIMILARITY_INDEX_PAGE_BYTES, SimilarityBucketKey, SimilarityBucketReference,
     SimilarityIndexEntry, SimilarityIndexRunDescriptor, SimilarityIndexRunLayout,
-    SimilarityIndexRunStreamEncoder,
+    SimilarityIndexRunStreamEncoder, similarity_bucket_length,
 };
 
 use crate::StorageIo;
 use crate::immutable_write::ImmutableWriteBuffer;
 use crate::similarity_index_repository::{
-    SIMILARITY_FINGERPRINT_PROFILE_V1, SIMILARITY_REPRESENTATIVE_PROFILE_V1,
-    SimilarityIndexStoreError,
+    SIMILARITY_FINGERPRINT_PROFILE_V1, SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT,
+    SIMILARITY_REPRESENTATIVE_PROFILE_V1, SimilarityIndexStoreError,
 };
 
 const SORT_CHUNK_BYTES: usize = 1024 * 1024;
@@ -386,7 +386,7 @@ fn write_bucket_partition<I: StorageIo>(
     ];
     let layout = SimilarityIndexRunLayout::new(
         SIMILARITY_FINGERPRINT_PROFILE_V1,
-        SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+        SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT,
         generation,
         entries.len(),
         bucket_count,
@@ -618,7 +618,10 @@ where
             let key = SimilarityBucketKey::new(
                 entry.fingerprint_profile(),
                 u8::try_from(slot).map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
-                entry.logical_length(),
+                similarity_bucket_length(
+                    SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT,
+                    entry.logical_length(),
+                ),
                 superfeature,
             )?;
             chunk.push(BucketRecord(SimilarityBucketReference::new(key, ordinal)));

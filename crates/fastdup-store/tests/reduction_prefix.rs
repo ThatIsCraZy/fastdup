@@ -81,10 +81,13 @@ fn wrong_base_and_unsafe_lengths_fail_before_decode_or_allocation() {
         VerifiedBaseChunk::from_expected(base.reference(), &other_bytes),
         Err(ZstdPrefixError::BaseIdentityMismatch)
     ));
-    assert_eq!(
-        ZstdPrefixCodec::encode_trial(base, b"short", target.len()),
-        Err(ZstdPrefixError::TargetLengthMismatch)
-    );
+    // Differing Base/target lengths are valid flexible-Prefix trials now;
+    // the retained BaseChunkRef carries the Base length for the writer.
+    let flexible = ZstdPrefixCodec::encode_trial(base, b"short", target.len())
+        .expect("flexible trial succeeds")
+        .expect("flexible trial fits");
+    assert_eq!(flexible.encoding().base().logical_length(), 32 * 1_024);
+    assert_eq!(flexible.encoding().logical_length(), 5);
 }
 
 fn patterned(length: usize, generation: u8) -> Vec<u8> {

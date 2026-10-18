@@ -133,6 +133,30 @@ impl SimilarityIndexEntry {
     }
 }
 
+/// Bucket profile v1: bucket keys carry the exact logical Chunk length.
+pub const SIMILARITY_BUCKET_PROFILE_V1: u16 = 1;
+/// Bucket profile v2: bucket keys carry a geometric length-band minimum so
+/// near-length Chunks share buckets (see [`similarity_bucket_length`]).
+pub const SIMILARITY_BUCKET_PROFILE_V2: u16 = 2;
+
+/// Returns the bucket-key length component for one logical Chunk length.
+///
+/// Profile v1 carries the exact logical length. Profile v2 carries the
+/// minimum of a geometric length band whose relative width stays below one
+/// eighth, so key ordering remains monotonic in length while Chunks whose
+/// lengths differ by less than one band share a bucket. Unknown profiles
+/// fall back to the exact length; writers and recovery reject unsupported
+/// profiles before deriving keys.
+#[must_use]
+pub fn similarity_bucket_length(bucket_profile: u16, logical_length: u32) -> u32 {
+    if bucket_profile != SIMILARITY_BUCKET_PROFILE_V2 || logical_length <= 1024 {
+        return logical_length;
+    }
+    let highest_power = 1_u32 << logical_length.ilog2();
+    let step = (highest_power / 8).max(1024);
+    logical_length / step * step
+}
+
 /// One versioned pool-wide Similarity bucket address.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SimilarityBucketKey {
@@ -302,7 +326,7 @@ impl SimilarityIndexRun {
         }
         entries.sort_unstable_by_key(|entry| entry.chunk_id);
         validate_entries(&entries, fingerprint_profile)?;
-        let (bucket_references, bucket_count) = build_bucket_references(&entries)?;
+        let (bucket_references, bucket_count) = build_bucket_references(&entries, bucket_profile)?;
         encoded_length(entries.len(), bucket_references.len())?;
         Ok(Self {
             fingerprint_profile,
@@ -1624,6 +1648,7 @@ fn validate_entries(
 
 fn build_bucket_references(
     entries: &[SimilarityIndexEntry],
+    bucket_profile: u16,
 ) -> Result<(Vec<SimilarityBucketReference>, usize), SimilarityIndexFormatError> {
     let capacity = entries
         .len()
@@ -1641,7 +1666,7 @@ fn build_bucket_references(
                     entry.fingerprint_profile,
                     u8::try_from(slot)
                         .map_err(|_| SimilarityIndexFormatError::ArithmeticOverflow)?,
-                    entry.logical_length,
+                    similarity_bucket_length(bucket_profile, entry.logical_length),
                     superfeature,
                 )?,
                 entry_ordinal,
@@ -1875,3 +1900,59 @@ impl fmt::Display for SimilarityIndexFormatError {
 }
 
 impl std::error::Error for SimilarityIndexFormatError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SIMILARITY_BUCKET_PROFILE_V1, SIMILARITY_BUCKET_PROFILE_V2, similarity_bucket_length,
+    };
+
+    #[test]
+    fn bucket_length_bands_are_monotonic_and_bounded() {
+        assert_eq!(
+            similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V1, 70_000),
+            70_000
+        );
+        assert_eq!(similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, 1), 1);
+        assert_eq!(
+            similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, 1024),
+            1024
+        );
+        assert_eq!(
+            similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, 1025),
+            1024
+        );
+        assert_eq!(
+            similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, 60_000),
+            57_344
+        );
+        assert_eq!(
+            similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, 65_536),
+            65_536
+        );
+        assert_eq!(
+            similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, 70_000),
+            65_536
+        );
+        assert_eq!(
+            similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, 73_727),
+            65_536
+        );
+        assert_eq!(
+            similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, 73_728),
+            73_728
+        );
+        assert_eq!(
+            similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, 262_144),
+            262_144
+        );
+        let mut previous = 0;
+        for length in 1..=262_144_u32 {
+            let band = similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V2, length);
+            assert!(band >= 1 && band <= length && band >= previous);
+            // Relative band width stays below one eighth of the band start.
+            assert!(length - band <= band / 8 + 1024);
+            previous = band;
+        }
+    }
+}

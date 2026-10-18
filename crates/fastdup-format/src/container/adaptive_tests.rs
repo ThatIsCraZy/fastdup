@@ -34,6 +34,7 @@ fn append_writer_matches_zeroed_image_for_all_record_plans_and_verifies() {
         ChunkId::of(&base),
         65_536,
         ChunkId::of(&prefix_target),
+        65_536,
         prefix_encoded[RAW_PAYLOAD_OFFSET..RAW_PAYLOAD_OFFSET + frame_length].into(),
     )
     .unwrap();

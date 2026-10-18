@@ -55,12 +55,12 @@ fn dependency_metadata_never_escapes_before_crc_and_shape_validation() {
 }
 
 #[test]
-fn codec_three_rejects_empty_unequal_and_oversized_chunks() {
+fn codec_three_rejects_empty_and_oversized_chunks_but_flex_accepts_unequal() {
     assert!(ZstdPrefixRecord::encode(&[], &[]).is_err());
-    assert_eq!(
-        ZstdPrefixRecord::encode(&[1; 16], &[2; 17]),
-        Err(FormatError::InvalidZstdPrefixRecord)
-    );
+    // Unequal lengths are no longer rejected: they emit the flexible
+    // codec 5 in the same layout and round-trip through the dispatcher.
+    let flexible = ZstdPrefixRecord::encode(&[1; 16], &[2; 17]).expect("flexible encode succeeds");
+    assert_eq!(u16::from_le_bytes([flexible[12], flexible[13]]), 5);
     let oversized = vec![1; MAX_LOGICAL_CHUNK_BYTES + 1];
     assert!(ZstdPrefixRecord::encode(&oversized, &oversized).is_err());
 }

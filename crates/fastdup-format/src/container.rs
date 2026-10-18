@@ -70,6 +70,10 @@ pub(crate) const RAW_CODEC: u16 = 1;
 pub(crate) const ZSTD_CODEC: u16 = 2;
 pub(crate) const ZSTD_PREFIX_CODEC: u16 = 3;
 pub(crate) const SPARSE_XOR_CODEC: u16 = 4;
+/// Codec 5 shares the codec-3 layout but permits the Base logical length to
+/// differ from the target logical length. Writers emit codec 3 whenever the
+/// lengths are equal, so codec 5 records always carry differing lengths.
+pub(crate) const ZSTD_PREFIX_FLEX_CODEC: u16 = 5;
 const ZSTD_LEVEL_V1: i32 = 3;
 const ZSTD_PREFIX_LEVEL_V1: i32 = 3;
 const ZSTD_RESCUE_LEVEL_V1: i32 = 1;

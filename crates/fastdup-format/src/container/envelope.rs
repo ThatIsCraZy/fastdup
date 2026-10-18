@@ -11,8 +11,8 @@ use super::{
     INDEX_HEADER_BYTES, INDEX_HEADER_BYTES_USIZE, INDEX_MAGIC, MAX_CONTAINER_BYTES,
     MAX_DECODED_RECORD_BYTES, MAX_LOGICAL_CHUNK_BYTES, MAX_RECORD_BYTES, MIN_RAW_RECORD_BYTES,
     RAW_CODEC, RECORD_ALIGNMENT, RECORD_CRC_OFFSET, RECORD_HEADER_BYTES, SEALED_STATE,
-    SPARSE_XOR_CODEC, ZSTD_CODEC, ZSTD_PREFIX_CODEC, align_up, crc32c_with_zeroed_field, get_u16,
-    get_u32, get_u64, put_u16, put_u32, put_u64,
+    SPARSE_XOR_CODEC, ZSTD_CODEC, ZSTD_PREFIX_CODEC, ZSTD_PREFIX_FLEX_CODEC, align_up,
+    crc32c_with_zeroed_field, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64,
 };
 use crate::crc32c_with_zeroed_u32;
 
@@ -159,7 +159,7 @@ impl IndexEntry {
             .expect("ASSERT: fixed Recovery Index dependency field is 32 bytes");
         if !matches!(
             codec_id,
-            RAW_CODEC | ZSTD_CODEC | ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC
+            RAW_CODEC | ZSTD_CODEC | ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC | ZSTD_PREFIX_FLEX_CODEC
         ) || get_u16(bytes, 58) != 0
             || (is_dependent_codec(codec_id) && dependency_id == [0; 32])
             || (!is_dependent_codec(codec_id) && dependency_id != [0; 32])

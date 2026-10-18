@@ -2,7 +2,8 @@
 use super::adaptive::PrehashedChunk;
 use super::compression::compress_zstd_v1;
 use super::dependent::{
-    is_dependent_codec, validate_sparse_xor_record, validate_zstd_prefix_record,
+    is_dependent_codec, is_zstd_prefix_codec, validate_sparse_xor_record,
+    validate_zstd_prefix_record,
 };
 use super::payload::VerifiedChunkPayload;
 use super::{
@@ -10,8 +11,8 @@ use super::{
     MAX_DECODED_RECORD_BYTES, MAX_LOGICAL_CHUNK_BYTES, MAX_RECORD_BYTES, MIN_RAW_RECORD_BYTES,
     RAW_CODEC, RAW_PAYLOAD_OFFSET, RAW_PAYLOAD_OFFSET_U32, RECORD_ALIGNMENT, RECORD_CRC_OFFSET,
     RECORD_HEADER_BYTES, RECORD_HEADER_BYTES_U16, RECORD_HEADER_BYTES_U32, RECORD_MAGIC,
-    SPARSE_XOR_CODEC, ZSTD_CODEC, ZSTD_LEVEL_V1, ZSTD_PREFIX_CODEC, align_up_usize,
-    crc32c_with_zeroed_field, get_u16, get_u32, get_u64, put_u16, put_u32,
+    SPARSE_XOR_CODEC, ZSTD_CODEC, ZSTD_LEVEL_V1, align_up_usize, crc32c_with_zeroed_field, get_u16,
+    get_u32, get_u64, put_u16, put_u32,
 };
 use fastdup_copy_metrics::CopyClass;
 use fastdup_copy_metrics::record_copy;
@@ -294,7 +295,7 @@ pub(super) fn decode_encoding_record_mode(
             logical_bytes,
         });
     }
-    if get_u16(bytes, 12) == ZSTD_PREFIX_CODEC {
+    if is_zstd_prefix_codec(get_u16(bytes, 12)) {
         validate_zstd_prefix_record(bytes)?;
         return Err(FormatError::ZstdPrefixBaseRequired);
     }

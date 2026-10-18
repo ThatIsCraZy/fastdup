@@ -1,6 +1,8 @@
 //! Complete container-image decoding and publication/content evidence. All payloads are verified.
 use super::adaptive::PreparedEncodedRecord;
-use super::dependent::{DependentRecord, ZstdPrefixDependency, is_dependent_codec};
+use super::dependent::{
+    DependentRecord, ZstdPrefixDependency, is_dependent_codec, is_zstd_prefix_codec,
+};
 use super::envelope::{
     ContainerHeader, IndexEntry, calculate_container_commitment, decode_footer, decode_index,
     validate_container_file_length,
@@ -12,7 +14,7 @@ use super::records::{
 use super::summary::{ContainerIntrinsicSummary, IntrinsicSummaryAccumulator};
 use super::{
     ChunkId, FOOTER_BYTES_USIZE, FormatError, HEADER_BYTES, RAW_CODEC, RECORD_HEADER_BYTES,
-    VerifiedChunkLocation, VerifiedRawLocation, ZSTD_CODEC, ZSTD_PREFIX_CODEC, get_u16, get_u32,
+    VerifiedChunkLocation, VerifiedRawLocation, ZSTD_CODEC, get_u16, get_u32,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -276,7 +278,7 @@ impl SealedContainer {
                 let base = resolver(dependency)?;
                 let record = DependentRecord::decode(encoded, &base)?;
                 DecodedEncodingRecord {
-                    codec: if codec == ZSTD_PREFIX_CODEC {
+                    codec: if is_zstd_prefix_codec(codec) {
                         EncodingCodec::ZstdPrefix
                     } else {
                         EncodingCodec::SparseXor
@@ -530,7 +532,7 @@ impl SealedContainer {
                 let base = resolver(dependency)?;
                 let record = DependentRecord::decode(encoded, &base)?;
                 DecodedEncodingRecord {
-                    codec: if codec == ZSTD_PREFIX_CODEC {
+                    codec: if is_zstd_prefix_codec(codec) {
                         EncodingCodec::ZstdPrefix
                     } else {
                         EncodingCodec::SparseXor

@@ -191,14 +191,15 @@ impl ZstdPrefixEncoding {
     /// # Errors
     ///
     /// Returns an error if the retained trial fields cannot form a bounded
-    /// codec-3 record.
+    /// codec-3 or codec-5 record.
     pub fn into_prepared_record(
         self,
     ) -> Result<fastdup_format::PreparedZstdPrefixRecord, fastdup_format::FormatError> {
         fastdup_format::ZstdPrefixRecord::prepare_precompressed(
             self.base.chunk_id,
-            self.logical_length,
+            self.base.logical_length,
             self.target_id,
+            self.logical_length,
             self.frame,
         )
     }
@@ -218,9 +219,6 @@ impl ZstdPrefixEncoding {
                     ZstdPrefixError::BaseLengthMismatch
                 },
             );
-        }
-        if self.logical_length != self.base.logical_length {
-            return Err(ZstdPrefixError::TargetLengthMismatch);
         }
         let logical_length = usize::try_from(self.logical_length)
             .map_err(|_| ZstdPrefixError::ArithmeticOverflow)?;
@@ -252,7 +250,9 @@ impl ZstdPrefixEncoding {
 pub struct ZstdPrefixCodec;
 
 impl ZstdPrefixCodec {
-    /// Encodes a same-length target against one verified Base Chunk.
+    /// Encodes a target against one verified Base Chunk. The Base may be
+    /// shorter or longer than the target; the durable writer selects the
+    /// equal-length or flexible Prefix codec from the retained lengths.
     ///
     /// `maximum_encoded_payload_bytes` includes the 32-byte Base Chunk ID and
     /// the complete Zstd frame. Returning `Ok(None)` means that no valid frame
@@ -286,9 +286,6 @@ impl ZstdPrefixCodec {
         maximum_encoded_payload_bytes: usize,
     ) -> Result<Option<ZstdPrefixTrial>, ZstdPrefixError> {
         validate_logical_length(target.len())?;
-        if target.len() != base.bytes.len() {
-            return Err(ZstdPrefixError::TargetLengthMismatch);
-        }
         let Some(maximum_frame_bytes) =
             maximum_encoded_payload_bytes.checked_sub(BASE_DEPENDENCY_BYTES)
         else {

@@ -5,7 +5,15 @@ use fastdup_format::ChunkId;
 
 pub(crate) const SIMILARITY_PROFILE_V1: u16 = 1;
 pub(crate) const MAX_SIMILARITY_CANDIDATES: usize = 16;
-pub(crate) const SIMILARITY_BUCKET_PROFILE_V1: u16 = 1;
+pub(crate) const SIMILARITY_BUCKET_PROFILE_V1: u16 = fastdup_format::SIMILARITY_BUCKET_PROFILE_V1;
+pub(crate) const SIMILARITY_BUCKET_PROFILE_V2: u16 = fastdup_format::SIMILARITY_BUCKET_PROFILE_V2;
+/// The bucket profile written by this implementation: geometric length
+/// bands (see `fastdup_format::similarity_bucket_length`).
+pub(crate) const SIMILARITY_BUCKET_PROFILE_CURRENT: u16 = SIMILARITY_BUCKET_PROFILE_V2;
+
+pub(crate) fn similarity_bucket_length_current(logical_length: u32) -> u32 {
+    fastdup_format::similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_CURRENT, logical_length)
+}
 const MAX_BUCKET_REPRESENTATIVES_V1: usize = 64;
 const SUPERFEATURE_SLOTS_V1: usize = 4;
 const MAX_QUERY_REPRESENTATIVES_EXAMINED_V1: usize =
@@ -555,7 +563,8 @@ impl SimilarityIndex {
                 validate_logical_length(resident.logical_length)?;
                 let slot = usize::from(key.slot);
                 if key.profile != resident.profile
-                    || key.logical_length != resident.logical_length
+                    || key.logical_length
+                        != similarity_bucket_length_current(resident.logical_length)
                     || resident.profile != SIMILARITY_PROFILE_V1
                     || self.arena.superfeatures(ordinal)?.get(slot) != Some(&key.superfeature)
                 {
@@ -667,7 +676,7 @@ impl SimilarityIndex {
                 .entry(BucketKey {
                     profile: fingerprint.profile,
                     slot,
-                    logical_length,
+                    logical_length: similarity_bucket_length_current(logical_length),
                     superfeature,
                 })
                 .or_default()
@@ -717,8 +726,8 @@ impl SimilarityIndex {
         Ok(())
     }
 
-    /// Returns at most `limit` distinct equal-length candidates sharing at
-    /// least one Superfeature with `target`.
+    /// Returns at most `limit` distinct same-length-band candidates sharing
+    /// at least one Superfeature with `target`.
     ///
     /// Ranking is scalar XOR plus POPCNT over the complete 512-bit Sketch.
     /// Exact content identity must be checked elsewhere with BLAKE3-256.
@@ -731,7 +740,7 @@ impl SimilarityIndex {
     ) -> Result<Vec<SimilarityCandidate>, SimilarityError> {
         let query = self.candidates_with_stats(target_id, logical_length, target, limit)?;
         assert_eq!(
-            query.stats.bucket_profile, SIMILARITY_BUCKET_PROFILE_V1,
+            query.stats.bucket_profile, SIMILARITY_BUCKET_PROFILE_CURRENT,
             "ASSERT: similarity query reports a different bucket profile"
         );
         assert!(
@@ -771,7 +780,7 @@ impl SimilarityIndex {
             return Ok(SimilarityQuery {
                 candidates: Vec::new(),
                 stats: SimilarityQueryStats {
-                    bucket_profile: SIMILARITY_BUCKET_PROFILE_V1,
+                    bucket_profile: SIMILARITY_BUCKET_PROFILE_CURRENT,
                     buckets_read: 0,
                     representatives_examined: 0,
                     distinct_representatives_visited: 0,
@@ -832,7 +841,9 @@ impl SimilarityIndex {
                 continue;
             }
             let entry = self.arena.metadata(ordinal)?;
-            if entry.logical_length != logical_length {
+            if similarity_bucket_length_current(entry.logical_length)
+                != similarity_bucket_length_current(logical_length)
+            {
                 continue;
             }
             let candidate = SimilarityCandidate {
@@ -846,7 +857,7 @@ impl SimilarityIndex {
         Ok(SimilarityQuery {
             candidates,
             stats: SimilarityQueryStats {
-                bucket_profile: SIMILARITY_BUCKET_PROFILE_V1,
+                bucket_profile: SIMILARITY_BUCKET_PROFILE_CURRENT,
                 buckets_read: selection.buckets_read,
                 representatives_examined: selection.representatives_examined,
                 distinct_representatives_visited,
@@ -868,7 +879,7 @@ impl SimilarityIndex {
             if let Some(bucket) = self.buckets.get(&BucketKey {
                 profile: target.profile,
                 slot: slot_u8,
-                logical_length,
+                logical_length: similarity_bucket_length_current(logical_length),
                 superfeature,
             }) {
                 buckets_read += 1;
@@ -1869,7 +1880,7 @@ mod tests {
         );
         assert_eq!(
             forward_query.stats.bucket_profile,
-            SIMILARITY_BUCKET_PROFILE_V1
+            SIMILARITY_BUCKET_PROFILE_CURRENT
         );
         assert_eq!(forward_query.stats.buckets_read, 4);
         assert_eq!(

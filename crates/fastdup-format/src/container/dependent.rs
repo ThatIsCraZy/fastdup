@@ -7,9 +7,24 @@ use super::{
     MAX_RECORD_BYTES, MIN_RAW_RECORD_BYTES, RAW_PAYLOAD_OFFSET, RAW_PAYLOAD_OFFSET_U32,
     RECORD_ALIGNMENT, RECORD_CRC_OFFSET, RECORD_HEADER_BYTES, RECORD_HEADER_BYTES_U16,
     RECORD_HEADER_BYTES_U32, RECORD_MAGIC, SPARSE_XOR_CODEC, ZSTD_PREFIX_CODEC,
-    ZSTD_PREFIX_LEVEL_V1, align_up_usize, crc32c_with_zeroed_field, get_u16, get_u32, get_u64,
-    put_u16, put_u32,
+    ZSTD_PREFIX_FLEX_CODEC, ZSTD_PREFIX_LEVEL_V1, align_up_usize, crc32c_with_zeroed_field,
+    get_u16, get_u32, get_u64, put_u16, put_u32,
 };
+
+/// Returns the durable codec ID for one Zstd Prefix record: codec 3 when
+/// Base and target lengths are equal, codec 5 when they differ.
+pub(super) const fn zstd_prefix_codec_id(base_logical_length: u32, logical_length: u32) -> u16 {
+    if base_logical_length == logical_length {
+        ZSTD_PREFIX_CODEC
+    } else {
+        ZSTD_PREFIX_FLEX_CODEC
+    }
+}
+
+/// Returns whether a durable codec ID names any Zstd Prefix record layout.
+pub(super) const fn is_zstd_prefix_codec(codec_id: u16) -> bool {
+    matches!(codec_id, ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC)
+}
 
 /// One verified logical dependency named by a Depth-1 dependent record.
 ///
@@ -50,6 +65,10 @@ pub struct PreparedZstdPrefixRecord {
 }
 
 impl PreparedZstdPrefixRecord {
+    pub(super) const fn codec_id(&self) -> u16 {
+        zstd_prefix_codec_id(self.dependency.logical_length, self.logical_length)
+    }
+
     fn record_length(&self) -> Result<usize, FormatError> {
         zstd_prefix_record_length(self.logical_length, self.frame.len())
     }
@@ -222,7 +241,7 @@ impl PreparedDependentRecord {
 
     pub(super) const fn codec_id(&self) -> u16 {
         match self {
-            Self::ZstdPrefix(_) => ZSTD_PREFIX_CODEC,
+            Self::ZstdPrefix(record) => record.codec_id(),
             Self::SparseXor(_) => SPARSE_XOR_CODEC,
         }
     }
@@ -290,16 +309,20 @@ impl ZstdPrefixRecord {
     /// Rejects invalid lengths, empty frames, or impossible record geometry.
     pub fn prepare_precompressed(
         base_id: ChunkId,
-        logical_length: u32,
+        base_logical_length: u32,
         target_id: ChunkId,
+        logical_length: u32,
         frame: Box<[u8]>,
     ) -> Result<PreparedZstdPrefixRecord, FormatError> {
         if base_id == ChunkId::from_bytes([0; 32]) {
             return Err(FormatError::InvalidZstdPrefixRecord);
         }
+        validate_logical_chunk_length(
+            usize::try_from(base_logical_length).map_err(|_| FormatError::ArithmeticOverflow)?,
+        )?;
         let dependency = ZstdPrefixDependency {
             chunk_id: base_id,
-            logical_length,
+            logical_length: base_logical_length,
         };
         zstd_prefix_record_length(logical_length, frame.len())?;
         Ok(PreparedZstdPrefixRecord {
@@ -310,7 +333,9 @@ impl ZstdPrefixRecord {
         })
     }
 
-    /// Encodes one same-length target against a verified Base byte slice.
+    /// Encodes one target against a verified Base byte slice. The Base may
+    /// be shorter or longer than the target; equal lengths emit codec 3 and
+    /// differing lengths emit codec 5 in the same record layout.
     ///
     /// This function emits a record but does not decide whether Prefix beats
     /// RAW, independent Zstd, or another Delta codec. The caller owns that
@@ -327,9 +352,6 @@ impl ZstdPrefixRecord {
     pub fn encode(base: &[u8], target: &[u8]) -> Result<Vec<u8>, FormatError> {
         validate_logical_chunk_length(base.len())?;
         validate_logical_chunk_length(target.len())?;
-        if base.len() != target.len() {
-            return Err(FormatError::InvalidZstdPrefixRecord);
-        }
 
         let mut frame = Vec::new();
         frame
@@ -548,15 +570,19 @@ fn write_zstd_prefix_metadata(
     bytes: &mut [u8],
 ) -> Result<(), FormatError> {
     assert_eq!(bytes.len(), RAW_PAYLOAD_OFFSET);
-    if dependency.logical_length != logical_length {
-        return Err(FormatError::InvalidZstdPrefixRecord);
-    }
+    validate_logical_chunk_length(
+        usize::try_from(dependency.logical_length).map_err(|_| FormatError::ArithmeticOverflow)?,
+    )?;
     let record_length = zstd_prefix_record_length(logical_length, frame.len())?;
 
     bytes[0..8].copy_from_slice(RECORD_MAGIC);
     put_u16(bytes, 8, FORMAT_VERSION);
     put_u16(bytes, 10, RECORD_HEADER_BYTES_U16);
-    put_u16(bytes, 12, ZSTD_PREFIX_CODEC);
+    put_u16(
+        bytes,
+        12,
+        zstd_prefix_codec_id(dependency.logical_length, logical_length),
+    );
     put_u32(
         bytes,
         32,
@@ -587,7 +613,7 @@ pub(super) fn validate_zstd_prefix_record(bytes: &[u8]) -> Result<(), FormatErro
         || &bytes[0..8] != RECORD_MAGIC
         || get_u16(bytes, 8) != FORMAT_VERSION
         || usize::from(get_u16(bytes, 10)) != RECORD_HEADER_BYTES
-        || get_u16(bytes, 12) != ZSTD_PREFIX_CODEC
+        || !is_zstd_prefix_codec(get_u16(bytes, 12))
         || get_u16(bytes, 14) != 0
         || get_u64(bytes, 16) != 0
         || get_u64(bytes, 24) != 0
@@ -612,7 +638,12 @@ pub(super) fn validate_zstd_prefix_record(bytes: &[u8]) -> Result<(), FormatErro
     let logical_length =
         usize::try_from(get_u32(bytes, 36)).map_err(|_| FormatError::ArithmeticOverflow)?;
     validate_logical_chunk_length(logical_length)?;
-    if get_u32(bytes, 100) != get_u32(bytes, 36)
+    let base_logical_length =
+        usize::try_from(get_u32(bytes, 100)).map_err(|_| FormatError::ArithmeticOverflow)?;
+    validate_logical_chunk_length(base_logical_length)?;
+    // Canonical codec selection: codec 3 requires equal lengths and codec 5
+    // requires differing lengths, so one length pair has one encoding.
+    if get_u16(bytes, 12) != zstd_prefix_codec_id(get_u32(bytes, 100), get_u32(bytes, 36))
         || bytes[64..96].iter().all(|byte| *byte == 0)
         || get_u32(bytes, RECORD_HEADER_BYTES + 32) != 0
         || get_u32(bytes, RECORD_HEADER_BYTES + 36) != get_u32(bytes, 36)
@@ -836,7 +867,7 @@ impl<'a> ValidatedDependentRecord<'a> {
     }
 
     fn base_mismatch(&self) -> FormatError {
-        if get_u16(self.bytes, 12) == ZSTD_PREFIX_CODEC {
+        if is_zstd_prefix_codec(get_u16(self.bytes, 12)) {
             FormatError::ZstdPrefixBaseMismatch
         } else {
             FormatError::DependentBaseMismatch
@@ -866,7 +897,9 @@ impl<'a> ValidatedDependentRecord<'a> {
 
     fn decode_after_base_verification(self, base: &[u8]) -> Result<RawRecord, FormatError> {
         match get_u16(self.bytes, 12) {
-            ZSTD_PREFIX_CODEC => ZstdPrefixRecord::decode_after_base_verification(self.bytes, base),
+            ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC => {
+                ZstdPrefixRecord::decode_after_base_verification(self.bytes, base)
+            }
             SPARSE_XOR_CODEC => SparseXorRecord::decode_after_base_verification(self.bytes, base),
             _ => unreachable!("validated dependent codec"),
         }
@@ -885,7 +918,7 @@ impl DependentRecord {
     /// Returns an error for an unknown, malformed, or corrupt dependent record.
     pub fn dependency(bytes: &[u8]) -> Result<DependentDependency, FormatError> {
         match record_codec(bytes)? {
-            ZSTD_PREFIX_CODEC => ZstdPrefixRecord::dependency(bytes),
+            ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC => ZstdPrefixRecord::dependency(bytes),
             SPARSE_XOR_CODEC => SparseXorRecord::dependency(bytes),
             _ => Err(FormatError::InvalidDependentRecord),
         }
@@ -898,7 +931,7 @@ impl DependentRecord {
     /// Returns a record, Base, codec, bounds, or target-integrity error.
     pub fn decode(bytes: &[u8], base: &[u8]) -> Result<RawRecord, FormatError> {
         match record_codec(bytes)? {
-            ZSTD_PREFIX_CODEC => ZstdPrefixRecord::decode(bytes, base),
+            ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC => ZstdPrefixRecord::decode(bytes, base),
             SPARSE_XOR_CODEC => SparseXorRecord::decode(bytes, base),
             _ => Err(FormatError::InvalidDependentRecord),
         }
@@ -914,7 +947,9 @@ impl DependentRecord {
         base: &VerifiedChunkPayload,
     ) -> Result<RawRecord, FormatError> {
         match record_codec(bytes)? {
-            ZSTD_PREFIX_CODEC => ZstdPrefixRecord::decode_with_verified_base(bytes, base),
+            ZSTD_PREFIX_CODEC | ZSTD_PREFIX_FLEX_CODEC => {
+                ZstdPrefixRecord::decode_with_verified_base(bytes, base)
+            }
             SPARSE_XOR_CODEC => SparseXorRecord::decode_with_verified_base(bytes, base),
             _ => Err(FormatError::InvalidDependentRecord),
         }
@@ -929,7 +964,10 @@ fn record_codec(bytes: &[u8]) -> Result<u16, FormatError> {
 }
 
 pub(super) fn is_dependent_codec(codec_id: u16) -> bool {
-    matches!(codec_id, ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC)
+    matches!(
+        codec_id,
+        ZSTD_PREFIX_CODEC | SPARSE_XOR_CODEC | ZSTD_PREFIX_FLEX_CODEC
+    )
 }
 
 fn sparse_xor_record_length(
@@ -1185,5 +1223,47 @@ mod tests {
         let mut corrupt = encoded;
         corrupt[RECORD_HEADER_BYTES + CHUNK_TABLE_ENTRY_BYTES] ^= 3;
         assert!(ZstdPrefixRecord::decode_with_verified_base(&corrupt, &verified).is_err());
+    }
+
+    #[test]
+    fn flexible_prefix_round_trips_differing_lengths_and_rejects_noncanonical_codec() {
+        let mut seed = 91_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            u8::try_from(seed & 0xff).unwrap()
+        };
+        let stream: Vec<u8> = (0..70_000).map(|_| next()).collect();
+        let base = stream[..65_536].to_vec();
+        let longer_target = stream.clone();
+        let shorter_target = stream[..60_000].to_vec();
+
+        for target in [&longer_target, &shorter_target] {
+            let encoded = ZstdPrefixRecord::encode(&base, target).unwrap();
+            assert_eq!(get_u16(&encoded, 12), ZSTD_PREFIX_FLEX_CODEC);
+            let dependency = DependentRecord::dependency(&encoded).unwrap();
+            assert_eq!(dependency.chunk_id(), ChunkId::of(&base));
+            assert_eq!(dependency.logical_length(), 65_536);
+            assert_eq!(
+                DependentRecord::decode(&encoded, &base).unwrap().payload(),
+                target.as_slice()
+            );
+            // A Base with the target's length but the wrong identity/length
+            // pairing must fail closed before any bytes escape.
+            assert!(DependentRecord::decode(&encoded, target).is_err());
+            // Rewriting the codec field to the equal-length codec 3 is
+            // noncanonical for differing lengths, even with a fixed CRC.
+            let mut relabelled = encoded.clone();
+            put_u16(&mut relabelled, 12, ZSTD_PREFIX_CODEC);
+            let checksum = crc32c_with_zeroed_field(&relabelled, RECORD_CRC_OFFSET);
+            put_u32(&mut relabelled, RECORD_CRC_OFFSET, checksum);
+            assert!(DependentRecord::dependency(&relabelled).is_err());
+        }
+
+        // Equal lengths keep emitting codec 3.
+        let equal_target = base.clone();
+        let encoded = ZstdPrefixRecord::encode(&base, &equal_target).unwrap();
+        assert_eq!(get_u16(&encoded, 12), ZSTD_PREFIX_CODEC);
     }
 }

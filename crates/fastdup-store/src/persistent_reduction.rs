@@ -796,11 +796,13 @@ impl ChunkTrial<'_> {
         let base = VerifiedBaseChunk::from_verified_location(expected, base_bytes)
             .map_err(|_| PersistentReductionError::VerifiedBaseMismatch)?;
         // Codec pre-selection: Sparse-XOR only wins on sparse same-offset
-        // edits. When sampled blocks mostly differ, spend the bounded trial
+        // edits and requires an equal-length Base. When sampled blocks
+        // mostly differ, or the Base length differs, spend the bounded trial
         // budget on ZSTD_PREFIX alone so more Bases fit the same four trials.
         // The bounded encoders remain the only size authority either way.
         let (differing, sampled) = sampled_differing_blocks(base_bytes, target);
-        if differing.saturating_mul(SPARSE_SAMPLE_DIVISOR_V1) <= sampled {
+        let sparse_sample = differing.saturating_mul(SPARSE_SAMPLE_DIVISOR_V1) <= sampled;
+        if sparse_sample && base_bytes.len() == target.len() {
             let sparse_base = IndependentBaseRef::from_verified_identity(
                 candidate.chunk_id(),
                 candidate.logical_length(),
@@ -829,7 +831,7 @@ impl ChunkTrial<'_> {
                     *best = Some((sparse_bytes, prepared));
                 }
             }
-        } else {
+        } else if !sparse_sample {
             counters.dense_xor_skips.fetch_add(1, Ordering::Relaxed);
         }
 
