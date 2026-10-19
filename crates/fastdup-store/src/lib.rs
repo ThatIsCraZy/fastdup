@@ -66,6 +66,7 @@ mod scrub_progress;
 mod seqcdc;
 mod similarity_external_sort;
 mod similarity_index_repository;
+mod similarity_presence;
 mod similarity_read;
 mod similarity_simd;
 pub use scrub_progress::{

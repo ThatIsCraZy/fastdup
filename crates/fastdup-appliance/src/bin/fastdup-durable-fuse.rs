@@ -1801,7 +1801,9 @@ fn emit_similarity_index_page_cache(appliance: &FsAppliance) {
             "resident_pages={} target_pages={} capacity_pages={} evictions={} ",
             "pressure_evictions={} admission_evictions={} removals={} ",
             "pressure_rejections={} reserve_bytes={} effective_limit_bytes={} ",
-            "available_bytes={} swap_used_bytes={}"
+            "available_bytes={} swap_used_bytes={} presence_skips={} ",
+            "presence_false_positives={} presence_declined={} presence_bytes={} ",
+            "presence_filters={}"
         ),
         similarity.hits(),
         similarity.misses(),
@@ -1822,6 +1824,11 @@ fn emit_similarity_index_page_cache(appliance: &FsAppliance) {
         similarity.effective_limit_bytes(),
         similarity.available_bytes(),
         similarity.swap_used_bytes(),
+        similarity.presence_skips(),
+        similarity.presence_false_positives(),
+        similarity.presence_declined(),
+        similarity.presence_bytes(),
+        similarity.presence_filters(),
     );
 }
 

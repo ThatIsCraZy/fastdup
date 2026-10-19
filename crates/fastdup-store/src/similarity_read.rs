@@ -32,7 +32,7 @@ impl ImmutableSimilarityRun {
         lease: ImmutableFileLease,
         expected: SimilarityIndexRunDescriptor,
         page_cache: &SimilarityPageCache,
-        observe_bucket_page: impl FnMut(SimilarityBucketKey),
+        observe_bucket_page: impl FnMut(&SimilarityBucketPage),
     ) -> Result<Self, SimilarityIndexStoreError> {
         let _read_reason = crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexAudit);
         let independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
@@ -85,7 +85,7 @@ fn audit_source(
     lease: &ImmutableFileLease,
     descriptor: SimilarityIndexRunDescriptor,
     page_cache: &SimilarityPageCache,
-    observe_bucket_page: impl FnMut(SimilarityBucketKey),
+    observe_bucket_page: impl FnMut(&SimilarityBucketPage),
 ) -> Result<(SimilarityBucketKey, SimilarityBucketKey), SimilarityIndexStoreError> {
     let independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
     let mut audit = descriptor.start_hash_audit();
@@ -208,7 +208,7 @@ fn walk_buckets_retained(
     descriptor: SimilarityIndexRunDescriptor,
     retained: &RetainedAuditPages,
     page_cache: &SimilarityPageCache,
-    mut observe_bucket_page: impl FnMut(SimilarityBucketKey),
+    mut observe_bucket_page: impl FnMut(&SimilarityBucketPage),
 ) -> Result<(SimilarityBucketKey, SimilarityBucketKey), SimilarityIndexStoreError> {
     if retained.entries.len() != descriptor.page_count()
         || retained.buckets.len() != descriptor.bucket_page_count()
@@ -221,7 +221,7 @@ fn walk_buckets_retained(
     for (ordinal, page) in retained.buckets.iter().enumerate() {
         minimum_bucket_key.get_or_insert_with(|| page.first_key());
         maximum_bucket_key = Some(page.last_key());
-        observe_bucket_page(page.last_key());
+        observe_bucket_page(page);
         for reference in page.references() {
             let entry_ordinal = usize::try_from(reference.entry_ordinal())
                 .map_err(|_| SimilarityIndexStoreError::IndexCorruption)?;
@@ -258,7 +258,7 @@ fn walk_buckets(
     lease: &ImmutableFileLease,
     descriptor: SimilarityIndexRunDescriptor,
     page_cache: &SimilarityPageCache,
-    mut observe_bucket_page: impl FnMut(SimilarityBucketKey),
+    mut observe_bucket_page: impl FnMut(&SimilarityBucketPage),
 ) -> Result<(SimilarityBucketKey, SimilarityBucketKey), SimilarityIndexStoreError> {
     let run_hash = descriptor.run_hash();
     let mut semantic_entry_page = None;
@@ -275,7 +275,7 @@ fn walk_buckets(
         };
         minimum_bucket_key.get_or_insert_with(|| page.first_key());
         maximum_bucket_key = Some(page.last_key());
-        observe_bucket_page(page.last_key());
+        observe_bucket_page(&page);
         for reference in page.references() {
             let entry = mapped_entry(
                 lease,

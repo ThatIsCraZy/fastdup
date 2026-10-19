@@ -266,6 +266,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
                 maximum_bucket_key: verified.maximum_bucket_key,
                 mapping: verified.mapping,
                 fences: verified.fences,
+                presence: verified.presence,
                 page_cache: Arc::clone(&self.page_cache),
             });
         }
@@ -1064,13 +1065,32 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             let mut fences = Vec::new();
             let collect = count <= MAX_BUCKET_FENCE_BYTES / size_of::<SimilarityBucketKey>()
                 && fences.try_reserve_exact(count).is_ok();
+            // The audit walk already decodes every Bucket page, so the
+            // presence filter costs no extra I/O. It is sized by the
+            // descriptor's distinct Bucket-key count and fails open (None)
+            // past its caps; queries then probe pages exactly as before.
+            let mut presence = self
+                .page_cache
+                .presence_builder(envelope.descriptor.bucket_count());
+            let mut last_inserted: Option<SimilarityBucketKey> = None;
             let mapping = Arc::new(ImmutableSimilarityRun::open(
                 lease,
                 envelope.descriptor,
                 &self.page_cache,
-                |key| {
+                |page| {
                     if collect {
-                        fences.push(key);
+                        fences.push(page.last_key());
+                    }
+                    if let Some(builder) = &mut presence {
+                        // References are key-sorted, so each distinct key
+                        // forms one run; inserting once per run is enough.
+                        for reference in page.references() {
+                            let key = reference.key();
+                            if last_inserted != Some(key) {
+                                builder.insert(key);
+                                last_inserted = Some(key);
+                            }
+                        }
                     }
                 },
             )?);
@@ -1080,6 +1100,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
                 maximum_bucket_key: mapping.maximum_bucket_key(),
                 mapping: Some(mapping),
                 fences: collect.then(|| fences.into()),
+                presence: presence.map(|builder| Arc::new(builder.finish())),
             });
         }
         let (descriptor, minimum_bucket_key, maximum_bucket_key) =
@@ -1090,6 +1111,7 @@ impl<I: Clone + StorageIo> SimilarityIndexRepository<I> {
             maximum_bucket_key,
             mapping: None,
             fences: None,
+            presence: None,
         })
     }
 
@@ -1124,6 +1146,7 @@ struct VerifiedSimilarityPartition {
     maximum_bucket_key: SimilarityBucketKey,
     mapping: Option<Arc<ImmutableSimilarityRun>>,
     fences: Option<Arc<[SimilarityBucketKey]>>,
+    presence: Option<Arc<crate::similarity_presence::BucketPresenceFilter>>,
 }
 
 pub(crate) struct StagedSimilarityIndex {
@@ -1215,6 +1238,7 @@ struct RecoveredSimilarityPartition {
     maximum_bucket_key: SimilarityBucketKey,
     mapping: Option<Arc<ImmutableSimilarityRun>>,
     fences: Option<Arc<[SimilarityBucketKey]>>,
+    presence: Option<Arc<crate::similarity_presence::BucketPresenceFilter>>,
     page_cache: Arc<SimilarityPageCache>,
 }
 
@@ -1226,7 +1250,22 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
         let Some(partition) = self.partition_for_key(key) else {
             return Ok(Vec::new());
         };
+        // A definite-absent presence answer proves this partition holds no
+        // reference for the key, so the Bucket-page probe (and its possible
+        // disk read) cannot find anything either. The filter is rebuilt
+        // from the audited pages of this same immutable Run on activation;
+        // when it is missing, probing proceeds exactly as before.
+        let filtered = self.partitions[partition].presence.as_deref();
+        if let Some(filter) = filtered
+            && !filter.might_contain(key)
+        {
+            self.page_cache.record_presence_skip();
+            return Ok(Vec::new());
+        }
         let ordinals = self.read_bucket(partition, key)?;
+        if ordinals.len == 0 && filtered.is_some() {
+            self.page_cache.record_presence_false_positive();
+        }
         let mut entries = Vec::with_capacity(usize::from(ordinals.len));
         // Bucket ordinals ascend, so candidates frequently share one Entry
         // page. Reusing it avoids one cache lookup (and one potential
@@ -1605,6 +1644,12 @@ pub(crate) struct SimilarityPageCache {
     // resident with their partition and are not cache entries.
     kind_hits: [AtomicU64; 2],
     kind_misses: [AtomicU64; 2],
+    // Presence filters live with their partitions, outside the unified
+    // cache budget; this ledger is their only bound and their evidence.
+    presence_budget: Arc<crate::similarity_presence::PresenceBudget>,
+    presence_skips: AtomicU64,
+    presence_false_positives: AtomicU64,
+    presence_declined: AtomicU64,
 }
 impl SimilarityPageCache {
     fn new(snapshot: MemoryPressureSnapshot, automatic_pressure: bool) -> Self {
@@ -1623,6 +1668,12 @@ impl SimilarityPageCache {
             target_pages: AtomicU64::new(0),
             kind_hits: [AtomicU64::new(0), AtomicU64::new(0)],
             kind_misses: [AtomicU64::new(0), AtomicU64::new(0)],
+            presence_budget: crate::similarity_presence::PresenceBudget::new(
+                crate::similarity_presence::MAX_PRESENCE_BYTES_TOTAL,
+            ),
+            presence_skips: AtomicU64::new(0),
+            presence_false_positives: AtomicU64::new(0),
+            presence_declined: AtomicU64::new(0),
         };
         cache.apply_pressure_snapshot(snapshot);
         cache
@@ -1690,6 +1741,29 @@ impl SimilarityPageCache {
             SIMILARITY_INDEX_PAGE_BYTES as u64,
         );
     }
+    pub(crate) fn presence_builder(
+        &self,
+        distinct_keys: usize,
+    ) -> Option<crate::similarity_presence::BucketPresenceBuilder> {
+        let builder = crate::similarity_presence::BucketPresenceBuilder::new(
+            distinct_keys,
+            Arc::clone(&self.presence_budget),
+        );
+        if builder.is_none() {
+            self.presence_declined.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        builder
+    }
+
+    pub(crate) fn record_presence_skip(&self) {
+        self.presence_skips.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    pub(crate) fn record_presence_false_positive(&self) {
+        self.presence_false_positives
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
     pub(crate) fn purge_run(&self, hash: [u8; 32], entry_pages: usize, bucket_pages: usize) {
         self.cache.remove(Self::key(hash, 0, 2));
         for ordinal in 0..entry_pages {
@@ -1721,6 +1795,11 @@ impl SimilarityPageCache {
             effective_limit_bytes: pressure.effective_limit_bytes(),
             available_bytes: pressure.available_bytes(),
             swap_used_bytes: pressure.swap_used_bytes(),
+            presence_skips: self.presence_skips.load(AtomicOrdering::Relaxed),
+            presence_false_positives: self.presence_false_positives.load(AtomicOrdering::Relaxed),
+            presence_declined: self.presence_declined.load(AtomicOrdering::Relaxed),
+            presence_bytes: self.presence_budget.used_bytes(),
+            presence_filters: self.presence_budget.live_filters(),
         }
     }
     fn apply_pressure_snapshot(&self, snapshot: MemoryPressureSnapshot) {
@@ -1998,6 +2077,11 @@ pub struct SimilarityIndexPageCacheStatus {
     effective_limit_bytes: u64,
     available_bytes: u64,
     swap_used_bytes: u64,
+    presence_skips: u64,
+    presence_false_positives: u64,
+    presence_declined: u64,
+    presence_bytes: u64,
+    presence_filters: u64,
 }
 
 impl SimilarityIndexPageCacheStatus {
@@ -2098,6 +2182,31 @@ impl SimilarityIndexPageCacheStatus {
     #[must_use]
     pub const fn swap_used_bytes(self) -> u64 {
         self.swap_used_bytes
+    }
+
+    #[must_use]
+    pub const fn presence_skips(self) -> u64 {
+        self.presence_skips
+    }
+
+    #[must_use]
+    pub const fn presence_false_positives(self) -> u64 {
+        self.presence_false_positives
+    }
+
+    #[must_use]
+    pub const fn presence_declined(self) -> u64 {
+        self.presence_declined
+    }
+
+    #[must_use]
+    pub const fn presence_bytes(self) -> u64 {
+        self.presence_bytes
+    }
+
+    #[must_use]
+    pub const fn presence_filters(self) -> u64 {
+        self.presence_filters
     }
 }
 
@@ -2606,6 +2715,82 @@ mod tests {
             "audit warming must not evict any resident page"
         );
         drop(second);
+        drop(index);
+        drop(repo);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn presence_filter_skips_absent_probes_without_changing_results() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("similarity-presence-{}", std::process::id()));
+        let storage = crate::FsStorageIo::open(&root).unwrap();
+        let repo = SimilarityIndexRepository::new_with_memory_snapshot(
+            storage,
+            MemoryPressureSnapshot::new(32 << 30, 30 << 30, 0),
+        );
+        let entries = (1..=2_000_u64)
+            .map(|n| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&n.to_be_bytes());
+                SimilarityIndexEntry::new(
+                    ChunkId::from_bytes(id),
+                    65536,
+                    1,
+                    [n.wrapping_mul(131) % 1021; 4],
+                    [n; 8],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        repo.publish_entries(1, entries.clone()).unwrap();
+        let index = repo.recover_generation(1).unwrap();
+        let status = repo.page_cache_status();
+        assert!(
+            status.presence_filters() >= 1 && status.presence_bytes() > 0,
+            "recovered partitions must carry a presence filter: {status:?}"
+        );
+        let profile = index.bucket_profile();
+        let present_length = similarity_bucket_length(profile, 65536);
+        // Present keys: results must equal the brute-force entry set.
+        for n in [1_u64, 7, 123, 999, 2_000] {
+            let sf = n.wrapping_mul(131) % 1021;
+            for slot in 0..4_u8 {
+                let key = SimilarityBucketKey::new(1, slot, present_length, sf).unwrap();
+                let found = index.bucket_entries(key).unwrap();
+                let mut expected: Vec<ChunkId> = entries
+                    .iter()
+                    .filter(|entry| entry.superfeatures()[usize::from(slot)] == sf)
+                    .map(|entry| entry.chunk_id())
+                    .collect();
+                let mut got: Vec<ChunkId> = found.iter().map(|entry| entry.chunk_id()).collect();
+                expected.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(got, expected, "filter changed results for {key:?}");
+                assert!(!got.is_empty());
+            }
+        }
+        // Absent keys (same superfeatures, a length band no entry uses)
+        // must be answered by the filter without touching a Bucket page.
+        let absent_length = similarity_bucket_length(profile, 131_072);
+        assert_ne!(absent_length, present_length);
+        let before = repo.page_cache_status();
+        for n in [3_u64, 42, 777, 1_500] {
+            let sf = n.wrapping_mul(131) % 1021;
+            let key = SimilarityBucketKey::new(1, 1, absent_length, sf).unwrap();
+            assert!(index.bucket_entries(key).unwrap().is_empty());
+        }
+        let after = repo.page_cache_status();
+        assert!(
+            after.presence_skips() > before.presence_skips(),
+            "absent probes must be answered by the presence filter"
+        );
+        assert_eq!(
+            after.bucket_misses(),
+            before.bucket_misses(),
+            "a presence skip must not touch a Bucket page"
+        );
+        assert_eq!(after.presence_false_positives(), 0);
         drop(index);
         drop(repo);
         std::fs::remove_dir_all(root).unwrap();
