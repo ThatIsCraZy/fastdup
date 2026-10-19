@@ -2546,6 +2546,72 @@ mod tests {
     }
 
     #[test]
+    fn audit_warming_never_evicts_demand_resident_pages() {
+        use super::*;
+        let root =
+            std::env::temp_dir().join(format!("similarity-audit-scan-{}", std::process::id()));
+        let storage = crate::FsStorageIo::open(&root).unwrap();
+        // The isolated namespace is capped at 512 pages, so two Runs of
+        // 12,000 entries each (~480 Entry pages plus Bucket pages) cannot
+        // both be resident: warming the second must fill headroom only.
+        let repo = SimilarityIndexRepository::new_with_memory_snapshot(
+            storage,
+            MemoryPressureSnapshot::new(32 << 30, 30 << 30, 0),
+        );
+        let entries = |range: std::ops::RangeInclusive<u64>| {
+            range
+                .map(|n| {
+                    let mut id = [0; 32];
+                    id[..8].copy_from_slice(&n.to_be_bytes());
+                    SimilarityIndexEntry::new(
+                        ChunkId::from_bytes(id),
+                        65536,
+                        1,
+                        [n.wrapping_mul(131) % 1021; 4],
+                        [n; 8],
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        repo.publish_entries(1, entries(1..=12_000)).unwrap();
+        let index = repo.recover_generation(1).unwrap();
+        // Demand-touch the first Run so its pages are proven residents.
+        assert!(
+            !index
+                .buckets()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .is_empty()
+        );
+        let filled = repo.page_cache_status();
+        assert!(
+            filled.resident_pages() >= filled.capacity_pages() - 32,
+            "fixture must fill the isolated cache: {} resident of {} capacity",
+            filled.resident_pages(),
+            filled.capacity_pages()
+        );
+        repo.publish_entries(2, entries(100_001..=112_000)).unwrap();
+        let before = repo.page_cache_status();
+        let second = repo.recover_generation(2).unwrap();
+        let after = repo.page_cache_status();
+        assert_eq!(
+            after.admission_evictions(),
+            before.admission_evictions(),
+            "audit warming is speculative: it must not evict demand pages"
+        );
+        assert_eq!(
+            after.evictions(),
+            before.evictions(),
+            "audit warming must not evict any resident page"
+        );
+        drop(second);
+        drop(index);
+        drop(repo);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn removing_a_retired_family_purges_its_cached_pages() {
         use super::*;
         let root =

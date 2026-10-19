@@ -18,8 +18,9 @@ pub enum MetadataReadReason {
     RecoveryScrub,
     GarbageCollection,
     IndexWarm,
+    IndexPublish,
 }
-const REASONS: [&str; 10] = [
+const REASONS: [&str; 11] = [
     "other",
     "indexLookup",
     "indexCompaction",
@@ -30,6 +31,7 @@ const REASONS: [&str; 10] = [
     "recoveryScrub",
     "garbageCollection",
     "indexWarm",
+    "indexPublish",
 ];
 const OBJECTS: [&str; 6] = [
     "exactIndex",
@@ -342,6 +344,55 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.reason == "other" && row.mode == "directStructure")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn similarity_publish_reads_attribute_separately_and_skip_the_raw_range_cache() {
+        let root = std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap())
+            .join(format!("metadata-publish-{}", std::process::id()));
+        let counters = Arc::new(MetadataReadCounters::default());
+        let mut storage = FsStorageIo::open(&root).unwrap();
+        storage.metadata_reads = Some(Arc::clone(&counters));
+        storage.create_new("sample.fds").unwrap();
+        storage.write_at("sample.fds", 0, &vec![77; 8192]).unwrap();
+        storage.sync_file("sample.fds").unwrap();
+        {
+            let _publish = MetadataReadScope::enter(MetadataReadReason::IndexPublish);
+            assert_eq!(
+                storage
+                    .read_exact_at("sample.fds", 4096, 4096)
+                    .unwrap()
+                    .len(),
+                4096
+            );
+            // Similarity pages are retained decoded in their own cache, so
+            // the raw storage-range cache must not assemble this read: the
+            // full 8 KiB reaches the backend again (a cached .fdx read
+            // above only fetched its missing 4 KiB page).
+            assert_eq!(storage.read("sample.fds").unwrap().len(), 8192);
+        }
+        let rows = counters.rows();
+        let publish: Vec<_> = rows
+            .iter()
+            .filter(|row| row.reason == "indexPublish" && row.object == "similarityIndex")
+            .collect();
+        assert_eq!(
+            publish.iter().map(|row| row.operations).sum::<u64>(),
+            2,
+            "publish reads must land on their own reason row"
+        );
+        assert_eq!(
+            publish.iter().map(|row| row.returned_bytes).sum::<u64>(),
+            4096 + 8192,
+            "similarity reads must bypass the raw storage-range cache"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.reason == "indexLookup" && row.operations > 0),
+            "publish work must not pollute the demand lookup row"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

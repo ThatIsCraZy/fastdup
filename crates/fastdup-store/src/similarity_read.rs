@@ -150,6 +150,11 @@ fn audit_source(
     audit.update(footer_offset, &exact_page(lease, footer_offset)?)?;
     audit.finish()?;
     drop(independent);
+    // Post-audit retention is speculative warming: it may fill eviction-free
+    // headroom (notably the empty cache at startup) but must never displace
+    // demand-resident pages. A newly compacted Run otherwise floods the
+    // cache with every Entry page and evicts hot query pages of other Runs.
+    let _warming = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
 
     if let Some(retained) = retained {
         let run_hash = descriptor.run_hash();

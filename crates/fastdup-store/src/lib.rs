@@ -4516,13 +4516,15 @@ struct CachedFileLayout {
 }
 
 fn immutable_storage_name(name: &str) -> bool {
+    // Similarity Runs (.fds/.fdsf) are excluded on purpose: their decoded
+    // pages already live in the SimilarityPage cache, so retaining the raw
+    // ranges here would charge every page twice against the common budget
+    // and halve the room decoded pages appear to have.
     !name.starts_with('.')
         && !name.starts_with("reduction-head.")
-        && [
-            ".fdc", ".fdm", ".fdx", ".fds", ".run", ".fdxset", ".fdsf", ".fdrc", ".fdd",
-        ]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
+        && [".fdc", ".fdm", ".fdx", ".run", ".fdxset", ".fdrc", ".fdd"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
 }
 
 /// Replaces a locked diagnostic record through the same aligned Direct-I/O

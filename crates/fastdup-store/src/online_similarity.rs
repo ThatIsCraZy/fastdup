@@ -536,6 +536,12 @@ impl<I: Clone + StorageIo> OnlineSimilarityRepository<I> {
         }
         // The builder loads one old value at a time. It does not retain 64
         // historical representatives for every changed key simultaneously.
+        // Those previous-value loads are publication work, not demand
+        // candidate lookup; attribute them separately so the lookup row
+        // stays a clean demand signal. The scope also covers the lazy
+        // bucket iterator consumed by publish_buckets below.
+        let _publish_reads =
+            crate::MetadataReadScope::enter(crate::MetadataReadReason::IndexPublish);
         if !mutations.is_empty() {
             let generation = next_generation(&mut publisher)?;
             let mut buckets = mutations
