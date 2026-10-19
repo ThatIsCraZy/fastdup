@@ -1,4 +1,6 @@
 //! Payload-free structural validation. This is deliberately not a content proof.
+use std::collections::BTreeMap;
+
 use super::dependent::{is_dependent_codec, is_zstd_prefix_codec, zstd_prefix_codec_id};
 use super::envelope::{IndexEntry, decode_index};
 use super::records::{validate_logical_chunk_length, validate_raw_record_constants};
@@ -58,6 +60,10 @@ impl ContainerStructure {
         hash.update(CONTAINER_COMMITMENT_DOMAIN_V1);
         hash.update(header);
         let mut entries = Vec::new();
+        // The Recovery Index carries no Base length; only the record header
+        // (offset 100) records it. Flex records pair differing Base/target
+        // lengths, so the target's own length must never stand in for it.
+        let mut base_lengths: BTreeMap<u64, u32> = BTreeMap::new();
         let mut summary =
             IntrinsicSummaryAccumulator::with_record_capacity(layout.record_count as usize)?;
         let mut cursor = HEADER_BYTES as u64;
@@ -88,6 +94,11 @@ impl ContainerStructure {
                 get_u32(&prefix, 56) as usize,
                 is_dependent_codec(codec).then_some(dependency_id),
             )?;
+            if is_dependent_codec(codec) {
+                let base_length = get_u32(&prefix, 100);
+                validate_logical_chunk_length(base_length as usize)?;
+                base_lengths.insert(cursor, base_length);
+            }
             IndexEntry::append_from_encoded_record(&prefix, cursor, &mut entries)?;
             hash.update(&prefix);
             cursor = end;
@@ -119,13 +130,23 @@ impl ContainerStructure {
         }
         let chunks = entries
             .into_iter()
-            .map(|entry| StructuralChunk {
-                chunk_id: entry.chunk_id,
-                logical_length: entry.logical_length,
-                dependency: is_dependent_codec(entry.codec_id)
-                    .then_some((ChunkId(entry.dependency_id), entry.logical_length)),
+            .map(|entry| {
+                let dependency = if is_dependent_codec(entry.codec_id) {
+                    let base_length = base_lengths
+                        .get(&entry.record_offset)
+                        .copied()
+                        .ok_or(FormatError::InvalidDependentRecord)?;
+                    Some((ChunkId(entry.dependency_id), base_length))
+                } else {
+                    None
+                };
+                Ok(StructuralChunk {
+                    chunk_id: entry.chunk_id,
+                    logical_length: entry.logical_length,
+                    dependency,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, FormatError>>()?;
         Ok(Self { descriptor, chunks })
     }
 }

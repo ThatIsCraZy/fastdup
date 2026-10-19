@@ -1,4 +1,6 @@
-use fastdup_format::{ContainerId, ContainerStructure, FormatError, HEADER_BYTES, SealedContainer};
+use fastdup_format::{
+    ChunkId, ContainerId, ContainerStructure, FormatError, HEADER_BYTES, SealedContainer,
+};
 
 fn fixture() -> Vec<u8> {
     let payload = vec![0x73; 256 * 1024];
@@ -114,4 +116,31 @@ fn structure_and_full_decoders_agree_for_all_compressed_codecs() {
             );
         }
     }
+}
+
+#[test]
+fn flex_dependency_reports_base_length_not_target_length() {
+    // Codec 5 (flex) pairs a Base and target of different lengths. The
+    // structural dependency must name the Base with the Base's own logical
+    // length; reporting the target length makes scrub/recovery look for a
+    // (Base ID, target length) key that can never exist independently.
+    let base = vec![b'A'; 65_536];
+    let mut target = base.clone();
+    target[177] = b'B';
+    target.extend_from_slice(&[b'C'; 4_464]);
+    assert_eq!(target.len(), 70_000);
+    let id = ContainerId::new([23; 16]).unwrap();
+    let image = SealedContainer::encode_zstd_prefix_pairs(id, 1, &[(&base, &target)])
+        .unwrap()
+        .into_bytes();
+    let checked = structure(&image).unwrap();
+    assert_eq!(checked.chunks().len(), 1);
+    let chunk = checked.chunks()[0];
+    assert_eq!(chunk.chunk_id, ChunkId::of(&target));
+    assert_eq!(chunk.logical_length, 70_000);
+    assert_eq!(
+        chunk.dependency,
+        Some((ChunkId::of(&base), 65_536)),
+        "dependency length must be the Base length recorded in the record header"
+    );
 }

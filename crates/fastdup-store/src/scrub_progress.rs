@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 const NAME: &str = ".fastdup-scrub-progress-v1";
-const MAGIC: &[u8; 8] = b"FDSCRB01";
+// v1 entries can carry a flex target's length as its Base length (the
+// structural reader once substituted it), so old rounds must never resume.
+const MAGIC: &[u8; 8] = b"FDSCRB02";
 const HEADER_LEN: usize = 80;
 const PENDING_FLUSH_BYTES: usize = 1024 * 1024;
 // Neither stopped nor completed passes may postpone latent-corruption checks indefinitely.
