@@ -2,7 +2,7 @@
 use crate::{ContainerRepository, PendingDataVerification, StorageIo, StoreError};
 use fastdup_format::{
     ChunkId, ContainerId, ContainerStructure, FOOTER_BYTES, HEADER_BYTES, MAX_CONTAINER_BYTES,
-    SealedContainerDescriptor, StructuralChunk,
+    MAX_LOGICAL_CHUNK_BYTES, SealedContainerDescriptor, StructuralChunk,
 };
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -654,15 +654,18 @@ fn decode_entry(bytes: &[u8], started: u64, now: u64) -> Option<ScrubCertificate
     for _ in 0..count {
         let chunk_id = ChunkId::from_bytes(reader.take()?);
         let logical_length = u32::from_le_bytes(reader.take()?);
-        if logical_length == 0 {
+        if logical_length == 0 || logical_length as usize > MAX_LOGICAL_CHUNK_BYTES {
             return None;
         }
         let dependency = match reader.take::<1>()?[0] {
             0 => None,
             1 => {
                 let base = ChunkId::from_bytes(reader.take()?);
+                // The Base is named with its own logical length; flex
+                // (codec 5) dependents legitimately differ from the target
+                // length, so only the format bound applies here.
                 let length = u32::from_le_bytes(reader.take()?);
-                if length != logical_length {
+                if length == 0 || length as usize > MAX_LOGICAL_CHUNK_BYTES {
                     return None;
                 }
                 Some((base, length))
@@ -693,5 +696,78 @@ impl Reader<'_> {
         let value = self.0.get(..N)?.try_into().ok()?;
         self.0 = &self.0[N..];
         Some(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastdup_format::{HEADER_BYTES, SealedContainer};
+
+    fn structure(image: &[u8]) -> ContainerStructure {
+        ContainerStructure::read(
+            &image[..HEADER_BYTES],
+            &image[image.len() - 4096..],
+            image.len() as u64,
+            |offset, length| {
+                Ok::<_, fastdup_format::FormatError>(
+                    image[offset as usize..offset as usize + length].to_vec(),
+                )
+            },
+        )
+        .expect("fixture structure")
+    }
+
+    fn flex_certificate(container_byte: u8, checked_at: u64) -> ScrubCertificate {
+        let base = vec![b'A'; 65_536];
+        let mut target = base.clone();
+        target[177] = b'B';
+        target.extend_from_slice(&[b'C'; 4_464]);
+        let id = ContainerId::new([container_byte; 16]).expect("fixture container id");
+        let image = SealedContainer::encode_zstd_prefix_pairs(id, 1, &[(&base, &target)])
+            .expect("flex fixture encodes")
+            .into_bytes();
+        ScrubCertificate::new(&structure(&image), checked_at)
+    }
+
+    #[test]
+    fn flex_dependent_certificates_survive_journal_reopen() {
+        // Flex (codec 5) dependents name their Base with the Base's own
+        // length, which differs from the target length. The journal reader
+        // once rejected exactly those entries, truncated the accepted
+        // prefix there, and silently disabled resume for every later mount.
+        let binding = [7; 32];
+        let first = flex_certificate(41, 100);
+        let second = flex_certificate(42, 100);
+        let dependency = first.chunks[0]
+            .dependency
+            .expect("flex fixture chunk is dependent");
+        assert_eq!(dependency.1, 65_536);
+        assert_eq!(first.chunks[0].logical_length, 70_000);
+
+        let root = std::path::PathBuf::from(std::env::var_os("TMPDIR").unwrap())
+            .join(format!("scrub-journal-flex-{}", std::process::id()));
+        let first_id = first.id;
+        let second_id = second.id;
+        {
+            let storage = crate::FsStorageIo::open(&root).unwrap();
+            let mut journal = ScrubProgress::open(storage, binding, 100).unwrap();
+            journal.record(&first).unwrap();
+            journal.record(&second).unwrap();
+            journal.sync().unwrap();
+        }
+        let storage = crate::FsStorageIo::open(&root).unwrap();
+        let journal = ScrubProgress::open(storage, binding, 101).unwrap();
+        let resumed = journal
+            .lookup(first_id, 101)
+            .unwrap()
+            .expect("flex certificate must decode after reopen");
+        assert_eq!(resumed.chunks[0].dependency, Some(dependency));
+        assert!(
+            journal.lookup(second_id, 101).unwrap().is_some(),
+            "entries after a flex certificate must not be truncated away"
+        );
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
