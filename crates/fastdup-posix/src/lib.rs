@@ -749,7 +749,10 @@ impl Operation<'_> {
                     | FallocateMode::InsertRange,
                 ..
             } => metadata,
-            Self::CloneRange { length, .. } if *length != 0 => metadata,
+            // Clone claims are planned per inode from the prepared extent
+            // count inside Namespace::clone_range, like write append credit;
+            // a fixed claim per syscall would charge thousands of sequential
+            // 4-MiB transform clones for Manifest paths they never copy.
             _ => CommitCapacityClaim::default(),
         }
     }
@@ -5749,7 +5752,7 @@ impl Namespace {
             });
         }
 
-        let source = {
+        let (source, prepared_extents) = {
             let state = source_object
                 .state
                 .read()
@@ -5762,7 +5765,9 @@ impl Namespace {
                 return Err(PosixError::Unsupported);
             };
             verify_prepared_clone_partition(&prepared, source_offset, length)?;
-            source
+            let prepared_extents =
+                u64::try_from(prepared.len()).expect("ASSERT: usize must fit in u64");
+            (source, prepared_extents)
         };
 
         let observer_order = target_object
@@ -5794,6 +5799,11 @@ impl Namespace {
             .checked_sub(overwritten)
             .and_then(|remaining| remaining.checked_add(length))
             .ok_or(PosixError::NoSpace)?;
+        let capacity = target
+            .data
+            .plan_clone_capacity(target_offset, length, prepared_extents)?;
+        let reservation =
+            self.reserve_commit_capacity(CommitCapacityClaim::new(capacity.metadata_bytes(), 0))?;
         let logical_quota =
             self.logical_quotas
                 .reserve_change(target_inode, logical_before, logical_after)?;
@@ -5805,6 +5815,7 @@ impl Namespace {
         target
             .data
             .clone_range(target_offset, source, source_offset, length, next_sequence)?;
+        target.data.accept_clone_capacity(capacity);
         assert_eq!(
             target.data.allocated_bytes(),
             logical_after,
@@ -5827,6 +5838,7 @@ impl Namespace {
         let target_size = target.data.logical_size();
         drop(target);
         logical_quota.accept();
+        reservation.accept();
         self.observe_truncate(target_inode, next_sequence, target_size);
         drop(observer_order);
         Ok(Reply::Cloned {

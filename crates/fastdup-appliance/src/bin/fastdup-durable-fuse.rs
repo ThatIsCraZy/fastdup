@@ -389,6 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(error) = checkpoint_cycle(
                         Arc::clone(&appliance),
                         gc_runtime.cancellation.clone(),
+                        &capacity_source,
                     )
                     .await
                     {
@@ -408,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(error) = checkpoint_cycle(
                     Arc::clone(&appliance),
                     gc_runtime.cancellation.clone(),
+                    &capacity_source,
                 )
                 .await
                 {
@@ -1581,9 +1583,32 @@ fn force_transient_checkpoint_staging_gate(appliance: &FsAppliance) -> bool {
     forced
 }
 
+fn emit_commit_capacity(source: &TieredStatFsSource) {
+    let status = source.commit_capacity_governor().status();
+    eprintln!(
+        concat!(
+            "commit_capacity metadata_limit_bytes={} data_limit_bytes={} ",
+            "small_file_limit_bytes={} reserved_metadata_bytes={} reserved_data_bytes={} ",
+            "reserved_small_file_bytes={} active_metadata_bytes={} active_data_bytes={} ",
+            "active_small_file_bytes={} frozen_generations={}"
+        ),
+        status.metadata_limit_bytes(),
+        status.data_limit_bytes(),
+        status.small_file_limit_bytes(),
+        status.reserved_metadata_bytes(),
+        status.reserved_data_bytes(),
+        status.reserved_small_file_bytes(),
+        status.active_metadata_bytes(),
+        status.active_data_bytes(),
+        status.active_small_file_bytes(),
+        status.frozen_generations(),
+    );
+}
+
 async fn checkpoint_cycle(
     appliance: Arc<FsAppliance>,
     gc_cancellation: MaintenanceCancellation,
+    capacity_source: &TieredStatFsSource,
 ) -> Result<(), String> {
     let already_paused = !appliance.namespace().mutation_admission_open();
     if already_paused {
@@ -1633,6 +1658,7 @@ async fn checkpoint_cycle(
         emit_checkpoint_metrics(&profiled);
     }
     emit_verified_read_cache(&appliance);
+    emit_commit_capacity(capacity_source);
     if !appliance.namespace().mutation_admission_open() {
         catch_up(Arc::clone(&appliance)).await?;
         appliance.namespace().resume_mutation_admission();

@@ -370,6 +370,15 @@ struct DirtyEpoch {
     data: SparseData,
     holes: RangeSet,
     append_metadata_covered_end: Option<u64>,
+    clone_metadata_coverage: Option<CloneCoverage>,
+}
+
+/// Remaining sequential-clone entry credit in the Active Dirty Epoch: the
+/// next append clone must start at `end_offset` to spend `extents_left`.
+#[derive(Clone, Copy, Debug)]
+struct CloneCoverage {
+    end_offset: u64,
+    extents_left: u64,
 }
 
 // A strict append from an empty base whose resulting size remains at most
@@ -386,6 +395,15 @@ const SINGLE_LEAF_APPEND_COVERAGE_END_BYTES_V1: u64 = 8 * 1_024 * 1_024;
 const SINGLE_LEAF_METADATA_BYTES_V1: u64 = 48 * 1_024;
 const SEQUENTIAL_APPEND_COVERAGE_BYTES_V1: u64 = 16 * 1_024 * 1_024;
 const SEQUENTIAL_APPEND_PATH_CLAIMS_V1: u64 = 4;
+
+// Sequential clones charge the same four-path bound as appends, but coverage
+// is counted in prepared Manifest entries (known exactly before mutation),
+// not bytes: 1,024 entries fill one leaf. Without this, a synthetic-full
+// transform issuing one 2-MiB path claim per 4-MiB extent clone can exhaust
+// Metadata headroom purely by syscall count while its real Manifest growth
+// is a few hundred KiB, and admission fails with ENOSPC on an empty disk.
+const SEQUENTIAL_CLONE_COVERAGE_EXTENTS_V1: u64 = 1_024;
+const SINGLE_LEAF_CLONE_COVERAGE_EXTENTS_V1: u64 = 513;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct WriteCapacityPlan {
@@ -408,6 +426,18 @@ impl WriteCapacityPlan {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CloneCapacityPlan {
+    metadata_bytes: u64,
+    clone_metadata_coverage: Option<CloneCoverage>,
+}
+
+impl CloneCapacityPlan {
+    pub(super) const fn metadata_bytes(self) -> u64 {
+        self.metadata_bytes
+    }
+}
+
 impl DirtyEpoch {
     fn new(base_size: u64, base_sequence: u64) -> Self {
         Self {
@@ -422,6 +452,7 @@ impl DirtyEpoch {
             },
             holes: RangeSet::default(),
             append_metadata_covered_end: None,
+            clone_metadata_coverage: None,
         }
     }
 
@@ -491,6 +522,69 @@ impl DirtyEpoch {
                 self.append_metadata_covered_end
                     .map_or(covered_end, |existing| existing.max(covered_end)),
             );
+        }
+    }
+
+    fn plan_clone_capacity(
+        &self,
+        offset: u64,
+        length: u64,
+        extents: u64,
+    ) -> Result<CloneCapacityPlan, PosixError> {
+        // Overwriting clones retain the full per-mutation path bound. Only
+        // exact EOF clones consume already reserved sequential coverage.
+        if offset != self.result_size {
+            return Ok(CloneCapacityPlan {
+                metadata_bytes: crate::MUTATION_METADATA_INCREMENT_BYTES_V1,
+                clone_metadata_coverage: None,
+            });
+        }
+        let end = offset.checked_add(length).ok_or(PosixError::FileTooLarge)?;
+        let mut metadata_bytes = 0_u64;
+        let mut budget = 0_u64;
+        if let Some(coverage) = self.clone_metadata_coverage
+            && coverage.end_offset == offset
+        {
+            budget = coverage.extents_left;
+        } else if self.base_size == 0 && offset == 0 && self.clone_metadata_coverage.is_none() {
+            // The first 513 entries of an empty base fit its single root
+            // leaf, exactly as for appends; extent counts are known, so no
+            // byte-derived estimate is needed.
+            metadata_bytes = SINGLE_LEAF_METADATA_BYTES_V1;
+            budget = SINGLE_LEAF_CLONE_COVERAGE_EXTENTS_V1;
+        }
+        let mut remaining = extents.saturating_sub(budget);
+        if remaining > 0 {
+            let windows = remaining.div_ceil(SEQUENTIAL_CLONE_COVERAGE_EXTENTS_V1);
+            let window_bytes = windows
+                .checked_mul(SEQUENTIAL_APPEND_PATH_CLAIMS_V1)
+                .and_then(|claims| claims.checked_mul(crate::MUTATION_METADATA_INCREMENT_BYTES_V1))
+                .ok_or(PosixError::NoSpace)?;
+            metadata_bytes = metadata_bytes
+                .checked_add(window_bytes)
+                .ok_or(PosixError::NoSpace)?;
+            budget = budget
+                .checked_add(
+                    windows
+                        .checked_mul(SEQUENTIAL_CLONE_COVERAGE_EXTENTS_V1)
+                        .ok_or(PosixError::NoSpace)?,
+                )
+                .ok_or(PosixError::NoSpace)?;
+            remaining = 0;
+        }
+        debug_assert_eq!(remaining, 0);
+        Ok(CloneCapacityPlan {
+            metadata_bytes,
+            clone_metadata_coverage: Some(CloneCoverage {
+                end_offset: end,
+                extents_left: budget - extents,
+            }),
+        })
+    }
+
+    fn accept_clone_capacity(&mut self, plan: CloneCapacityPlan) {
+        if let Some(coverage) = plan.clone_metadata_coverage {
+            self.clone_metadata_coverage = Some(coverage);
         }
     }
 
@@ -1253,6 +1347,19 @@ impl VersionedFile {
         self.active.accept_write_capacity(plan);
     }
 
+    pub(super) fn plan_clone_capacity(
+        &self,
+        offset: u64,
+        length: u64,
+        extents: u64,
+    ) -> Result<CloneCapacityPlan, PosixError> {
+        self.active.plan_clone_capacity(offset, length, extents)
+    }
+
+    pub(super) fn accept_clone_capacity(&mut self, plan: CloneCapacityPlan) {
+        self.active.accept_clone_capacity(plan);
+    }
+
     #[cfg(test)]
     fn write(&mut self, offset: u64, bytes: &[u8], sequence: u64) -> Result<(), PosixError> {
         self.write_payload(
@@ -1556,6 +1663,7 @@ impl VersionedFile {
             data: flattened,
             holes,
             append_metadata_covered_end: None,
+            clone_metadata_coverage: None,
         };
         self.live_allocated_bytes = allocated_bytes;
         self.active.assert_valid_after_mutation();

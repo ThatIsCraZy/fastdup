@@ -82,3 +82,17 @@ current observation epoch. Only a successful physical observation begun after
 that tag releases the DATA claim. Multiple claims may be conservatively
 coalesced behind the newest tag; this may delay reuse but can never authorize
 the same physical bytes twice.
+
+Amendment (Release 41): sequential EOF clones charge the same four-path bound
+as sequential appends, but coverage is counted in prepared Manifest entries,
+which clone admission knows exactly before mutation. Four path claims cover
+each window of 1,024 sequential clone entries (one full leaf plus tail and
+early close, as for appends); an empty base's first 513 entries fit its single
+root leaf for 48 KiB. Overwriting clones retain the full 2-MiB claim each.
+Without entry-counted coverage, a synthetic-full transform issuing one
+2-MiB claim per 4-MiB extent clone exhausted Metadata headroom purely by
+syscall count while its real Manifest growth stayed orders of magnitude
+smaller, failing clones with `ENOSPC` on an almost empty disk (observed
+2026-10-20). Governor status (limits, reserved and active claims per tier,
+frozen generations) is emitted with the per-checkpoint telemetry so claim
+pressure is attributable when admission denies.

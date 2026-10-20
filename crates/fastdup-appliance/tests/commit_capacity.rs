@@ -630,6 +630,160 @@ fn sequential_128k_writes_do_not_exhaust_metadata_by_syscall_count() {
     );
 }
 
+#[derive(Debug)]
+struct FillCloneFile {
+    length: u64,
+}
+
+impl CommittedFile for FillCloneFile {
+    fn logical_size(&self) -> u64 {
+        self.length
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.length
+    }
+
+    fn allocated_bytes_in_range(&self, offset: u64, length: u64) -> Result<u64, PosixError> {
+        Ok(offset.saturating_add(length).min(self.length) - offset.min(self.length))
+    }
+
+    fn read_at(&self, offset: u64, length: u32) -> Result<Vec<u8>, PosixError> {
+        let end = offset.saturating_add(u64::from(length)).min(self.length);
+        Ok(vec![
+            b'Z';
+            usize::try_from(end - offset)
+                .expect("ASSERT: bounded test read fits")
+        ])
+    }
+
+    fn prepared_data_recipe(&self) -> Option<fastdup_posix::PreparedDataRecipe> {
+        Some(fastdup_posix::PreparedDataRecipe::Chunk {
+            chunk_id: [0x7a; 32],
+        })
+    }
+}
+
+#[test]
+fn sequential_clones_do_not_exhaust_metadata_by_syscall_count() {
+    const EXTENT_BYTES: u64 = 4 * 1_024 * 1_024;
+    const CLONE_COUNT: u64 = 64;
+
+    let governor = Arc::new(
+        CommitCapacityGovernor::new(CommitCapacitySnapshot::new(
+            COMMIT_METADATA_FLOOR_BYTES_V1 + 16 * 1_024 * 1_024,
+            128 * 1_024 * 1_024,
+        ))
+        .expect("capacity floor fits"),
+    );
+    let source = CommittedInode::new(
+        2,
+        0o600,
+        1_000,
+        1_000,
+        1,
+        7,
+        Arc::new(FillCloneFile {
+            length: EXTENT_BYTES,
+        }),
+    )
+    .expect("source inode");
+    let target = CommittedInode::new(
+        3,
+        0o600,
+        1_000,
+        1_000,
+        1,
+        11,
+        Arc::new(FillCloneFile { length: 0 }),
+    )
+    .expect("target inode");
+    let snapshot = CommittedNamespaceSnapshot::new(
+        4,
+        4_096,
+        12,
+        vec![source, target],
+        vec![
+            CommittedEntry::new(1, 2, b"source".to_vec()).expect("source entry"),
+            CommittedEntry::new(1, 3, b"target".to_vec()).expect("target entry"),
+        ],
+    )
+    .expect("snapshot");
+    let namespace = Namespace::from_committed_writable(NamespaceConfig::default(), snapshot)
+        .expect("writable namespace");
+    namespace.install_commit_capacity_admission(governor.clone());
+    let source_inode = InodeId::new(2).expect("source inode id");
+    let target_inode = InodeId::new(3).expect("target inode id");
+    let Reply::Opened(source_handle) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: source_inode,
+                options: OpenOptions::READ_ONLY,
+                truncate: false,
+            },
+        )
+        .expect("source open")
+    else {
+        panic!("source open reply")
+    };
+    let Reply::Opened(target_handle) = namespace
+        .dispatch(
+            CALLER,
+            Operation::Open {
+                inode: target_inode,
+                options: OpenOptions::READ_WRITE,
+                truncate: false,
+            },
+        )
+        .expect("target open")
+    else {
+        panic!("target open reply")
+    };
+
+    // A synthetic-full transform compiles its target from tens of thousands
+    // of sequential 4-MiB extent clones. Each clone adds one prepared
+    // Manifest entry, so admission must be bounded by entries, not syscall
+    // count: with only 16 MiB of Metadata headroom, one 2-MiB path claim
+    // per clone would fail the ninth clone although no commit is anywhere
+    // near the physical Metadata bound.
+    for ordinal in 0..CLONE_COUNT {
+        namespace
+            .dispatch(
+                CALLER,
+                Operation::CloneRange {
+                    source_inode,
+                    source_handle,
+                    source_offset: 0,
+                    target_inode,
+                    target_handle,
+                    target_offset: ordinal * EXTENT_BYTES,
+                    length: EXTENT_BYTES,
+                },
+            )
+            .expect("sequential clone must not reserve one Manifest path per syscall");
+    }
+
+    let status = governor.status();
+    assert!(
+        status.active_metadata_bytes() <= 1_024 * 1_024,
+        "64 sequential one-extent clones have a small bounded claim, got {}",
+        status.active_metadata_bytes()
+    );
+    let Reply::Attr(attributes) = namespace
+        .dispatch(
+            CALLER,
+            Operation::GetAttr {
+                inode: target_inode,
+            },
+        )
+        .expect("read final size")
+    else {
+        panic!("attribute reply")
+    };
+    assert_eq!(attributes.size, CLONE_COUNT * EXTENT_BYTES);
+}
+
 #[test]
 fn discontinuous_writes_retain_one_manifest_path_claim_each() {
     let governor = Arc::new(
