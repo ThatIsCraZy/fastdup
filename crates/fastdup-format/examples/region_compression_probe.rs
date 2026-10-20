@@ -26,6 +26,16 @@ struct Config {
 }
 
 fn compress(input: &[u8], level: i32, window_log: Option<u32>) -> Vec<u8> {
+    compress_with(input, level, window_log, None, None)
+}
+
+fn compress_with(
+    input: &[u8],
+    level: i32,
+    window_log: Option<u32>,
+    dictionary: Option<&[u8]>,
+    prefix: Option<&[u8]>,
+) -> Vec<u8> {
     let bound = zstd::zstd_safe::compress_bound(input.len());
     let mut out = vec![0_u8; bound];
     let mut ctx = zstd::zstd_safe::CCtx::try_create().expect("cctx");
@@ -41,9 +51,23 @@ fn compress(input: &[u8], level: i32, window_log: Option<u32>) -> Vec<u8> {
     }
     ctx.set_pledged_src_size(Some(input.len() as u64))
         .expect("pledged size");
+    if let Some(dict) = dictionary {
+        ctx.load_dictionary(dict).expect("load dictionary");
+    }
+    if let Some(prefix) = prefix {
+        ctx.ref_prefix(prefix).expect("ref prefix");
+    }
     let written = ctx.compress2(&mut out, input).expect("compress");
     out.truncate(written);
     out
+}
+
+fn decompress_with(frame: &[u8], output: &mut [u8], dictionary: Option<&[u8]>) -> usize {
+    let mut ctx = zstd::zstd_safe::DCtx::try_create().expect("dctx");
+    if let Some(dict) = dictionary {
+        ctx.load_dictionary(dict).expect("load dictionary");
+    }
+    ctx.decompress(output, frame).expect("decompress")
 }
 
 fn decompress(frame: &[u8], output: &mut [u8]) -> usize {
@@ -163,6 +187,77 @@ fn main() {
                 data.len() as f64 / 1048576.0 / decomp_s,
                 extract_ms,
                 n as f64 / 1048576.0,
+            );
+        }
+        // Dictionary variants on the held-out windows: the dictionary is
+        // trained only on the first sampled window, then every remaining
+        // 512-KiB frame is compressed against it (or against its raw
+        // predecessor as a prefix). Both keep single-frame random access;
+        // the prefix variant additionally needs the predecessor frame.
+        if data.len() > WINDOW {
+            let (train, eval) = data.split_at(WINDOW);
+            let samples: Vec<&[u8]> = train.chunks(FRAME_512K).collect();
+            let dict = zstd::dict::from_samples(&samples, 112 * 1024).expect("train dict");
+            for (label, use_dict, use_prefix) in [
+                ("512K L3 train-dict112K", true, false),
+                ("512K L3 prev-prefix", false, true),
+            ] {
+                let started = Instant::now();
+                let mut frames: Vec<Vec<u8>> = Vec::new();
+                let mut out_bytes = 0_u64;
+                let mut previous: Option<&[u8]> = None;
+                for piece in eval.chunks(FRAME_512K) {
+                    let frame = compress_with(
+                        piece,
+                        3,
+                        Some(19),
+                        use_dict.then_some(dict.as_slice()),
+                        use_prefix.then_some(()).and(previous),
+                    );
+                    out_bytes += frame.len() as u64;
+                    frames.push(frame);
+                    previous = Some(piece);
+                }
+                let comp_s = started.elapsed().as_secs_f64();
+                let started = Instant::now();
+                let mut scratch = vec![0_u8; FRAME_512K];
+                let mut restored = 0_u64;
+                let pieces: Vec<&[u8]> = eval.chunks(FRAME_512K).collect();
+                for (i, frame) in frames.iter().enumerate() {
+                    let dict_arg = if use_prefix && i > 0 {
+                        Some(pieces[i - 1])
+                    } else if use_dict {
+                        Some(dict.as_slice())
+                    } else {
+                        None
+                    };
+                    // zstd treats a raw prefix as dictionary content for
+                    // decoding purposes in this probe accounting.
+                    restored += decompress_with(frame, &mut scratch, dict_arg) as u64;
+                }
+                let decomp_s = started.elapsed().as_secs_f64();
+                assert_eq!(restored, eval.len() as u64);
+                println!(
+                    "  {:24} out_MiB={:9.2} ratio={:5.1}% comp_MiB_s={:8.0} decomp_MiB_s={:8.0} (eval_MiB={:.0}, dict_KiB={:.0})",
+                    label,
+                    out_bytes as f64 / 1048576.0,
+                    100.0 * out_bytes as f64 / eval.len() as f64,
+                    eval.len() as f64 / 1048576.0 / comp_s,
+                    eval.len() as f64 / 1048576.0 / decomp_s,
+                    eval.len() as f64 / 1048576.0,
+                    dict.len() as f64 / 1024.0,
+                );
+            }
+            // Held-out baseline for a fair dictionary comparison.
+            let mut out_bytes = 0_u64;
+            for piece in eval.chunks(FRAME_512K) {
+                out_bytes += compress(piece, 3, Some(19)).len() as u64;
+            }
+            println!(
+                "  {:24} out_MiB={:9.2} ratio={:5.1}% (held-out baseline)",
+                "512K L3 held-out",
+                out_bytes as f64 / 1048576.0,
+                100.0 * out_bytes as f64 / eval.len() as f64,
             );
         }
     }
