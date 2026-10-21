@@ -45,7 +45,7 @@ pub fn metadata_object_kind(bytes: &[u8]) -> Result<MetadataObjectKind, Metadata
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MetadataObjectId([u8; 32]);
 
 impl MetadataObjectId {

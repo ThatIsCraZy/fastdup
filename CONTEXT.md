@@ -245,8 +245,9 @@ _Avoid_: Recovery checkpoint, online index
 
 **Recovery checkpoint**:
 A Data-Tier copy of committed Namespace and Manifest recovery state for
-rebuilding after complete Metadata-Tier loss. It may lag normal durability and
-contains no online index.
+rebuilding after complete Metadata-Tier loss. It is stored as a chain: one Base
+with the complete graph and Deltas with only the objects new since their parent.
+It may lag normal durability and contains no online index.
 _Avoid_: Commit WAL, normal checkpoint, snapshot, backup
 
 **Visible version**:

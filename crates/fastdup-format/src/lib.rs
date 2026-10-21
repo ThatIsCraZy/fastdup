@@ -98,17 +98,22 @@ pub use metadata_mark_catalog::{
 pub use namespace::{
     DurableInode, DurableInodeKind, DurableRootMetadata, DurableTimes, DurableTimestamp,
     DurableXattr, EncodedNamespaceGraph, EncodedNamespaceShard, NAMESPACE_ROOT_HEADER_BYTES,
-    NamespaceEntry, NamespaceGcGraph, NamespaceGraphRoot, NamespaceRoot, NamespaceShardRef,
+    NamespaceEntry, NamespaceGcGraph, NamespaceGraphRoot, NamespaceObjectReferences, NamespaceRoot,
+    NamespaceShardRef, decode_namespace_object_references,
 };
 pub use pool_identity::{
     ApplianceId, POOL_IDENTITY_RECORD_BYTES, PoolId, PoolIdentityFormatError, PoolIdentityRecord,
     PoolRole,
 };
 pub use recovery_checkpoint::{
-    RECOVERY_CHECKPOINT_ENTRY_ALIGNMENT, RECOVERY_CHECKPOINT_ENTRY_HEADER_BYTES,
     RECOVERY_CHECKPOINT_FOOTER_BYTES, RECOVERY_CHECKPOINT_HEAD_BYTES,
-    RECOVERY_CHECKPOINT_HEADER_BYTES, RecoveryCheckpointDescriptor, RecoveryCheckpointEntryHeader,
-    RecoveryCheckpointFormatError, RecoveryCheckpointHeadRecord,
+    RECOVERY_CHECKPOINT_HEADER_BYTES, RECOVERY_CHECKPOINT_MAX_CHAIN_FILES,
+    RECOVERY_CHECKPOINT_PAYLOAD_ALIGNMENT, RECOVERY_CHECKPOINT_PAYLOAD_OFFSET,
+    RECOVERY_CHECKPOINT_TABLE_RECORD_BYTES, RecoveryCheckpointBody, RecoveryCheckpointChain,
+    RecoveryCheckpointDescriptor, RecoveryCheckpointFormatError, RecoveryCheckpointHeadRecord,
+    RecoveryCheckpointLink, RecoveryCheckpointObjectFacts, RecoveryCheckpointObjectKind,
+    RecoveryCheckpointTableRecord, decode_recovery_checkpoint_table,
+    recovery_checkpoint_padded_length,
 };
 pub use similarity_index::{
     SIMILARITY_BUCKET_PROFILE_V1, SIMILARITY_BUCKET_PROFILE_V2, SIMILARITY_BUCKET_REFERENCE_BYTES,

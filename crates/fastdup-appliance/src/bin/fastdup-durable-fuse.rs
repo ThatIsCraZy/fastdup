@@ -829,12 +829,15 @@ async fn publish_recovery_checkpoint_background(
 ) {
     match publish_recovery_checkpoint_once(generations, checkpoints).await {
         Ok(Some(summary)) => eprintln!(
-            "data_tier_recovery_checkpoint_ok=true generation={} metadata_objects={} metadata_bytes={} required_chunks={} file_bytes={}",
+            "data_tier_recovery_checkpoint_ok=true generation={} base={} metadata_objects={} metadata_bytes={} required_chunks={} file_bytes={} chain_files={} chain_metadata_bytes={}",
             summary.generation(),
+            summary.is_base(),
             summary.metadata_object_count(),
             summary.metadata_payload_bytes(),
             summary.required_chunk_count(),
             summary.file_length(),
+            summary.chain_file_count(),
+            summary.chain_metadata_payload_bytes(),
         ),
         Ok(None) => {}
         Err(error) => eprintln!("data_tier_recovery_checkpoint_error={error}"),

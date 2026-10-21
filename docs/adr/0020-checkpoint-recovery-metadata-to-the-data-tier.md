@@ -4,6 +4,11 @@ status: accepted
 
 # Checkpoint recovery metadata to the data tier
 
+Current format (2026-10-21): [ADR 0104](0104-chain-incremental-recovery-checkpoints.md)
+replaces the full-copy publication and the v1 format below with chains of one
+Base and incremental Deltas. Schedule, head selection, recovery ordering and
+DATA-tier placement remain as recorded here.
+
 Current policy (2026-09-07): [ADR 0090](0090-mount-after-structural-validation-and-scrub-in-background.md)
 implements structural normal startup followed by background content scrub.
 It supersedes mandatory startup rehashing and the runtime's repeated DATA proof
@@ -39,7 +44,7 @@ process-local root pin protects a candidate while its graph is copied, but the
 scan, verification, and HDD publication hold neither the Commit lock nor the
 Metadata-GC publication barrier. The exact v1 byte layout and crash boundaries
 are specified in
-[`recovery-checkpoint-v1.md`](../specs/recovery-checkpoint-v1.md).
+[`recovery-checkpoint-v2.md`](../specs/recovery-checkpoint-v2.md).
 
 During shutdown the periodic scheduler is stopped immediately, alongside GC and
 Scrub, so it cannot repeatedly copy the same graph while another worker drains.

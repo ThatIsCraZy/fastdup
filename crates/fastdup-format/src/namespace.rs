@@ -1299,6 +1299,59 @@ impl NamespaceGraphRoot {
     }
 }
 
+/// Metadata Object references carried by one Namespace graph object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamespaceObjectReferences {
+    /// Shard identities in descriptor order.
+    GraphRoot(Vec<MetadataObjectId>),
+    /// One Manifest Root and logical size per regular-file inode.
+    InodeShard(Vec<(MetadataObjectId, u64)>),
+    /// Directory-entry records carry no Metadata Object references.
+    EntryShard,
+}
+
+/// Fully decodes one Namespace graph root or shard on its own and returns its
+/// outgoing Metadata references. Cross-shard partition checks remain the job
+/// of [`NamespaceRoot::decode_graph`].
+///
+/// # Errors
+///
+/// Returns any envelope, magic, field, or record failure.
+pub fn decode_namespace_object_references(
+    encoded: &[u8],
+) -> Result<NamespaceObjectReferences, MetadataFormatError> {
+    let object = decode_metadata_object(Some(NAMESPACE_ROOT_KIND), encoded)?;
+    let magic = object
+        .payload
+        .get(..8)
+        .ok_or(MetadataFormatError::InvalidPayload)?;
+    if magic == NAMESPACE_GRAPH_MAGIC_V2 {
+        let root = NamespaceGraphRoot::decode(encoded)?;
+        Ok(NamespaceObjectReferences::GraphRoot(
+            root.shards
+                .iter()
+                .map(|reference| reference.object_id)
+                .collect(),
+        ))
+    } else if magic == INODE_SHARD_MAGIC {
+        Ok(NamespaceObjectReferences::InodeShard(
+            decode_inode_shard(encoded)?
+                .into_iter()
+                .filter_map(|inode| {
+                    inode
+                        .manifest_root
+                        .map(|manifest_root| (manifest_root, inode.logical_size))
+                })
+                .collect(),
+        ))
+    } else if magic == ENTRY_SHARD_MAGIC {
+        decode_entry_shard(encoded)?;
+        Ok(NamespaceObjectReferences::EntryShard)
+    } else {
+        Err(MetadataFormatError::InvalidPayload)
+    }
+}
+
 /// Encodes the Namespace as record-range shards plus one graph root.
 ///
 /// Shard boundaries come from the record keys alone, so two generations that

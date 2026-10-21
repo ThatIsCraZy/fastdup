@@ -3,7 +3,7 @@ use fastdup_format::{
     ManifestInnerNode, ManifestInnerNodeError, ManifestLayout, ManifestLeaf, MetadataFormatError,
     MetadataObjectId, MetadataObjectKind, metadata_object_kind,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::ops::Range;
@@ -1642,6 +1642,113 @@ struct PendingNode {
     expected_length: Option<u64>,
     expected_level: Option<u16>,
     expected_allocated_bytes: Option<u64>,
+}
+
+impl PendingNode {
+    fn admits(&self, facts: ManifestNodeFacts) -> bool {
+        self.expected_level.is_none_or(|level| level == facts.level)
+            && self
+                .expected_length
+                .is_none_or(|length| length == facts.logical_length)
+            && self
+                .expected_allocated_bytes
+                .is_none_or(|expected| facts.allocated_bytes == Some(expected))
+    }
+}
+
+/// Structural facts of one Manifest node that every parent reference must match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManifestNodeFacts {
+    pub(crate) level: u16,
+    pub(crate) logical_length: u64,
+    pub(crate) allocated_bytes: Option<u64>,
+}
+
+/// Walks only the part of one Manifest tree that is not already recorded.
+///
+/// `known` answers for complete subtrees verified when they were first
+/// recorded elsewhere; their parent reference is checked against the facts and
+/// the subtree is not read. Every other node is read, validated exactly like a
+/// complete walk, and added to `discovered`, so a subtree shared by several
+/// files is read once per scan. `visit` sees the extents of new leaves only.
+pub(crate) fn scan_unknown_manifest_nodes<K, F, V>(
+    root: MetadataObjectId,
+    expected_length: u64,
+    known: K,
+    discovered: &mut BTreeMap<MetadataObjectId, ManifestNodeFacts>,
+    read: &mut F,
+    mut visit: V,
+) -> Result<(), ManifestTreeError>
+where
+    K: Fn(MetadataObjectId) -> Option<ManifestNodeFacts>,
+    F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, ManifestTreeError>,
+    V: FnMut(&ManifestExtent) -> Result<(), ManifestTreeError>,
+{
+    let mut pending = vec![PendingNode {
+        object_id: root,
+        absolute_offset: 0,
+        expected_length: Some(expected_length),
+        expected_level: None,
+        expected_allocated_bytes: None,
+    }];
+    while let Some(candidate) = pending.pop() {
+        if let Some(facts) = discovered
+            .get(&candidate.object_id)
+            .copied()
+            .or_else(|| known(candidate.object_id))
+        {
+            if !candidate.admits(facts) {
+                return Err(ManifestTreeError::InvalidTree);
+            }
+            continue;
+        }
+        let facts = match decode_manifest_node(candidate.object_id, read)? {
+            DecodedManifestNode::Leaf(leaf) => {
+                let mut local_offset = 0_u64;
+                for extent in leaf.extents() {
+                    visit(extent)?;
+                    local_offset = local_offset
+                        .checked_add(extent_length(extent))
+                        .ok_or(ManifestTreeError::ArithmeticOverflow)?;
+                }
+                if local_offset != leaf.file_length() {
+                    return Err(ManifestTreeError::InvalidTree);
+                }
+                ManifestNodeFacts {
+                    level: 0,
+                    logical_length: leaf.file_length(),
+                    allocated_bytes: Some(manifest_allocated_bytes(leaf.extents())?),
+                }
+            }
+            DecodedManifestNode::Inner(node) => {
+                if node.level() == 0 || node.level() > MAX_TREE_LEVEL {
+                    return Err(ManifestTreeError::InvalidTree);
+                }
+                pending
+                    .try_reserve(node.children().len())
+                    .map_err(|_| ManifestTreeError::OutOfMemory)?;
+                for child in node.children().iter().rev() {
+                    pending.push(PendingNode {
+                        object_id: child.child(),
+                        absolute_offset: 0,
+                        expected_length: Some(child.logical_length()),
+                        expected_level: Some(node.level() - 1),
+                        expected_allocated_bytes: child.allocated_bytes(),
+                    });
+                }
+                ManifestNodeFacts {
+                    level: node.level(),
+                    logical_length: node.file_length(),
+                    allocated_bytes: node.allocated_bytes()?,
+                }
+            }
+        };
+        if !candidate.admits(facts) {
+            return Err(ManifestTreeError::InvalidTree);
+        }
+        discovered.insert(candidate.object_id, facts);
+    }
+    Ok(())
 }
 
 fn walk_manifest_tree<F, V>(

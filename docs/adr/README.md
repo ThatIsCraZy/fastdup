@@ -21,7 +21,7 @@ is dated evidence, not the current decision map.
 | Exact Index | 0035, 0044, 0045, 0079: immutable generations, activation, compaction, leased mappings; 0046's dated 2026-09-16 section bounds protected warming; 0035 remains proposed with scale/performance gates. |
 | Read and publication paths | 0046, 0058, 0077: one Unified Read Cache, Direct I/O, direct FUSE handles, io_uring DATA publication, and restore locality. ADRs 0051 and 0073 are superseded; userspace prefetch from 0030 remains open. |
 | Write ingestion | 0041, 0053, 0054, 0057, 0099: owned FUSE payloads feed ordered SeqCDC Lanes and ordered Container retirement; bounded parallel FUSE writes remain proposed pending Veeam qualification. |
-| Recovery and GC | 0020, 0037, 0064–0072: DATA-tier checkpoints, graph proof, local victim proofs, Metadata marks, lease and recovery latch. |
+| Recovery and GC | 0020, 0104, 0037, 0064–0072: DATA-tier checkpoint chains (Base plus incremental Deltas), graph proof, local victim proofs, Metadata marks, lease and recovery latch. |
 | Capacity and placement | 0080–0084: pool identity, distinct XFS filesystems, Small-File project quota, physical admission and cached capacity reporting. |
 | Commit cut | 0096–0098: announce before fencing, admit the backlog during the cut, and charge the pending-region gate only for live Lane payload. |
 | Commit cost | 0094, 0095: prove once, publish record-range shards, and reuse unchanged objects. Commit construction remains O(Namespace) until the commit-side mirror is incremental. |

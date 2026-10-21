@@ -25,6 +25,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
+pub(crate) use checkpoint_copy::CheckpointIncrement;
 pub use error::GenerationError;
 pub use results::WalTail;
 pub use results::{

@@ -1,3 +1,4 @@
+//! DATA-tier Recovery Checkpoint chains (ADR 0104, `recovery-checkpoint-v2`).
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -6,14 +7,20 @@ use std::sync::{Arc, Mutex};
 
 use fastdup_format::{
     COMMIT_RECORD_BYTES, ChunkId, CommitFormatError, CommitRecord, ManifestExtent,
-    MetadataFormatError, MetadataObjectId, NamespaceGraphRoot, NamespaceRoot,
-    RECOVERY_CHECKPOINT_ENTRY_HEADER_BYTES, RECOVERY_CHECKPOINT_FOOTER_BYTES,
-    RECOVERY_CHECKPOINT_HEAD_BYTES, RECOVERY_CHECKPOINT_HEADER_BYTES, RecoveryCheckpointDescriptor,
-    RecoveryCheckpointEntryHeader, RecoveryCheckpointFormatError, RecoveryCheckpointHeadRecord,
+    ManifestInnerNode, ManifestLeaf, MetadataFormatError, MetadataObjectId, MetadataObjectKind,
+    NamespaceGraphRoot, NamespaceObjectReferences, NamespaceRoot, RECOVERY_CHECKPOINT_FOOTER_BYTES,
+    RECOVERY_CHECKPOINT_HEAD_BYTES, RECOVERY_CHECKPOINT_HEADER_BYTES,
+    RECOVERY_CHECKPOINT_MAX_CHAIN_FILES, RECOVERY_CHECKPOINT_PAYLOAD_OFFSET,
+    RECOVERY_CHECKPOINT_TABLE_RECORD_BYTES, RecoveryCheckpointBody, RecoveryCheckpointChain,
+    RecoveryCheckpointDescriptor, RecoveryCheckpointFormatError, RecoveryCheckpointHeadRecord,
+    RecoveryCheckpointLink, RecoveryCheckpointObjectFacts, RecoveryCheckpointObjectKind,
+    RecoveryCheckpointTableRecord, decode_namespace_object_references,
+    decode_recovery_checkpoint_table, metadata_object_kind, recovery_checkpoint_padded_length,
 };
 
 use crate::generation::{
-    GenerationError, GenerationRepository, RecoveredGeneration, RequiredChunkVerifier,
+    CheckpointIncrement, GenerationError, GenerationRepository, RecoveredGeneration,
+    RequiredChunkVerifier,
 };
 use crate::immutable_write::ImmutableWriteBuffer;
 use crate::manifest_tree::{ManifestTreeError, scan_manifest_tree};
@@ -22,108 +29,75 @@ use crate::{MAX_STORAGE_RANGE_BYTES, StorageIo, StoreError};
 const CHECKPOINT_PREFIX: &str = "recovery-checkpoint.";
 const CHECKPOINT_SUFFIX: &str = ".fdrc";
 const HEAD_NAMES: [&str; 2] = ["recovery-checkpoint.0.head", "recovery-checkpoint.1.head"];
-const CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT: usize = 8_388_608;
+/// Child and Chunk references the Online-GC protection cache may retain.
+const CHECKPOINT_PROTECTED_REFERENCE_CACHE_LIMIT: usize = 8_388_608;
 
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
-struct CheckpointProtectedIdentity {
-    generation: u64,
-    file_length: u64,
-    body_hash: [u8; 32],
+/// Outgoing references of one object embedded in a verified checkpoint file.
+#[derive(Debug, Default)]
+struct NodeReferences {
+    children: Vec<MetadataObjectId>,
+    chunks: Vec<(ChunkId, u64)>,
 }
 
-struct ProtectedChunkEntry {
-    chunk_id: ChunkId,
-    logical_length: u32,
-}
-
-struct CheckpointProtectedChunkSet {
-    entries: Vec<ProtectedChunkEntry>,
-}
-
-impl CheckpointProtectedChunkSet {
-    fn matched(&self, selected: &BTreeSet<ChunkId>) -> BTreeMap<ChunkId, u64> {
-        let mut matched = BTreeMap::new();
-        for chunk_id in selected {
-            if let Ok(index) = self
-                .entries
-                .binary_search_by(|entry| entry.chunk_id.cmp(chunk_id))
-            {
-                matched.insert(*chunk_id, u64::from(self.entries[index].logical_length));
-            }
-        }
-        matched
-    }
+/// References of every object embedded in one verified checkpoint file.
+#[derive(Debug, Default)]
+struct FileReferences {
+    nodes: HashMap<MetadataObjectId, NodeReferences>,
+    reference_count: usize,
 }
 
 #[derive(Default)]
 struct CheckpointProtectedChunkCacheState {
-    entries: HashMap<CheckpointProtectedIdentity, Arc<CheckpointProtectedChunkSet>>,
-    retained_chunks: usize,
+    files: HashMap<RecoveryCheckpointLink, Arc<FileReferences>>,
+    retained_references: usize,
 }
 
+/// Online-GC cache of per-file references, keyed by immutable file identity.
+/// A new Delta costs one read of that Delta; protection itself is an exact
+/// in-memory traversal of every retained recovery point.
 #[derive(Default)]
 pub(crate) struct CheckpointProtectedChunkCache {
     state: Mutex<CheckpointProtectedChunkCacheState>,
 }
 
 impl CheckpointProtectedChunkCache {
-    fn retain_current(&self, active: &HashSet<CheckpointProtectedIdentity>) {
+    fn retain_current(&self, active: &HashSet<RecoveryCheckpointLink>) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state
-            .entries
-            .retain(|identity, _| active.contains(identity));
-        state.retained_chunks = state
-            .entries
+        state.files.retain(|identity, _| active.contains(identity));
+        state.retained_references = state
+            .files
             .values()
-            .map(|entry| entry.entries.len())
+            .map(|file| file.reference_count)
             .sum::<usize>();
     }
 
-    fn get(
-        &self,
-        identity: &CheckpointProtectedIdentity,
-    ) -> Option<Arc<CheckpointProtectedChunkSet>> {
-        self.state.lock().ok()?.entries.get(identity).cloned()
+    fn get(&self, identity: &RecoveryCheckpointLink) -> Option<Arc<FileReferences>> {
+        self.state.lock().ok()?.files.get(identity).cloned()
     }
 
-    fn invalidate(&self, identity: &CheckpointProtectedIdentity) {
+    fn insert(&self, identity: RecoveryCheckpointLink, references: &Arc<FileReferences>) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if let Some(entry) = state.entries.remove(identity) {
-            state.retained_chunks = state.retained_chunks.saturating_sub(entry.entries.len());
+        if let Some(previous) = state.files.remove(&identity) {
+            state.retained_references = state
+                .retained_references
+                .saturating_sub(previous.reference_count);
         }
-    }
-
-    fn insert(
-        &self,
-        identity: CheckpointProtectedIdentity,
-        entries: Vec<ProtectedChunkEntry>,
-    ) -> Option<Arc<CheckpointProtectedChunkSet>> {
-        if entries.len() > CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT {
-            return None;
+        let retained = state
+            .retained_references
+            .saturating_add(references.reference_count);
+        if retained <= CHECKPOINT_PROTECTED_REFERENCE_CACHE_LIMIT {
+            state.retained_references = retained;
+            state.files.insert(identity, Arc::clone(references));
         }
-        let inserted = Arc::new(CheckpointProtectedChunkSet { entries });
-        let Ok(mut state) = self.state.lock() else {
-            return Some(inserted.clone());
-        };
-        if let Some(previous) = state.entries.remove(&identity) {
-            state.retained_chunks = state.retained_chunks.saturating_sub(previous.entries.len());
-        }
-        let retained = state.retained_chunks.saturating_add(inserted.entries.len());
-        if retained > CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT {
-            return Some(inserted);
-        }
-        state.retained_chunks = retained;
-        state.entries.insert(identity, inserted.clone());
-        Some(inserted)
     }
 
     #[cfg(test)]
-    fn cached_checkpoint_count_for_test(&self) -> usize {
-        self.state.lock().map_or(0, |state| state.entries.len())
+    fn cached_file_count_for_test(&self) -> usize {
+        self.state.lock().map_or(0, |state| state.files.len())
     }
 }
 
@@ -135,11 +109,100 @@ impl fmt::Debug for CheckpointProtectedChunkCache {
     }
 }
 
+/// Descriptor, Commit and authenticated table of one immutable checkpoint file.
+#[derive(Clone, Debug)]
+struct CheckpointFile {
+    name: String,
+    descriptor: RecoveryCheckpointDescriptor,
+    record: CommitRecord,
+    table: Arc<[RecoveryCheckpointTableRecord]>,
+    payload_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ObjectLocation {
+    file: usize,
+    record: RecoveryCheckpointTableRecord,
+}
+
+/// One structurally linked chain, Base first.
+#[derive(Clone, Debug)]
+struct CheckpointChain {
+    files: Vec<CheckpointFile>,
+    objects: HashMap<MetadataObjectId, ObjectLocation>,
+}
+
+impl CheckpointChain {
+    fn tip(&self) -> &CheckpointFile {
+        self.files
+            .last()
+            .expect("ASSERT: a loaded checkpoint chain has a Base")
+    }
+
+    fn contains_link(&self, link: RecoveryCheckpointLink) -> bool {
+        self.files.iter().any(|file| file.descriptor.link() == link)
+    }
+
+    fn names(&self) -> impl Iterator<Item = String> + '_ {
+        self.files.iter().map(|file| file.name.clone())
+    }
+}
+
+/// Active writer state of the selected chain: the facts of every object it
+/// holds. It is owner state behind the publication lock, not a content cache.
+#[derive(Debug)]
+pub(crate) struct CheckpointWriterState {
+    chain: CheckpointChain,
+    previous_chain_names: BTreeSet<String>,
+    summary: RecoveryCheckpointSummary,
+}
+
+impl CheckpointWriterState {
+    pub(crate) fn tip_record(&self) -> CommitRecord {
+        self.chain.tip().record
+    }
+
+    pub(crate) const fn summary(&self) -> RecoveryCheckpointSummary {
+        self.summary
+    }
+
+    pub(crate) fn facts(
+        &self,
+        object_id: MetadataObjectId,
+    ) -> Option<RecoveryCheckpointObjectFacts> {
+        self.chain
+            .objects
+            .get(&object_id)
+            .map(|location| location.record.facts())
+    }
+
+    /// A new file may extend this chain unless it is full or its Deltas
+    /// already carry as much payload as its Base.
+    pub(crate) fn accepts_delta(&self) -> bool {
+        let base_payload = self.chain.files[0].payload_bytes;
+        let delta_payload = self
+            .chain
+            .tip()
+            .descriptor
+            .chain_payload_bytes()
+            .saturating_sub(base_payload);
+        u64::try_from(self.chain.files.len()).is_ok_and(|files| {
+            files < RECOVERY_CHECKPOINT_MAX_CHAIN_FILES && delta_payload < base_payload
+        })
+    }
+
+    fn retained_names(&self) -> BTreeSet<String> {
+        let mut names = self.previous_chain_names.clone();
+        names.extend(self.chain.names());
+        names
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RecoveryCheckpointRepository<I> {
     storage: I,
-    // One successful publication receipt, shared by this destination owner.
-    publication: Arc<Mutex<Option<(CommitRecord, RecoveryCheckpointSummary)>>>,
+    // One active chain writer, shared by clones of this destination owner.
+    writer: Arc<Mutex<Option<CheckpointWriterState>>>,
 }
 
 impl<I: StorageIo> RecoveryCheckpointRepository<I> {
@@ -147,18 +210,18 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
     pub fn new(storage: I) -> Self {
         Self {
             storage,
-            publication: Arc::new(Mutex::new(None)),
+            writer: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Publishes the newest wholly verified Commit graph as one immutable,
-    /// self-contained DATA-tier Recovery Checkpoint.
+    /// Publishes the newest wholly verified Commit graph as a new chain Base.
     ///
     /// The source repository briefly serializes candidate selection and root
     /// pinning with Commit and Metadata GC. Graph enumeration, DATA verification,
     /// and checkpoint I/O run after those locks are released while the selected
     /// root remains pinned. This operation is never called from the Commit hot
-    /// loop.
+    /// loop. If that Commit is already selected, its complete chain and DATA
+    /// are verified instead.
     ///
     /// # Errors
     ///
@@ -173,19 +236,19 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         source: &GenerationRepository<M>,
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<Option<RecoveryCheckpointSummary>, RecoveryCheckpointError> {
-        let mut publication = self
-            .publication
+        let mut writer = self
+            .writer
             .lock()
             .expect("ASSERT: checkpoint publication lock poisoned");
-        *publication = None;
-        source.publish_latest_recovery_checkpoint_to(self, Some(verifier), &mut publication)
+        *writer = None;
+        source.publish_latest_recovery_checkpoint_to(self, Some(verifier), &mut writer)
     }
 
     /// Copies a committed graph whose DATA durability was established before
-    /// its Commit WAL record. Validates the pinned source graph and hash-binds
-    /// every copied object while writing, without rereading the new image.
-    /// Recovery and offline
-    /// scrub still independently verify DATA before restoring a lost Metadata tier.
+    /// its Commit WAL record, as a Delta of the selected chain when the chain
+    /// accepts one. Only objects absent from the chain are read, hash-bound and
+    /// written; the new file is not read back. Recovery and offline scrub still
+    /// independently verify DATA before restoring a lost Metadata tier.
     ///
     /// # Errors
     /// Returns source/copy graph, identity, format, or durability failures.
@@ -197,22 +260,23 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         &self,
         source: &GenerationRepository<M>,
     ) -> Result<Option<RecoveryCheckpointSummary>, RecoveryCheckpointError> {
-        let mut publication = self
-            .publication
+        let mut writer = self
+            .writer
             .lock()
             .expect("ASSERT: checkpoint publication lock poisoned");
         if crate::read_intent::independent() {
-            *publication = None;
+            *writer = None;
         }
-        source.publish_latest_recovery_checkpoint_to(self, None, &mut publication)
+        source.publish_latest_recovery_checkpoint_to(self, None, &mut writer)
     }
 
-    /// Selects the greatest wholly valid checkpoint and installs its exact
-    /// Metadata objects plus Commit anchor into an empty Metadata repository.
+    /// Selects the greatest wholly valid recovery point and installs its exact
+    /// reachable Metadata objects plus Commit anchor into an empty Metadata
+    /// repository.
     ///
-    /// Corrupt, torn, or transitively incomplete newer candidates are ignored
-    /// as whole generations. Transient storage I/O is returned instead of
-    /// being mistaken for durable corruption.
+    /// Corrupt, torn, or transitively incomplete candidates are ignored as
+    /// whole chains. Transient storage I/O is returned instead of being
+    /// mistaken for durable corruption.
     ///
     /// # Errors
     ///
@@ -227,53 +291,51 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         target: &GenerationRepository<M>,
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<Option<RecoveredGeneration>, RecoveryCheckpointError> {
-        let mut publication = self
-            .publication
+        let mut writer = self
+            .writer
             .lock()
             .expect("ASSERT: checkpoint publication lock poisoned");
-        // Independent recovery establishes fresh stored-byte evidence. A
-        // previous online publication receipt must not survive that boundary,
-        // including when recovery later returns a candidate or I/O error.
-        *publication = None;
+        // Independent recovery establishes fresh stored-byte evidence. Writer
+        // state must not survive that boundary, including on error.
+        *writer = None;
         let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
-        let candidates = self.head_candidates(false)?;
-        let had_candidates = !candidates.is_empty();
-        for (head, name) in candidates {
-            let audited = match self.audit_head_candidate(head, &name) {
-                Ok(audited) => audited,
+        let candidates = self.recovery_candidates(false)?;
+        for link in &candidates {
+            let outcome = self.load_chain(*link).and_then(|chain| {
+                self.audit_chain_files(&chain)?;
+                let (reachable, required) = self.verify_candidate_graph(&chain)?;
+                verifier.verify_required_chunks(&required)?;
+                Ok((chain, reachable))
+            });
+            let (chain, reachable) = match outcome {
+                Ok(complete) => complete,
                 Err(error) if error.is_candidate_corruption() => continue,
                 Err(error) => return Err(error),
             };
-            if let Err(error) = self.verify_graph(&audited, verifier) {
-                if error.is_candidate_corruption() {
-                    continue;
-                }
-                return Err(error);
-            }
             let recovered = target.install_recovery_checkpoint(
-                audited.record,
-                &audited.objects.keys().copied().collect(),
-                |object_id| self.read_object(&audited, object_id),
+                chain.tip().record,
+                &reachable,
+                |object_id| self.read_object(&chain, object_id),
                 verifier,
             )?;
             return Ok(Some(recovered));
         }
-        if had_candidates {
-            Err(RecoveryCheckpointError::NoCompleteCheckpoint)
-        } else {
+        if candidates.is_empty() {
             Ok(None)
+        } else {
+            Err(RecoveryCheckpointError::NoCompleteCheckpoint)
         }
     }
 
-    /// Exhaustively verifies every published Recovery Checkpoint.
+    /// Exhaustively verifies every retained recovery point and its chain.
     ///
     /// Unlike recovery selection, scrub never hides a corrupt retained
-    /// generation by falling back to an older one.
+    /// candidate by falling back to an older one.
     ///
     /// # Errors
     ///
-    /// Returns the first selector, format, graph, DATA-verification, identity,
-    /// storage, or arithmetic failure.
+    /// Returns the first selector, format, chain, graph, DATA-verification,
+    /// identity, storage, or arithmetic failure.
     pub fn scrub(
         &self,
         verifier: &dyn RequiredChunkVerifier,
@@ -287,205 +349,203 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         verifier: &dyn RequiredChunkVerifier,
     ) -> Result<(RecoveryCheckpointScrubSummary, BTreeMap<ChunkId, u64>), RecoveryCheckpointError>
     {
-        let mut publication = self
-            .publication
+        let mut writer = self
+            .writer
             .lock()
             .expect("ASSERT: checkpoint publication lock poisoned");
-        *publication = None;
+        *writer = None;
         let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
-        let mut candidates = self.head_candidates(true)?;
-        candidates.reverse();
         let mut summary = RecoveryCheckpointScrubSummary::default();
         let mut protected = BTreeMap::new();
-        for (head, name) in candidates {
-            let generation = head.generation();
-            let audited = self.audit_head_candidate(head, &name)?;
-            let (checkpoint, required) = self.verify_graph_with_chunks(&audited, verifier)?;
-            for (chunk_id, logical_length) in required {
-                if let Some(previous) = protected.insert(chunk_id, logical_length)
-                    && previous != logical_length
-                {
-                    return Err(RecoveryCheckpointError::IdentityMismatch);
+        let mut audited = HashSet::new();
+        for link in self.recovery_candidates(true)? {
+            let chain = self.load_chain(link)?;
+            for (index, file) in chain.files.iter().enumerate() {
+                if audited.insert(file.descriptor.link()) {
+                    self.audit_file(&chain, index, false)?;
+                    summary.metadata_object_count = summary
+                        .metadata_object_count
+                        .checked_add(file.descriptor.object_count())
+                        .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
+                    summary.metadata_payload_bytes = summary
+                        .metadata_payload_bytes
+                        .checked_add(file.payload_bytes)
+                        .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
+                    summary.file_bytes = summary
+                        .file_bytes
+                        .checked_add(file.descriptor.file_length())
+                        .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
                 }
             }
+            let (_, required) = self.verify_candidate_graph(&chain)?;
+            verifier.verify_required_chunks(&required)?;
+            merge_protected(&mut protected, required)?;
             summary.checkpoint_count = summary
                 .checkpoint_count
                 .checked_add(1)
                 .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-            summary.first_generation.get_or_insert(generation);
-            summary.latest_generation = Some(generation);
-            summary.metadata_object_count = summary
-                .metadata_object_count
-                .checked_add(checkpoint.metadata_object_count)
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-            summary.metadata_payload_bytes = summary
-                .metadata_payload_bytes
-                .checked_add(checkpoint.metadata_payload_bytes)
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-            summary.file_bytes = summary
-                .file_bytes
-                .checked_add(checkpoint.file_length)
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
+            let generation = link.generation();
+            summary.first_generation = Some(
+                summary
+                    .first_generation
+                    .map_or(generation, |first| first.min(generation)),
+            );
+            summary.latest_generation = Some(
+                summary
+                    .latest_generation
+                    .map_or(generation, |latest| latest.max(generation)),
+            );
         }
         Ok((summary, protected))
     }
 
+    /// Returns the selected Chunks reachable from any retained recovery point.
     pub(crate) fn protected_chunks_matching(
         &self,
         selected_chunks: &BTreeSet<ChunkId>,
         cache: Option<&CheckpointProtectedChunkCache>,
     ) -> Result<BTreeMap<ChunkId, u64>, RecoveryCheckpointError> {
-        let candidates = self.head_candidates(false)?;
-        if let Some(cache) = cache {
-            cache.retain_current(
-                &candidates
-                    .iter()
-                    .map(|(head, _)| Self::protected_identity(*head))
-                    .collect(),
-            );
-        }
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        let mut active = HashSet::new();
         let mut protected = BTreeMap::new();
-        let mut complete = 0_usize;
-        for (head, name) in candidates {
-            let required = match cache {
-                Some(cache) => {
-                    self.matched_from_cached_head(head, &name, selected_chunks, cache)?
-                }
-                None => self.matched_from_audited_head(head, &name, selected_chunks)?,
+        'candidates: for link in self.recovery_candidates(false)? {
+            let chain = match self.load_chain(link) {
+                Ok(chain) => chain,
+                Err(error) if error.is_candidate_corruption() => continue,
+                Err(error) => return Err(error),
             };
-            let Some(required) = required else {
-                continue;
-            };
-            for (chunk_id, logical_length) in required {
-                if let Some(previous) = protected.insert(chunk_id, logical_length)
-                    && previous != logical_length
-                {
-                    return Err(RecoveryCheckpointError::IdentityMismatch);
+            let mut references = Vec::with_capacity(chain.files.len());
+            for (index, file) in chain.files.iter().enumerate() {
+                let identity = file.descriptor.link();
+                active.insert(identity);
+                if let Some(cached) = cache.and_then(|cache| cache.get(&identity)) {
+                    references.push(cached);
+                    continue;
                 }
+                let audited = match self.audit_file(&chain, index, true) {
+                    Ok(audited) => Arc::new(audited),
+                    Err(error) if error.is_candidate_corruption() => continue 'candidates,
+                    Err(error) => return Err(error),
+                };
+                if let Some(cache) = cache {
+                    cache.insert(identity, &audited);
+                }
+                references.push(audited);
             }
-            complete += 1;
-            if complete == 2 {
-                break;
-            }
+            collect_protected(&chain, &references, selected_chunks, &mut protected)?;
+        }
+        if let Some(cache) = cache {
+            cache.retain_current(&active);
         }
         Ok(protected)
     }
 
-    fn protected_identity(head: RecoveryCheckpointHeadRecord) -> CheckpointProtectedIdentity {
-        CheckpointProtectedIdentity {
-            generation: head.generation(),
-            file_length: head.file_length(),
-            body_hash: head.checkpoint_body_hash(),
-        }
-    }
-
-    fn matched_from_cached_head(
+    /// Adopts the newest head's chain as writer state from descriptors and
+    /// authenticated tables only. A corrupt chain yields `None`: the next
+    /// publication then starts a new Base.
+    pub(crate) fn adopt_selected_chain(
         &self,
-        head: RecoveryCheckpointHeadRecord,
-        name: &str,
-        selected_chunks: &BTreeSet<ChunkId>,
-        cache: &CheckpointProtectedChunkCache,
-    ) -> Result<Option<BTreeMap<ChunkId, u64>>, RecoveryCheckpointError> {
-        let identity = Self::protected_identity(head);
-        if let Some(cached) = cache.get(&identity).filter(|_| {
-            self.storage
-                .object_len(name)
-                .is_ok_and(|length| length == head.file_length())
-        }) {
-            return Ok(Some(cached.matched(selected_chunks)));
-        }
-        cache.invalidate(&identity);
-        let audited = match self.audit_head_candidate(head, name) {
-            Ok(audited) => audited,
+    ) -> Result<Option<CheckpointWriterState>, RecoveryCheckpointError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        self.ensure_head_slots()?;
+        let Some(newest) = self.head_candidates(false)?.first().copied() else {
+            return Ok(None);
+        };
+        let chain = match self.load_chain(newest.tip()) {
+            Ok(chain) => chain,
             Err(error) if error.is_candidate_corruption() => return Ok(None),
             Err(error) => return Err(error),
         };
-        let all = match self.scan_graph_matching(&audited, None) {
-            Ok((_, all)) => all,
-            Err(RecoveryCheckpointError::Manifest(ManifestTreeError::InvalidReplacement)) => {
-                return Ok(Some(
-                    self.scan_graph_matching(&audited, Some(selected_chunks))?.1,
-                ));
-            }
-            Err(error) if error.is_candidate_corruption() => return Ok(None),
-            Err(error) => return Err(error),
+        let previous_chain_names = match chain.tip().descriptor.previous_chain() {
+            Some(link) => self.chain_names(link)?.unwrap_or_default(),
+            None => BTreeSet::new(),
         };
-        let required = all
-            .iter()
-            .filter(|(chunk_id, _)| selected_chunks.contains(chunk_id))
-            .map(|(chunk_id, logical_length)| (*chunk_id, *logical_length))
-            .collect();
-        if let Some(entries) = Self::cached_protected_entries(all) {
-            cache.insert(identity, entries);
-        }
-        Ok(Some(required))
+        let summary = RecoveryCheckpointSummary::for_tip(&chain, 0)?;
+        Ok(Some(CheckpointWriterState {
+            chain,
+            previous_chain_names,
+            summary,
+        }))
     }
 
-    fn matched_from_audited_head(
+    /// Fully verifies the stored chain named by writer state, plus its DATA
+    /// when a verifier is supplied.
+    pub(crate) fn verify_writer_chain(
         &self,
-        head: RecoveryCheckpointHeadRecord,
-        name: &str,
-        selected_chunks: &BTreeSet<ChunkId>,
-    ) -> Result<Option<BTreeMap<ChunkId, u64>>, RecoveryCheckpointError> {
-        let audited = match self.audit_head_candidate(head, name) {
-            Ok(audited) => audited,
-            Err(error) if error.is_candidate_corruption() => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        match self.scan_graph_matching(&audited, Some(selected_chunks)) {
-            Ok((_, required)) => Ok(Some(required)),
-            Err(error) if error.is_candidate_corruption() => Ok(None),
-            Err(error) => Err(error),
+        state: &CheckpointWriterState,
+        verifier: Option<&dyn RequiredChunkVerifier>,
+    ) -> Result<(), RecoveryCheckpointError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        let chain = self.load_chain(state.chain.tip().descriptor.link())?;
+        self.audit_chain_files(&chain)?;
+        let (_, required) = self.verify_candidate_graph(&chain)?;
+        if let Some(verifier) = verifier {
+            verifier.verify_required_chunks(&required)?;
         }
+        Ok(())
     }
 
-    fn cached_protected_entries(
-        required: BTreeMap<ChunkId, u64>,
-    ) -> Option<Vec<ProtectedChunkEntry>> {
-        if required.len() > CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT {
-            return None;
-        }
-        required
-            .into_iter()
-            .map(|(chunk_id, logical_length)| {
-                u32::try_from(logical_length)
-                    .ok()
-                    .map(|logical_length| ProtectedChunkEntry {
-                        chunk_id,
-                        logical_length,
-                    })
-            })
-            .collect()
-    }
-
+    /// Writes one Base, or one Delta of `current`, selects it, and prunes
+    /// every checkpoint name outside the retained chains.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn publish_source<F>(
+    pub(crate) fn publish_chain_file<F>(
         &self,
         record: CommitRecord,
-        object_ids: &BTreeSet<MetadataObjectId>,
-        required_chunk_count: usize,
-        verifier: Option<&dyn RequiredChunkVerifier>,
+        increment: &CheckpointIncrement,
+        current: Option<CheckpointWriterState>,
+        delta: bool,
         mut read_object: F,
-    ) -> Result<RecoveryCheckpointSummary, RecoveryCheckpointError>
+    ) -> Result<CheckpointWriterState, RecoveryCheckpointError>
     where
         F: FnMut(MetadataObjectId) -> Result<Arc<Vec<u8>>, RecoveryCheckpointError>,
     {
-        if object_ids.is_empty() || !object_ids.contains(&record.namespace_root()) {
+        let (parent, replaced) = if delta {
+            (
+                Some(current.ok_or(RecoveryCheckpointError::IdentityMismatch)?),
+                None,
+            )
+        } else {
+            (None, current)
+        };
+        let root_held = increment.objects.contains_key(&record.namespace_root())
+            || parent
+                .as_ref()
+                .is_some_and(|state| state.facts(record.namespace_root()).is_some());
+        if !root_held
+            || (parent.is_none() && increment.objects.is_empty())
+            || parent.as_ref().is_some_and(|state| !state.accepts_delta())
+        {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
         self.ensure_head_slots()?;
         let published_name = checkpoint_name(record.generation());
         if self.storage.exists(&published_name)? {
-            let audited = self.audit_named(&published_name)?;
-            if audited.record != record || !audited.objects.keys().eq(object_ids.iter()) {
-                return Err(RecoveryCheckpointError::IdentityMismatch);
+            if let Some(link) = self
+                .head_candidates(false)?
+                .into_iter()
+                .map(RecoveryCheckpointHeadRecord::tip)
+                .find(|link| link.generation() == record.generation())
+            {
+                // A selected file of this generation must audit completely.
+                return self.reuse_selected(link, record);
             }
+            // An unselected name carries no authority; rewrite it.
+            self.storage.remove_file(&published_name)?;
             self.storage.sync_root()?;
-            let summary = self.verify_publication_graph(&audited, verifier)?;
-            let obsolete = self.publish_head(audited.descriptor)?;
-            self.prune_obsolete(&obsolete)?;
-            return Ok(summary);
         }
+        // A Delta inherits its chain's previous-chain link; a Base names the
+        // chain it replaces and keeps that chain recoverable.
+        let (previous_chain, previous_chain_names) = match (&parent, &replaced) {
+            (Some(state), _) => (
+                state.chain.tip().descriptor.previous_chain(),
+                state.previous_chain_names.clone(),
+            ),
+            (None, Some(state)) => (
+                Some(state.chain.tip().descriptor.link()),
+                state.chain.names().collect(),
+            ),
+            (None, None) => (None, BTreeSet::new()),
+        };
 
         let temporary_name = format!(".{published_name}.building");
         match self.storage.create_new(&temporary_name) {
@@ -495,8 +555,6 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         }
         self.storage.set_len_unpublished(&temporary_name, 0)?;
         let encoded_record = record.encode();
-        let commit_offset = u64::try_from(RECOVERY_CHECKPOINT_HEADER_BYTES)
-            .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
         let mut output = ImmutableWriteBuffer::new_unpublished()?;
         output.append(
             &self.storage,
@@ -506,113 +564,203 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         output.append(&self.storage, &temporary_name, &encoded_record)?;
         let mut body_hasher = blake3::Hasher::new();
         body_hasher.update(&encoded_record);
-        let mut cursor = commit_offset
-            .checked_add(
-                u64::try_from(COMMIT_RECORD_BYTES)
-                    .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-            )
-            .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-        let mut metadata_payload_bytes = 0_u64;
-        for object_id in object_ids.iter().copied() {
-            let encoded = read_object(object_id)?;
-            if MetadataObjectId::from_encoded(&encoded)? != object_id {
+        let mut cursor = RECOVERY_CHECKPOINT_PAYLOAD_OFFSET;
+        let mut table = Vec::new();
+        table
+            .try_reserve_exact(increment.objects.len())
+            .map_err(|_| RecoveryCheckpointError::OutOfMemory)?;
+        let mut payload_bytes = 0_u64;
+        for (object_id, facts) in &increment.objects {
+            let encoded = read_object(*object_id)?;
+            if MetadataObjectId::from_encoded(&encoded)? != *object_id {
                 return Err(RecoveryCheckpointError::IdentityMismatch);
             }
-            let header = RecoveryCheckpointEntryHeader::new(
-                object_id,
+            let entry = RecoveryCheckpointTableRecord::new(
+                *object_id,
+                cursor,
                 encoded.len(),
                 crc32c::crc32c(&encoded),
+                *facts,
             )?;
-            let encoded_header = header.encode();
-            output.append(&self.storage, &temporary_name, &encoded_header)?;
-            body_hasher.update(&encoded_header);
             output.append(&self.storage, &temporary_name, &encoded)?;
             body_hasher.update(&encoded);
-            let padded_length = header.padded_length()?;
-            let unpadded_length = u64::try_from(encoded_header.len())
-                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?
-                .checked_add(
-                    u64::try_from(encoded.len())
-                        .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-                )
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-            let padding_length = usize::try_from(padded_length - unpadded_length)
-                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
+            let padding_length =
+                usize::try_from(entry.padded_end() - cursor - u64::from(entry.payload_length()))
+                    .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
             if padding_length != 0 {
-                let padding = [0_u8; 63];
-                let padding = &padding[..padding_length];
+                let padding = &[0_u8; 63][..padding_length];
                 output.append(&self.storage, &temporary_name, padding)?;
                 body_hasher.update(padding);
             }
-            cursor = cursor
-                .checked_add(padded_length)
+            cursor = entry.padded_end();
+            payload_bytes = payload_bytes
+                .checked_add(u64::from(entry.payload_length()))
                 .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-            metadata_payload_bytes = metadata_payload_bytes
-                .checked_add(
-                    u64::try_from(encoded.len())
-                        .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-                )
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
+            table.push(entry);
         }
+        let table_bytes = encode_table(&table)?;
+        output.append(&self.storage, &temporary_name, &table_bytes)?;
+        body_hasher.update(&table_bytes);
+        let object_count =
+            u64::try_from(table.len()).map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
         let file_length = cursor
             .checked_add(
-                u64::try_from(RECOVERY_CHECKPOINT_FOOTER_BYTES)
+                u64::try_from(table_bytes.len())
                     .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
             )
+            .and_then(|length| length.checked_add(RECOVERY_CHECKPOINT_FOOTER_BYTES as u64))
             .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
+        let (chain, chain_object_count, chain_payload_bytes) = match &parent {
+            Some(state) => {
+                let tip = state.chain.tip().descriptor;
+                (
+                    RecoveryCheckpointChain::Delta {
+                        parent: tip.link(),
+                        chain_index: tip
+                            .chain_index()
+                            .checked_add(1)
+                            .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?,
+                        base_generation: tip.base_generation(),
+                    },
+                    tip.chain_object_count()
+                        .checked_add(object_count)
+                        .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?,
+                    tip.chain_payload_bytes()
+                        .checked_add(payload_bytes)
+                        .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?,
+                )
+            }
+            None => (RecoveryCheckpointChain::Base, object_count, payload_bytes),
+        };
         let descriptor = RecoveryCheckpointDescriptor::new(
             record,
-            u64::try_from(object_ids.len())
-                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-            file_length,
-            *body_hasher.finalize().as_bytes(),
+            RecoveryCheckpointBody {
+                object_count,
+                file_length,
+                body_hash: *body_hasher.finalize().as_bytes(),
+                table_hash: *blake3::hash(&table_bytes).as_bytes(),
+                chain_object_count,
+                chain_payload_bytes,
+            },
+            chain,
+            previous_chain,
         )?;
         output.append(&self.storage, &temporary_name, &descriptor.encode_footer())?;
         output.finish(&self.storage, &temporary_name)?;
-        // The body hash is now known. Patch only the fixed header; all entry
+        // The body hash is now known. Patch only the fixed header; all other
         // fields were batched across boundaries without partial-page appends.
         self.storage
             .write_unpublished_at(&temporary_name, 0, &descriptor.encode_header())?;
         self.storage
             .set_len_unpublished(&temporary_name, file_length)?;
-        // This name has no selector or published reader until the final file
-        // sync and rename below. Syncing each one-MiB length extension would
-        // serialize background copying with foreground DATA publication.
-        // The pinned source graph was validated by the sole caller before
-        // copying. Every copied object is hash-bound to that graph above;
-        // lengths, entry CRCs and the body hash come from the emitted bytes.
-        // Do not read our fresh file back as a substitute for durability.
-        // Recovery/scrub and existing-file collisions still audit stored bytes.
-        let summary = RecoveryCheckpointSummary {
-            generation: record.generation(),
-            metadata_object_count: u64::try_from(object_ids.len())
-                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-            metadata_payload_bytes,
-            required_chunk_count: u64::try_from(required_chunk_count)
-                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-            file_length,
-        };
+        // Every copied object is hash-bound to the pinned source graph above;
+        // table, lengths, checksums and hashes come from the emitted bytes.
+        // Do not read the fresh file back as a substitute for durability.
         self.storage.sync_file(&temporary_name)?;
-        match self
-            .storage
-            .publish_noreplace(&temporary_name, &published_name)
-        {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let raced = self.audit_named(&published_name)?;
-                if raced.record != record
-                    || !raced.objects.keys().eq(object_ids.iter())
-                    || raced.descriptor != descriptor
-                {
-                    return Err(RecoveryCheckpointError::IdentityMismatch);
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
+        self.storage
+            .publish_noreplace(&temporary_name, &published_name)?;
         self.storage.sync_root()?;
-        let obsolete = self.publish_head(descriptor)?;
-        self.prune_obsolete(&obsolete)?;
-        Ok(summary)
+        self.publish_head(&descriptor)?;
+
+        let file = CheckpointFile {
+            name: published_name,
+            descriptor,
+            record,
+            table: table.into(),
+            payload_bytes,
+        };
+        let mut chain = parent.map_or_else(
+            || CheckpointChain {
+                files: Vec::new(),
+                objects: HashMap::new(),
+            },
+            |state| state.chain,
+        );
+        let index = chain.files.len();
+        for entry in file.table.iter() {
+            chain.objects.insert(
+                entry.object_id(),
+                ObjectLocation {
+                    file: index,
+                    record: *entry,
+                },
+            );
+        }
+        chain.files.push(file);
+        let summary = RecoveryCheckpointSummary::for_tip(
+            &chain,
+            u64::try_from(increment.required.len())
+                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
+        )?;
+        let state = CheckpointWriterState {
+            chain,
+            previous_chain_names,
+            summary,
+        };
+        self.prune_unretained(&state)?;
+        Ok(state)
+    }
+
+    fn reuse_selected(
+        &self,
+        link: RecoveryCheckpointLink,
+        record: CommitRecord,
+    ) -> Result<CheckpointWriterState, RecoveryCheckpointError> {
+        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+        let chain = self.load_chain(link)?;
+        if chain.tip().record != record {
+            return Err(RecoveryCheckpointError::IdentityMismatch);
+        }
+        self.audit_chain_files(&chain)?;
+        self.verify_candidate_graph(&chain)?;
+        let previous_chain_names = match chain.tip().descriptor.previous_chain() {
+            Some(link) => self.chain_names(link)?.unwrap_or_default(),
+            None => BTreeSet::new(),
+        };
+        let summary = RecoveryCheckpointSummary::for_tip(&chain, 0)?;
+        Ok(CheckpointWriterState {
+            chain,
+            previous_chain_names,
+            summary,
+        })
+    }
+
+    /// Removes checkpoint names outside every retained chain. Listing is
+    /// cleanup only; selection authority remains the heads.
+    fn prune_unretained(
+        &self,
+        state: &CheckpointWriterState,
+    ) -> Result<(), RecoveryCheckpointError> {
+        let mut retained = state.retained_names();
+        for head in self.head_candidates(false)? {
+            if state.chain.contains_link(head.tip())
+                || retained.contains(&checkpoint_name(head.generation()))
+            {
+                continue;
+            }
+            match self.chain_names(head.tip())? {
+                Some(names) => retained.extend(names),
+                // Keep everything that cannot be attributed to a chain.
+                None => return Ok(()),
+            }
+        }
+        let obsolete = self
+            .storage
+            .list_names()?
+            .into_iter()
+            .filter(|name| {
+                name.starts_with(CHECKPOINT_PREFIX)
+                    && name.ends_with(CHECKPOINT_SUFFIX)
+                    && !retained.contains(name)
+            })
+            .collect::<Vec<_>>();
+        for name in &obsolete {
+            self.storage.remove_file(name)?;
+        }
+        if !obsolete.is_empty() {
+            self.storage.sync_root()?;
+        }
+        Ok(())
     }
 
     fn ensure_head_slots(&self) -> Result<(), RecoveryCheckpointError> {
@@ -634,33 +782,25 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
 
     fn publish_head(
         &self,
-        descriptor: RecoveryCheckpointDescriptor,
-    ) -> Result<Vec<String>, RecoveryCheckpointError> {
+        descriptor: &RecoveryCheckpointDescriptor,
+    ) -> Result<(), RecoveryCheckpointError> {
         let old = self.head_candidates(false)?;
-        if let Some((current, _)) = old.first()
-            && current.generation() == descriptor.generation()
+        if let Some(current) = old.first()
+            && current.generation() >= descriptor.generation()
         {
-            if current.file_length() != descriptor.file_length()
-                || current.checkpoint_body_hash() != descriptor.body_hash()
-            {
-                return Err(RecoveryCheckpointError::IdentityMismatch);
-            }
-            return Ok(Vec::new());
-        }
-        if old
-            .first()
-            .is_some_and(|(current, _)| current.generation() > descriptor.generation())
-        {
-            return Err(RecoveryCheckpointError::IdentityMismatch);
+            return if current.tip() == descriptor.link() {
+                Ok(())
+            } else {
+                Err(RecoveryCheckpointError::IdentityMismatch)
+            };
         }
         let selected_slot = old
             .first()
-            .map(|(record, _)| self.head_slot(*record))
+            .map(|record| self.head_slot(*record))
             .transpose()?
             .flatten();
         let target_slot = selected_slot.map_or(0, |slot| 1 - slot);
-        let record =
-            RecoveryCheckpointHeadRecord::new(descriptor, old.first().map(|(record, _)| *record))?;
+        let record = RecoveryCheckpointHeadRecord::new(descriptor.link(), old.first().copied())?;
         let encoded = record.encode();
         self.storage.set_len(HEAD_NAMES[target_slot], 0)?;
         self.storage
@@ -675,26 +815,6 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
         self.storage.sync_file(HEAD_NAMES[target_slot])?;
-        let retained = self
-            .head_candidates(false)?
-            .into_iter()
-            .map(|(_, name)| name)
-            .collect::<BTreeSet<_>>();
-        Ok(old
-            .into_iter()
-            .map(|(_, name)| name)
-            .filter(|name| !retained.contains(name))
-            .collect())
-    }
-
-    fn prune_obsolete(&self, obsolete: &[String]) -> Result<(), RecoveryCheckpointError> {
-        if obsolete.is_empty() {
-            return Ok(());
-        }
-        for name in obsolete {
-            self.storage.remove_file(name)?;
-        }
-        self.storage.sync_root()?;
         Ok(())
     }
 
@@ -721,13 +841,15 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         Ok(None)
     }
 
+    /// Valid heads, newest first. With two heads the newer must link exactly
+    /// to the older; strict mode rejects any malformed retained head.
     fn head_candidates(
         &self,
         strict: bool,
-    ) -> Result<Vec<(RecoveryCheckpointHeadRecord, String)>, RecoveryCheckpointError> {
+    ) -> Result<Vec<RecoveryCheckpointHeadRecord>, RecoveryCheckpointError> {
         let mut valid = Vec::new();
         let mut invalid = false;
-        for (slot, name) in HEAD_NAMES.into_iter().enumerate() {
+        for name in HEAD_NAMES {
             let length = match self.storage.object_len(name) {
                 Ok(length) => length,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -747,15 +869,15 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
                 RecoveryCheckpointHeadRecord::decode(&bytes)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             }) {
-                Ok(record) => valid.push((slot, record)),
+                Ok(record) => valid.push(record),
                 Err(error) if error.kind() == io::ErrorKind::InvalidData => invalid = true,
                 Err(error) => return Err(error.into()),
             }
         }
-        valid.sort_unstable_by_key(|candidate| Reverse(candidate.1.generation()));
+        valid.sort_unstable_by_key(|record| Reverse(record.generation()));
         if valid.len() == 2 {
-            let newer = valid[0].1;
-            let older = valid[1].1;
+            let newer = valid[0];
+            let older = valid[1];
             if newer.previous_generation() != older.generation()
                 || newer.previous_record_hash() != older.record_hash()
             {
@@ -767,64 +889,237 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         } else if strict && invalid {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
-        Ok(valid
-            .into_iter()
-            .map(|(_, record)| (record, checkpoint_name(record.generation())))
-            .collect())
+        Ok(valid)
     }
 
-    fn audit_head_candidate(
+    /// Retained recovery points in fallback order: newest head, older head,
+    /// then the newest head's previous-chain link.
+    fn recovery_candidates(
         &self,
-        head: RecoveryCheckpointHeadRecord,
-        name: &str,
-    ) -> Result<AuditedCheckpoint, RecoveryCheckpointError> {
-        let audited = self.audit_named(name)?;
-        if audited.descriptor.generation() != head.generation()
-            || audited.descriptor.file_length() != head.file_length()
-            || audited.descriptor.body_hash() != head.checkpoint_body_hash()
-        {
+        strict: bool,
+    ) -> Result<Vec<RecoveryCheckpointLink>, RecoveryCheckpointError> {
+        let heads = self.head_candidates(strict)?;
+        let mut links = heads.iter().map(|head| head.tip()).collect::<Vec<_>>();
+        if let Some(newest) = heads.first() {
+            match self.discover_previous_chain(newest.tip()) {
+                Ok(Some(link)) if !links.contains(&link) => links.push(link),
+                Ok(_) => {}
+                Err(error) if !strict && error.is_candidate_corruption() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(links)
+    }
+
+    /// Reads the previous-chain link from the tip header, or from its footer
+    /// when the header is damaged.
+    fn discover_previous_chain(
+        &self,
+        tip: RecoveryCheckpointLink,
+    ) -> Result<Option<RecoveryCheckpointLink>, RecoveryCheckpointError> {
+        let name = checkpoint_name(tip.generation());
+        let footer_offset = tip
+            .file_length()
+            .checked_sub(RECOVERY_CHECKPOINT_FOOTER_BYTES as u64)
+            .ok_or(RecoveryCheckpointError::IdentityMismatch)?;
+        for (offset, footer) in [(0, false), (footer_offset, true)] {
+            let bytes = match self.storage.read_exact_at(&name, offset, 4_096) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let decoded = if footer {
+                RecoveryCheckpointDescriptor::decode_footer(&bytes)
+            } else {
+                RecoveryCheckpointDescriptor::decode_header(&bytes)
+            };
+            if let Ok(descriptor) = decoded
+                && descriptor.link() == tip
+            {
+                return Ok(descriptor.previous_chain());
+            }
+        }
+        Err(RecoveryCheckpointError::IdentityMismatch)
+    }
+
+    /// Names of every file in the chain ending at `tip`, or `None` when the
+    /// chain cannot be read as a structurally linked whole.
+    fn chain_names(
+        &self,
+        tip: RecoveryCheckpointLink,
+    ) -> Result<Option<BTreeSet<String>>, RecoveryCheckpointError> {
+        let mut names = BTreeSet::new();
+        let mut link = tip;
+        loop {
+            let name = checkpoint_name(link.generation());
+            let descriptor = match self.read_descriptor(&name) {
+                Ok((descriptor, _)) if descriptor.link() == link => descriptor,
+                Ok(_) => return Ok(None),
+                Err(error) if error.is_candidate_corruption() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            names.insert(name);
+            match descriptor.parent() {
+                Some(parent)
+                    if u64::try_from(names.len())
+                        .is_ok_and(|files| files < RECOVERY_CHECKPOINT_MAX_CHAIN_FILES) =>
+                {
+                    link = parent;
+                }
+                Some(_) => return Ok(None),
+                None => return Ok(Some(names)),
+            }
+        }
+    }
+
+    /// Reads the descriptors, Commits and authenticated tables of the chain
+    /// ending at `tip` and validates every link, position, total and identity
+    /// constraint that needs no payload bytes.
+    fn load_chain(
+        &self,
+        tip: RecoveryCheckpointLink,
+    ) -> Result<CheckpointChain, RecoveryCheckpointError> {
+        let mut files = Vec::new();
+        let mut link = tip;
+        loop {
+            if u64::try_from(files.len())
+                .map_or(true, |files| files >= RECOVERY_CHECKPOINT_MAX_CHAIN_FILES)
+            {
+                return Err(RecoveryCheckpointError::IdentityMismatch);
+            }
+            let file = self.read_file(link)?;
+            let parent = file.descriptor.parent();
+            files.push(file);
+            match parent {
+                Some(parent) => link = parent,
+                None => break,
+            }
+        }
+        files.reverse();
+        let base_generation = files[0].descriptor.generation();
+        let previous_chain = files[0].descriptor.previous_chain();
+        let capacity = usize::try_from(
+            files
+                .last()
+                .map_or(0, |file| file.descriptor.chain_object_count()),
+        )
+        .map_err(|_| RecoveryCheckpointError::OutOfMemory)?;
+        let mut objects = HashMap::new();
+        objects
+            .try_reserve(capacity)
+            .map_err(|_| RecoveryCheckpointError::OutOfMemory)?;
+        let mut chain_objects = 0_u64;
+        let mut chain_payload = 0_u64;
+        for (index, file) in files.iter().enumerate() {
+            let descriptor = file.descriptor;
+            chain_objects = chain_objects
+                .checked_add(descriptor.object_count())
+                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
+            chain_payload = chain_payload
+                .checked_add(file.payload_bytes)
+                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
+            if u64::try_from(index) != Ok(descriptor.chain_index())
+                || descriptor.base_generation() != base_generation
+                || descriptor.previous_chain() != previous_chain
+                || descriptor.chain_object_count() != chain_objects
+                || descriptor.chain_payload_bytes() != chain_payload
+            {
+                return Err(RecoveryCheckpointError::IdentityMismatch);
+            }
+            for entry in file.table.iter() {
+                if objects
+                    .insert(
+                        entry.object_id(),
+                        ObjectLocation {
+                            file: index,
+                            record: *entry,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(RecoveryCheckpointError::IdentityMismatch);
+                }
+            }
+            if !objects
+                .get(&file.record.namespace_root())
+                .is_some_and(|location| {
+                    location.record.facts().kind()
+                        == RecoveryCheckpointObjectKind::NamespaceGraphRoot
+                })
+            {
+                return Err(RecoveryCheckpointError::IdentityMismatch);
+            }
+        }
+        Ok(CheckpointChain { files, objects })
+    }
+
+    fn read_file(
+        &self,
+        link: RecoveryCheckpointLink,
+    ) -> Result<CheckpointFile, RecoveryCheckpointError> {
+        let name = checkpoint_name(link.generation());
+        let (descriptor, record) = self.read_descriptor(&name)?;
+        if descriptor.link() != link {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
-        Ok(audited)
+        let table_length = usize::try_from(descriptor.object_count())
+            .ok()
+            .and_then(|count| count.checked_mul(RECOVERY_CHECKPOINT_TABLE_RECORD_BYTES))
+            .ok_or(RecoveryCheckpointError::OutOfMemory)?;
+        let table_bytes = read_bounded(
+            &self.storage,
+            &name,
+            descriptor.table_offset(),
+            table_length,
+        )?;
+        if *blake3::hash(&table_bytes).as_bytes() != descriptor.table_hash() {
+            return Err(RecoveryCheckpointError::IdentityMismatch);
+        }
+        let table = decode_recovery_checkpoint_table(&table_bytes, descriptor.table_offset())?;
+        let payload_bytes = table.iter().try_fold(0_u64, |total, entry| {
+            total
+                .checked_add(u64::from(entry.payload_length()))
+                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)
+        })?;
+        Ok(CheckpointFile {
+            name,
+            descriptor,
+            record,
+            table: table.into(),
+            payload_bytes,
+        })
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn audit_named(&self, name: &str) -> Result<AuditedCheckpoint, RecoveryCheckpointError> {
-        let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+    fn read_descriptor(
+        &self,
+        name: &str,
+    ) -> Result<(RecoveryCheckpointDescriptor, CommitRecord), RecoveryCheckpointError> {
         let actual_length = self.storage.object_len(name)?;
-        let minimum_length = RECOVERY_CHECKPOINT_HEADER_BYTES
-            .checked_add(COMMIT_RECORD_BYTES)
-            .and_then(|length| length.checked_add(RECOVERY_CHECKPOINT_FOOTER_BYTES))
+        let minimum_length = RECOVERY_CHECKPOINT_PAYLOAD_OFFSET
+            .checked_add(RECOVERY_CHECKPOINT_FOOTER_BYTES as u64)
             .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-        if actual_length
-            < u64::try_from(minimum_length)
-                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?
-        {
+        if actual_length < minimum_length {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
         let header = self
             .storage
             .read_exact_at(name, 0, RECOVERY_CHECKPOINT_HEADER_BYTES)?;
         let descriptor = RecoveryCheckpointDescriptor::decode_header(&header)?;
-        let footer_offset = actual_length
-            .checked_sub(
-                u64::try_from(RECOVERY_CHECKPOINT_FOOTER_BYTES)
-                    .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-            )
-            .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-        let footer =
-            self.storage
-                .read_exact_at(name, footer_offset, RECOVERY_CHECKPOINT_FOOTER_BYTES)?;
+        let footer = self.storage.read_exact_at(
+            name,
+            actual_length - RECOVERY_CHECKPOINT_FOOTER_BYTES as u64,
+            RECOVERY_CHECKPOINT_FOOTER_BYTES,
+        )?;
         if RecoveryCheckpointDescriptor::decode_footer(&footer)? != descriptor
             || descriptor.file_length() != actual_length
         {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
-        let commit_offset = u64::try_from(RECOVERY_CHECKPOINT_HEADER_BYTES)
-            .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
-        let encoded_record =
-            self.storage
-                .read_exact_at(name, commit_offset, COMMIT_RECORD_BYTES)?;
+        let encoded_record = self.storage.read_exact_at(
+            name,
+            RECOVERY_CHECKPOINT_HEADER_BYTES as u64,
+            COMMIT_RECORD_BYTES,
+        )?;
         let record = CommitRecord::decode(&encoded_record)?;
         if record.generation() != descriptor.generation()
             || record.namespace_root() != descriptor.namespace_root()
@@ -832,163 +1127,95 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
         {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
+        Ok((descriptor, record))
+    }
+
+    fn audit_chain_files(&self, chain: &CheckpointChain) -> Result<(), RecoveryCheckpointError> {
+        for index in 0..chain.files.len() {
+            self.audit_file(chain, index, false)?;
+        }
+        Ok(())
+    }
+
+    /// Streams one file's payload region and proves its body hash, every
+    /// payload identity and checksum, its recorded facts, and prefix closure:
+    /// each reference resolves to this file or an earlier one and matches the
+    /// referenced object's facts.
+    fn audit_file(
+        &self,
+        chain: &CheckpointChain,
+        index: usize,
+        collect: bool,
+    ) -> Result<FileReferences, RecoveryCheckpointError> {
+        let file = &chain.files[index];
+        let encoded_record = self.storage.read_exact_at(
+            &file.name,
+            RECOVERY_CHECKPOINT_HEADER_BYTES as u64,
+            COMMIT_RECORD_BYTES,
+        )?;
+        if CommitRecord::decode(&encoded_record)? != file.record {
+            return Err(RecoveryCheckpointError::IdentityMismatch);
+        }
         let mut body_hasher = blake3::Hasher::new();
         body_hasher.update(&encoded_record);
-        let mut cursor = commit_offset
-            .checked_add(
-                u64::try_from(COMMIT_RECORD_BYTES)
-                    .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-            )
-            .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-        let maximum_entries = footer_offset.saturating_sub(cursor)
-            / u64::try_from(RECOVERY_CHECKPOINT_ENTRY_HEADER_BYTES)
+        let mut reader =
+            SequentialReader::new(&self.storage, &file.name, file.descriptor.table_offset());
+        let mut references = FileReferences::default();
+        for entry in file.table.iter() {
+            let padded = usize::try_from(recovery_checkpoint_padded_length(entry.payload_length()))
                 .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
-        if descriptor.object_count() > maximum_entries {
-            return Err(RecoveryCheckpointError::IdentityMismatch);
-        }
-        let capacity = usize::try_from(descriptor.object_count())
-            .map_err(|_| RecoveryCheckpointError::OutOfMemory)?;
-        let mut objects = BTreeMap::new();
-        let mut previous_object_id = None;
-        let mut metadata_payload_bytes = 0_u64;
-        for _ in 0..capacity {
-            let encoded_header =
-                self.storage
-                    .read_exact_at(name, cursor, RECOVERY_CHECKPOINT_ENTRY_HEADER_BYTES)?;
-            body_hasher.update(&encoded_header);
-            let entry = RecoveryCheckpointEntryHeader::decode(&encoded_header)?;
-            if previous_object_id.is_some_and(|previous| previous >= entry.object_id()) {
-                return Err(RecoveryCheckpointError::IdentityMismatch);
-            }
-            let payload_offset = cursor
-                .checked_add(
-                    u64::try_from(RECOVERY_CHECKPOINT_ENTRY_HEADER_BYTES)
-                        .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-                )
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-            let payload = read_bounded(
-                &self.storage,
-                name,
-                payload_offset,
-                usize::try_from(entry.encoded_length())
+            let bytes = reader.read(entry.payload_offset(), padded)?;
+            body_hasher.update(&bytes);
+            let (payload, padding) = bytes.split_at(
+                usize::try_from(entry.payload_length())
                     .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-            )?;
-            body_hasher.update(&payload);
-            if crc32c::crc32c(&payload) != entry.payload_crc32c()
-                || MetadataObjectId::from_encoded(&payload)? != entry.object_id()
+            );
+            if padding.iter().any(|byte| *byte != 0)
+                || crc32c::crc32c(payload) != entry.payload_crc32c()
+                || MetadataObjectId::from_encoded(payload)? != entry.object_id()
             {
                 return Err(RecoveryCheckpointError::IdentityMismatch);
             }
-            let padded_length = entry.padded_length()?;
-            let unpadded_length = u64::try_from(RECOVERY_CHECKPOINT_ENTRY_HEADER_BYTES)
-                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?
-                .checked_add(u64::from(entry.encoded_length()))
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-            let padding_length = usize::try_from(padded_length - unpadded_length)
-                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
-            if padding_length != 0 {
-                let padding = self.storage.read_exact_at(
-                    name,
-                    cursor
-                        .checked_add(unpadded_length)
-                        .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?,
-                    padding_length,
-                )?;
-                if padding.iter().any(|byte| *byte != 0) {
+            let decoded = decode_checkpoint_object(payload)?;
+            if decoded.facts != entry.facts() {
+                return Err(RecoveryCheckpointError::IdentityMismatch);
+            }
+            for (child, expectation) in &decoded.references {
+                if !chain.objects.get(child).is_some_and(|location| {
+                    location.file <= index && expectation.admits(location.record.facts())
+                }) {
                     return Err(RecoveryCheckpointError::IdentityMismatch);
                 }
-                body_hasher.update(&padding);
             }
-            if cursor
-                .checked_add(padded_length)
-                .is_none_or(|end| end > footer_offset)
-            {
-                return Err(RecoveryCheckpointError::IdentityMismatch);
+            if collect {
+                references.reference_count = references
+                    .reference_count
+                    .saturating_add(decoded.references.len())
+                    .saturating_add(decoded.chunks.len());
+                references.nodes.insert(
+                    entry.object_id(),
+                    NodeReferences {
+                        children: decoded.references.iter().map(|(child, _)| *child).collect(),
+                        chunks: decoded.chunks,
+                    },
+                );
             }
-            objects.insert(
-                entry.object_id(),
-                ObjectSpan {
-                    offset: payload_offset,
-                    length: entry.encoded_length(),
-                },
-            );
-            previous_object_id = Some(entry.object_id());
-            cursor = cursor
-                .checked_add(padded_length)
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
-            metadata_payload_bytes = metadata_payload_bytes
-                .checked_add(u64::from(entry.encoded_length()))
-                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
         }
-        if cursor != footer_offset
-            || *body_hasher.finalize().as_bytes() != descriptor.body_hash()
-            || !objects.contains_key(&record.namespace_root())
-        {
+        body_hasher.update(&encode_table(&file.table)?);
+        if *body_hasher.finalize().as_bytes() != file.descriptor.body_hash() {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
-        Ok(AuditedCheckpoint {
-            name: name.to_owned(),
-            descriptor,
-            record,
-            objects,
-            metadata_payload_bytes,
-        })
+        Ok(references)
     }
 
-    fn verify_graph(
+    /// Verifies the tip Commit's graph through the chain and returns its exact
+    /// reachable objects and required Chunks.
+    fn verify_candidate_graph(
         &self,
-        checkpoint: &AuditedCheckpoint,
-        verifier: &dyn RequiredChunkVerifier,
-    ) -> Result<RecoveryCheckpointSummary, RecoveryCheckpointError> {
-        self.verify_graph_with_chunks(checkpoint, verifier)
-            .map(|(summary, _)| summary)
-    }
-
-    fn verify_publication_graph(
-        &self,
-        checkpoint: &AuditedCheckpoint,
-        verifier: Option<&dyn RequiredChunkVerifier>,
-    ) -> Result<RecoveryCheckpointSummary, RecoveryCheckpointError> {
-        self.verify_graph_policy(checkpoint, verifier)
-            .map(|(summary, _)| summary)
-    }
-
-    fn verify_graph_with_chunks(
-        &self,
-        checkpoint: &AuditedCheckpoint,
-        verifier: &dyn RequiredChunkVerifier,
-    ) -> Result<(RecoveryCheckpointSummary, BTreeMap<ChunkId, u64>), RecoveryCheckpointError> {
-        self.verify_graph_policy(checkpoint, Some(verifier))
-    }
-
-    fn verify_graph_policy(
-        &self,
-        checkpoint: &AuditedCheckpoint,
-        verifier: Option<&dyn RequiredChunkVerifier>,
-    ) -> Result<(RecoveryCheckpointSummary, BTreeMap<ChunkId, u64>), RecoveryCheckpointError> {
-        let (_root, required) = self.scan_graph(checkpoint)?;
-        if let Some(verifier) = verifier {
-            verifier.verify_required_chunks(&required)?;
-        }
-        Ok((
-            RecoveryCheckpointSummary {
-                generation: checkpoint.record.generation(),
-                metadata_object_count: u64::try_from(checkpoint.objects.len())
-                    .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-                metadata_payload_bytes: checkpoint.metadata_payload_bytes,
-                required_chunk_count: u64::try_from(required.len())
-                    .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
-                file_length: checkpoint.descriptor.file_length(),
-            },
-            required,
-        ))
-    }
-
-    fn scan_graph(
-        &self,
-        checkpoint: &AuditedCheckpoint,
-    ) -> Result<(NamespaceRoot, BTreeMap<ChunkId, u64>), RecoveryCheckpointError> {
-        let encoded_root = self.read_object(checkpoint, checkpoint.record.namespace_root())?;
+        chain: &CheckpointChain,
+    ) -> Result<(BTreeSet<MetadataObjectId>, BTreeMap<ChunkId, u64>), RecoveryCheckpointError> {
+        let record = chain.tip().record;
+        let encoded_root = self.read_object(chain, record.namespace_root())?;
         let descriptor = NamespaceGraphRoot::decode(&encoded_root)?;
         let mut encoded_shards = BTreeMap::new();
         for reference in descriptor.shards() {
@@ -996,46 +1223,49 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 encoded_shards.entry(shard_id)
             {
-                entry.insert(self.read_object(checkpoint, shard_id)?);
+                entry.insert(self.read_object(chain, shard_id)?);
             }
         }
         let root = NamespaceRoot::decode_graph(&encoded_root, &encoded_shards)?;
-        if root.namespace_mutation_sequence() != checkpoint.record.namespace_mutation_cutoff()
-            || root.inode_reservation_end() != checkpoint.record.inode_reservation_end()
-            || root.inode_allocation_cursor() != checkpoint.record.inode_allocation_cursor()
+        if root.namespace_mutation_sequence() != record.namespace_mutation_cutoff()
+            || root.inode_reservation_end() != record.inode_reservation_end()
+            || root.inode_allocation_cursor() != record.inode_allocation_cursor()
         {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
         let mut reachable = BTreeSet::new();
-        reachable.insert(checkpoint.record.namespace_root());
+        reachable.insert(record.namespace_root());
         reachable.extend(encoded_shards.keys().copied());
         let mut required = BTreeMap::new();
-        let mut length_conflict = None;
+        let mut length_conflict = false;
         for inode in root.file_inodes() {
+            if reachable.contains(&inode.manifest_root()) {
+                // A shared tree was walked for an earlier inode; its length
+                // must still match this inode.
+                if chain
+                    .objects
+                    .get(&inode.manifest_root())
+                    .is_none_or(|location| {
+                        location.record.facts().logical_length() != inode.logical_size()
+                    })
+                {
+                    return Err(RecoveryCheckpointError::IdentityMismatch);
+                }
+                continue;
+            }
             let summary = scan_manifest_tree(
                 inode.manifest_root(),
                 |object_id| {
                     reachable.insert(object_id);
-                    self.read_object(checkpoint, object_id)
+                    self.read_object(chain, object_id)
                         .map_err(map_checkpoint_manifest_error)
                 },
                 |_logical_offset, extent| {
-                    let (chunk_id, logical_length) = match *extent {
-                        ManifestExtent::Data {
-                            logical_length,
-                            chunk_id,
-                        } => (chunk_id, logical_length),
-                        ManifestExtent::DataSlice {
-                            chunk_id,
-                            chunk_length,
-                            ..
-                        } => (chunk_id, u64::from(chunk_length)),
-                        ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => return Ok(()),
-                    };
-                    if let Some(previous) = required.insert(chunk_id, logical_length)
+                    if let Some((chunk_id, logical_length)) = extent_chunk(extent)
+                        && let Some(previous) = required.insert(chunk_id, logical_length)
                         && previous != logical_length
                     {
-                        length_conflict = Some((chunk_id, previous, logical_length));
+                        length_conflict = true;
                     }
                     Ok(())
                 },
@@ -1044,103 +1274,26 @@ impl<I: StorageIo> RecoveryCheckpointRepository<I> {
                 return Err(RecoveryCheckpointError::IdentityMismatch);
             }
         }
-        if length_conflict.is_some() || !reachable.iter().eq(checkpoint.objects.keys()) {
+        if length_conflict {
             return Err(RecoveryCheckpointError::IdentityMismatch);
         }
-        Ok((root, required))
-    }
-
-    fn scan_graph_matching(
-        &self,
-        checkpoint: &AuditedCheckpoint,
-        selected_chunks: Option<&BTreeSet<ChunkId>>,
-    ) -> Result<(NamespaceRoot, BTreeMap<ChunkId, u64>), RecoveryCheckpointError> {
-        let mut encoded_shards = BTreeMap::new();
-        let encoded_root = self.read_object(checkpoint, checkpoint.record.namespace_root())?;
-        let descriptor = NamespaceGraphRoot::decode(&encoded_root)?;
-        for reference in descriptor.shards() {
-            let shard_id = reference.object_id();
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                encoded_shards.entry(shard_id)
-            {
-                entry.insert(self.read_object(checkpoint, shard_id)?);
-            }
-        }
-        let root = NamespaceRoot::decode_graph(&encoded_root, &encoded_shards)?;
-        if root.namespace_mutation_sequence() != checkpoint.record.namespace_mutation_cutoff()
-            || root.inode_reservation_end() != checkpoint.record.inode_reservation_end()
-            || root.inode_allocation_cursor() != checkpoint.record.inode_allocation_cursor()
-        {
-            return Err(RecoveryCheckpointError::IdentityMismatch);
-        }
-        let mut reachable = BTreeSet::new();
-        reachable.insert(checkpoint.record.namespace_root());
-        reachable.extend(encoded_shards.keys().copied());
-        let mut required = BTreeMap::new();
-        let mut length_conflict = None;
-        let collect_all = selected_chunks.is_none();
-        for inode in root.file_inodes() {
-            let summary = scan_manifest_tree(
-                inode.manifest_root(),
-                |object_id| {
-                    reachable.insert(object_id);
-                    self.read_object(checkpoint, object_id)
-                        .map_err(map_checkpoint_manifest_error)
-                },
-                |_logical_offset, extent| {
-                    let (chunk_id, logical_length) = match *extent {
-                        ManifestExtent::Data {
-                            logical_length,
-                            chunk_id,
-                        } => (chunk_id, logical_length),
-                        ManifestExtent::DataSlice {
-                            chunk_id,
-                            chunk_length,
-                            ..
-                        } => (chunk_id, u64::from(chunk_length)),
-                        ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => return Ok(()),
-                    };
-                    if let Some(selected_chunks) = selected_chunks {
-                        if !selected_chunks.contains(&chunk_id) {
-                            return Ok(());
-                        }
-                    } else if collect_all
-                        && required.len() >= CHECKPOINT_PROTECTED_CHUNK_CACHE_LIMIT
-                    {
-                        return Err(ManifestTreeError::InvalidReplacement);
-                    }
-                    if let Some(previous) = required.insert(chunk_id, logical_length)
-                        && previous != logical_length
-                    {
-                        length_conflict = Some((chunk_id, previous, logical_length));
-                    }
-                    Ok(())
-                },
-            )?;
-            if summary.logical_size() != inode.logical_size() {
-                return Err(RecoveryCheckpointError::IdentityMismatch);
-            }
-        }
-        if length_conflict.is_some() || !reachable.iter().eq(checkpoint.objects.keys()) {
-            return Err(RecoveryCheckpointError::IdentityMismatch);
-        }
-        Ok((root, required))
+        Ok((reachable, required))
     }
 
     fn read_object(
         &self,
-        checkpoint: &AuditedCheckpoint,
+        chain: &CheckpointChain,
         object_id: MetadataObjectId,
     ) -> Result<Arc<Vec<u8>>, RecoveryCheckpointError> {
-        let span = checkpoint
+        let location = chain
             .objects
             .get(&object_id)
             .ok_or(RecoveryCheckpointError::IdentityMismatch)?;
         let encoded = read_bounded(
             &self.storage,
-            &checkpoint.name,
-            span.offset,
-            usize::try_from(span.length)
+            &chain.files[location.file].name,
+            location.record.payload_offset(),
+            usize::try_from(location.record.payload_length())
                 .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
         )?;
         if MetadataObjectId::from_encoded(&encoded)? != object_id {
@@ -1157,24 +1310,49 @@ pub struct RecoveryCheckpointSummary {
     metadata_payload_bytes: u64,
     required_chunk_count: u64,
     file_length: u64,
+    chain_file_count: u64,
+    chain_metadata_payload_bytes: u64,
+    base: bool,
 }
 
 impl RecoveryCheckpointSummary {
+    fn for_tip(
+        chain: &CheckpointChain,
+        required_chunk_count: u64,
+    ) -> Result<Self, RecoveryCheckpointError> {
+        let tip = chain.tip();
+        Ok(Self {
+            generation: tip.descriptor.generation(),
+            metadata_object_count: tip.descriptor.object_count(),
+            metadata_payload_bytes: tip.payload_bytes,
+            required_chunk_count,
+            file_length: tip.descriptor.file_length(),
+            chain_file_count: u64::try_from(chain.files.len())
+                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
+            chain_metadata_payload_bytes: tip.descriptor.chain_payload_bytes(),
+            base: tip.descriptor.is_base(),
+        })
+    }
+
     #[must_use]
     pub const fn generation(self) -> u64 {
         self.generation
     }
 
+    /// Metadata objects embedded in the published file.
     #[must_use]
     pub const fn metadata_object_count(self) -> u64 {
         self.metadata_object_count
     }
 
+    /// Payload bytes of the objects embedded in the published file.
     #[must_use]
     pub const fn metadata_payload_bytes(self) -> u64 {
         self.metadata_payload_bytes
     }
 
+    /// Distinct Chunks named by the leaves embedded in the published file;
+    /// zero when an existing file was adopted rather than written.
     #[must_use]
     pub const fn required_chunk_count(self) -> u64 {
         self.required_chunk_count
@@ -1183,6 +1361,21 @@ impl RecoveryCheckpointSummary {
     #[must_use]
     pub const fn file_length(self) -> u64 {
         self.file_length
+    }
+
+    #[must_use]
+    pub const fn chain_file_count(self) -> u64 {
+        self.chain_file_count
+    }
+
+    #[must_use]
+    pub const fn chain_metadata_payload_bytes(self) -> u64 {
+        self.chain_metadata_payload_bytes
+    }
+
+    #[must_use]
+    pub const fn is_base(self) -> bool {
+        self.base
     }
 }
 
@@ -1197,6 +1390,7 @@ pub struct RecoveryCheckpointScrubSummary {
 }
 
 impl RecoveryCheckpointScrubSummary {
+    /// Verified recovery points.
     #[must_use]
     pub const fn checkpoint_count(self) -> u64 {
         self.checkpoint_count
@@ -1212,6 +1406,7 @@ impl RecoveryCheckpointScrubSummary {
         self.latest_generation
     }
 
+    /// Objects across every distinct verified file.
     #[must_use]
     pub const fn metadata_object_count(self) -> u64 {
         self.metadata_object_count
@@ -1249,7 +1444,10 @@ impl RecoveryCheckpointError {
             Self::Io(error)
             | Self::Store(StoreError::Io(error))
             | Self::Manifest(ManifestTreeError::Io(error)) => {
-                error.kind() == io::ErrorKind::NotFound
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+                )
             }
             Self::Format(_)
             | Self::Commit(_)
@@ -1346,19 +1544,266 @@ impl From<GenerationError> for RecoveryCheckpointError {
     }
 }
 
+/// What a reference requires of the object it names.
 #[derive(Clone, Copy, Debug)]
-struct ObjectSpan {
-    offset: u64,
-    length: u32,
+enum ReferenceExpectation {
+    NamespaceShard,
+    ManifestRoot {
+        logical_length: u64,
+    },
+    ManifestChild {
+        level: u16,
+        logical_length: u64,
+        allocated_bytes: Option<u64>,
+    },
 }
 
-#[derive(Debug)]
-struct AuditedCheckpoint {
-    name: String,
-    descriptor: RecoveryCheckpointDescriptor,
-    record: CommitRecord,
-    objects: BTreeMap<MetadataObjectId, ObjectSpan>,
-    metadata_payload_bytes: u64,
+impl ReferenceExpectation {
+    fn admits(self, facts: RecoveryCheckpointObjectFacts) -> bool {
+        match self {
+            Self::NamespaceShard => matches!(
+                facts.kind(),
+                RecoveryCheckpointObjectKind::NamespaceInodeShard
+                    | RecoveryCheckpointObjectKind::NamespaceEntryShard
+            ),
+            Self::ManifestRoot { logical_length } => {
+                facts.is_manifest() && facts.logical_length() == logical_length
+            }
+            Self::ManifestChild {
+                level,
+                logical_length,
+                allocated_bytes,
+            } => {
+                facts.is_manifest()
+                    && facts.level() == level
+                    && facts.logical_length() == logical_length
+                    && allocated_bytes
+                        .is_none_or(|expected| facts.allocated_bytes() == Some(expected))
+            }
+        }
+    }
+}
+
+struct DecodedCheckpointObject {
+    facts: RecoveryCheckpointObjectFacts,
+    references: Vec<(MetadataObjectId, ReferenceExpectation)>,
+    chunks: Vec<(ChunkId, u64)>,
+}
+
+/// Fully decodes one embedded object into its facts and outgoing references.
+fn decode_checkpoint_object(
+    encoded: &[u8],
+) -> Result<DecodedCheckpointObject, RecoveryCheckpointError> {
+    match metadata_object_kind(encoded)? {
+        MetadataObjectKind::ManifestLeaf => {
+            let leaf = ManifestLeaf::decode(encoded)?;
+            let mut allocated = 0_u64;
+            let mut chunks = Vec::new();
+            for extent in leaf.extents() {
+                if let Some(chunk) = extent_chunk(extent) {
+                    chunks.push(chunk);
+                }
+                if let ManifestExtent::Data { logical_length, .. }
+                | ManifestExtent::DataSlice { logical_length, .. }
+                | ManifestExtent::Fill { logical_length, .. } = *extent
+                {
+                    allocated = allocated
+                        .checked_add(logical_length)
+                        .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
+                }
+            }
+            chunks.sort_unstable();
+            chunks.dedup();
+            Ok(DecodedCheckpointObject {
+                facts: RecoveryCheckpointObjectFacts::manifest_leaf(leaf.file_length(), allocated)?,
+                references: Vec::new(),
+                chunks,
+            })
+        }
+        MetadataObjectKind::ManifestInnerNode => {
+            let node = ManifestInnerNode::decode(encoded).map_err(ManifestTreeError::from)?;
+            let child_level = node
+                .level()
+                .checked_sub(1)
+                .ok_or(RecoveryCheckpointError::IdentityMismatch)?;
+            Ok(DecodedCheckpointObject {
+                facts: RecoveryCheckpointObjectFacts::manifest_inner(
+                    node.level(),
+                    node.file_length(),
+                    node.allocated_bytes().map_err(ManifestTreeError::from)?,
+                )?,
+                references: node
+                    .children()
+                    .iter()
+                    .map(|child| {
+                        (
+                            child.child(),
+                            ReferenceExpectation::ManifestChild {
+                                level: child_level,
+                                logical_length: child.logical_length(),
+                                allocated_bytes: child.allocated_bytes(),
+                            },
+                        )
+                    })
+                    .collect(),
+                chunks: Vec::new(),
+            })
+        }
+        MetadataObjectKind::NamespaceRoot => {
+            let (kind, references) = match decode_namespace_object_references(encoded)? {
+                NamespaceObjectReferences::GraphRoot(shards) => (
+                    RecoveryCheckpointObjectKind::NamespaceGraphRoot,
+                    shards
+                        .into_iter()
+                        .map(|shard| (shard, ReferenceExpectation::NamespaceShard))
+                        .collect(),
+                ),
+                NamespaceObjectReferences::InodeShard(files) => (
+                    RecoveryCheckpointObjectKind::NamespaceInodeShard,
+                    files
+                        .into_iter()
+                        .map(|(root, logical_length)| {
+                            (root, ReferenceExpectation::ManifestRoot { logical_length })
+                        })
+                        .collect(),
+                ),
+                NamespaceObjectReferences::EntryShard => (
+                    RecoveryCheckpointObjectKind::NamespaceEntryShard,
+                    Vec::new(),
+                ),
+            };
+            Ok(DecodedCheckpointObject {
+                facts: RecoveryCheckpointObjectFacts::namespace(kind)?,
+                references,
+                chunks: Vec::new(),
+            })
+        }
+        MetadataObjectKind::ExactIndexRunSet
+        | MetadataObjectKind::NamespaceShard
+        | MetadataObjectKind::Unknown(_) => Err(RecoveryCheckpointError::IdentityMismatch),
+    }
+}
+
+const fn extent_chunk(extent: &ManifestExtent) -> Option<(ChunkId, u64)> {
+    match *extent {
+        ManifestExtent::Data {
+            logical_length,
+            chunk_id,
+        } => Some((chunk_id, logical_length)),
+        ManifestExtent::DataSlice {
+            chunk_id,
+            chunk_length,
+            ..
+        } => Some((chunk_id, chunk_length as u64)),
+        ManifestExtent::Hole { .. } | ManifestExtent::Fill { .. } => None,
+    }
+}
+
+/// Exact in-memory traversal of one recovery point over verified references.
+fn collect_protected(
+    chain: &CheckpointChain,
+    references: &[Arc<FileReferences>],
+    selected_chunks: &BTreeSet<ChunkId>,
+    protected: &mut BTreeMap<ChunkId, u64>,
+) -> Result<(), RecoveryCheckpointError> {
+    let mut pending = vec![chain.tip().record.namespace_root()];
+    let mut visited = HashSet::new();
+    while let Some(object_id) = pending.pop() {
+        if !visited.insert(object_id) {
+            continue;
+        }
+        let node = chain
+            .objects
+            .get(&object_id)
+            .and_then(|location| references.get(location.file))
+            .and_then(|file| file.nodes.get(&object_id))
+            .ok_or(RecoveryCheckpointError::IdentityMismatch)?;
+        pending.extend(node.children.iter().copied());
+        for (chunk_id, logical_length) in &node.chunks {
+            if selected_chunks.contains(chunk_id) {
+                merge_protected(protected, [(*chunk_id, *logical_length)])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_protected(
+    protected: &mut BTreeMap<ChunkId, u64>,
+    chunks: impl IntoIterator<Item = (ChunkId, u64)>,
+) -> Result<(), RecoveryCheckpointError> {
+    for (chunk_id, logical_length) in chunks {
+        if let Some(previous) = protected.insert(chunk_id, logical_length)
+            && previous != logical_length
+        {
+            return Err(RecoveryCheckpointError::IdentityMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn encode_table(
+    table: &[RecoveryCheckpointTableRecord],
+) -> Result<Vec<u8>, RecoveryCheckpointError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(
+            table
+                .len()
+                .checked_mul(RECOVERY_CHECKPOINT_TABLE_RECORD_BYTES)
+                .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| RecoveryCheckpointError::OutOfMemory)?;
+    for entry in table {
+        bytes.extend_from_slice(&entry.encode());
+    }
+    Ok(bytes)
+}
+
+/// Forward reader over one payload region using bounded windows.
+struct SequentialReader<'a, I> {
+    storage: &'a I,
+    name: &'a str,
+    limit: u64,
+    start: u64,
+    window: Vec<u8>,
+}
+
+impl<'a, I: StorageIo> SequentialReader<'a, I> {
+    const fn new(storage: &'a I, name: &'a str, limit: u64) -> Self {
+        Self {
+            storage,
+            name,
+            limit,
+            start: 0,
+            window: Vec::new(),
+        }
+    }
+
+    fn read(&mut self, offset: u64, length: usize) -> Result<Vec<u8>, RecoveryCheckpointError> {
+        let end = offset
+            .checked_add(
+                u64::try_from(length).map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?,
+            )
+            .ok_or(RecoveryCheckpointError::ArithmeticOverflow)?;
+        if end > self.limit {
+            return Err(RecoveryCheckpointError::IdentityMismatch);
+        }
+        let window_end = self.start + self.window.len() as u64;
+        if offset < self.start || end > window_end {
+            if length >= MAX_STORAGE_RANGE_BYTES {
+                self.window.clear();
+                return read_bounded(self.storage, self.name, offset, length);
+            }
+            let fill = usize::try_from((self.limit - offset).min(MAX_STORAGE_RANGE_BYTES as u64))
+                .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
+            self.window = self.storage.read_exact_at(self.name, offset, fill)?;
+            self.start = offset;
+        }
+        let from = usize::try_from(offset - self.start)
+            .map_err(|_| RecoveryCheckpointError::ArithmeticOverflow)?;
+        Ok(self.window[from..from + length].to_vec())
+    }
 }
 
 fn checkpoint_name(generation: u64) -> String {
@@ -1402,137 +1847,205 @@ fn map_checkpoint_manifest_error(error: RecoveryCheckpointError) -> ManifestTree
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastdup_format::{DurableInode, ManifestLeaf, NamespaceEntry, PolicySetId};
+    use crate::ContainerRepository;
+    use fastdup_format::{DurableInode, NamespaceEntry, PolicySetId};
 
-    #[test]
-    fn checkpoint_copy_batches_entries_without_per_page_read_modify_write() {
-        let root = std::env::temp_dir().join(format!("checkpoint-batch-{}", std::process::id()));
-        let metadata = crate::FsStorageIo::open(root.join("metadata")).unwrap();
-        let data = crate::FsStorageIo::open(root.join("data")).unwrap();
-        let source = GenerationRepository::new(metadata, PolicySetId::new([1; 32]).unwrap());
-        source
-            .commit_namespace(&NamespaceRoot::new(1024, 2, 0, vec![], vec![]).unwrap())
-            .unwrap();
-        let length = (0..32_000_u64).map(|i| 4096 + i).sum();
-        let manifest = ManifestLeaf::new(
-            length,
-            (0..32_000_u64)
-                .map(|i| ManifestExtent::Fill {
-                    logical_length: 4096 + i,
-                    value: (i % 2) as u8,
-                })
-                .collect(),
-        )
-        .unwrap();
-        let id = source.publish_manifest(&manifest).unwrap();
-        let namespace = NamespaceRoot::new(
-            1024,
-            3,
-            1,
-            vec![DurableInode::new(2, 0o640, 1000, 1000, 1, 1, length, id).unwrap()],
-            vec![NamespaceEntry::new(1, 2, b"backup".to_vec()).unwrap()],
-        )
-        .unwrap();
-        let committed = source.commit_namespace(&namespace).unwrap();
-        let checkpoints = RecoveryCheckpointRepository::new(data);
-        let before = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get);
-        let edges_before = crate::direct_io::WRITE_EDGE_READS.with(std::cell::Cell::get);
-        let syncs_before = crate::direct_io::LENGTH_HEAD_SYNC_CALLS.with(std::cell::Cell::get);
-        let summary = checkpoints.publish_committed(&source).unwrap().unwrap();
-        let writes = crate::direct_io::WRITE_CALLS.with(std::cell::Cell::get) - before;
-        let edge_reads =
-            crate::direct_io::WRITE_EDGE_READS.with(std::cell::Cell::get) - edges_before;
-        let length_syncs =
-            crate::direct_io::LENGTH_HEAD_SYNC_CALLS.with(std::cell::Cell::get) - syncs_before;
-        eprintln!(
-            "checkpoint bytes={}, writes={writes}, write-edge reads={edge_reads}, length syncs={length_syncs}",
-            summary.file_length()
-        );
-        assert!(
-            length_syncs <= 1,
-            "only selector heads need incremental durability; temporary checkpoint batches must not sync their length heads: {length_syncs}"
-        );
-        assert_eq!(
-            edge_reads, 0,
-            "the aligned checkpoint stream must not read sectors to preserve write edges"
-        );
-        assert!(
-            writes <= 24,
-            "checkpoint body must batch across object boundaries: {writes} physical writes"
-        );
-        assert!(summary.file_length() > 1024 * 1024);
-        let audited = checkpoints
-            .audit_named(&checkpoint_name(committed.generation()))
-            .unwrap();
-        assert_eq!(audited.record, committed);
-        assert_eq!(
-            audited.objects.len() as u64,
-            summary.metadata_object_count()
-        );
-        std::fs::remove_dir_all(root).unwrap();
+    struct AcceptAll;
+
+    impl RequiredChunkVerifier for AcceptAll {
+        fn verify_required_chunks(&self, _: &BTreeMap<ChunkId, u64>) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        root: std::path::PathBuf,
+        metadata: crate::FsStorageIo,
+        source: GenerationRepository<crate::FsStorageIo>,
+        containers: ContainerRepository<crate::FsStorageIo>,
+        checkpoints: RecoveryCheckpointRepository<crate::FsStorageIo>,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let metadata = crate::FsStorageIo::open(root.join("metadata")).unwrap();
+            let data = crate::FsStorageIo::open(root.join("data")).unwrap();
+            let source =
+                GenerationRepository::new(metadata.clone(), PolicySetId::new([1; 32]).unwrap());
+            source
+                .commit_namespace(&NamespaceRoot::new(1024, 2, 0, vec![], vec![]).unwrap())
+                .unwrap();
+            Self {
+                root,
+                metadata,
+                source,
+                containers: ContainerRepository::new(data.clone()),
+                checkpoints: RecoveryCheckpointRepository::new(data),
+            }
+        }
+
+        /// Commits one regular file per Chunk, each backed by a one-extent leaf.
+        fn commit_files(&self, chunks: &[ChunkId], sequence: u64) -> CommitRecord {
+            let mut inodes = Vec::new();
+            let mut entries = Vec::new();
+            for (ordinal, chunk_id) in chunks.iter().enumerate() {
+                let inode = u64::try_from(ordinal).unwrap() + 2;
+                let manifest = ManifestLeaf::new(
+                    4096,
+                    vec![ManifestExtent::Data {
+                        logical_length: 4096,
+                        chunk_id: *chunk_id,
+                    }],
+                )
+                .unwrap();
+                let manifest_root = self.source.publish_manifest(&manifest).unwrap();
+                inodes.push(
+                    DurableInode::new(inode, 0o640, 1000, 1000, 1, sequence, 4096, manifest_root)
+                        .unwrap(),
+                );
+                entries.push(
+                    NamespaceEntry::new(1, inode, format!("file-{ordinal}").into_bytes()).unwrap(),
+                );
+            }
+            let namespace = NamespaceRoot::new(1024, 8, sequence, inodes, entries).unwrap();
+            self.source
+                .commit_namespace_with_verified_files_using(
+                    &namespace,
+                    &self.containers,
+                    &AcceptAll,
+                )
+                .unwrap()
+                .record()
+        }
+
+        fn read_source_object(&self, object_id: MetadataObjectId) -> Arc<Vec<u8>> {
+            use std::fmt::Write as _;
+            let mut name = String::new();
+            for byte in object_id.bytes() {
+                write!(&mut name, "{byte:02x}").unwrap();
+            }
+            name.push_str(".fdm");
+            Arc::new(self.metadata.read(&name).unwrap())
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 
     #[test]
-    fn checkpoint_protection_cache_answers_later_proofs_without_rereading_the_graph() {
-        let root = std::env::temp_dir().join(format!(
-            "checkpoint-protection-cache-{}",
-            std::process::id()
-        ));
-        let metadata = crate::FsStorageIo::open(root.join("metadata")).unwrap();
-        let data = crate::FsStorageIo::open(root.join("data")).unwrap();
-        let source = GenerationRepository::new(metadata, PolicySetId::new([1; 32]).unwrap());
-        source
-            .commit_namespace(&NamespaceRoot::new(1024, 2, 0, vec![], vec![]).unwrap())
-            .unwrap();
-        let manifest = ManifestLeaf::new(
-            8192,
-            vec![
-                ManifestExtent::Fill {
-                    logical_length: 4096,
-                    value: 0,
-                },
-                ManifestExtent::Fill {
-                    logical_length: 4096,
-                    value: 1,
-                },
-            ],
-        )
-        .unwrap();
-        let manifest_id = source.publish_manifest(&manifest).unwrap();
-        let namespace = NamespaceRoot::new(
-            1024,
-            3,
-            1,
-            vec![DurableInode::new(2, 0o640, 1000, 1000, 1, 1, 8192, manifest_id).unwrap()],
-            vec![NamespaceEntry::new(1, 2, b"backup".to_vec()).unwrap()],
-        )
-        .unwrap();
-        source.commit_namespace(&namespace).unwrap();
-
-        let checkpoints = RecoveryCheckpointRepository::new(data);
-        checkpoints.publish_committed(&source).unwrap().unwrap();
-        let selected = BTreeSet::from([ChunkId::from_bytes([7; 32])]);
-        let cache = CheckpointProtectedChunkCache::default();
-
-        let first_before = crate::direct_io::READ_BYTES.with(std::cell::Cell::get);
-        let first = checkpoints
-            .protected_chunks_matching(&selected, Some(&cache))
-            .unwrap();
-        let first_reads = crate::direct_io::READ_BYTES.with(std::cell::Cell::get) - first_before;
-        assert!(first.is_empty());
-        assert_eq!(cache.cached_checkpoint_count_for_test(), 1);
-
-        let second_before = crate::direct_io::READ_BYTES.with(std::cell::Cell::get);
-        let second = checkpoints
-            .protected_chunks_matching(&selected, Some(&cache))
-            .unwrap();
-        let second_reads = crate::direct_io::READ_BYTES.with(std::cell::Cell::get) - second_before;
-        assert_eq!(second, first);
+    fn online_protection_is_exact_per_retained_point_and_reads_only_new_files() {
+        let fixture = Fixture::new("checkpoint-chain-protection");
+        let deleted = ChunkId::from_bytes([7; 32]);
+        let kept = ChunkId::from_bytes([8; 32]);
+        fixture.commit_files(&[deleted, kept], 1);
         assert!(
-            second_reads < first_reads,
-            "cached protection must avoid a second checkpoint graph read: \
-             first={first_reads} second={second_reads}"
+            fixture
+                .checkpoints
+                .publish_committed(&fixture.source)
+                .unwrap()
+                .unwrap()
+                .is_base()
         );
-        std::fs::remove_dir_all(root).unwrap();
+        fixture.commit_files(&[kept], 2);
+        assert!(
+            !fixture
+                .checkpoints
+                .publish_committed(&fixture.source)
+                .unwrap()
+                .unwrap()
+                .is_base()
+        );
+
+        let selected = BTreeSet::from([deleted, kept]);
+        let cache = CheckpointProtectedChunkCache::default();
+        let protected = fixture
+            .checkpoints
+            .protected_chunks_matching(&selected, Some(&cache))
+            .unwrap();
+        assert_eq!(
+            protected.keys().copied().collect::<BTreeSet<_>>(),
+            selected,
+            "the older head still names the deleted file"
+        );
+        assert_eq!(cache.cached_file_count_for_test(), 2);
+
+        fixture.commit_files(&[kept], 3);
+        assert!(
+            !fixture
+                .checkpoints
+                .publish_committed(&fixture.source)
+                .unwrap()
+                .unwrap()
+                .is_base()
+        );
+        let full_before = crate::direct_io::READ_BYTES.with(std::cell::Cell::get);
+        let uncached = fixture
+            .checkpoints
+            .protected_chunks_matching(&selected, None)
+            .unwrap();
+        let full_reads = crate::direct_io::READ_BYTES.with(std::cell::Cell::get) - full_before;
+        let cached_before = crate::direct_io::READ_BYTES.with(std::cell::Cell::get);
+        let cached = fixture
+            .checkpoints
+            .protected_chunks_matching(&selected, Some(&cache))
+            .unwrap();
+        let cached_reads = crate::direct_io::READ_BYTES.with(std::cell::Cell::get) - cached_before;
+        assert_eq!(cached, uncached);
+        assert_eq!(
+            cached.keys().copied().collect::<Vec<_>>(),
+            vec![kept],
+            "superseded chain objects protect nothing once no retained point reaches them"
+        );
+        assert_eq!(cache.cached_file_count_for_test(), 3);
+        assert!(
+            cached_reads < full_reads,
+            "cached protection rereads only the new Delta: cached={cached_reads} full={full_reads}"
+        );
+    }
+
+    #[test]
+    fn scrub_and_recovery_reject_a_delta_without_prefix_closure() {
+        let fixture = Fixture::new("checkpoint-chain-closure");
+        let first = fixture.commit_files(&[ChunkId::from_bytes([3; 32])], 1);
+        fixture
+            .checkpoints
+            .publish_committed(&fixture.source)
+            .unwrap();
+        let second = fixture.commit_files(&[ChunkId::from_bytes([4; 32])], 2);
+
+        let state = fixture.checkpoints.adopt_selected_chain().unwrap().unwrap();
+        let mut increment = fixture
+            .source
+            .scan_recovery_checkpoint_increment(second, |object_id| state.facts(object_id))
+            .unwrap();
+        let leaf = increment
+            .objects
+            .iter()
+            .find(|(_, facts)| facts.kind() == RecoveryCheckpointObjectKind::ManifestLeaf)
+            .map(|(object_id, _)| *object_id)
+            .unwrap();
+        // Simulate a writer that forgets one new child of an embedded parent.
+        increment.objects.remove(&leaf);
+        fixture
+            .checkpoints
+            .publish_chain_file(second, &increment, Some(state), true, |object_id| {
+                Ok(fixture.read_source_object(object_id))
+            })
+            .unwrap();
+
+        assert!(fixture.checkpoints.scrub(&AcceptAll).is_err());
+        let replacement = crate::FsStorageIo::open(fixture.root.join("replacement")).unwrap();
+        let target = GenerationRepository::new(replacement, PolicySetId::new([1; 32]).unwrap());
+        let recovered = fixture
+            .checkpoints
+            .recover_latest(&target, &AcceptAll)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.record(), first);
     }
 }

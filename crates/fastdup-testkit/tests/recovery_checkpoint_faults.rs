@@ -21,6 +21,7 @@ use fastdup_testkit::{MemoryStorageIo, PausedStorageIo, StorageOperation};
 struct ReadRecordingStorage {
     inner: MemoryStorageIo,
     reads: Arc<Mutex<Vec<(StorageOperation, String)>>>,
+    ranges: Arc<Mutex<Vec<(String, u64, usize)>>>,
 }
 
 impl ReadRecordingStorage {
@@ -28,7 +29,15 @@ impl ReadRecordingStorage {
         Self {
             inner: MemoryStorageIo::new(),
             reads: Arc::new(Mutex::new(Vec::new())),
+            ranges: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn read_ranges(&self) -> Vec<(String, u64, usize)> {
+        self.ranges
+            .lock()
+            .expect("range recording lock is valid")
+            .clone()
     }
 
     fn read_names(&self) -> Vec<(StorageOperation, String)> {
@@ -74,6 +83,10 @@ impl StorageIo for ReadRecordingStorage {
 
     fn read_exact_at(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
         self.record_read(StorageOperation::ReadExactAt, name);
+        self.ranges
+            .lock()
+            .expect("range recording lock is valid")
+            .push((name.to_owned(), offset, length));
         self.inner.read_exact_at(name, offset, length)
     }
 
@@ -1125,4 +1138,430 @@ fn blocked_hdd_checkpoint_publication_does_not_hold_the_commit_lock() {
 
     assert_eq!(checkpoint.generation(), selected.generation());
     assert_eq!(commit.generation(), selected.generation() + 1);
+}
+
+const MIB: u64 = 1_024 * 1_024;
+const LARGE_FILE_EXTENTS: u64 = 3_000;
+
+/// Distinct Fill extents, so every leaf window is a distinct object.
+fn fill_layout(extents: u64, extent_length: u64, changed_extent: Option<u64>) -> ManifestLeaf {
+    ManifestLeaf::new(
+        extents * extent_length,
+        (0..extents)
+            .map(|ordinal| ManifestExtent::Fill {
+                logical_length: extent_length,
+                value: if changed_extent == Some(ordinal) {
+                    255
+                } else {
+                    u8::try_from(ordinal % 251).expect("fill value fits u8")
+                },
+            })
+            .collect(),
+    )
+    .expect("Fill layout is valid")
+}
+
+/// A 3,000-MiB file whose Manifest tree spans 47 leaves under one inner node.
+/// Changing one extent changes exactly one leaf and the root.
+fn large_layout(changed_extent: Option<u64>) -> ManifestLeaf {
+    fill_layout(LARGE_FILE_EXTENTS, MIB, changed_extent)
+}
+
+fn commit_large(
+    source: &GenerationRepository<MemoryStorageIo>,
+    changed_extent: Option<u64>,
+    mutation_sequence: u64,
+) -> (fastdup_format::CommitRecord, NamespaceRoot) {
+    let manifest_root = source
+        .publish_manifest(&large_layout(changed_extent))
+        .expect("publish large Manifest tree");
+    let namespace = visible_root_at(manifest_root, LARGE_FILE_EXTENTS * MIB, mutation_sequence);
+    let record = source
+        .commit_namespace(&namespace)
+        .expect("commit large Namespace");
+    (record, namespace)
+}
+
+fn large_source() -> (
+    GenerationRepository<MemoryStorageIo>,
+    fastdup_format::CommitRecord,
+    NamespaceRoot,
+) {
+    let source = GenerationRepository::new(MemoryStorageIo::new(), policy());
+    source
+        .commit_namespace(&reservation_root())
+        .expect("reserve inode identities before visibility");
+    let (record, namespace) = commit_large(&source, None, 1);
+    (source, record, namespace)
+}
+
+fn checkpoint_names<I: StorageIo>(storage: &I) -> Vec<String> {
+    let mut names = storage
+        .list_names()
+        .expect("list checkpoint publications")
+        .into_iter()
+        .filter(|name| {
+            name.starts_with("recovery-checkpoint.")
+                && std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("fdrc"))
+        })
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
+
+fn generation_name(generation: u64) -> String {
+    format!("recovery-checkpoint.{generation:016x}.fdrc")
+}
+
+#[test]
+fn committed_publications_extend_one_chain_with_only_new_objects() {
+    let (source, _, _) = large_source();
+    let data = MemoryStorageIo::new();
+    let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+    let base = checkpoints
+        .publish_committed(&source)
+        .expect("publish the chain Base")
+        .expect("one committed generation exists");
+    assert!(base.is_base());
+    assert_eq!(base.chain_file_count(), 1);
+    // Graph root, inode shard, entry shard, inner root and 47 leaves.
+    assert_eq!(base.metadata_object_count(), 51);
+
+    let (changed, _) = commit_large(&source, Some(1_500), 2);
+    let delta = checkpoints
+        .publish_committed(&source)
+        .expect("publish a Delta")
+        .expect("a newer generation exists");
+    assert_eq!(delta.generation(), changed.generation());
+    assert!(!delta.is_base());
+    assert_eq!(delta.chain_file_count(), 2);
+    assert_eq!(
+        delta.metadata_object_count(),
+        4,
+        "graph root, inode shard, Manifest root and the one changed leaf"
+    );
+    assert!(delta.file_length() * 4 < base.file_length());
+
+    let (latest, latest_namespace) = commit_large(&source, Some(1_500), 3);
+    let unchanged_tree = checkpoints
+        .publish_committed(&source)
+        .expect("publish a Namespace-only Delta")
+        .expect("a newer generation exists");
+    assert_eq!(unchanged_tree.metadata_object_count(), 2);
+    assert_eq!(unchanged_tree.chain_file_count(), 3);
+    assert_eq!(
+        checkpoint_names(&data),
+        vec![
+            generation_name(base.generation()),
+            generation_name(changed.generation()),
+            generation_name(latest.generation()),
+        ]
+    );
+
+    let scrub = checkpoints
+        .scrub(&AcceptAllRequiredChunks)
+        .expect("both selected tips verify through one chain");
+    assert_eq!(scrub.checkpoint_count(), 2);
+    assert_eq!(scrub.latest_generation(), Some(latest.generation()));
+    data.crash();
+    let replacement_metadata = MemoryStorageIo::new();
+    let replacement = GenerationRepository::new(replacement_metadata.clone(), policy());
+    let recovered = checkpoints
+        .recover_latest(&replacement, &AcceptAllRequiredChunks)
+        .expect("recover the Delta tip from its chain")
+        .expect("the chain tip is complete");
+    assert_eq!(recovered.record(), latest);
+    assert_eq!(recovered.namespace_root(), &latest_namespace);
+    replacement_metadata.crash();
+    assert_eq!(
+        GenerationRepository::new(replacement_metadata, policy())
+            .recover_latest()
+            .expect("the restored Metadata tier reopens")
+            .expect("the restored anchor is durable")
+            .record(),
+        latest
+    );
+}
+
+#[test]
+fn a_new_owner_adopts_the_selected_chain_without_reading_payloads() {
+    let (source, _, _) = large_source();
+    let data = ReadRecordingStorage::new();
+    let base = RecoveryCheckpointRepository::new(data.clone())
+        .publish_committed(&source)
+        .expect("publish the chain Base")
+        .expect("one committed generation exists");
+
+    let restarted = RecoveryCheckpointRepository::new(data.clone());
+    let ranges_before = data.read_ranges().len();
+    let adopted = restarted
+        .publish_committed(&source)
+        .expect("adopt the unchanged selected chain")
+        .expect("the selected generation exists");
+    assert_eq!(adopted.generation(), base.generation());
+    let table_offset = base.file_length()
+        - 4_096
+        - base.metadata_object_count()
+            * u64::try_from(fastdup_format::RECOVERY_CHECKPOINT_TABLE_RECORD_BYTES).unwrap();
+    for (name, offset, length) in &data.read_ranges()[ranges_before..] {
+        if name == &generation_name(base.generation()) {
+            assert!(
+                *offset + u64::try_from(*length).unwrap() <= 8_192 || *offset >= table_offset,
+                "adoption must not read the payload region: {offset}+{length}"
+            );
+        }
+    }
+
+    commit_large(&source, Some(7), 2);
+    let delta = restarted
+        .publish_committed(&source)
+        .expect("extend the adopted chain")
+        .expect("a newer generation exists");
+    assert!(!delta.is_base());
+    assert_eq!(delta.chain_file_count(), 2);
+    assert_eq!(delta.metadata_object_count(), 4);
+}
+
+#[test]
+fn every_delta_publication_fault_recovers_the_previous_tip_or_the_complete_delta() {
+    let (source, base_record, base_namespace) = large_source();
+    let probe = MemoryStorageIo::new();
+    let probe_checkpoints = RecoveryCheckpointRepository::new(probe.clone());
+    probe_checkpoints
+        .publish_committed(&source)
+        .expect("probe Base publication succeeds");
+    let (delta_record, delta_namespace) = commit_large(&source, Some(42), 2);
+    let before = probe.operation_count();
+    assert!(
+        !probe_checkpoints
+            .publish_committed(&source)
+            .expect("probe Delta publication succeeds")
+            .expect("probe Delta exists")
+            .is_base()
+    );
+    let delta_operations = probe.operation_count() - before;
+    assert!(delta_operations > 0);
+
+    for fail_after in [false, true] {
+        for position in 0..delta_operations {
+            let data = MemoryStorageIo::new();
+            let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+            // The Base was published for the older Commit; republish it here
+            // from a source view pinned to that generation.
+            let base_source = GenerationRepository::new(MemoryStorageIo::new(), policy());
+            base_source.commit_namespace(&reservation_root()).unwrap();
+            let base_manifest = base_source.publish_manifest(&large_layout(None)).unwrap();
+            assert_eq!(base_namespace.inodes()[0].manifest_root(), base_manifest);
+            base_source.commit_namespace(&base_namespace).unwrap();
+            checkpoints
+                .publish_committed(&base_source)
+                .expect("publish the Base before injecting a Delta fault");
+            drop(base_source);
+            let base_operations = data.operation_count();
+            data.arm_failpoint(fail_after, base_operations + position);
+            let result = checkpoints.publish_committed(&source);
+            data.crash();
+            let replacement = GenerationRepository::new(MemoryStorageIo::new(), policy());
+            let recovered = checkpoints
+                .recover_latest(&replacement, &AcceptAllRequiredChunks)
+                .unwrap_or_else(|error| {
+                    panic!("operation {position} (after={fail_after}) recovery failed: {error}")
+                })
+                .expect("the Base or the Delta is always selected");
+            if recovered.record() == delta_record {
+                assert_eq!(recovered.namespace_root(), &delta_namespace);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "operation {position} (after={fail_after}) lost a successful Delta"
+                );
+                assert_eq!(recovered.record().generation(), base_record.generation());
+                assert_eq!(recovered.namespace_root(), &base_namespace);
+            }
+            // A retry from fresh owner state completes the Delta.
+            let retried = RecoveryCheckpointRepository::new(data.clone())
+                .publish_committed(&source)
+                .unwrap_or_else(|error| panic!("operation {position} retry failed: {error}"))
+                .expect("the Delta generation exists");
+            assert_eq!(retried.generation(), delta_record.generation());
+            data.crash();
+            let replacement = GenerationRepository::new(MemoryStorageIo::new(), policy());
+            assert_eq!(
+                checkpoints
+                    .recover_latest(&replacement, &AcceptAllRequiredChunks)
+                    .unwrap()
+                    .unwrap()
+                    .record(),
+                delta_record
+            );
+        }
+    }
+}
+
+#[test]
+fn a_damaged_base_falls_back_to_the_previous_chain() {
+    let (source, _, _) = large_source();
+    let data = MemoryStorageIo::new();
+    let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+    checkpoints.publish_committed(&source).unwrap();
+    let (first_tip, first_namespace) = commit_large(&source, Some(3), 2);
+    assert!(
+        !checkpoints
+            .publish_committed(&source)
+            .unwrap()
+            .unwrap()
+            .is_base()
+    );
+
+    let (rebased, _) = commit_large(&source, Some(4), 3);
+    let base = checkpoints
+        .publish(&source, &AcceptAllRequiredChunks)
+        .expect("explicit publication starts a new Base")
+        .expect("a newer generation exists");
+    assert!(base.is_base());
+    assert_eq!(base.generation(), rebased.generation());
+    let (latest, _) = commit_large(&source, Some(5), 4);
+    assert!(
+        !checkpoints
+            .publish_committed(&source)
+            .unwrap()
+            .unwrap()
+            .is_base()
+    );
+    assert_eq!(
+        checkpoint_names(&data).len(),
+        4,
+        "the previous chain is retained"
+    );
+
+    let name = generation_name(rebased.generation());
+    let mut payload_byte = data.read_exact_at(&name, 8_192 + 200, 1).unwrap();
+    payload_byte[0] ^= 0x40;
+    data.write_at(&name, 8_192 + 200, &payload_byte).unwrap();
+    data.sync_file(&name).unwrap();
+    data.crash();
+
+    assert!(checkpoints.scrub(&AcceptAllRequiredChunks).is_err());
+    let replacement = GenerationRepository::new(MemoryStorageIo::new(), policy());
+    let recovered = checkpoints
+        .recover_latest(&replacement, &AcceptAllRequiredChunks)
+        .expect("recovery falls back to the previous chain")
+        .expect("the previous chain tip is complete");
+    assert_ne!(recovered.record(), latest);
+    assert_eq!(recovered.record(), first_tip);
+    assert_eq!(recovered.namespace_root(), &first_namespace);
+}
+
+#[test]
+fn a_second_base_prunes_the_chain_before_the_previous_one() {
+    let (source, first, _) = large_source();
+    let data = MemoryStorageIo::new();
+    let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+    checkpoints.publish_committed(&source).unwrap();
+    let (second, _) = commit_large(&source, Some(1), 2);
+    checkpoints.publish_committed(&source).unwrap();
+    let (third, _) = commit_large(&source, Some(2), 3);
+    checkpoints
+        .publish(&source, &AcceptAllRequiredChunks)
+        .unwrap();
+    let (fourth, _) = commit_large(&source, Some(3), 4);
+    checkpoints.publish_committed(&source).unwrap();
+    assert_eq!(
+        checkpoint_names(&data),
+        [&first, &second, &third, &fourth]
+            .map(|record| generation_name(record.generation()))
+            .to_vec()
+    );
+    let (fifth, _) = commit_large(&source, Some(4), 5);
+    checkpoints
+        .publish(&source, &AcceptAllRequiredChunks)
+        .unwrap();
+    assert_eq!(
+        checkpoint_names(&data),
+        [&third, &fourth, &fifth]
+            .map(|record| generation_name(record.generation()))
+            .to_vec(),
+        "only the current chain and the chain it replaced remain"
+    );
+    let scrub = checkpoints.scrub(&AcceptAllRequiredChunks).unwrap();
+    assert_eq!(scrub.checkpoint_count(), 2);
+    assert_eq!(scrub.first_generation(), Some(fourth.generation()));
+}
+
+#[test]
+fn delta_payload_reaching_the_base_payload_starts_a_new_base() {
+    let (source, _, _) = seed_source();
+    let data = MemoryStorageIo::new();
+    let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+    let base = checkpoints.publish_committed(&source).unwrap().unwrap();
+    assert!(base.is_base());
+    let manifest_root = source.publish_manifest(&large_layout(None)).unwrap();
+    source
+        .commit_namespace(&visible_root_at(manifest_root, LARGE_FILE_EXTENTS * MIB, 2))
+        .unwrap();
+    let large_delta = checkpoints.publish_committed(&source).unwrap().unwrap();
+    assert!(!large_delta.is_base());
+    assert!(large_delta.metadata_payload_bytes() >= base.metadata_payload_bytes());
+    source
+        .commit_namespace(&visible_root_at(manifest_root, LARGE_FILE_EXTENTS * MIB, 3))
+        .unwrap();
+    let rebased = checkpoints.publish_committed(&source).unwrap().unwrap();
+    assert!(
+        rebased.is_base(),
+        "a chain stops when its Deltas outgrow its Base"
+    );
+    assert_eq!(rebased.chain_file_count(), 1);
+}
+
+#[test]
+fn a_full_chain_starts_a_new_base_after_256_files() {
+    let (source, _, _) = seed_source();
+    let data = MemoryStorageIo::new();
+    let checkpoints = RecoveryCheckpointRepository::new(data.clone());
+    // A Base of about 5 MB keeps 255 Namespace-only Deltas below its payload.
+    let extents = 80_000;
+    let length = extents * 4_096;
+    let large_root = source
+        .publish_manifest(&fill_layout(extents, 4_096, None))
+        .unwrap();
+    source
+        .commit_namespace(&visible_root_at(large_root, length, 2))
+        .unwrap();
+    assert!(
+        checkpoints
+            .publish_committed(&source)
+            .unwrap()
+            .unwrap()
+            .is_base()
+    );
+    for sequence in 3..=257 {
+        source
+            .commit_namespace(&visible_root_at(large_root, length, sequence))
+            .unwrap();
+        let summary = checkpoints.publish_committed(&source).unwrap().unwrap();
+        assert!(
+            !summary.is_base(),
+            "file {} still fits the chain",
+            sequence - 1
+        );
+        assert_eq!(summary.chain_file_count(), sequence - 1);
+    }
+    source
+        .commit_namespace(&visible_root_at(large_root, length, 258))
+        .unwrap();
+    let rebased = checkpoints.publish_committed(&source).unwrap().unwrap();
+    assert!(rebased.is_base());
+    data.crash();
+    let replacement = GenerationRepository::new(MemoryStorageIo::new(), policy());
+    assert_eq!(
+        checkpoints
+            .recover_latest(&replacement, &AcceptAllRequiredChunks)
+            .unwrap()
+            .unwrap()
+            .record()
+            .generation(),
+        rebased.generation()
+    );
 }
