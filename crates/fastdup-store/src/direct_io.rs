@@ -18,6 +18,8 @@ const MAGIC: &[u8; 8] = b"FDIO0001";
 #[cfg(test)]
 thread_local! {
     pub(crate) static READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static SPARE_CAPACITY_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     pub(crate) static WRITE_EDGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static LENGTH_HEAD_SYNC_CALLS: std::cell::Cell<usize> =
@@ -521,6 +523,9 @@ fn read_physical(file: &File, offset: u64, length: usize) -> io::Result<Vec<u8>>
         return Ok(output);
     }
     let alignment = Alignment::cached(file, metadata.dev())?;
+    if read_into_spare_capacity(file, &mut output, offset, length, alignment)? {
+        return Ok(output);
+    }
     let mut position = offset;
     while position < end {
         let amount = usize::try_from((end - position).min(QUANTUM as u64))
@@ -534,6 +539,55 @@ fn read_physical(file: &File, offset: u64, length: usize) -> io::Result<Vec<u8>>
         position += amount as u64;
     }
     Ok(output)
+}
+
+/// Reads an aligned range straight into `output`'s spare capacity, so the
+/// Direct-I/O target is the returned allocation and no bounce buffer is
+/// zeroed, filled, and copied. Returns `false` without reading when the range,
+/// the allocation, or its exact capacity does not meet Direct-I/O alignment;
+/// the caller then uses the bounce path.
+fn read_into_spare_capacity(
+    file: &File,
+    output: &mut Vec<u8>,
+    offset: u64,
+    length: usize,
+    alignment: Alignment,
+) -> io::Result<bool> {
+    // The spare capacity is the read length, so it must equal the request.
+    if !output.is_empty()
+        || output.capacity() != length
+        || !offset.is_multiple_of(alignment.offset as u64)
+        || !length.is_multiple_of(alignment.offset)
+        || !output.as_ptr().addr().is_multiple_of(alignment.memory)
+    {
+        return Ok(false);
+    }
+    while output.len() < length {
+        let position = offset + output.len() as u64;
+        let count = match rustix::io::pread(file, rustix::buffer::spare_capacity(output), position)
+        {
+            Err(rustix::io::Errno::INTR) => continue,
+            result => result?,
+        };
+        #[cfg(test)]
+        READ_BYTES.with(|total| total.set(total.get() + count));
+        #[cfg(test)]
+        SPARE_CAPACITY_READS.with(|total| total.set(total.get() + 1));
+        if count == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        // A nonaligned partial read cannot be resubmitted directly.
+        if output.len() < length
+            && (!output.len().is_multiple_of(alignment.offset)
+                || !output.len().is_multiple_of(alignment.memory))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unaligned short Direct-I/O read",
+            ));
+        }
+    }
+    Ok(true)
 }
 
 /// The caller serializes mutation of this name. Partial edge sectors are read
@@ -724,6 +778,75 @@ mod tests {
         assert_eq!(
             (layout.length, layout.generation, layout.slot),
             (4167, 2, 1)
+        );
+    }
+
+    #[test]
+    fn aligned_reads_fill_the_output_directly_and_unaligned_reads_still_bounce() {
+        let fixture = Fixture::new();
+        let file = fixture.file();
+        let payload: Vec<u8> = (0..3 * BLOCK)
+            .map(|n| u8::try_from(n % 251).unwrap())
+            .collect();
+        write_with_layout(&file, layout(&file).unwrap(), 0, &payload).unwrap();
+        let base = PAYLOAD_OFFSET;
+        let direct = || SPARE_CAPACITY_READS.with(std::cell::Cell::get);
+
+        // The global allocator guarantees 16-byte alignment on x86-64; a
+        // stricter device memory alignment legitimately keeps the bounce path.
+        let fast_path = Alignment::read(&file).unwrap().memory <= 16;
+        let before = direct();
+        assert_eq!(
+            read_physical(&file, base, 2 * BLOCK).unwrap(),
+            payload[..2 * BLOCK]
+        );
+        assert_eq!(
+            direct() > before,
+            fast_path,
+            "an aligned range needs no bounce buffer when the allocation is aligned"
+        );
+
+        let before = direct();
+        assert_eq!(
+            read_physical(&file, base + 7, BLOCK + 13).unwrap(),
+            payload[7..BLOCK + 20]
+        );
+        assert_eq!(direct(), before, "an unaligned range keeps the bounce path");
+    }
+
+    #[test]
+    fn spare_capacity_reads_return_exact_bytes_and_reject_mismatched_requests() {
+        // A buffered descriptor exercises the read loop on hosts whose device
+        // memory alignment keeps production reads on the bounce path.
+        let fixture = Fixture::new();
+        let path = fixture.root.join("buffered.bin");
+        let payload: Vec<u8> = (0..4 * BLOCK)
+            .map(|n| u8::try_from(n % 239).unwrap())
+            .collect();
+        std::fs::write(&path, &payload).unwrap();
+        let file = File::open(&path).unwrap();
+        let alignment = Alignment {
+            memory: 4,
+            offset: 512,
+        };
+        let mut output = Vec::with_capacity(2 * BLOCK);
+        assert!(
+            read_into_spare_capacity(&file, &mut output, BLOCK as u64, 2 * BLOCK, alignment)
+                .unwrap()
+        );
+        assert_eq!(output, payload[BLOCK..3 * BLOCK]);
+
+        let mut oversized = Vec::with_capacity(4 * BLOCK);
+        assert!(!read_into_spare_capacity(&file, &mut oversized, 0, BLOCK, alignment).unwrap());
+        assert!(oversized.is_empty());
+        let mut unaligned = Vec::with_capacity(BLOCK);
+        assert!(!read_into_spare_capacity(&file, &mut unaligned, 7, BLOCK, alignment).unwrap());
+        assert!(unaligned.is_empty());
+
+        let mut past_end = Vec::with_capacity(2 * BLOCK);
+        assert!(
+            read_into_spare_capacity(&file, &mut past_end, 3 * BLOCK as u64, 2 * BLOCK, alignment)
+                .is_err()
         );
     }
 

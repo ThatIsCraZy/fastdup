@@ -2688,21 +2688,61 @@ impl<I: StorageIo> ContainerRepository<I> {
         Ok(record.into_payload())
     }
 
-    fn read_verified_dependent_location_payload(
+    /// Reads one dependent target Record and the Base key it authenticates.
+    ///
+    /// Codec-5 Bases differ in length from their target (ADR 0103), so the
+    /// Base must be looked up under the Record's own length. The Record bytes
+    /// are returned for the later decode instead of being read twice.
+    fn read_dependent_target(
         &self,
         candidate: ExactIndexEntry,
-        verified_base: &VerifiedChunkPayload,
-    ) -> Result<VerifiedChunkRead, StoreError> {
-        if candidate.transition() != ExactLocationTransition::Active
-            || candidate.location().dependency_id() != verified_base.chunk_id().bytes()
-            || u64::try_from(verified_base.len()) != Ok(u64::from(candidate.logical_length()))
-        {
+    ) -> Result<DependentTarget, StoreError> {
+        if candidate.transition() != ExactLocationTransition::Active {
             return Err(StoreError::ExactLocationMismatch);
         }
         let descriptor = self.read_candidate_descriptor(candidate)?;
-        descriptor
-            .record_range(candidate)
+        let encoded = self.read_candidate_record_with_descriptor(candidate, descriptor)?;
+        let dependency = descriptor
+            .dependent_candidate_dependency(candidate, &encoded)
             .map_err(map_exact_location_error)?;
+        Ok(DependentTarget {
+            descriptor,
+            encoded,
+            dependency,
+        })
+    }
+
+    /// Returns the Base identity and length named by one ACTIVE dependent
+    /// Location after pairing its Record.
+    ///
+    /// # Errors
+    ///
+    /// Returns Container I/O/integrity failures or
+    /// [`StoreError::ExactLocationMismatch`] for an unpaired candidate.
+    pub fn dependent_location_dependency(
+        &self,
+        candidate: ExactIndexEntry,
+    ) -> Result<fastdup_format::DependentDependency, StoreError> {
+        Ok(self.read_dependent_target(candidate)?.dependency)
+    }
+
+    /// Reads one dependent target as the single-flight leader, or waits for
+    /// the concurrent leader's verified result.
+    ///
+    /// Only the leader reads the target Record, learns the Base key it names,
+    /// and asks `resolve_base` for that independently verified Base, so
+    /// concurrent readers share both the target and the Base I/O.
+    fn read_verified_dependent_location_payload(
+        &self,
+        candidate: ExactIndexEntry,
+        target_intent: Option<ReadIntent>,
+        resolve_base: &mut dyn FnMut(
+            fastdup_format::DependentDependency,
+        ) -> Option<VerifiedChunkPayload>,
+    ) -> Result<VerifiedChunkRead, StoreError> {
+        if candidate.transition() != ExactLocationTransition::Active {
+            return Err(StoreError::ExactLocationMismatch);
+        }
         let join = self
             .record_reads
             .coordinate(RecordReadCoordinator::key(candidate));
@@ -2711,9 +2751,25 @@ impl<I: StorageIo> ContainerRepository<I> {
                 RecordReadCoordinator::wait(&flight).ok_or(StoreError::ExactLocationMismatch)?;
             return verified_record_read(candidate, &payloads);
         }
-        let encoded = self.read_candidate_record_with_descriptor(candidate, descriptor)?;
-        let record = descriptor
-            .decode_dependent_candidate_with_verified_base(candidate, &encoded, verified_base)
+        let target = {
+            let _target = target_intent.map(ReadIntentScope::enter);
+            self.read_dependent_target(candidate)?
+        };
+        let verified_base =
+            resolve_base(target.dependency).ok_or(StoreError::ExactLocationMismatch)?;
+        if target.dependency.chunk_id() != verified_base.chunk_id()
+            || u64::try_from(verified_base.len())
+                != Ok(u64::from(target.dependency.logical_length()))
+        {
+            return Err(StoreError::ExactLocationMismatch);
+        }
+        let record = target
+            .descriptor
+            .decode_dependent_candidate_with_verified_base(
+                candidate,
+                &target.encoded,
+                &verified_base,
+            )
             .map_err(map_exact_location_error)?;
         let payloads = Arc::new(vec![record.into_verified_payload()]);
         if let CoordinatedRecordRead::Leader(leader) = join {
@@ -3044,28 +3100,29 @@ impl<I: StorageIo> ContainerRepository<I> {
             let verified = if location.dependency_id() == [0; 32] {
                 self.read_verified_location_payload_with_intent(candidate, payload_intent)
             } else {
-                let base_id = fastdup_format::ChunkId::from_bytes(location.dependency_id());
-                let Some(base_read) = self.find_verified_independent_base_read_gated(
-                    index,
-                    base_id,
-                    index_length,
-                    cache,
-                    payload_intent,
-                    &mut || true,
-                ) else {
-                    continue;
-                };
-                let (mut base_requested, mut groups) = base_read.into_parts();
-                let Some(base) = base_requested.pop() else {
-                    continue;
-                };
-                let _payload = ReadIntentScope::enter(payload_intent);
-                self.read_verified_dependent_location_payload(candidate, &base)
-                    .map(|target_read| {
-                        let (requested, target_groups) = target_read.into_parts();
-                        groups.extend(target_groups);
-                        VerifiedChunkRead::new(requested, groups)
-                    })
+                let mut groups = Vec::new();
+                self.read_verified_dependent_location_payload(
+                    candidate,
+                    Some(payload_intent),
+                    &mut |dependency| {
+                        let base_read = self.find_verified_independent_base_read_gated(
+                            index,
+                            dependency.chunk_id(),
+                            dependency.logical_length(),
+                            cache,
+                            payload_intent,
+                            &mut || true,
+                        )?;
+                        let (mut base_requested, base_groups) = base_read.into_parts();
+                        groups.extend(base_groups);
+                        base_requested.pop()
+                    },
+                )
+                .map(|target_read| {
+                    let (requested, target_groups) = target_read.into_parts();
+                    groups.extend(target_groups);
+                    VerifiedChunkRead::new(requested, groups)
+                })
             };
             if let Ok(read) = verified {
                 return Some((candidate, read));
@@ -3724,43 +3781,35 @@ impl<I: StorageIo> ContainerRepository<I> {
             if resolved[request_ordinal].is_some() {
                 continue;
             }
-            let (_, logical_length) = requests[request_ordinal];
-            let Ok(index_length) = u32::try_from(logical_length) else {
-                continue;
-            };
             for candidate in active.into_iter().flatten() {
-                let dependency = candidate.location().dependency_id();
-                if dependency == [0; 32] {
+                if candidate.location().dependency_id() == [0; 32] {
                     continue;
                 }
-                let base_id = fastdup_format::ChunkId::from_bytes(dependency);
-                let base_key = (base_id, index_length);
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    verified_bases.entry(base_key)
-                {
-                    let base = index
-                        .and_then(|index| {
-                            self.find_verified_independent_base_read_with_index(
-                                index,
-                                base_id,
-                                index_length,
-                                cache,
-                            )
-                        })
-                        .and_then(|read| {
-                            let (mut requested, groups) = read.into_parts();
-                            let payload = requested.pop()?;
-                            admission_groups.extend(groups);
-                            Some(payload)
-                        });
-                    entry.insert(base);
-                }
-                let Some(base) = verified_bases.get(&base_key).and_then(Option::as_ref) else {
-                    continue;
-                };
-                let Ok(target_read) =
-                    self.read_verified_dependent_location_payload(candidate, base)
-                else {
+                let Ok(target_read) = self.read_verified_dependent_location_payload(
+                    candidate,
+                    None,
+                    &mut |dependency| {
+                        let base_key = (dependency.chunk_id(), dependency.logical_length());
+                        if let std::collections::btree_map::Entry::Vacant(entry) =
+                            verified_bases.entry(base_key)
+                        {
+                            let base = index
+                                .and_then(|index| {
+                                    self.find_verified_independent_base_read_with_index(
+                                        index, base_key.0, base_key.1, cache,
+                                    )
+                                })
+                                .and_then(|read| {
+                                    let (mut requested, groups) = read.into_parts();
+                                    let payload = requested.pop()?;
+                                    admission_groups.extend(groups);
+                                    Some(payload)
+                                });
+                            entry.insert(base);
+                        }
+                        verified_bases.get(&base_key).cloned().flatten()
+                    },
+                ) else {
                     continue;
                 };
                 let (mut requested, groups) = target_read.into_parts();
@@ -5639,6 +5688,13 @@ fn exact_entry_location_order(
                 .chunk_ordinal()
                 .cmp(&right_location.chunk_ordinal())
         })
+}
+
+/// One paired dependent target Record and the Base it authenticates.
+struct DependentTarget {
+    descriptor: SealedContainerDescriptor,
+    encoded: Vec<u8>,
+    dependency: fastdup_format::DependentDependency,
 }
 
 fn verified_record_read(

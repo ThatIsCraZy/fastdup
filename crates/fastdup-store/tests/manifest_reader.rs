@@ -16,6 +16,7 @@ struct RangeTrackingStorage {
     inner: FsStorageIo,
     range_reads: Arc<Mutex<Vec<(String, u64, usize)>>>,
     full_reads: Arc<Mutex<Vec<String>>>,
+    namespace_scans: Arc<Mutex<usize>>,
 }
 
 impl RangeTrackingStorage {
@@ -24,7 +25,12 @@ impl RangeTrackingStorage {
             inner: FsStorageIo::open(root).expect("create range-tracking storage"),
             range_reads: Arc::new(Mutex::new(Vec::new())),
             full_reads: Arc::new(Mutex::new(Vec::new())),
+            namespace_scans: Arc::new(Mutex::new(0)),
         }
+    }
+
+    fn namespace_scans(&self) -> usize {
+        *self.namespace_scans.lock().expect("namespace-scan lock")
     }
 
     fn clear_range_reads(&self) {
@@ -77,6 +83,7 @@ impl StorageIo for RangeTrackingStorage {
     }
 
     fn list_names(&self) -> io::Result<Vec<String>> {
+        *self.namespace_scans.lock().expect("namespace-scan lock") += 1;
         self.inner.list_names()
     }
 
@@ -1332,5 +1339,90 @@ fn recovery_record_proof_benchmark() {
             started.elapsed().as_nanos()
         );
     }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn flex_dependent_reads_resolve_bases_by_record_length_without_namespace_scans() {
+    let root = unique_test_root("manifest-flex-base");
+    let storage = RangeTrackingStorage::open(&root);
+    let containers = ContainerRepository::new(storage.clone());
+    let base = (0_u32..16384)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect::<Vec<_>>();
+    // Both targets differ in length from their Base, so both encode as
+    // codec-5 flexible Prefix records (ADR 0103).
+    let mut longer = base.clone();
+    longer.extend((0_u32..2048).map(|i| u8::try_from(i % 241).unwrap()));
+    longer[31] ^= 0x63;
+    let mut shorter = base[..12288].to_vec();
+    shorter[4096] ^= 31;
+    let base_id = ContainerId::new([0xd1; 16]).unwrap();
+    let target_id = ContainerId::new([0xd2; 16]).unwrap();
+    containers.publish_raw(base_id, 1, &[&base]).unwrap();
+    let publication = containers
+        .publish_zstd_prefix_pairs_verified(target_id, 2, &[(&base, &longer), (&base, &shorter)])
+        .unwrap();
+    let mut entries = containers
+        .read(base_id)
+        .unwrap()
+        .locations()
+        .iter()
+        .copied()
+        .map(ExactIndexEntry::from_verified)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    entries.extend(
+        publication
+            .locations()
+            .iter()
+            .copied()
+            .map(ExactIndexEntry::from_verified)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+    );
+    let indexes = ExactIndexRunRepository::new(storage.clone());
+    indexes
+        .append_level_zero(ExactIndexProfileId::new([0xd3; 32]).unwrap(), entries)
+        .unwrap();
+    let active = indexes.pin_active_generation().unwrap();
+    let total = longer.len() + shorter.len();
+    let manifest = ManifestLeaf::new(
+        u64::try_from(total).unwrap(),
+        vec![
+            ManifestExtent::Data {
+                logical_length: u64::try_from(longer.len()).unwrap(),
+                chunk_id: ChunkId::of(&longer),
+            },
+            ManifestExtent::Data {
+                logical_length: u64::try_from(shorter.len()).unwrap(),
+                chunk_id: ChunkId::of(&shorter),
+            },
+        ],
+    )
+    .unwrap();
+    let file = VerifiedManifestFile::new(manifest, containers.clone())
+        .unwrap()
+        .with_active_index(&active);
+
+    let scans_before = storage.namespace_scans();
+    // A one-Chunk request takes the scalar candidate path; a two-Chunk
+    // request takes the planned batch path.
+    let single = file
+        .read_at(0, u32::try_from(longer.len()).unwrap())
+        .unwrap();
+    assert_eq!(single, longer);
+    let batch = file.read_at(0, u32::try_from(total).unwrap()).unwrap();
+    assert_eq!(batch, [longer.as_slice(), shorter.as_slice()].concat());
+    assert_eq!(
+        storage.namespace_scans() - scans_before,
+        0,
+        "flexible Bases must resolve through the Exact Index, not a Container scan"
+    );
+    let audit = indexes
+        .audit_active_locations(&containers)
+        .unwrap()
+        .expect("an activated generation is audited");
+    assert_eq!(audit.active_locations(), 3);
     std::fs::remove_dir_all(root).unwrap();
 }

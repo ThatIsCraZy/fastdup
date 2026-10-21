@@ -505,12 +505,47 @@ impl SealedContainerDescriptor {
         })
     }
 
+    /// Returns the authenticated Base dependency of one paired dependent
+    /// Exact candidate Record without decoding its target.
+    ///
+    /// Codec-5 Bases differ in length from their target (ADR 0103), so a
+    /// reader must take the Base length from this Record, never from the
+    /// candidate. The full decode later repeats every pairing check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Exact pairing, record, checksum, or codec error.
+    pub fn dependent_candidate_dependency(
+        self,
+        candidate: ExactIndexEntry,
+        record_bytes: &[u8],
+    ) -> Result<DependentDependency, FormatError> {
+        Ok(self
+            .pair_dependent_candidate(candidate, record_bytes)?
+            .dependency)
+    }
+
     fn decode_dependent_candidate_using(
         self,
         candidate: ExactIndexEntry,
         record_bytes: &[u8],
         decode: impl FnOnce(ValidatedDependentRecord<'_>) -> Result<RawRecord, FormatError>,
     ) -> Result<RawRecord, FormatError> {
+        let validated = self.pair_dependent_candidate(candidate, record_bytes)?;
+        let record = decode(validated)?;
+        if record.chunk_id() != candidate.chunk_id()
+            || usize::try_from(candidate.logical_length()) != Ok(record.payload().len())
+        {
+            return Err(FormatError::ExactLocationMismatch);
+        }
+        Ok(record)
+    }
+
+    fn pair_dependent_candidate(
+        self,
+        candidate: ExactIndexEntry,
+        record_bytes: &[u8],
+    ) -> Result<ValidatedDependentRecord<'_>, FormatError> {
         let location = candidate.location();
         if !is_dependent_codec(location.codec_id()) {
             return Err(FormatError::ExactLocationMismatch);
@@ -529,20 +564,13 @@ impl SealedContainerDescriptor {
         {
             return Err(FormatError::ExactLocationMismatch);
         }
+        // Record validation already enforces the canonical codec for each
+        // Base/target length pair: equal for codecs 3 and 4, differing for 5.
         let validated = ValidatedDependentRecord::new(record_bytes)?;
-        let dependency = validated.dependency;
-        if dependency.chunk_id().bytes() != location.dependency_id()
-            || dependency.logical_length() != candidate.logical_length()
-        {
+        if validated.dependency.chunk_id().bytes() != location.dependency_id() {
             return Err(FormatError::ExactLocationMismatch);
         }
-        let record = decode(validated)?;
-        if record.chunk_id() != candidate.chunk_id()
-            || usize::try_from(candidate.logical_length()) != Ok(record.payload().len())
-        {
-            return Err(FormatError::ExactLocationMismatch);
-        }
-        Ok(record)
+        Ok(validated)
     }
 
     /// Fully validates the one stored RAW record selected by an Exact Index

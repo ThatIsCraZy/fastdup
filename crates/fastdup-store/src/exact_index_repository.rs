@@ -2143,12 +2143,13 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             if entry.location().dependency_id() == [0; 32] {
                 containers.read_verified_location(entry)?;
             } else {
-                let base_id = fastdup_format::ChunkId::from_bytes(entry.location().dependency_id());
+                // Codec-5 Bases carry their own length (ADR 0103).
+                let dependency = containers.dependent_location_dependency(entry)?;
                 let base = containers
                     .find_verified_independent_base_with_index(
                         &active,
-                        base_id,
-                        entry.logical_length(),
+                        dependency.chunk_id(),
+                        dependency.logical_length(),
                     )
                     .ok_or(ExactIndexStoreError::DependencyMismatch)?;
                 containers.read_verified_dependent_location(entry, &base)?;
