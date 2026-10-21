@@ -751,6 +751,7 @@ where
         generation_proof.extend_protected_chunks(checkpoint_chunks)?;
 
         let mut required_chunks = BTreeMap::new();
+        let mut dependents_by_base: BTreeMap<ChunkId, BTreeSet<ChunkId>> = BTreeMap::new();
         let mut dependency_edges = 0_u64;
         let protected_chunks = generation_proof.protected_chunks().clone();
         self.indexes.visit_active_locations_matching(
@@ -759,6 +760,18 @@ where
             self.cancellation.as_ref(),
             |entry| {
                 let target = entry.chunk_id();
+                // Every stored dependent keeps its Base, live or not (ADR 0105):
+                // its Container still decodes the record. The Base carries its
+                // own length; the dependent's length says nothing about it.
+                if entry.location().dependency_id() != [0; 32] {
+                    let base = ChunkId::from_bytes(entry.location().dependency_id());
+                    if candidate_chunk_ids.contains(&base) {
+                        dependents_by_base.entry(base).or_default().insert(target);
+                        dependency_edges = dependency_edges
+                            .checked_add(1)
+                            .ok_or(ExactIndexStoreError::CounterOverflow)?;
+                    }
+                }
                 let Some(expected_length) = protected_chunks.get(&target).copied() else {
                     return Ok(());
                 };
@@ -779,23 +792,6 @@ where
                         observed: logical_length,
                     });
                 }
-                if entry.location().dependency_id() != [0; 32] {
-                    let base = ChunkId::from_bytes(entry.location().dependency_id());
-                    if candidate_chunk_ids.contains(&base) {
-                        if let Some(previous) = required_chunks.insert(base, logical_length)
-                            && previous != logical_length
-                        {
-                            return Err(ExactIndexStoreError::ChunkLengthMismatch {
-                                chunk_id: base,
-                                expected: previous,
-                                observed: logical_length,
-                            });
-                        }
-                        dependency_edges = dependency_edges
-                            .checked_add(1)
-                            .ok_or(ExactIndexStoreError::CounterOverflow)?;
-                    }
-                }
                 Ok(())
             },
         )?;
@@ -810,7 +806,7 @@ where
             exact_activation: exact.record(),
             protected_commit_generation: generation_proof.summary().latest_generation(),
             required_chunks,
-            dependents_by_base: BTreeMap::new(),
+            dependents_by_base,
             dependency_edges,
         });
         let job_bytes = rows
@@ -907,7 +903,9 @@ where
                             }
                             true
                         } else {
-                            false
+                            reverse_dependencies
+                                .dependents_by_base
+                                .contains_key(&chunk_id)
                         };
                         if required_here {
                             reachable_victim_chunks.insert(chunk_id);
@@ -996,10 +994,12 @@ where
             }
             return Err(MaintenanceError::EmptyGcCandidateProof);
         }
-        if generation_proof.protected_chunks().is_empty() {
+        if generation_proof.protected_chunks().is_empty()
+            && reverse_dependencies.dependents_by_base.is_empty()
+        {
             assert!(
                 replacement_chunks.is_empty() && reachable_victim_chunks.is_empty(),
-                "ASSERT: an empty protected DATA set cannot require GC replacement coverage"
+                "ASSERT: without protected DATA or stored dependents nothing requires GC replacement coverage"
             );
         }
         let replacement_upper = replacement_file_bytes_upper_bound(&replacement_chunks)?;
@@ -2085,29 +2085,42 @@ where
     ) -> Result<ContainerGcInventory, MaintenanceError> {
         let mut inventory = ContainerGcInventory::default();
         let mut partial = BTreeMap::new();
-        let mut partial_coverage = BTreeSet::new();
+        let mut partial_coverage = BTreeMap::new();
         let mut retained_coverage = BTreeSet::new();
+        // Classification waits for the complete pass: a Base is required by
+        // every stored dependent record in any Container (ADR 0105).
+        let mut summaries = Vec::new();
+        let mut stored_bases = BTreeSet::new();
         let containers = self
             .containers
             .visit_verified_published_pipelined::<MaintenanceError, _>(|container| {
-                classify_container(
-                    container,
-                    online_chunks,
-                    &mut inventory,
-                    &mut partial,
-                    &mut partial_coverage,
-                    &mut retained_coverage,
-                )
+                for location in container.locations() {
+                    if location.dependency_id() != [0; 32] {
+                        stored_bases.insert(ChunkId::from_bytes(location.dependency_id()));
+                    }
+                }
+                summaries
+                    .try_reserve(1)
+                    .map_err(|_| MaintenanceError::OutOfMemory)?;
+                summaries.push(ContainerGcSummary::of(container)?);
+                Ok(())
             })?;
+        for summary in &summaries {
+            classify_container(
+                summary,
+                online_chunks,
+                &stored_bases,
+                &mut inventory,
+                &mut partial,
+                &mut partial_coverage,
+                &mut retained_coverage,
+            )?;
+        }
         inventory.containers = containers;
-        for chunk_id in partial_coverage {
+        for (chunk_id, logical_length) in partial_coverage {
             if retained_coverage.contains(&chunk_id) {
                 continue;
             }
-            let logical_length = online_chunks
-                .get(&chunk_id)
-                .copied()
-                .expect("ASSERT: partial coverage originates from the online Chunk map");
             inventory
                 .replacement_chunks
                 .insert(chunk_id, logical_length);
@@ -2948,57 +2961,82 @@ struct ContainerGcInventory {
     partially_live_containers: u64,
 }
 
+/// Identity, size and stored Chunks of one verified Container.
+struct ContainerGcSummary {
+    container_id: ContainerId,
+    file_length: u64,
+    chunks: Vec<(ChunkId, u64)>,
+}
+
+impl ContainerGcSummary {
+    fn of(container: &SealedContainer) -> Result<Self, MaintenanceError> {
+        let mut chunks = Vec::new();
+        chunks
+            .try_reserve_exact(container.records().len())
+            .map_err(|_| MaintenanceError::OutOfMemory)?;
+        for record in container.records() {
+            chunks.push((
+                record.chunk_id(),
+                u64::try_from(record.payload().len())
+                    .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
+            ));
+        }
+        Ok(Self {
+            container_id: container.header().container_id(),
+            file_length: container.header().layout().file_length,
+            chunks,
+        })
+    }
+}
+
 fn classify_container(
-    container: &SealedContainer,
+    summary: &ContainerGcSummary,
     online_chunks: &BTreeMap<ChunkId, u64>,
+    stored_bases: &BTreeSet<ChunkId>,
     inventory: &mut ContainerGcInventory,
     partial: &mut BTreeMap<[u8; 16], (ContainerId, u64)>,
-    partial_coverage: &mut BTreeSet<ChunkId>,
+    partial_coverage: &mut BTreeMap<ChunkId, u64>,
     retained_coverage: &mut BTreeSet<ChunkId>,
 ) -> Result<(), MaintenanceError> {
-    let mut live = 0_usize;
     let mut live_chunks = Vec::new();
-    for record in container.records() {
-        if let Some(expected_length) = online_chunks.get(&record.chunk_id()).copied() {
-            let observed_length = u64::try_from(record.payload().len())
-                .map_err(|_| MaintenanceError::ArithmeticOverflow)?;
+    for (chunk_id, observed_length) in summary.chunks.iter().copied() {
+        let required = if let Some(expected_length) = online_chunks.get(&chunk_id).copied() {
             if observed_length != expected_length {
                 return Err(MaintenanceError::OnlineChunkLengthMismatch {
-                    chunk_id: record.chunk_id(),
+                    chunk_id,
                     expected: expected_length,
                     observed: observed_length,
                 });
             }
-            live = live
-                .checked_add(1)
-                .ok_or(MaintenanceError::ArithmeticOverflow)?;
+            true
+        } else {
+            stored_bases.contains(&chunk_id)
+        };
+        if required {
             live_chunks
                 .try_reserve(1)
                 .map_err(|_| MaintenanceError::OutOfMemory)?;
-            live_chunks.push(record.chunk_id());
+            live_chunks.push((chunk_id, observed_length));
         }
     }
-    let container_id = container.header().container_id();
-    if live == 0 {
+    let container_id = summary.container_id;
+    if live_chunks.is_empty() {
         inventory
             .reclaimable
             .insert(container_id.bytes(), container_id);
         inventory.reclaimable_bytes = inventory
             .reclaimable_bytes
-            .checked_add(container.header().layout().file_length)
+            .checked_add(summary.file_length)
             .ok_or(MaintenanceError::ArithmeticOverflow)?;
-    } else if live < container.records().len() {
+    } else if live_chunks.len() < summary.chunks.len() {
         inventory.partially_live_containers = inventory
             .partially_live_containers
             .checked_add(1)
             .ok_or(MaintenanceError::ArithmeticOverflow)?;
-        partial.insert(
-            container_id.bytes(),
-            (container_id, container.header().layout().file_length),
-        );
+        partial.insert(container_id.bytes(), (container_id, summary.file_length));
         partial_coverage.extend(live_chunks);
     } else {
-        retained_coverage.extend(live_chunks);
+        retained_coverage.extend(live_chunks.into_iter().map(|(chunk_id, _)| chunk_id));
     }
     Ok(())
 }
