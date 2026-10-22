@@ -2346,6 +2346,10 @@ where
     ///
     /// Panics for the same impossible poisoned-lock or paired-proof failures as
     /// [`Self::checkpoint`], or if monotonic duration accounting moves backward.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the commit coordinator keeps its cut, publication and proof-retirement order visible"
+    )]
     pub fn checkpoint_profiled(&self) -> Result<Option<ProfiledCheckpoint>, DurableNamespaceError> {
         let timings = &self.checkpoint_timings;
         let total_started = timings.begin(CheckpointStage::Total);
@@ -2402,6 +2406,7 @@ where
             &self.container_generations,
             self.manifest_readers.as_ref(),
             self.checkpoint_workers,
+            self.write_through.worker_permits(),
             Arc::clone(&self.online_dependency_proofs),
             residues,
         );

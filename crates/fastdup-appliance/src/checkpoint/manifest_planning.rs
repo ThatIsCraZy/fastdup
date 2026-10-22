@@ -1399,6 +1399,7 @@ pub(super) struct AdaptiveCommitWriter<'a, C> {
     level_zero_entries: Vec<ExactIndexEntry>,
     payload_bytes: usize,
     workers: NonZeroUsize,
+    worker_permits: &'a fastdup_store::WorkerPermits,
     metrics: CheckpointReductionMetrics,
     current_inode: Option<u64>,
     placement: ContainerPlacement,
@@ -1414,6 +1415,7 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
         container_generations: &'a ContainerGenerationAllocator<C>,
         index: &'a dyn ManifestReaderPolicy<C>,
         workers: NonZeroUsize,
+        worker_permits: &'a fastdup_store::WorkerPermits,
         online_dependency_proofs: Arc<OnlineDependencyProofs>,
         residues: Vec<DrainResidue>,
     ) -> Self {
@@ -1435,6 +1437,7 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             level_zero_entries: Vec::new(),
             payload_bytes: 0,
             workers,
+            worker_permits,
             metrics: CheckpointReductionMetrics::default(),
             current_inode: None,
             placement: ContainerPlacement::Data,
@@ -1753,6 +1756,30 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             .then(|| self.containers.try_pin_data_reference())
             .flatten();
         let advanced = publication_guard.is_some();
+        // The commit's bounded residue uses the same planning/admission path as
+        // detached ingest. One pinned view covers the batch; its DATA reference
+        // guard remains owned through publication and Exact activation.
+        let plans = if advanced {
+            let targets = self
+                .chunks
+                .iter()
+                .zip(&self.chunk_ids)
+                .map(|(chunk, &id)| PrehashedChunk::new(id, chunk))
+                .collect::<Vec<_>>();
+            self.index.plan_similarity_batch(
+                self.containers,
+                &targets,
+                self.workers,
+                self.worker_permits,
+            )
+        } else {
+            Vec::new()
+        };
+        assert!(
+            !advanced || plans.len() == self.chunks.len(),
+            "ASSERT: every commit Chunk has one ordered reduction plan"
+        );
+        let mut plans = plans.into_iter();
         let mut regions = Vec::<Vec<PrehashedChunk<'_>>>::new();
         let mut independent = Vec::new();
         let mut dependents = Vec::new();
@@ -1760,9 +1787,9 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
         let mut region_bytes = 0_usize;
         for (chunk, &chunk_id) in self.chunks.iter().zip(&self.chunk_ids) {
             if advanced {
-                let (plan, hint) =
-                    self.index
-                        .plan_similarity_chunk(self.containers, chunk_id, chunk);
+                let (plan, hint) = plans
+                    .next()
+                    .expect("ASSERT: ordered reduction plan covers each commit Chunk");
                 if let Some(entry) = hint {
                     similarities.push(entry);
                 }
@@ -1814,15 +1841,19 @@ impl<'a, C: StorageIo> AdaptiveCommitWriter<'a, C> {
             .map(|r| PrehashedAdaptiveRegion::Borrowed(r))
             .collect::<Vec<_>>();
         let generation = self.container_generations.reserve_generation()?;
+        let desired = NonZeroUsize::new(self.workers.get().min(region_refs.len().max(1)))
+            .expect("ASSERT: Container preparation needs at least one worker");
+        let lease = self.worker_permits.acquire(desired);
         let prepared = ContainerRepository::<C>::prepare_mixed_prehashed_reduction_parallel(
             id,
             generation,
             &region_refs,
             independent,
             dependents,
-            self.workers,
+            lease.workers(),
             Some(&self.chunk_ids),
         )?;
+        drop(lease);
         let (verified, publish_metrics) = self
             .containers
             .publish_prepared_adaptive_profiled_with_placement(prepared, self.placement)?;
@@ -1931,6 +1962,10 @@ pub(super) fn random_container_id() -> Result<ContainerId, DurableNamespaceError
         }
     }
 }
+
+#[cfg(test)]
+#[path = "commit_reduction_tests.rs"]
+mod commit_reduction_tests;
 
 #[cfg(test)]
 mod rechunk_intent_tests {

@@ -2586,6 +2586,10 @@ impl<C> WriteThroughIngest<C>
 where
     C: Clone + Send + Sync + StorageIo + 'static,
 {
+    pub(super) fn worker_permits(&self) -> &WorkerPermits {
+        &self.worker_permits
+    }
+
     fn start_workers(self: &Arc<Self>, namespace: &Arc<Namespace>) {
         self.namespace
             .set(Arc::downgrade(namespace))
