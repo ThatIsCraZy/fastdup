@@ -4583,22 +4583,22 @@ fn catalog_bootstrap_uses_one_name_snapshot_during_concurrent_publication() {
 
 #[test]
 fn republishing_collected_metadata_after_pin_drain_does_not_duplicate_journal_additions() {
-    republish_after_exact_gc(MemoryStorageIo::new(), false);
+    republish_after_exact_gc(MemoryStorageIo::new(), None);
 }
 
 #[test]
 fn republishing_after_failed_exact_gc_does_not_reuse_the_retired_journal() {
-    let sync_position = republish_after_exact_gc(MemoryStorageIo::new(), false);
-    for metadata in [
-        MemoryStorageIo::with_fail_before(sync_position),
-        MemoryStorageIo::with_fail_after(sync_position),
-    ] {
-        republish_after_exact_gc(metadata, true);
+    let sync_offset = republish_after_exact_gc(MemoryStorageIo::new(), None);
+    for fail_after in [false, true] {
+        republish_after_exact_gc(MemoryStorageIo::new(), Some((fail_after, sync_offset)));
     }
 }
 
+/// Returns the final directory sync's position relative to the paused catalog
+/// write. Cache-resident reads before that pause vary between runs, so a fault
+/// replay arms its sync fault against its own pause position.
 #[allow(clippy::too_many_lines)]
-fn republish_after_exact_gc(metadata: MemoryStorageIo, gc_fails: bool) -> usize {
+fn republish_after_exact_gc(metadata: MemoryStorageIo, sync_fault: Option<(bool, usize)>) -> usize {
     let paused = PausedStorageIo::disarmed_before_name_prefix(
         metadata.clone(),
         StorageOperation::WriteAt,
@@ -4674,17 +4674,22 @@ fn republish_after_exact_gc(metadata: MemoryStorageIo, gc_fails: bool) -> usize 
     let collecting = maintenance.clone();
     let collector = std::thread::spawn(move || collecting.garbage_collect_metadata());
     let reached = paused.wait_until_reached(Duration::from_secs(2));
+    let pause_position = metadata.operation_count();
+    if let Some((fail_after, sync_offset)) = sync_fault {
+        metadata.arm_failpoint(fail_after, pause_position + sync_offset);
+    }
     // A live-reader/recovery-checkpoint pin can drain while exact GC holds the
     // publication barrier. The changed epoch forbids declaring the mark clean.
     drop(abandoned);
     paused.resume();
     assert!(reached, "exact GC reached catalog publication");
     let collected = collector.join().unwrap();
-    if gc_fails {
+    if sync_fault.is_some() {
         assert!(
             collected.is_err(),
             "injected final directory-sync fault must fail exact GC"
         );
+        metadata.clear_faults();
     } else {
         assert!(collected.unwrap().objects_removed() > 0);
     }
@@ -4720,7 +4725,7 @@ fn republish_after_exact_gc(metadata: MemoryStorageIo, gc_fails: bool) -> usize 
             .record(),
         committed.record()
     );
-    sync_position
+    sync_position - pause_position
 }
 
 /// A Metadata root pin protects the whole Manifest tree, not just its root
