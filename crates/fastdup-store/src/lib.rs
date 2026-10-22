@@ -169,9 +169,10 @@ pub use seqcdc::{
 };
 pub use similarity_index_repository::{
     RecoveredSimilarityIndex, SIMILARITY_FINGERPRINT_PROFILE_V1,
-    SIMILARITY_REPRESENTATIVE_PROFILE_V1, SimilarityBaseCandidate, SimilarityIndexAuditStatus,
-    SimilarityIndexPageCacheStatus, SimilarityIndexReadMode, SimilarityIndexRebuildStatus,
-    SimilarityIndexRepository, SimilarityIndexStoreError, similarity_index_entry_v1,
+    SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT, SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+    SimilarityBaseCandidate, SimilarityIndexAuditStatus, SimilarityIndexPageCacheStatus,
+    SimilarityIndexReadMode, SimilarityIndexRebuildStatus, SimilarityIndexRepository,
+    SimilarityIndexStoreError, similarity_index_entry_v1,
 };
 pub use tiered_storage::{TieredStorageError, TieredStorageIo};
 

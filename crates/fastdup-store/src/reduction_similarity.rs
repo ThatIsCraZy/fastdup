@@ -7,9 +7,18 @@ pub(crate) const SIMILARITY_PROFILE_V1: u16 = 1;
 pub(crate) const MAX_SIMILARITY_CANDIDATES: usize = 16;
 pub(crate) const SIMILARITY_BUCKET_PROFILE_V1: u16 = fastdup_format::SIMILARITY_BUCKET_PROFILE_V1;
 pub(crate) const SIMILARITY_BUCKET_PROFILE_V2: u16 = fastdup_format::SIMILARITY_BUCKET_PROFILE_V2;
-/// The bucket profile written by this implementation: geometric length
-/// bands (see `fastdup_format::similarity_bucket_length`).
-pub(crate) const SIMILARITY_BUCKET_PROFILE_CURRENT: u16 = SIMILARITY_BUCKET_PROFILE_V2;
+pub(crate) const SIMILARITY_BUCKET_PROFILE_V3: u16 = fastdup_format::SIMILARITY_BUCKET_PROFILE_V3;
+/// The bucket profile written by this implementation: one band for every
+/// length (see `fastdup_format::similarity_bucket_length`, ADR 0106).
+pub(crate) const SIMILARITY_BUCKET_PROFILE_CURRENT: u16 = SIMILARITY_BUCKET_PROFILE_V3;
+/// A candidate Base may be at most this many times longer than its target, so
+/// a dependent read never decodes more than this multiple of Base bytes per
+/// logical target byte (ADR 0106).
+pub(crate) const MAX_BASE_TO_TARGET_LENGTH_RATIO: u64 = 4;
+
+pub(crate) const fn admissible_base_length(base_length: u32, target_length: u32) -> bool {
+    base_length as u64 <= MAX_BASE_TO_TARGET_LENGTH_RATIO * target_length as u64
+}
 
 pub(crate) fn similarity_bucket_length_current(logical_length: u32) -> u32 {
     fastdup_format::similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_CURRENT, logical_length)
@@ -843,6 +852,7 @@ impl SimilarityIndex {
             let entry = self.arena.metadata(ordinal)?;
             if similarity_bucket_length_current(entry.logical_length)
                 != similarity_bucket_length_current(logical_length)
+                || !admissible_base_length(entry.logical_length, logical_length)
             {
                 continue;
             }
@@ -1747,20 +1757,20 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_ordered_deduplicated_limited_and_length_filtered() {
+    fn candidates_are_ordered_deduplicated_limited_and_length_bounded() {
         let target_id = fixture_id(9_000);
         let target = controlled_fingerprint([10, 20, 30, 40], [0; 8]);
         let same_fingerprint_id = fixture_id(1);
         let multi_bucket_id = fixture_id(2);
         let farther_id = fixture_id(3);
-        let wrong_length_id = fixture_id(4);
+        let too_long_id = fixture_id(4);
         let mut index = SimilarityIndex::new();
 
         index
-            .insert(target_id, 64 * 1_024, target)
+            .insert(target_id, 16 * 1_024, target)
             .expect("target insertion succeeds");
         index
-            .insert(same_fingerprint_id, 64 * 1_024, target)
+            .insert(same_fingerprint_id, 16 * 1_024, target)
             .expect("same derived fingerprint is not content identity");
         index
             .insert(
@@ -1768,20 +1778,20 @@ mod tests {
                 64 * 1_024,
                 controlled_fingerprint([10, 20, 300, 400], [1; 8]),
             )
-            .expect("multi-bucket candidate insertion succeeds");
+            .expect("a Base four times the target length qualifies");
         index
             .insert(
                 farther_id,
-                64 * 1_024,
+                8 * 1_024,
                 controlled_fingerprint([10, 200, 300, 400], [u64::MAX; 8]),
             )
             .expect("far candidate insertion succeeds");
         index
-            .insert(wrong_length_id, 32 * 1_024, target)
-            .expect("different-length derived entry is valid");
+            .insert(too_long_id, 64 * 1_024 + 1, target)
+            .expect("an over-long derived entry is valid");
 
         let candidates = index
-            .candidates(target_id, 64 * 1_024, target, 16)
+            .candidates(target_id, 16 * 1_024, target, 16)
             .expect("bounded query succeeds");
         assert_eq!(candidates.len(), 3);
         assert_eq!(candidates[0].chunk_id(), same_fingerprint_id);
@@ -1794,12 +1804,12 @@ mod tests {
         assert!(
             candidates
                 .iter()
-                .all(|candidate| candidate.logical_length() == 64 * 1_024)
+                .all(|candidate| candidate.logical_length() <= 64 * 1_024)
         );
         assert!(
             candidates
                 .iter()
-                .all(|candidate| candidate.chunk_id() != wrong_length_id)
+                .all(|candidate| candidate.chunk_id() != too_long_id)
         );
         assert_eq!(
             index.candidates(target_id, 64 * 1_024, target, 0),
@@ -1951,31 +1961,33 @@ mod tests {
     }
 
     #[test]
-    fn hot_buckets_of_other_lengths_cannot_evict_equal_length_bases() {
+    fn hot_buckets_keep_the_smallest_ids_across_every_length() {
         let target_id = fixture_id(30_000);
         let target = controlled_fingerprint([71, 81, 91, 101], [0; 8]);
         let mut ids = (0_u64..96).map(fixture_id).collect::<Vec<_>>();
         ids.sort_unstable();
-        let (small_wrong_length_ids, large_equal_length_ids) = ids.split_at(64);
+        let (small_other_length_ids, large_equal_length_ids) = ids.split_at(64);
         let mut index = SimilarityIndex::new();
-        for chunk_id in small_wrong_length_ids {
-            index
-                .insert(*chunk_id, 32 * 1_024, target)
-                .expect("different-length hot-bucket insertion succeeds");
-        }
         for chunk_id in large_equal_length_ids {
             index
                 .insert(*chunk_id, 64 * 1_024, target)
                 .expect("equal-length hot-bucket insertion succeeds");
         }
+        for chunk_id in small_other_length_ids {
+            index
+                .insert(*chunk_id, 32 * 1_024, target)
+                .expect("different-length hot-bucket insertion succeeds");
+        }
 
+        // Bucket profile v3 shares one band across lengths (ADR 0106): the 64
+        // smallest Chunk IDs win regardless of length.
         let actual = index
             .candidates(target_id, 64 * 1_024, target, MAX_SIMILARITY_CANDIDATES)
-            .expect("length-isolated bounded query succeeds")
+            .expect("bounded query succeeds")
             .into_iter()
             .map(SimilarityCandidate::chunk_id)
             .collect::<Vec<_>>();
-        assert_eq!(actual, large_equal_length_ids[..MAX_SIMILARITY_CANDIDATES]);
+        assert_eq!(actual, small_other_length_ids[..MAX_SIMILARITY_CANDIDATES]);
     }
 
     #[test]

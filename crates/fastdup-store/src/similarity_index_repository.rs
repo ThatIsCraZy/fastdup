@@ -18,7 +18,8 @@ use crate::StorageIo;
 use crate::read_cache::{MemoryPressureSnapshot, shared_cache_reserve_bytes};
 use crate::reduction_similarity::{
     MAX_SIMILARITY_CANDIDATES, SIMILARITY_BUCKET_PROFILE_CURRENT, SIMILARITY_BUCKET_PROFILE_V1,
-    SIMILARITY_PROFILE_V1, SimilarityError, SimilarityFingerprint,
+    SIMILARITY_BUCKET_PROFILE_V2, SIMILARITY_BUCKET_PROFILE_V3, SIMILARITY_PROFILE_V1,
+    SimilarityError, SimilarityFingerprint, admissible_base_length,
 };
 use crate::similarity_external_sort::{
     BuiltSimilarityPartition, PartitionedSimilarityBuild, SimilarityEntryStager,
@@ -30,9 +31,9 @@ use crate::similarity_read::ImmutableSimilarityRun;
 pub const SIMILARITY_FINGERPRINT_PROFILE_V1: u16 = SIMILARITY_PROFILE_V1;
 /// The bounded 64-representative bucket policy written by this implementation.
 pub const SIMILARITY_REPRESENTATIVE_PROFILE_V1: u16 = SIMILARITY_BUCKET_PROFILE_V1;
-/// The bucket profile written for new Similarity families: geometric
-/// length bands instead of exact logical lengths. Profile-v1 families stay
-/// readable and queryable during the transition.
+/// The bucket profile written for new Similarity families: one band for every
+/// logical length (ADR 0106). Profile-v1 and v2 families stay readable and
+/// queryable until a pool-index rebuild converts them.
 pub const SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT: u16 = SIMILARITY_BUCKET_PROFILE_CURRENT;
 
 /// Durable immutable Similarity snapshot publication and streaming rebuild.
@@ -1438,7 +1439,9 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
                 }
             }
             let entry = selected.ok_or(SimilarityIndexStoreError::IndexCorruption)?;
-            if entry.chunk_id() == target_id {
+            if entry.chunk_id() == target_id
+                || !admissible_base_length(entry.logical_length(), logical_length)
+            {
                 continue;
             }
             if similarity_bucket_length(bucket_profile, entry.logical_length()) != bucket_length
@@ -1455,13 +1458,12 @@ impl<I: Clone + StorageIo> RecoveredSimilarityIndex<I> {
             {
                 return Err(SimilarityIndexStoreError::IndexCorruption);
             }
-            let candidate = SimilarityBaseCandidate {
-                chunk_id: entry.chunk_id(),
-                logical_length: entry.logical_length(),
-                sketch_distance: fingerprint
-                    .distance_from_sketch(entry.fingerprint_profile(), entry.sketch())
-                    .map_err(map_similarity_error)?,
-            };
+            let candidate = SimilarityBaseCandidate::from_entry(
+                entry,
+                fingerprint,
+                u8::try_from(matched_slots.count_ones())
+                    .map_err(|_| SimilarityIndexStoreError::CounterOverflow)?,
+            )?;
             insert_ranked_candidate(&mut candidates, candidate);
         }
         Ok(candidates)
@@ -1889,13 +1891,12 @@ fn validate_query_entry(
     Ok(())
 }
 
-fn insert_ranked_candidate(
+pub(crate) fn insert_ranked_candidate(
     candidates: &mut Vec<SimilarityBaseCandidate>,
     candidate: SimilarityBaseCandidate,
 ) {
-    let key = (candidate.sketch_distance, candidate.chunk_id);
-    let position =
-        candidates.partition_point(|existing| (existing.sketch_distance, existing.chunk_id) < key);
+    let key = candidate.rank();
+    let position = candidates.partition_point(|existing| existing.rank() < key);
     if candidates.len() < MAX_SIMILARITY_CANDIDATES {
         candidates.insert(position, candidate);
     } else if position < MAX_SIMILARITY_CANDIDATES {
@@ -1910,12 +1911,14 @@ pub struct SimilarityBaseCandidate {
     chunk_id: ChunkId,
     logical_length: u32,
     sketch_distance: u16,
+    matched_buckets: u8,
 }
 
 impl SimilarityBaseCandidate {
     pub(crate) fn from_entry(
         entry: SimilarityIndexEntry,
         fingerprint: &SimilarityFingerprint,
+        matched_buckets: u8,
     ) -> Result<Self, SimilarityIndexStoreError> {
         Ok(Self {
             chunk_id: entry.chunk_id(),
@@ -1923,7 +1926,19 @@ impl SimilarityBaseCandidate {
             sketch_distance: fingerprint
                 .distance_from_sketch(entry.fingerprint_profile(), entry.sketch())
                 .map_err(map_similarity_error)?,
+            matched_buckets,
         })
+    }
+
+    /// Ranks more shared Superfeature buckets first, then the nearer Sketch,
+    /// then the Chunk ID (ADR 0106). Each shared bucket estimates a quarter
+    /// of the content overlap; the Sketch only breaks ties.
+    fn rank(self) -> (std::cmp::Reverse<u8>, u16, ChunkId) {
+        (
+            std::cmp::Reverse(self.matched_buckets),
+            self.sketch_distance,
+            self.chunk_id,
+        )
     }
 }
 
@@ -2042,6 +2057,11 @@ impl SimilarityBaseCandidate {
     #[must_use]
     pub const fn sketch_distance(self) -> u16 {
         self.sketch_distance
+    }
+
+    #[must_use]
+    pub const fn matched_buckets(self) -> u8 {
+        self.matched_buckets
     }
 }
 
@@ -2355,7 +2375,9 @@ fn require_supported_profiles(
     if fingerprint_profile != SIMILARITY_PROFILE_V1
         || !matches!(
             bucket_profile,
-            SIMILARITY_BUCKET_PROFILE_V1 | SIMILARITY_BUCKET_PROFILE_CURRENT
+            SIMILARITY_BUCKET_PROFILE_V1
+                | SIMILARITY_BUCKET_PROFILE_V2
+                | SIMILARITY_BUCKET_PROFILE_V3
         )
     {
         return Err(SimilarityIndexStoreError::UnsupportedProfile);
@@ -2770,14 +2792,11 @@ mod tests {
                 assert!(!got.is_empty());
             }
         }
-        // Absent keys (same superfeatures, a length band no entry uses)
-        // must be answered by the filter without touching a Bucket page.
-        let absent_length = similarity_bucket_length(profile, 131_072);
-        assert_ne!(absent_length, present_length);
+        // Absent keys (Superfeatures no entry uses) must be answered by the
+        // filter without touching a Bucket page.
         let before = repo.page_cache_status();
-        for n in [3_u64, 42, 777, 1_500] {
-            let sf = n.wrapping_mul(131) % 1021;
-            let key = SimilarityBucketKey::new(1, 1, absent_length, sf).unwrap();
+        for sf in [2_000_u64, 3_000, 5_000, 9_000] {
+            let key = SimilarityBucketKey::new(1, 1, present_length, sf).unwrap();
             assert!(index.bucket_entries(key).unwrap().is_empty());
         }
         let after = repo.page_cache_status();
@@ -2865,8 +2884,10 @@ mod tests {
                 )
                 .unwrap();
                 for slot in 0..4 {
+                    let length =
+                        similarity_bucket_length(SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT, 65536);
                     expected
-                        .entry(SimilarityBucketKey::new(1, slot, 65536, ordinal / 4).unwrap())
+                        .entry(SimilarityBucketKey::new(1, slot, length, ordinal / 4).unwrap())
                         .or_default()
                         .push(entry);
                 }

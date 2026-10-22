@@ -324,7 +324,7 @@ fn dense_bases_skip_xor_and_saturated_results_stop_base_loads() {
 }
 
 #[test]
-fn length_band_candidates_reach_flexible_prefix_trials() {
+fn length_free_candidates_reach_flexible_prefix_trials() {
     let root = std::env::temp_dir().join(format!(
         "length-band-candidates-{}-{}",
         std::process::id(),
@@ -336,7 +336,7 @@ fn length_band_candidates_reach_flexible_prefix_trials() {
     let storage = ReadCountingStorage::open(&root);
     let containers = ContainerRepository::new(storage.clone());
     let mut seed = 71_u64;
-    let stream = (0..70_000)
+    let stream = (0..106_000)
         .map(|_| {
             seed ^= seed << 13;
             seed ^= seed >> 7;
@@ -376,18 +376,23 @@ fn length_band_candidates_reach_flexible_prefix_trials() {
             .0
     };
 
-    // Same length band (65_536..73_728), different exact length: the Base is
-    // a candidate and the flexible Prefix trial wins. Under exact-length
-    // buckets this target found no candidate at all.
-    let longer = stream.clone();
+    // A different exact length: the Base is a candidate and the flexible
+    // Prefix trial wins. Under exact-length buckets this target found no
+    // candidate at all.
+    let longer = stream[..70_000].to_vec();
     assert!(matches!(plan(&longer), PersistentChunkPlan::Dependent(_)));
     let status = planner.status();
     assert!(status.candidates() >= 1);
     assert_eq!(status.accepted_prefixes(), 1);
     assert_eq!(status.errors(), 0);
 
-    // A target in a different length band stays outside the candidate set.
-    let shorter = stream[..20_000].to_vec();
-    assert!(!matches!(plan(&shorter), PersistentChunkPlan::Dependent(_)));
+    // Bucket profile v3 has one band for every length (ADR 0106): a target
+    // outside the old v2 band (98_304..114_688) still reaches the Base.
+    let outside_band = stream.clone();
+    assert!(matches!(
+        plan(&outside_band),
+        PersistentChunkPlan::Dependent(_)
+    ));
+    assert_eq!(planner.status().accepted_prefixes(), 2);
     std::fs::remove_dir_all(root).unwrap();
 }

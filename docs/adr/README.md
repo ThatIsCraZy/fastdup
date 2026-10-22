@@ -17,7 +17,7 @@ is dated evidence, not the current decision map.
 | Normal startup and background verification | 0091: committed Metadata start; 0090: paced scrub, GC gate and sticky integrity failure; 0092: durable incomplete-round resume; 0023 retains full disaster rebuild. |
 | Manifest and Namespace graphs | 0011, 0036, 0042, 0043, 0094, 0095: Manifest trees plus one record-range-sharded Namespace Root. ADR 0085's FastCDC layout is superseded. |
 | User-DATA chunking | 0054: SeqCDC-v1. Namespace record partitioning is a separate key-derived rule under 0095. |
-| Advanced Reduction | 0010, 0018, 0088, 0089: depth-one Prefix/Sparse-XOR, bounded online Similarity; 0062 retains the offline rebuild contract. |
+| Advanced Reduction | 0010, 0018, 0088, 0089, 0103, 0106: depth-one Prefix/Sparse-XOR, bounded online Similarity with length-free v3 buckets and a 4× Base length bound; 0062 retains the offline rebuild contract. |
 | Exact Index | 0035, 0044, 0045, 0079: immutable generations, activation, compaction, leased mappings; 0046's dated 2026-09-16 section bounds protected warming; 0035 remains proposed with scale/performance gates. |
 | Read and publication paths | 0046, 0058, 0077: one Unified Read Cache, Direct I/O, direct FUSE handles, io_uring DATA publication, and restore locality. ADRs 0051 and 0073 are superseded; userspace prefetch from 0030 remains open. |
 | Write ingestion | 0041, 0053, 0054, 0057, 0099: owned FUSE payloads feed ordered SeqCDC Lanes and ordered Container retirement; bounded parallel FUSE writes remain proposed pending Veeam qualification. |
@@ -30,5 +30,6 @@ is dated evidence, not the current decision map.
 Open gates: Exact Index workload qualification (0035), userspace prefetch
 (0030), Dictionary activation (0017/0047), Veeam qualification (0043),
 device-loss protection (0001), the Namespace commit-side mirror (0095), and
-default-on Advanced Reduction qualification (0089), and bounded parallel FUSE
-write qualification (0099).
+default-on Advanced Reduction qualification (0089), bounded parallel FUSE
+write qualification (0099), and real-Veeam qualification of bucket profile v3
+(0106).

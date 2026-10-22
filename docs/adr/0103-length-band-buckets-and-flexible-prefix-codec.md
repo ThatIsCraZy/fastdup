@@ -30,3 +30,6 @@ and offline-scrub boundaries. Sparse-XOR stays equal-length. Depth remains
 one, the 5%/4 KiB acceptance rule and the four-trial budget are unchanged,
 and codec-3/4 records decode exactly as before. Binaries predating codec 5
 reject the unknown codec and fail closed.
+
+ADR 0106 replaces the length band for new families with bucket profile v3,
+which gives every length one band. Codec 5 is unchanged.

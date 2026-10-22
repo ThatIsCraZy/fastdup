@@ -320,3 +320,83 @@ fn corrupt_selected_partition_fails_recovery_and_scrub() {
     assert!(OnlineSimilarityRepository::open(repository.clone(), &exact).is_err());
     assert!(OnlineSimilarityRepository::audit(&repository).is_err());
 }
+
+fn entry_like(
+    id: u8,
+    length: u32,
+    superfeatures: [u64; 4],
+    sketch: [u64; 8],
+) -> SimilarityIndexEntry {
+    let template = similarity_index_entry_v1(&target()).unwrap();
+    SimilarityIndexEntry::new(
+        ChunkId::from_bytes([id; 32]),
+        length,
+        template.fingerprint_profile(),
+        superfeatures,
+        sketch,
+    )
+    .unwrap()
+}
+
+/// Bucket profile v3 keeps every length in one band (ADR 0106); only Bases
+/// more than four times longer than the target are left out.
+#[test]
+fn candidates_of_any_length_up_to_four_times_the_target_share_buckets() {
+    let exact = exact();
+    let online = OnlineSimilarityRepository::open(
+        SimilarityIndexRepository::new(MemoryStorageIo::new()),
+        &exact,
+    )
+    .unwrap();
+    let data = target()[..32_768].to_vec();
+    let template = similarity_index_entry_v1(&data).unwrap();
+    let (features, sketch) = (template.superfeatures(), template.sketch());
+    online
+        .append_current(&[
+            entry_like(1, 16_384, features, sketch),
+            entry_like(2, 131_072, features, sketch),
+            entry_like(3, 131_073, features, sketch),
+        ])
+        .unwrap();
+    let mut lengths = online
+        .candidates_prehashed(ChunkId::of(&data), &data)
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate.logical_length())
+        .collect::<Vec<_>>();
+    lengths.sort_unstable();
+    assert_eq!(
+        lengths,
+        [16_384, 131_072],
+        "a Base more than four times the target length is excluded"
+    );
+}
+
+#[test]
+fn candidates_sharing_more_buckets_rank_ahead_of_a_nearer_sketch() {
+    let exact = exact();
+    let online = OnlineSimilarityRepository::open(
+        SimilarityIndexRepository::new(MemoryStorageIo::new()),
+        &exact,
+    )
+    .unwrap();
+    let data = target();
+    let template = similarity_index_entry_v1(&data).unwrap();
+    let features = template.superfeatures();
+    let sketch = template.sketch();
+    let far_sketch = sketch.map(|word| !word);
+    let one_slot = [features[0], !features[1], !features[2], !features[3]];
+    online
+        .append_current(&[
+            entry_like(1, 65_536, one_slot, sketch),
+            entry_like(2, 65_536, features, far_sketch),
+        ])
+        .unwrap();
+    let candidates = online
+        .candidates_prehashed(ChunkId::of(&data), &data)
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].chunk_id(), ChunkId::from_bytes([2; 32]));
+    assert_eq!(candidates[0].matched_buckets(), 4);
+    assert_eq!(candidates[1].matched_buckets(), 1);
+}

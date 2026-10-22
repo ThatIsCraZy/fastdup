@@ -1406,45 +1406,49 @@ impl ReductionEngine {
                                 base.location,
                                 dictionary,
                             )?;
-                            let base_reference =
-                                IndependentBaseRef::from_verified_bytes(&decoded_base.bytes)
-                                    .map_err(similarity_writer_error)?;
-                            if base_reference.chunk_id() != base.candidate.chunk_id()
-                                || base_reference.logical_length()
-                                    != base.candidate.logical_length()
-                            {
-                                return Err(ReductionError::Corruption(
-                                    "verified Base disagrees with its Similarity Candidate",
-                                ));
-                            }
-                            let trial = SparseXorDelta::encode_trial(
-                                base_reference,
-                                &decoded_base.bytes,
-                                target,
-                            )
-                            .map_err(similarity_writer_error)?;
-                            let trial_cost = trial.cost();
-                            if trial.encoding().target_id() != target_id
-                                || usize::try_from(trial_cost.target_bytes()).map_err(|_| {
-                                    ReductionError::InvalidInput(
-                                        "Delta Trial target length does not fit memory",
-                                    )
-                                })? != target.len()
-                                || trial_cost.run_count() > trial_cost.xor_bytes()
-                            {
-                                return Err(ReductionError::Corruption(
-                                    "Delta Trial cost disagrees with its byte-exact encoding",
-                                ));
-                            }
-                            let trial_bytes = trial_cost.encoded_payload_bytes();
-                            if best
-                                .as_ref()
-                                .is_none_or(|(best_bytes, _)| trial_bytes < *best_bytes)
-                            {
-                                best = Some((
-                                    trial_bytes,
-                                    DependentEncoding::SparseXor(trial.into_encoding()),
-                                ));
+                            // Sparse XOR pairs equal lengths only; a Base of
+                            // another length goes straight to the Prefix trial.
+                            if decoded_base.bytes.len() == target.len() {
+                                let base_reference =
+                                    IndependentBaseRef::from_verified_bytes(&decoded_base.bytes)
+                                        .map_err(similarity_writer_error)?;
+                                if base_reference.chunk_id() != base.candidate.chunk_id()
+                                    || base_reference.logical_length()
+                                        != base.candidate.logical_length()
+                                {
+                                    return Err(ReductionError::Corruption(
+                                        "verified Base disagrees with its Similarity Candidate",
+                                    ));
+                                }
+                                let trial = SparseXorDelta::encode_trial(
+                                    base_reference,
+                                    &decoded_base.bytes,
+                                    target,
+                                )
+                                .map_err(similarity_writer_error)?;
+                                let trial_cost = trial.cost();
+                                if trial.encoding().target_id() != target_id
+                                    || usize::try_from(trial_cost.target_bytes()).map_err(|_| {
+                                        ReductionError::InvalidInput(
+                                            "Delta Trial target length does not fit memory",
+                                        )
+                                    })? != target.len()
+                                    || trial_cost.run_count() > trial_cost.xor_bytes()
+                                {
+                                    return Err(ReductionError::Corruption(
+                                        "Delta Trial cost disagrees with its byte-exact encoding",
+                                    ));
+                                }
+                                let trial_bytes = trial_cost.encoded_payload_bytes();
+                                if best
+                                    .as_ref()
+                                    .is_none_or(|(best_bytes, _)| trial_bytes < *best_bytes)
+                                {
+                                    best = Some((
+                                        trial_bytes,
+                                        DependentEncoding::SparseXor(trial.into_encoding()),
+                                    ));
+                                }
                             }
 
                             if zstd_prefix_enabled && remaining_trials != 0 {

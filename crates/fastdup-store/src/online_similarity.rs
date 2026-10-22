@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::StorageIo;
 use crate::exact_index_repository::{ExactIndexGenerationPin, ExactIndexRunRepository};
-use crate::reduction_similarity::SimilarityFingerprint;
+use crate::reduction_similarity::{SimilarityFingerprint, admissible_base_length};
 use crate::similarity_index_repository::{
     RecoveredSimilarityIndex, SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT, SimilarityBaseCandidate,
-    SimilarityIndexRepository, SimilarityIndexStoreError,
+    SimilarityIndexRepository, SimilarityIndexStoreError, insert_ranked_candidate,
 };
 use fastdup_format::{
     ChunkId, SimilarityBucketKey, SimilarityIndexEntry, similarity_bucket_length,
@@ -137,10 +137,10 @@ impl<I: Clone + StorageIo> OnlineReductionGeneration<I> {
         logical_length: u32,
         superfeature: u64,
     ) -> Result<Vec<SimilarityIndexEntry>, Error> {
-        // Newest complete value per bucket profile. During the v1-to-v2
-        // transition both key spaces stay visible as a Chunk-ID union, so
-        // neither profile shadows the other's representatives.
-        let mut satisfied: [Option<u16>; 2] = [None, None];
+        // Newest complete value per bucket profile. Until a rebuild converts
+        // older families, every key space stays visible as a Chunk-ID union,
+        // so no profile shadows another's representatives.
+        let mut satisfied: [Option<u16>; 3] = [None; 3];
         let mut found = 0_usize;
         let mut merged: Vec<SimilarityIndexEntry> = Vec::new();
         for run in self.runs.iter().rev() {
@@ -158,7 +158,7 @@ impl<I: Clone + StorageIo> OnlineReductionGeneration<I> {
             if entries.is_empty() {
                 continue;
             }
-            satisfied[found] = Some(profile);
+            *satisfied.get_mut(found).ok_or(Error::UnsupportedProfile)? = Some(profile);
             found += 1;
             for entry in entries {
                 match merged.binary_search_by_key(&entry.chunk_id(), |e| e.chunk_id()) {
@@ -199,6 +199,7 @@ impl<I: Clone + StorageIo> OnlineReductionGeneration<I> {
             let Some(entry) = next else {
                 break;
             };
+            let mut matched_buckets = 0_u8;
             for i in 0..4 {
                 if let Some(other) = buckets[i].get(positions[i])
                     && other.chunk_id() == entry.chunk_id()
@@ -207,18 +208,17 @@ impl<I: Clone + StorageIo> OnlineReductionGeneration<I> {
                         return Err(Error::IndexCorruption);
                     }
                     positions[i] += 1;
+                    matched_buckets += 1;
                 }
             }
-            if entry.chunk_id() == target_id {
+            if entry.chunk_id() == target_id
+                || !admissible_base_length(entry.logical_length(), length)
+            {
                 continue;
             }
-            let candidate = SimilarityBaseCandidate::from_entry(entry, fingerprint)?;
-            let key = (candidate.sketch_distance(), candidate.chunk_id());
-            let at = candidates.partition_point(|c| (c.sketch_distance(), c.chunk_id()) < key);
-            if at < 16 {
-                candidates.insert(at, candidate);
-                candidates.truncate(16);
-            }
+            let candidate =
+                SimilarityBaseCandidate::from_entry(entry, fingerprint, matched_buckets)?;
+            insert_ranked_candidate(&mut candidates, candidate);
         }
         Ok(candidates)
     }

@@ -9,23 +9,26 @@ const EXPLORATION_INTERVAL: u64 = 32;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GateKey(usize);
 impl GateKey {
+    /// `base_length` sizes the speculative read; the target's independent
+    /// compression ratio uses `target_length`, which differs for codec 5.
     pub(crate) fn new(
         distance: u16,
-        length: u32,
+        base_length: u32,
         independent_bytes: usize,
+        target_length: usize,
         has_best: bool,
     ) -> Self {
         let distance = usize::from(distance / 32).min(15);
-        let size = if length <= 16 * 1024 {
+        let size = if base_length <= 16 * 1024 {
             0
-        } else if length <= 64 * 1024 {
+        } else if base_length <= 64 * 1024 {
             1
         } else {
             2
         };
         let compression = independent_bytes
             .saturating_mul(4)
-            .checked_div(length as usize)
+            .checked_div(target_length)
             .unwrap_or(0)
             .min(3);
         Self(((distance * 3 + size) * 4 + compression) * 2 + usize::from(has_best))
@@ -116,7 +119,7 @@ mod tests {
     #[test]
     fn learns_unprofitable_reads_and_probes_changed_workloads() {
         let gate = CandidateReadGate::default();
-        let key = GateKey::new(180, 65536, 60000, false);
+        let key = GateKey::new(180, 65536, 60000, 65536, false);
         for _ in 0..WARMUP {
             assert_eq!(gate.decide(key), GateDecision::Allow);
             gate.observe(key, 0, 1_000_000);
@@ -135,8 +138,8 @@ mod tests {
     #[test]
     fn measured_cost_and_gain_matter_not_a_fixed_sketch_cutoff() {
         let gate = CandidateReadGate::default();
-        let good = GateKey::new(220, 65536, 60000, false);
-        let expensive = GateKey::new(20, 65536, 60000, false);
+        let good = GateKey::new(220, 65536, 60000, 65536, false);
+        let expensive = GateKey::new(20, 65536, 60000, 65536, false);
         for _ in 0..32 {
             gate.observe(good, 30_000, 1000);
         }
@@ -149,15 +152,15 @@ mod tests {
     #[test]
     fn buckets_separate_size_compression_and_marginal_trials_and_contention_fails_open() {
         let gate = CandidateReadGate::default();
-        let key = GateKey::new(512, 262144, 262144, false);
+        let key = GateKey::new(512, 262_144, 262_144, 262_144, false);
         for _ in 0..WARMUP {
             gate.observe(key, 0, 1000);
         }
         assert_eq!(gate.decide(key), GateDecision::Skip);
         for key in [
-            GateKey::new(512, 16000, 16000, false),
-            GateKey::new(512, 262144, 9000, false),
-            GateKey::new(512, 262144, 262144, true),
+            GateKey::new(512, 16_000, 16_000, 16_000, false),
+            GateKey::new(512, 262_144, 9_000, 262_144, false),
+            GateKey::new(512, 262_144, 262_144, 262_144, true),
         ] {
             assert_eq!(gate.decide(key), GateDecision::Allow);
         }

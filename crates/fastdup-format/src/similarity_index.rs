@@ -138,17 +138,24 @@ pub const SIMILARITY_BUCKET_PROFILE_V1: u16 = 1;
 /// Bucket profile v2: bucket keys carry a geometric length-band minimum so
 /// near-length Chunks share buckets (see [`similarity_bucket_length`]).
 pub const SIMILARITY_BUCKET_PROFILE_V2: u16 = 2;
+/// Bucket profile v3: one band covers every length, so a Base of any length
+/// shares buckets with its target (ADR 0106).
+pub const SIMILARITY_BUCKET_PROFILE_V3: u16 = 3;
 
 /// Returns the bucket-key length component for one logical Chunk length.
 ///
 /// Profile v1 carries the exact logical length. Profile v2 carries the
 /// minimum of a geometric length band whose relative width stays below one
 /// eighth, so key ordering remains monotonic in length while Chunks whose
-/// lengths differ by less than one band share a bucket. Unknown profiles
-/// fall back to the exact length; writers and recovery reject unsupported
-/// profiles before deriving keys.
+/// lengths differ by less than one band share a bucket. Profile v3 carries
+/// the minimum of its single band, 1. Unknown profiles fall back to the exact
+/// length; writers and recovery reject unsupported profiles before deriving
+/// keys.
 #[must_use]
 pub fn similarity_bucket_length(bucket_profile: u16, logical_length: u32) -> u32 {
+    if bucket_profile == SIMILARITY_BUCKET_PROFILE_V3 {
+        return 1;
+    }
     if bucket_profile != SIMILARITY_BUCKET_PROFILE_V2 || logical_length <= 1024 {
         return logical_length;
     }
@@ -1917,7 +1924,8 @@ impl std::error::Error for SimilarityIndexFormatError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        SIMILARITY_BUCKET_PROFILE_V1, SIMILARITY_BUCKET_PROFILE_V2, similarity_bucket_length,
+        SIMILARITY_BUCKET_PROFILE_V1, SIMILARITY_BUCKET_PROFILE_V2, SIMILARITY_BUCKET_PROFILE_V3,
+        similarity_bucket_length,
     };
 
     #[test]
@@ -1993,6 +2001,43 @@ mod tests {
             run.bucket_references()
                 .iter()
                 .all(|reference| reference.key().logical_length() == 65_536)
+        );
+        let bytes = run.encode().unwrap();
+        let decoded = SimilarityIndexRun::decode(&bytes).unwrap();
+        assert_eq!(decoded.entries(), run.entries());
+        assert_eq!(decoded.bucket_references(), run.bucket_references());
+    }
+
+    #[test]
+    fn v3_run_keeps_every_length_in_one_bucket() {
+        use super::{SimilarityIndexEntry, SimilarityIndexRun};
+        use crate::ChunkId;
+
+        for length in [1, 16_384, 262_144] {
+            assert_eq!(
+                similarity_bucket_length(SIMILARITY_BUCKET_PROFILE_V3, length),
+                1
+            );
+        }
+        let entries: Vec<_> = [16_384_u32, 70_000, 262_144]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, length)| {
+                SimilarityIndexEntry::new(
+                    ChunkId::of(format!("any-length-chunk-{ordinal}").as_bytes()),
+                    length,
+                    1,
+                    [11, 22, 33, 44],
+                    [7; 8],
+                )
+                .unwrap()
+            })
+            .collect();
+        let run = SimilarityIndexRun::new(1, SIMILARITY_BUCKET_PROFILE_V3, 1, entries).unwrap();
+        assert!(
+            run.bucket_references()
+                .iter()
+                .all(|reference| reference.key().logical_length() == 1)
         );
         let bytes = run.encode().unwrap();
         let decoded = SimilarityIndexRun::decode(&bytes).unwrap();

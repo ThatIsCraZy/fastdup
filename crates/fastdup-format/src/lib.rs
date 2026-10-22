@@ -116,13 +116,14 @@ pub use recovery_checkpoint::{
     recovery_checkpoint_padded_length,
 };
 pub use similarity_index::{
-    SIMILARITY_BUCKET_PROFILE_V1, SIMILARITY_BUCKET_PROFILE_V2, SIMILARITY_BUCKET_REFERENCE_BYTES,
-    SIMILARITY_BUCKET_REFERENCES_PER_PAGE, SIMILARITY_INDEX_ENTRIES_PER_PAGE,
-    SIMILARITY_INDEX_ENTRY_BYTES, SIMILARITY_INDEX_HEADER_BYTES, SIMILARITY_INDEX_PAGE_BYTES,
-    SimilarityBucketKey, SimilarityBucketPage, SimilarityBucketReference, SimilarityIndexEntry,
-    SimilarityIndexFormatError, SimilarityIndexPage, SimilarityIndexRun,
-    SimilarityIndexRunDescriptor, SimilarityIndexRunHashAudit, SimilarityIndexRunLayout,
-    SimilarityIndexRunStreamEncoder, similarity_bucket_length,
+    SIMILARITY_BUCKET_PROFILE_V1, SIMILARITY_BUCKET_PROFILE_V2, SIMILARITY_BUCKET_PROFILE_V3,
+    SIMILARITY_BUCKET_REFERENCE_BYTES, SIMILARITY_BUCKET_REFERENCES_PER_PAGE,
+    SIMILARITY_INDEX_ENTRIES_PER_PAGE, SIMILARITY_INDEX_ENTRY_BYTES, SIMILARITY_INDEX_HEADER_BYTES,
+    SIMILARITY_INDEX_PAGE_BYTES, SimilarityBucketKey, SimilarityBucketPage,
+    SimilarityBucketReference, SimilarityIndexEntry, SimilarityIndexFormatError,
+    SimilarityIndexPage, SimilarityIndexRun, SimilarityIndexRunDescriptor,
+    SimilarityIndexRunHashAudit, SimilarityIndexRunLayout, SimilarityIndexRunStreamEncoder,
+    similarity_bucket_length,
 };
 pub use similarity_index_family::{
     SIMILARITY_FAMILY_HEADER_BYTES, SIMILARITY_FAMILY_PARTITION_BYTES, SimilarityIndexFamilyError,

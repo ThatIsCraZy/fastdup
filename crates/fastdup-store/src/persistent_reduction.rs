@@ -701,6 +701,7 @@ impl<I: Clone + StorageIo> PersistentReductionIndex<I> {
                 candidate.sketch_distance(),
                 key.1,
                 trial.independent.encoded_payload_bytes(),
+                trial.target.len(),
                 trial.best.is_some(),
             );
             let started = std::time::Instant::now();

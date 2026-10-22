@@ -6,8 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fastdup_format::{ChunkId, SimilarityIndexEntry, SimilarityIndexRun};
 use fastdup_store::{
     FsStorageIo, MemoryPressureSnapshot, SIMILARITY_FINGERPRINT_PROFILE_V1,
-    SIMILARITY_REPRESENTATIVE_PROFILE_V1, SimilarityIndexReadMode, SimilarityIndexRepository,
-    SimilarityIndexStoreError, StorageIo, similarity_index_entry_v1,
+    SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT, SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+    SimilarityIndexReadMode, SimilarityIndexRepository, SimilarityIndexStoreError, StorageIo,
+    similarity_index_entry_v1,
 };
 
 fn is_similarity_partition_name(name: &str) -> bool {
@@ -343,7 +344,7 @@ fn external_sort_publication_matches_canonical_run_and_cleans_spools() {
         .collect::<Vec<_>>();
     let canonical = SimilarityIndexRun::new(
         SIMILARITY_FINGERPRINT_PROFILE_V1,
-        SIMILARITY_REPRESENTATIVE_PROFILE_V1,
+        SIMILARITY_REPRESENTATIVE_PROFILE_CURRENT,
         33,
         entries.clone(),
     )
