@@ -13,6 +13,9 @@
 - Set `CARGO_TARGET_DIR=/source/fastdup/.artifacts/target` and
   `TMPDIR=/source/fastdup/.artifacts/tmp` for every Cargo build or test. Create
   the workspace-local directories before invoking tools that require them.
+- A git worktree under `.artifacts/worktrees/<name>` builds into
+  `/source/fastdup/.artifacts/target/wt-<name>` instead. Worktrees sharing one
+  target directory can silently link another tree's stale workspace crates.
 - Keep generated and downloaded corpora out of source control.
 
 ## Durable code
