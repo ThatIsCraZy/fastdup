@@ -228,7 +228,13 @@ fn commit_similar_chunks(workers: usize, count: usize, mixed: bool, held: usize)
 
 #[test]
 fn commit_similarity_overlaps_cold_index_reads() {
-    let measured = commit_similar_chunks(4, 32, false, 0);
+    // The overlap invariant must also run on single-vCPU builders or with a
+    // one-thread global Rayon pool. The measured I/O releases the CPU.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let measured = pool.install(|| commit_similar_chunks(4, 32, false, 0));
     assert!(
         measured.reads > 0,
         "fixture must reach cold Similarity reads"

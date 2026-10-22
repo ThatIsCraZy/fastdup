@@ -52,6 +52,9 @@ return and the two-worker limit when two of four permits are held elsewhere.
 
 Eight alternating baseline/optimized repetitions in release mode produced:
 
+Build host: ten logical CPUs on an Intel Core i7-1370P, Linux
+`6.12.0-211.50.1.el10_2.x86_64`, Rust `1.97.1`.
+
 | Implementation | Workers | Median finish | Range | Median cold reads | Peak concurrent reads |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Baseline | 1 | 49 ms | 46–51 ms | 10 | 1 |
@@ -88,6 +91,8 @@ the homogeneous timed input and read count are unchanged.
   intentionally ignored, including the benchmark.
 - Both focused commit tests passed again after restricting the concurrency
   measurement to lookup reads, excluding asynchronous index publication.
+- Both also pass with `RAYON_NUM_THREADS=1`. The overlap regression owns a
+  four-thread test pool so single-vCPU builders still exercise concurrent I/O.
 - `cargo fmt --all` and `git diff --check` passed.
 - Unfiltered Clippy is blocked by existing findings in POSIX, appliance
   publication, telemetry and integration tests. Production-library Clippy passed
@@ -100,3 +105,29 @@ updated package is running: frontend throughput, admission-closed fraction,
 commit/ManifestPlan time, Metadata read count/latency, DATA read latency, RSS,
 and reduction rate. A package startup check does not replace backup or restore
 qualification.
+
+## Test-VM deployment
+
+The update from `fastdup-0.8.1-46.el10.x86_64` to
+`fastdup-0.8.1-47.el10.x86_64` completed after the backup finished. Runtime
+source commit: `dfd0885991996e9e496d674980f53ec329fd47a5`. The subsequent change
+only isolates the regression test's Rayon pool and updates this evidence.
+
+- RPM: `.artifacts/rpmbuild/RPMS/x86_64/fastdup-0.8.1-47.el10.x86_64.rpm`.
+- RPM SHA256: `daeb4c5d7a027ef2db35c60494e406f605c8d78815be2f61a6c1f2bd79c87d11`.
+- Update job:
+  `.artifacts/test-vm-update/20261022T235049Z-3847622a1b/job.json`.
+- The old runtime stopped cleanly. PID 3878537 runs the installed executable;
+  SHA256 `37113161c2997ffab0485eb165c782ad5a19296f66d006335bed6241d05dfd7e`.
+- Repository, agent, control plane, Samba and Veeam container are active;
+  FUSE is mounted and agent health is `online` with no runtime issue.
+- The Veeam container was explicitly started again after its dependency on
+  the repository stopped it. Its repository bind has the same device and inode
+  as the host's new mount. Veeam deployment, environment, immutability and
+  transport services are active inside it.
+- Two existing VBM metadata prefixes read identically through the host and
+  container views. This is a read-access smoke check, not a backup restore test.
+
+Deployment evidence is under `.artifacts/commit-batch-20261023/`, including
+`package-provenance.json`, `package-status.json`, `container-after-update.txt`
+and `container-read-verification.json`. No new Veeam job was started.
