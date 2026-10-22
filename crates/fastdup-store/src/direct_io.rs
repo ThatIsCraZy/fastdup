@@ -792,17 +792,17 @@ mod tests {
         let base = PAYLOAD_OFFSET;
         let direct = || SPARE_CAPACITY_READS.with(std::cell::Cell::get);
 
-        // The global allocator guarantees 16-byte alignment on x86-64; a
-        // stricter device memory alignment legitimately keeps the bounce path.
-        let fast_path = Alignment::read(&file).unwrap().memory <= 16;
+        // The global allocator guarantees 16-byte alignment on x86-64. A
+        // stricter device memory alignment usually keeps the bounce path, but
+        // an allocation that happens to meet it may still read directly.
+        let guaranteed = Alignment::read(&file).unwrap().memory <= 16;
         let before = direct();
         assert_eq!(
             read_physical(&file, base, 2 * BLOCK).unwrap(),
             payload[..2 * BLOCK]
         );
-        assert_eq!(
-            direct() > before,
-            fast_path,
+        assert!(
+            !guaranteed || direct() > before,
             "an aligned range needs no bounce buffer when the allocation is aligned"
         );
 
