@@ -47,6 +47,21 @@ impl ScrubCertificate {
     pub const fn bytes(&self) -> u64 {
         self.length
     }
+
+    #[must_use]
+    pub const fn container_id(&self) -> ContainerId {
+        self.id
+    }
+
+    /// Yields `(Chunk ID, logical length, Base Chunk ID)` for every dependent
+    /// record the certified Container stores.
+    pub fn dependents(&self) -> impl Iterator<Item = (ChunkId, u32, ChunkId)> + '_ {
+        self.chunks.iter().filter_map(|chunk| {
+            chunk
+                .dependency
+                .map(|(base, _)| (chunk.chunk_id, chunk.logical_length, base))
+        })
+    }
 }
 
 /// Coverage of today's startup graph and all resumed dependent Bases. Independent

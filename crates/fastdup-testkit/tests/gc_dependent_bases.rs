@@ -8,9 +8,9 @@ use fastdup_format::{
     ManifestLeaf, NamespaceEntry, NamespaceRoot, PolicySetId, SealedContainer,
 };
 use fastdup_store::{
-    ContainerGenerationAllocator, ContainerRepository, DataPoolUsage, ExactIndexRunRepository,
-    GcCandidateCatalogRepository, GcCandidateSelectionMode, GenerationRepository,
-    MaintenanceRepository,
+    ContainerGenerationAllocator, ContainerRepository, DataPoolUsage, DependentBasePinCollector,
+    ExactIndexRunRepository, GcCandidateCatalogRepository, GcCandidateSelectionMode,
+    GenerationRepository, MaintenanceRepository, ScrubCoverage,
 };
 use fastdup_testkit::MemoryStorageIo;
 
@@ -251,19 +251,29 @@ fn offline_gc_keeps_the_base_of_a_dead_dependent_that_stays_stored() {
         .expect("a stored dead dependent must not lose its Base");
 }
 
+type Maintenance = MaintenanceRepository<MemoryStorageIo, MemoryStorageIo, MemoryStorageIo>;
+
 fn prove(
     fixture: &Fixture,
     committed: u64,
     rows: Vec<GcCandidateCatalogRow>,
-) -> (
-    MaintenanceRepository<MemoryStorageIo, MemoryStorageIo, MemoryStorageIo>,
-    fastdup_store::GcCandidateProof,
-) {
+) -> (Maintenance, fastdup_store::GcCandidateProof) {
     let maintenance = fixture.maintenance();
+    let proof = prove_with(&maintenance, fixture, 1, committed, rows);
+    (maintenance, proof)
+}
+
+fn prove_with(
+    maintenance: &Maintenance,
+    fixture: &Fixture,
+    catalog_generation: u64,
+    committed: u64,
+    rows: Vec<GcCandidateCatalogRow>,
+) -> fastdup_store::GcCandidateProof {
     let catalog = GcCandidateCatalogRepository::new(fixture.metadata.clone());
     let row_count = u64::try_from(rows.len()).expect("row count fits u64");
     catalog
-        .publish_rows(1, committed, 0, row_count, rows)
+        .publish_rows(catalog_generation, committed, 0, row_count, rows)
         .expect("publish candidate catalog");
     let snapshot = catalog
         .recover_latest()
@@ -272,13 +282,42 @@ fn prove(
     let shortlist = snapshot
         .shortlist(GcCandidateSelectionMode::Urgent, 4, 4)
         .expect("select every candidate row");
-    let proof = maintenance
+    maintenance
         .prove_gc_candidates(
             &shortlist,
             DataPoolUsage::new(50, 100).expect("pool usage is valid"),
         )
-        .expect("prove the victim set with its dependent Bases");
-    (maintenance, proof)
+        .expect("prove the victim set with its dependent Bases")
+}
+
+/// Scrubs every published Container the way the startup scrub does and
+/// collects the Bases of dependents absent from the active Exact generation.
+fn scrub_pins(fixture: &Fixture) -> DependentBasePinCollector {
+    let active = fixture
+        .indexes
+        .recover_active()
+        .expect("recover active Exact generation")
+        .expect("an Exact generation is active");
+    let (_, required) = fixture
+        .generations
+        .recover_committed_for_mount(&fixture.containers)
+        .expect("recover the committed graph");
+    let mut coverage = ScrubCoverage::new(required);
+    let mut collector = DependentBasePinCollector::default();
+    for id in fixture
+        .containers
+        .recovery_container_snapshot()
+        .expect("snapshot published Containers")
+    {
+        let certificate = fixture
+            .containers
+            .scrub_for_progress(id, Some(&active), &mut coverage, 1)
+            .expect("scrub one Container");
+        collector
+            .observe(&certificate, Some(&active))
+            .expect("collect dependent Base pins");
+    }
+    collector
 }
 
 fn prove_and_collect(fixture: &Fixture, committed: u64, rows: Vec<GcCandidateCatalogRow>) -> usize {
@@ -460,4 +499,146 @@ fn recovered_online_gc_finalizes_a_dead_dependent_victim_after_process_loss() {
         .scrub()
         .expect("the finalized pool has no orphaned dependent");
     fixture.assert_readable(&kept);
+}
+
+/// A Container published before a process loss and never activated in Exact
+/// is invisible to online proofs; the startup scrub pins its dependents' Bases.
+#[test]
+fn online_gc_relocates_a_base_pinned_by_an_unindexed_dependent() {
+    let fixture = Fixture::new();
+    let (base, target) = base_and_target(12);
+    let (indexed_base, indexed_target) = base_and_target(13);
+    let padding = dead_padding();
+    let victim_generation = fixture.publish_raw(0x80, &[&base, &padding]);
+    fixture.publish_raw(0x81, &[&indexed_base]);
+    fixture.publish_dependents(0x82, &[(&indexed_base, &indexed_target)]);
+    let committed = fixture.commit_files(&[&indexed_target], 1);
+    let maintenance = fixture.maintenance();
+    fixture.publish_dependents(0x83, &[(&base, &target)]);
+
+    let collector = scrub_pins(&fixture);
+    assert_eq!(
+        collector.len(),
+        1,
+        "only the unindexed dependent pins its Base"
+    );
+    let pins = maintenance.dependent_base_pins();
+    pins.install(collector);
+    let proof = prove_with(
+        &maintenance,
+        &fixture,
+        1,
+        committed,
+        vec![candidate_row(0x80, victim_generation, &[&base, &padding])],
+    );
+    assert_eq!(
+        proof.replacement_chunks(),
+        1,
+        "the pinned Base is relocated"
+    );
+    maintenance
+        .garbage_collect_proved_candidates(proof)
+        .expect("relocate the pinned Base before deleting its Container");
+
+    maintenance
+        .scrub()
+        .expect("the unindexed dependent still resolves its Base");
+    fixture.assert_readable(&indexed_target);
+}
+
+#[test]
+fn online_gc_releases_a_scrub_pin_once_its_dependent_container_is_collected() {
+    let fixture = Fixture::new();
+    let (base, target) = base_and_target(14);
+    let padding = dead_padding();
+    let victim_generation = fixture.publish_raw(0x84, &[&base, &padding]);
+    let committed = fixture.commit_files(&[], 1);
+    let maintenance = fixture.maintenance();
+    let pairs: [(&[u8], &[u8]); 1] = [(&base, &target)];
+    let dependent_generation = fixture.publish_dependents(0x85, &pairs);
+    let pins = maintenance.dependent_base_pins();
+    pins.install(scrub_pins(&fixture));
+    assert_eq!(pins.len(), 1);
+
+    let proof = prove_with(
+        &maintenance,
+        &fixture,
+        1,
+        committed,
+        vec![dependent_row(0x85, dependent_generation, &pairs)],
+    );
+    maintenance
+        .garbage_collect_proved_candidates(proof)
+        .expect("collect the dead unindexed dependent");
+    assert!(
+        pins.is_empty(),
+        "removing the pinning Container releases its pin"
+    );
+
+    let proof = prove_with(
+        &maintenance,
+        &fixture,
+        2,
+        committed,
+        vec![candidate_row(0x84, victim_generation, &[&base, &padding])],
+    );
+    assert_eq!(
+        proof.replacement_chunks(),
+        0,
+        "the unnamed Base is released"
+    );
+    maintenance
+        .garbage_collect_proved_candidates(proof)
+        .expect("collect the released Base");
+    maintenance
+        .scrub()
+        .expect("no stored dependent names the collected Base");
+}
+
+/// A RETIRING Container still stores its dependents until it is unlinked.
+#[test]
+fn online_gc_keeps_the_base_of_a_dependent_in_a_retiring_container() {
+    let fixture = Fixture::new();
+    let (base, target) = base_and_target(15);
+    let padding = dead_padding();
+    let victim_generation = fixture.publish_raw(0x86, &[&base, &padding]);
+    let pairs: [(&[u8], &[u8]); 1] = [(&base, &target)];
+    let dependent_generation = fixture.publish_dependents(0x87, &pairs);
+    let committed = fixture.commit_files(&[], 1);
+    let maintenance = fixture.maintenance();
+
+    let proof = prove_with(
+        &maintenance,
+        &fixture,
+        1,
+        committed,
+        vec![dependent_row(0x87, dependent_generation, &pairs)],
+    );
+    let retirement = maintenance
+        .begin_online_gc_retirement(proof)
+        .expect("activate RETIRING for the dead dependent");
+    let base_victim = vec![candidate_row(0x86, victim_generation, &[&base, &padding])];
+    let proof = prove_with(&maintenance, &fixture, 2, committed, base_victim.clone());
+    assert_eq!(
+        proof.replacement_chunks(),
+        1,
+        "a RETIRING dependent still requires its Base"
+    );
+    drop(proof);
+
+    maintenance
+        .finish_online_gc_retirement(retirement)
+        .expect("unlink the retired dependent");
+    let proof = prove_with(&maintenance, &fixture, 3, committed, base_victim);
+    assert_eq!(
+        proof.replacement_chunks(),
+        0,
+        "the unnamed Base is released"
+    );
+    maintenance
+        .garbage_collect_proved_candidates(proof)
+        .expect("collect the released Base");
+    maintenance
+        .scrub()
+        .expect("no stored dependent names the collected Base");
 }

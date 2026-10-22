@@ -1710,6 +1710,33 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
     where
         F: FnMut(ExactIndexEntry) -> Result<(), ExactIndexStoreError>,
     {
+        self.visit_stored_locations_matching(
+            generation,
+            candidate_chunk_ids,
+            cancellation,
+            |entry| {
+                if entry.transition() == ExactLocationTransition::Active {
+                    consume(entry)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
+
+    /// Visits every effective Location whose record is still stored: ACTIVE,
+    /// RETIRING and QUARANTINED, never REMOVED. Matching follows
+    /// [`Self::visit_active_locations_matching`].
+    pub(crate) fn visit_stored_locations_matching<F>(
+        &self,
+        generation: &ExactIndexGenerationPin<I>,
+        candidate_chunk_ids: &BTreeSet<ChunkId>,
+        cancellation: Option<&crate::MaintenanceCancellation>,
+        mut consume: F,
+    ) -> Result<(), ExactIndexStoreError>
+    where
+        F: FnMut(ExactIndexEntry) -> Result<(), ExactIndexStoreError>,
+    {
         if candidate_chunk_ids.is_empty() {
             return Ok(());
         }
@@ -1722,7 +1749,7 @@ impl<I: Clone + StorageIo> ExactIndexRunRepository<I> {
             visited = visited
                 .checked_add(1)
                 .ok_or(ExactIndexStoreError::CounterOverflow)?;
-            if entry.transition() != ExactLocationTransition::Active {
+            if entry.transition() == ExactLocationTransition::Removed {
                 return Ok(());
             }
             let target = entry.chunk_id();

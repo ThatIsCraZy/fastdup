@@ -5,6 +5,7 @@ use fastdup_format::{
     ChunkId, ContainerId, ContainerStructure, FOOTER_BYTES, HEADER_BYTES, MAX_CONTAINER_BYTES,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 
 /// Outstanding DATA identities from one selected committed Metadata graph.
 /// This is scrub work, never a content proof or deletion capability. Only a
@@ -218,6 +219,44 @@ impl<I: StorageIo> ContainerRepository<I> {
             .iter()
             .map(|name| parse_published_name(name)?.ok_or(StoreError::PublishVerificationMismatch))
             .collect()
+    }
+
+    /// Returns every Base Chunk named by a stored dependent record in the
+    /// published Containers among `names`, sorted and unique, from
+    /// authenticated structure alone (ADR 0105). It holds Bases only, never an
+    /// inventory of every stored Chunk; callers that then fully verify each
+    /// Container must check that this set covers every dependency they observe.
+    ///
+    /// # Errors
+    /// Returns naming, length, seal, structure or allocation errors.
+    pub(crate) fn stored_dependent_bases(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<ChunkId>, StoreError> {
+        let mut bases = Vec::new();
+        for name in names {
+            let Some(id) = parse_published_name(name)? else {
+                continue;
+            };
+            let structure = self.read_structure(id)?;
+            let dependents = structure
+                .chunks()
+                .iter()
+                .filter(|chunk| chunk.dependency.is_some())
+                .count();
+            bases
+                .try_reserve(dependents)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            bases.extend(
+                structure
+                    .chunks()
+                    .iter()
+                    .filter_map(|chunk| chunk.dependency.map(|(base, _)| base)),
+            );
+        }
+        bases.sort_unstable();
+        bases.dedup();
+        Ok(bases)
     }
 
     pub(crate) fn verify_required_chunk_structure(

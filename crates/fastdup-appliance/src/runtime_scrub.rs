@@ -2,8 +2,9 @@
 use super::{MaintenanceContainerStorage, TelemetryStorageIo, runtime_telemetry};
 use fastdup_posix::Namespace;
 use fastdup_store::{
-    ContainerRepository, ExactIndexRunRepository, FsStorageIo, SCRUB_RESUME_MAX_IOS, ScrubCoverage,
-    ScrubProgress, ScrubResumePool, StorageIo,
+    ContainerRepository, DependentBasePinCollector, DependentBasePins, ExactIndexRunRepository,
+    FsStorageIo, SCRUB_RESUME_MAX_IOS, ScrubCertificate, ScrubCoverage, ScrubProgress,
+    ScrubResumePool, StorageIo,
 };
 use std::fmt::Write as _;
 use std::io;
@@ -21,6 +22,7 @@ pub struct ScrubGate(Arc<Control>);
 struct Control {
     cancelled: AtomicBool,
     complete: AtomicBool,
+    gc_open: AtomicBool,
     read_bytes: AtomicU64,
     progress: Mutex<Progress>,
     activity: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -76,6 +78,10 @@ struct Progress {
 
 impl ScrubGate {
     pub fn permits_gc(&self) -> bool {
+        self.0.complete.load(Ordering::Acquire) && self.0.gc_open.load(Ordering::Acquire)
+    }
+
+    pub fn scrub_complete(&self) -> bool {
         self.0.complete.load(Ordering::Acquire)
     }
 }
@@ -106,6 +112,7 @@ impl ScrubHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     required: fastdup_store::PendingDataVerification,
     containers: ContainerRepository<MaintenanceContainerStorage>,
@@ -114,6 +121,7 @@ pub fn start(
     namespace: Arc<Namespace>,
     progress_storage: (FsStorageIo, [u8; 32]),
     read_cache: Arc<fastdup_store::VerifiedReadCache>,
+    pins: DependentBasePins,
 ) -> io::Result<ScrubHandle> {
     let control = Arc::new(Control::new(frontend));
     start_with_control(
@@ -124,9 +132,11 @@ pub fn start(
         namespace,
         progress_storage,
         read_cache,
+        pins,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_with_control(
     required: fastdup_store::PendingDataVerification,
     containers: ContainerRepository<MaintenanceContainerStorage>,
@@ -135,6 +145,7 @@ fn start_with_control(
     namespace: Arc<Namespace>,
     progress_storage: (FsStorageIo, [u8; 32]),
     read_cache: Arc<fastdup_store::VerifiedReadCache>,
+    pins: DependentBasePins,
 ) -> io::Result<ScrubHandle> {
     control.report("running", None);
     let gate = ScrubGate(Arc::clone(&control));
@@ -145,6 +156,7 @@ fn start_with_control(
                 fastdup_store::MetadataReadReason::RecoveryScrub,
             );
             let mut journal = None;
+            let mut collector = PinCollection::default();
             let result = (|| {
                 fastdup_store::set_background_io_priority().map_err(io::Error::other)?;
                 rustix::process::nice(10).map_err(io::Error::from)?;
@@ -190,6 +202,7 @@ fn start_with_control(
                         &mut coverage,
                         &mut journal,
                         &mut resume_pool,
+                        &mut |entry| collector.observe(entry, index.as_deref()),
                     )?;
                     let pending = pending_ids(batch, &resumed);
                     if !pending.is_empty() && resume_pool.is_none() {
@@ -206,6 +219,9 @@ fn start_with_control(
                         resume_pool.as_ref().expect("scrub workers initialized"),
                         &read_cache,
                     )?;
+                    for entry in &verified {
+                        collector.observe(entry, index.as_deref());
+                    }
                     record_verified_batch(
                         &control,
                         batch,
@@ -226,7 +242,8 @@ fn start_with_control(
                 Ok::<_, io::Error>(())
             })();
             sync_progress(&mut journal);
-            control.finish(result, &namespace);
+            let gc_permitted = result.is_ok() && collector.install(&pins);
+            control.finish(result, &namespace, gc_permitted);
         })?;
     Ok(ScrubHandle {
         gate,
@@ -309,6 +326,7 @@ fn resume_batch(
     coverage: &mut ScrubCoverage,
     journal: &mut Option<ScrubProgress<FsStorageIo>>,
     pool: &mut Option<ScrubResumePool>,
+    observe: &mut dyn FnMut(&ScrubCertificate),
 ) -> io::Result<Vec<Option<u64>>> {
     let mut resumed = vec![None; ids.len()];
     let Some(progress) = journal.as_ref() else {
@@ -342,11 +360,45 @@ fn resume_batch(
             .map_err(io::Error::other)?;
         for ((entry, position), matched) in entries.iter().zip(positions).zip(outcomes) {
             if matched {
+                observe(entry);
                 resumed[position] = Some(entry.bytes());
             }
         }
     }
     Ok(resumed)
+}
+
+/// Bases of dependents the scrub's Exact generation does not show (ADR 0105).
+/// A failed collection is not corruption; it only keeps online GC closed.
+#[derive(Default)]
+struct PinCollection {
+    collector: DependentBasePinCollector,
+    error: Option<fastdup_store::DependentBasePinError>,
+}
+
+impl PinCollection {
+    fn observe(
+        &mut self,
+        certificate: &ScrubCertificate,
+        index: Option<&fastdup_store::ActivatedExactIndex<FsStorageIo>>,
+    ) {
+        if self.error.is_none()
+            && let Err(error) = self.collector.observe(certificate, index)
+        {
+            self.error = Some(error);
+        }
+    }
+
+    /// Installs the pins before the gate opens and reports whether it may.
+    fn install(self, pins: &DependentBasePins) -> bool {
+        if let Some(error) = self.error {
+            eprintln!("WARNING: online_gc_gate=closed reason=dependent_base_pins error={error}");
+            return false;
+        }
+        eprintln!("unindexed_dependent_base_pins={}", self.collector.len());
+        pins.install(self.collector);
+        true
+    }
 }
 
 fn unix_seconds() -> u64 {
@@ -376,6 +428,7 @@ impl Control {
         Self {
             cancelled: AtomicBool::new(false),
             complete: AtomicBool::new(false),
+            gc_open: AtomicBool::new(false),
             read_bytes: AtomicU64::new(0),
             progress: Mutex::new(Progress {
                 total: 0,
@@ -450,7 +503,7 @@ impl Control {
     #[allow(clippy::unused_self)]
     fn wait_for_record_permit(&self, _: usize) {}
 
-    fn finish(&self, result: io::Result<()>, namespace: &Namespace) {
+    fn finish(&self, result: io::Result<()>, namespace: &Namespace, gc_permitted: bool) {
         let cancelled = self.cancelled.load(Ordering::Acquire);
         let result = result.or_else(|error| {
             let interrupted = error.kind() == io::ErrorKind::Interrupted
@@ -467,6 +520,9 @@ impl Control {
         } else if cancelled {
             self.report("cancelled", None);
         } else {
+            // Release pairs with `permits_gc`: installed pins are visible to
+            // every GC proof that observes the open gate.
+            self.gc_open.store(gc_permitted, Ordering::Release);
             self.complete.store(true, Ordering::Release);
             self.report("complete", None);
             eprintln!(
@@ -682,6 +738,7 @@ mod tests {
             Control {
                 cancelled: AtomicBool::new(false),
                 complete: AtomicBool::new(false),
+                gc_open: AtomicBool::new(false),
                 read_bytes: AtomicU64::new(0),
                 progress: Mutex::new(Progress {
                     total: 1,
@@ -729,7 +786,7 @@ mod tests {
         let control = control(false);
         control.cancelled.store(true, Ordering::Release);
         let namespace = Namespace::new_volatile(fastdup_posix::NamespaceConfig::default());
-        control.finish(Err(io::Error::other("damaged envelope")), &namespace);
+        control.finish(Err(io::Error::other("damaged envelope")), &namespace, true);
         assert!(namespace.integrity_failed());
         assert!(!ScrubGate(control).permits_gc());
     }
@@ -790,7 +847,7 @@ mod tests {
             "cancelled header requests join without issuing their footer reads"
         );
         let namespace = Namespace::new_volatile(fastdup_posix::NamespaceConfig::default());
-        control.finish(result.map(drop).map_err(io::Error::other), &namespace);
+        control.finish(result.map(drop).map_err(io::Error::other), &namespace, true);
         assert!(!ScrubGate(control).permits_gc());
         assert!(!namespace.integrity_failed());
     }
@@ -820,7 +877,7 @@ mod tests {
                 .map_err(io::Error::other);
             assert_eq!(result.is_err(), damaged);
             let namespace = Namespace::new_volatile(fastdup_posix::NamespaceConfig::default());
-            control.finish(result, &namespace);
+            control.finish(result, &namespace, true);
             namespace.resume_mutation_admission();
             assert_eq!(ScrubGate(Arc::clone(&control)).permits_gc(), !damaged);
             assert_eq!(namespace.integrity_failed(), damaged);
@@ -852,8 +909,20 @@ mod tests {
             READ_QUANTUM as u64
         );
         let namespace = Namespace::new_volatile(fastdup_posix::NamespaceConfig::default());
-        control.finish(result, &namespace);
+        control.finish(result, &namespace, true);
         assert!(!ScrubGate(control).permits_gc());
+        assert!(!namespace.integrity_failed());
+        assert!(namespace.mutation_admission_open());
+    }
+
+    #[test]
+    fn failed_pin_collection_completes_the_scrub_but_keeps_gc_closed() {
+        let namespace = Namespace::new_volatile(fastdup_posix::NamespaceConfig::default());
+        let control = control(false);
+        control.finish(Ok(()), &namespace, false);
+        let gate = ScrubGate(control);
+        assert!(gate.scrub_complete());
+        assert!(!gate.permits_gc());
         assert!(!namespace.integrity_failed());
         assert!(namespace.mutation_admission_open());
     }
@@ -919,6 +988,7 @@ mod resume_tests {
                 )),
                 (metadata.clone(), [19; 32]),
                 Arc::clone(&cache),
+                DependentBasePins::default(),
             )
             .unwrap();
             (worker, control, cache)

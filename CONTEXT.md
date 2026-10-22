@@ -88,11 +88,18 @@ cache reuse while also concentrating recovery dependency.
 _Avoid_: Reference count, duplicate count
 
 **Reverse dependency generation**:
-A generation-bound projection from protected logical chunks to every Base Chunk
-required by their active dependent Locations. It is deletion-proof input bound
-to one Commit pair and Exact Index generation, not durable liveness authority by
-itself.
+A generation-bound projection from protected logical chunks, plus every
+candidate Base Chunk still named by a stored dependent record: an effective
+ACTIVE, RETIRING or QUARANTINED Location or a Dependent Base pin. It is
+deletion-proof input bound to one Commit pair and Exact Index generation, not
+durable liveness authority by itself.
 _Avoid_: Similarity fanout, mutable reference count, GC candidate estimate
+
+**Dependent Base pin**:
+A process-local requirement, installed by the startup scrub before it opens the
+GC gate, that keeps the Base of a stored dependent whose Location the Exact
+Index does not show. It ends when its pinning Container is removed.
+_Avoid_: Reference count, durable pin, Metadata Root Pin
 
 **Encoding record**:
 One physical payload that decodes to a contiguous region partitioned into one or

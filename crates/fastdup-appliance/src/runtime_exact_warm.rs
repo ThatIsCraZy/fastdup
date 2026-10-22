@@ -211,7 +211,7 @@ async fn run(
                     operations,
                     now,
                     &namespace,
-                    scrub_gate.permits_gc(),
+                    scrub_gate.scrub_complete(),
                 );                let mut record_action = cycle.action;
                 next = match cycle.action {
                     WarmAction::Skipped(_) => cycle.interval,

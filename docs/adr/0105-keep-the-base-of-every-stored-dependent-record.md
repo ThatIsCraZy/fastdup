@@ -29,14 +29,18 @@ had lost both of their Bases. Regression tests reproduced three GC defects:
 A Base is required while any stored dependent record names it, whether or
 not that dependent is reachable. The rule holds for every DATA-GC path.
 
-- Online proofs collect, for every ACTIVE Exact location whose dependency is
-  a candidate Chunk, the edge from that Base to its dependent in the proof's
-  reverse-dependency map. A victim record is relocated when it is a protected
-  Chunk or a Base in that map. The Base keeps the length of its own record; a
-  dependent's length never describes its Base.
-- Offline planning reads the dependency of every location in every verified
-  Container and classifies Containers only after that complete pass. Bases
-  named anywhere count as required Chunks with their own record lengths.
+- Online proofs collect every candidate Base named by an effective ACTIVE,
+  RETIRING or QUARANTINED Exact Location: a RETIRING Container still stores
+  its dependents until it is unlinked. A victim record is relocated when it is
+  a protected Chunk or such a Base. The Base keeps the length of its own
+  record; a dependent's length never describes its Base. The set is bounded by
+  the proof's candidate Chunks.
+- Offline planning first reads the authenticated structure of every published
+  Container and collects the Bases named by its dependents. The full
+  verification pass then classifies each Container as it streams and rejects
+  any dependency the structural pass did not see. Bases named anywhere count
+  as required Chunks with their own record lengths. Only Bases are held, not
+  every stored Chunk of the pool.
 
 A dependent that is removed in the same cycle still pins its Base for that
 cycle. A pin ends exactly when every Container holding a dependent on that Base
@@ -50,16 +54,33 @@ Base as an independent Chunk. A violation is structural corruption, because
 the Container can no longer be decoded at all. Repairing a repository that
 already contains such orphans is a rebuild, not an online policy.
 
-## Open gap
+## Dependents the Exact Index does not show
 
-Online proofs see dependents only through ACTIVE Exact locations. A Container
-published before a process loss but never activated in Exact is invisible to
-them, and startup deliberately does not scan the Container inventory (ADR
-0091). Its dependents could lose a Base to a later online cycle, which scrub
-then reports as an orphan. Offline planning is unaffected because it reads
-every Container. The intended closure is for the background scrub, which reads
-every Container before it opens the GC gate, to pin the Bases of dependents
-outside the active Exact generation until the next completed round.
+Exact activation is asynchronous (ADR 0015). A Container published before a
+process loss, or one whose activation failed while the process degraded its
+Exact publication, stores dependents that online proofs cannot see, and normal
+startup does not scan Containers (ADR 0091). Such a dependent would lose its
+Base to a later online cycle, and the next scrub would latch a sticky integrity
+failure.
+
+The startup scrub closes this. For every Container it certifies, freshly or by
+journal resume, it looks up each dependent in its pinned Exact generation, one
+batched lookup per Container. A dependent whose own Location in that Container
+is not effective there pins its Base, keyed by the pinning Container. Without
+an Exact generation every dependent pins. Each dependent is checked on its own
+rather than letting one stand for its Container: Exact activates a Container's
+Locations together today, but a missed pin would become a sticky integrity
+failure, so the check does not depend on that. The pins are installed into the online maintenance repository
+before the scrub opens the GC gate, so every proof that sees the open gate also
+sees the pins and relocates a pinned Base like any other required Chunk. A pin
+ends when its Container is unlinked and synced by GC. Pins are process-local;
+a restart repeats the scrub with the gate closed.
+
+The set is bounded by the in-flight work of one crash window or one degraded
+activation. More than 262,144 distinct pinned Bases, or a failed Exact lookup,
+keeps online GC closed for the process. That is not corruption: the scrub
+still completes, writes stay admitted, and the warning names the reason.
+Offline planning needs no pins because it reads every Container.
 
 ## Consequences
 
@@ -68,4 +89,6 @@ dependents keep their Base's DATA until their own Containers are collected.
 Tests in `crates/fastdup-testkit/tests/gc_dependent_bases.rs` cover live and
 dead dependents under both GC paths, two targets of different lengths on one
 Base, release of a Base after its last dependent, recovery finalization after
-process loss during retirement, and a final scrub after every collection.
+process loss during retirement, a dependent in a RETIRING Container, a scrub
+pin for an unindexed dependent and its release, and a final scrub after every
+collection.

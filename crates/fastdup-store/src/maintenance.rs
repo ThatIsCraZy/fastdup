@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use fastdup_format::{
     ChunkId, ContainerId, ExactIndexActivationRecord, ExactIndexEntry, ExactIndexFormatError,
     ExactIndexProfileId, ExactIndexRun, ExactIndexRunRef, ExactIndexRunSet, ExactIndexRunSetError,
-    ExactIndexRunSetId, GC_CANDIDATE_CATALOG_ROW_BYTES, GcCandidateCatalogDescriptor,
-    GcCandidateCatalogRow, MAX_LOGICAL_CHUNK_BYTES, PrehashedChunk, PreparedEncodedRecord,
-    SealedContainer, VerifiedChunkPayload, VerifiedContainerImage,
+    ExactIndexRunSetId, ExactLocationTransition, GC_CANDIDATE_CATALOG_ROW_BYTES,
+    GcCandidateCatalogDescriptor, GcCandidateCatalogRow, MAX_LOGICAL_CHUNK_BYTES, PrehashedChunk,
+    PreparedEncodedRecord, SealedContainer, VerifiedChunkPayload, VerifiedContainerImage,
 };
 
 use crate::generation::GenerationLivenessProof;
@@ -317,6 +317,7 @@ pub struct MaintenanceRepository<M, C, X> {
     rebuild_lock: Arc<Mutex<()>>,
     candidate_queue: Arc<Mutex<GcCandidateSelectionQueue>>,
     checkpoint_protection_cache: Arc<crate::CheckpointProtectedChunkCache>,
+    dependent_base_pins: crate::DependentBasePins,
     cancellation: Option<crate::MaintenanceCancellation>,
 }
 
@@ -336,8 +337,16 @@ impl<M, C, X> MaintenanceRepository<M, C, X> {
             rebuild_lock: Arc::new(Mutex::new(())),
             candidate_queue: Arc::new(Mutex::new(GcCandidateSelectionQueue::default())),
             checkpoint_protection_cache: Arc::new(crate::CheckpointProtectedChunkCache::default()),
+            dependent_base_pins: crate::DependentBasePins::default(),
             cancellation: None,
         }
+    }
+
+    /// Returns the shared handle through which the startup scrub installs the
+    /// Bases of dependents that are absent from the Exact Index (ADR 0105).
+    #[must_use]
+    pub fn dependent_base_pins(&self) -> crate::DependentBasePins {
+        self.dependent_base_pins.clone()
     }
 
     /// Returns a detached maintenance view that cooperatively stops long scans
@@ -751,26 +760,36 @@ where
         generation_proof.extend_protected_chunks(checkpoint_chunks)?;
 
         let mut required_chunks = BTreeMap::new();
-        let mut dependents_by_base: BTreeMap<ChunkId, BTreeSet<ChunkId>> = BTreeMap::new();
+        // Bases named by stored dependents, bounded by the candidate set. The
+        // startup scrub adds those whose dependents Exact does not show.
+        let mut stored_dependent_bases = self
+            .dependent_base_pins
+            .matching(&candidate_chunk_ids)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         let mut dependency_edges = 0_u64;
         let protected_chunks = generation_proof.protected_chunks().clone();
-        self.indexes.visit_active_locations_matching(
+        self.indexes.visit_stored_locations_matching(
             &exact,
             &candidate_chunk_ids,
             self.cancellation.as_ref(),
             |entry| {
                 let target = entry.chunk_id();
                 // Every stored dependent keeps its Base, live or not (ADR 0105):
-                // its Container still decodes the record. The Base carries its
-                // own length; the dependent's length says nothing about it.
+                // its Container, RETIRING ones included, still decodes the
+                // record. The Base carries its own length; the dependent's
+                // length says nothing about it.
                 if entry.location().dependency_id() != [0; 32] {
                     let base = ChunkId::from_bytes(entry.location().dependency_id());
                     if candidate_chunk_ids.contains(&base) {
-                        dependents_by_base.entry(base).or_default().insert(target);
+                        stored_dependent_bases.insert(base);
                         dependency_edges = dependency_edges
                             .checked_add(1)
                             .ok_or(ExactIndexStoreError::CounterOverflow)?;
                     }
+                }
+                if entry.transition() != ExactLocationTransition::Active {
+                    return Ok(());
                 }
                 let Some(expected_length) = protected_chunks.get(&target).copied() else {
                     return Ok(());
@@ -806,7 +825,7 @@ where
             exact_activation: exact.record(),
             protected_commit_generation: generation_proof.summary().latest_generation(),
             required_chunks,
-            dependents_by_base,
+            stored_dependent_bases,
             dependency_edges,
         });
         let job_bytes = rows
@@ -904,8 +923,8 @@ where
                             true
                         } else {
                             reverse_dependencies
-                                .dependents_by_base
-                                .contains_key(&chunk_id)
+                                .stored_dependent_bases
+                                .contains(&chunk_id)
                         };
                         if required_here {
                             reachable_victim_chunks.insert(chunk_id);
@@ -995,7 +1014,7 @@ where
             return Err(MaintenanceError::EmptyGcCandidateProof);
         }
         if generation_proof.protected_chunks().is_empty()
-            && reverse_dependencies.dependents_by_base.is_empty()
+            && reverse_dependencies.stored_dependent_bases.is_empty()
         {
             assert!(
                 replacement_chunks.is_empty() && reachable_victim_chunks.is_empty(),
@@ -1757,6 +1776,7 @@ where
             bytes_removed, victim_bytes,
             "ASSERT: proved victim identities retain their immutable lengths"
         );
+        self.dependent_base_pins.release(&victims);
         Ok(GarbageCollectionReport {
             containers_removed: u64::try_from(victims.len())
                 .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
@@ -1969,6 +1989,7 @@ where
             .append_level_zero(self.exact_profile, removed)?;
         let removed_activation_wall = removed_activation_started.elapsed();
         self.containers.remove_retiring_selection_barrier(&victims);
+        self.dependent_base_pins.release(&victims);
         Ok(GarbageCollectionReport {
             containers_removed: u64::try_from(victims.len())
                 .map_err(|_| MaintenanceError::ArithmeticOverflow)?,
@@ -2087,35 +2108,38 @@ where
         let mut partial = BTreeMap::new();
         let mut partial_coverage = BTreeMap::new();
         let mut retained_coverage = BTreeSet::new();
-        // Classification waits for the complete pass: a Base is required by
-        // every stored dependent record in any Container (ADR 0105).
-        let mut summaries = Vec::new();
-        let mut stored_bases = BTreeSet::new();
+        // A Base is required by every stored dependent record in any Container
+        // (ADR 0105). A structural pass learns those Bases first, so the full
+        // verification pass classifies each Container as it streams instead
+        // of holding every stored Chunk of the pool.
+        let names = self
+            .containers
+            .storage()
+            .list_names()
+            .map_err(StoreError::from)?;
+        let stored_bases = self.containers.stored_dependent_bases(&names)?;
         let containers = self
             .containers
-            .visit_verified_published_pipelined::<MaintenanceError, _>(|container| {
+            .visit_verified_named_pipelined::<MaintenanceError, _>(names, |container| {
                 for location in container.locations() {
-                    if location.dependency_id() != [0; 32] {
-                        stored_bases.insert(ChunkId::from_bytes(location.dependency_id()));
+                    if location.dependency_id() != [0; 32]
+                        && stored_bases
+                            .binary_search(&ChunkId::from_bytes(location.dependency_id()))
+                            .is_err()
+                    {
+                        return Err(StoreError::PublishVerificationMismatch.into());
                     }
                 }
-                summaries
-                    .try_reserve(1)
-                    .map_err(|_| MaintenanceError::OutOfMemory)?;
-                summaries.push(ContainerGcSummary::of(container)?);
-                Ok(())
+                classify_container(
+                    &ContainerGcSummary::of(container)?,
+                    online_chunks,
+                    &stored_bases,
+                    &mut inventory,
+                    &mut partial,
+                    &mut partial_coverage,
+                    &mut retained_coverage,
+                )
             })?;
-        for summary in &summaries {
-            classify_container(
-                summary,
-                online_chunks,
-                &stored_bases,
-                &mut inventory,
-                &mut partial,
-                &mut partial_coverage,
-                &mut retained_coverage,
-            )?;
-        }
         inventory.containers = containers;
         for (chunk_id, logical_length) in partial_coverage {
             if retained_coverage.contains(&chunk_id) {
@@ -2992,7 +3016,7 @@ impl ContainerGcSummary {
 fn classify_container(
     summary: &ContainerGcSummary,
     online_chunks: &BTreeMap<ChunkId, u64>,
-    stored_bases: &BTreeSet<ChunkId>,
+    stored_bases: &[ChunkId],
     inventory: &mut ContainerGcInventory,
     partial: &mut BTreeMap<[u8; 16], (ContainerId, u64)>,
     partial_coverage: &mut BTreeMap<ChunkId, u64>,
@@ -3010,7 +3034,7 @@ fn classify_container(
             }
             true
         } else {
-            stored_bases.contains(&chunk_id)
+            stored_bases.binary_search(&chunk_id).is_ok()
         };
         if required {
             live_chunks
@@ -3634,14 +3658,15 @@ pub struct GarbageCollectionPlan {
     gc_priority: MaintenancePriority,
 }
 
-/// Opaque generation-bound projection from live target Chunks to every Base
-/// Chunk named by an effective ACTIVE Exact Location.
+/// Opaque generation-bound projection from live target Chunks, plus every
+/// candidate Base named by a stored dependent: an effective ACTIVE, RETIRING or
+/// QUARANTINED Exact Location, or a startup-scrub pin (ADR 0105).
 #[derive(Debug)]
 pub struct ReverseDependencyGeneration {
     exact_activation: ExactIndexActivationRecord,
     protected_commit_generation: Option<u64>,
     required_chunks: BTreeMap<ChunkId, u64>,
-    dependents_by_base: BTreeMap<ChunkId, BTreeSet<ChunkId>>,
+    stored_dependent_bases: BTreeSet<ChunkId>,
     dependency_edges: u64,
 }
 
@@ -3663,7 +3688,7 @@ impl ReverseDependencyGeneration {
 
     #[must_use]
     pub fn base_chunks(&self) -> usize {
-        self.dependents_by_base.len()
+        self.stored_dependent_bases.len()
     }
 
     #[must_use]

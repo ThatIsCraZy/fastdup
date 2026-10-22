@@ -17,6 +17,7 @@ pub use operation_timing::{OperationTimer, OperationTiming, OperationTimingSnaps
 mod container_descriptor_cache;
 mod container_generation_allocator;
 mod container_image_cache;
+mod dependent_base_pins;
 mod exact_activation_log;
 mod exact_index_read;
 mod exact_index_repository;
@@ -69,6 +70,9 @@ mod similarity_index_repository;
 mod similarity_presence;
 mod similarity_read;
 mod similarity_simd;
+pub use dependent_base_pins::{
+    DependentBasePinCollector, DependentBasePinError, DependentBasePins, MAX_DEPENDENT_BASE_PINS,
+};
 pub use scrub_progress::{
     SCRUB_RESUME_MAX_IOS, ScrubCertificate, ScrubCoverage, ScrubProgress, ScrubResumePool,
 };
@@ -4403,6 +4407,25 @@ impl<I: StorageIo> ContainerRepository<I> {
 
     pub(crate) fn visit_verified_published_pipelined<E, F>(
         &self,
+        visitor: F,
+    ) -> Result<ContainerAuditSummary, E>
+    where
+        I: Sync,
+        E: From<StoreError>,
+        F: FnMut(&SealedContainer) -> Result<(), E>,
+    {
+        let names = self
+            .storage
+            .list_names()
+            .map_err(|error| E::from(StoreError::from(error)))?;
+        self.visit_verified_named_pipelined(names, visitor)
+    }
+
+    /// Fully verifies the published Containers among `names`, one directory
+    /// snapshot shared with an earlier pass over the same inventory.
+    pub(crate) fn visit_verified_named_pipelined<E, F>(
+        &self,
+        mut names: Vec<String>,
         mut visitor: F,
     ) -> Result<ContainerAuditSummary, E>
     where
@@ -4411,10 +4434,6 @@ impl<I: StorageIo> ContainerRepository<I> {
         F: FnMut(&SealedContainer) -> Result<(), E>,
     {
         let _independent = ReadIntentScope::enter(ReadIntent::Independent);
-        let mut names = self
-            .storage
-            .list_names()
-            .map_err(|error| E::from(StoreError::from(error)))?;
         names.sort_unstable();
         let worker_limit = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
         let mut summary = ContainerAuditSummary::default();
