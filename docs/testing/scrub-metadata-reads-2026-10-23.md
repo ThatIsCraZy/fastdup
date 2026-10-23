@@ -116,3 +116,74 @@ Package `fastdup-0.8.1-48.el10.x86_64` was built in the isolated
 Its SHA256 is `4143c1c1adec582bdb61b4a2eeedf9228bf3a4911c35b986a3a4905638aa6336`.
 The unrelated root-workspace stylesheet change was excluded. Full provenance
 and package comparison are saved in the measurement directory.
+
+## Final storage review
+
+Muse Wonder Full 1.0 (`xhigh`) reviewed the operation-local reader in `6d2abe4`
+and found no critical correctness, lifetime or freshness issues. The reader
+borrows the immutable Run lease, revalidates both storage heads and descriptor
+length, and cannot outlive the current bounded lookup window. Leaf CRC/ordinal
+checks, fresh Base verification, error precedence and the GC gate remain intact.
+The requested Store tests and production Clippy had already passed as recorded
+above; the reviewer did not rerun them.
+
+One non-blocking performance limitation remains: pages already present in the
+ordinary page cache can take a fresh scalar Independent read and lose the
+batched header saving. They do not reuse cached verification. The sparse-leaf
+regression measures the cold path; live results depend on the cache state and
+Run layout.
+
+## Test-VM deployment and live observation
+
+The authorized update from `fastdup-0.8.1-47.el10.x86_64` to
+`fastdup-0.8.1-48.el10.x86_64` completed at 03:33:51 CEST on 23 October,
+after the preceding FastDup backup had finished successfully. The update job is
+`.artifacts/test-vm-update/20261023T013154Z-ec06068041/job.json`.
+
+- Repository, agent, control plane, Samba and the Veeam service container are
+  active. The agent reports `repositoryState=online`, `runtimeIssue=null`.
+- Runtime PID 3945699 runs the packaged executable. Its SHA256,
+  `1f628752ce4ab934c02d9fbcece7759e54608186cd2ed7e9d55368c9d730c41d`,
+  matches both the RPM file digest and the installed executable. RPM packaging
+  strips the build binary; provenance distinguishes the unstripped build hash
+  from this installed-runtime hash.
+- The Veeam container was restarted against the new FUSE mount. Its repository
+  bind has the same device/inode as the host, and two existing VBM metadata
+  prefixes read identically through host and container paths. Veeam transport,
+  deployment, environment and immutability services are active.
+
+The post-mount device window excludes startup audit and covers 95.3 seconds:
+
+| Device | Read IOPS | Read MB/s | Mean read latency | Mean queue |
+| --- | ---: | ---: | ---: | ---: |
+| Metadata (`sdb`) | 694 | 3.21 | 0.962 ms | 0.668 |
+| DATA (`sdc`) | 417 | 5.89 | 0.826 ms | 0.345 |
+
+There was no swap activity; runtime RSS at the end of this window was about
+998 MiB. Metadata device busy time was 60.0%, so the lower byte count does not
+mean that storage latency has disappeared.
+
+A separate 130.0-second runtime window ended before frontend writes began:
+343 Containers were freshly verified and 1,449 resumed from prior evidence.
+All read/write/integrity error counters stayed clear. Of the 65,219 Exact
+lookup reads, 65,216 were correctly attributed to `recoveryScrub` and three
+to ordinary `indexLookup`.
+
+The earlier observation had 4,403 Metadata read IOPS at 24.45 MB/s, but it
+freshly verified all 320 Containers in its window. The new mount has 9,477
+Containers instead of 7,774, a changed Run layout and mixed resume/fresh work.
+Consequently these live figures establish a healthy deployed runtime and
+correct attribution, **not a controlled percentage improvement**. In
+particular, `verifiedBytes` includes resumed evidence and must not be treated
+as newly scrubbed payload throughput. The controlled physical-read reduction
+remains the 77.8% sparse-fixture result above.
+
+A new backup session, `8712e800-de05-47c0-8c6a-124c3cf7e370`, was observed
+starting at 03:35:34 CEST. Later samples with frontend writes are excluded from
+the quiet runtime window; the session was still running at this observation.
+This deployment check does not claim a completed backup or restore on RPM 48.
+
+Evidence under `.artifacts/gc-metadata-20261023/`: `deployment-48.json`,
+`container-read-after-48.json`, `host-after-48-analysis.json`,
+`runtime-after-48-quiescent-analysis.json`, their input samples, and
+`veeam-postdeploy-48.json`.
