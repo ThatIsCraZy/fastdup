@@ -39,7 +39,7 @@ const INTERNAL_CONTEXT: RequestContext = RequestContext {
     pid: 0,
 };
 
-const FRONTEND_LATENCY_BUCKET_MICROS: [u64; 12] = [
+pub const FRONTEND_LATENCY_BUCKET_MICROS: [u64; 16] = [
     50,
     100,
     250,
@@ -51,6 +51,10 @@ const FRONTEND_LATENCY_BUCKET_MICROS: [u64; 12] = [
     25_000,
     50_000,
     100_000,
+    1_000_000,
+    5_000_000,
+    10_000_000,
+    60_000_000,
     u64::MAX,
 ];
 
@@ -84,6 +88,8 @@ impl Default for FrontendTelemetry {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FrontendTelemetrySnapshot {
+    pub read_latency_buckets: [u64; FRONTEND_LATENCY_BUCKET_MICROS.len()],
+    pub write_latency_buckets: [u64; FRONTEND_LATENCY_BUCKET_MICROS.len()],
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub read_operations: u64,
@@ -110,6 +116,8 @@ impl FrontendTelemetry {
             .each_ref()
             .map(|value| value.load(Ordering::Relaxed));
         FrontendTelemetrySnapshot {
+            read_latency_buckets: read_buckets,
+            write_latency_buckets: write_buckets,
             read_bytes: self.read_bytes.load(Ordering::Relaxed),
             write_bytes: self.write_bytes.load(Ordering::Relaxed),
             read_operations: self.read_operations.load(Ordering::Relaxed),

@@ -46,7 +46,7 @@ pub use detail_telemetry::{
     ReductionTelemetry, RuntimeDetails, ScrubTelemetry,
 };
 pub use inventory::{BackingDisk, BlockInventory, BlockTarget, InventoryError};
-pub use jobs::{AuditEvent, JobState, JobStatus};
+pub use jobs::{AuditEvent, DiagnosticEvent, JobState, JobStatus};
 pub use pfx::decode_pfx;
 pub use protocol::{
     AGENT_PROTOCOL_VERSION, AgentOperation, AgentRequest, AgentResponse, AgentResult,
@@ -58,8 +58,10 @@ pub use samba_users::SambaUserRequest;
 pub use shares::{CapacityUnit, LogicalQuota, ShareSettings, SmbEncryption};
 pub use store::{ControlStore, StoreError, TelemetryStore};
 pub use telemetry::{
-    DiskTelemetry, IngestReductionTelemetry, RuntimeIssue, SeriesPoint, SmallFileQuotaStatus,
-    StorageUsageTelemetry, SystemSampler, TelemetrySnapshot, dedup_rate,
+    DiskTelemetry, HistorySummary, IngestReductionTelemetry, LatencyHistogram, LatencyWindow,
+    MetricRange, RuntimeIssue, SeriesPoint, SmallFileQuotaStatus, StorageUsageTelemetry,
+    SystemSampler, TelemetrySnapshot, WorkloadConnection, WorkloadContext, WorkloadShare,
+    dedup_rate,
 };
 pub use tls::{TlsIdentity, TlsIdentityError};
 pub use veeam::{BootstrapPassword, VeeamSettings};

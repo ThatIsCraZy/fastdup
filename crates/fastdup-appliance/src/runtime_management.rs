@@ -140,6 +140,9 @@ impl From<fastdup_posix::SmallFilePolicySnapshot> for SmallFilePolicyResponse {
 
 #[derive(Debug, Serialize)]
 struct FrontendResponse {
+    latency_bucket_upper_micros: Vec<Option<u64>>,
+    read_latency_buckets: Vec<u64>,
+    write_latency_buckets: Vec<u64>,
     mutation_admission_open: bool,
     integrity_failed: bool,
     logical_allocated_bytes: Option<u64>,
@@ -413,6 +416,12 @@ fn apply_operation(
                 ok: true,
                 error: None,
                 frontend: Some(FrontendResponse {
+                    latency_bucket_upper_micros: fastdup_posix::FRONTEND_LATENCY_BUCKET_MICROS
+                        .iter()
+                        .map(|v| (*v != u64::MAX).then_some(*v))
+                        .collect(),
+                    read_latency_buckets: snapshot.read_latency_buckets.to_vec(),
+                    write_latency_buckets: snapshot.write_latency_buckets.to_vec(),
                     mutation_admission_open: namespace.mutation_admission_open(),
                     integrity_failed: namespace.integrity_failed(),
                     logical_allocated_bytes: logical_usage.map(|value| value.0),

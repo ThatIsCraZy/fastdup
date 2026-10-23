@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetailTelemetry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_window: Option<crate::telemetry::LatencyWindow>,
+    #[serde(skip)]
+    pub(crate) latency_histograms: Option<(
+        crate::telemetry::LatencyHistogram,
+        crate::telemetry::LatencyHistogram,
+    )>,
     pub latency: Option<FrontendLatency>,
     pub runtime: Option<RuntimeDetails>,
 }
@@ -338,6 +345,24 @@ pub(crate) fn parse_details(frontend: &serde_json::Value) -> DetailTelemetry {
         })
     };
     DetailTelemetry {
+        latency_window: None,
+        latency_histograms: (|| {
+            let bounds: Vec<Option<u64>> =
+                serde_json::from_value(frontend.get("latency_bucket_upper_micros")?.clone())
+                    .ok()?;
+            let histogram = |name: &str| -> Option<crate::telemetry::LatencyHistogram> {
+                let result = crate::telemetry::LatencyHistogram {
+                    upper_micros: bounds.clone(),
+                    counts: serde_json::from_value(
+                        frontend.get(format!("{name}_latency_buckets"))?.clone(),
+                    )
+                    .ok()?,
+                    errors: frontend.get(format!("{name}_errors"))?.as_u64()?,
+                };
+                result.valid().then_some(result)
+            };
+            histogram("read").zip(histogram("write"))
+        })(),
         latency: operation("read")
             .zip(operation("write"))
             .map(|(read, write)| FrontendLatency { read, write }),

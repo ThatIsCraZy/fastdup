@@ -176,6 +176,7 @@ fn routes(state: AppState) -> Router {
             get(list_samba_users).post(create_samba_user),
         )
         .route("/api/v1/telemetry/history", get(history))
+        .route("/api/v1/telemetry/events", get(diagnostic_events))
         .route("/api/v1/audit", get(audit_log))
         .route("/api/v1/events", get(events))
         .fallback(static_asset)
@@ -632,6 +633,7 @@ async fn history(
     let now = fastdup_control::unix_seconds();
     let from = query.from.unwrap_or(now - 900);
     let to = query.to.unwrap_or(now);
+    validate_history_window(from, to)?;
     let limit = query.limit.unwrap_or(1_500).min(1_500);
     let permit = Arc::clone(&state.history_slots)
         .try_acquire_owned()
@@ -651,6 +653,37 @@ async fn history(
     .map_err(internal_error)?
     .map_err(store_error)?;
     Ok(Json(samples).into_response())
+}
+
+fn validate_history_window(from: i64, to: i64) -> Result<(), ApiError> {
+    if from < 0 || to < from || to.saturating_sub(from) > 7_776_000 {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            problem: ControlProblem::new(
+                "invalid_history_window",
+                "Ungültiges Diagnosefenster (maximal 90 Tage).",
+            ),
+        });
+    }
+    Ok(())
+}
+
+async fn diagnostic_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Response, ApiError> {
+    authenticate(&state, &headers, false)?;
+    let to = query.to.unwrap_or_else(fastdup_control::unix_seconds);
+    let from = query.from.unwrap_or(to.saturating_sub(900));
+    validate_history_window(from, to)?;
+    let mut events = tokio::task::spawn_blocking(move || state.store.diagnostic_events(from, to))
+        .await
+        .map_err(internal_error)?
+        .map_err(store_error)?;
+    let truncated = events.len() > 1000;
+    events.truncate(1000);
+    Ok(Json(serde_json::json!({ "events": events, "truncated": truncated })).into_response())
 }
 
 async fn audit_log(
@@ -923,6 +956,86 @@ mod settings_api_tests {
             tls_update: Arc::new(tokio::sync::Mutex::new(())),
         };
         (directory, state)
+    }
+
+    #[tokio::test]
+    async fn diagnosis_requires_login_validates_bounds_and_reports_event_truncation() {
+        let (_directory, state) = fixture();
+        let query = || {
+            Query(HistoryQuery {
+                from: Some(0),
+                to: Some(10),
+                limit: None,
+            })
+        };
+        assert_eq!(
+            diagnostic_events(State(state.clone()), HeaderMap::new(), query())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(validate_history_window(-1, 10).is_err());
+        assert!(validate_history_window(10, 9).is_err());
+        assert!(validate_history_window(0, 7_776_001).is_err());
+        assert!(validate_history_window(0, 7_776_000).is_ok());
+        let login = state.sessions.login("admin", "fastdup01.").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("fastdup_session={}", login.session_token)
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            diagnostic_events(State(state.clone()), headers.clone(), query())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        let login = state
+            .sessions
+            .change_password(&login.session_token, "fastdup01.", "long-test-password")
+            .unwrap();
+        headers.insert(
+            "cookie",
+            format!("fastdup_session={}", login.session_token)
+                .parse()
+                .unwrap(),
+        );
+        for _ in 0..1001 {
+            state
+                .store
+                .audit("test", "diagnostic", "observed", "evidence")
+                .unwrap();
+        }
+        let now = fastdup_control::unix_seconds();
+        let response = diagnostic_events(
+            State(state.clone()),
+            headers.clone(),
+            Query(HistoryQuery {
+                from: Some(now - 60),
+                to: Some(now + 60),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["events"].as_array().unwrap().len(), 1000);
+        let empty = diagnostic_events(State(state), headers, query())
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(empty.into_body(), 1000).await.unwrap())
+                .unwrap();
+        assert_eq!(value["events"], serde_json::json!([]));
+        assert_eq!(value["truncated"], false);
     }
 
     #[tokio::test]

@@ -67,6 +67,10 @@ pub struct SeriesPoint {
 #[serde(rename_all = "camelCase")]
 pub struct TelemetrySnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workloads: Option<Box<super::workloads::WorkloadContext>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Box<super::history::HistorySummary>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_issue: Option<RuntimeIssue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub small_file_quota: Option<SmallFileQuotaStatus>,
@@ -147,6 +151,8 @@ pub struct SmallFileQuotaStatus {
 impl Default for TelemetrySnapshot {
     fn default() -> Self {
         Self {
+            history: None,
+            workloads: None,
             runtime_issue: None,
             small_file_quota: None,
             storage_usage: None,

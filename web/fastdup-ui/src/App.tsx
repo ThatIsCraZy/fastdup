@@ -1,3 +1,5 @@
+import { DiagnosisPanel } from "./diagnosis-panel";
+import { diagnosticExport, historicalChart, nearestSample, sampleWindow, type HistoryWindow, type EventWindow } from "./history-diagnostics";
 import { VeeamPage } from "./veeam";
 import { formatQueueDepth } from "./disk-io";
 import { StorageOverview } from "./storage-overview";
@@ -1466,11 +1468,13 @@ function TelemetryPage({
   snapshot,
   disks,
   loadHistory,
+  loadEvents,
   liveResources,
 }: {
   snapshot: TelemetrySnapshot;
   disks: DiskTelemetry[];
-  loadHistory: (seconds: number) => Promise<TelemetrySnapshot[]>;
+  loadHistory: (window: HistoryWindow) => Promise<TelemetrySnapshot[]>;
+  loadEvents: (window: HistoryWindow) => Promise<EventWindow>;
   liveResources: ResourceSample[];
 }) {
   const { t, locale } = useI18n();
@@ -1478,6 +1482,12 @@ function TelemetryPage({
   const [history, setHistory] = useState<TelemetrySnapshot[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [historyError, setHistoryError] = useState(false);
+  const [cursor, setCursor] = useState<number | null>(null);
+  const [incident, setIncident] = useState(false);
+  const [window, setWindow] = useState<HistoryWindow | null>(null);
+  const [parents, setParents] = useState<HistoryWindow[]>([]);
+  const [events, setEvents] = useState<EventWindow | null>(null);
+  const [invalidWindow, setInvalidWindow] = useState(false);
   const ranges = [
     "Live",
     "15 min",
@@ -1498,7 +1508,16 @@ function TelemetryPage({
     "90 d": 90 * 24 * 60 * 60,
   };
   const historical = range !== "Live";
-  const sample = historical ? history?.at(-1) : snapshot;
+  const selectedIndex = cursor ?? Math.max(0, (history?.length ?? 0) - 1);
+  const bucket = history?.[selectedIndex];
+  const sample = historical ? (incident ? bucket?.history?.incident ?? bucket : bucket) : snapshot;
+  const selectSample = (item: TelemetrySnapshot) => {
+    const index = history?.findIndex(value => value === item || value.history?.incident === item) ?? -1;
+    if (index >= 0) { setCursor(index); setIncident(history?.[index] !== item); }
+  };
+  const chartEvents = {click: (event: {dataIndex?: number}) => {
+    if (historical && event.dataIndex != null && history?.[event.dataIndex]) {setCursor(event.dataIndex); setIncident(false);}
+  }};
   const displayedSnapshot = { ...snapshot, series: historical ? (history ?? []).map(item => ({time: item.observedAt, read: item.frontendReadMbps, write: item.frontendWriteMbps})) : snapshot.series };
   const usage = sample?.storageUsage;
   const physical = usage?.metadataUsedBytes != null && usage.dataUsedBytes != null ? usage.metadataUsedBytes + usage.dataUsedBytes : undefined;
@@ -1509,22 +1528,44 @@ function TelemetryPage({
   const rate = (value?: number) => value == null ? "—" : `${number(value)} MB/s`;
   const resourceSamples = historical ? history ?? [] : liveResources;
   const historyRequest = useRef(0);
-  const selectRange = (item: string) => {
+  const loadWindow = (target: HistoryWindow, anchor?: number) => {
     const request = ++historyRequest.current;
-    setRange(item);
-    setHistoryError(false);
-    if (item === "Live") {
-      setHistory(null);
-      setLoading(false);
-      return;
-    }
-    setHistory(null);
-    setLoading(true);
-    void loadHistory(rangeSeconds[item] ?? 900)
-      .then(samples => { if (request === historyRequest.current) setHistory(samples); })
+    setWindow(target); setHistory(null); setEvents(null); setCursor(null); setIncident(false);
+    setHistoryError(false); setInvalidWindow(false); setLoading(true);
+    void Promise.all([loadHistory(target), loadEvents(target).catch(() => null)])
+      .then(([samples, eventWindow]) => {
+        if (request !== historyRequest.current) return;
+        setHistory(samples); setEvents(eventWindow);
+        if (anchor != null) setCursor(nearestSample(samples, anchor));
+      })
       .catch(() => { if (request === historyRequest.current) setHistoryError(true); })
       .finally(() => { if (request === historyRequest.current) setLoading(false); });
   };
+  const selectRange = (item: string) => {
+    setRange(item); setParents([]);
+    if (item === "Live") {
+      ++historyRequest.current; setHistory(null); setWindow(null); setEvents(null); setLoading(false); setHistoryError(false);
+      return;
+    }
+    const to = Math.floor(Date.now() / 1000);
+    loadWindow({from: to - (rangeSeconds[item] ?? 900), to});
+  };
+  const zoom = () => {
+    if (!sample || !bucket || !window) return;
+    const bounds = sampleWindow(bucket);
+    const center = Math.floor(Date.parse(sample.observedAt) / 1000);
+    const target = bounds.to - bounds.from > 120 ? bounds : {from: center - 60, to: center + 60};
+    const next = {from: Math.max(window.from, target.from), to: Math.min(window.to, target.to)};
+    if (next.from >= next.to || (next.from === window.from && next.to === window.to)) return;
+    setParents([...parents, window]); setRange("Detail"); loadWindow(next, center);
+  };
+  const exportDiagnosis = () => {
+    if (!window || !history) return;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(diagnosticExport(window, history, sample, events))], {type: "application/json"}));
+    const link = document.createElement("a"); link.href = url; link.download = `fastdup-diagnose-${window.from}-${window.to}.json`; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+  const localTime = (seconds: number) => {const date = new Date(seconds * 1000); return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0,19);};
   const resourceOption = useMemo(() => resourceChartOption(resourceSamples, locale), [resourceSamples, locale]);
   return (
     <div className="telemetry-page">
@@ -1547,8 +1588,35 @@ function TelemetryPage({
           ))}
         </div>
       </div>
-      <p className="telemetry-sample-note" role="status">{loading ? t("Lädt") : sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)} · ${t("Messreihe")} ${formatCount(sample.sequence, locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</p>
-      {historyError && <p className="telemetry-history-error" role="alert">{t("Verlauf konnte nicht geladen werden.")} <button onClick={() => selectRange(range)}>{t("Erneut versuchen")}</button></p>}
+      <p className="telemetry-sample-note" role="status">{loading ? t("Lädt") : sample ? `${t(historical ? "Ausgewählter Messpunkt" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)} · ${t("Messreihe")} ${formatCount(sample.sequence, locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}</p>
+      {historyError && <p className="telemetry-history-error" role="alert">{t("Verlauf konnte nicht geladen werden.")} <button onClick={() => window && loadWindow(window)}>{t("Erneut versuchen")}</button></p>}
+      {historical && <section className="history-controls" aria-label={t("Historische Zeitachse")}>
+        <p>{t("Messpunkt im Diagramm anklicken oder mit dem Regler auswählen. Alle Detailbereiche folgen dieser Auswahl.")}</p>
+        <div className="history-cursor">
+          <Button disabled={!history?.length || selectedIndex === 0} onClick={() => {setCursor(selectedIndex - 1); setIncident(false);}}>{t("Vorheriger Messpunkt")}</Button>
+          <input type="range" aria-label={t("Historischer Messpunkt")} min={0} max={Math.max(0, (history?.length ?? 0) - 1)} value={selectedIndex} disabled={!history?.length} onChange={event => {setCursor(Number(event.target.value)); setIncident(false);}}/>
+          <Button disabled={!history?.length || selectedIndex >= history.length - 1} onClick={() => {setCursor(selectedIndex + 1); setIncident(false);}}>{t("Nächster Messpunkt")}</Button>
+        </div>
+        <div className="history-actions">
+          <Button disabled={!bucket?.history?.incident} aria-pressed={incident} onClick={() => setIncident(!incident)}>{t(incident ? "Zum Intervallende" : "Auffälligen Snapshot anzeigen")}</Button>
+          <Button disabled={!sample || !window || window.to - window.from <= 120} onClick={zoom}>{t("Detail-Zoom")}</Button>
+          <Button disabled={!parents.length} onClick={() => {const parent = parents.at(-1); if (parent) {setParents(parents.slice(0,-1)); loadWindow(parent);}}}>{t("Zurück zum größeren Zeitfenster")}</Button>
+          <Button disabled={loading || !history?.length} onClick={exportDiagnosis}>{t("Diagnosefenster exportieren")}</Button>
+        </div>
+        {bucket?.history && <p>{t("Intervall")}: {new Date(bucket.history.from * 1000).toLocaleString(locale)} – {new Date(bucket.history.to * 1000).toLocaleString(locale)} · {t("Gespeicherte Auflösung")}: {bucket.history.resolutionSeconds} s · {bucket.history.sampleCount ?? "?"} {t("Messwerte")}. {t("Kurven zeigen Mittelwert und Min/Max; Details stammen vom letzten Snapshot im Intervall oder vom ausgewählten auffälligen Snapshot.")}</p>}
+        {bucket?.history && !bucket.history.extremaComplete && <p>{t("Ältere Aggregate enthalten keine vollständigen Spitzenwerte.")}</p>}
+        {window && <form className="history-window-form" key={`${window.from}-${window.to}`} onSubmit={event => {
+          event.preventDefault(); const form = new FormData(event.currentTarget);
+          const from = Math.floor(Date.parse(String(form.get("from"))) / 1000), to = Math.floor(Date.parse(String(form.get("to"))) / 1000);
+          if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || to < from || to - from > 90 * 86400) {setInvalidWindow(true); return;}
+          setParents([]); setRange("Detail"); loadWindow({from, to});
+        }}>
+          <label>{t("Von")} <input type="datetime-local" step="1" name="from" required defaultValue={localTime(window.from)}/></label>
+          <label>{t("Bis")} <input type="datetime-local" step="1" name="to" required defaultValue={localTime(window.to)}/></label>
+          <Button type="submit">{t("Zeitfenster laden")}</Button>
+        </form>}
+        {invalidWindow && <p role="alert">{t("Ungültiges Zeitfenster; maximal 90 Tage.")}</p>}
+      </section>}
       <nav className="telemetry-jump-links" aria-label={t("Telemetrie-Bereiche")}>
         <a href="#telemetry-performance">{t("Durchsatz & Ressourcen")}</a>
         <a href="#telemetry-disks">{t("Laufwerke & I/O")}</a>
@@ -1601,7 +1669,9 @@ function TelemetryPage({
         </CardHeader>
         <CardContent>
           <ReactECharts
-            option={throughputOption(displayedSnapshot, true, locale)}
+            option={historical ? historicalChart(history ?? [], selectedIndex, "throughput", locale, sample?.observedAt) : throughputOption(displayedSnapshot, true, locale)}
+            onEvents={chartEvents}
+            notMerge={historical}
             style={{ height: 260 }}
           />
         </CardContent>
@@ -1616,7 +1686,7 @@ function TelemetryPage({
           <CardContent>
             {!historical && resourceSamples.length < 2 && <p className="chart-note">{t("Live-Messwerte werden gesammelt…")}</p>}
             {historical && !loading && resourceSamples.length === 0 && <p className="chart-note">{t("Keine Messwerte im gewählten Zeitraum.")}</p>}
-            <ReactECharts option={resourceOption} style={{ height: 260 }} />
+            <ReactECharts option={historical ? historicalChart(history ?? [], selectedIndex, "resources", locale, sample?.observedAt) : resourceOption} onEvents={chartEvents} notMerge={historical} style={{ height: 260 }} />
           </CardContent>
         </Card>
       </div>
@@ -1625,6 +1695,7 @@ function TelemetryPage({
         <DiskTelemetryTable disks={historical ? sample?.disks ?? [] : disks} historical={historical} />
       </section>
       <section id="telemetry-diagnostics" aria-label={t("Ursachen & Details")}>
+        <DiagnosisPanel sample={sample} bucket={historical ? bucket : snapshot} samples={historical ? history ?? [] : [snapshot]} events={events} onSelect={selectSample} historical={historical}/>
         <DetailTelemetryPanel sample={sample} historical={historical} loading={loading} initialTab={detailTabs.caches} />
       </section>
       <section id="telemetry-capacity" aria-label={t("Belegung & Reduktion")}>
@@ -2331,10 +2402,9 @@ function Application() {
       });
     }
   };
-  const loadTelemetryHistory = (seconds: number) => {
-    const now = Math.floor(Date.now() / 1000);
+  const loadTelemetryHistory = ({from, to}: HistoryWindow) => {
     return api<TelemetrySnapshot[]>(
-      `/api/v1/telemetry/history?from=${now - seconds}&to=${now}&limit=1500`,
+      `/api/v1/telemetry/history?from=${from}&to=${to}&limit=1500`,
     );
   };
   const logout = () => {
@@ -2420,6 +2490,10 @@ function Application() {
         snapshot={snapshot.telemetry}
         disks={repositoryDisks(snapshot)}
         loadHistory={loadTelemetryHistory}
+        loadEvents={({from, to}) => api<EventWindow>(`/api/v1/telemetry/events?from=${from}&to=${to}`).then(value => {
+          if (!Array.isArray(value.events) || typeof value.truncated !== "boolean") throw new Error("Invalid event window");
+          return value;
+        })}
         liveResources={liveResources}
       />
     );

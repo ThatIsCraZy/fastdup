@@ -420,6 +420,27 @@ progress { accent-color: #63c4d5; height: 6px; }
 .detail-scrub[role="alert"] { border-color: #75434b; background: #281c22; }
 .telemetry-history-error { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 12px; background: #281c22; color: #f1979f; border: 1px solid #75434b; border-radius: 7px; }
 .telemetry-history-error button { color: inherit; padding: 6px 10px; border: 1px solid currentColor; border-radius: 5px; background: transparent; cursor: pointer; }
+.history-controls, .diagnostic-section { padding: 18px; border: 1px solid #283e49; border-radius: 9px; background: #0e1a22; min-width: 0; }
+.history-controls { margin-bottom: 18px; }
+.history-controls p, .diagnostic-section p { color: var(--muted); font-size: 13px; line-height: 1.6; margin: 8px 0 14px; }
+.history-cursor, .history-actions, .history-window-form, .diagnostic-matches { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 0; }
+.history-cursor input { flex: 1; min-width: 100px; accent-color: #22d3ee; }
+.history-window-form label, .diagnostic-section label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; }
+.history-window-form input, .diagnostic-section select { color-scheme: dark; padding: 9px; background: #101c24; color: #d9e6ec; border: 1px solid #375361; border-radius: 6px; max-width: 100%; }
+.diagnosis-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 18px 0; }
+.diagnostic-section h3 { margin: 0 0 10px; font-size: 16px; }
+.diagnostic-finding { border-left: 2px solid #f5b84b; padding: 4px 12px; margin: 18px 0; overflow-wrap: anywhere; }
+.diagnostic-finding h4 { margin: 4px 0; }
+.diagnostic-finding ul { padding-left: 18px; font-size: 12px; line-height: 1.8; }
+.diagnostic-table-scroll { overflow-x: auto; }
+.diagnostic-section table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
+.diagnostic-section th, .diagnostic-section td { padding: 9px; border-bottom: 1px solid #283e49; white-space: nowrap; }
+.diagnostic-event-list { max-height: 340px; overflow: auto; display: grid; gap: 8px; }
+.diagnostic-event-list button { text-align: left; color: #d9e6ec; background: #101c24; border: 1px solid #283e49; border-radius: 6px; padding: 10px; display: grid; gap: 5px; cursor: pointer; overflow-wrap: anywhere; }
+.diagnostic-event-list button.selected { border-color: #22d3ee; background: #142b35; }
+.diagnostic-event-list time, .diagnostic-event-list small { color: var(--muted); font-size: 12px; }
+@media (max-width: 1000px) { .diagnosis-panel { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 600px) { .history-cursor input { order: -1; flex-basis: 100%; } .history-window-form label { width: 100%; } }
 @media (max-width: 1100px) {
   .telemetry-chart-grid { grid-template-columns: 1fr; }
   .detail-tab-groups { grid-template-columns: 1fr; gap: 16px; }
@@ -503,6 +524,22 @@ progress { accent-color: #63c4d5; height: 6px; }
 }
 
 .veeam-form fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 18px; }
-.veeam-form label { display: grid; gap: 8px; }
-.veeam-form .checkbox-row { display: flex; align-items: center; gap: 10px; }
-.veeam-form textarea { width: 100%; resize: vertical; }
+.veeam-form label { display: grid; gap: 8px; color: #93a5ad; font-size: 12px; font-weight: 600; }
+.veeam-form .checkbox-row { display: flex; align-items: center; gap: 10px; color: var(--muted); font-weight: 400; font-size: 13px; }
+.veeam-form .checkbox-row input { width: auto; height: auto; accent-color: #63c4d5; }
+.veeam-form input:not([type="checkbox"]),
+.veeam-form select,
+.veeam-form textarea {
+  width: 100%; height: 44px; padding: 0 11px; color: #cbd8de; background: #0e1d24;
+  border: 1px solid #283e49; border-radius: 7px; outline: none; font: 500 13px/1.4 var(--font-ui);
+}
+.veeam-form textarea { height: auto; min-height: 88px; padding: 10px 11px; resize: vertical; font: 500 13px/1.55 var(--font-code); }
+.veeam-form input:focus, .veeam-form select:focus, .veeam-form textarea:focus {
+  border-color: rgba(34,211,238,.55); box-shadow: 0 0 0 3px rgba(34,211,238,.05);
+}
+.veeam-form input:disabled, .veeam-form select:disabled, .veeam-form textarea:disabled {
+  color: var(--muted); background: #0a151b; cursor: not-allowed;
+}
+.veeam-form p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.veeam-form .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+.veeam-form .form-actions { display: flex; flex-wrap: wrap; gap: 9px; }

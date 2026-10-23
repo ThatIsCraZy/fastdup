@@ -33,3 +33,14 @@ pub struct AuditEvent {
     pub outcome: String,
     pub detail: String,
 }
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticEvent {
+    pub id: String,
+    pub timestamp: i64,
+    pub source: String,
+    pub action: String,
+    pub outcome: String,
+    pub detail: String,
+}

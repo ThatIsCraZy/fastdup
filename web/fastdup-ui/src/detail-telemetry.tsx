@@ -18,6 +18,7 @@ import type { TelemetrySnapshot } from "./types";
 
 export interface OperationLatency { operations: number; errors: number; p50Micros: number; p95Micros: number; p99Micros: number }
 export interface DetailTelemetry {
+  latencyWindow?: import("./history-diagnostics").LatencyWindow | null;
   latency?: { read: OperationLatency; write: OperationLatency } | null;
   runtime?: {
     runtimeId: string;
@@ -268,7 +269,7 @@ export function DetailTelemetryPanel({ sample, historical, loading, initialTab =
     <div className="detail-telemetry-heading">
       <h2>{t("Ursachen & Details")}</h2>
       <span>
-        {sample ? `${t(historical ? "Letzter Messpunkt im Zeitraum" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}
+        {sample ? `${t(historical ? "Ausgewählter Messpunkt" : "Messpunkt")}: ${new Date(sample.observedAt).toLocaleString(locale)}` : t("Keine Messwerte im gewählten Zeitraum.")}
         {runtime?.runtimeId && ` · ${t("Runtime")} ${runtime.runtimeId}`}
       </span>
     </div>

@@ -28,8 +28,8 @@ use versioned_file::VersionedFile;
 const VEEAM_RETENTION_XATTR: &[u8] = b"user.immutable.until";
 
 pub use fuse_adapter::{
-    FrontendTelemetry, FrontendTelemetrySnapshot, FuseFilesystem, StatFsSnapshot,
-    StatFsSnapshotError, StatFsSource, volatile_mount_options,
+    FRONTEND_LATENCY_BUCKET_MICROS, FrontendTelemetry, FrontendTelemetrySnapshot, FuseFilesystem,
+    StatFsSnapshot, StatFsSnapshotError, StatFsSource, volatile_mount_options,
 };
 pub use inode_metadata::{
     ExtendedAttribute, FS_IMMUTABLE_FL, InodeMetadata, POSIX_ACL_ACCESS_XATTR,

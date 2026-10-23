@@ -281,6 +281,8 @@ pub struct AgentRuntime {
     latest: RwLock<TelemetrySnapshot>,
     sampler: Mutex<SystemSampler>,
     cache_window: Mutex<crate::cache_window::CacheWindow>,
+    latency_sampler: Mutex<crate::telemetry::latency::LatencySampler>,
+    workloads: RwLock<Option<crate::WorkloadContext>>,
     events: broadcast::Sender<ControlEvent>,
     shutdown: watch::Sender<bool>,
     /// Ids of the Jobs this process is executing right now.
@@ -313,6 +315,8 @@ impl AgentRuntime {
             latest: RwLock::new(TelemetrySnapshot::default()),
             sampler: Mutex::new(SystemSampler::default()),
             cache_window: Mutex::default(),
+            latency_sampler: Mutex::default(),
+            workloads: RwLock::default(),
             events,
             shutdown,
             executing_jobs: Mutex::new(BTreeSet::new()),
@@ -363,6 +367,23 @@ impl AgentRuntime {
     }
 
     pub fn start_sampler(self: &Arc<Self>) {
+        let runtime = Arc::clone(self);
+        let mut shutdown = self.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let context = crate::telemetry::workloads::sample(&runtime.store).await;
+                        if let Ok(mut latest) = runtime.workloads.write() { *latest = Some(context); }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
         let runtime = Arc::clone(self);
         let mut shutdown = self.shutdown.subscribe();
         tokio::spawn(async move {
@@ -527,6 +548,12 @@ impl AgentRuntime {
             sampler.sample()
         };
         snapshot.runtime_issue = runtime_issue;
+        snapshot.workloads = self
+            .workloads
+            .read()
+            .ok()
+            .and_then(|context| context.clone())
+            .map(Box::new);
         snapshot.small_file_quota = if frontend.is_some() {
             std::fs::read("/run/fastdup/small-file-quota.json")
                 .ok()
@@ -535,6 +562,12 @@ impl AgentRuntime {
             None
         };
         snapshot.details = frontend.map(|frontend| Box::new(frontend.details.clone()));
+        if let Ok(mut sampler) = self.latency_sampler.lock() {
+            sampler.observe(
+                u64::try_from(unix_seconds()).unwrap_or_default(),
+                snapshot.details.as_deref_mut(),
+            );
+        }
         snapshot.ingest_reduction = frontend.and_then(|frontend| frontend.ingest_reduction);
         if let Some(runtime) = snapshot.details.as_mut().and_then(|d| d.runtime.as_mut())
             && let Ok(mut window) = self.cache_window.lock()

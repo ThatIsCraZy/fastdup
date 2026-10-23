@@ -2,6 +2,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::telemetry::history::TelemetryAverage;
+
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::{
@@ -428,6 +430,34 @@ impl ControlStore {
             .map_err(Into::into)
     }
 
+    pub fn diagnostic_events(
+        &self,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<crate::DiagnosticEvent>, StoreError> {
+        let connection = self.locked()?;
+        let mut statement = connection.prepare(
+            "SELECT * FROM (
+                SELECT 'audit:' || id AS id, timestamp, 'audit' AS source, action, outcome, detail FROM audit_log WHERE timestamp BETWEEN ?1 AND ?2
+                UNION ALL
+                SELECT 'job:' || id, updated_at, 'job', kind, state, message FROM jobs WHERE updated_at BETWEEN ?1 AND ?2
+             ) ORDER BY timestamp, id LIMIT 1001"
+        )?;
+        statement
+            .query_map(params![from, to], |r| {
+                Ok(crate::DiagnosticEvent {
+                    id: r.get(0)?,
+                    timestamp: r.get(1)?,
+                    source: r.get(2)?,
+                    action: r.get(3)?,
+                    outcome: r.get(4)?,
+                    detail: r.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn begin_provisioning(
         &self,
         metadata_target: &str,
@@ -559,6 +589,7 @@ impl TelemetryStore {
         // The live chart is a sliding window, not part of one historical measurement.
         let mut measurement = snapshot.clone();
         measurement.series.clear();
+        measurement.history = None;
         self.locked()?.execute(
             "INSERT OR REPLACE INTO samples_raw(observed_at, sequence, body) VALUES(?1, ?2, ?3)",
             params![
@@ -580,43 +611,97 @@ impl TelemetryStore {
             return Ok(Vec::new());
         }
         let limit = limit.min(1_500);
-        let connection = self.locked()?;
-        let span = to.saturating_sub(from);
-        let bucket_seconds = (span / i64::try_from(limit).unwrap_or(1_500)).saturating_add(1);
-        let table = if span > 604_800 {
-            "samples_60s"
-        } else if span > 86_400 {
-            "samples_10s"
-        } else {
-            "samples_raw"
+        let bucket_seconds =
+            (to.saturating_sub(from) / i64::try_from(limit).unwrap_or(1_500)).saturating_add(1);
+        // A separate read connection keeps a long history scan off the sampler
+        // mutex. Use one SQLite snapshot for tier boundaries and rows.
+        let mut connection = Connection::open(&self.path)?;
+        connection.busy_timeout(std::time::Duration::from_millis(500))?;
+        connection.pragma_update(None, "cache_size", -2048)?;
+        let transaction = connection.transaction()?;
+        let oldest = |table: &str| -> Result<Option<i64>, StoreError> {
+            Ok(transaction.query_row(
+                &format!("SELECT MIN(observed_at) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?)
         };
-        let sql = format!(
-            // SQLite takes bare columns from the row supplying MIN(observed_at).
-            // Return a representative measurement across the entire selected range.
-            "SELECT json_set(body, '$.series', json('[]')), MIN(observed_at) FROM {table}
-             WHERE observed_at >= ?1 AND observed_at <= ?2
-             GROUP BY (observed_at - ?1) / ?3 ORDER BY MIN(observed_at) LIMIT ?4"
-        );
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(
-            params![
-                from,
-                to,
-                bucket_seconds,
-                i64::try_from(limit).unwrap_or(1_500)
-            ],
-            |row| row.get::<_, String>(0),
+        let raw_first = oldest("samples_raw")?.unwrap_or(i64::MAX);
+        let ten_first = oldest("samples_10s")?.unwrap_or(raw_first);
+        // At retention boundaries use the complete coarse bucket rather than
+        // overwriting its earlier observations with a retained suffix.
+        let boundary = |first: i64, size: i64, table: &str| -> Result<i64, StoreError> {
+            if first == i64::MAX {
+                return Ok(first);
+            }
+            let floor = first - first.rem_euclid(size);
+            let coarse_first: Option<i64> = transaction.query_row(&format!("SELECT COALESCE(json_extract(body, '$.history.from'), observed_at) FROM {table} WHERE observed_at = ?1"), [floor], |r| r.get(0)).optional()?;
+            Ok(if coarse_first.is_some_and(|earlier| earlier < first) {
+                floor.saturating_add(size)
+            } else {
+                first
+            })
+        };
+        let newest = |table: &str| -> Result<i64, StoreError> {
+            Ok(transaction.query_row(
+                &format!("SELECT COALESCE(MAX(observed_at), 0) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        let mut fine_start = boundary(ten_first.min(raw_first), 60, "samples_60s")?;
+        if bucket_seconds >= 60 {
+            fine_start = fine_start.max(newest("samples_60s")?);
+        }
+        let mut raw_start = boundary(raw_first, 10, "samples_10s")?.max(fine_start);
+        if bucket_seconds >= 10 {
+            raw_start = raw_start.max(newest("samples_10s")?);
+        }
+        // Re-read the final coarse bucket from the finer tier: maintenance may
+        // have published it before all its observations arrived.
+        let mut statement = transaction.prepare(
+            "SELECT observed_at, resolution, json_set(body, '$.series', json('[]')) FROM (
+                SELECT observed_at, 1 AS resolution, body, sequence FROM samples_raw
+                 WHERE observed_at >= MAX(?1, ?3) AND observed_at <= ?2
+                UNION ALL
+                SELECT observed_at, 10, body, 0 FROM samples_10s
+                 WHERE observed_at >= ?1 - 9 AND observed_at <= ?2 AND observed_at >= ?4 AND observed_at + 9 < ?3
+                UNION ALL
+                SELECT observed_at, 60, body, 0 FROM samples_60s
+                 WHERE observed_at >= ?1 - 59 AND observed_at <= ?2 AND observed_at + 59 < ?4
+             ) ORDER BY observed_at, sequence"
         )?;
+        let rows = statement.query_map(params![from, to, raw_start, fine_start], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut pending: Option<(i64, TelemetryAverage)> = None;
         let mut result = Vec::new();
         for row in rows {
-            let mut sample: TelemetrySnapshot = serde_json::from_str(&row?)?;
-            // Old history used ingest counters for this field. Reconstruct
-            // occupancy from the sample itself; never display that old ratio.
+            let (time, resolution, body) = row?;
+            let bucket = time.saturating_sub(from).max(0) / bucket_seconds;
+            if pending
+                .as_ref()
+                .is_some_and(|(previous, _)| *previous != bucket)
+                && let Some((_, average)) = pending.take()
+            {
+                result.push(average.finish());
+            }
+            let mut sample: TelemetrySnapshot = serde_json::from_str(&body)?;
             sample.reduction_ratio = sample
                 .storage_usage
                 .as_deref()
                 .and_then(crate::StorageUsageTelemetry::reduction_ratio);
-            result.push(sample);
+            pending
+                .get_or_insert_with(|| (bucket, TelemetryAverage::new()))
+                .1
+                .push(time, resolution, sample);
+        }
+        if let Some((_, average)) = pending {
+            result.push(average.finish());
         }
         Ok(result)
     }
@@ -688,54 +773,6 @@ fn io_store_error(error: std::io::Error) -> StoreError {
     StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
-/// One bucket stays in memory regardless of retention length or sample count.
-struct TelemetryAverage {
-    latest: TelemetrySnapshot,
-    sums: [f64; 6],
-    count: u64,
-    reduction_count: u64,
-}
-
-impl TelemetryAverage {
-    fn new() -> Self {
-        Self {
-            latest: TelemetrySnapshot::default(),
-            sums: [0.0; 6],
-            count: 0,
-            reduction_count: 0,
-        }
-    }
-
-    fn push(&mut self, mut sample: TelemetrySnapshot) {
-        for (sum, value) in self.sums.iter_mut().zip([
-            sample.frontend_read_mbps,
-            sample.frontend_write_mbps,
-            sample.dedup_rate,
-            sample.reduction_ratio.unwrap_or(0.0),
-            sample.cpu_percent,
-            sample.ram_percent,
-        ]) {
-            *sum += value;
-        }
-        self.reduction_count += u64::from(sample.reduction_ratio.is_some());
-        self.count += 1;
-        sample.series.clear();
-        self.latest = sample;
-    }
-
-    fn finish(mut self) -> TelemetrySnapshot {
-        let count = self.count.max(1) as f64;
-        self.latest.frontend_read_mbps = self.sums[0] / count;
-        self.latest.frontend_write_mbps = self.sums[1] / count;
-        self.latest.dedup_rate = self.sums[2] / count;
-        self.latest.reduction_ratio =
-            (self.reduction_count != 0).then(|| self.sums[3] / self.reduction_count as f64);
-        self.latest.cpu_percent = self.sums[4] / count;
-        self.latest.ram_percent = self.sums[5] / count;
-        self.latest
-    }
-}
-
 fn roll_up(
     connection: &Connection,
     writer: &Connection,
@@ -755,8 +792,23 @@ fn roll_up(
     })?;
     let insert = format!("INSERT OR REPLACE INTO {target}(observed_at, body) VALUES(?1, ?2)");
     let mut pending: Option<(i64, TelemetryAverage)> = None;
+    let source_first: Option<i64> =
+        connection.query_row(&format!("SELECT MIN(observed_at) FROM {source}"), [], |r| {
+            r.get(0)
+        })?;
     for row in rows {
         let (observed_at, body) = row?;
+        if source_first
+            .is_some_and(|first| first > observed_at - observed_at.rem_euclid(bucket_seconds))
+        {
+            let previous_from: Option<i64> = writer.query_row(&format!("SELECT COALESCE(json_extract(body, '$.history.from'), observed_at) FROM {target} WHERE observed_at = ?1"), [observed_at - observed_at.rem_euclid(bucket_seconds)], |r| r.get(0)).optional()?;
+            if previous_from
+                .zip(source_first)
+                .is_some_and(|(previous, first)| previous < first)
+            {
+                continue;
+            }
+        }
         let bucket = observed_at - observed_at.rem_euclid(bucket_seconds);
         if pending.as_ref().is_some_and(|(time, _)| *time != bucket) {
             let (time, average) = pending.take().expect("pending bucket exists");
@@ -768,7 +820,11 @@ fn roll_up(
         pending
             .get_or_insert_with(|| (bucket, TelemetryAverage::new()))
             .1
-            .push(serde_json::from_str(&body)?);
+            .push(
+                observed_at,
+                if source == "samples_raw" { 1 } else { 10 },
+                serde_json::from_str(&body)?,
+            );
     }
     if let Some((time, average)) = pending {
         writer.execute(
@@ -956,7 +1012,7 @@ mod tests {
         assert_eq!(samples.len(), 10);
         assert_eq!(
             samples.last().unwrap().sequence,
-            90,
+            99,
             "cover the end, not just the first ten seconds"
         );
         assert!(samples.iter().all(|sample| sample.series.is_empty()));
@@ -989,17 +1045,22 @@ mod tests {
     #[test]
     fn streaming_rollup_preserves_averages_and_latest_metadata() {
         let mut average = TelemetryAverage::new();
-        for value in [2.0, 4.0, 9.0] {
-            average.push(TelemetrySnapshot {
-                observed_at: value.to_string(),
-                frontend_read_mbps: value,
-                frontend_write_mbps: value * 2.0,
-                dedup_rate: value * 3.0,
-                reduction_ratio: Some(value * 4.0),
-                cpu_percent: value * 5.0,
-                ram_percent: value * 6.0,
-                ..TelemetrySnapshot::default()
-            });
+        for number in [2, 4, 9] {
+            let value = f64::from(number);
+            average.push(
+                i64::from(number),
+                1,
+                TelemetrySnapshot {
+                    observed_at: value.to_string(),
+                    frontend_read_mbps: value,
+                    frontend_write_mbps: value * 2.0,
+                    dedup_rate: value * 3.0,
+                    reduction_ratio: Some(value * 4.0),
+                    cpu_percent: value * 5.0,
+                    ram_percent: value * 6.0,
+                    ..TelemetrySnapshot::default()
+                },
+            );
         }
         let result = average.finish();
         assert_eq!(result.observed_at, "9");
@@ -1044,6 +1105,20 @@ mod tests {
         let start = std::time::Instant::now();
         store.retain_and_roll_up(103_600).unwrap();
         eprintln!("rollup elapsed: {:?}", start.elapsed());
+        let query_start = std::time::Instant::now();
+        let samples = store.query(100_000, 103_600, 1500).unwrap();
+        eprintln!(
+            "history elapsed: {:?}, {} display buckets",
+            query_start.elapsed(),
+            samples.len()
+        );
+        assert_eq!(
+            samples
+                .iter()
+                .map(|s| s.history.as_ref().unwrap().sample_count.unwrap())
+                .sum::<u64>(),
+            3600
+        );
         assert_eq!(
             store
                 .locked()
@@ -1117,7 +1192,184 @@ mod tests {
             .query(now - 100_000, now, 100)
             .expect("query 10-second history");
         assert_eq!(history.len(), 2);
+        assert_eq!(
+            history
+                .iter()
+                .map(|s| s.history.as_ref().unwrap().sample_count.unwrap())
+                .sum::<u64>(),
+            12
+        );
         assert!(history.iter().all(|sample| sample.series.is_empty()));
+    }
+
+    fn history_fixture(store: &TelemetryStore) {
+        for index in 0..60_u64 {
+            store
+                .insert(
+                    60_000 + i64::try_from(index).unwrap(),
+                    &TelemetrySnapshot {
+                        sequence: index,
+                        observed_at: format!("sample-{index}"),
+                        frontend_write_mbps: if index == 5 { 0.0 } else { 100.0 },
+                        cpu_percent: if index == 7 { 99.0 } else { 10.0 },
+                        disks: vec![crate::DiskTelemetry {
+                            model: format!("disk-state-{index}"),
+                            ..crate::DiskTelemetry::default()
+                        }],
+                        ..TelemetrySnapshot::default()
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn peaks_and_correlated_incident_survive_both_tiers_and_display_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let store = TelemetryStore::open(&path).unwrap();
+        history_fixture(&store);
+        let raw = store.query(60_000, 60_059, 1).unwrap();
+        let summary = raw[0].history.as_ref().unwrap();
+        assert!((summary.write.min - 0.0).abs() < f64::EPSILON);
+        assert!((summary.write.max - 100.0).abs() < f64::EPSILON);
+        assert!((summary.cpu.max - 99.0).abs() < f64::EPSILON);
+        assert_eq!(summary.sample_count, Some(60));
+        assert_eq!(
+            summary.incident.as_ref().unwrap().disks[0].model,
+            "disk-state-5"
+        );
+        store.retain_and_roll_up(160_000).unwrap();
+        // A short window from yesterday must find the retained 10s tier.
+        let ten = store.query(60_004, 60_006, 1500).unwrap();
+        assert_eq!(ten.len(), 1);
+        assert_eq!(ten[0].history.as_ref().unwrap().resolution_seconds, 10);
+        assert!(ten[0].history.as_ref().unwrap().write.min.abs() < f64::EPSILON);
+        store.retain_and_roll_up(800_000).unwrap();
+        drop(store);
+        let reopened = TelemetryStore::open(&path).unwrap();
+        let minute = reopened.query(60_004, 60_006, 1500).unwrap();
+        let summary = minute[0].history.as_ref().unwrap();
+        assert_eq!(summary.resolution_seconds, 60);
+        assert_eq!(summary.sample_count, Some(60));
+        assert!((summary.write.min - 0.0).abs() < f64::EPSILON);
+        assert!((summary.cpu.max - 99.0).abs() < f64::EPSILON);
+        assert!((summary.write.mean - 5900.0 / 60.0).abs() < 0.000_001);
+        assert_eq!(summary.incident.as_ref().unwrap().sequence, 5);
+        assert!(summary.incident.as_ref().unwrap().history.is_none());
+    }
+
+    #[test]
+    fn interrupted_rollup_restarts_without_losing_sources_or_extrema() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let store = TelemetryStore::open(&path).unwrap();
+        history_fixture(&store);
+        store.locked().unwrap().execute_batch("CREATE TRIGGER fail_rollup BEFORE INSERT ON samples_10s WHEN NEW.observed_at = 60010 BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(store.retain_and_roll_up(160_000).is_err());
+        assert_eq!(
+            store
+                .locked()
+                .unwrap()
+                .query_row("SELECT count(*) FROM samples_raw", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            60
+        );
+        drop(store);
+        let reopened = TelemetryStore::open(&path).unwrap();
+        reopened
+            .locked()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_rollup;")
+            .unwrap();
+        reopened.retain_and_roll_up(160_000).unwrap();
+        let summary = reopened
+            .query(60_000, 60_059, 1)
+            .unwrap()
+            .remove(0)
+            .history
+            .unwrap();
+        assert_eq!(summary.sample_count, Some(60));
+        assert!((summary.write.min - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn retention_boundary_does_not_replace_a_complete_bucket_with_its_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TelemetryStore::open(&directory.path().join("history.db")).unwrap();
+        history_fixture(&store);
+        store.retain_and_roll_up(146_407).unwrap(); // removes raw samples 60000..60006
+        store.retain_and_roll_up(146_408).unwrap(); // repeated maintenance sees a partial source bucket
+        let samples = store.query(60_000, 60_059, 1).unwrap();
+        let summary = samples[0].history.as_ref().unwrap();
+        assert_eq!(summary.sample_count, Some(60));
+        assert!((summary.write.min - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn coarse_queries_include_samples_arriving_after_the_last_rollup() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TelemetryStore::open(&directory.path().join("history.db")).unwrap();
+        history_fixture(&store);
+        store.retain_and_roll_up(60_060).unwrap();
+        store
+            .insert(
+                60_058,
+                &TelemetrySnapshot {
+                    sequence: 100,
+                    cpu_percent: 100.0,
+                    ..TelemetrySnapshot::default()
+                },
+            )
+            .unwrap();
+        let samples = store.query(60_000, 60_100, 1).unwrap();
+        let summary = samples[0].history.as_ref().unwrap();
+        assert_eq!(summary.sample_count, Some(61));
+        assert!((summary.cpu.max - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn legacy_rollups_do_not_claim_missing_extrema_and_unknown_versions_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TelemetryStore::open(&directory.path().join("history.db")).unwrap();
+        let body = serde_json::to_string(&TelemetrySnapshot::default()).unwrap();
+        store
+            .locked()
+            .unwrap()
+            .execute("INSERT INTO samples_60s VALUES(60000,?1)", [body])
+            .unwrap();
+        let samples = store.query(60_005, 60_006, 1).unwrap();
+        let summary = samples[0].history.as_ref().unwrap();
+        assert_eq!(summary.sample_count, None);
+        assert!(!summary.extrema_complete);
+        assert!(summary.incident.is_none());
+        let mut value = serde_json::to_value(&samples[0]).unwrap();
+        value["history"]["version"] = serde_json::json!("999");
+        assert!(serde_json::from_value::<TelemetrySnapshot>(value).is_err());
+    }
+
+    #[test]
+    fn display_budget_covers_all_samples_including_a_single_between_bucket_spike() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TelemetryStore::open(&directory.path().join("history.db")).unwrap();
+        let body = serde_json::to_string(&TelemetrySnapshot::default()).unwrap();
+        store.locked().unwrap().execute("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<3000) INSERT INTO samples_raw SELECT x,x,json_set(?1,'$.sequence',x,'$.cpuPercent',CASE WHEN x=1499 THEN 100 ELSE 0 END) FROM n", [body]).unwrap();
+        let samples = store.query(0, 3000, usize::MAX).unwrap();
+        assert!(samples.len() <= 1500);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|s| s.history.as_ref().unwrap().sample_count.unwrap())
+                .sum::<u64>(),
+            3001
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|s| (s.history.as_ref().unwrap().cpu.max - 100.0).abs() < f64::EPSILON)
+        );
+        assert_eq!(samples.last().unwrap().sequence, 3000);
     }
 
     #[test]

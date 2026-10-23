@@ -166,6 +166,8 @@ impl SystemSampler {
             .and_then(filesystem_usage)
             .unwrap_or((0, 0));
         TelemetrySnapshot {
+            history: None,
+            workloads: None,
             runtime_issue: None,
             small_file_quota: None,
             storage_usage: None,
