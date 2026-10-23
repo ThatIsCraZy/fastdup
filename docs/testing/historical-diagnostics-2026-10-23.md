@@ -101,7 +101,8 @@ legacy extrema. Browser checks use mocked API data and real ECharts events
 at 1,440 px and 390 px, including original incident selection and zoom.
 TypeScript checking and a production Vite build are included. Build output,
 test logs, the manual RSS probe and browser evidence are under
-`.artifacts/history/`. No appliance or test-VM deployment was performed.
+`.artifacts/history/`. These checks preceded the appliance deployment recorded
+below.
 
 Recorded results: 75 Control Plane tests, the focused POSIX telemetry test and
 78 UI tests passed. TypeScript, production build, formatting and whitespace
@@ -115,3 +116,53 @@ fixture creation. Rollup took 110 ms; querying 1,200 display buckets took 91 ms.
 This is a bounded-memory regression probe, not a fully populated 90-day
 production-load qualification. Retaining an incident adds up to one extra
 original snapshot per aggregate, plus small summary/histogram fields.
+
+## Appliance deployment
+
+On 2026-10-23, RPM `fastdup-0.8.1-49.el10.x86_64` replaced RPM 48 on
+`10.1.1.161`. The update ran from 04:18:05 to 04:19:50 CEST, after all FastDup
+backup jobs reported `Stopped`. The latest qualification session,
+`95aa052f-60bc-4b44-9629-a5dfdc2836a2`, had completed successfully in 7:46
+with Veeam reporting 766 MB/s. It ran on RPM 48; it is not an end-to-end test
+of RPM 49.
+
+The package was built from clean isolated checkout
+`1ab5ed53f8dc9b2672a2fd38e6601ecbd1c4a9bc`, including feature commit
+`e2c1e1ea1744b751dacf77d67de237a40ba793d8`. The packaging script performed
+a fresh UI production build before compiling the Control Plane, which embeds
+the UI assets. The generated files were byte-identical to the previously
+tested UI build. The RPM SHA256 is
+`87e9d008fc5a25fd52ebc2069d1cbfe2cbca705089b175d1c8dbe68d4d470c7b`.
+
+Post-deployment checks passed:
+
+- Installed RPM identity and header match the selected package. Runtime PID
+  changed from `3945699` to `3978184`; hashes of the running Runtime, Agent
+  and Control Plane executables match their packaged files. The installed
+  maintenance executable also matches the package.
+- Repository, Agent, Control Plane, Samba and Veeam container services are
+  active. The FUSE mount exists; Agent health reports `online` without a
+  runtime issue. All four Veeam transport/deployment/environment/immutability
+  services inside the container are active.
+- The container sees the same repository mount as the host. Two read-only
+  64-KiB VBM prefix checks returned identical host/container hashes.
+- HTTPS requests returned status 200 for the index and all four referenced
+  assets. All five SHA256 values match the fresh build. The index references
+  `index-pUdG5Ok9.js` and `index-a1EKpQBA.css`; its SHA256 is
+  `dd73a21bc315bc0cf04e30bf187da975a8794402969096c130ea2abb5646f493`.
+  The index is served with `no-cache`, while named assets are immutable.
+- Runtime inspection exposes the new 16-bucket read/write histograms. Fresh
+  persisted telemetry identifies runtime `3978184`, contains one-second
+  interval histograms and sampled workload context with SMB status
+  `available`. Read/write errors are zero and integrity failure is false.
+
+UI delivery was verified against the live appliance; authenticated chart
+interaction remains covered by the pre-deployment browser tests described
+above. No new backup was launched for this deployment verification.
+
+The update job is
+`.artifacts/test-vm-update/20261023T021711Z-3228e919cd/job.json`.
+Build, package provenance, service/process checks, delivered UI hashes,
+runtime inspection and container-read evidence are under
+`.artifacts/deploy-history-20261023/`. The RPM is under
+`.artifacts/wt-history-49/rpmbuild/RPMS/x86_64/`.
