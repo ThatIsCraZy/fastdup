@@ -10,7 +10,7 @@ use fastdup_format::{
 use fastdup_store::{
     ContainerGenerationAllocator, ContainerRepository, DataPoolUsage, DependentBasePinCollector,
     ExactIndexRunRepository, GcCandidateCatalogRepository, GcCandidateSelectionMode,
-    GenerationRepository, MaintenanceRepository, ScrubCoverage,
+    GenerationRepository, MaintenanceRepository, ScrubCoverage, StorageIo,
 };
 use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
@@ -462,6 +462,92 @@ fn indexed_dependent_proof_is_identical_with_one_or_four_workers() {
     }
     fixture.assert_readable(&base);
     maintenance.scrub().unwrap();
+}
+
+#[test]
+fn online_gc_unindexed_bases_use_one_scan_and_preserve_live_data() {
+    let fixture = Fixture::new();
+    let kept = b"live file covered by the pinned Exact generation";
+    fixture.publish_raw(1, &[kept]);
+    let committed = fixture.commit_files(&[kept], 1);
+    let maintenance = fixture.maintenance();
+    // Publish the Base and dead dependent after the Exact generation was
+    // activated. The proof must not interpret an index miss as missing DATA.
+    let (base, target) = base_and_target(23);
+    fixture.publish_raw(0xb0, &[&base]);
+    let pairs = [(base.as_slice(), target.as_slice())];
+    let generation = fixture.publish_dependents(0xb1, &pairs);
+    let data = fixture.containers.storage();
+    let before = data.operation_count();
+    let proof = prove_with(
+        &maintenance,
+        &fixture,
+        1,
+        committed,
+        vec![dependent_row(0xb1, generation, &pairs)],
+    );
+    assert_eq!(proof.victim_containers(), 1);
+    assert_eq!(
+        data.operations()[before..]
+            .iter()
+            .filter(|op| **op == StorageOperation::ListNames)
+            .count(),
+        1
+    );
+    maintenance
+        .garbage_collect_proved_candidates(proof)
+        .unwrap();
+    fixture.assert_readable(kept);
+    maintenance.scrub().unwrap();
+}
+
+#[test]
+fn online_gc_corrupt_sole_base_fails_before_any_retirement() {
+    let fixture = Fixture::new();
+    let kept = b"unrelated live file remains readable after a rejected proof";
+    fixture.publish_raw(1, &[kept]);
+    let (base, target) = base_and_target(24);
+    fixture.publish_raw(0xb2, &[&base]);
+    let pairs = [(base.as_slice(), target.as_slice())];
+    let generation = fixture.publish_dependents(0xb3, &pairs);
+    let committed = fixture.commit_files(&[kept], 1);
+    let maintenance = fixture.maintenance();
+    let catalog = GcCandidateCatalogRepository::new(fixture.metadata.clone());
+    catalog
+        .publish_rows(
+            1,
+            committed,
+            0,
+            1,
+            vec![dependent_row(0xb3, generation, &pairs)],
+        )
+        .unwrap();
+    let shortlist = catalog
+        .recover_latest()
+        .unwrap()
+        .unwrap()
+        .shortlist(GcCandidateSelectionMode::Urgent, 4, 4)
+        .unwrap();
+    let data = fixture.containers.storage();
+    let name = format!("{}.fdc", "b2".repeat(16));
+    let bytes = data.read(&name).unwrap();
+    let offset = fastdup_format::HEADER_BYTES + 256;
+    data.write_at(&name, offset as u64, &[bytes[offset] ^ 1])
+        .unwrap();
+    let names = data.list_names().unwrap();
+    let before = data.operation_count();
+    assert!(
+        maintenance
+            .prove_gc_candidates_with_workers(
+                &shortlist,
+                DataPoolUsage::new(50, 100).unwrap(),
+                std::num::NonZeroUsize::new(4).unwrap(),
+            )
+            .is_err()
+    );
+    assert!(!data.operations()[before..].contains(&StorageOperation::RemoveFile));
+    assert_eq!(data.list_names().unwrap(), names);
+    fixture.assert_readable(kept);
 }
 
 #[test]

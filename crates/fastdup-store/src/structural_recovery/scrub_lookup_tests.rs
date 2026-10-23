@@ -208,8 +208,137 @@ fn gc_image_bad_index_falls_back_but_missing_base_still_fails() {
 }
 
 #[test]
+fn gc_image_exact_storage_read_failure_falls_back_to_scan() {
+    let fixture = Fixture::new("gc-index-eof", 1, 8);
+    let index = fixture.indexes.pin_online_generation().unwrap().unwrap();
+    let base = fixture.containers.read(fixture.base).unwrap();
+    let key = ExactIndexEntry::from_verified(base.locations()[0]).unwrap();
+    let run = fixture
+        .metadata
+        .list_names()
+        .unwrap()
+        .into_iter()
+        .find(|name| name.ends_with(".fdx"))
+        .unwrap();
+    // Keep the FDIO heads, but cut off the logical file after pinning it.
+    // A fresh Leaf read must now fail at the storage boundary.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.root.join("metadata").join(run))
+        .unwrap()
+        .set_len(8192)
+        .unwrap();
+    let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+    assert!(matches!(
+        index.lookup_transitions(key.chunk_id(), key.logical_length()),
+        Err(crate::ExactIndexStoreError::Io(_))
+    ));
+    let image = fixture
+        .containers
+        .read_verified_image_with_index(fixture.target, &index)
+        .unwrap();
+    let reference = fixture.containers.read(fixture.target).unwrap();
+    for record in reference.records() {
+        assert_eq!(
+            image.container().chunk(record.chunk_id()),
+            Some(record.payload())
+        );
+    }
+}
+
+#[test]
+fn gc_image_tries_a_healthy_indexed_copy_after_a_corrupt_base() {
+    let fixture = Fixture::new("gc-second-base", 1, 8);
+    let reference = fixture.containers.read(fixture.target).unwrap();
+    let base = fixture.containers.read(fixture.base).unwrap();
+    let copy = ContainerId::new([0x94; 16]).unwrap();
+    fixture
+        .containers
+        .publish_raw(copy, 3, &[base.records()[0].payload()])
+        .unwrap();
+    let verified = fixture.containers.read(copy).unwrap();
+    fixture
+        .indexes
+        .append_level_zero(
+            ExactIndexProfileId::new([0x93; 32]).unwrap(),
+            verified
+                .locations()
+                .iter()
+                .copied()
+                .map(|location| ExactIndexEntry::from_verified(location).unwrap())
+                .collect(),
+        )
+        .unwrap();
+    let index = fixture.indexes.pin_online_generation().unwrap().unwrap();
+    let key = ExactIndexEntry::from_verified(base.locations()[0]).unwrap();
+    let candidates = index
+        .lookup_transitions(key.chunk_id(), key.logical_length())
+        .unwrap();
+    assert_eq!(candidates.candidates().len(), 2);
+    // Damage whichever copy is first in the actual candidate order, so the
+    // success requires rejecting it and verifying the second independent copy.
+    let name = crate::published_name(candidates.candidates()[0].location().container_id());
+    let bytes = fixture.data.read(&name).unwrap();
+    let offset = HEADER_BYTES + 256;
+    fixture
+        .data
+        .write_at(&name, offset as u64, &[bytes[offset] ^ 1])
+        .unwrap();
+    let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
+    let image = fixture
+        .containers
+        .read_verified_image_with_index(fixture.target, &index)
+        .unwrap();
+    for record in reference.records() {
+        assert_eq!(
+            image.container().chunk(record.chunk_id()),
+            Some(record.payload())
+        );
+    }
+}
+
+#[test]
+fn gc_image_does_not_prove_a_cached_but_unlinked_victim() {
+    let mut fixture = Fixture::new("gc-unlinked-victim", 1, 8);
+    let name = crate::published_name(fixture.target);
+    let bytes = fixture.data.read(&name).unwrap();
+    fixture.containers.container_images = Arc::new(
+        crate::container_image_cache::ContainerImageCache::isolated(1 << 20),
+    );
+    fixture
+        .containers
+        .container_images
+        .admit_validated(fixture.target, bytes);
+    assert!(
+        fixture
+            .containers
+            .container_images
+            .get(fixture.target)
+            .is_some()
+    );
+    let index = fixture.indexes.pin_online_generation().unwrap().unwrap();
+    fixture.data.remove_file(&name).unwrap();
+    let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
+    assert!(matches!(
+        fixture.containers.read_verified_image_with_index(fixture.target, &index),
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+    // The old reader already bypasses the image cache under real GC intent.
+    assert!(matches!(
+        fixture.containers.read_verified_image(fixture.target),
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+}
+
+#[test]
 fn gc_image_unusable_index_candidates_fall_back_to_verified_scan() {
-    for case in ["absent", "wrong-location", "retiring", "removed"] {
+    for case in [
+        "absent",
+        "wrong-location",
+        "retiring",
+        "removed",
+        "dependent",
+    ] {
         let fixture = Fixture::new(&format!("gc-{case}"), 1, 2);
         let reference = fixture.containers.read(fixture.target).unwrap();
         let base = fixture.containers.read(fixture.base).unwrap();
@@ -233,6 +362,26 @@ fn gc_image_unusable_index_candidates_fall_back_to_verified_scan() {
             "retiring" => ExactIndexEntry::retiring(actual).unwrap(),
             "removed" => {
                 ExactIndexEntry::removed(ExactIndexEntry::retiring(actual).unwrap()).unwrap()
+            }
+            "dependent" => {
+                let payload = base.records()[0].payload();
+                let mut other_base = payload.to_vec();
+                other_base[700] ^= 0x51;
+                let other_id = ContainerId::new([0x11; 16]).unwrap();
+                let dependent_id = ContainerId::new([0x12; 16]).unwrap();
+                fixture
+                    .containers
+                    .publish_raw(other_id, 4, &[&other_base])
+                    .unwrap();
+                fixture
+                    .containers
+                    .publish_zstd_prefix_pairs_verified(dependent_id, 5, &[(&other_base, payload)])
+                    .unwrap();
+                let copy = fixture.containers.read(dependent_id).unwrap();
+                let hint = ExactIndexEntry::from_verified(copy.locations()[0]).unwrap();
+                assert_eq!(hint.chunk_id(), actual.chunk_id());
+                assert_ne!(hint.location().dependency_id(), [0; 32]);
+                hint
             }
             _ => unreachable!(),
         };

@@ -1328,7 +1328,8 @@ struct RetiringSelectionBarrier {
     committed: bool,
 }
 
-/// One decode-local, index-free Base resolver.
+/// One decode-local Base resolver with a verified-hint fast path and an
+/// index-free scan fallback.
 ///
 /// Namespace enumeration and successfully verified Base bytes are retained
 /// only for the duration of one requested Container decode. This keeps the
