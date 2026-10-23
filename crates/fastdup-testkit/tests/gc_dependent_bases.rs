@@ -12,7 +12,7 @@ use fastdup_store::{
     ExactIndexRunRepository, GcCandidateCatalogRepository, GcCandidateSelectionMode,
     GenerationRepository, MaintenanceRepository, ScrubCoverage,
 };
-use fastdup_testkit::MemoryStorageIo;
+use fastdup_testkit::{MemoryStorageIo, StorageOperation};
 
 struct Fixture {
     metadata: MemoryStorageIo,
@@ -337,6 +337,131 @@ fn dead_padding() -> Vec<u8> {
     (0..96 * 1_024_u32)
         .map(|index| u8::try_from(index.wrapping_mul(2_654_435_761) >> 24).expect("byte"))
         .collect()
+}
+
+#[test]
+fn online_gc_dependent_proof_does_not_scan_unrelated_containers_for_bases() {
+    let fixture = Fixture::new();
+    let kept = b"one live file outside the GC victims";
+    fixture.publish_raw(1, &[kept]);
+    // Put the Bases after unrelated Containers in canonical scan order.
+    for id in 2..66 {
+        fixture.publish_raw(id, &[&vec![id; 512]]);
+    }
+    let chunks = (1..=8).map(base_and_target).collect::<Vec<_>>();
+    let bases = chunks
+        .iter()
+        .map(|(base, _)| base.as_slice())
+        .collect::<Vec<_>>();
+    fixture.publish_raw(0xe0, &bases);
+    let pairs = chunks
+        .iter()
+        .map(|(base, target)| (base.as_slice(), target.as_slice()))
+        .collect::<Vec<_>>();
+    let generation = fixture.publish_dependents(0xf0, &pairs);
+    let committed = fixture.commit_files(&[kept], 1);
+    let maintenance = fixture.maintenance();
+    let data = fixture.containers.storage();
+    let before = data.operation_count();
+    let started = std::time::Instant::now();
+    let proof = prove_with(
+        &maintenance,
+        &fixture,
+        1,
+        committed,
+        vec![dependent_row(0xf0, generation, &pairs)],
+    );
+    let operations = data.operations();
+    let reads = operations[before..]
+        .iter()
+        .filter(|op| matches!(op, StorageOperation::Read | StorageOperation::ReadExactAt))
+        .count();
+    let enumerations = operations[before..]
+        .iter()
+        .filter(|op| **op == StorageOperation::ListNames)
+        .count();
+    eprintln!(
+        "GC Base proof: reads={reads} enumerations={enumerations} wall={:?}",
+        started.elapsed()
+    );
+    assert_eq!(proof.victim_containers(), 1);
+    assert_eq!(proof.replacement_chunks(), 0);
+    assert!(
+        reads <= 96,
+        "indexed Base lookup must not read each unrelated Container: {reads}"
+    );
+    assert_eq!(enumerations, 0, "indexed Bases need no DATA namespace scan");
+    maintenance
+        .garbage_collect_proved_candidates(proof)
+        .expect("collect the verified dead dependent Container");
+    fixture.assert_readable(kept);
+    maintenance
+        .scrub()
+        .expect("collection preserves all required DATA");
+}
+
+#[test]
+fn indexed_dependent_proof_is_identical_with_one_or_four_workers() {
+    let fixture = Fixture::new();
+    let (base, first) = base_and_target(21);
+    let mut second = first.clone();
+    second[300] ^= 0x51;
+    fixture.publish_raw(0xa0, &[&base]);
+    let first_pairs = [(base.as_slice(), first.as_slice())];
+    let second_pairs = [(base.as_slice(), second.as_slice())];
+    let first_generation = fixture.publish_dependents(0xa1, &first_pairs);
+    let second_generation = fixture.publish_dependents(0xa2, &second_pairs);
+    let committed = fixture.commit_files(&[&base], 1);
+    let maintenance = fixture.maintenance();
+    let catalog = GcCandidateCatalogRepository::new(fixture.metadata.clone());
+    catalog
+        .publish_rows(
+            1,
+            committed,
+            0,
+            2,
+            vec![
+                dependent_row(0xa1, first_generation, &first_pairs),
+                dependent_row(0xa2, second_generation, &second_pairs),
+            ],
+        )
+        .unwrap();
+    let shortlist = catalog
+        .recover_latest()
+        .unwrap()
+        .unwrap()
+        .shortlist(GcCandidateSelectionMode::Urgent, 4, 4)
+        .unwrap();
+    let mut expected = None;
+    for workers in [1, 4] {
+        let proof = maintenance
+            .prove_gc_candidates_with_workers(
+                &shortlist,
+                DataPoolUsage::new(50, 100).unwrap(),
+                std::num::NonZeroUsize::new(workers).unwrap(),
+            )
+            .unwrap();
+        let observed = (
+            proof.victim_containers(),
+            proof.victim_bytes(),
+            proof.replacement_chunks(),
+            proof.reachable_victim_chunks(),
+            proof.replacement_upper_bound(),
+            proof.replacement_estimated_bytes(),
+        );
+        assert_eq!(proof.victim_containers(), 2);
+        if let Some(expected) = expected {
+            assert_eq!(observed, expected);
+        }
+        expected = Some(observed);
+        if workers == 4 {
+            maintenance
+                .garbage_collect_proved_candidates(proof)
+                .unwrap();
+        }
+    }
+    fixture.assert_readable(&base);
+    maintenance.scrub().unwrap();
 }
 
 #[test]

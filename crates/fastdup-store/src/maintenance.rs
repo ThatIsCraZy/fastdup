@@ -599,7 +599,10 @@ where
         &self,
         shortlist: &GcCandidateShortlist,
         pool_usage: DataPoolUsage,
-    ) -> Result<GcCandidateProof, MaintenanceError> {
+    ) -> Result<GcCandidateProof, MaintenanceError>
+    where
+        X: Send + Sync,
+    {
         self.prove_gc_candidates_with_workers(shortlist, pool_usage, NonZeroUsize::MIN)
     }
 
@@ -701,7 +704,10 @@ where
         shortlist: &GcCandidateShortlist,
         pool_usage: DataPoolUsage,
         relocation_workers: NonZeroUsize,
-    ) -> Result<GcCandidateProof, MaintenanceError> {
+    ) -> Result<GcCandidateProof, MaintenanceError>
+    where
+        X: Send + Sync,
+    {
         let exact = self
             .indexes
             .pin_online_generation()?
@@ -844,6 +850,7 @@ where
         let readers = NonZeroUsize::new(relocation_workers.get().min(rows.len().max(1)))
             .unwrap_or(NonZeroUsize::MIN);
         let containers = &self.containers;
+        let base_index = &exact;
         let rows_ref = rows.as_slice();
         let reader_cancellation = self.cancellation.clone();
         run_ordered_maintenance_reads(
@@ -857,7 +864,9 @@ where
                 reader_cancellation
                     .as_ref()
                     .map_or(Ok(()), crate::MaintenanceCancellation::check)?;
-                match containers.read_verified_image(rows_ref[job].container_id()) {
+                match containers
+                    .read_verified_image_with_index(rows_ref[job].container_id(), base_index)
+                {
                     Ok(image) => Ok(Some(image)),
                     Err(error) if is_missing_container_error(&error) => Ok(None),
                     Err(error) => Err(error.into()),

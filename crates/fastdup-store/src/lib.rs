@@ -1393,9 +1393,23 @@ impl<'a, I: StorageIo> ContainerBaseResolver<'a, I> {
         &mut self,
         dependency: fastdup_format::DependentDependency,
     ) -> Result<Vec<u8>, StoreError> {
+        self.resolve_with_hint(dependency, || None)
+    }
+
+    /// A hint may supply only fully verified independent Base bytes. Both
+    /// indexed hits and scan fallback share this one-Container memo.
+    fn resolve_with_hint(
+        &mut self,
+        dependency: fastdup_format::DependentDependency,
+        hint: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, StoreError> {
         let key = (dependency.chunk_id(), dependency.logical_length());
         if let Some(bytes) = self.resolved.get(&key) {
             return Ok(bytes.clone());
+        }
+        if let Some(bytes) = hint() {
+            self.resolved.insert(key, bytes.clone());
+            return Ok(bytes);
         }
         if self.names.is_none() {
             let mut names = self.repository.storage.list_names()?;
@@ -2333,21 +2347,45 @@ impl<I: StorageIo> ContainerRepository<I> {
         container_id: ContainerId,
     ) -> Result<VerifiedContainerImage, StoreError> {
         if let Some(bytes) = self.container_images.get(container_id) {
-            return self.verify_image_bytes(container_id, bytes);
+            return self.verify_image_bytes(container_id, bytes, |_| None);
         }
         let bytes = self.storage.read(&published_name(container_id))?;
-        self.verify_image_bytes(container_id, Arc::new(bytes))
+        self.verify_image_bytes(container_id, Arc::new(bytes), |_| None)
+    }
+
+    /// Online-GC proof borrows its pinned Exact generation only to locate
+    /// independent Bases. Every selected Base payload is freshly verified;
+    /// missing, damaged or unusable index hints retain the scan fallback.
+    fn read_verified_image_with_index<J: StorageIo>(
+        &self,
+        container_id: ContainerId,
+        index: &ActivatedExactIndex<J>,
+    ) -> Result<VerifiedContainerImage, StoreError> {
+        let bytes = self.storage.read(&published_name(container_id))?;
+        self.verify_image_bytes(container_id, Arc::new(bytes), |dependency| {
+            let read = self.find_verified_independent_base_read_gated(
+                index,
+                dependency.chunk_id(),
+                dependency.logical_length(),
+                None,
+                ReadIntent::Independent,
+                &mut || true,
+            )?;
+            let (mut requested, _) = read.into_parts();
+            requested.pop().map(VerifiedChunkPayload::into_payload)
+        })
     }
 
     fn verify_image_bytes(
         &self,
         container_id: ContainerId,
         bytes: Arc<Vec<u8>>,
+        mut base_hint: impl FnMut(fastdup_format::DependentDependency) -> Option<Vec<u8>>,
     ) -> Result<VerifiedContainerImage, StoreError> {
         let mut base_resolver = ContainerBaseResolver::new(self);
         let mut resolver_error = None;
         let mut resolve = |dependency: fastdup_format::DependentDependency| match base_resolver
-            .resolve(dependency)
+            .resolve_with_hint(dependency, || base_hint(dependency))
         {
             Ok(bytes) => Ok(bytes),
             Err(error) => {

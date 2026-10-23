@@ -2,7 +2,7 @@
 
 Name:           fastdup
 Version:        0.8.1
-Release:        49%{?dist}
+Release:        50%{?dist}
 Summary:        Deduplicating POSIX storage appliance with an embedded WebUI
 License:        Apache-2.0 AND GPL-3.0-or-later
 URL:            https://github.com/ThatIsCraZy/fastdup
@@ -124,6 +124,10 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 %config(noreplace) %{_sysconfdir}/samba/fastdup-shares.conf
 
 %changelog
+* Fri Oct 23 2026 fastdup maintainers <noreply@fastdup.local> - 0.8.1-50
+- Resolve online GC Bases through pinned Exact hints with verified scan fallback
+- Reuse verified Bases within each victim decode to avoid repeated pool scans
+
 * Fri Oct 23 2026 fastdup maintainers <noreply@fastdup.local> - 0.8.1-49
 - Ship historical diagnostics, interval latency evidence, workload context and
   JSON export together with freshly built German/English WebUI assets.

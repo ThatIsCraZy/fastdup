@@ -124,6 +124,146 @@ impl Drop for Fixture {
     }
 }
 
+// GC and scrub use different complete-Container verifiers, but the same
+// durable Base/index fixture exercises their shared hint trust boundary.
+#[test]
+fn gc_image_memoizes_verified_indexed_bases_per_container() {
+    let fixture = Fixture::new("gc-memo", 1, 128);
+    let index = fixture.indexes.pin_online_generation().unwrap().unwrap();
+    let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
+    let before = fixture.reads();
+    let image = fixture
+        .containers
+        .read_verified_image_with_index(fixture.target, &index)
+        .unwrap();
+    let reads = fixture.reads() - before;
+    assert!(
+        reads <= 4,
+        "one Base must not repeat Exact lookup 128 times: {reads}"
+    );
+    let reference = fixture.containers.read(fixture.target).unwrap();
+    for record in reference.records() {
+        assert_eq!(
+            image.container().chunk(record.chunk_id()),
+            Some(record.payload())
+        );
+    }
+}
+
+#[test]
+fn gc_image_index_hint_does_not_hide_changed_base_payload() {
+    let fixture = Fixture::new("gc-base-damage", 1, 8);
+    let index = fixture.indexes.pin_online_generation().unwrap().unwrap();
+    let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
+    fixture
+        .containers
+        .read_verified_image_with_index(fixture.target, &index)
+        .unwrap();
+    let name = crate::published_name(fixture.base);
+    let bytes = fixture.data.read(&name).unwrap();
+    let offset = HEADER_BYTES + 256;
+    fixture
+        .data
+        .write_at(&name, offset as u64, &[bytes[offset] ^ 1])
+        .unwrap();
+    assert!(
+        fixture
+            .containers
+            .read_verified_image_with_index(fixture.target, &index)
+            .is_err()
+    );
+}
+
+#[test]
+fn gc_image_bad_index_falls_back_but_missing_base_still_fails() {
+    let fixture = Fixture::new("gc-index-damage", 1, 8);
+    let index = fixture.indexes.pin_online_generation().unwrap().unwrap();
+    let run = fixture
+        .metadata
+        .list_names()
+        .unwrap()
+        .into_iter()
+        .find(|name| name.ends_with(".fdx"))
+        .unwrap();
+    let bytes = fixture.metadata.read(&run).unwrap();
+    let offset = 4096 + 256;
+    let file = crate::direct_io::open(&fixture.root.join("metadata").join(&run), true).unwrap();
+    crate::direct_io::write(&file, offset as u64, &[bytes[offset] ^ 1]).unwrap();
+    // Force the damaged Leaf to be observed, even if it was previously cached.
+    let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
+    fixture
+        .containers
+        .read_verified_image_with_index(fixture.target, &index)
+        .unwrap();
+    fixture
+        .data
+        .remove_file(&crate::published_name(fixture.base))
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .containers
+            .read_verified_image_with_index(fixture.target, &index),
+        Err(StoreError::MissingVerifiedChunk { .. })
+    ));
+}
+
+#[test]
+fn gc_image_unusable_index_candidates_fall_back_to_verified_scan() {
+    for case in ["absent", "wrong-location", "retiring", "removed"] {
+        let fixture = Fixture::new(&format!("gc-{case}"), 1, 2);
+        let reference = fixture.containers.read(fixture.target).unwrap();
+        let base = fixture.containers.read(fixture.base).unwrap();
+        let actual = ExactIndexEntry::from_verified(base.locations()[0]).unwrap();
+        let wrong_id = ContainerId::new([0x10; 16]).unwrap();
+        let wrong_bytes = vec![0x5a; actual.logical_length() as usize];
+        fixture
+            .containers
+            .publish_raw(wrong_id, 3, &[&wrong_bytes])
+            .unwrap();
+        let wrong = fixture.containers.read(wrong_id).unwrap();
+        let wrong = ExactIndexEntry::from_verified(wrong.locations()[0]).unwrap();
+        let hint = match case {
+            "absent" => wrong,
+            "wrong-location" => ExactIndexEntry::active(
+                actual.chunk_id(),
+                actual.logical_length(),
+                wrong.location(),
+            )
+            .unwrap(),
+            "retiring" => ExactIndexEntry::retiring(actual).unwrap(),
+            "removed" => {
+                ExactIndexEntry::removed(ExactIndexEntry::retiring(actual).unwrap()).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let hints =
+            ExactIndexRunRepository::new(FsStorageIo::open(fixture.root.join("hints")).unwrap());
+        let profile = ExactIndexProfileId::new([0x93; 32]).unwrap();
+        let run = hints
+            .publish(&fastdup_format::ExactIndexRun::new(profile, 1, vec![hint]).unwrap())
+            .unwrap();
+        let runs = fastdup_format::ExactIndexRunSet::new(
+            profile,
+            1,
+            vec![fastdup_format::ExactIndexRunRef::new(0, run).unwrap()],
+        )
+        .unwrap();
+        let index = hints.activate(&runs).unwrap();
+        let _scan = crate::ReadIntentScope::enter(crate::ReadIntent::Scan);
+        let image = fixture
+            .containers
+            .read_verified_image_with_index(fixture.target, &index)
+            .unwrap();
+        for record in reference.records() {
+            assert_eq!(
+                image.container().chunk(record.chunk_id()),
+                Some(record.payload()),
+                "{case}"
+            );
+        }
+    }
+}
+
 #[test]
 fn scrub_batches_repeated_base_index_reads() {
     let fixture = Fixture::new("repeated", 1, 128);
