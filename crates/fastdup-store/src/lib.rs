@@ -3197,6 +3197,25 @@ impl<I: StorageIo> ContainerRepository<I> {
         before_backend_read: &mut dyn FnMut() -> bool,
     ) -> Option<VerifiedChunkRead> {
         let lookup = index.lookup_transitions(chunk_id, logical_length).ok()?;
+        self.find_verified_independent_base_from_lookup(
+            &lookup,
+            chunk_id,
+            logical_length,
+            cache,
+            payload_intent,
+            before_backend_read,
+        )
+    }
+
+    fn find_verified_independent_base_from_lookup(
+        &self,
+        lookup: &ExactIndexLookup,
+        chunk_id: fastdup_format::ChunkId,
+        logical_length: u32,
+        cache: Option<&VerifiedReadCache>,
+        payload_intent: ReadIntent,
+        before_backend_read: &mut dyn FnMut() -> bool,
+    ) -> Option<VerifiedChunkRead> {
         let mut seen_locations: [Option<ExactIndexLocation>; MAX_EXACT_LOOKUP_CANDIDATES] =
             [None; MAX_EXACT_LOOKUP_CANDIDATES];
         let mut seen_count = 0_usize;

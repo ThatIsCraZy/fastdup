@@ -7,6 +7,10 @@ use fastdup_format::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
+#[cfg(test)]
+#[path = "structural_recovery/scrub_lookup_tests.rs"]
+mod scrub_lookup_tests;
+
 /// Outstanding DATA identities from one selected committed Metadata graph.
 /// This is scrub work, never a content proof or deletion capability. Only a
 /// completely verified selectable Container can discharge an identity.
@@ -110,10 +114,28 @@ impl<I: StorageIo> ContainerRepository<I> {
     > {
         let _independent = crate::ReadIntentScope::enter(crate::ReadIntent::Independent);
         let bytes = self.storage.read(&crate::published_name(id))?;
+        // Structural metadata only supplies lookup keys. Full payload proof is
+        // still produced below from these same freshly read immutable bytes.
+        let structure = structure_from_image(&bytes)?;
+        let hints = ScrubBaseHints::new(&structure, index);
         let mut fallback = crate::ContainerBaseResolver::new(self);
         let mut resolver_error = None;
         let mut resolve = |dependency: fastdup_format::DependentDependency| {
-            if let Some(index) = index
+            if let Some(lookup) = hints.get(dependency.chunk_id(), dependency.logical_length()) {
+                if let Some(read) = self.find_verified_independent_base_from_lookup(
+                    lookup,
+                    dependency.chunk_id(),
+                    dependency.logical_length(),
+                    None,
+                    crate::ReadIntent::Independent,
+                    &mut || true,
+                ) {
+                    let (mut requested, _) = read.into_parts();
+                    if let Some(base) = requested.pop() {
+                        return Ok(base.into_payload());
+                    }
+                }
+            } else if let Some(index) = index
                 && let Some(base) = self.find_verified_independent_base_with_index(
                     index,
                     dependency.chunk_id(),
@@ -138,29 +160,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         if verified.header().container_id() != id {
             return Err(StoreError::PublishVerificationMismatch);
         }
-        {
-            // All payloads and Bases have already verified. Extract identities
-            // from that same immutable image, with no extra disk reads.
-            let footer_bytes = usize::try_from(FOOTER_BYTES)
-                .map_err(|_| fastdup_format::FormatError::ArithmeticOverflow)?;
-            let structure = ContainerStructure::read(
-                &bytes[..HEADER_BYTES],
-                &bytes[bytes.len() - footer_bytes..],
-                bytes.len() as u64,
-                |offset, length| {
-                    let start = usize::try_from(offset)
-                        .map_err(|_| fastdup_format::FormatError::ArithmeticOverflow)?;
-                    let end = start
-                        .checked_add(length)
-                        .ok_or(fastdup_format::FormatError::ArithmeticOverflow)?;
-                    bytes
-                        .get(start..end)
-                        .map(<[u8]>::to_vec)
-                        .ok_or(fastdup_format::FormatError::InvalidContainerLayout)
-                },
-            )?;
-            Ok((structure, verified))
-        }
+        Ok((structure, verified))
     }
 
     /// Validates all metadata of one immutable Container, without payload reads.
@@ -317,4 +317,74 @@ impl<I: StorageIo> ContainerRepository<I> {
         }
         Ok(())
     }
+}
+
+// At most 256 keys * 64 candidate transitions per worker. Larger Containers
+// retain the ordinary per-key path for overflow; no whole-pool hint map or Base
+// payload is retained. Hints live for exactly one complete Container scrub.
+const SCRUB_BASE_HINT_KEYS: usize = 256;
+
+struct ScrubBaseHints {
+    keys: Vec<(ChunkId, u32)>,
+    lookups: Vec<crate::ExactIndexLookup>,
+}
+
+impl ScrubBaseHints {
+    fn new<X: StorageIo>(
+        structure: &ContainerStructure,
+        index: Option<&crate::ActivatedExactIndex<X>>,
+    ) -> Self {
+        let mut keys = BTreeSet::new();
+        if index.is_some() {
+            for key in structure
+                .chunks()
+                .iter()
+                .filter_map(|chunk| chunk.dependency)
+            {
+                keys.insert(key);
+                if keys.len() == SCRUB_BASE_HINT_KEYS {
+                    break;
+                }
+            }
+        }
+        let keys: Vec<_> = keys.into_iter().collect();
+        // Index damage remains advisory: preserve the existing per-key/verified
+        // scan fallback rather than turning an optimization failure into proof.
+        let lookups = index
+            .filter(|_| !keys.is_empty())
+            .and_then(|index| index.lookup_transitions_batch(&keys).ok())
+            .unwrap_or_default();
+        Self { keys, lookups }
+    }
+
+    fn get(&self, id: ChunkId, length: u32) -> Option<&crate::ExactIndexLookup> {
+        self.keys
+            .binary_search(&(id, length))
+            .ok()
+            .and_then(|position| self.lookups.get(position))
+    }
+}
+
+fn structure_from_image(bytes: &[u8]) -> Result<ContainerStructure, StoreError> {
+    if !(HEADER_BYTES as u64 + FOOTER_BYTES..=MAX_CONTAINER_BYTES).contains(&(bytes.len() as u64)) {
+        return Err(fastdup_format::FormatError::InvalidContainerLength(bytes.len()).into());
+    }
+    let footer_bytes = usize::try_from(FOOTER_BYTES)
+        .map_err(|_| fastdup_format::FormatError::ArithmeticOverflow)?;
+    ContainerStructure::read(
+        &bytes[..HEADER_BYTES],
+        &bytes[bytes.len() - footer_bytes..],
+        bytes.len() as u64,
+        |offset, length| {
+            let start = usize::try_from(offset)
+                .map_err(|_| fastdup_format::FormatError::ArithmeticOverflow)?;
+            let end = start
+                .checked_add(length)
+                .ok_or(fastdup_format::FormatError::ArithmeticOverflow)?;
+            bytes
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| fastdup_format::FormatError::InvalidContainerLayout.into())
+        },
+    )
 }

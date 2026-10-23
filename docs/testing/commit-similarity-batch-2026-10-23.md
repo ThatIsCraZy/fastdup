@@ -31,9 +31,13 @@ The writer's existing target-byte bound remains in force. Borrowed target views
 do not copy payloads; the planner retains at most eight verified Base owners
 per codec wave. One coherent Exact/Similarity snapshot covers the batch.
 The DATA reference guard still covers planning, publication and Exact activation.
-Chunk order, candidate policy, codec selection, durable formats and recovery
-semantics are unchanged. This applies the existing ADR 0050 execution policy
-to commit residue, retaining the ADR 0093 handoff.
+Chunk order, candidate/trial limits, acceptance thresholds, durable formats and
+recovery semantics are unchanged. The chosen Base/codec is not universally
+byte-identical to serial planning: batch preparation sees a different warm-cache
+snapshot, and concurrent adaptive-gate observations can change trial decisions.
+The fixture below establishes matching decisions for its fixed input only.
+This applies the existing ADR 0050 execution policy to commit residue, retaining
+the ADR 0093 handoff.
 
 ## Regression and controlled A/B
 

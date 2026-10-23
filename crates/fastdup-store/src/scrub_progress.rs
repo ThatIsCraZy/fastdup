@@ -267,6 +267,9 @@ impl ScrubResumePool {
                 ids[start..end]
                     .par_iter()
                     .map(|id| {
+                        let _reason = crate::MetadataReadScope::enter(
+                            crate::MetadataReadReason::RecoveryScrub,
+                        );
                         repository.scrub_certificate_with_cache(*id, index, checked_at, cache)
                     })
                     .collect()
@@ -328,7 +331,11 @@ impl ScrubResumePool {
         let mut outcomes: Vec<Result<bool, StoreError>> = self.0.install(|| {
             entries
                 .par_iter()
-                .map(|entry| repository.matches_scrub_envelope(entry))
+                .map(|entry| {
+                    let _reason =
+                        crate::MetadataReadScope::enter(crate::MetadataReadReason::RecoveryScrub);
+                    repository.matches_scrub_envelope(entry)
+                })
                 .collect()
         });
         // A concurrent stop must not hide a damaged envelope or real I/O error
