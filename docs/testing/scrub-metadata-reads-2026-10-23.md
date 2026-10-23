@@ -104,3 +104,15 @@ fixture's 2-ms scheduling race was replaced with a bounded rendezvous. A separat
 global cache-admission test failed amid parallel tests and passed alone; its
 entire 38-test ingest suite also passed with one test thread. No production cache
 policy was changed to accommodate that test.
+
+Final validation on `6d2abe4`: `cargo test --locked -p fastdup-store` passed
+344 tests (16 ignored); `cargo test --locked -p fastdup-appliance --
+--test-threads=1` passed 309 tests (4 ignored). Production Store Clippy,
+formatting and whitespace checks passed. The sparse-leaf performance gate is
+part of the ordinary Store test run.
+
+Package `fastdup-0.8.1-48.el10.x86_64` was built in the isolated
+`.artifacts/worktrees/scrub-48` checkout from `6d2abe4c7931a42725de688468f038230df43a15`.
+Its SHA256 is `4143c1c1adec582bdb61b4a2eeedf9228bf3a4911c35b986a3a4905638aa6336`.
+The unrelated root-workspace stylesheet change was excluded. Full provenance
+and package comparison are saved in the measurement directory.
