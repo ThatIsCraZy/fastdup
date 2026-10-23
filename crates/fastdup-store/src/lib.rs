@@ -1034,6 +1034,20 @@ pub struct ImmutableFileLease {
 }
 
 impl ImmutableFileLease {
+    /// Starts one bounded independent operation on this immutable file. Heads
+    /// are read freshly once; subsequent ranges bypass all application caches.
+    /// The borrow keeps the physical identity pinned for the entire operation.
+    fn independent_read_batch(&self) -> io::Result<IndependentFileReadBatch<'_>> {
+        assert!(
+            read_intent::independent(),
+            "ASSERT: fresh batch requires Independent intent"
+        );
+        Ok(IndependentFileReadBatch {
+            lease: self,
+            layout: direct_io::layout(&self.file)?,
+        })
+    }
+
     pub(crate) fn read_at(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
         read_cached_file_range(
             &self.file,
@@ -1052,6 +1066,33 @@ impl ImmutableFileLease {
 
     pub(crate) const fn file(&self) -> &File {
         &self.file
+    }
+}
+
+/// An operation-local length snapshot, never resident verification evidence.
+pub(crate) struct IndependentFileReadBatch<'a> {
+    lease: &'a ImmutableFileLease,
+    layout: direct_io::Layout,
+}
+
+impl IndependentFileReadBatch<'_> {
+    pub(crate) const fn logical_len(&self) -> u64 {
+        self.layout.length
+    }
+
+    pub(crate) fn read_at(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        if length > MAX_STORAGE_RANGE_BYTES {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let span = metadata_read_telemetry::ReadSpan::start(
+            self.lease.metadata_reads.as_deref(),
+            &self.lease.name,
+            3,
+            Some(length),
+        );
+        let result = direct_io::read_with_layout(&self.lease.file, self.layout, offset, length);
+        span.finish(&result);
+        result
     }
 }
 

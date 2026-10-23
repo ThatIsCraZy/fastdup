@@ -5242,12 +5242,15 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         count: usize,
         run_hash: [u8; 32],
         resident: &mut std::collections::BTreeMap<usize, Arc<ExactIndexPage>>,
+        independent: Option<&crate::IndependentFileReadBatch<'_>>,
     ) -> Result<(), ExactIndexStoreError> {
         let offset = self
             .descriptor
             .page_offset(first)
             .ok_or(ExactIndexFormatError::InvalidPage)?;
-        let span = if let Some(mapping) = &self.mapping {
+        let span = if let Some(independent) = independent {
+            independent.read_at(offset, count * EXACT_INDEX_PAGE_BYTES)?
+        } else if let Some(mapping) = &self.mapping {
             mapping.page_span(offset, count * EXACT_INDEX_PAGE_BYTES)?
         } else {
             self.storage
@@ -5297,6 +5300,17 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
         };
         let run_hash = self.descriptor.run_hash();
         let mut pending = self.batch_pending_keys(keys, candidates, complete);
+        // A bounded lookup window is one independent operation. Its immutable
+        // Run lease permits one fresh head/length check across scattered spans;
+        // the snapshot is dropped before the next window or Container starts.
+        let independent = if crate::read_intent::independent() && !pending.is_empty() {
+            self.mapping
+                .as_ref()
+                .map(|mapping| mapping.independent_read_batch())
+                .transpose()?
+        } else {
+            None
+        };
         let page_count = self.descriptor.page_count();
         let mut leaf: Vec<usize> = vec![usize::MAX; keys.len()];
         for &ordinal in &pending {
@@ -5330,7 +5344,7 @@ impl<I: StorageIo> ExactIndexRunReader<I> {
                 }
             }
             for (first, count) in spans {
-                self.batch_span_pages(first, count, run_hash, &mut resident)?;
+                self.batch_span_pages(first, count, run_hash, &mut resident, independent.as_ref())?;
             }
             let mut next_pending = Vec::new();
             for ordinal in pending {

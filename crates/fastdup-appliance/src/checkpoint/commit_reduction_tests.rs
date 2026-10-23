@@ -17,6 +17,7 @@ struct MeasuredIndexIo {
 #[derive(Default)]
 struct ReadMeasurements {
     armed: AtomicBool,
+    overlap_probe: AtomicBool,
     active: AtomicUsize,
     peak: AtomicUsize,
     count: AtomicUsize,
@@ -45,7 +46,16 @@ impl StorageIo for MeasuredIndexIo {
         if measured {
             let active = self.reads.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.reads.peak.fetch_max(active, Ordering::SeqCst);
-            self.reads.count.fetch_add(1, Ordering::SeqCst);
+            let ordinal = self.reads.count.fetch_add(1, Ordering::SeqCst);
+            if ordinal == 0 && self.reads.overlap_probe.load(Ordering::SeqCst) {
+                // Hold the first cold read until another worker enters. A
+                // bounded timeout makes a serial implementation fail instead
+                // of deadlocking; a 2-ms scheduling race is not the invariant.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while self.reads.peak.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             // Match the order of the appliance's measured 1.8--3 ms Metadata reads.
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -88,7 +98,13 @@ struct Measurement {
     clippy::too_many_lines,
     reason = "one fixture keeps setup, timed commit and independent verification together"
 )]
-fn commit_similar_chunks(workers: usize, count: usize, mixed: bool, held: usize) -> Measurement {
+fn commit_similar_chunks(
+    workers: usize,
+    count: usize,
+    mixed: bool,
+    held: usize,
+    overlap_probe: bool,
+) -> Measurement {
     let mut state = 71_u64;
     let bases = (0..count)
         .map(|_| {
@@ -169,6 +185,10 @@ fn commit_similar_chunks(workers: usize, count: usize, mixed: bool, held: usize)
     for bytes in &targets {
         writer.push(ChunkId::of(bytes), bytes.clone()).unwrap();
     }
+    index_io
+        .reads
+        .overlap_probe
+        .store(overlap_probe, Ordering::SeqCst);
     index_io.reads.armed.store(true, Ordering::SeqCst);
     let start = Instant::now();
     let (_, metrics, _) = writer.finish().unwrap();
@@ -234,7 +254,7 @@ fn commit_similarity_overlaps_cold_index_reads() {
         .num_threads(4)
         .build()
         .unwrap();
-    let measured = pool.install(|| commit_similar_chunks(4, 32, false, 0));
+    let measured = pool.install(|| commit_similar_chunks(4, 32, false, 0, true));
     assert!(
         measured.reads > 0,
         "fixture must reach cold Similarity reads"
@@ -250,8 +270,8 @@ fn commit_similarity_overlaps_cold_index_reads() {
 
 #[test]
 fn commit_similarity_preserves_mixed_records_and_partial_cpu_admission() {
-    let serial = commit_similar_chunks(1, 32, true, 0);
-    let parallel = commit_similar_chunks(4, 32, true, 2);
+    let serial = commit_similar_chunks(1, 32, true, 0, false);
+    let parallel = commit_similar_chunks(4, 32, true, 2, false);
     assert_eq!(serial.decisions, parallel.decisions);
     assert_eq!(serial.file_bytes, parallel.file_bytes);
     assert!(
@@ -272,7 +292,7 @@ fn commit_similarity_preserves_mixed_records_and_partial_cpu_admission() {
 #[ignore = "controlled A/B benchmark; run alone in release mode with --nocapture"]
 fn checkpoint_similarity_benchmark() {
     for workers in [1, 4] {
-        let m = commit_similar_chunks(workers, 128, false, 0);
+        let m = commit_similar_chunks(workers, 128, false, 0, false);
         println!(
             "checkpoint_similarity workers={workers} chunks=128 elapsed_ms={} peak_reads={} reads={} file_bytes={} accepted={}",
             m.elapsed.as_millis(),

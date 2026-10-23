@@ -116,12 +116,20 @@ impl<I: StorageIo> ContainerRepository<I> {
         let bytes = self.storage.read(&crate::published_name(id))?;
         // Structural metadata only supplies lookup keys. Full payload proof is
         // still produced below from these same freshly read immutable bytes.
-        let structure = structure_from_image(&bytes)?;
-        let hints = ScrubBaseHints::new(&structure, index);
+        let structure = structure_from_image(&bytes);
+        // A speculative structural error must not outrank the full verifier's
+        // original error. Reuse the result only after payload verification.
+        let hints = structure
+            .as_ref()
+            .ok()
+            .map(|structure| ScrubBaseHints::new(structure, index));
         let mut fallback = crate::ContainerBaseResolver::new(self);
         let mut resolver_error = None;
         let mut resolve = |dependency: fastdup_format::DependentDependency| {
-            if let Some(lookup) = hints.get(dependency.chunk_id(), dependency.logical_length()) {
+            if let Some(lookup) = hints
+                .as_ref()
+                .and_then(|hints| hints.get(dependency.chunk_id(), dependency.logical_length()))
+            {
                 if let Some(read) = self.find_verified_independent_base_from_lookup(
                     lookup,
                     dependency.chunk_id(),
@@ -160,7 +168,7 @@ impl<I: StorageIo> ContainerRepository<I> {
         if verified.header().container_id() != id {
             return Err(StoreError::PublishVerificationMismatch);
         }
-        Ok((structure, verified))
+        Ok((structure?, verified))
     }
 
     /// Validates all metadata of one immutable Container, without payload reads.

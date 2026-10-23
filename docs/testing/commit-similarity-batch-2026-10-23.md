@@ -110,6 +110,24 @@ commit/ManifestPlan time, Metadata read count/latency, DATA read latency, RSS,
 and reduction rate. A package startup check does not replace backup or restore
 qualification.
 
+## External storage review
+
+Muse Wonder Full 1.0 (`xhigh`) reviewed the baseline `65b3259`, not the final
+implementation. Its shared-permit and pre-planning DATA-guard requirements are
+implemented; Container encoding now also acquires the same pool. Its warning
+about warm-cache/gate effects is reflected above.
+
+Cold Base loads still run serially on the batch coordinator. A future controlled
+DATA-latency comparison should measure those separately before adding bounded
+parallel loads. Per-path Similarity timings and batch bucket reuse are further
+measurement targets. Prefix dictionary reuse, allocator changes and larger
+trial budgets were not justified by the current evidence.
+
+The subsequent session `f3374f66-9d23-43ab-af47-31008a707e7b`, starting at
+02:24:20 CEST, completed successfully on package 47. Veeam reported 8:16,
+693.4 MB/s processing rate and 307,446,677,504 bytes read. This differs materially
+from the earlier session's workload and is not an end-to-end A/B speedup claim.
+
 ## Test-VM deployment
 
 The update from `fastdup-0.8.1-46.el10.x86_64` to

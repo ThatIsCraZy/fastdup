@@ -282,6 +282,18 @@ impl ImmutableExactIndexRun {
         exact_range(&self.lease, offset, length)
     }
 
+    /// Each independent batch validates current heads and descriptor length
+    /// once, then reads every requested page freshly under the same file lease.
+    pub(crate) fn independent_read_batch(
+        &self,
+    ) -> Result<crate::IndependentFileReadBatch<'_>, ExactIndexStoreError> {
+        let batch = self.lease.independent_read_batch()?;
+        if batch.logical_len() != self.descriptor.file_length() as u64 {
+            return Err(ExactIndexStoreError::IdentityMismatch);
+        }
+        Ok(batch)
+    }
+
     /// Returns the complete cached page-key bounds array without I/O.
     pub(crate) fn peek_page_bounds(&self) -> Option<Arc<Box<[ExactPageKeyBounds]>>> {
         self.bounds_cache.peek(crate::ReadCacheKey {

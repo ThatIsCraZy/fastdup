@@ -42,9 +42,17 @@ payload or hint survives that Container operation; the hint-result bound is
 Only lookup hints are shared. Every selected Base still uses fresh Independent
 reads, CRC checks and identity verification. Bad/negative hints retain the
 verified DATA scan fallback. Full target verification still precedes certificate
-creation and coverage updates. Storage-head validation, GC barriers, journal
-version, candidate precedence and the two-Base-attempt limit are unchanged.
+creation and coverage updates. GC barriers, journal version, candidate
+precedence and the two-Base-attempt limit are unchanged.
 Scrub worker reads now carry the `recoveryScrub` reason explicitly.
+
+An independent Exact lookup window now borrows an operation-local file reader.
+It freshly validates FDIO heads and descriptor length once per leased Run, then
+reads each requested span directly without cached payloads. The snapshot cannot
+outlive its file lease and is discarded before the next window/Container.
+Ordinary per-range independent reads still obtain fresh heads per call; no
+process-wide or thread-local layout cache is introduced. Writer-born or absent
+page bounds retain their existing serial fallback.
 
 ## Regression measurements
 
@@ -64,8 +72,26 @@ per verified Container/byte and completion rate.
 The original tests failed on both read-count assertions. Further tests cover
 320 distinct Bases beyond the hint cap, fresh reads on a second scrub, Base
 payload corruption after a successful scrub, damaged index pages falling back
-to verified DATA, and worker read attribution. Fault injection into a leased
-index deliberately bypasses normal immutable-reader write exclusion.
+to verified DATA, destroyed FDIO heads followed by a missing Base, preservation
+of full-verifier error precedence, and worker read attribution. Fault injection
+into a leased index deliberately bypasses normal immutable-reader write exclusion.
+
+Muse Wonder Full 1.0 (`xhigh`) correctly challenged the tiny fixture's page
+adjacency. A second fixture requests 128 Bases across three Runs, including two
+with 65,536 unrelated hash keys each. Test-only physical byte counters minus
+logical returned bytes count actual 8-KiB head reads:
+
+| Sparse-leaf variant | Fresh head reads | Physical bytes read |
+| --- | ---: | ---: |
+| Per-key lookup | 393 | 4,829,184 |
+| Page batching alone | 237 | 2,990,080 |
+| Batch with operation-local head validation | 3 | 1,073,152 |
+
+The last variant reads 77.8% fewer physical bytes for index resolution in this
+fixture. The regular regression requires at least 50% fewer head reads and
+also verifies the complete target Container. It failed with page batching alone
+before adding the operation-local reader. This does not measure total scrub
+DATA traffic or claim a live throughput multiplier.
 
 ```sh
 CARGO_TARGET_DIR=/source/fastdup/.artifacts/target \
@@ -73,6 +99,8 @@ TMPDIR=/source/fastdup/.artifacts/tmp \
 cargo test --locked -p fastdup-store --lib structural_recovery::scrub_lookup_tests
 ```
 
-Full `fastdup-store` validation passed: 341 tests, zero failures, 16 intentionally
-ignored. Production-library Clippy passed without lint allowances; formatting
-and whitespace checks passed. Logs are retained with the measurement artifacts.
+Logs are retained with the measurement artifacts. An appliance concurrency
+fixture's 2-ms scheduling race was replaced with a bounded rendezvous. A separate
+global cache-admission test failed amid parallel tests and passed alone; its
+entire 38-test ingest suite also passed with one test thread. No production cache
+policy was changed to accommodate that test.
