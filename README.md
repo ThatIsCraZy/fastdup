@@ -30,18 +30,22 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
 > fastdup is a research prototype, not a production backup product. Do not use
 > it as the only copy of important data. Current limitations are listed below.
 
-## New in v0.8.1 · 19 September 2026
+## Current development · 23 October 2026
 
-- **A warm cache no longer shrinks between jobs.** The shared memory budget
-  scored each cache pool from recent hits, misses and evictions. Between two
-  backup jobs the counters go quiet, the score decays, and the target fell back
-  toward whatever was resident — so the next job started against a cold cache
-  the appliance had already earned and had room to keep. A hit-only phase had
-  the same effect: class ceilings dropped below residency and the cache evicted
-  useful entries, manufacturing the misses the score had not seen. A disk-backed
-  pool now retains its granted target out of headroom no other pool wants. It
-  never grows an idle target, yields as soon as pools genuinely compete, and is
-  skipped entirely under hard memory pressure.
+The `main` branch includes the changes below. The public download remains
+**v0.8.1 / RPM 0.8.1-1** from 19 September; these newer changes are not yet in
+that release.
+
+- **Commit planning uses available CPU capacity.** Advanced Reduction plans
+  chunks in bounded batches, sharing CPU admission with ingest and Container
+  encoding. Publication order and verification remain intact.
+- **Background integrity checks issue fewer small index reads.** Scrub batches
+  Base lookups and validates storage headers once per immutable Run within each
+  batch. Selected Bases still receive fresh payload and identity verification.
+  Worker reads are now attributed to recovery scrub in telemetry.
+- **Similarity finds candidates across chunk lengths.** Bucket profile v3
+  removes the length band while retaining bounded trials and the existing
+  savings threshold. Bases are limited to four times the target length.
 - **An experimental Veeam Linux repository is now integrated.** The WebUI
   provisions an isolated system container with its own IPv4 configuration,
   optional logical quota, Advanced Reduction and scoped hardened immutability.
@@ -55,6 +59,35 @@ high throughput, while the embedded HTTPS WebUI keeps administration simple.
   [operator guide](docs/operations/veeam-service-container.md). This remains an
   experimental compatibility layer, not real XFS, Veeam certification or a
   support commitment.
+
+### Measured on controlled fixtures
+
+| Change | Before → after | Scope |
+| --- | --- | --- |
+| Commit batch planning | 48.5 ms → 31 ms median (**36.1% shorter**) | Four workers, 128 targets, injected 2-ms index latency; DATA in memory |
+| Scrub index resolution | 4,829,184 B → 1,073,152 B (**77.8% fewer bytes**) | 128 Base keys scattered across three Exact Runs; physical index reads |
+
+These are isolated comparisons, not end-to-end backup speedups. The latest
+Store and appliance suites passed **653 tests**; 20 were intentionally ignored.
+See the [commit benchmark and VM qualification](docs/testing/commit-similarity-batch-2026-10-23.md)
+and [scrub diagnosis and regression evidence](docs/testing/scrub-metadata-reads-2026-10-23.md).
+
+**Development compatibility:** older binaries without Similarity profile v3
+reject v3 index families. Do not infer downgrade compatibility from the shared
+0.8.1 version number; see [ADR 0106](docs/adr/0106-drop-the-length-band-from-similarity-buckets.md).
+
+## New in v0.8.1 · 19 September 2026
+
+- **A warm cache no longer shrinks between jobs.** The shared memory budget
+  scored each cache pool from recent hits, misses and evictions. Between two
+  backup jobs the counters go quiet, the score decays, and the target fell back
+  toward whatever was resident — so the next job started against a cold cache
+  the appliance had already earned and had room to keep. A hit-only phase had
+  the same effect: class ceilings dropped below residency and the cache evicted
+  useful entries, manufacturing the misses the score had not seen. A disk-backed
+  pool now retains its granted target out of headroom no other pool wants. It
+  never grows an idle target, yields as soon as pools genuinely compete, and is
+  skipped entirely under hard memory pressure.
 
 No format change: v0.8.1 reads and writes the same epoch-3 repository as v0.8.0,
 and upgrading from v0.8.0 needs no repository work.
@@ -98,9 +131,8 @@ and upgrading from v0.8.0 needs no repository work.
 
 This is a working configuration measured on one appliance. It is **not** a
 Veeam-certified or Veeam-qualified integration and carries no support statement
-or performance SLA. Work is under way to integrate the **Veeam Repository
-Agent** into the appliance so that fastdup can be added as a Linux repository
-rather than only as an SMB share; that is not part of this release.
+or performance SLA. The Linux repository integration described under current
+development is not part of this release.
 
 Workspace suite: 1,111 tests passed, 0 failed.
 

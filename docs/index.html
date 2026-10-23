@@ -135,7 +135,7 @@
             data.
           </p>
           <div class="compatibility">
-            <span>RPM v0.8.1</span><span>Rocky Linux 10</span><span>x86-64</span
+            <span>Release v0.8.1 · RPM 0.8.1-1</span><span>Rocky Linux 10</span><span>x86-64</span
             ><span>Rust</span>
           </div>
         </div>
@@ -158,22 +158,20 @@
 
       <div class="section-shell release-note">
         <p lang="de" class="lang-de">
-          <b>Aktueller Entwicklungsstand · 20.09.2026:</b> Ein isolierter
-          Veeam-Servicecontainer stellt ein Linux Hardened Repository mit
-          nativem Fast Clone, eigener IP, optionaler Quota und begrenzter
-          Immutability bereit. v0.8.1 hält zusätzlich einen warmen Cache zwischen
-          Backup-Jobs, solange niemand den Speicher braucht. Repository-Format-
-          Epoch 3 — Pools aus 0.7.x werden nicht migriert.
-          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.8.1">Release-Details ↗</a>
+          <b>Aktueller Entwicklungsstand · 23.10.2026:</b> Gebündelte
+          Commit-Planung nutzt mehr CPU-Kapazität; die Hintergrundprüfung spart
+          kleine Metadaten-Reads. Diese Änderungen und das Veeam-Linux-Repository
+          sind im Entwicklungsbranch enthalten. Der Download bleibt beim
+          veröffentlichten RPM 0.8.1-1 vom 19. September.
+          <a href="#development">Neue Messungen und Prüfberichte ↓</a>
         </p>
         <p lang="en" class="lang-en">
-          <b>Current development branch · 20 September 2026:</b> an isolated
-          Veeam service container provides a Linux Hardened Repository with
-          native Fast Clone, its own IP, optional quota and scoped immutability.
-          v0.8.1 also keeps a warm cache between backup jobs while nothing else
-          needs the memory. Repository format epoch 3 — pools from 0.7.x are not
-          migrated.
-          <a href="https://github.com/ThatIsCraZy/fastdup/releases/tag/v0.8.1">Release details ↗</a>
+          <b>Current development branch · 23 October 2026:</b> batched commit
+          planning uses more CPU capacity; background integrity checks reduce
+          small metadata reads. These changes and the Veeam Linux repository
+          are in the development branch. The download remains the published
+          RPM 0.8.1-1 from 19 September.
+          <a href="#development">New measurements and test reports ↓</a>
         </p>
       </div>
       <section class="trust-strip" aria-label="Produktmerkmale">
@@ -396,10 +394,98 @@
         </p>
       </section>
 
+      <section id="development" class="section-shell plain-section">
+        <div class="section-heading">
+          <div class="eyebrow lang-de">ENTWICKLUNG · 23.10.2026</div>
+          <div class="eyebrow lang-en">DEVELOPMENT · 23 OCTOBER 2026</div>
+          <h2 lang="de" class="lang-de">Weniger Wartezeit. Weniger Index-Reads.</h2>
+          <h2 lang="en" class="lang-en">Less waiting. Fewer index reads.</h2>
+        </div>
+        <p lang="de" class="lang-de section-lead">
+          Die Commit-Planung verarbeitet Chunks parallel unter dem gemeinsamen
+          CPU-Budget. Scrub bündelt Base-Lookups und prüft Storage-Header einmal
+          pro Run und Batch. Base-Inhalte und ihre Identität werden weiterhin
+          frisch geprüft.
+        </p>
+        <p lang="en" class="lang-en section-lead">
+          Commit planning processes chunks in parallel under the shared CPU
+          budget. Scrub batches Base lookups and validates storage headers once
+          per Run and batch. Base contents and their identity still receive
+          fresh verification.
+        </p>
+        <div class="metric-grid">
+          <article>
+            <span class="lang-de metric">36,1 %</span>
+            <span class="lang-en metric">36.1%</span>
+            <strong class="lang-de">kürzere Commit-Dauer im Test</strong>
+            <strong class="lang-en">shorter commit duration in the fixture</strong>
+            <h3 class="lang-de">48,5 ms → 31 ms Median</h3>
+            <h3 class="lang-en">48.5 ms → 31 ms median</h3>
+            <p lang="de" class="lang-de">
+              Vier Worker, 128 Targets, acht wechselnde A/B-Läufe. Simulierte
+              Index-Latenz von 2 ms; DATA und Publikation im RAM.
+            </p>
+            <p lang="en" class="lang-en">
+              Four workers, 128 targets, eight alternating A/B repetitions.
+              Injected 2-ms index latency; DATA and publication in memory.
+            </p>
+          </article>
+          <article>
+            <span class="lang-de metric">77,8 %</span>
+            <span class="lang-en metric">77.8%</span>
+            <strong class="lang-de">weniger physische Index-Lesebytes</strong>
+            <strong class="lang-en">fewer physical index bytes read</strong>
+            <h3 class="lang-de">Scrub mit gestreuten Base-Keys</h3>
+            <h3 class="lang-en">Scrub with scattered Base keys</h3>
+            <p lang="de" class="lang-de">
+              128 Base-Keys über drei Exact Runs verteilt: 4.829.184 auf
+              1.073.152 Bytes. Misst die Index-Auflösung, nicht alle DATA-Reads.
+            </p>
+            <p lang="en" class="lang-en">
+              128 Base keys across three Exact Runs: 4,829,184 to 1,073,152
+              bytes. Measures index resolution, not all DATA reads.
+            </p>
+          </article>
+          <article>
+            <span class="metric">653</span>
+            <strong class="lang-de">Tests bestanden</strong>
+            <strong class="lang-en">tests passed</strong>
+            <h3>Store &amp; Appliance</h3>
+            <p lang="de" class="lang-de">
+              344 Store- und 309 Appliance-Tests, 20 bewusst ausgenommen.
+              Einschließlich Korruptionsfällen, frischer Base-Verifikation und
+              einer Regression für verstreute Indexseiten.
+            </p>
+            <p lang="en" class="lang-en">
+              344 Store and 309 appliance tests, 20 intentionally ignored.
+              Includes corruption cases, fresh Base verification and a
+              regression for scattered index pages.
+            </p>
+          </article>
+        </div>
+        <p lang="de" class="lang-de section-lead">
+          Kontrollierte Einzelmessungen, keine Beschleunigungszusage für ganze
+          Backup-Jobs. Similarity-Profil v3 findet zusätzlich Kandidaten über
+          Chunk-Längen hinweg; ältere Binaries ohne v3 können diese neuen
+          Indexfamilien nicht lesen.
+        </p>
+        <p lang="en" class="lang-en section-lead">
+          Controlled, isolated measurements, not a whole-backup speedup claim.
+          Similarity profile v3 also finds candidates across chunk lengths;
+          older binaries without v3 cannot read these new index families.
+        </p>
+        <div class="evidence-links">
+          <a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/testing/commit-similarity-batch-2026-10-23.md">Commit A/B &amp; VM</a>
+          <a class="lang-de" href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/testing/scrub-metadata-reads-2026-10-23.md">Scrub-Diagnose &amp; Regressionen</a>
+          <a class="lang-en" href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/testing/scrub-metadata-reads-2026-10-23.md">Scrub diagnosis &amp; regressions</a>
+          <a href="https://github.com/ThatIsCraZy/fastdup/blob/main/docs/adr/0106-drop-the-length-band-from-similarity-buckets.md">Similarity v3 · ADR 0106</a>
+        </div>
+      </section>
+
       <section id="performance" class="performance-section">
         <div class="section-shell">
           <div class="section-heading">
-            <div class="eyebrow">BENCHMARKS · 05.09.2026</div>
+            <div class="eyebrow">SMB &amp; LINUX · SEPTEMBER 2026</div>
             <h2 lang="de" class="lang-de">
               Messwerte mit dem passenden Kontext.
             </h2>

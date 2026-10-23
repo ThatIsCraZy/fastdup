@@ -32,20 +32,24 @@ HTTPS-WebUI hält die Administration einfach.
 > Verwende es nicht als einzige Kopie wichtiger Daten. Die aktuellen Grenzen
 > sind weiter unten aufgeführt.
 
-## Neu in v0.8.1 · 19. September 2026
+## Aktueller Entwicklungsstand · 23. Oktober 2026
 
-- **Ein warmer Cache schrumpft nicht mehr zwischen zwei Jobs.** Das gemeinsame
-  Speicherbudget bewertete jeden Cache-Pool nach Treffern, Fehlzugriffen und
-  Verdrängungen. Zwischen zwei Backup-Jobs werden die Zähler still, die Bewertung
-  verfällt, und das Ziel fiel auf das zurück, was gerade resident war — der
-  nächste Job startete also gegen einen kalten Cache, den die Appliance bereits
-  verdient hatte und hätte halten können. Eine reine Trefferphase hatte denselben
-  Effekt: Klassenobergrenzen sanken unter die Residency, der Cache verdrängte
-  brauchbare Einträge und erzeugte damit genau die Fehlzugriffe, die die
-  Bewertung nicht gesehen hatte. Ein plattengestützter Pool behält sein
-  zugeteiltes Ziel jetzt aus Headroom, den kein anderer Pool will. Ein
-  ungenutztes Ziel wächst dadurch nie, bei echter Konkurrenz wird sofort
-  abgegeben, und unter harter Speicherknappheit entfällt die Rückhaltung ganz.
+Der Branch `main` enthält die folgenden Änderungen. Der öffentliche Download
+bleibt **v0.8.1 / RPM 0.8.1-1** vom 19. September; die neueren Änderungen sind
+noch nicht in diesem Release enthalten.
+
+- **Die Commit-Planung nutzt verfügbare CPU-Kapazität.** Advanced Reduction
+  plant Chunks in begrenzten Batches und teilt sich das CPU-Budget mit Ingest
+  und Container-Encoding. Publikationsreihenfolge und Verifikation bleiben
+  erhalten.
+- **Die Hintergrundprüfung benötigt weniger kleine Index-Reads.** Scrub bündelt
+  Base-Lookups und prüft Storage-Header einmal pro immutablem Run innerhalb
+  eines Batches. Gewählte Bases werden weiterhin frisch gelesen und auf Inhalt
+  und Identität geprüft. Worker-Reads erscheinen jetzt korrekt als Recovery
+  Scrub in der Telemetrie.
+- **Similarity findet Kandidaten über Chunk-Längen hinweg.** Bucket-Profil v3
+  entfernt das Längenband; begrenzte Trials und die bisherige Einsparschwelle
+  bleiben erhalten. Bases dürfen höchstens viermal so lang wie das Target sein.
 - **Ein experimentelles Veeam-Linux-Repository ist jetzt integriert.** Die WebUI
   provisioniert einen isolierten Systemcontainer mit eigener IPv4-Konfiguration,
   optionaler logischer Quota, Advanced Reduction und begrenzter Hardened
@@ -60,6 +64,39 @@ HTTPS-WebUI hält die Administration einfach.
   [Betriebsanleitung](docs/operations/veeam-service-container.md). Die Integration
   bleibt eine experimentelle Kompatibilitätsschicht, kein echtes XFS, keine
   Veeam-Zertifizierung und keine Support-Zusage.
+
+### Messungen mit kontrollierten Testdaten
+
+| Änderung | Vorher → nachher | Messumfang |
+| --- | --- | --- |
+| Commit-Batch-Planung | 48,5 ms → 31 ms Median (**36,1 % kürzer**) | Vier Worker, 128 Targets, simulierte Index-Latenz von 2 ms; DATA im RAM |
+| Scrub-Index-Auflösung | 4.829.184 B → 1.073.152 B (**77,8 % weniger Bytes**) | 128 Base-Keys über drei Exact Runs gestreut; physische Index-Reads |
+
+Das sind isolierte Vergleiche, keine Messungen einer Beschleunigung des gesamten
+Backup-Jobs. Die aktuellen Store- und Appliance-Suites haben **653 Tests**
+bestanden; 20 waren bewusst ausgenommen. Details im
+[Commit-Benchmark und VM-Prüfbericht](docs/testing/commit-similarity-batch-2026-10-23.md)
+und in der [Scrub-Diagnose mit Regressionen](docs/testing/scrub-metadata-reads-2026-10-23.md).
+
+**Kompatibilität des Entwicklungsstands:** Ältere Binaries ohne Similarity-Profil
+v3 lehnen v3-Indexfamilien ab. Die gemeinsame Versionsnummer 0.8.1 bedeutet
+keine Downgrade-Kompatibilität; siehe
+[ADR 0106](docs/adr/0106-drop-the-length-band-from-similarity-buckets.md).
+
+## Neu in v0.8.1 · 19. September 2026
+
+- **Ein warmer Cache schrumpft nicht mehr zwischen zwei Jobs.** Das gemeinsame
+  Speicherbudget bewertete jeden Cache-Pool nach Treffern, Fehlzugriffen und
+  Verdrängungen. Zwischen zwei Backup-Jobs werden die Zähler still, die Bewertung
+  verfällt, und das Ziel fiel auf das zurück, was gerade resident war — der
+  nächste Job startete also gegen einen kalten Cache, den die Appliance bereits
+  verdient hatte und hätte halten können. Eine reine Trefferphase hatte denselben
+  Effekt: Klassenobergrenzen sanken unter die Residency, der Cache verdrängte
+  brauchbare Einträge und erzeugte damit genau die Fehlzugriffe, die die
+  Bewertung nicht gesehen hatte. Ein plattengestützter Pool behält sein
+  zugeteiltes Ziel jetzt aus Headroom, den kein anderer Pool will. Ein
+  ungenutztes Ziel wächst dadurch nie, bei echter Konkurrenz wird sofort
+  abgegeben, und unter harter Speicherknappheit entfällt die Rückhaltung ganz.
 
 Keine Formatänderung: v0.8.1 liest und schreibt dasselbe Epoch-3-Repository wie
 v0.8.0, ein Upgrade von v0.8.0 erfordert keine Repository-Arbeit.
@@ -106,10 +143,9 @@ v0.8.0, ein Upgrade von v0.8.0 erfordert keine Repository-Arbeit.
 
 Das ist eine auf einer Appliance gemessene, funktionierende Konfiguration. Es
 ist **keine** Veeam-zertifizierte oder Veeam-qualifizierte Integration und
-enthält keine Support-Zusage und keine Performance-SLA. An der Integration des
-**Veeam Repository Agent** in die Appliance wird gearbeitet, damit fastdup als
-Linux-Repository und nicht nur als SMB-Freigabe eingebunden werden kann; das ist
-nicht Teil dieses Release.
+enthält keine Support-Zusage und keine Performance-SLA. Die unter dem aktuellen
+Entwicklungsstand beschriebene Linux-Repository-Integration ist nicht Teil
+dieses Release.
 
 Workspace-Suite: 1.111 Tests bestanden, 0 fehlgeschlagen.
 
